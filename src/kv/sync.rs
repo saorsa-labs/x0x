@@ -44,6 +44,9 @@ struct StateSyncCounters {
     rejected_no_retained: AtomicU64,
     rejected_other: AtomicU64,
     incoming_record_merges: AtomicU64,
+    digest_beacons_sent: AtomicU64,
+    digest_beacon_divergences: AtomicU64,
+    digest_beacon_wakes_deferred: AtomicU64,
 }
 
 /// Cumulative state-sync activity for one currently open local store.
@@ -64,6 +67,16 @@ pub struct StateSyncSnapshot {
     pub rejected_no_retained: u64,
     pub rejected_other: u64,
     pub incoming_record_merges: u64,
+    /// Post-convergence digest beacons this replica published (#1117).
+    pub digest_beacons_sent: u64,
+    /// Peer digest beacons that disagreed with local state (#1117) — each
+    /// one re-arms the bounded state-request tail.
+    pub digest_beacon_divergences: u64,
+    /// Divergent peer beacons whose wake the gate damped (#1601): pair
+    /// suppression, the per-author rate cap, or the per-group wake budget
+    /// deferred it. Added to `digest_beacon_divergences`, this is the
+    /// store's total beacon-divergence pressure.
+    pub digest_beacon_wakes_deferred: u64,
 }
 
 impl StateSyncCounters {
@@ -84,6 +97,9 @@ impl StateSyncCounters {
             rejected_no_retained: get(&self.rejected_no_retained),
             rejected_other: get(&self.rejected_other),
             incoming_record_merges: get(&self.incoming_record_merges),
+            digest_beacons_sent: get(&self.digest_beacons_sent),
+            digest_beacon_divergences: get(&self.digest_beacon_divergences),
+            digest_beacon_wakes_deferred: get(&self.digest_beacon_wakes_deferred),
         }
     }
 }
@@ -290,6 +306,14 @@ const RETAINED_IMAGE_REPAIR_ATTEMPTS: u8 = 2;
 
 /// Same spacing as a key-gap repair: past `STATE_RESPONSE_COOLDOWN_SECS`.
 const RETAINED_IMAGE_REPAIR_RETRY_AFTER: std::time::Duration = KEY_GAP_REPAIR_RETRY_AFTER;
+
+/// Spacing between one sealed store's `StateDigestBeacon` publications
+/// (#1117). The beacon piggybacks on the parked requester's existing
+/// liveness tick — no new periodic loop — so the interval only paces that
+/// ride, matching the presence beacon default (30 s): one tiny sealed
+/// side-topic message per store per interval at rest.
+const DIGEST_BEACON_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 const MAX_RETAINED_GROUP_IMAGE_BYTES: usize = crate::kv::retained_paging::MAX_RETAINED_IMAGE_BYTES;
 
 fn serialize_retained_group_image(store: &KvStore) -> Result<Vec<u8>> {
@@ -672,6 +696,7 @@ fn state_request_wait(attempt: usize) -> std::time::Duration {
 /// (their receive loop tolerates undecodable payloads), so the addition is
 /// purely additive.
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 enum KvSyncMessage {
     /// A peer with no local state for the store asks holders to republish
     /// their full state (as a regular delta) on the main topic.
@@ -754,6 +779,54 @@ enum KvSyncMessage {
         /// verified full-replace adopt path (and useful in logs).
         entry_count: u32,
     },
+    /// A converged sealed-plane replica's periodic digest declaration
+    /// (#1117 beacon half, ruled 20 Oct 2026 as ADR 0092's
+    /// liveness-piggybacked beacon). Unlike `StateServedV2`, it is
+    /// unsolicited: it rides the requester's existing liveness tick
+    /// (no new periodic loop), continuously once armed — at the first
+    /// convergence, or for a non-empty lone holder stuck in the
+    /// persistent tail — and is published ONLY on sealed stores
+    /// (encrypted or TreeKEM), where it is sign-then-encrypt sealed and
+    /// membership-gated like every other control message. It deliberately
+    /// carries NO transport identity: the sealed author IS the declarer,
+    /// so nothing in it can be attributed to another peer. A receiver
+    /// whose own served digest differs re-enters the bounded
+    /// `StateRequest` tail — damped per verified author and digest pair —
+    /// so a lost live update is repaired without a restart. Detection is
+    /// symmetric — either side of a divergence wakes — because the digest
+    /// carries no ordering.
+    ///
+    /// Wire compatibility: additive variant, same precedent as
+    /// `OwnerAnnounce`/`StateServed`/`StateServedV2` — older peers fail to
+    /// deserialize it and skip the message. It never reaches a plaintext
+    /// store: senders seal it, and non-sealed open paths reject it.
+    StateDigestBeacon {
+        /// Canonical BLAKE3 digest over the declaring replica's full entry
+        /// set (same computation as `StateServedV2`).
+        digest: [u8; 32],
+        /// Number of entries in the declaring replica's set.
+        entry_count: u32,
+    },
+}
+
+/// #1604: main-era wire bytes of every `KvSyncMessage` variant still match.
+#[cfg(test)]
+#[test]
+fn kv_sync_message_wire_matches_main() {
+    crate::wire_golden_tests::check::<KvSyncMessage>(
+        "KvSyncMessage",
+        &[(
+            crate::wire_golden_tests::Codec::Bincode,
+            crate::wire_golden_tests::Mode::RoundTrip,
+        )],
+        &[
+            "StateRequest",
+            "OwnerAnnounce",
+            "StateServed",
+            "StateServedV2",
+            "StateDigestBeacon",
+        ],
+    );
 }
 
 /// One responder's latest v2 digest declaration.
@@ -843,6 +916,172 @@ fn state_request_delay_at(attempt: usize) -> u64 {
     }
 }
 
+/// Publishes one sealed `StateDigestBeacon` for the parked requester
+/// (#1117). The scheduler owns the cadence; the hook owns sealing and
+/// publication, so socket-free scheduler tests can observe calls without
+/// any wire.
+type DigestBeaconHook = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+/// Sealed-plane digest-beacon state for the requester (#1117). The beacon
+/// piggybacks on the requester's EXISTING liveness tick — this adds no
+/// timer of its own. From the first convergence on, the replica keeps
+/// declaring its digest whether parked or repairing: an ahead replica that
+/// stopped declaring while its own repair tail ran would leave a stale
+/// peer with no wake-up left (lost-update deadlock).
+struct DigestBeaconPlan {
+    hook: DigestBeaconHook,
+    /// Bumped by the responder loop for every peer beacon that disagrees
+    /// with local state; the parked requester watches it.
+    divergence: tokio::sync::watch::Receiver<u64>,
+    /// When the next beacon may leave; `None` means the next liveness tick
+    /// carries one immediately (a fresh divergence is noticed fast).
+    /// `tokio::time::Instant` — same clock as the tick it rides.
+    next_at: Option<tokio::time::Instant>,
+    /// Whether this replica's digest declarations are meaningful yet:
+    /// armed at the first convergence (park), or when a NON-EMPTY holder
+    /// reaches the persistent tail — the lone holder whose peers cannot
+    /// answer it (the sole writer of an `AdminOnly` group, whose readers
+    /// cannot publish serve markers, and a restarted writer holding a
+    /// missed update). Before arming, a bootstrapping replica's partial
+    /// digest would only wake converged peers needlessly, and an empty
+    /// tailer's emptiness is already declared by the empty-holder markers.
+    armed: bool,
+}
+
+/// Damps beacon-divergence wakes per VERIFIED author (#1117). One wake per
+/// distinct (declared digest, local digest) pair per repeat window: a
+/// difference the repair cannot close — pruning off under `Allowlisted`,
+/// or a checkpointed store where the prune-adopt never runs — recurs with
+/// both digests fixed, so it costs at most one bounded tail per window.
+/// Keyed by the sealed author, never a wire claim, so rotating identities
+/// buys nothing. A suppressed pair RE-earns its wake after the window: a
+/// repair can fail (the sole holder went offline, or two stale replicas
+/// parked on each other's matching digests and the ahead replica's
+/// unchanged beacon returns later), and the #238 rule applies — infinite
+/// patience at capped cadence, never permanent suppression. A per-author
+/// rate cap covers beacons that merely cross an in-flight delta under
+/// write load; a wake it defers is not consumed. Both maps are capped;
+/// at the cap they are cleared and re-learned — memory stays bounded
+/// even under a beacon flood.
+///
+/// A per-GROUP budget (#1601) bounds the aggregate across authors. The
+/// gate lives inside one store's responder loop, so the budget caps that
+/// store's granted wakes per rate-cap window however many sealed members
+/// churn: per-author damping alone let K churning authors (every local
+/// write mints a fresh declared digest, so pair suppression never
+/// applied) wake a parked replica about K times per window — about
+/// K × M tails across M parked replicas. A granted wake only re-arms ONE
+/// bounded request tail whose next verified serve repairs every
+/// divergence, so distinct authors' wakes inside one window are largely
+/// redundant; budget excess defers exactly like the per-author cap (not
+/// consumed, re-earned next window) and the #238 patience rule still
+/// holds. The wake log below is bounded by the budget itself, so the map
+/// cap never needs to clear it.
+#[derive(Default)]
+struct BeaconWakeGate {
+    woken_for: std::collections::HashMap<AgentId, ([u8; 32], [u8; 32], tokio::time::Instant)>,
+    last_wake: std::collections::HashMap<AgentId, tokio::time::Instant>,
+    /// Granted-wake instants still inside the rate-cap window, oldest
+    /// first. Never longer than [`BEACON_WAKE_GROUP_BUDGET`].
+    group_wakes: std::collections::VecDeque<tokio::time::Instant>,
+}
+
+/// How long one (author, declared, local) divergence stays suppressed.
+const BEACON_WAKE_REPEAT_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(STATE_REQUEST_TAIL_CAP_SECS);
+
+/// Map ceiling before the gate re-learns from scratch.
+const BEACON_WAKE_GATE_CAP: usize = 1024;
+
+/// Most wakes one gate (one open store, one parked replica) grants per
+/// rate-cap interval across ALL authors (#1601). One granted wake re-arms
+/// one bounded tail, so four re-arms per 16 s — regardless of group size
+/// or churn — keeps post-divergence repair latency small while capping
+/// the aggregate wake cost at a per-store constant.
+const BEACON_WAKE_GROUP_BUDGET: usize = 4;
+
+impl BeaconWakeGate {
+    fn should_wake(&mut self, author: AgentId, declared: [u8; 32], local: [u8; 32]) -> bool {
+        let now = tokio::time::Instant::now();
+        if let Some((prior_declared, prior_local, at)) = self.woken_for.get(&author) {
+            if (*prior_declared, *prior_local) == (declared, local)
+                && now < *at + BEACON_WAKE_REPEAT_AFTER
+            {
+                return false;
+            }
+        }
+        if self
+            .last_wake
+            .get(&author)
+            .is_some_and(|at| now < *at + KEY_GAP_REPAIR_RETRY_AFTER)
+        {
+            return false;
+        }
+        // Per-group budget (#1601): a sliding rate-cap window across
+        // authors. Expired entries leave first; a full budget then defers
+        // the wake without consuming anything, exactly like the per-author
+        // cap above — the same beacon re-earns its wake next window.
+        while self
+            .group_wakes
+            .front()
+            .is_some_and(|at| now >= *at + KEY_GAP_REPAIR_RETRY_AFTER)
+        {
+            self.group_wakes.pop_front();
+        }
+        if self.group_wakes.len() >= BEACON_WAKE_GROUP_BUDGET {
+            return false;
+        }
+        if self.woken_for.len() >= BEACON_WAKE_GATE_CAP
+            || self.last_wake.len() >= BEACON_WAKE_GATE_CAP
+        {
+            self.woken_for.clear();
+            self.last_wake.clear();
+        }
+        self.woken_for.insert(author, (declared, local, now));
+        self.last_wake.insert(author, now);
+        self.group_wakes.push_back(now);
+        true
+    }
+}
+
+/// Count one verified divergent beacon and, when the gate grants it, wake
+/// the parked requester (#1601).
+///
+/// A granted wake increments `digest_beacon_divergences` and bumps
+/// `divergence`, which is the only signal that re-arms the bounded
+/// `StateRequest` tail. A damped wake — pair suppression, the per-author
+/// cap, or the per-group budget — increments `digest_beacon_wakes_deferred`
+/// and leaves the requester parked. Both counters are what
+/// [`StateSyncCounters::snapshot`] reports on `/diagnostics/state-sync`.
+fn record_divergent_beacon(
+    gate: &mut BeaconWakeGate,
+    counters: &StateSyncCounters,
+    divergence: Option<&tokio::sync::watch::Sender<u64>>,
+    author: AgentId,
+    declared: [u8; 32],
+    local: [u8; 32],
+) -> bool {
+    if gate.should_wake(author, declared, local) {
+        counters
+            .digest_beacon_divergences
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(divergence) = divergence {
+            divergence.send_if_modified(|epoch| {
+                *epoch += 1;
+                true
+            });
+        }
+        true
+    } else {
+        counters
+            .digest_beacon_wakes_deferred
+            .fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
 /// Owns the request cadence shared by production and socket-free tests.
 /// Returning `true` grants one publication slot; `false` ends the task.
 struct RequestSlotScheduler {
@@ -856,6 +1095,7 @@ struct RequestSlotScheduler {
     converged: bool,
     initialized: bool,
     refresh_tick: tokio::time::Interval,
+    digest_beacon: Option<DigestBeaconPlan>,
 }
 
 struct RequestSlotContext<'a> {
@@ -884,6 +1124,7 @@ impl RequestSlotScheduler {
             converged: false,
             initialized: false,
             refresh_tick,
+            digest_beacon: None,
         }
     }
 
@@ -891,6 +1132,48 @@ impl RequestSlotScheduler {
         self.membership_changes = ctx.encrypted_authorization_changes();
         self.reader = Some((ctx, reader));
         self
+    }
+
+    /// Arm the sealed-plane digest beacon (#1117). A scheduler with a
+    /// beacon plan parks after convergence instead of exiting, so it can
+    /// keep declaring its digest and watching for divergence.
+    fn with_digest_beacon(
+        mut self,
+        hook: DigestBeaconHook,
+        divergence: tokio::sync::watch::Receiver<u64>,
+    ) -> Self {
+        self.digest_beacon = Some(DigestBeaconPlan {
+            hook,
+            divergence,
+            next_at: None,
+            armed: false,
+        });
+        self
+    }
+
+    /// Whether the liveness tick that just fired carries a beacon.
+    fn digest_beacon_due(&self) -> bool {
+        self.digest_beacon.as_ref().is_some_and(|plan| {
+            plan.armed
+                && plan
+                    .next_at
+                    .is_none_or(|at| tokio::time::Instant::now() >= at)
+        })
+    }
+
+    /// Mark this tick's beacon as taken and return its publish future.
+    fn take_digest_beacon_publish(
+        &mut self,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
+        let plan = self.digest_beacon.as_mut()?;
+        plan.next_at = Some(tokio::time::Instant::now() + DIGEST_BEACON_INTERVAL);
+        Some((plan.hook)())
+    }
+
+    /// Whether the unparked wait loop also rides beacons on its tick —
+    /// true once the replica's declarations are armed.
+    fn digest_beacon_declares_while_tailing(&self) -> bool {
+        self.digest_beacon.as_ref().is_some_and(|plan| plan.armed)
     }
 
     fn request_unavailable(&mut self) {
@@ -956,6 +1239,34 @@ impl RequestSlotScheduler {
                                 None => return false,
                             }
                         },
+                        changed = async {
+                            match self.digest_beacon.as_mut() {
+                                Some(plan) => plan.divergence.changed().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            if changed.is_err() { return false; }
+                            // A sealed peer's beacon disagreed with local
+                            // state (#1117). Re-run the bounded discovery
+                            // tail. The served-evidence reset matters: the
+                            // digests that retired the previous tail
+                            // describe the OLD local state and must not
+                            // re-retire this one before a fresh serve
+                            // verifies the repair. The adopt window re-arms
+                            // so the digest-verified full-replace adopt can
+                            // prune keys the repair serve no longer carries
+                            // (a missed tombstone cannot converge by merge
+                            // alone).
+                            if let Some(plan) = self.digest_beacon.as_mut() {
+                                let _ = plan.divergence.borrow_and_update();
+                            }
+                            reset_public_served_evidence(evidence, self.version);
+                            bootstrap_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.attempt = 0;
+                            self.published_requests = 0;
+                            self.converged = false;
+                            continue 'schedule;
+                        },
                         _ = self.refresh_tick.tick() => {
                             if stopped.load(std::sync::atomic::Ordering::Relaxed) { return false; }
                             if let Some(refresh) = refresh {
@@ -964,6 +1275,19 @@ impl RequestSlotScheduler {
                                     () = cancel.cancelled() => return false,
                                     () = bootstrap_cancel.cancelled() => return false,
                                     () = refresh() => {},
+                                }
+                            }
+                            // Piggyback the digest beacon on this existing
+                            // liveness tick (#1117): no timer of its own,
+                            // one sealed side-topic message per interval.
+                            if self.digest_beacon_due() {
+                                if let Some(publish) = self.take_digest_beacon_publish() {
+                                    tokio::select! {
+                                        biased;
+                                        () = cancel.cancelled() => return false,
+                                        () = bootstrap_cancel.cancelled() => return false,
+                                        () = publish => {},
+                                    }
                                 }
                             }
                         },
@@ -1011,13 +1335,31 @@ impl RequestSlotScheduler {
                             break;
                         }
                     },
-                    _ = self.refresh_tick.tick(), if self.changes.is_some() => {
+                    _ = self.refresh_tick.tick(),
+                        if self.changes.is_some()
+                            || self.digest_beacon_declares_while_tailing() =>
+                    {
                         if let Some(refresh) = refresh {
                             tokio::select! {
                                 biased;
                                 () = cancel.cancelled() => return false,
                                 () = bootstrap_cancel.cancelled() => return false,
                                 () = refresh() => {},
+                            }
+                        }
+                        // A replica repairing post-convergence divergence
+                        // KEEPS declaring its digest on the same tick: the
+                        // ahead side of a divergence must never go silent
+                        // while its own tail runs, or the stale peer loses
+                        // its only wake-up (#1117 lost-update deadlock).
+                        if self.digest_beacon_due() {
+                            if let Some(publish) = self.take_digest_beacon_publish() {
+                                tokio::select! {
+                                    biased;
+                                    () = cancel.cancelled() => return false,
+                                    () = bootstrap_cancel.cancelled() => return false,
+                                    () = publish => {},
+                                }
                             }
                         }
                     },
@@ -1040,13 +1382,44 @@ impl RequestSlotScheduler {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                let (is_empty, cp_hwm, local_digest) = {
+                let (is_empty, has_content, cp_hwm, local_digest) = {
                     let s = store.read().await;
-                    (s.is_empty(), s.highest_checkpoint_seq, s.served_digest())
+                    let empty = s.is_empty();
+                    (
+                        empty,
+                        !empty || s.has_retained_group_history(),
+                        s.highest_checkpoint_seq,
+                        s.served_digest(),
+                    )
                 };
+                // Arm the digest declaration for a lone holder (#1117): a
+                // replica with content — live keys OR retained tombstone
+                // history, so a writer that deleted its last key still
+                // declares — this deep in the tail has asked everything
+                // askable and nobody could answer, typically because its
+                // peers are read-only and cannot publish serve markers.
+                // It may never converge (and so never park), but its
+                // digest is exactly what its stale peers need to wake.
+                if has_content && self.attempt >= STATE_REQUEST_RETRY_SECS.len() {
+                    if let Some(plan) = self.digest_beacon.as_mut() {
+                        plan.armed = true;
+                    }
+                }
                 if bootstrap_converged(&ev, is_empty, cp_hwm, local_digest) {
-                    if self.changes.is_some() {
+                    // A sealed-plane beacon scheduler parks instead of
+                    // exiting (#1117): the parked loop keeps declaring the
+                    // local digest and repairs divergence. Plain stores
+                    // keep the legacy exit.
+                    if self.changes.is_some() || self.digest_beacon.is_some() {
                         bootstrap_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(plan) = self.digest_beacon.as_mut() {
+                            // Divergence heard BEFORE parking was handled by
+                            // the then-active tail; it must not fire the
+                            // instant this replica parks.
+                            let _ = plan.divergence.borrow_and_update();
+                            plan.next_at = None;
+                            plan.armed = true;
+                        }
                         self.converged = true;
                         continue 'schedule;
                     }
@@ -1061,7 +1434,8 @@ impl RequestSlotScheduler {
 
 /// Disarms the bootstrap-active flag on ANY requester exit path (converged,
 /// silenced, cancelled, torn down) so the listener's digest-verified
-/// full-replace adopt can never fire outside the bootstrap window.
+/// full-replace adopt can never fire outside the bootstrap or
+/// beacon-repair (#1117) windows.
 struct BootstrapGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 impl Drop for BootstrapGuard {
@@ -1095,11 +1469,9 @@ fn bootstrap_converged(
         return highest_checkpoint_seq >= ev.max_checkpoint_seq;
     }
     if !ev.digests.is_empty() {
-        let any_nonempty = ev.digests.values().any(|d| d.entry_count > 0);
-        return ev
-            .digests
-            .values()
-            .any(|d| d.digest == local_digest && (d.entry_count > 0 || !any_nonempty));
+        let mut declared = ev.digests.values();
+        let any_nonempty = declared.clone().any(|d| d.entry_count > 0);
+        return declared.any(|d| d.digest == local_digest && (d.entry_count > 0 || !any_nonempty));
     }
     if ev.saw_nonempty {
         !is_empty
@@ -1666,7 +2038,7 @@ impl KvStoreSync {
         msg: &KvSyncMessage,
     ) -> Option<Vec<u8>> {
         let authorized = match msg {
-            KvSyncMessage::StateRequest { .. } => {
+            KvSyncMessage::StateRequest { .. } | KvSyncMessage::StateDigestBeacon { .. } => {
                 protector.is_authorized_reader(&signing.agent_id).await
             }
             KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
@@ -1684,7 +2056,10 @@ impl KvStoreSync {
                 KvMutationKind::Control,
                 store_id,
                 &payload,
-                matches!(msg, KvSyncMessage::StateRequest { .. }),
+                matches!(
+                    msg,
+                    KvSyncMessage::StateRequest { .. } | KvSyncMessage::StateDigestBeacon { .. }
+                ),
             )
             .await
             .ok()?;
@@ -1706,10 +2081,11 @@ impl KvStoreSync {
         if mutation.kind != KvMutationKind::Control {
             return Err(ControlOpenFailure::Verify);
         }
-        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload)
-            .map_err(|_| ControlOpenFailure::Verify)?;
+        let msg =
+            crate::wire_compat::decode_bincode::<KvSyncMessage>("KvSyncMessage", &mutation.payload)
+                .map_err(|_| ControlOpenFailure::Verify)?;
         let authorized = match msg {
-            KvSyncMessage::StateRequest { .. } => {
+            KvSyncMessage::StateRequest { .. } | KvSyncMessage::StateDigestBeacon { .. } => {
                 opened.reader_only && protector.is_authorized_reader(&mutation.author_id).await
             }
             KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
@@ -2277,6 +2653,7 @@ impl KvStoreSync {
         }
         let authorized = match msg {
             KvSyncMessage::StateRequest { .. } => ctx.is_authorized_reader(&signing.agent_id),
+            KvSyncMessage::StateDigestBeacon { .. } => ctx.is_authorized_reader(&signing.agent_id),
             KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
                 ctx.is_authorized_writer(&signing.agent_id)
             }
@@ -2340,10 +2717,14 @@ impl KvStoreSync {
             );
             return Err(ControlOpenFailure::Verify);
         }
-        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload)
-            .map_err(|_| ControlOpenFailure::Verify)?;
+        let msg =
+            crate::wire_compat::decode_bincode::<KvSyncMessage>("KvSyncMessage", &mutation.payload)
+                .map_err(|_| ControlOpenFailure::Verify)?;
         let authorized = match &msg {
             KvSyncMessage::StateRequest { .. } => ctx.is_authorized_reader(&mutation.author_id),
+            KvSyncMessage::StateDigestBeacon { .. } => {
+                ctx.is_authorized_reader(&mutation.author_id)
+            }
             KvSyncMessage::StateServed { .. } | KvSyncMessage::StateServedV2 { .. } => {
                 ctx.is_authorized_writer(&mutation.author_id)
             }
@@ -2429,9 +2810,15 @@ impl KvStoreSync {
         }
         let payload = open_public_payload(ctx.as_ref(), &mutation.payload)
             .map_err(|_| ControlOpenFailure::Verify)?;
-        let msg: KvSyncMessage =
-            bincode::deserialize(payload).map_err(|_| ControlOpenFailure::Verify)?;
+        let msg: KvSyncMessage = crate::wire_compat::decode_bincode("KvSyncMessage", payload)
+            .map_err(|_| ControlOpenFailure::Verify)?;
         if matches!(msg, KvSyncMessage::OwnerAnnounce { .. }) {
+            return Err(ControlOpenFailure::UnauthorizedControl);
+        }
+        // Digest beacons are sealed-plane only (#1117). A beacon on a
+        // signed-public store was never published by a conforming sender,
+        // so it is rejected rather than trusted to a writer check.
+        if matches!(msg, KvSyncMessage::StateDigestBeacon { .. }) {
             return Err(ControlOpenFailure::UnauthorizedControl);
         }
         if matches!(msg, KvSyncMessage::StateRequest { .. })
@@ -2788,11 +3175,122 @@ impl KvStoreSync {
             authorization: public_version,
             ..ServedEvidence::default()
         }));
-        // Armed only while the bootstrap requester runs: the verified
-        // full-replace adopt fires exclusively in that window — a converged
-        // replica must never let a divergent holder's serve truncate state
-        // it legitimately holds.
+        // Armed while the bootstrap requester runs or while a verified
+        // divergent beacon (#1117) has it repairing: the verified
+        // full-replace adopt fires exclusively in those windows. The
+        // beacon re-open is reader-triggerable, but the adopt itself still
+        // demands an owner-authored serve whose declared digest and entry
+        // count match the served content, so a beacon alone can never
+        // truncate state a converged replica legitimately holds.
         let bootstrap_active = Arc::new(std::sync::atomic::AtomicBool::new(bootstrap_needed));
+        // #1117 beacon half (ruled 20 Oct 2026, option A): sealed-plane
+        // digest beacon, piggybacked on the parked requester's existing
+        // liveness tick. The responder loop bumps `digest_divergence` for
+        // every peer beacon that disagrees with local state; the parked
+        // requester watches it and re-enters its bounded request tail.
+        let store_is_sealed = store_is_encrypted || store_is_treekem;
+        let (digest_divergence_tx, digest_divergence_rx) = tokio::sync::watch::channel(0u64);
+        let responder_digest_divergence = if store_is_sealed {
+            Some(digest_divergence_tx)
+        } else {
+            None
+        };
+        let digest_beacon_hook: Option<DigestBeaconHook> = if store_is_sealed {
+            let pubsub = Arc::clone(&self.pubsub);
+            let secure = self.secure.clone();
+            let treekem = self.treekem_secure.clone();
+            let refresh = self.secure_refresh.clone();
+            let gate = self.gss_publication_gate.clone();
+            let signing = self.author_signing.clone();
+            // Weak like the requester's handle: a parked beacon publisher
+            // must not keep the store alive past teardown.
+            let store = Arc::downgrade(&self.store);
+            let counters = Arc::clone(&self.state_sync_counters);
+            let store_id = { *self.store.read().await.id() };
+            let sync_topic = self.state_sync_topic();
+            let encrypted = store_is_encrypted;
+            let local_peer_id = self.local_peer_id;
+            Some(Arc::new(move || {
+                let (pubsub, secure, treekem, refresh, gate, signing) = (
+                    Arc::clone(&pubsub),
+                    secure.clone(),
+                    treekem.clone(),
+                    refresh.clone(),
+                    gate.clone(),
+                    signing.clone(),
+                );
+                let (store, counters) = (store.clone(), Arc::clone(&counters));
+                let sync_topic = sync_topic.clone();
+                Box::pin(async move {
+                    let Some(store) = store.upgrade() else {
+                        return;
+                    };
+                    let (digest, entry_count) = {
+                        let s = store.read().await;
+                        (s.served_digest(), s.checkpoint_pairs().len() as u32)
+                    };
+                    let beacon = KvSyncMessage::StateDigestBeacon {
+                        digest,
+                        entry_count,
+                    };
+                    // Same gate + deadline discipline as every other sealed
+                    // control publication.
+                    let _publication_guard = if encrypted {
+                        match gate.as_ref() {
+                            Some(gate) => Some(gate.read().await),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let publication_deadline = gss_deadline(_publication_guard.is_some());
+                    let serialized = if let (Some(protector), Some(signing)) =
+                        (treekem.as_ref(), signing.as_ref())
+                    {
+                        KvStoreSync::seal_treekem_control(
+                            protector,
+                            signing,
+                            &store_id,
+                            local_peer_id,
+                            &beacon,
+                        )
+                        .await
+                    } else if let (Some(ctx), Some(signing)) = (secure.as_ref(), signing.as_ref()) {
+                        within_gss_deadline(
+                            KvStoreSync::seal_control_message(
+                                ctx,
+                                refresh.as_ref(),
+                                signing,
+                                &store_id,
+                                local_peer_id,
+                                &beacon,
+                            ),
+                            publication_deadline,
+                        )
+                        .await
+                        .flatten()
+                    } else {
+                        None
+                    };
+                    let Some(serialized) = serialized else {
+                        return;
+                    };
+                    let published = publish_with_gss_deadline(
+                        pubsub.as_ref(),
+                        sync_topic.clone(),
+                        bytes::Bytes::from(serialized),
+                        publication_deadline,
+                    )
+                    .await
+                    .is_ok();
+                    if published {
+                        counters.digest_beacons_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            }))
+        } else {
+            None
+        };
         let listener_served = Arc::clone(&served_evidence);
         let listener_counters = Arc::clone(&self.state_sync_counters);
         let listener_bootstrap_active = Arc::clone(&bootstrap_active);
@@ -3110,6 +3608,9 @@ impl KvStoreSync {
                         }
                     }
                     Err(e) => {
+                        // #1604: an unknown variant (for example a newer
+                        // `AccessPolicy`) is counted as well as logged.
+                        let e = crate::wire_compat::classify_bincode("KvStoreDelta", &e);
                         tracing::warn!("Failed to deserialize KvStore delta: {e}");
                     }
                 }
@@ -3168,6 +3669,11 @@ impl KvStoreSync {
             // are requesting — the response is a broadcast, so it serves
             // them all.
             let mut last_full_response: Option<tokio::time::Instant> = None;
+            // Beacon-wake damping (#1117): a lasting difference that this
+            // replica's repair cannot close (pruning off, or a checkpointed
+            // store where the prune-adopt never runs) must not re-arm the
+            // request tail forever.
+            let mut beacon_wakes = BeaconWakeGate::default();
             loop {
                 let msg = tokio::select! {
                     // Cancel-first (#757), as in the listener above.
@@ -3237,7 +3743,10 @@ impl KvStoreSync {
                         }
                     }
                 } else {
-                    match bincode::deserialize::<KvSyncMessage>(&msg.payload) {
+                    match crate::wire_compat::decode_bincode::<KvSyncMessage>(
+                        "KvSyncMessage",
+                        &msg.payload,
+                    ) {
                         Ok(m) => (m, msg.sender, None),
                         Err(_) => {
                             responder_counters
@@ -3772,6 +4281,60 @@ impl KvStoreSync {
                             },
                         );
                     }
+                    KvSyncMessage::StateDigestBeacon {
+                        digest,
+                        entry_count: _,
+                    } => {
+                        // Beacons are sealed-plane only (#1117). One that
+                        // decoded on a plaintext store was never published
+                        // by a conforming sender; the public-signed open
+                        // path rejects them before this match.
+                        if responder_treekem.is_none() && !responder_is_encrypted {
+                            responder_counters
+                                .rejected_unauthorized_control
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        // The sealed author IS the declarer — the variant
+                        // carries no transport claim, so nothing here can
+                        // be attributed to another peer.
+                        let Some(author) = verified_sender else {
+                            continue;
+                        };
+                        if local_agent_id.is_some_and(|me| me == author) {
+                            continue; // our own beacon echoed back
+                        }
+                        // Wake-only by design (the 20 Oct ruling's
+                        // detection role): a beacon NEVER feeds convergence
+                        // evidence. A stale reader's digest matches another
+                        // stale replica's local state, so it could retire a
+                        // repair before a verified writer's fresh serve
+                        // arrives; convergence stays owned by writer-tier
+                        // serve markers. A beacon's sole effect is the
+                        // divergence wake below.
+                        //
+                        // Trust note: a forged mismatch at worst starts one
+                        // bounded re-request tail; the repair serve is
+                        // itself verified, so a beacon can neither inject
+                        // nor truncate state.
+                        let local_digest = responder_store.read().await.served_digest();
+                        if local_digest != digest
+                            && record_divergent_beacon(
+                                &mut beacon_wakes,
+                                responder_counters.as_ref(),
+                                responder_digest_divergence.as_ref(),
+                                author,
+                                digest,
+                                local_digest,
+                            )
+                        {
+                            tracing::debug!(
+                                store_id = %responder_store_id,
+                                "peer digest beacon disagrees with local state; \
+                                 re-entering the bounded repair tail"
+                            );
+                        }
+                    }
                     KvSyncMessage::OwnerAnnounce {
                         owner,
                         policy,
@@ -3905,6 +4468,11 @@ impl KvStoreSync {
             let requester_store_id = { *self.store.read().await.id() };
             let requester_is_encrypted = store_is_encrypted;
             let requester_public_changes = public_changes;
+            // #1117: sealed stores keep a parked beacon publisher after
+            // convergence. Both handles move into the requester task; the
+            // responder keeps the divergence sender.
+            let requester_digest_beacon = digest_beacon_hook;
+            let requester_digest_divergence = digest_divergence_rx;
             #[cfg(test)]
             let requester_loop_exits = Arc::clone(&self.loop_exits);
             // #765 r4: the loop-exit tracker wraps the WHOLE loop future,
@@ -3917,6 +4485,10 @@ impl KvStoreSync {
                 // full-replace adopt must never fire outside bootstrap.
                 let _guard = BootstrapGuard(Arc::clone(&requester_bootstrap_active));
                 let mut schedule = RequestSlotScheduler::new(requester_public_changes);
+                if let Some(hook) = requester_digest_beacon.as_ref() {
+                    schedule =
+                        schedule.with_digest_beacon(Arc::clone(hook), requester_digest_divergence);
+                }
                 if requester_is_encrypted {
                     if let (Some(ctx), Some(signing)) =
                         (requester_secure.as_ref(), requester_signing.as_ref())
@@ -6979,6 +7551,606 @@ mod tests {
             !matching_empty_v2.next_slot(empty_context()).await,
             "matching empty v2 digest stops before request five"
         );
+    }
+
+    /// #1117 beacon half, scheduler behaviour without sockets: a sealed
+    /// beacon scheduler PARKS after convergence (it must not exit — the
+    /// parked loop is the beacon carrier), declares its digest on the
+    /// existing liveness tick, ignores divergence heard before parking, and
+    /// a later divergent beacon grants a fresh request slot with the adopt
+    /// window re-armed and the served evidence cleared.
+    #[tokio::test(start_paused = true)]
+    async fn sealed_parked_scheduler_beacons_on_liveness_and_wakes_on_digest_divergence() {
+        let owner = agent(1);
+        let mut store = KvStore::new(
+            store_id(73),
+            "sealed".to_string(),
+            owner,
+            AccessPolicy::Signed,
+        )
+        .expect("store");
+        store
+            .put(
+                "held".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed");
+        let store = Arc::new(RwLock::new(store));
+        let weak_store = Arc::downgrade(&store);
+        let digest = store.read().await.served_digest();
+        let evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .digests
+            .insert(
+                peer(1),
+                ServedState {
+                    digest,
+                    entry_count: 1,
+                },
+            );
+        let active = std::sync::atomic::AtomicBool::new(true);
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let bootstrap_cancel = tokio_util::sync::CancellationToken::new();
+        let (divergence_tx, divergence_rx) = tokio::sync::watch::channel(0u64);
+        let beacon_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&beacon_calls);
+        let hook: DigestBeaconHook = Arc::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Box::pin(std::future::ready(()))
+        });
+        let context = || RequestSlotContext {
+            cancel: &cancel,
+            bootstrap_cancel: &bootstrap_cancel,
+            stopped: &stopped,
+            refresh: None,
+            evidence: &evidence,
+            store: &weak_store,
+            bootstrap_active: &active,
+        };
+        let mut schedule = RequestSlotScheduler::new(None).with_digest_beacon(hook, divergence_rx);
+        for slot in 0..STATE_REQUEST_DISCOVERY_MIN_SLOTS {
+            assert!(
+                schedule.next_slot(context()).await,
+                "discovery slot {slot} must still publish"
+            );
+            schedule.request_published();
+        }
+        // Divergence heard while the tail was still active is that tail's
+        // business; it must not fire the moment this replica parks.
+        assert!(divergence_tx.send_if_modified(|epoch| {
+            *epoch += 1;
+            true
+        }));
+        // Scope the pinned parked future: its hidden stack slot must drop
+        // before the scheduler can be borrowed for the repair-tail checks.
+        let woke =
+            {
+                let parked = schedule.next_slot(context());
+                tokio::pin!(parked);
+                assert!(
+                    matches!(
+                        std::future::poll_fn(|cx| std::task::Poll::Ready(
+                            std::future::Future::poll(parked.as_mut(), cx)
+                        ))
+                        .await,
+                        std::task::Poll::Pending
+                    ),
+                    "a beacon scheduler parks at convergence instead of exiting"
+                );
+                let beacon_wait = std::future::poll_fn(|cx| {
+                    if beacon_calls.load(Ordering::Relaxed) >= 1 {
+                        return std::task::Poll::Ready(());
+                    }
+                    match std::future::Future::poll(parked.as_mut(), cx) {
+                        std::task::Poll::Ready(true) => {
+                            panic!("parked scheduler left its park before any divergence")
+                        }
+                        std::task::Poll::Ready(false) => panic!("parked scheduler ended"),
+                        std::task::Poll::Pending => {
+                            if beacon_calls.load(Ordering::Relaxed) >= 1 {
+                                std::task::Poll::Ready(())
+                            } else {
+                                std::task::Poll::Pending
+                            }
+                        }
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(60), beacon_wait)
+                    .await
+                    .expect("the parked liveness tick must carry a digest beacon");
+                assert!(
+                    !active.load(std::sync::atomic::Ordering::Relaxed),
+                    "parking disarms the adopt window"
+                );
+                assert!(
+                    matches!(
+                        std::future::poll_fn(|cx| std::task::Poll::Ready(
+                            std::future::Future::poll(parked.as_mut(), cx)
+                        ))
+                        .await,
+                        std::task::Poll::Pending
+                    ),
+                    "pre-park divergence must stay swallowed"
+                );
+                assert!(divergence_tx.send_if_modified(|epoch| {
+                    *epoch += 1;
+                    true
+                }));
+                tokio::time::timeout(Duration::from_secs(5), &mut parked)
+                    .await
+                    .expect("divergence must wake the parked scheduler")
+            };
+        assert!(
+            active.load(std::sync::atomic::Ordering::Relaxed),
+            "the wake re-arms the adopt window for the repair serve"
+        );
+        assert!(
+            evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .digests
+                .is_empty(),
+            "the wake clears served evidence — the digests that retired the \
+             previous tail describe the old local state"
+        );
+        assert!(woke, "a divergent beacon grants a fresh request slot");
+        // The woken scheduler is now in its repair tail. It must KEEP
+        // declaring its digest on the tick: an ahead replica that went
+        // silent while repairing would leave a stale peer with no wake-up
+        // (#1117 lost-update deadlock). The granted slot's wait runs while
+        // ticks pass, so more beacons must leave during it.
+        let before = beacon_calls.load(Ordering::Relaxed);
+        // Drive the tail to its long (15 s) wait: two granted slots, then
+        // the third wait spans several liveness ticks, so a beacon must
+        // leave before that wait can expire.
+        for slot in 0..2 {
+            assert!(
+                schedule.next_slot(context()).await,
+                "repair-tail slot {slot} must publish"
+            );
+            schedule.request_published();
+        }
+        let tail_wait = schedule.next_slot(context());
+        tokio::pin!(tail_wait);
+        let more_beacons = std::future::poll_fn(|cx| {
+            if beacon_calls.load(Ordering::Relaxed) > before {
+                return std::task::Poll::Ready(());
+            }
+            match std::future::Future::poll(tail_wait.as_mut(), cx) {
+                std::task::Poll::Ready(true) => {
+                    panic!("slot granted without fresh served evidence")
+                }
+                std::task::Poll::Ready(false) => panic!("repair-tail scheduler ended"),
+                std::task::Poll::Pending => {
+                    if beacon_calls.load(Ordering::Relaxed) > before {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(60), more_beacons)
+            .await
+            .expect("a repairing post-convergence scheduler keeps beaconing");
+    }
+
+    /// #1117: a difference the repair cannot close (pruning off under
+    /// `Allowlisted`, or a checkpointed store where the prune-adopt never
+    /// runs) recurs forever with BOTH digests fixed — it must cost at most
+    /// one bounded tail per repeat window, never a 30-second re-request
+    /// cycle. A genuinely new (declared, local) pair wakes sooner,
+    /// rate-capped per verified author, and a cap-deferred pair is not
+    /// consumed. The repeat window also un-suppresses a pair whose earlier
+    /// repair could not run (the holder was offline): suppression is
+    /// never permanent.
+    #[tokio::test(start_paused = true)]
+    async fn beacon_wake_gate_bounds_wakes_for_a_lasting_difference() {
+        let mut gate = BeaconWakeGate::default();
+        let member = agent(3);
+        let declared = [7u8; 32];
+        let local = [9u8; 32];
+        assert!(
+            gate.should_wake(member, declared, local),
+            "a new divergence wakes"
+        );
+        for _ in 0..10 {
+            assert!(
+                !gate.should_wake(member, declared, local),
+                "the identical recurring pair must stay suppressed"
+            );
+        }
+        // A new declared digest is new information, but the per-author cap
+        // defers it while the first wake's repair interval still runs —
+        // without consuming it.
+        let next_declared = [8u8; 32];
+        assert!(
+            !gate.should_wake(member, next_declared, local),
+            "the per-author cap defers a fresh pair inside the repair interval"
+        );
+        tokio::time::sleep(KEY_GAP_REPAIR_RETRY_AFTER).await;
+        assert!(
+            gate.should_wake(member, next_declared, local),
+            "a deferred fresh pair earns its wake once the cap lapses"
+        );
+        // Still inside the repeat window, the first pair stays suppressed.
+        assert!(
+            !gate.should_wake(member, declared, local),
+            "a recorded pair stays suppressed inside the repeat window"
+        );
+        // A changed local digest makes the ORIGINAL declared digest a new
+        // pair again: this replica merged state since that pair was seen.
+        tokio::time::sleep(KEY_GAP_REPAIR_RETRY_AFTER).await;
+        let moved_local = [1u8; 32];
+        assert!(
+            gate.should_wake(member, declared, moved_local),
+            "a moved local digest re-opens the original pair"
+        );
+        // The window lapses: a repair that never ran (the holder was
+        // offline) earns its retry — #238 patience at capped cadence.
+        tokio::time::sleep(BEACON_WAKE_REPEAT_AFTER).await;
+        assert!(
+            gate.should_wake(member, declared, local),
+            "the repeat window must re-open a recorded pair for retry"
+        );
+        // Authors are damped independently.
+        assert!(
+            gate.should_wake(agent(4), declared, local),
+            "another author's divergence is not damped by this author's history"
+        );
+    }
+
+    /// Above the jittered 15 s discovery wait (at most 18 s) and below the
+    /// jittered 30 s tail start (at least 24 s). A slot still pending at
+    /// this ceiling has parked; a discovery-prefix slot has returned.
+    const DISCOVERY_SLOT_CEILING: Duration = Duration::from_secs(22);
+
+    /// One parked sealed replica and its real [`RequestSlotScheduler`].
+    /// Socket-free: the beacon hook does not publish, and the wake path is
+    /// [`record_divergent_beacon`] — the same function the responder uses
+    /// to move the diagnostic counters and the divergence watch.
+    struct ChurnReplica {
+        schedule: RequestSlotScheduler,
+        evidence: Arc<std::sync::Mutex<ServedEvidence>>,
+        store: Arc<RwLock<KvStore>>,
+        weak_store: std::sync::Weak<RwLock<KvStore>>,
+        active: std::sync::atomic::AtomicBool,
+        stopped: std::sync::atomic::AtomicBool,
+        cancel: tokio_util::sync::CancellationToken,
+        bootstrap_cancel: tokio_util::sync::CancellationToken,
+        digest: [u8; 32],
+        divergence: tokio::sync::watch::Sender<u64>,
+    }
+
+    impl ChurnReplica {
+        fn new() -> Self {
+            let owner = agent(1);
+            let mut store = KvStore::new(
+                store_id(76),
+                "churn".to_string(),
+                owner,
+                AccessPolicy::Signed,
+            )
+            .expect("store");
+            store
+                .put(
+                    "held".to_string(),
+                    b"v".to_vec(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("seed");
+            let digest = store.served_digest();
+            let store = Arc::new(RwLock::new(store));
+            let weak_store = Arc::downgrade(&store);
+            let (divergence, divergence_rx) = tokio::sync::watch::channel(0u64);
+            let hook: DigestBeaconHook = Arc::new(|| Box::pin(std::future::ready(())));
+            let schedule = RequestSlotScheduler::new(None).with_digest_beacon(hook, divergence_rx);
+            Self {
+                schedule,
+                evidence: Arc::new(std::sync::Mutex::new(ServedEvidence::default())),
+                store,
+                weak_store,
+                active: std::sync::atomic::AtomicBool::new(true),
+                stopped: std::sync::atomic::AtomicBool::new(false),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                bootstrap_cancel: tokio_util::sync::CancellationToken::new(),
+                digest,
+                divergence,
+            }
+        }
+
+        fn restore_evidence(&self) {
+            self.evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .digests
+                .insert(
+                    peer(1),
+                    ServedState {
+                        digest: self.digest,
+                        entry_count: 1,
+                    },
+                );
+        }
+
+        async fn take_grant(&mut self) -> Option<bool> {
+            let ChurnReplica {
+                schedule,
+                evidence,
+                weak_store,
+                active,
+                stopped,
+                cancel,
+                bootstrap_cancel,
+                ..
+            } = self;
+            let context = RequestSlotContext {
+                cancel,
+                bootstrap_cancel,
+                stopped,
+                refresh: None,
+                evidence,
+                store: weak_store,
+                bootstrap_active: active,
+            };
+            let slot = schedule.next_slot(context);
+            tokio::pin!(slot);
+            tokio::time::timeout(DISCOVERY_SLOT_CEILING, &mut slot)
+                .await
+                .ok()
+        }
+
+        /// Grant slots until the scheduler parks. Each `Some(true)` is one
+        /// `StateRequest` publication.
+        async fn publications_until_park(&mut self) -> u64 {
+            let mut publications = 0u64;
+            loop {
+                match self.take_grant().await {
+                    Some(true) => {
+                        publications += 1;
+                        self.schedule.request_published();
+                        self.restore_evidence();
+                        assert!(
+                            publications <= STATE_REQUEST_DISCOVERY_MIN_SLOTS as u64,
+                            "{publications} StateRequests before parking; one wake re-arms \
+                             only the {STATE_REQUEST_DISCOVERY_MIN_SLOTS}-slot discovery prefix"
+                        );
+                    }
+                    Some(false) => panic!("repair scheduler ended"),
+                    None => return publications,
+                }
+            }
+        }
+    }
+
+    /// #1601: twelve sealed members each churn a fresh digest, so pair
+    /// suppression never applies. The per-group budget grants 4 wakes per
+    /// rate-cap window — that 4 is hard-coded below, so raising
+    /// `BEACON_WAKE_GROUP_BUDGET` fails this test — and the deferred
+    /// remainder is read from [`StateSyncSnapshot`], not from a test-local
+    /// tally. One burst wakes the real parked scheduler once; it publishes
+    /// the discovery prefix of the state-request tail
+    /// ([`STATE_REQUEST_DISCOVERY_MIN_SLOTS`] slots) and parks again.
+    /// Twelve authors do not publish twelve tails.
+    #[tokio::test(start_paused = true)]
+    async fn beacon_wake_group_budget_bounds_scheduler_under_multi_author_churn() {
+        // The issue's per-store cap. Not `BEACON_WAKE_GROUP_BUDGET`: a
+        // looser constant must fail these asserts rather than move them.
+        const GROUP_WAKE_BUDGET: u64 = 4;
+        const CHURNING_AUTHORS: u8 = 12;
+        const ROUNDS: u8 = 3;
+
+        let mut replica = ChurnReplica::new();
+        replica.restore_evidence();
+        let discovery = replica.publications_until_park().await;
+        assert_eq!(
+            discovery, STATE_REQUEST_DISCOVERY_MIN_SLOTS as u64,
+            "the parked replica converges on the discovery prefix before churn"
+        );
+
+        let counters = StateSyncCounters::default();
+        let mut gate = BeaconWakeGate::default();
+        let mut state_requests = 0u64;
+        let mut deferred_pair = None;
+        for round in 1..=ROUNDS {
+            let before = counters.snapshot();
+            for member in 2..=(CHURNING_AUTHORS + 1) {
+                let mut declared = [0u8; 32];
+                declared[0] = round;
+                declared[1] = member;
+                declared[2] = 0xA5;
+                assert_ne!(declared, replica.digest, "a churn digest must diverge");
+                let granted = record_divergent_beacon(
+                    &mut gate,
+                    &counters,
+                    Some(&replica.divergence),
+                    agent(member),
+                    declared,
+                    replica.digest,
+                );
+                if !granted {
+                    deferred_pair = Some((member, declared));
+                }
+            }
+            let after = counters.snapshot();
+            let wakes = after.digest_beacon_divergences - before.digest_beacon_divergences;
+            let deferred = after.digest_beacon_wakes_deferred - before.digest_beacon_wakes_deferred;
+            assert_eq!(
+                wakes, GROUP_WAKE_BUDGET,
+                "round {round}: {wakes} granted wakes for {CHURNING_AUTHORS} churning authors"
+            );
+            assert_eq!(
+                deferred,
+                u64::from(CHURNING_AUTHORS) - GROUP_WAKE_BUDGET,
+                "round {round}: the production deferred counter must record every damped beacon"
+            );
+            assert_eq!(wakes + deferred, u64::from(CHURNING_AUTHORS));
+
+            let published = replica.publications_until_park().await;
+            assert_eq!(
+                published, STATE_REQUEST_DISCOVERY_MIN_SLOTS as u64,
+                "round {round}: {CHURNING_AUTHORS} authors published {published} StateRequests; \
+                 one burst re-arms one discovery prefix of the tail, not one tail per author"
+            );
+            state_requests += published;
+        }
+
+        let snap = counters.snapshot();
+        assert_eq!(
+            snap.digest_beacon_divergences,
+            u64::from(ROUNDS) * GROUP_WAKE_BUDGET
+        );
+        assert_eq!(
+            snap.digest_beacon_wakes_deferred,
+            u64::from(ROUNDS) * (u64::from(CHURNING_AUTHORS) - GROUP_WAKE_BUDGET)
+        );
+        assert!(
+            state_requests < u64::from(ROUNDS) * u64::from(CHURNING_AUTHORS),
+            "StateRequest publications stayed inside the tail-schedule bound: {state_requests}"
+        );
+
+        // A budget-deferred beacon is not consumed (#238). The repair tail
+        // above already ran longer than the rate-cap window, so the same
+        // pair earns one wake and one tail.
+        let (member, declared) = deferred_pair.expect("a full budget defers someone");
+        let before = counters.snapshot();
+        assert!(
+            record_divergent_beacon(
+                &mut gate,
+                &counters,
+                Some(&replica.divergence),
+                agent(member),
+                declared,
+                replica.digest,
+            ),
+            "a budget-deferred pair earns its wake once the window slides"
+        );
+        let after = counters.snapshot();
+        assert_eq!(
+            after.digest_beacon_wakes_deferred, before.digest_beacon_wakes_deferred,
+            "re-earning a deferred wake must not count as another deferral"
+        );
+        assert_eq!(
+            after.digest_beacon_divergences,
+            before.digest_beacon_divergences + 1
+        );
+        assert_eq!(
+            replica.publications_until_park().await,
+            STATE_REQUEST_DISCOVERY_MIN_SLOTS as u64,
+            "the re-earned wake re-arms one discovery prefix"
+        );
+        assert_eq!(
+            replica.store.read().await.served_digest(),
+            replica.digest,
+            "churn wakes the requester and does not rewrite local state"
+        );
+    }
+
+    /// #1117: a NON-EMPTY lone holder that cannot converge (its peers
+    /// cannot publish serve markers, so no evidence ever arrives) must
+    /// still declare its digest — armed from the persistent tail. A
+    /// holder left with ONLY tombstones (its last live key deleted, or a
+    /// restart with just retained history) counts as content: the
+    /// deletion must still reach a parked peer that missed it. A truly
+    /// empty tailer stays silent; the empty-holder markers already speak
+    /// for it.
+    #[tokio::test(start_paused = true)]
+    async fn lone_holder_scheduler_declares_from_the_persistent_tail() {
+        let owner = agent(1);
+        let mut group = crate::groups::GroupInfo::new(
+            "public".to_string(),
+            String::new(),
+            owner,
+            "13".repeat(16),
+        );
+        group.migrate_from_v1();
+        group.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
+        group.policy.read_access = crate::groups::GroupReadAccess::Public;
+        let context = Arc::new(
+            crate::groups::PublicGroupKvContext::from_group(&group).expect("public context"),
+        );
+        let mut store = KvStore::new_group_signed(
+            store_id(74),
+            "lone".to_string(),
+            owner,
+            group.stable_group_id().as_bytes().to_vec(),
+            context,
+        )
+        .expect("store");
+        store
+            .put(
+                "held".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed");
+        // Delete it again: the store ends live-empty with retained
+        // tombstone history, exactly the deletion a parked peer could
+        // have missed.
+        store.remove("held").expect("tombstone");
+        assert!(store.is_empty());
+        assert!(store.has_retained_group_history());
+        let store = Arc::new(RwLock::new(store));
+        let weak_store = Arc::downgrade(&store);
+        // No declarations at all: nobody can answer this holder.
+        let evidence = Arc::new(std::sync::Mutex::new(ServedEvidence::default()));
+        let active = std::sync::atomic::AtomicBool::new(true);
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let bootstrap_cancel = tokio_util::sync::CancellationToken::new();
+        let (_divergence_tx, divergence_rx) = tokio::sync::watch::channel(0u64);
+        let beacon_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&beacon_calls);
+        let hook: DigestBeaconHook = Arc::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Box::pin(std::future::ready(()))
+        });
+        let context = || RequestSlotContext {
+            cancel: &cancel,
+            bootstrap_cancel: &bootstrap_cancel,
+            stopped: &stopped,
+            refresh: None,
+            evidence: &evidence,
+            store: &weak_store,
+            bootstrap_active: &active,
+        };
+        let mut schedule = RequestSlotScheduler::new(None).with_digest_beacon(hook, divergence_rx);
+        // Drive past the front-loaded schedule into the persistent tail.
+        for slot in 0..=STATE_REQUEST_RETRY_SECS.len() {
+            assert!(
+                schedule.next_slot(context()).await,
+                "slot {slot}: an unanswered holder keeps asking"
+            );
+            schedule.request_published();
+        }
+        let tail_wait = schedule.next_slot(context());
+        tokio::pin!(tail_wait);
+        let declared = std::future::poll_fn(|cx| {
+            if beacon_calls.load(Ordering::Relaxed) >= 1 {
+                return std::task::Poll::Ready(());
+            }
+            match std::future::Future::poll(tail_wait.as_mut(), cx) {
+                std::task::Poll::Ready(true) => panic!("slot granted without evidence"),
+                std::task::Poll::Ready(false) => panic!("tail scheduler ended"),
+                std::task::Poll::Pending => {
+                    if beacon_calls.load(Ordering::Relaxed) >= 1 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(60), declared)
+            .await
+            .expect("a lone holder must declare its digest from the tail");
     }
 
     #[tokio::test(start_paused = true)]
@@ -10071,6 +11243,251 @@ mod tests {
             .get("secret-key")
             .map(|e| e.value.clone());
         assert_eq!(value, Some(b"hush".to_vec()));
+    }
+
+    /// #1117 beacon half (ruled 20 Oct 2026, option A): a converged sealed
+    /// replica still repairs a live delta whose publication was lost. Both
+    /// replicas hold pre-seeded state, bootstrap each other, and reach
+    /// digest convergence; then A writes "dropped" locally without
+    /// publishing it (a lost live update). The post-convergence digest
+    /// beacon must surface the divergence and repair B within a bound,
+    /// without a restart.
+    #[tokio::test(start_paused = true)]
+    async fn digest_beacon_repairs_a_dropped_live_delta_after_convergence() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
+        let kp_a = AgentKeypair::generate().expect("kp");
+        let kp_b = AgentKeypair::generate().expect("kp");
+        let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a, b]);
+        let ctx_b = ctxs.pop().expect("ctx b");
+        let ctx_a = ctxs.pop().expect("ctx a");
+        let topic = "store/1117-beacon";
+        let sync_a = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            7,
+            a,
+            a,
+            &kp_a,
+            ctx_a,
+            group_id.clone(),
+            peer(1),
+        )
+        .await;
+        let sync_b = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            7,
+            a,
+            b,
+            &kp_b,
+            ctx_b,
+            group_id,
+            peer(2),
+        )
+        .await;
+        // Each replica seeds its own key first, so both sides serve
+        // non-empty state and both can reach digest convergence.
+        sync_a
+            .write()
+            .await
+            .put(
+                "a-base".to_string(),
+                b"a".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed a");
+        sync_b
+            .write()
+            .await
+            .put(
+                "b-base".to_string(),
+                b"b".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("seed b");
+        sync_a.start().await.expect("start a");
+        sync_b.start().await.expect("start b");
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let (digest_a, digest_b) = (
+                    sync_a.read().await.served_digest(),
+                    sync_b.read().await.served_digest(),
+                );
+                if digest_a == digest_b {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("both sealed replicas must converge to one digest");
+        // Let both requesters pass their organic convergence checks, so the
+        // dropped delta lands strictly after convergence, never during a
+        // bootstrap tail.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let b_requests_before = sync_b.state_sync_snapshot().requests_sent;
+        let a_received_before = sync_a.state_sync_snapshot().requests_received;
+        // The lost live update: A merges "dropped" locally and its delta
+        // publication never reaches the topic.
+        sync_a
+            .write()
+            .await
+            .put(
+                "dropped".to_string(),
+                b"lost".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("dropped put");
+        tokio::time::timeout(Duration::from_secs(300), async {
+            loop {
+                if sync_b.read().await.get("dropped").is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the digest beacon must repair the dropped live delta");
+        assert!(
+            sync_b.state_sync_snapshot().digest_beacons_sent >= 1,
+            "both replicas parked and declared their digests"
+        );
+        assert!(
+            sync_b.state_sync_snapshot().digest_beacon_divergences >= 1,
+            "B observed A's divergent beacon"
+        );
+        assert!(
+            sync_b.state_sync_snapshot().requests_sent > b_requests_before,
+            "the repair must re-request state, not merge a stray delivery"
+        );
+        assert!(
+            sync_a.state_sync_snapshot().requests_received > a_received_before,
+            "A must have answered the repair request"
+        );
+        assert!(
+            sync_b.read().await.get("a-base").is_some(),
+            "the repair keeps the merged history"
+        );
+    }
+
+    /// #1117 in an `AdminOnly` group with ONE writer: the writer's only
+    /// peer is a reader, which can never publish writer-tier
+    /// `StateServedV2` evidence — so the writer never converges and never
+    /// parks (its infinite capped tail is pre-existing behaviour for this
+    /// topology). It still must DECLARE its digest, arming from the
+    /// persistent tail as a non-empty lone holder, or a dropped live
+    /// delta to the parked reader would be unrepaired forever — and a
+    /// restarted writer holding a missed update would deadlock recovery
+    /// the same way.
+    #[tokio::test(start_paused = true)]
+    async fn sole_admin_writer_declares_from_the_tail_and_repairs_its_reader() {
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, test_signing()).expect("pubsub"));
+        let kp_a = AgentKeypair::generate().expect("kp");
+        let kp_b = AgentKeypair::generate().expect("kp");
+        let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
+        let (mut info, mut ctxs, group_id) = encrypted_group(&[a, b]);
+        info.policy.write_access = crate::groups::GroupWriteAccess::AdminOnly;
+        for context in &ctxs {
+            context.update_from_group(&info);
+        }
+        let ctx_b = ctxs.pop().expect("ctx b");
+        let ctx_a = ctxs.pop().expect("ctx a");
+        let topic = "store/1117-beacon-adminonly";
+        let sync_a = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            8,
+            a,
+            a,
+            &kp_a,
+            ctx_a,
+            group_id.clone(),
+            peer(1),
+        )
+        .await;
+        let sync_b = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            8,
+            a,
+            b,
+            &kp_b,
+            ctx_b,
+            group_id,
+            peer(2),
+        )
+        .await;
+        // Only the writer (and owner) holds state; the reader starts empty.
+        sync_a
+            .write()
+            .await
+            .put(
+                "a-base".to_string(),
+                b"a".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("seed a");
+        sync_a.start().await.expect("start a");
+        sync_b.start().await.expect("start b");
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let (digest_a, digest_b) = (
+                    sync_a.read().await.served_digest(),
+                    sync_b.read().await.served_digest(),
+                );
+                if digest_a == digest_b {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the reader must converge to the writer's digest");
+        // The writer can never converge here; it must still arm its
+        // digest declaration from the persistent tail.
+        tokio::time::timeout(Duration::from_secs(600), async {
+            loop {
+                if sync_a.state_sync_snapshot().digest_beacons_sent >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the lone writer must declare its digest from the tail");
+        let b_requests_before = sync_b.state_sync_snapshot().requests_sent;
+        // A lost live update from the sole writer to its reader.
+        sync_a
+            .write()
+            .await
+            .put(
+                "dropped".to_string(),
+                b"lost".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("dropped put");
+        tokio::time::timeout(Duration::from_secs(300), async {
+            loop {
+                if sync_b.read().await.get("dropped").is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the beacon must repair the reader after the writer beacons");
+        assert!(
+            sync_b.state_sync_snapshot().requests_sent > b_requests_before,
+            "the reader re-requested state rather than merging a stray delivery"
+        );
     }
 
     /// #976 r4 (T1c): the ONLY publish path (put_with_delta →

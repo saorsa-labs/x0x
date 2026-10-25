@@ -526,7 +526,7 @@ fn owner_principal_entry_parses_with_explicit_targets() {
     assert!(acl.allow.is_empty(), "owner entry is not an exact pair");
     assert_eq!(acl.owner_allow.len(), 1);
     let t22: SocketAddr = "127.0.0.1:22".parse().unwrap();
-    assert_eq!(acl.owner_allow[0].targets, vec![t22]);
+    assert_eq!(acl.owner_allow[0].targets, vec![OwnerTarget::Exact(t22)]);
     assert_eq!(policy.summary().allow_entry_count, 1);
 }
 
@@ -597,7 +597,7 @@ fn grant_principal_entry_parses_into_grant_allow() {
     );
     assert_eq!(acl.grant_allow.len(), 1);
     let t22: SocketAddr = "127.0.0.1:22".parse().unwrap();
-    assert_eq!(acl.grant_allow[0].targets, vec![t22]);
+    assert_eq!(acl.grant_allow[0].targets, vec![OwnerTarget::Exact(t22)]);
     assert_eq!(policy.summary().allow_entry_count, 1);
 }
 
@@ -614,4 +614,94 @@ fn owner_principal_targets_stay_loopback_only() {
                 targets = [\"10.0.0.1:22\"]\n";
     let err = parse_connect_policy(Path::new("/tmp/x"), 0, text).unwrap_err();
     assert!(matches!(err, ConnectAclError::Invalid { .. }), "{err}");
+}
+
+// ===========================================================================
+// ADR-0074 Q4 — owner port ranges (SOCKS5 / slice 4)
+// ===========================================================================
+
+#[test]
+fn owner_principal_accepts_loopback_port_range() {
+    let text = "[connect]\nenabled = true\n\
+         [[connect.allow]]\nprincipal = \"owner\"\n\
+         targets = [\"127.0.0.1:8000-8090\", \"[::1]:9000-9002\"]\n";
+    let policy = parse_connect_policy(Path::new("/tmp/x"), 0, text).unwrap();
+    let ConnectPolicy::Enabled(acl) = &policy else {
+        panic!("expected Enabled");
+    };
+    assert_eq!(acl.owner_allow.len(), 1);
+    assert_eq!(
+        acl.owner_allow[0].targets,
+        vec![
+            OwnerTarget::PortRange {
+                ip: "127.0.0.1".parse().unwrap(),
+                start: 8000,
+                end: 8090,
+            },
+            OwnerTarget::PortRange {
+                ip: "::1".parse().unwrap(),
+                start: 9000,
+                end: 9002,
+            },
+        ]
+    );
+    let agent = parse_agent_id(&"aa".repeat(32)).unwrap();
+    let machine = parse_machine_id(&"bb".repeat(32)).unwrap();
+    let allowed: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let edge_low: SocketAddr = "127.0.0.1:8000".parse().unwrap();
+    let edge_high: SocketAddr = "127.0.0.1:8090".parse().unwrap();
+    let denied: SocketAddr = "127.0.0.1:8091".parse().unwrap();
+    let v6_ok: SocketAddr = "[::1]:9001".parse().unwrap();
+    assert!(acl.is_allowed_for_principal(&agent, &machine, true, &allowed));
+    assert!(acl.is_allowed_for_principal(&agent, &machine, true, &edge_low));
+    assert!(acl.is_allowed_for_principal(&agent, &machine, true, &edge_high));
+    assert!(!acl.is_allowed_for_principal(&agent, &machine, true, &denied));
+    assert!(acl.is_allowed_for_principal(&agent, &machine, true, &v6_ok));
+}
+
+#[test]
+fn grant_and_pair_principals_refuse_port_ranges() {
+    for (label, text) in [
+        (
+            "grant",
+            "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"grant\"\n\
+             targets = [\"127.0.0.1:8000-8090\"]\n",
+        ),
+        (
+            "pair",
+            &format!(
+                "[connect]\nenabled = true\n[[connect.allow]]\n\
+                 agent_id = \"{a}\"\nmachine_id = \"{m}\"\n\
+                 targets = [\"127.0.0.1:8000-8090\"]\n",
+                a = "aa".repeat(32),
+                m = "bb".repeat(32),
+            ),
+        ),
+    ] {
+        let err = parse_connect_policy(Path::new("/tmp/x"), 0, text).unwrap_err();
+        assert!(
+            matches!(err, ConnectAclError::Invalid { .. }),
+            "{label}: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("port range") || msg.contains("numeric IP:port") || msg.contains("owner"),
+            "{label}: unexpected message: {msg}"
+        );
+    }
+}
+
+#[test]
+fn owner_port_range_rejects_non_loopback_and_inverted() {
+    for text in [
+        "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"owner\"\n\
+         targets = [\"192.168.1.5:8000-8090\"]\n",
+        "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"owner\"\n\
+         targets = [\"127.0.0.1:8090-8000\"]\n",
+        "[connect]\nenabled = true\n[[connect.allow]]\nprincipal = \"owner\"\n\
+         targets = [\"127.0.0.1:0-10\"]\n",
+    ] {
+        let err = parse_connect_policy(Path::new("/tmp/x"), 0, text).unwrap_err();
+        assert!(matches!(err, ConnectAclError::Invalid { .. }), "{err}");
+    }
 }

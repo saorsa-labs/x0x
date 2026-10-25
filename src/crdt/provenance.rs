@@ -63,6 +63,7 @@ pub const COMPLETE_DOMAIN: &[u8] = b"x0x.task.complete.v2";
 /// The kind of operation an attestation covers. Determines the domain separator
 /// in [`canonical_op_bytes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum OpKind {
     /// A task claim (`Empty`/`Claimed` → `Claimed`).
     Claim,

@@ -224,10 +224,11 @@ impl World {
     /// A connect ACL for `:22` with exact entries for `exact`, plus owner
     /// and grant entries.
     fn acl(&self, exact: &[(AgentId, MachineId)], owner: bool, grant: bool) -> ConnectPolicy {
-        let targets = vec![SSH.parse().unwrap()];
+        let exact_targets = vec![SSH.parse().unwrap()];
+        let owner_targets = vec![crate::connect::OwnerTarget::Exact(SSH.parse().unwrap())];
         let entry = || ConnectOwnerEntry {
             description: None,
-            targets: targets.clone(),
+            targets: owner_targets.clone(),
         };
         ConnectPolicy::Enabled(ConnectAcl {
             loaded_from: self.dir.path().join("connect-acl.toml"),
@@ -238,7 +239,7 @@ impl World {
                     description: None,
                     agent_id: *agent_id,
                     machine_id: *machine_id,
-                    targets: targets.clone(),
+                    targets: exact_targets.clone(),
                 })
                 .collect(),
             owner_allow: if owner { vec![entry()] } else { Vec::new() },
@@ -265,8 +266,21 @@ impl World {
         grant
     }
 
-    /// Apply an owner-signed revocation of `grant` through the v3 ingest
-    /// path, as gossip delivers it.
+    /// Apply an owner-signed revocation of `grant` with the same verified
+    /// insert (and change-notify kick) the v3 gossip ingest performs —
+    /// but without the ingest's durable `revocations-v3.bin` write.
+    ///
+    /// WHY no I/O: these tests run on a paused tokio clock, and the
+    /// ingest's real async file work (tokio::fs, fsync, a cross-process
+    /// lock) parks the test task on the blocking pool. If the runtime
+    /// goes idle around that park, tokio auto-advances the paused clock
+    /// through the reauth loop's armed timers — spacing, then the pass
+    /// deadline — so the loop fail-closes the stalled pass and tears the
+    /// stream down while the test is not looking (#1599). The pass
+    /// deadline must only ever be reached by the test's own `advance()`
+    /// calls, so the event path stays in memory; the paused-time guard
+    /// below fails loudly if anything else ever moves the clock across
+    /// the event.
     async fn revoke_grant(&self, grant: &ShareGrant) {
         let record = crate::revocation::RevocationRecord::sign(
             crate::revocation::RevokedSubject::ShareGrant(
@@ -282,15 +296,16 @@ impl World {
             None,
         )
         .unwrap();
-        let payload = bincode::serialize(&vec![record]).unwrap();
+        let before = Instant::now();
+        let inserted = {
+            let mut set = self.revocations.write().await;
+            set.verify_and_insert_at(record, None, real_now())
+                .expect("owner-signed share-grant revocation must verify")
+        };
+        assert!(inserted, "revocation record must be newly inserted");
         assert!(
-            crate::ingest_share_grant_revocations(
-                &OwnerTrust::default(),
-                &self.revocations,
-                Some(self.dir.path().to_path_buf()),
-                &payload,
-            )
-            .await
+            before.elapsed().is_zero(),
+            "the revocation event must not move paused tokio time (#1599)"
         );
     }
 
@@ -1509,6 +1524,9 @@ async fn kick_during_spacing_deadline_from_event() {
 
     let event_at = Instant::now();
     w.revoke_grant(&grant).await;
+    // Let the loop observe the kick now, so it timestamps the event (and
+    // so the pass deadline) from this instant — before the clock moves.
+    tokio::task::yield_now().await;
 
     // Finish the remaining spacing; the pending event's pass starts blocked.
     tokio::time::advance(REAUTH_MIN_SPACING - Duration::from_millis(100)).await;

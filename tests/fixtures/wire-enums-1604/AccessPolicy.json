@@ -1,0 +1,73 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "Signed",
+      "variant": "Signed",
+      "wire": {
+        "bincode": "00000000"
+      }
+    },
+    {
+      "input": "Allowlisted",
+      "variant": "Allowlisted",
+      "wire": {
+        "bincode": "01000000"
+      }
+    },
+    {
+      "input": {
+        "Encrypted": {
+          "group_id": [
+            1
+          ]
+        }
+      },
+      "variant": "Encrypted",
+      "wire": {
+        "bincode": "02000000010000000000000001"
+      }
+    },
+    {
+      "input": "AppendOnly",
+      "variant": "AppendOnly",
+      "wire": {
+        "bincode": "03000000"
+      }
+    },
+    {
+      "input": "SelfKeyed",
+      "variant": "SelfKeyed",
+      "wire": {
+        "bincode": "04000000"
+      }
+    },
+    {
+      "input": {
+        "GroupSigned": {
+          "group_id": [
+            2
+          ]
+        }
+      },
+      "variant": "GroupSigned",
+      "wire": {
+        "bincode": "05000000010000000000000002"
+      }
+    },
+    {
+      "input": {
+        "TreeKemEncrypted": {
+          "group_id": [
+            3
+          ]
+        }
+      },
+      "variant": "TreeKemEncrypted",
+      "wire": {
+        "bincode": "06000000010000000000000003"
+      }
+    }
+  ],
+  "type": "AccessPolicy"
+}

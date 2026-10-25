@@ -78,7 +78,7 @@ pub(crate) struct ProbeClock {
 }
 
 impl ProbeClock {
-    fn now() -> io::Result<Self> {
+    pub(crate) fn now() -> io::Result<Self> {
         Ok(Self {
             boot_id: boot_id()?,
             monotonic_ms: monotonic_ms()?,

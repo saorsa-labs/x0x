@@ -84,6 +84,8 @@ pub mod revocation;
 /// envelope, and the placement-ledger enforcement checks (B and P).
 pub mod key_move;
 
+pub mod names;
+
 /// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
 /// records over `SyncV1` streams between the owner's enrolled machines).
 pub mod owner_sync;
@@ -105,6 +107,9 @@ pub mod streams;
 
 /// Local port-forwarder over tailnet byte-streams (tailnet Phase 1, #132 T4).
 pub mod forward;
+
+/// SOCKS5 front-end over ForwardV2 (ADR-0074 §3 / #1389).
+pub mod socks;
 
 /// Contact store with trust levels for message filtering.
 pub mod contacts;
@@ -224,8 +229,14 @@ pub mod api;
 /// CLI infrastructure and command implementations.
 pub mod cli;
 
+/// Embedded GUI shell, view grammar, and ADR 0083 show runtime.
+pub mod gui;
+
 /// HTTP/WebSocket server: axum router, handlers, and the daemon serving entrypoint.
 pub mod server;
+
+/// Forward compatibility for wire-format enums (#1604).
+pub(crate) mod wire_compat;
 
 // Re-export key gossip types (including new pubsub components)
 pub use gossip::{
@@ -609,6 +620,17 @@ fn pinned_standin_is_strict(agent: &identity::AgentId) -> bool {
         .is_ok_and(|agents| agents.contains(agent))
 }
 
+/// The result of [`Agent::adopt_own_certificate_renewal`]. Local only;
+/// never on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CertificateRenewalAdoption {
+    /// The renewal is on disk as `agent.cert` and is the certificate in use.
+    Adopted,
+    /// The renewal was refused; nothing changed.
+    Refused(identity::CertificateRenewalRefusal),
+}
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -661,6 +683,13 @@ pub struct Agent {
     /// `None` when no user identity is configured. Written at cert-issue
     /// time; read by `GET /owner/agents` as the authoritative base roster.
     cert_journal_path: Option<std::path::PathBuf>,
+    /// Where this daemon's `agent.cert` lives; `None` without a user
+    /// identity. [`Agent::adopt_own_certificate_renewal`] writes an adopted
+    /// renewal here so a restart keeps it.
+    agent_cert_path: Option<std::path::PathBuf>,
+    /// Serializes [`Agent::adopt_own_certificate_renewal`]: the check, the
+    /// `agent.cert` write and the in-memory switch run as one step.
+    cert_adoption_lock: tokio::sync::Mutex<()>,
     /// Bootstrap peer cache for quality-based peer selection across restarts.
     bootstrap_cache: Option<std::sync::Arc<ant_quic::BootstrapCache>>,
     /// Gossip cache adapter wrapping bootstrap_cache with coordinator advert storage.
@@ -795,6 +824,10 @@ pub struct Agent {
     /// and never await while holding it — write lock is taken only when
     /// applying a new revocation (rare) and when persisting to disk.
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    /// ADR 0110 §1: the S4 intake queue. Every route that inserts a
+    /// verified revocation feeds it after `verify_and_insert` returns
+    /// `Ok(true)`, and the startup load feeds it every loaded record.
+    s4_revocation_intake: groups::eviction::RevocationIntake,
     /// Identity-scoped directory.  When `Some`, revocations.bin is saved here
     /// instead of `~/.x0x/`.
     identity_dir: Option<std::path::PathBuf>,
@@ -909,6 +942,12 @@ pub struct Agent {
     /// (revocation, contacts, ACL reload, placement, device set, discovery
     /// cert). Shared with the stores that raise those events.
     stream_reauth: std::sync::Arc<tokio::sync::Notify>,
+    /// Set when a machine-bound send enters `send_direct_all_stages`.
+    ///
+    /// Tests hold the discovery cache and wait for this flag. The binding
+    /// change then happens while that read is still awaiting.
+    #[cfg(test)]
+    show_stage_entered: std::sync::atomic::AtomicBool,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -1694,6 +1733,21 @@ fn classify_with_cache(
     } else {
         SelectionChoice::NonBootstrap
     }
+}
+
+/// The operator bootstrap ADDRESS set (#1112 round 4): every seed
+/// listener row exactly. The operator hint tier matches the FULL observed
+/// socket address against this set, never the IP alone — a NATed peer
+/// with a relay slot on a seed advertises the seed's IP on an allocated
+/// port, and an IP-only match would wrongly enlist it as an operator
+/// hint.
+#[must_use]
+pub(crate) fn bootstrap_seed_addrs() -> std::collections::HashSet<std::net::SocketAddr> {
+    network::DEFAULT_BOOTSTRAP_PEERS
+        .iter()
+        .filter_map(|row| row.parse::<std::net::SocketAddr>().ok())
+        .map(network::normalize_v4_mapped_addr)
+        .collect()
 }
 
 /// The operator bootstrap IP set, deduped by IP across port rows
@@ -3694,6 +3748,7 @@ async fn apply_legacy_revocation_records(
     records: Vec<revocation::RevocationRecord>,
     subject_certs: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
     revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: &groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
     owner_trust: &owner_trust::OwnerTrust,
     contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
@@ -3725,7 +3780,11 @@ async fn apply_legacy_revocation_records(
                 subject_cert,
                 Agent::unix_timestamp_secs(),
             ) {
-                Ok(true) => newly_inserted.push(record),
+                Ok(true) => {
+                    // ADR 0110 §1: the S4 post-verification hook.
+                    s4_intake.note_verified(&record);
+                    newly_inserted.push(record);
+                }
                 Ok(false) => {}
                 Err(e) => {
                     tracing::debug!("revocation record rejected: {e}");
@@ -3800,6 +3859,7 @@ async fn apply_v2_revocation_records(
     records: Vec<revocation::RevocationRecord>,
     subject_certs: std::collections::HashMap<identity::AgentId, Vec<identity::AgentCertificate>>,
     revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: &groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
     owner_trust: &owner_trust::OwnerTrust,
 ) {
@@ -3822,8 +3882,11 @@ async fn apply_v2_revocation_records(
             };
             let is_share_grant =
                 matches!(record.subject, revocation::RevokedSubject::ShareGrant(_));
+            // ADR 0110 §1: the S4 hook needs the record after the insert.
+            let hook_record = record.clone();
             match set.verify_and_insert_at(record, subject_cert, Agent::unix_timestamp_secs()) {
                 Ok(true) => {
+                    s4_intake.note_verified(&hook_record);
                     inserted = true;
                     share_grant_inserted |= is_share_grant;
                 }
@@ -3855,6 +3918,7 @@ async fn apply_v2_revocation_records(
 struct LegacyCertRecovery {
     records: Vec<revocation::RevocationRecord>,
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
     owner_trust: owner_trust::OwnerTrust,
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
@@ -3869,6 +3933,7 @@ struct LegacyCertRecovery {
 struct V2CertRecovery {
     records: Vec<revocation::RevocationRecord>,
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
     owner_trust: owner_trust::OwnerTrust,
 }
@@ -4394,6 +4459,7 @@ fn spawn_cert_recovery_task(
                     batch.records,
                     fetched.found,
                     &batch.revocation_set,
+                    &batch.s4_intake,
                     batch.identity_dir,
                     &batch.owner_trust,
                     &batch.contact_store,
@@ -4407,6 +4473,7 @@ fn spawn_cert_recovery_task(
                     batch.records,
                     fetched.found,
                     &batch.revocation_set,
+                    &batch.s4_intake,
                     batch.identity_dir,
                     &batch.owner_trust,
                 )
@@ -5496,11 +5563,64 @@ fn deserialize_machine_announcement(
         .deserialize(payload)
 }
 
+/// #1112 (round 10, refactored round 21): the cache-consumption fence is
+/// ADDRESS-scoped, like every other #1112 verdict. The seam evicts a
+/// mismatched identity's row on refusal, but a delayed ant-quic
+/// reachability write (`observe_direct_reachability` off connection
+/// completion) can re-create the row afterwards; the pair checks here
+/// are the durable fence. The pin table is a parameter (Codex 23 Oct
+/// 2026 review): production passes the live dial table, tests their own
+/// table, so no verdict depends on the process-global test override.
+fn cached_addr_pinned_mismatch(
+    pins: &[network::SeedPeerPin],
+    peer_id: &ant_quic::PeerId,
+    addr: &std::net::SocketAddr,
+) -> bool {
+    matches!(
+        network::seed_pin_gate_in(pins, *addr, peer_id.0),
+        network::SeedPinVerdict::Mismatch { .. }
+    )
+}
+
+/// The addresses of a cached row the pin verdict still allows. Phase 0
+/// dials only these (#1112 round 21, Codex P2: a mismatching sibling
+/// address costs itself, not the row's valid addresses — the whole-row
+/// drop used to lose every join path a mixed row still had).
+fn cached_row_addresses_allowed(
+    pins: &[network::SeedPeerPin],
+    peer_id: &ant_quic::PeerId,
+    addresses: &[std::net::SocketAddr],
+) -> Vec<std::net::SocketAddr> {
+    addresses
+        .iter()
+        .filter(|addr| !cached_addr_pinned_mismatch(pins, peer_id, addr))
+        .copied()
+        .collect()
+}
+
+/// A row is refused at consumption only when EVERY address mismatches a
+/// pin set that excludes the identity — a fully poisoned row is dialled
+/// by id never (#1112 round 3; the cache itself stays untouched for
+/// ant-quic's own accounting). A MIXED row keeps its Phase 1 candidacy
+/// (round 21): an id dial cannot be steered per address, so the
+/// post-dial pair partition and the live-session guards refuse a
+/// landing on the bad address instead.
+fn cached_row_fully_pinned_mismatch(
+    pins: &[network::SeedPeerPin],
+    peer_id: &ant_quic::PeerId,
+    addresses: &[std::net::SocketAddr],
+) -> bool {
+    !addresses.is_empty()
+        && addresses
+            .iter()
+            .all(|addr| cached_addr_pinned_mismatch(pins, peer_id, addr))
+}
+
 /// Compute coordinator / relay hint lists for an announcement.
 ///
-/// Collects machine IDs of currently-connected peers that the machine cache
-/// marks as coordinator- or relay-capable. Deduplicated, capped to
-/// `MAX_COORDINATOR_HINTS` each, and returned in stable order.
+/// Delegates the choice to [`select_capability_hints`] (#1112): one
+/// eligibility tier over the connected set, and never the announcer
+/// itself.
 ///
 /// Used to populate `reachable_via` / `relay_candidates` on outgoing
 /// announcements so that remote peers have concrete targets to dial when
@@ -5513,45 +5633,150 @@ async fn collect_coordinator_hints(
     own_machine_id: identity::MachineId,
     selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
-    /// Upper bound on hint list length. Keeps the signed payload small and
-    /// avoids amplifying gossip if we accumulate many peers.
-    const MAX_COORDINATOR_HINTS: usize = 8;
-
-    let connected = network.connected_peers().await;
-    if connected.is_empty() {
+    let origins = network.connected_peer_origins().await;
+    if origins.is_empty() {
         // ADR-0035 metering: the announce wanted coordinator/relay hints
         // but nothing connected could supply them.
         selection_skew.record(SelectionChoice::NoneAvailable);
         return (Vec::new(), Vec::new());
     }
-
     // ADR-0035 metering: classify every hint this announce is about to
     // advertise — the supply-side choice skew.
     let bootstrap_ips = bootstrap_ip_set();
+    let seed_addrs = bootstrap_seed_addrs();
+    let dial_pins = network::dial_pin_table();
     let cache = machine_cache.read().await;
+    select_capability_hints(
+        &origins,
+        &cache,
+        own_machine_id,
+        &bootstrap_ips,
+        &seed_addrs,
+        dial_pins,
+        selection_skew,
+    )
+}
+
+/// #1112: the coordinator / relay hint selection, as a pure function.
+///
+/// One eligibility tier:
+///
+/// - **Operator tier:** the peer is connected over a DIRECT path whose
+///   OBSERVED remote address (v4-mapped forms normalized) IS a
+///   compiled-in seed listener address — the full socket address — and
+///   the identity is inside that address's pin set when pinned. The
+///   operator fleet runs coordinator and relay roles by deployment, and
+///   a completed QUIC handshake with that source is deployment-derived
+///   evidence no announcement can forge. No capability flag is
+///   consulted, and a pin-mismatched identity never qualifies.
+///
+///   David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026) REPLACES
+///   ADR 0071's community flag tiers: the announcement's self-asserted
+///   `is_coordinator`/`is_relay` is informational wire data only and
+///   never grants a hint, on any selection path. The flags stay in the
+///   wire structs (compatibility) but no decision reads them.
+///
+/// Identities rejected by a seed-pin mismatch are excluded from the
+/// tier PAIR-SCOPED (review round 7): only the origin whose observed
+/// address mismatched its pin set is skipped — a mismatch at one seed
+/// address never suppresses the same identity's valid, pinned origin at
+/// another address, and no dial completion order changes that. Hints are
+/// deduplicated, capped to `MAX_COORDINATOR_HINTS` each, and returned in
+/// stable order. The announcer never hints itself.
+///
+/// The pin table is a parameter (Codex 23 Oct 2026 review): production
+/// passes the live dial table, tests their own table, so the selector's
+/// verdicts never depend on the process-global test override.
+fn select_capability_hints(
+    origins: &[network::PeerOrigin],
+    cache: &std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
+    own_machine_id: identity::MachineId,
+    bootstrap_ips: &std::collections::HashSet<std::net::IpAddr>,
+    seed_addrs: &std::collections::HashSet<std::net::SocketAddr>,
+    pins: &[network::SeedPeerPin],
+    selection_skew: &SelectionSkew,
+) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
+    /// Upper bound on hint list length. Keeps the signed payload small and
+    /// avoids amplifying gossip if we accumulate many peers.
+    const MAX_COORDINATOR_HINTS: usize = 8;
+
     let mut reachable_via: Vec<identity::MachineId> = Vec::new();
     let mut relay_candidates: Vec<identity::MachineId> = Vec::new();
 
-    for peer_id in connected {
-        let mid = identity::MachineId(peer_id.0);
+    for origin in origins {
+        let mid = identity::MachineId(origin.peer_id.0);
         if mid == own_machine_id {
             continue;
         }
-        let Some(entry) = cache.get(&mid) else {
+        // Rounds 5-6 + 18: the selector validates the PAIR — when the
+        // observed address (whatever the path: ant-quic reports
+        // hole-punched paths as non-direct while still naming the
+        // peer's remote address, round 18) is a pinned seed address and
+        // the identity is OUTSIDE its pin set, the pair never qualifies.
+        // Inbound connections and `connect_peer_with_addrs` bypass the
+        // dial seam, so the selector cannot assume the seam already
+        // rejected a mismatched identity.
+        let observed_addr = origin.remote_addr.map(network::normalize_v4_mapped_addr);
+        let pin_mismatch_at_seed = observed_addr.is_some_and(|observed| {
+            matches!(
+                network::seed_pin_gate_in(pins, observed, origin.peer_id.0),
+                network::SeedPinVerdict::Mismatch { .. }
+            )
+        });
+        if pin_mismatch_at_seed {
             continue;
-        };
-        if entry.is_coordinator == Some(true)
+        }
+        // Operator tier: the OBSERVED transport address of a DIRECT path
+        // IS a seed listener address — the FULL socket address, never the
+        // IP alone (round 4: a NATed peer with a relay slot on a seed
+        // advertises the seed's IP on an allocated port, and an IP-only
+        // match would wrongly enlist it). The peer cannot forge this by
+        // announcing anything. v4-mapped forms are normalized here as
+        // well as in `connected_peer_origins`, so the pure function's
+        // contract does not depend on the caller (review round 3).
+        let observed_seed_addr = origin
+            .direct
+            .then_some(observed_addr)
+            .flatten()
+            .filter(|observed| seed_addrs.contains(observed));
+        let on_operator_host = observed_seed_addr.is_some();
+        if !cache.contains_key(&mid) {
+            // No announcement seen: only the operator tier can qualify,
+            // under the same deduplication and cap as the announced case
+            // (review round 3).
+            if on_operator_host
+                && !reachable_via.contains(&mid)
+                && reachable_via.len() < MAX_COORDINATOR_HINTS
+            {
+                selection_skew.record(SelectionChoice::Bootstrap);
+                reachable_via.push(mid);
+            }
+            if on_operator_host
+                && !relay_candidates.contains(&mid)
+                && relay_candidates.len() < MAX_COORDINATOR_HINTS
+            {
+                selection_skew.record(SelectionChoice::Bootstrap);
+                relay_candidates.push(mid);
+            }
+            continue;
+        }
+        // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026)
+        // replaces ADR 0071's community flag tiers: the announcement's
+        // self-asserted `is_coordinator`/`is_relay` grants nothing — the
+        // flags are informational wire data only. Only the operator tier
+        // qualifies an announced peer.
+        if on_operator_host
             && !reachable_via.contains(&mid)
             && reachable_via.len() < MAX_COORDINATOR_HINTS
         {
-            selection_skew.record(classify_with_cache(&cache, &bootstrap_ips, &mid));
+            selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             reachable_via.push(mid);
         }
-        if entry.is_relay == Some(true)
+        if on_operator_host
             && !relay_candidates.contains(&mid)
             && relay_candidates.len() < MAX_COORDINATOR_HINTS
         {
-            selection_skew.record(classify_with_cache(&cache, &bootstrap_ips, &mid));
+            selection_skew.record(classify_with_cache(cache, bootstrap_ips, &mid));
             relay_candidates.push(mid);
         }
     }
@@ -5559,6 +5784,70 @@ async fn collect_coordinator_hints(
     reachable_via.sort_by_key(|id| id.0);
     relay_candidates.sort_by_key(|id| id.0);
     (reachable_via, relay_candidates)
+}
+
+/// #1112 (round 25): whether a bootstrap-cache row carries the evidence a
+/// transport helper mark needs.
+///
+/// The evidence is the row's own FRESH Global-scope direct observation:
+/// ant-quic records one only when THIS node's outbound dial to that
+/// address completed without coordinator or relay assistance
+/// (`observe_direct_reachability`), and every cache read drops records
+/// older than the reachability TTL first. The effective
+/// `supports_relay` / `supports_coordination` flags are NOT consulted:
+/// they also derive from the sticky `hinted_supports_*` marks, so reading
+/// them would let a mark justify itself. A LAN or loopback observation is
+/// not evidence that third parties can reach the peer.
+fn cache_row_has_verified_helper_evidence(row: &ant_quic::bootstrap_cache::CachedPeer) -> bool {
+    row.capabilities.has_global_direct_reachability()
+}
+
+/// #1112 (round 25): clear the `hinted_supports_*` marks that no fresh
+/// Global-scope direct observation supports. Returns the number of rows
+/// changed.
+///
+/// ant-quic persists a higher-layer helper hint as a sticky
+/// `hinted_supports_relay` / `hinted_supports_coordination` bit on the
+/// row, and `record_assist_hints(false, false)` never clears one. Before
+/// round 25 `seed_transport_peer_hints_for_target` marked every
+/// cache-selected fallback candidate, and earlier heads marked
+/// self-asserted roles, so a cache on disk can carry marks that no
+/// evidence supports; the marks also rank the row first in ant-quic's
+/// own helper selection. The row's addresses, direct observations,
+/// statistics and token are untouched, and a mark the row's current
+/// evidence supports is kept — the dial seeding would grant it again.
+///
+/// ant-quic offers no compare-and-swap on a row: each change re-reads the
+/// row and writes it back under two consecutive cache locks, which is
+/// the narrowest window its API allows. The endpoint's in-memory
+/// `PeerHintRecord` is private to ant-quic and merges marks
+/// monotonically; it starts empty at every process start, and after
+/// round 25 x0x feeds it a mark only on verified evidence.
+async fn clear_unsupported_helper_hint_marks(cache: &ant_quic::BootstrapCache) -> usize {
+    let mut cleared = 0usize;
+    for row in cache.all_peers().await {
+        if !(row.capabilities.hinted_supports_relay
+            || row.capabilities.hinted_supports_coordination)
+            || cache_row_has_verified_helper_evidence(&row)
+        {
+            continue;
+        }
+        let Some(fresh) = cache.get_peer(&row.peer_id).await else {
+            continue;
+        };
+        let mut caps = fresh.capabilities;
+        caps.hinted_supports_relay = false;
+        caps.hinted_supports_coordination = false;
+        cache.update_capabilities(&row.peer_id, caps).await;
+        cleared += 1;
+        tracing::debug!(
+            target: "x0x::connect",
+            stage = "clear_helper_hint_marks",
+            peer_prefix = %network::hex_prefix(&row.peer_id.0, 4),
+            "cleared an unsupported persisted helper mark"
+        );
+    }
+    cleared
 }
 
 fn build_machine_announcement_for_identity(
@@ -6272,7 +6561,7 @@ impl HeartbeatContext {
             // gating as the v1 arm.
             let binding_records = self.revocation_set.read().await.binding_records();
             if !binding_records.is_empty() {
-                if let Ok(bytes) = bincode::serialize(&binding_records) {
+                if let Ok(bytes) = revocation::encode_revocation_batch(&binding_records) {
                     let _ = self
                         .runtime
                         .pubsub()
@@ -6283,7 +6572,7 @@ impl HeartbeatContext {
             // ADR-0070: share-grant revocations ride v3 only, same gating.
             let share_grant_records = self.revocation_set.read().await.share_grant_records();
             if !share_grant_records.is_empty() {
-                if let Ok(bytes) = bincode::serialize(&share_grant_records) {
+                if let Ok(bytes) = revocation::encode_revocation_batch(&share_grant_records) {
                     let _ = self
                         .runtime
                         .pubsub()
@@ -6294,7 +6583,7 @@ impl HeartbeatContext {
 
             let records = self.revocation_set.read().await.all_records();
             if !records.is_empty() {
-                match bincode::serialize(&records) {
+                match revocation::encode_revocation_batch(&records) {
                     Ok(bytes) => {
                         if let Err(e) = self
                             .runtime
@@ -6505,7 +6794,7 @@ pub(crate) async fn ingest_share_grant_revocations(
     if payload.len() > MAX_V3_PAYLOAD_BYTES {
         return false;
     }
-    let Ok(records) = bincode::deserialize::<Vec<revocation::RevocationRecord>>(payload) else {
+    let Ok(records) = revocation::decode_revocation_batch(payload) else {
         return false;
     };
     let mut inserted = false;
@@ -6521,6 +6810,8 @@ pub(crate) async fn ingest_share_grant_revocations(
             {
                 continue;
             }
+            // ADR 0110 §1: this route inserts ShareGrant subjects only, so
+            // the S4 hook (Agent subjects) has nothing to schedule here.
             match set.verify_and_insert_at(record, None, Agent::unix_timestamp_secs()) {
                 Ok(true) => inserted = true,
                 Ok(false) => {}
@@ -7333,6 +7624,95 @@ impl Agent {
         self.identity.agent_certificate()
     }
 
+    /// Adopt a verified renewal of this daemon's OWN agent certificate
+    /// (#1357, ADR 0110 §4a run (6)).
+    ///
+    /// The renewal must pass
+    /// [`identity::Identity::check_agent_certificate_renewal`]: it binds
+    /// this agent, its owner signature verifies, the user in use issued
+    /// it, it has not expired, and it expires strictly later than the
+    /// certificate in use (never a downgrade). On a pass it is written
+    /// atomically to `agent.cert`, then it becomes the certificate in use
+    /// for every later announce, user announcement and cert-blob fetch.
+    /// The caller re-announces ([`Self::reannounce_identity_if_consented`]).
+    ///
+    /// Without this, a daemon never leaves a certificate that it loaded at
+    /// startup: after that certificate expires, every peer's pinned send
+    /// to this agent resolves no machine (ADR 0107/0115), even when an
+    /// owner has issued a renewal and an admin has committed it into the
+    /// agent's group seat.
+    ///
+    /// # Errors
+    /// The `agent.cert` write failed before its rename; the certificate in
+    /// use does not change. A failure after the rename (the directory
+    /// sync) still adopts, because the new bytes are on disk.
+    pub async fn adopt_own_certificate_renewal(
+        &self,
+        renewal: &identity::AgentCertificate,
+    ) -> error::Result<CertificateRenewalAdoption> {
+        // No path means no user identity, so no certificate to renew.
+        let Some(path) = self.agent_cert_path.as_deref() else {
+            return Ok(CertificateRenewalAdoption::Refused(
+                identity::CertificateRenewalRefusal::NoCurrentCertificate,
+            ));
+        };
+        let _guard = self.cert_adoption_lock.lock().await;
+        let now_unix = unix_now_secs_for_gc();
+        if let Err(refused) = self
+            .identity
+            .check_agent_certificate_renewal(renewal, now_unix)
+        {
+            return Ok(CertificateRenewalAdoption::Refused(refused));
+        }
+        let bytes = renewal.to_storage_bytes()?;
+        match storage::write_private_bytes_durable_typed(path, bytes).await {
+            Ok(()) => {}
+            Err(storage::DurableWriteError::AfterRename(e)) => {
+                tracing::warn!(
+                    "adopted agent certificate renewal is on disk without a directory sync: {e}"
+                );
+            }
+            Err(storage::DurableWriteError::BeforeRename(e)) => {
+                return Err(error::IdentityError::Storage(e));
+            }
+        }
+        if let Err(refused) = self
+            .identity
+            .adopt_agent_certificate_renewal(renewal.clone(), now_unix)
+        {
+            return Ok(CertificateRenewalAdoption::Refused(refused));
+        }
+        *self
+            .own_cert_pair
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (self.identity.user_id(), Some(renewal.clone()));
+        tracing::info!(
+            agent_id = %hex::encode(self.agent_id().as_bytes()),
+            not_after = ?renewal.not_after(),
+            "adopted a renewal of this agent's own certificate"
+        );
+        Ok(CertificateRenewalAdoption::Adopted)
+    }
+
+    /// Publish a fresh identity announcement with the certificate in use,
+    /// but only when the user has already consented to user-identity
+    /// disclosure ([`Self::announce_identity`] with consent). Without that
+    /// consent the heartbeat carries no certificate, so there is nothing
+    /// to refresh.
+    ///
+    /// # Errors
+    /// As [`Self::announce_identity`].
+    pub async fn reannounce_identity_if_consented(&self) -> error::Result<()> {
+        if !self
+            .user_identity_consented
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        self.announce_identity(true, true).await
+    }
+
     /// Get the agent self-name (ADR-0036 `display_name`), if set.
     ///
     /// Announced on the V3 identity beat so peers render a name without
@@ -7742,25 +8122,47 @@ impl Agent {
         let mut helper_hints: std::collections::HashMap<ant_quic::PeerId, HelperHintEntry> =
             std::collections::HashMap::new();
 
+        // #1112 round 25: ant-quic's selectors return unverified fallback
+        // rows by design ("measure, don't trust"), and ant-quic itself keeps
+        // those as plain address candidates. A capability mark reaches
+        // ant-quic only on the row's own fresh Global-scope direct
+        // observation — evidence THIS node's outbound dial created and no
+        // announcement can forge. Every other row stays an address hint, so
+        // an address-only announcement can never be promoted into a
+        // persistent helper here (Codex P2 at d722045).
+        let mut cache_selector_verified = 0usize;
+        let mut cache_selector_address_only = 0usize;
         if let Some(ref cache) = self.bootstrap_cache {
             for peer in cache.select_coordinators(6).await {
+                let verified = cache_row_has_verified_helper_evidence(&peer);
+                if verified {
+                    cache_selector_verified += 1;
+                } else {
+                    cache_selector_address_only += 1;
+                }
                 merge_helper_hint(
                     &mut helper_hints,
                     peer.peer_id,
                     "bootstrap_cache:coordinator",
                     peer.preferred_addresses(),
-                    true,
+                    verified,
                     false,
                 );
             }
             for peer in cache.select_relay_peers(6).await {
+                let verified = cache_row_has_verified_helper_evidence(&peer);
+                if verified {
+                    cache_selector_verified += 1;
+                } else {
+                    cache_selector_address_only += 1;
+                }
                 merge_helper_hint(
                     &mut helper_hints,
                     peer.peer_id,
                     "bootstrap_cache:relay",
                     peer.preferred_addresses(),
                     false,
-                    true,
+                    verified,
                 );
             }
         }
@@ -7773,6 +8175,10 @@ impl Agent {
                 if advert_peer_id == target_peer_id {
                     continue;
                 }
+                // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct
+                // 2026) replaces ADR 0071's community flag tiers: the
+                // advert's self-asserted roles mark nothing — it only
+                // contributes address hints.
                 merge_helper_hint(
                     &mut helper_hints,
                     advert_peer_id,
@@ -7782,8 +8188,8 @@ impl Agent {
                         .into_iter()
                         .map(|hint| hint.addr)
                         .filter(|addr| is_publicly_advertisable(*addr)),
-                    advert.roles.coordinator || advert.roles.rendezvous,
-                    advert.roles.relay,
+                    false,
+                    false,
                 );
             }
         }
@@ -7796,13 +8202,19 @@ impl Agent {
             if candidate.machine_id == target.machine_id || candidate.machine_id.0 == [0u8; 32] {
                 continue;
             }
+            // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026)
+            // replaces ADR 0071's community flag tiers: the machine
+            // cache's self-asserted flag fields mark nothing — the
+            // candidate only contributes address hints. Coordinator and
+            // relay capability reaches ant-quic only through the loop
+            // above, gated on the cache row's own direct evidence.
             merge_helper_hint(
                 &mut helper_hints,
                 ant_quic::PeerId(candidate.machine_id.0),
                 "machine_discovery_cache",
                 candidate.addresses.iter().copied(),
-                candidate.is_coordinator == Some(true),
-                candidate.is_relay == Some(true),
+                false,
+                false,
             );
         }
 
@@ -7816,6 +8228,8 @@ impl Agent {
             target_addr_count = target.addresses.len(),
             helper_candidate_count,
             helper_addr_total,
+            cache_selector_verified,
+            cache_selector_address_only,
             "prepared helper hints for peer-authenticated dial"
         );
 
@@ -9337,14 +9751,6 @@ impl Agent {
             tracing::info!("Presence system shut down");
         }
 
-        if let Some(ref cache) = self.bootstrap_cache {
-            if let Err(e) = cache.save().await {
-                tracing::warn!("Failed to save bootstrap cache on shutdown: {e}");
-            } else {
-                tracing::info!("Bootstrap cache saved on shutdown");
-            }
-        }
-
         // Issue #110 Phase 2: tear down the gossip runtime and the QUIC node so
         // an in-process embedder gets the socket and all background tasks back
         // when `shutdown()` returns. The gossip runtime's dispatcher/peer-sync/
@@ -9375,6 +9781,49 @@ impl Agent {
                 shutdown_errors.push(format!("network node: {e}"));
             } else {
                 tracing::info!("Network node shut down");
+            }
+        }
+
+        // Final cache save follows gossip/network teardown. save() alone neither
+        // fsyncs nor removes an old snapshot when the final cache is empty.
+        if let Some(cache) = self
+            .bootstrap_cache
+            .as_ref()
+            .filter(|cache| cache.config().persist)
+        {
+            // Non-Unix keeps ordinary shutdown; the M2 receipt clock is unsupported.
+            #[cfg(not(unix))]
+            let flushed = cache.save().await;
+            #[cfg(unix)]
+            let flushed: std::io::Result<()> = async {
+                let config = cache.config();
+                let path = config.cache_dir.join("bootstrap_cache.json");
+                let count = cache.peer_count().await;
+                if count == 0 {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                    tokio::fs::File::open(&config.cache_dir)
+                        .await?
+                        .sync_all()
+                        .await
+                } else {
+                    if count < config.min_peers_to_save {
+                        return Err(std::io::Error::other(
+                            "cache save threshold would skip the final snapshot",
+                        ));
+                    }
+                    cache.save().await?;
+                    storage::confirm_published_durability(&path)
+                        .await
+                        .map_err(std::io::Error::other)
+                }
+            }
+            .await;
+            if let Err(error) = flushed {
+                shutdown_errors.push(format!("bootstrap cache: {error}"));
             }
         }
 
@@ -9647,6 +10096,26 @@ impl Agent {
             .map(|(receipt, _ingress)| receipt)
     }
 
+    /// Send to `to` only while the capability binding still names `machine`.
+    ///
+    /// GUI show admits one machine. The check runs inside
+    /// [`Self::send_direct_all_stages`], after that stage resolves the
+    /// binding, and again after each later await in the same stage. A
+    /// binding that names a different machine is not a destination. The
+    /// gossip address stays the admitted machine. The whole stage stays
+    /// inside the one absolute send deadline.
+    pub(crate) async fn send_direct_bound_to_machine(
+        &self,
+        to: &identity::AgentId,
+        machine: identity::MachineId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_history(to, payload, config, None, Some(machine))
+            .await
+            .map(|(receipt, _ingress)| receipt)
+    }
+
     /// #461: provenance variant for the direct-send HTTP route — identical
     /// behavior to the public method INCLUDING the ADR-0023 §4 outbound
     /// history wiring (this is the single common path; the public method
@@ -9659,7 +10128,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
-        self.send_direct_with_history(to, payload, config, None)
+        self.send_direct_with_history(to, payload, config, None, None)
             .await
     }
 
@@ -9674,7 +10143,7 @@ impl Agent {
         config: dm::DmSendConfig,
         cold_wait: std::time::Duration,
     ) -> Result<dm::DmReceipt, dm::DmError> {
-        self.send_direct_with_history(to, payload, config, Some(ColdWait(cold_wait)))
+        self.send_direct_with_history(to, payload, config, Some(ColdWait(cold_wait)), None)
             .await
             .map(|(receipt, _ingress)| receipt)
     }
@@ -9688,6 +10157,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
+        bound_machine: Option<identity::MachineId>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
@@ -9703,7 +10173,13 @@ impl Agent {
             None
         };
         let result = self
-            .send_direct_with_config_inner_with_provenance(to, payload, config, cold_wait)
+            .send_direct_with_config_inner_with_provenance(
+                to,
+                payload,
+                config,
+                cold_wait,
+                bound_machine,
+            )
             .await;
         if let (Ok((receipt, _ingress)), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
@@ -9757,7 +10233,121 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
         cold_wait: Option<ColdWait>,
+        bound_machine: Option<identity::MachineId>,
     ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        // #1239: ONE absolute deadline across the entire send. The stages
+        // below keep their own budgets (the evidence budget, the transport
+        // ACK caps, the cold-repair bound); this deadline is their sum, so a
+        // send that fits its configured stages is never cut short, while a
+        // later wait no stage bounds — a held revocation, registry or
+        // contact lock, a stacked slow stage, a stuck fallback — ends the
+        // whole send here with the typed timeout instead of staying open.
+        let started = std::time::Instant::now();
+        let retries = config.max_retries;
+        let strict = config.require_durable_app_ack;
+        let deadline = tokio::time::Instant::now()
+            + dm_evidence::ordinary_send_budget(&config, cold_wait.map(|ColdWait(wait)| wait));
+        // The body records both failure counters before it awaits relay
+        // fallback. This flag is that record. A deadline during the fallback
+        // must not record the same send again.
+        let failure_accounted = std::sync::atomic::AtomicBool::new(false);
+        match tokio::time::timeout_at(
+            deadline,
+            self.send_direct_all_stages(
+                to,
+                payload,
+                config,
+                cold_wait,
+                bound_machine,
+                &failure_accounted,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_expired) => {
+                // A deadline before the body's own accounting is still one
+                // failed send. Once the body has recorded that pair, this
+                // handler must not record it again. A strict send keeps a
+                // stage row (the named stages are unknown past the wrap, so
+                // the whole budget folds into publish, as the strict-gate
+                // fold does). Strict sends do not attempt relay fallback.
+                if !failure_accounted.load(std::sync::atomic::Ordering::Acquire) {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    self.peer_relay.record_direct_failure(to);
+                }
+                if strict {
+                    let elapsed = dm::millis_since(started);
+                    self.direct_messaging
+                        .record_durable_send_stages(dm::DurableSendStages {
+                            elapsed_ms: elapsed,
+                            publish_ms: elapsed,
+                            ..dm::DurableSendStages::default()
+                        });
+                }
+                Err(dm::DmError::Timeout {
+                    retries,
+                    elapsed: started.elapsed(),
+                })
+            }
+        }
+    }
+
+    /// Fail closed when a GUI-show send's admitted machine is no longer the
+    /// capability binding. `None` is every other caller.
+    ///
+    /// Call this after the binding and capability resolution, and again
+    /// after each later await that can still choose a destination. The
+    /// gossip address becomes the admitted machine.
+    fn pin_show_machine(
+        &self,
+        to: &identity::AgentId,
+        bound_machine: Option<identity::MachineId>,
+        cap_machine: &mut Option<identity::MachineId>,
+    ) -> Result<(), dm::DmError> {
+        let Some(bound) = bound_machine else {
+            return Ok(());
+        };
+        let resolved = self
+            .capability_store
+            .lookup_binding(to)
+            .map(|binding| binding.machine_id);
+        if resolved != Some(bound) || cap_machine.is_some_and(|current| current != bound) {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::RecipientUndiscovered(
+                "selected machine changed before the show send".to_string(),
+            ));
+        }
+        *cap_machine = Some(bound);
+        Ok(())
+    }
+
+    /// True after a machine-bound send has entered [`Self::send_direct_all_stages`].
+    #[cfg(test)]
+    pub(crate) fn show_stage_entered_for_test(&self) -> bool {
+        self.show_stage_entered
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn mark_show_stage_entered(&self) {
+        self.show_stage_entered
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn send_direct_all_stages(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        cold_wait: Option<ColdWait>,
+        bound_machine: Option<identity::MachineId>,
+        failure_accounted: &std::sync::atomic::AtomicBool,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmAckIngress>), dm::DmError> {
+        #[cfg(test)]
+        if bound_machine.is_some() {
+            self.mark_show_stage_entered();
+        }
         let mut evidence = dm_evidence::SendEvidence::new(
             self,
             *to,
@@ -10029,6 +10619,11 @@ impl Agent {
             }
         }
 
+        // The binding and capability resolution above has awaited. Read the
+        // admitted machine again here, still inside this stage. A move during
+        // any of those awaits is not a destination.
+        self.pin_show_machine(to, bound_machine, &mut cap_machine)?;
+
         // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
         // key clone when the engine is enabled AND we have a key to seal
         // a fresh envelope with. With the default disabled policy this
@@ -10086,6 +10681,12 @@ impl Agent {
             None
         };
 
+        // The preferred raw-QUIC attempt is one later await. A show that
+        // still has to choose a destination reads the binding again.
+        if preferred_raw_receipt.is_none() {
+            self.pin_show_machine(to, bound_machine, &mut cap_machine)?;
+        }
+
         let result = if let Some(receipt) = preferred_raw_receipt {
             Ok((receipt, None))
         } else if preferred_raw_err.as_ref().is_some_and(|err| {
@@ -10112,6 +10713,7 @@ impl Agent {
                     // `Replaced` for that machine_id rather than serving out
                     // the full backoff window.
                     let lifecycle_hint = self.dm_lifecycle_hint(to).await;
+                    self.pin_show_machine(to, bound_machine, &mut cap_machine)?;
                     dm_send::send_via_gossip_with_provenance(
                         dm_send::DmSendContext {
                             pubsub: std::sync::Arc::clone(runtime.pubsub()),
@@ -10190,6 +10792,9 @@ impl Agent {
                 // returns `false` and the fallback below is skipped. With
                 // an opted-in policy this drives the relay decision.
                 self.peer_relay.record_direct_failure(to);
+                // #1239: one sample for this send. The deadline handler
+                // records the same pair only when this store has not run.
+                failure_accounted.store(true, std::sync::atomic::Ordering::Release);
                 // X0X-0070b: relay fallback. We only attempt it when the
                 // engine says the peer has now crossed `needs_relay`, and
                 // only when we have both a saved payload and a recipient
@@ -10957,7 +11562,7 @@ impl Agent {
                     // executor or its timers. Load and Lookup share the
                     // resolver's deadline; only the source re-read below
                     // can establish a binding.
-                    let _ = evidence.lookup_before(*to, deadline).await;
+                    let _ = evidence.lookup_before(*to, None, deadline).await;
                 }
             };
             tokio::pin!(lookup);
@@ -13335,6 +13940,7 @@ impl Agent {
         // #926: every share-grant revocation insert takes the redelivery
         // outbox's barrier (see `share_grant::outbox`).
         let owner_trust_for_listener = self.owner_trust.clone();
+        let s4_intake_for_listener = self.s4_revocation_intake.clone();
         let contact_store_for_evict = std::sync::Arc::clone(&self.contact_store);
         // L3 fetch-on-miss: the listener resolves V3 cert digests from the
         // blob cache (hit) or fires a background fetch (miss) — never
@@ -13637,7 +14243,7 @@ impl Agent {
                             continue;
                         }
                         let records: Vec<revocation::RevocationRecord> =
-                            match bincode::deserialize(&msg.payload) {
+                            match revocation::decode_revocation_batch(&msg.payload) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     tracing::debug!("ignoring invalid revocation payload: {e}");
@@ -13680,6 +14286,7 @@ impl Agent {
                                 CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                                     records,
                                     revocation_set: revocation_set.clone(),
+                                    s4_intake: s4_intake_for_listener.clone(),
                                     identity_dir: identity_dir_for_listener.clone(),
                                     owner_trust: owner_trust_for_listener.clone(),
                                     contact_store: contact_store_for_evict.clone(),
@@ -13692,6 +14299,7 @@ impl Agent {
                                 records,
                                 found,
                                 &revocation_set,
+                                &s4_intake_for_listener,
                                 identity_dir_for_listener.clone(),
                                 &owner_trust_for_listener,
                                 &contact_store_for_evict,
@@ -13758,11 +14366,7 @@ impl Agent {
                         if msg.payload.len() > MAX_V2_PAYLOAD_BYTES {
                             continue;
                         }
-                        let Ok(records) =
-                            bincode::deserialize::<Vec<revocation::RevocationRecord>>(
-                                &msg.payload,
-                            )
-                        else {
+                        let Ok(records) = revocation::decode_revocation_batch(&msg.payload) else {
                             continue;
                         };
                         let journal =
@@ -13797,6 +14401,7 @@ impl Agent {
                                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                                     records,
                                     revocation_set: revocation_set.clone(),
+                                    s4_intake: s4_intake_for_listener.clone(),
                                     identity_dir: identity_dir_for_listener.clone(),
                                     owner_trust: owner_trust_for_listener.clone(),
                                 })),
@@ -13806,6 +14411,7 @@ impl Agent {
                                 records,
                                 found,
                                 &revocation_set,
+                                &s4_intake_for_listener,
                                 identity_dir_for_listener.clone(),
                                 &owner_trust_for_listener,
                             )
@@ -13834,9 +14440,10 @@ impl Agent {
                         if msg.payload.len() > MAX_BUNDLE_PAYLOAD_BYTES {
                             continue;
                         }
-                        let Ok(record) =
-                            bincode::deserialize::<key_move::ChainedRecord>(&msg.payload)
-                        else {
+                        let Ok(record) = wire_compat::decode_bincode::<key_move::ChainedRecord>(
+                            "ChainedRecord",
+                            &msg.payload,
+                        ) else {
                             continue;
                         };
                         let (agent, bundle_cert) = match &record.record {
@@ -14663,9 +15270,24 @@ impl Agent {
         // phase starts no dial, and a cancellation ends its dial batch.
         if let Some(ref cache) = self.bootstrap_cache {
             let coordinators = cache.select_coordinators(6).await;
+            // #1112 (round 10, address-scoped round 21): fence rejected
+            // pairs at cache consumption — the seam evicts a mismatched
+            // row, but a delayed ant-quic reachability write can re-create
+            // it; the pair check here is the durable filter, before any
+            // dial is spent. Round 21 (Codex P2): only the MISMATCHING
+            // addresses drop — a row with a stale pinned seed address and
+            // a valid address keeps the valid one (the whole-row filter
+            // used to lose both join paths).
+            let dial_pins = network::dial_pin_table();
             let coordinator_addrs: Vec<std::net::SocketAddr> = coordinators
                 .iter()
-                .flat_map(|peer| peer.preferred_addresses())
+                .flat_map(|peer| {
+                    cached_row_addresses_allowed(
+                        dial_pins,
+                        &peer.peer_id,
+                        &peer.preferred_addresses(),
+                    )
+                })
                 .collect();
 
             if !coordinator_addrs.is_empty() && !self.shutdown_token.is_cancelled() {
@@ -14681,10 +15303,21 @@ impl Agent {
                         &self.shutdown_token,
                     )
                     .await;
-                all_connected.extend(succeeded.iter().copied());
+                // #1112 (review round 2): the cached-coordinator tier gets
+                // the same pin verdict as the seed tiers — a pinned
+                // address that answered with an identity outside its pin
+                // set never becomes a join candidate, on any join path.
+                // Round 21: one shared per-address predicate
+                // (`cached_addr_pinned_mismatch`) backs every consumption
+                // check, pre- and post-dial.
+                let (admitted, _pin_rejected): (Vec<_>, Vec<_>) =
+                    succeeded.into_iter().partition(|(addr, peer_id)| {
+                        !cached_addr_pinned_mismatch(dial_pins, peer_id, addr)
+                    });
+                all_connected.extend(admitted.iter().copied());
                 tracing::info!(
                     "Phase 0: {}/{} coordinator addresses connected",
-                    succeeded.len(),
+                    admitted.len(),
                     coordinator_addrs.len()
                 );
             }
@@ -15267,7 +15900,23 @@ impl Agent {
             return;
         };
         const PHASE1_PEER_CANDIDATES: usize = 12;
-        let cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+        let mut cached_peers = cache.select_peers(PHASE1_PEER_CANDIDATES).await;
+        // #1112 (review round 3, scoped rounds 7 and 21): cached joins
+        // take the pin verdict PAIR-SCOPED, and an id dial cannot be
+        // steered per address — so only a FULLY poisoned row (every
+        // address mismatches a pin set that excludes the identity) is
+        // dropped; the cache itself stays untouched for ant-quic's own
+        // accounting. A MIXED row (stale pinned seed address + valid
+        // address) stays a candidate (round 21, Codex P2: the whole-row
+        // drop used to lose the valid address too). If the id dial lands
+        // on the bad address anyway, the post-dial pair partition below
+        // and the live-session guards refuse that landing, and the dial
+        // seam plus its bounded backoff refuse the address on any later
+        // address dial.
+        let dial_pins = network::dial_pin_table();
+        cached_peers.retain(|peer| {
+            !cached_row_fully_pinned_mismatch(dial_pins, &peer.peer_id, &peer.preferred_addresses())
+        });
         if cached_peers.is_empty() || stop.is_cancelled() {
             return;
         }
@@ -15275,10 +15924,19 @@ impl Agent {
         let (succeeded, _failed) = self
             .connect_cached_peers_parallel_tracked(network, &cached_peers, stop)
             .await;
-        candidates.extend(succeeded.iter().copied());
+        // #1112 (round 21): ant-quic's id dial tries every cached address
+        // of a row, so a mixed row's landing can be the mismatching
+        // address — this tier takes the same post-dial pair partition as
+        // Phase 0 (round 2): a pinned address that answered with an
+        // identity outside its pin set never becomes a join candidate, on
+        // any join path.
+        let (admitted, _pin_rejected): (Vec<_>, Vec<_>) = succeeded
+            .into_iter()
+            .partition(|(addr, peer_id)| !cached_addr_pinned_mismatch(dial_pins, peer_id, addr));
+        candidates.extend(admitted.iter().copied());
         tracing::info!(
             "Phase 1: {}/{} cached peers connected",
-            succeeded.len(),
+            admitted.len(),
             cached_peers.len()
         );
     }
@@ -15489,6 +16147,12 @@ impl Agent {
                     };
                     match dialled {
                         Ok(Ok(peer_id)) => {
+                            // #1112 (round 4): the per-address seed pin is
+                            // enforced inside `connect_addr_with_origin`,
+                            // BEFORE the cache write, success record, and
+                            // PeerConnected event — a mismatched answer
+                            // never returns `Ok` from the dial at all, so
+                            // this batch only sees admitted hints.
                             tracing::info!("Connected to peer: {}", addr);
                             Ok((addr, peer_id))
                         }
@@ -15912,6 +16576,83 @@ impl Agent {
         true
     }
 
+    /// ADR 0110 §1: the S4 intake queue fed by the revocation choke point.
+    #[must_use]
+    pub fn s4_revocation_intake(&self) -> groups::eviction::RevocationIntake {
+        self.s4_revocation_intake.clone()
+    }
+
+    /// ADR 0110 §4: verify a signed revocation record carried by an
+    /// `EvictionHandoffV1` and insert it through the same verify, persist
+    /// and publish path as a gossip receipt, so it passes the §1 choke
+    /// point (and its S4 hook) after `verify_and_insert` returns
+    /// `Ok(true)`. Returns whether the local set holds the record
+    /// afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record fails signature or issuer-authority
+    /// verification.
+    ///
+    /// ADR 0115 §3: the issuer authority comes only from a subject
+    /// certificate with authenticated provenance, as for a gossip receipt.
+    /// A group roster is not such a source: any group owner can seat a
+    /// certificate it issued for another agent's key. `roster_cert` counts
+    /// only when the local user issued it.
+    pub async fn ingest_eviction_handoff_revocation(
+        &self,
+        record: revocation::RevocationRecord,
+        roster_cert: Option<&identity::AgentCertificate>,
+    ) -> error::Result<bool> {
+        let hash = record.record_hash();
+        if self.revocation_set.read().await.contains_hash(&hash) {
+            return Ok(true);
+        }
+        let certs = match record.needs_certificate_authority() {
+            Some(subject) => {
+                let journal = load_journal_certs(self.cert_journal_path.as_deref()).await;
+                let local_user = self.user_id();
+                let mut certs = {
+                    let announced = self.announced_machine_bindings.read().await;
+                    let cache = self.identity_discovery_cache.read().await;
+                    subject_certs_with_provenance(
+                        &ProvenanceSources {
+                            cache: &cache,
+                            announced: &announced,
+                            evidence: Some(self.peer_evidence()),
+                            local_user,
+                            journal: &journal,
+                        },
+                        &subject,
+                    )
+                };
+                if let Some(cert) = roster_cert
+                    .filter(|cert| local_user.is_some() && cert.user_id().ok() == local_user)
+                {
+                    if !certs.contains(cert) {
+                        certs.push(cert.clone());
+                    }
+                }
+                certs
+            }
+            None => Vec::new(),
+        };
+        let subject_cert = pick_subject_cert(Some(&certs), &record).cloned();
+        self.apply_and_publish_revocation(record, subject_cert.as_ref())
+            .await?;
+        Ok(self.revocation_set.read().await.contains_hash(&hash))
+    }
+
+    /// ADR 0110 §4 (ADR 0093): unknown or expired support for an
+    /// application bit first requests an authenticated advert refresh.
+    /// Ask `recipient` once to republish its signed capability advert and
+    /// wait a bounded time for it; concurrent callers share one flight.
+    /// Read the result from [`Self::capability_store`] afterwards.
+    pub async fn refresh_application_capability(&self, recipient: identity::AgentId, bit: u64) {
+        self.refresh_strict_dm_capability(recipient, Some(bit), false)
+            .await;
+    }
+
     /// Return the shared revocation set.
     ///
     /// Callers that need to publish a new revocation record should call
@@ -16078,12 +16819,20 @@ impl Agent {
                 .share_grant_revocation_barrier(std::iter::once(&record), &self.revocation_set)
                 .await;
             let mut set = self.revocation_set.write().await;
-            if let Err(e) =
-                set.verify_and_insert_at(record.clone(), subject_cert, Self::unix_timestamp_secs())
-            {
-                return Err(error::IdentityError::CertificateVerification(format!(
-                    "revocation rejected: {e}"
-                )));
+            match set.verify_and_insert_at(
+                record.clone(),
+                subject_cert,
+                Self::unix_timestamp_secs(),
+            ) {
+                // ADR 0110 §1: the S4 post-verification hook for local
+                // revocations (`revoke_as_owner`, self-revocation).
+                Ok(true) => self.s4_revocation_intake.note_verified(&record),
+                Ok(false) => {}
+                Err(e) => {
+                    return Err(error::IdentityError::CertificateVerification(format!(
+                        "revocation rejected: {e}"
+                    )));
+                }
             }
         }
         persist_completed_revocation_rebuild(&self.revocation_set, self.identity_dir.as_deref())
@@ -16146,7 +16895,7 @@ impl Agent {
                     _ => (REVOCATION_TOPIC, set.all_records()),
                 }
             };
-            match bincode::serialize(&records) {
+            match revocation::encode_revocation_batch(&records) {
                 Ok(bytes) if !bytes.is_empty() => {
                     let _ = rt
                         .pubsub()
@@ -18891,25 +19640,45 @@ impl Agent {
         .map_err(|e| e.fail_closed_admission(agent_id.0))
     }
 
-    /// Shared body for [`Self::gate_peer_outbound`] and the ADR-0074 §4
-    /// re-check. Cert expiry uses [`OwnerTrust::now_unix_secs`] immediately
-    /// before the compare (after discovery + authority awaits). With
-    /// `local_authority_only`, ADR 0115 confirmation uses only local
-    /// stores / non-blocking evidence and contended reads return Busy.
+    /// The machine [`Self::gate_peer_outbound_at`] would dial for `agent_id`
+    /// on the admission path (`local_authority_only` = false).
+    ///
+    /// A missing discovery entry or a zero routing machine is not a dial
+    /// target (the gate returns `PeerNotVerified` and does not fall back).
+    /// A non-zero cached route is used only when an authority store confirms
+    /// it; otherwise the authority stores' machine is used. `None` when the
+    /// gate would have no machine.
+    pub(crate) async fn outbound_dial_machine(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> Option<identity::MachineId> {
+        Self::select_outbound_dial_machine(
+            &self.identity_discovery_cache,
+            &self.owner_trust,
+            &self.announced_machine_bindings,
+            &self.authenticated_machine_bindings,
+            agent_id,
+            false,
+        )
+        .await
+        .ok()
+        .map(|(machine, _)| machine)
+    }
+
+    /// Machine half of [`Self::gate_peer_outbound_at`]: the dial target and
+    /// the cached certificate expiry. Admission and reauth share this body
+    /// so a persisted forward cannot pin a route the gate would not dial.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn gate_peer_outbound_at(
+    pub(crate) async fn select_outbound_dial_machine(
         identity_discovery_cache: &tokio::sync::RwLock<
             std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
         >,
-        contact_store: &tokio::sync::RwLock<contacts::ContactStore>,
-        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
-        move_state: &tokio::sync::RwLock<key_move::MoveState>,
         owner_trust: &owner_trust::OwnerTrust,
         announced_bindings: &dm_inbox::AuthenticatedMachineBindings,
         authenticated_bindings: &dm_inbox::AuthenticatedMachineBindings,
         agent_id: &identity::AgentId,
         local_authority_only: bool,
-    ) -> Result<identity::MachineId, crate::forward::PeerGateError> {
+    ) -> Result<(identity::MachineId, Option<u64>), crate::forward::PeerGateError> {
         use crate::owner_trust::NonblockingEval;
         let (routing, cert_not_after) = {
             let cache = identity_discovery_cache.read().await;
@@ -18954,6 +19723,38 @@ impl Agent {
                     agent_id: agent_id.0,
                 },
             )?;
+        Ok((machine_id, cert_not_after))
+    }
+
+    /// Shared body for [`Self::gate_peer_outbound`] and the ADR-0074 §4
+    /// re-check. Cert expiry uses [`OwnerTrust::now_unix_secs`] immediately
+    /// before the compare (after discovery + authority awaits). With
+    /// `local_authority_only`, ADR 0115 confirmation uses only local
+    /// stores / non-blocking evidence and contended reads return Busy.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gate_peer_outbound_at(
+        identity_discovery_cache: &tokio::sync::RwLock<
+            std::collections::HashMap<identity::AgentId, DiscoveredAgent>,
+        >,
+        contact_store: &tokio::sync::RwLock<contacts::ContactStore>,
+        revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+        move_state: &tokio::sync::RwLock<key_move::MoveState>,
+        owner_trust: &owner_trust::OwnerTrust,
+        announced_bindings: &dm_inbox::AuthenticatedMachineBindings,
+        authenticated_bindings: &dm_inbox::AuthenticatedMachineBindings,
+        agent_id: &identity::AgentId,
+        local_authority_only: bool,
+    ) -> Result<identity::MachineId, crate::forward::PeerGateError> {
+        use crate::owner_trust::NonblockingEval;
+        let (machine_id, cert_not_after) = Self::select_outbound_dial_machine(
+            identity_discovery_cache,
+            owner_trust,
+            announced_bindings,
+            authenticated_bindings,
+            agent_id,
+            local_authority_only,
+        )
+        .await?;
         // Runtime cert-expiry gate (issue #191): EP1 drops expired
         // announcements at ingest but never re-checks a cached entry on
         // the live path. Absent expiry (None) is fail-open — is_expired
@@ -21767,8 +22568,13 @@ impl AgentBuilder {
         // the agent certificate — written at issue time, read by
         // `GET /owner/agents` as the authoritative issuance record.
         let mut cert_journal_path: Option<std::path::PathBuf> = None;
+        let mut agent_cert_path: Option<std::path::PathBuf> = None;
         let identity = if let Some(user_kp) = user_keypair {
             let cert_path = self.agent_cert_path.clone();
+            agent_cert_path = match cert_path.as_ref() {
+                Some(p) => Some(p.clone()),
+                None => storage::default_agent_certificate_path().await.ok(),
+            };
             let existing_cert = if let Some(ref p) = cert_path {
                 if tokio::fs::try_exists(p).await.unwrap_or(false) {
                     storage::load_agent_certificate_from(p).await.ok()
@@ -21995,6 +22801,23 @@ impl AgentBuilder {
                 }
             }
         }
+        // #1112 round 25: a persisted helper mark survives only while the
+        // row's own direct evidence supports it. Caches written by earlier
+        // heads carry marks that no evidence supports (fallback promotion
+        // and, older still, self-asserted roles); clear them now, post-load,
+        // before any selection can read them, and persist the cleaned rows.
+        if let Some(cache) = bootstrap_cache.as_ref() {
+            let cleared = clear_unsupported_helper_hint_marks(cache).await;
+            if cleared > 0 {
+                tracing::info!(
+                    cleared,
+                    "#1112: cleared unsupported helper hint marks from the bootstrap cache"
+                );
+                if let Err(e) = cache.save().await {
+                    tracing::warn!("#1112: failed to persist the cleared helper hint marks: {e}");
+                }
+            }
+        }
         // Load the local revocation set now (shared Arc) so the relay-DM
         // listener can enforce revocation on inbound relayed envelopes. The
         // same Arc is moved into the Agent below, so the listener and the
@@ -22005,6 +22828,14 @@ impl AgentBuilder {
         let mut revocation_loaded =
             storage::load_revocation_set(self.identity_dir.as_deref()).await;
         revocation_loaded.set_change_notify(std::sync::Arc::clone(&stream_reauth));
+        // ADR 0110 §1: every loaded record was verified by
+        // `verify_and_insert` while the store decoded. The S4 worker
+        // reconciles them against the loaded rosters (read-only until its
+        // host-commit gate).
+        let s4_revocation_intake = groups::eviction::RevocationIntake::new();
+        for record in revocation_loaded.all_records() {
+            s4_revocation_intake.note_loaded(&record);
+        }
         let revocation_set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation_loaded));
 
         // ADR-0043: load-or-generate this machine's ML-KEM-768 enrollment
@@ -22340,6 +23171,8 @@ impl AgentBuilder {
             self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),
             self_name_ever_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cert_journal_path,
+            agent_cert_path,
+            cert_adoption_lock: tokio::sync::Mutex::new(()),
             identity: std::sync::Arc::new(identity),
             network,
             gossip_runtime,
@@ -22403,6 +23236,7 @@ impl AgentBuilder {
             own_cert_pair: announce_blob::shared_cert_pair(own_pair_user, own_pair_cert),
             dm_inbox_service: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             revocation_set,
+            s4_revocation_intake,
             identity_dir: self.identity_dir,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             tracked_tasks: std::sync::Arc::new(std::sync::Mutex::new(TrackedTasks {
@@ -22419,6 +23253,8 @@ impl AgentBuilder {
                 connect::ConnectPolicy::default(),
             ))),
             owner_trust,
+            #[cfg(test)]
+            show_stage_entered: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -26825,6 +27661,9 @@ mod tests {
             crate::exec::EXEC_DM_PREFIX,
             b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".as_slice(),
             b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n".as_slice(),
+            crate::gui::remote::SHOW_REQUEST_PREFIX,
+            crate::gui::remote::SHOW_RESULT_PREFIX,
+            crate::gui::remote::ACTIVITY_PREFIX,
         ] {
             let mut payload = prefix.to_vec();
             payload.extend_from_slice(b"unverified-startup-window-frame");
@@ -35037,6 +35876,7 @@ mod tests {
             CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                 records: records.clone(),
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
                 owner_trust: agent.owner_trust.clone(),
                 contact_store: std::sync::Arc::clone(&agent.contact_store),
@@ -35054,6 +35894,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
                 owner_trust: agent.owner_trust.clone(),
             })),
@@ -35158,6 +35999,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner.clone(),
                 })),
@@ -35261,6 +36103,7 @@ mod tests {
                     CertRecoveryApply::V2(Box::new(V2CertRecovery {
                         records: Vec::new(),
                         revocation_set: std::sync::Arc::clone(&rig.set),
+                        s4_intake: groups::eviction::RevocationIntake::new(),
                         identity_dir: None,
                         owner_trust: rig.owner.clone(),
                     })),
@@ -35306,6 +36149,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: signed.clone(),
                 revocation_set: std::sync::Arc::clone(&rig.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: rig.owner.clone(),
             })),
@@ -35343,6 +36187,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: signed,
                 revocation_set: std::sync::Arc::clone(&rig.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: rig.owner.clone(),
             })),
@@ -35371,6 +36216,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&rig.set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: rig.owner.clone(),
                 })),
@@ -35407,6 +36253,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![later],
                 revocation_set: std::sync::Arc::clone(&rig.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: rig.owner.clone(),
             })),
@@ -35445,6 +36292,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![fat_record],
                 revocation_set: std::sync::Arc::clone(&fat.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: fat.owner.clone(),
             })),
@@ -35487,6 +36335,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![matching_record],
                 revocation_set: std::sync::Arc::clone(&matching_fat.set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: matching_fat.owner.clone(),
             })),
@@ -35662,6 +36511,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -35677,6 +36527,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records,
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust,
             })),
@@ -35779,6 +36630,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -35796,6 +36648,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m1.clone(), pending_record],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -35812,6 +36665,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m2.clone()],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -35846,6 +36700,7 @@ mod tests {
             view[0].records.clone(),
             view[0].found.clone(),
             &set,
+            &groups::eviction::RevocationIntake::new(),
             None,
             &owner_trust,
         )
@@ -35864,6 +36719,7 @@ mod tests {
             vec![record_m1, record_m2],
             only_a,
             &negative,
+            &groups::eviction::RevocationIntake::new(),
             None,
             &owner_trust,
         )
@@ -35986,6 +36842,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -36001,6 +36858,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m2.clone()],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -36017,6 +36875,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m1.clone(), pending_record],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust,
             })),
@@ -36146,6 +37005,7 @@ mod tests {
                     CertRecoveryApply::V2(Box::new(V2CertRecovery {
                         records,
                         revocation_set: std::sync::Arc::clone(&set),
+                        s4_intake: groups::eviction::RevocationIntake::new(),
                         identity_dir: None,
                         owner_trust: owner_trust.clone(),
                     })),
@@ -36440,6 +37300,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: vec![record],
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -36456,6 +37317,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -36745,6 +37607,7 @@ mod tests {
                 CertRecoveryApply::V2(Box::new(V2CertRecovery {
                     records: Vec::new(),
                     revocation_set: std::sync::Arc::clone(&set),
+                    s4_intake: groups::eviction::RevocationIntake::new(),
                     identity_dir: None,
                     owner_trust: owner_trust.clone(),
                 })),
@@ -36760,6 +37623,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m1.clone()],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -36776,6 +37640,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: vec![record_m2.clone(), record_y.clone()],
                 revocation_set: std::sync::Arc::clone(&set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: None,
                 owner_trust: owner_trust.clone(),
             })),
@@ -36884,6 +37749,7 @@ mod tests {
             CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                 records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
                 owner_trust: agent.owner_trust.clone(),
                 contact_store: std::sync::Arc::clone(&agent.contact_store),
@@ -37015,6 +37881,7 @@ mod tests {
             CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                 records: held_records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
                 owner_trust: agent.owner_trust.clone(),
                 contact_store: std::sync::Arc::clone(&agent.contact_store),
@@ -37047,6 +37914,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: waiting_records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
                 owner_trust: agent.owner_trust.clone(),
             })),
@@ -37154,6 +38022,7 @@ mod tests {
             CertRecoveryApply::Legacy(Box::new(LegacyCertRecovery {
                 records: occupier_records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir: identity_dir.clone(),
                 owner_trust: agent.owner_trust.clone(),
                 contact_store: std::sync::Arc::clone(&agent.contact_store),
@@ -37188,6 +38057,7 @@ mod tests {
             CertRecoveryApply::V2(Box::new(V2CertRecovery {
                 records: waiter_records,
                 revocation_set: std::sync::Arc::clone(&agent.revocation_set),
+                s4_intake: groups::eviction::RevocationIntake::new(),
                 identity_dir,
                 owner_trust: agent.owner_trust.clone(),
             })),
@@ -38386,8 +39256,9 @@ async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
         None,
     )
     .expect("Rider issuance");
-    // OwnerSyncService::apply_journal_line materializes exactly this Tier-1
-    // subset: hosting mode/certificate bytes do not travel and default to ACP.
+    // OwnerSyncStore::commit_batch (apply_journal_value) materializes exactly
+    // this Tier-1 subset: hosting mode/certificate bytes do not travel and
+    // default to ACP.
     // This fixture covers the resulting local hint, not the sync protocol.
     let synced: profile::IssuedCertRecord = serde_json::from_value(serde_json::json!({
         "user_id": rider.user_id,
@@ -40593,6 +41464,774 @@ mod peer_connected_handler_integration_tests {
         assert_eq!(back.machine_kem_public_key, unsigned.machine_kem_public_key);
         assert_eq!(back.move_protocol, unsigned.move_protocol);
     }
+
+    mod issue1112_capability_hint_tests {
+        use super::*;
+
+        // ── Issue #1112: relay/coordinator hints from evidence, not self-report ──
+
+        fn issue1112_machine(
+            machine_id: identity::MachineId,
+            addresses: &[std::net::SocketAddr],
+            is_relay: Option<bool>,
+            is_coordinator: Option<bool>,
+        ) -> DiscoveredMachine {
+            DiscoveredMachine {
+                machine_id,
+                addresses: addresses.to_vec(),
+                announced_at: 1,
+                last_seen: 1,
+                machine_public_key: vec![1],
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay,
+                is_coordinator,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                machine_kem_public_key: None,
+                placement_digests: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            }
+        }
+
+        /// A directly-connected peer whose socket the local endpoint
+        /// observes at `observed` (issue #1112 evidence model).
+        fn issue1112_origin(peer: [u8; 32], observed: &str, direct: bool) -> network::PeerOrigin {
+            network::PeerOrigin {
+                peer_id: ant_quic::PeerId(peer),
+                remote_addr: Some(observed.parse().unwrap()),
+                direct,
+            }
+        }
+
+        #[test]
+        fn issue1112_forged_seed_address_grants_no_operator_tier() {
+            // Review rounds 1-3: an announcement's address list is a claim,
+            // not evidence. A peer that lists operator seed IPs but is
+            // observed from its own address gains nothing: the operator
+            // tier keys on the OBSERVED address. Self-asserted flags
+            // grant nothing either (David's 20 Oct 2026 ruling).
+            let mut cache = std::collections::HashMap::new();
+            let forger = identity::MachineId([0x11; 32]);
+            cache.insert(
+                forger,
+                issue1112_machine(
+                    forger,
+                    &[
+                        "142.93.199.50:5483".parse().unwrap(),
+                        "147.182.234.192:443".parse().unwrap(),
+                    ],
+                    None,
+                    None,
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[issue1112_origin([0x11; 32], "203.0.113.10:52000", true)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a forged seed address in an announcement must not grant the operator tier"
+            );
+        }
+
+        #[test]
+        fn issue1112_self_asserted_flags_alone_grant_no_hint() {
+            // David's 20 Oct 2026 #1112 ruling (confirmed 22 Oct 2026)
+            // REPLACES ADR 0071's community flag tiers: a peer that only
+            // self-asserts `is_relay`/`is_coordinator` gets NO hint. The
+            // flags stay in the wire structs as informational data, but
+            // no selection path reads them. Runtime-RED before the
+            // removal: this peer was hinted by its flags alone.
+            let mut cache = std::collections::HashMap::new();
+            let flagged = identity::MachineId([0x11; 32]);
+            cache.insert(
+                flagged,
+                issue1112_machine(
+                    flagged,
+                    &["203.0.113.10:5483".parse().unwrap()],
+                    Some(true),
+                    Some(true),
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[issue1112_origin([0x11; 32], "198.51.100.99:52000", true)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
+                &skew,
+            );
+            assert!(
+                coordinators.is_empty() && relays.is_empty(),
+                "self-asserted capability flags alone must not grant a hint"
+            );
+        }
+
+        #[test]
+        fn issue1112_operator_seed_host_is_a_hint_without_self_assertion() {
+            // Evidence side of #1112: a machine whose DIRECT connection the
+            // local socket OBSERVED on a compiled-in operator seed IP is a
+            // coordinator and relay hint even with no self-asserted flags —
+            // the operator fleet runs both roles by deployment. The announcer
+            // never hints itself. A dual-stack socket reports the same peer
+            // v4-mapped; the normalized form must work identically.
+            // Post-pins the operator tier requires the observed
+            // (address, identity) pair to MATCH the compiled-in pin, so
+            // the fixtures carry the production pinned PeerIds. The reads
+            // go to the compiled-in table itself, never the live
+            // `pinned_seed_peer_ids`: a concurrently-running override
+            // test in a shared libtest process must not be able to empty
+            // them (Codex 23 Oct 2026 review).
+            let nyc_5483 = *network::pinned_peer_ids_in(
+                network::SEED_PEER_ID_PINS,
+                "142.93.199.50:5483".parse().unwrap(),
+            )[0];
+            let hel_5483 = *network::pinned_peer_ids_in(
+                network::SEED_PEER_ID_PINS,
+                "65.21.157.229:5483".parse().unwrap(),
+            )[0];
+            let seed_host = identity::MachineId(nyc_5483);
+            let own = identity::MachineId([0x99; 32]);
+            let mut cache = std::collections::HashMap::new();
+            cache.insert(
+                seed_host,
+                issue1112_machine(
+                    seed_host,
+                    &["142.93.199.50:5483".parse().unwrap()],
+                    None,
+                    None,
+                ),
+            );
+            cache.insert(
+                own,
+                issue1112_machine(own, &["142.93.199.50:443".parse().unwrap()], None, None),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[
+                    issue1112_origin(nyc_5483, "142.93.199.50:5483", true),
+                    issue1112_origin([0x99; 32], "142.93.199.50:443", true),
+                    // Same seed host seen v4-mapped on a dual-stack socket
+                    // (review round 2): normalization must keep it a hint.
+                    issue1112_origin(hel_5483, "[::ffff:65.21.157.229]:5483", true),
+                ],
+                &cache,
+                own,
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
+                &skew,
+            );
+            assert!(coordinators.contains(&seed_host));
+            assert!(relays.contains(&seed_host));
+            // The mapped seed host (no cache entry) is also an
+            // operator-tier hint, and each hint-list entry records one
+            // bootstrap-classified choice: seed_host twice (its cache
+            // entry classifies) + the mapped peer twice (the no-cache
+            // operator branch). None for the self-entry.
+            let mapped_seed = identity::MachineId(hel_5483);
+            assert!(
+                coordinators.contains(&mapped_seed) && relays.contains(&mapped_seed),
+                "a v4-mapped observed seed address must stay an operator-tier hint"
+            );
+            assert_eq!(skew.snapshot().chosen_bootstrap, 4);
+            assert_eq!(skew.snapshot().chosen_non_bootstrap, 0);
+        }
+
+        #[test]
+        fn issue1112_pin_mismatch_exclusion_is_pair_scoped_not_identity_wide() {
+            // Review round 7: a seed-pin mismatch excludes the mismatching
+            // (address, identity) PAIR only. The selector's pair check
+            // (`seed_pin_gate`) is live the moment an operator pins rows;
+            // the identity-wide skip it used to carry is gone, because a
+            // rejection recorded at one seed address must not suppress the
+            // same identity's valid, pinned origin at another address —
+            // whatever the dial completion order. Both fixture rows below
+            // pin the SAME machine identity (the deployment shape where
+            // one key serves two listeners), so every origin pair is a
+            // member and stays eligible. The table is injected into the
+            // selector, not installed as the process-global dial override:
+            // the verdicts stay this test's own whatever concurrently
+            // runs in a shared libtest process (Codex 23 Oct 2026
+            // review).
+            const PAIR_IDS: [&[u8; 32]; 1] = [&[0x33; 32]];
+            static PAIR_PINS: [network::SeedPeerPin; 2] = [
+                network::SeedPeerPin {
+                    addr: "142.93.199.50:5483",
+                    expected_peer_ids: &PAIR_IDS,
+                },
+                network::SeedPeerPin {
+                    addr: "147.182.234.192:443",
+                    expected_peer_ids: &PAIR_IDS,
+                },
+            ];
+            let mut cache = std::collections::HashMap::new();
+            let seed_host = identity::MachineId([0x33; 32]);
+            cache.insert(seed_host, issue1112_machine(seed_host, &[], None, None));
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[
+                    // The same identity seen at two distinct seed
+                    // listeners: both pairs are members, so both origins
+                    // are eligible — the ordering of any mismatch
+                    // elsewhere cannot change that.
+                    issue1112_origin([0x33; 32], "142.93.199.50:5483", true),
+                    issue1112_origin([0x33; 32], "147.182.234.192:443", true),
+                ],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &PAIR_PINS,
+                &skew,
+            );
+            assert_eq!(coordinators, vec![seed_host]);
+            assert_eq!(relays, vec![seed_host]);
+            // The pair verdict itself — the only thing that can exclude an
+            // origin — stays scoped to the address that mismatched.
+            let pins = [network::SeedPeerPin {
+                addr: "142.93.199.50:5483",
+                expected_peer_ids: &[&[0xAA; 32]],
+            }];
+            assert!(matches!(
+                network::seed_pin_gate_in(&pins, "142.93.199.50:5483".parse().unwrap(), [0x33; 32]),
+                network::SeedPinVerdict::Mismatch { .. }
+            ));
+            assert_eq!(
+                network::seed_pin_gate_in(
+                    &pins,
+                    "147.182.234.192:443".parse().unwrap(),
+                    [0x33; 32]
+                ),
+                network::SeedPinVerdict::Unpinned,
+                "the other address's pair is untouched by the mismatch"
+            );
+        }
+
+        #[test]
+        fn issue1112_cache_consumption_refuses_a_rewritten_row() {
+            // Review round 10 (Codex P2: cache eviction races a pending
+            // transport write): the seam evicts a mismatched identity's
+            // row, but a delayed ant-quic reachability write can
+            // re-create it. The join tiers fence rejected pairs at cache
+            // CONSUMPTION — the row is never dialled, whatever wrote it.
+            // Runtime-RED before the consumption fence: Phase 0 dialled
+            // whatever `select_coordinators` returned. Round 21 keeps the
+            // fence address-scoped (see the mixed-row test below). The
+            // table is passed to each fence call, never installed as the
+            // process-global dial override (Codex 23 Oct 2026 review).
+            const PINNED_KEY: [u8; 32] = [0xAE; 32];
+            const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &[&PINNED_KEY],
+            }];
+            let rejected = ant_quic::PeerId([0x77; 32]);
+            let pinned_addr: std::net::SocketAddr = "198.51.100.7:5483".parse().unwrap();
+            // The rewritten row (the delayed writer's product): every
+            // address mismatches, so no tier touches it.
+            assert!(
+                cached_row_fully_pinned_mismatch(&PINS, &rejected, &[pinned_addr]),
+                "a re-created row for a mismatching pair is refused at consumption"
+            );
+            assert!(
+                cached_row_addresses_allowed(&PINS, &rejected, &[pinned_addr]).is_empty(),
+                "a fully poisoned row contributes no dial address"
+            );
+            // Other addresses, and the pinned member itself, stay eligible.
+            assert!(!cached_row_fully_pinned_mismatch(
+                &PINS,
+                &rejected,
+                &["203.0.113.9:40000".parse().unwrap()]
+            ));
+            assert!(!cached_row_fully_pinned_mismatch(
+                &PINS,
+                &ant_quic::PeerId(PINNED_KEY),
+                &[pinned_addr]
+            ));
+        }
+
+        #[test]
+        fn issue1112_mixed_cache_row_keeps_its_valid_addresses() {
+            // Review round 21 (Codex P2: a valid cached address was
+            // discarded with a mismatching one): the consumption fence is
+            // ADDRESS-scoped. A row listing stale pinned seed address A
+            // (whose pin set excludes the identity) and valid address B
+            // keeps B on every join path: Phase 0 dials only B (A is
+            // filtered out before any dial is spent), and Phase 1 keeps
+            // the row — an id dial cannot be steered per address, so a
+            // landing on A is refused by the post-dial pair partition
+            // and the live-session guards, never by losing B. Runtime-RED
+            // before round 21: the any-mismatch row drop removed the row
+            // — and with it B — from both tiers. The table is passed to
+            // each fence call, never installed as the process-global
+            // dial override (Codex 23 Oct 2026 review).
+            const PINNED_KEY: [u8; 32] = [0xAF; 32];
+            const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &[&PINNED_KEY],
+            }];
+            let rejected = ant_quic::PeerId([0x66; 32]);
+            let bad_addr: std::net::SocketAddr = "198.51.100.7:5483".parse().unwrap();
+            let good_addr: std::net::SocketAddr = "203.0.113.9:40000".parse().unwrap();
+            let mixed_row = [bad_addr, good_addr];
+            // Phase 0: only the valid address is dialled.
+            assert_eq!(
+                cached_row_addresses_allowed(&PINS, &rejected, &mixed_row),
+                vec![good_addr],
+                "a mismatching sibling address must not cost the row its valid address"
+            );
+            // Phase 1: the mixed row stays a candidate; a fully poisoned
+            // row still drops, and the pinned member itself is untouched.
+            assert!(!cached_row_fully_pinned_mismatch(
+                &PINS, &rejected, &mixed_row
+            ));
+            assert!(cached_row_fully_pinned_mismatch(
+                &PINS,
+                &rejected,
+                &[bad_addr]
+            ));
+            assert!(!cached_row_fully_pinned_mismatch(
+                &PINS,
+                &ant_quic::PeerId(PINNED_KEY),
+                &[bad_addr]
+            ));
+            // The post-dial pair partition (round 21) uses the same
+            // per-address verdict: a landing on the bad address never
+            // becomes a join candidate; a landing on the good one does.
+            assert!(cached_addr_pinned_mismatch(&PINS, &rejected, &bad_addr));
+            assert!(!cached_addr_pinned_mismatch(&PINS, &rejected, &good_addr));
+        }
+
+        #[test]
+        fn issue1112_pin_mismatch_skips_both_tiers_on_a_nondirect_path() {
+            // Review round 18 (Codex P2: pin checks bypassed for
+            // hole-punched hint candidates): ant-quic reports hole-punched
+            // paths as non-direct while still naming the peer's remote
+            // address. The pin pair verdict runs on the OBSERVED address
+            // whatever the path, so a mismatched identity at a pinned seed
+            // address cannot enter either tier — not even through its
+            // cached capability flags. Runtime-RED before round 18: the
+            // pair check ran only for direct origins, so this origin
+            // reached both hint lists. The table is injected into the
+            // selector, not installed as the process-global dial override
+            // (Codex 23 Oct 2026 review).
+            const NOT_IT: [u8; 32] = [0xB7; 32];
+            const PINS: [network::SeedPeerPin; 1] = [network::SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &[&NOT_IT],
+            }];
+            let mut cache = std::collections::HashMap::new();
+            let flagged = identity::MachineId([0x33; 32]);
+            cache.insert(
+                flagged,
+                issue1112_machine(
+                    flagged,
+                    &["198.51.100.7:5483".parse().unwrap()],
+                    Some(true),
+                    Some(true),
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                // Non-direct (hole-punched shape) at the PINNED address,
+                // with both capability flags asserted.
+                &[issue1112_origin([0x33; 32], "198.51.100.7:5483", false)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                &PINS,
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a pin-mismatched pair skips both tiers on any path, flags or not"
+            );
+        }
+
+        #[test]
+        fn issue1112_allocated_relay_port_on_a_seed_ip_is_no_operator_tier() {
+            // Review round 4: a NATed peer with a relay slot on a seed
+            // advertises the seed's IP on an ALLOCATED port. The operator
+            // tier matches the full seed listener address, so an observed
+            // connection to that allocated port is the NATed peer's own
+            // path — never operator evidence.
+            let mut cache = std::collections::HashMap::new();
+            let nated = identity::MachineId([0x66; 32]);
+            cache.insert(
+                nated,
+                issue1112_machine(nated, &["142.93.199.50:61234".parse().unwrap()], None, None),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[issue1112_origin([0x66; 32], "142.93.199.50:61234", true)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a seed IP on an allocated relay port is not a seed listener address"
+            );
+        }
+
+        #[test]
+        fn issue1112_relayed_origin_grants_no_operator_tier() {
+            // A relayed path's observed address names the relay, not the
+            // peer — it is never OPERATOR-tier evidence, whatever the peer
+            // announces. The peer self-asserts both capability flags and
+            // still gets no hint: self-asserted flags grant nothing
+            // (David's 20 Oct 2026 ruling, confirmed 22 Oct 2026). The
+            // fixture identity is the production pinned PeerId for the
+            // observed address, so the pin pair matches and the relayed
+            // path is the ONLY thing that can exclude the origin. The
+            // read goes to the compiled-in table itself, never the live
+            // `pinned_seed_peer_ids` (Codex 23 Oct 2026 review).
+            let seed_nyc_5483 = *network::pinned_peer_ids_in(
+                network::SEED_PEER_ID_PINS,
+                "142.93.199.50:5483".parse().unwrap(),
+            )[0];
+            let relayed = identity::MachineId(seed_nyc_5483);
+            let mut cache = std::collections::HashMap::new();
+            cache.insert(
+                relayed,
+                issue1112_machine(
+                    relayed,
+                    &["142.93.199.50:5483".parse().unwrap()],
+                    Some(true),
+                    Some(true),
+                ),
+            );
+            let skew = SelectionSkew::default();
+            let (coordinators, relays) = select_capability_hints(
+                &[issue1112_origin(seed_nyc_5483, "142.93.199.50:5483", false)],
+                &cache,
+                identity::MachineId([0x99; 32]),
+                &bootstrap_ip_set(),
+                &bootstrap_seed_addrs(),
+                network::SEED_PEER_ID_PINS,
+                &skew,
+            );
+            assert!(
+                relays.is_empty() && coordinators.is_empty(),
+                "a relayed observation of a seed IP is evidence about the relay, not the peer"
+            );
+        }
+
+        // ── Round 25: cache-selected helpers need the row's own evidence ──
+
+        /// A loopback-only network for an Agent that must never reach the
+        /// real network: no seeds, no mDNS, no port mapping.
+        fn issue1112_loopback_network_config() -> network::NetworkConfig {
+            network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
+                bootstrap_nodes: Vec::new(),
+                port_mapping_enabled: false,
+                mdns_enabled: false,
+                ..network::NetworkConfig::default()
+            }
+        }
+
+        fn issue1112_target(byte: u8, addr: &str) -> DiscoveredAgent {
+            DiscoveredAgent {
+                agent_id: identity::AgentId([byte; 32]),
+                machine_id: identity::MachineId([byte; 32]),
+                user_id: None,
+                addresses: vec![addr.parse().expect("target addr")],
+                announced_at: 1,
+                last_seen: 1,
+                machine_public_key: vec![1],
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                cert_not_after: None,
+                agent_certificate: None,
+                cert_digest: None,
+                agent_public_key: Vec::new(),
+                self_name: None,
+            }
+        }
+
+        fn issue1112_cache_config(
+            cache_dir: &std::path::Path,
+            persist: bool,
+        ) -> ant_quic::BootstrapCacheConfig {
+            ant_quic::BootstrapCacheConfig::builder()
+                .cache_dir(cache_dir)
+                .min_peers_to_save(1)
+                .persist(persist)
+                .build()
+        }
+
+        /// Round 25 (Codex P2 at d722045): ant-quic's `select_coordinators`
+        /// and `select_relay_peers` return unverified fallback rows by
+        /// design ("measure, don't trust"). The dial seeding marked every
+        /// returned row capable and persisted the mark through
+        /// `upsert_peer_hints`, so an address-only row — all a gossip
+        /// advert or machine-cache candidate contributes since David's
+        /// ruling — became a persistent helper on the next dial. A mark now
+        /// needs the row's own fresh Global-scope direct observation.
+        /// Runtime-RED at d722045: the fallback row carried both marks
+        /// after the first call.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue1112_cache_fallback_row_gains_no_helper_mark_across_dials() {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let agent = Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(issue1112_loopback_network_config())
+                .build()
+                .await
+                .expect("agent");
+            let network = agent.network().expect("network").clone();
+            let cache = network.bootstrap_cache().expect("endpoint cache");
+
+            // An address-only row: what the advert and machine-cache
+            // sources leave behind, and the selectors' fallback in a
+            // small cache.
+            let fallback = ant_quic::PeerId([0x5a; 32]);
+            let fallback_addr: std::net::SocketAddr = "203.0.113.5:5483".parse().unwrap();
+            network
+                .upsert_peer_hints(fallback, vec![fallback_addr], None)
+                .await
+                .expect("address hint");
+            let target = issue1112_target(0x77, "198.51.100.7:5483");
+
+            for round in 1..=3 {
+                agent
+                    .seed_transport_peer_hints_for_target(&network, &target)
+                    .await
+                    .expect("seed hints");
+                let row = cache.get_peer(&fallback).await.expect("fallback row");
+                assert!(
+                    !row.capabilities.hinted_supports_coordination
+                        && !row.capabilities.hinted_supports_relay,
+                    "round {round}: an unverified fallback row must not gain a persisted helper mark"
+                );
+                assert!(
+                    !row.capabilities.supports_coordination && !row.capabilities.supports_relay,
+                    "round {round}: no effective helper capability without direct evidence"
+                );
+                assert_eq!(
+                    row.addresses,
+                    vec![fallback_addr],
+                    "round {round}: the address hint itself is kept"
+                );
+            }
+
+            // Control: a row with fresh Global-scope direct evidence — the
+            // transport's own outbound-verified observation — is granted.
+            let verified = ant_quic::PeerId([0x5b; 32]);
+            let verified_addr: std::net::SocketAddr = "203.0.113.6:5483".parse().unwrap();
+            cache
+                .observe_direct_reachability(verified, verified_addr)
+                .await;
+            agent
+                .seed_transport_peer_hints_for_target(&network, &target)
+                .await
+                .expect("seed hints");
+            let row = cache.get_peer(&verified).await.expect("verified row");
+            assert!(
+                row.capabilities.hinted_supports_coordination
+                    && row.capabilities.hinted_supports_relay,
+                "fresh Global-scope direct evidence earns the helper marks"
+            );
+            let row = cache.get_peer(&fallback).await.expect("fallback row");
+            assert!(
+                !row.capabilities.hinted_supports_coordination
+                    && !row.capabilities.hinted_supports_relay,
+                "the fallback row stays unmarked beside a verified one"
+            );
+        }
+
+        /// Round 25: a persisted `hinted_supports_*` mark is sticky in
+        /// ant-quic (`record_assist_hints(false, false)` clears nothing), so
+        /// a cache written by an earlier head carries marks no evidence
+        /// supports. The Agent's post-load hook clears a mark unless the
+        /// row has fresh Global-scope direct evidence, and leaves every
+        /// address, direct observation and verified capability intact.
+        /// Runtime-RED at d722045: the legacy row kept both marks after
+        /// the reload.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn issue1112_unsupported_legacy_helper_marks_are_cleared_on_load() {
+            use ant_quic::bootstrap_cache::{CachedPeer, PeerSource};
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let cache_dir = dir.path().join("peers");
+            let legacy = ant_quic::PeerId([0x61; 32]);
+            let legacy_addr: std::net::SocketAddr = "203.0.113.61:5483".parse().unwrap();
+            let verified = ant_quic::PeerId([0x62; 32]);
+            let verified_addr: std::net::SocketAddr = "203.0.113.62:5483".parse().unwrap();
+            let plain = ant_quic::PeerId([0x63; 32]);
+            let plain_addr: std::net::SocketAddr = "203.0.113.63:5483".parse().unwrap();
+            {
+                // The cache an earlier head left on disk.
+                let cache =
+                    ant_quic::BootstrapCache::open(issue1112_cache_config(&cache_dir, true))
+                        .await
+                        .expect("open fixture cache");
+                let mut row = CachedPeer::new(legacy, vec![legacy_addr], PeerSource::Merge);
+                row.capabilities.record_assist_hints(true, true);
+                cache.upsert(row).await;
+                let mut row = CachedPeer::new(verified, vec![verified_addr], PeerSource::Merge);
+                row.capabilities.record_assist_hints(true, true);
+                row.capabilities
+                    .record_direct_observation(verified_addr, std::time::SystemTime::now());
+                cache.upsert(row).await;
+                cache
+                    .upsert(CachedPeer::new(plain, vec![plain_addr], PeerSource::Merge))
+                    .await;
+                cache.save().await.expect("save fixture cache");
+            }
+
+            let agent = Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_dir(&cache_dir)
+                .with_network_config(issue1112_loopback_network_config())
+                .build()
+                .await
+                .expect("agent");
+            let cache = agent
+                .network()
+                .expect("network")
+                .bootstrap_cache()
+                .expect("endpoint cache");
+
+            let row = cache
+                .get_peer(&legacy)
+                .await
+                .expect("legacy row survives the load");
+            assert!(
+                !row.capabilities.hinted_supports_relay
+                    && !row.capabilities.hinted_supports_coordination,
+                "an unsupported legacy mark is cleared at load"
+            );
+            assert!(
+                !row.capabilities.supports_relay && !row.capabilities.supports_coordination,
+                "no effective capability remains once the unsupported mark is gone"
+            );
+            assert_eq!(
+                row.addresses,
+                vec![legacy_addr],
+                "the legacy row keeps its address"
+            );
+
+            let row = cache.get_peer(&verified).await.expect("verified row");
+            assert!(
+                row.capabilities.has_global_direct_reachability(),
+                "the direct observation is kept"
+            );
+            assert!(
+                row.capabilities.supports_relay && row.capabilities.supports_coordination,
+                "a row with fresh Global-scope direct evidence keeps its capability"
+            );
+            assert!(
+                row.capabilities.hinted_supports_relay
+                    && row.capabilities.hinted_supports_coordination,
+                "a mark the evidence supports is kept"
+            );
+
+            let row = cache.get_peer(&plain).await.expect("plain row");
+            assert_eq!(row.addresses, vec![plain_addr]);
+            assert!(!row.capabilities.supports_relay && !row.capabilities.supports_coordination);
+        }
+
+        /// Round 25: the helper-evidence predicate counts FRESH Global-scope
+        /// direct evidence only. A sticky mark alone, a LAN observation and
+        /// an expired global observation grant nothing; the cleanup clears
+        /// exactly the unsupported mark and is idempotent.
+        #[tokio::test]
+        async fn issue1112_helper_evidence_needs_fresh_global_direct_reachability() {
+            use ant_quic::bootstrap_cache::{CachedPeer, PeerSource};
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let cache = ant_quic::BootstrapCache::open(issue1112_cache_config(dir.path(), false))
+                .await
+                .expect("open cache");
+            let now = std::time::SystemTime::now();
+            let global_a: std::net::SocketAddr = "203.0.113.71:5483".parse().unwrap();
+            let global_b: std::net::SocketAddr = "203.0.113.72:5483".parse().unwrap();
+            let lan_addr: std::net::SocketAddr = "192.168.1.9:5483".parse().unwrap();
+
+            let marked = ant_quic::PeerId([0x71; 32]);
+            let mut row = CachedPeer::new(marked, vec![global_a], PeerSource::Merge);
+            row.capabilities.record_assist_hints(true, true);
+            cache.upsert(row).await;
+
+            let lan = ant_quic::PeerId([0x72; 32]);
+            let mut row = CachedPeer::new(lan, vec![lan_addr], PeerSource::Merge);
+            row.capabilities.record_direct_observation(lan_addr, now);
+            cache.upsert(row).await;
+
+            let stale = ant_quic::PeerId([0x73; 32]);
+            let mut row = CachedPeer::new(stale, vec![global_a], PeerSource::Merge);
+            row.capabilities.record_direct_observation(
+                global_a,
+                now - cache.config().reachability_ttl - std::time::Duration::from_secs(60),
+            );
+            cache.upsert(row).await;
+
+            let fresh = ant_quic::PeerId([0x74; 32]);
+            let mut row = CachedPeer::new(fresh, vec![global_b], PeerSource::Merge);
+            row.capabilities.record_direct_observation(global_b, now);
+            cache.upsert(row).await;
+
+            for (peer, expected, why) in [
+                (marked, false, "a sticky mark alone is not evidence"),
+                (lan, false, "a LAN observation is not global evidence"),
+                (
+                    stale,
+                    false,
+                    "an expired global observation is not fresh evidence",
+                ),
+                (fresh, true, "a fresh global observation is evidence"),
+            ] {
+                let row = cache.get_peer(&peer).await.expect("row");
+                assert_eq!(
+                    cache_row_has_verified_helper_evidence(&row),
+                    expected,
+                    "{why}"
+                );
+            }
+
+            assert_eq!(
+                clear_unsupported_helper_hint_marks(&cache).await,
+                1,
+                "exactly the unsupported mark is cleared"
+            );
+            let row = cache.get_peer(&marked).await.expect("marked row");
+            assert!(
+                !row.capabilities.hinted_supports_relay
+                    && !row.capabilities.hinted_supports_coordination
+                    && !row.capabilities.supports_relay
+                    && !row.capabilities.supports_coordination
+            );
+            assert_eq!(row.addresses, vec![global_a], "the address is kept");
+            assert_eq!(
+                clear_unsupported_helper_hint_marks(&cache).await,
+                0,
+                "a second pass finds nothing to clear"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -40609,3 +42248,14 @@ mod issue1099_tests;
 
 #[cfg(test)]
 mod issue1239_tests;
+
+#[cfg(test)]
+mod issue1239_send_deadline_tests;
+
+#[cfg(test)]
+mod wire_golden_tests;
+
+#[cfg(test)]
+include!("../tests/upgrade_cache_flush.rs");
+#[cfg(test)]
+upgrade_cache_flush_tests!();

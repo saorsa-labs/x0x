@@ -366,6 +366,13 @@ pub(in crate::server) static GROUP_PLANE_ROUTES: &[RouteAccess] = &[
         path: "/groups/:id/display-name",
         level: AccessLevel::JoinSelf,
     },
+    // ADR 0110 §4a: the self-rebind's subject is the daemon's own Active
+    // seat; the handler refuses any other agent's seat.
+    RouteAccess {
+        method: Method::POST,
+        path: "/groups/:id/members/:agent_id/certificate/rebind",
+        level: AccessLevel::JoinSelf,
+    },
     RouteAccess {
         method: Method::POST,
         path: "/groups/:id/state/seal",
@@ -1942,6 +1949,11 @@ mod tests {
                 "/groups/:id/display-name",
                 AccessLevel::JoinSelf,
             ),
+            (
+                Method::POST,
+                "/groups/:id/members/:agent_id/certificate/rebind",
+                AccessLevel::JoinSelf,
+            ),
             (Method::POST, "/groups/:id/state/seal", AccessLevel::Admin),
             (
                 Method::POST,
@@ -2310,6 +2322,7 @@ mod tests {
             token_id: 1,
             token_hash: "bb".repeat(32),
             groups: Vec::new(),
+            scopes: Vec::new(),
         }
     }
 
@@ -3025,6 +3038,7 @@ mod tests {
             token_id: 1,
             token_hash: "hash".to_string(),
             groups: vec!["stable".to_string()],
+            scopes: Vec::new(),
         };
         assert_eq!(
             admit_group_store_route(&granted, "stable").unwrap(),
@@ -3044,6 +3058,7 @@ mod tests {
             token_id: 2,
             token_hash: "hash".to_string(),
             groups: vec!["stab".to_string()],
+            scopes: Vec::new(),
         };
         assert_refusal(
             admit_group_store_route(&near_miss, "stable"),
@@ -3081,6 +3096,7 @@ mod tests {
             token_id: 3,
             token_hash: "hash".to_string(),
             groups: vec!["stable".to_string()],
+            scopes: Vec::new(),
         };
         // The grant cannot lift the owner-class requirement.
         assert_refusal(

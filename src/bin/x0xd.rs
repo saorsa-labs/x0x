@@ -20,7 +20,8 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tracing_appender::non_blocking::WorkerGuard;
+#[path = "../upgrade/log_flush.rs"]
+mod log_flush;
 
 #[cfg(feature = "profile-heap")]
 #[global_allocator]
@@ -118,7 +119,7 @@ async fn run_daemon() -> anyhow::Result<()> {
             "    --no-hard-coded-bootstrap       Skip embedded bootstrap peers (config peers kept)"
         );
         println!(
-            "    --relay                         Be a relay node: Full participation + capability advertisement (ADR-0034)"
+            "    --relay                         Be a relay node: Full participation + capability advertisement (ADR-0034); the advert is informational only and grants no hint eligibility (#1112)"
         );
         println!("    --disable-peer-cache            Do not load or save cached peers");
         println!("    --exec-acl <PATH>               Override default exec ACL path");
@@ -237,24 +238,21 @@ async fn run_daemon() -> anyhow::Result<()> {
     // Whether a config file was actually loaded (explicit `--config`, or the
     // instance's default path). A named instance with a file must declare its
     // plane (David, 2026-09-29); one with no file keeps unset = prod.
-    let mut config_file_loaded = true;
-    let (mut config, mut config_findings) = match &config_path {
-        Some(path) => load_config(path).await?,
-        None => {
-            let config_dir_name = match &cli_instance_name {
-                Some(name) => format!("x0x-{}", name.as_str()),
-                None => "x0x".to_string(),
-            };
-            let default_path = dirs::config_dir()
-                .map(|d| d.join(&config_dir_name).join("config.toml"))
-                .unwrap_or_else(|| PathBuf::from("/etc/x0x/config.toml"));
-            if default_path.exists() {
-                load_config(default_path.to_str().unwrap_or("/etc/x0x/config.toml")).await?
-            } else {
-                config_file_loaded = false;
-                (DaemonConfig::default(), Vec::new())
-            }
-        }
+    // `[gui_show]` reload follows this same path, including the default file
+    // when startup loaded it without `--config`.
+    let config_dir_name = match &cli_instance_name {
+        Some(name) => format!("x0x-{}", name.as_str()),
+        None => "x0x".to_string(),
+    };
+    let default_config_path = dirs::config_dir()
+        .map(|d| d.join(&config_dir_name).join("config.toml"))
+        .unwrap_or_else(|| PathBuf::from("/etc/x0x/config.toml"));
+    let loaded_config_path =
+        x0x::gui::startup_config_path(config_path.as_deref().map(Path::new), &default_config_path);
+    let config_file_loaded = loaded_config_path.is_some();
+    let (mut config, mut config_findings) = match loaded_config_path.as_ref() {
+        Some(path) => load_config(path.to_str().unwrap_or("/etc/x0x/config.toml")).await?,
+        None => (DaemonConfig::default(), Vec::new()),
     };
 
     let (instance_name, effective_connect_acl_path) = resolve_instance_startup(
@@ -268,7 +266,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     // the testnet ran on prod). Without any config file, keep unset = prod
     // (install.sh / `x0x daemon start --name` write none) and only warn below.
     if let Some(name) = instance_name.as_ref() {
-        if config_file_loaded && config.network_id.is_none() {
+        if x0x::server::config::named_instance_refuses_startup(
+            config_file_loaded,
+            config.network_id.as_deref(),
+        ) {
             anyhow::bail!(x0x::server::config::named_instance_missing_network_id(
                 name.as_str()
             ));
@@ -422,6 +423,10 @@ async fn run_daemon() -> anyhow::Result<()> {
         exec_policy,
         connect_policy,
         self_update_enabled,
+        daemon_config_path: loaded_config_path.clone(),
+        // Stop does not write this file. Reload reads the config startup
+        // loaded, or this default path when startup loaded no file.
+        gui_show_write_path: Some(loaded_config_path.unwrap_or(default_config_path)),
     };
     let handle = x0x::server::serve_with_options(config, options).await?;
 
@@ -715,6 +720,11 @@ async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
         .history
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid [history] configuration: {e}"))?;
+    // ADR-0074 §3: non-loopback SOCKS binds are a hard refuse at load time.
+    config
+        .socks
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid [socks] configuration: {e}"))?;
     Ok((config, findings.warning_lines()))
 }
 
@@ -735,11 +745,8 @@ fn log_ansi_enabled(stdout_is_terminal: bool, no_color: bool) -> bool {
 /// The effective filter string is logged at startup so operators can verify
 /// what ended up active.
 ///
-/// Returns the [`tracing_appender::non_blocking::WorkerGuard`] for the stdout
-/// sink. **The caller must keep it alive for the process lifetime** — dropping
-/// it shuts the writer thread down and every subsequent log line is silently
-/// discarded (issue #600).
-fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
+/// Keep the returned guards alive until the process stops accepting logs.
+fn init_logging(level: &str, format: &str) -> Result<Vec<log_flush::LogGuard>> {
     use tracing_subscriber::EnvFilter;
 
     let fallback = level.to_lowercase();
@@ -771,35 +778,60 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
         .map(std::path::PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());
 
-    let file_writer = match log_dir.as_ref() {
-        Some(dir) => match std::fs::create_dir_all(dir) {
-            Ok(()) => {
-                let path = dir.join(format!("x0xd-{}.log", std::process::id()));
-                match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                {
-                    Ok(f) => Some((path, f)),
-                    Err(e) => {
+    let (stdout_writer, stdout_guard) = log_flush::acknowledged(std::io::stdout())?;
+    let mut writers = vec![stdout_writer.clone()];
+    let mut guards = vec![stdout_guard];
+    let file_writer = log_dir.as_ref().and_then(|dir| {
+        let open = || -> std::io::Result<_> {
+            #[cfg(unix)]
+            log_flush::prepare_log_dir(
+                dir,
+                |path| std::fs::File::open(path)?.sync_all(),
+                |path, error| {
+                    eprintln!(
+                        "x0xd: log directory {} sync warning: {error}",
+                        path.display()
+                    );
+                },
+            )?;
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(dir)?;
+            let path = dir.join(format!("x0xd-{}.log", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            #[cfg(unix)]
+            let (writer, guard) = {
+                let parent = match std::fs::File::open(dir) {
+                    Ok(parent) => Some(parent),
+                    Err(error) => {
                         eprintln!(
-                            "x0xd: X0X_LOG_DIR set but could not open {}: {e}",
-                            path.display()
+                            "x0xd: log directory {} open warning: {error}",
+                            dir.display()
                         );
                         None
                     }
-                }
+                };
+                log_flush::acknowledged_file(file, parent)?
+            };
+            #[cfg(not(unix))]
+            let (writer, guard) = log_flush::acknowledged_file(file, None)?;
+            Ok((path, writer, guard))
+        };
+        match open() {
+            Ok((path, writer, guard)) => {
+                writers.push(writer.clone());
+                guards.push(guard);
+                Some((path, writer))
             }
-            Err(e) => {
-                eprintln!(
-                    "x0xd: X0X_LOG_DIR set but mkdir -p {} failed: {e}",
-                    dir.display()
-                );
+            Err(error) => {
+                stdout_writer.record_setup_error(&error);
+                eprintln!("x0xd: X0X_LOG_DIR {} setup failed: {error}", dir.display());
                 None
             }
-        },
-        None => None,
-    };
+        }
+    });
 
     let file_path_for_log = file_writer.as_ref().map(|(p, _)| p.display().to_string());
 
@@ -815,7 +847,7 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
     // process-wide stdout lock — from tokio workers, and under a gossip storm
     // that is tens of thousands of serialised syscalls competing with the very
     // tasks that must stay responsive for the API watchdog's `/health` probe.
-    // `non_blocking` hands formatted lines to a dedicated writer thread instead.
+    // The acknowledged writer sends formatted lines to a dedicated thread.
     // #1036: ANSI colour codes only when stdout is an interactive terminal.
     // Under systemd/journald (and in log files) escape sequences are noise
     // that inflates syslog and breaks grep.
@@ -823,7 +855,6 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
         std::io::IsTerminal::is_terminal(&std::io::stdout()),
         std::env::var_os("NO_COLOR").is_some(),
     );
-    let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
 
     let stdout_layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static> =
         if format == "json" {
@@ -843,8 +874,7 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
 
     let file_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
         match file_writer {
-            Some((_, f)) => {
-                let writer = std::sync::Mutex::new(f);
+            Some((_, writer)) => {
                 if format == "json" {
                     Some(Box::new(
                         tracing_subscriber::fmt::layer()
@@ -870,7 +900,8 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
         // the /health verdict's rolling error count. Cheapest possible
         // layer — no formatting, no I/O — so it keeps the #600 logging
         // path non-blocking.
-        .with(x0x::server::health_verdict::ErrorCountLayer);
+        .with(x0x::server::health_verdict::ErrorCountLayer)
+        .with(log_flush::FlushLayer::new(writers)?);
     if let Some(layer) = file_layer {
         registry.with(layer).init();
     } else {
@@ -892,11 +923,73 @@ fn init_logging(level: &str, format: &str) -> Result<WorkerGuard> {
         );
     }
 
-    Ok(stdout_guard)
+    Ok(guards)
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_log_directory_skips_unrelated_existing_ancestors() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/upgrade-log-dir-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = tempfile::tempdir_in(root).unwrap();
+        let ancestor = fixture.path().join("search-only");
+        let existing = ancestor.join("logs");
+        std::fs::create_dir_all(&existing).unwrap();
+        // Permission checks need a non-root process; the injected check below is unconditional.
+        // SAFETY: geteuid has no pointer or memory preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            let original = std::fs::metadata(&ancestor).unwrap().permissions();
+            std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+            let denied = std::fs::File::open(&ancestor);
+            let write = std::fs::write(existing.join("accepted.log"), b"accepted");
+            let result = super::log_flush::prepare_log_dir(
+                &existing,
+                |path| std::fs::File::open(path)?.sync_all(),
+                |_, error| panic!("unexpected warning: {error}"),
+            );
+            std::fs::set_permissions(&ancestor, original).unwrap();
+            assert_eq!(
+                denied.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            write.unwrap();
+            result.unwrap();
+        }
+        super::log_flush::prepare_log_dir(
+            &existing,
+            |_| {
+                Err(std::io::Error::other(
+                    "existing directory needs no ancestor sync",
+                ))
+            },
+            |_, error| panic!("unexpected warning: {error}"),
+        )
+        .unwrap();
+        let nested = existing.join("new/deep");
+        let mut synced = Vec::new();
+        super::log_flush::prepare_log_dir(
+            &nested,
+            |path| {
+                if path == ancestor {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "unrelated ancestor",
+                    ));
+                }
+                synced.push(path.to_path_buf());
+                std::fs::File::open(path)?.sync_all()
+            },
+            |_, error| panic!("unexpected warning: {error}"),
+        )
+        .unwrap();
+        assert_eq!(synced, vec![nested.clone(), existing.join("new")]);
+        assert!(nested.is_dir());
+    }
+
     #[test]
     fn logs_are_uncoloured_unless_stdout_is_a_terminal() {
         // #1036: journald/syslog captured ANSI escapes from every WARN line.
@@ -1050,6 +1143,23 @@ mod tests {
         assert!(
             super::load_config(&path_str).await.is_ok(),
             "a config without the new rules still loads"
+        );
+    }
+
+    /// ADR-0074 §3: a non-loopback `[socks] listen` refuses config load.
+    #[tokio::test]
+    async fn load_config_refuses_non_loopback_socks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let path_str = path.to_str().expect("utf-8 path").to_owned();
+        std::fs::write(&path, "[socks]\nlisten = \"0.0.0.0:1080\"\n").expect("write config");
+        let error = super::load_config(&path_str)
+            .await
+            .expect_err("non-loopback socks listen must refuse startup");
+        let message = format!("{error:#}").to_ascii_lowercase();
+        assert!(
+            message.contains("loopback"),
+            "refused for the wrong reason: {message}"
         );
     }
 }

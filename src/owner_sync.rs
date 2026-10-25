@@ -73,7 +73,7 @@
 //! is not one of the four fails to decode, and a record whose kind does not
 //! match its value variant is rejected whole.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -156,6 +156,18 @@ pub const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const DEVICES_FILE: &str = "devices.json";
 /// File holding the winning versioned records, inside `<data_dir>/sync/`.
 const RECORDS_FILE: &str = "records.json";
+/// File holding the `IssuanceJournal` records of a commit in progress,
+/// inside `<data_dir>/sync/` (#1542, see `recover_journal_commit`).
+const JOURNAL_INTENT_FILE: &str = "journal-intent.json";
+/// File holding the committed name records that live daemon state may not
+/// show yet, inside `<data_dir>/sync/` (#1545, see `pending_applies`).
+const APPLY_PENDING_FILE: &str = "apply-pending.json";
+/// File holding the unenroll tombstones, inside `<data_dir>/sync/` (#1055).
+const TOMBSTONES_FILE: &str = "unenroll_tombstones.json";
+/// Body-layout version of [`TOMBSTONES_FILE`] (ADR 0085: a version is part
+/// of every persisted format). 1 is the only layout; any other value fails
+/// the load closed instead of decoding into a guessed shape.
+const TOMBSTONES_FORMAT_VERSION: u32 = 1;
 /// Directory under the instance data dir holding all sync state.
 const SYNC_DIR: &str = "sync";
 
@@ -165,6 +177,7 @@ const SYNC_DIR: &str = "sync";
 /// carrying any other kind tag is undecodable and rejected whole.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SyncKind {
     /// Owner profile (`{ human_name }`) — one record, key `"owner"`.
     OwnerProfile = 0x01,
@@ -218,6 +231,7 @@ pub struct HomeRosterEntry {
 /// [`SyncKind`] with NO catch-all. Compiling a new variant forces every
 /// exhaustive match (including [`SyncValue::kind`]) to handle it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SyncValue {
     /// Owner profile: the owner's human-facing name.
     OwnerProfile {
@@ -394,6 +408,11 @@ impl VersionedRecord {
     /// variant disagree; [`SyncError::MalformedFrame`] when the key exceeds
     /// [`MAX_KEY_BYTES`].
     pub fn verify(&self) -> Result<(), SyncError> {
+        // #1604 G5: a value holding a variant this node does not know (for
+        // example a Home policy) can never re-encode to the signed bytes.
+        // Refuse it before any signature work.
+        crate::wire_compat::reject_unknown("SyncValue", &self.value)
+            .map_err(|e| SyncError::UnsupportedVariant(e.to_string()))?;
         if self.value.kind() != self.kind {
             return Err(SyncError::KindMismatch);
         }
@@ -545,8 +564,11 @@ impl OwnerEnrollment {
     }
 }
 
-/// Typed sync failures — every one is fail-closed.
+/// Typed sync failures — every one is fail-closed. New variants can be
+/// added without a breaking change: match it outside this crate with a
+/// wildcard arm (David's approval, 20 Oct 2026, PR #1499).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SyncError {
     Io(String),
     /// Frame body exceeded [`MAX_FRAME_BYTES`], a decode failed, or a
@@ -559,6 +581,16 @@ pub enum SyncError {
     OwnerMismatch,
     /// The peer machine is not in the local owner device set.
     NotEnrolled {
+        machine: [u8; 32],
+    },
+    /// The enrollment was refused: its `enrolled_at_ms` is at or before the
+    /// machine's persisted unenroll tombstone (#1055).
+    EnrollmentTombstoned {
+        machine: [u8; 32],
+    },
+    /// The peer machine was revoked (ADR-0018) while the session ran; the
+    /// session aborted fail-closed (#1055).
+    MachineRevoked {
         machine: [u8; 32],
     },
     /// The peer's owner-key possession proof failed (challenge-response).
@@ -574,6 +606,10 @@ pub enum SyncError {
     UnknownKind {
         tag: u8,
     },
+    /// A frame or record value with a variant this node does not know
+    /// (#1604). Refused before any signature check; the session answers
+    /// with an `Abort` frame.
+    UnsupportedVariant(String),
     /// Store cardinality limit exceeded ([`MAX_STORED_RECORDS`]).
     StoreLimit(String),
     /// Inbound batch/vector exceeded its session cap.
@@ -593,12 +629,15 @@ impl SyncError {
             Self::ProtocolVersion { .. } => "protocol_version",
             Self::OwnerMismatch => "owner_mismatch",
             Self::NotEnrolled { .. } => "not_enrolled",
+            Self::EnrollmentTombstoned { .. } => "enrollment_tombstoned",
+            Self::MachineRevoked { .. } => "machine_revoked",
             Self::ChallengeFailed(_) => "challenge_failed",
             Self::SessionTimeout => "session_timeout",
             Self::SelfSync => "self_sync",
             Self::BadSignature(_) => "bad_signature",
             Self::KindMismatch => "kind_mismatch",
             Self::UnknownKind { .. } => "unknown_kind",
+            Self::UnsupportedVariant(_) => "unsupported_variant",
             Self::StoreLimit(_) => "store_limit",
             Self::TooManyRecords(_) => "too_many_records",
             Self::Poisoned(_) => "poisoned",
@@ -623,6 +662,16 @@ impl std::fmt::Display for SyncError {
                 "machine {} is not in the owner device set",
                 hex::encode(machine)
             ),
+            Self::EnrollmentTombstoned { machine } => write!(
+                f,
+                "enrollment for machine {} predates its unenroll tombstone",
+                hex::encode(machine)
+            ),
+            Self::MachineRevoked { machine } => write!(
+                f,
+                "machine {} is revoked; session aborted fail-closed",
+                hex::encode(machine)
+            ),
             Self::ChallengeFailed(e) => {
                 write!(f, "owner-key possession proof failed: {e}")
             }
@@ -633,6 +682,7 @@ impl std::fmt::Display for SyncError {
             Self::UnknownKind { tag } => {
                 write!(f, "unknown sync kind tag 0x{tag:02x} (Tier-3 allowlist)")
             }
+            Self::UnsupportedVariant(e) => write!(f, "unsupported sync variant: {e}"),
             Self::Poisoned(e) => write!(
                 f,
                 "sync store poisoned (state replaced but not durable): {e}"
@@ -694,6 +744,7 @@ pub struct KindVersions {
 /// [`MAX_RECORDS_PER_SESSION`]) so a large state set never produces a frame
 /// over [`MAX_FRAME_BYTES`] (review R2 finding 5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum SyncFrame {
     /// Handshake: protocol version, sender machine, sender owner, and a
     /// fresh random nonce for the possession proof.
@@ -736,6 +787,25 @@ fn proof_message(
     msg.extend_from_slice(verifier);
     msg.extend_from_slice(owner);
     msg
+}
+
+/// Time allowed to send the `Abort` refusal for an unsupported variant.
+const ABORT_SEND_BUDGET: Duration = Duration::from_secs(2);
+
+/// #1604: answer an unsupported frame variant with the existing `Abort`
+/// frame (best effort, bounded), then return the typed error. Use it only
+/// while this side's send half is still open (before `Done` and FIN).
+async fn refuse_unsupported<S: AsyncWrite + Unpin, T>(
+    send: &mut S,
+    result: Result<T, SyncError>,
+) -> Result<T, SyncError> {
+    if let Err(err @ SyncError::UnsupportedVariant(_)) = &result {
+        let abort = SyncFrame::Abort {
+            reason: err.class().to_string(),
+        };
+        let _ = tokio::time::timeout(ABORT_SEND_BUDGET, write_frame(send, &abort)).await;
+    }
+    result
 }
 
 /// Write one frame: `u32` big-endian length + bincode body.
@@ -782,7 +852,14 @@ pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<SyncFrame,
     }
     let mut body = vec![0u8; len as usize];
     recv.read_exact(&mut body).await?;
-    bincode::deserialize(&body).map_err(|e| SyncError::MalformedFrame(format!("decode: {e}")))
+    crate::wire_compat::decode_bincode("SyncFrame", &body).map_err(|e| match e {
+        crate::wire_compat::WireDecodeError::UnknownVariant { .. } => {
+            SyncError::UnsupportedVariant(e.to_string())
+        }
+        crate::wire_compat::WireDecodeError::Malformed { detail, .. } => {
+            SyncError::MalformedFrame(format!("decode: {detail}"))
+        }
+    })
 }
 
 /// Outcome of one sync session, for surfaces and tests.
@@ -799,14 +876,41 @@ pub struct SessionSummary {
 
 type VerifiedEnrollmentOwners = BTreeMap<[u8; 32], (UserId, OwnerEnrollment)>;
 
+/// The register: the winning record of each `(kind, key)`.
+type RecordMap = BTreeMap<(SyncKind, String), VersionedRecord>;
+
+/// An owned hold of `OwnerSyncStore::journal_apply`.
+type JournalGuard = tokio::sync::OwnedMutexGuard<()>;
+
+/// #1545: a hold of the store's write custody
+/// (`OwnerSyncStore::write_custody`). The task of a durable write owns
+/// one until the write ends; shutdown waits for every hold.
+pub(crate) struct WriteCustody {
+    _custody: tokio::sync::OwnedRwLockReadGuard<bool>,
+}
+
 pub struct OwnerSyncStore {
     dir: PathBuf,
-    records: tokio::sync::RwLock<BTreeMap<(SyncKind, String), VersionedRecord>>,
-    devices: tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>,
+    /// Every change of the register runs its durable write in a task that
+    /// owns this lock until the write and the memory update are done
+    /// (`replace_records`, #1545).
+    records: Arc<tokio::sync::RwLock<RecordMap>>,
+    /// Each change runs its durable write as the register does
+    /// (`replace_state`, #1545).
+    devices: Arc<tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>>,
+    /// #1055: machine → deletion time (Unix ms). Written BEFORE the device
+    /// row is removed, so a crash between the two writes leaves the machine
+    /// blocked (fail closed), never re-admittable from a stale enrollment.
+    /// Guard order everywhere: `tombstones` BEFORE `devices`, never the
+    /// reverse. `enroll` holds the tombstone READ across its device insert
+    /// and `unenroll` holds the WRITE across both of its mutations, so
+    /// enrollment and deletion serialize on this lock (RC1: no delete can
+    /// land between `enroll`'s check and its insert).
+    unenroll_tombstones: Arc<tokio::sync::RwLock<BTreeMap<[u8; 32], u64>>>,
     // Verified once on load/enroll, consulted under the devices read lock.
-    evidence_owners: std::sync::RwLock<VerifiedEnrollmentOwners>,
+    evidence_owners: Arc<std::sync::RwLock<VerifiedEnrollmentOwners>>,
     last_session: tokio::sync::RwLock<BTreeMap<[u8; 32], DeviceSyncStatus>>,
-    generation_tx: tokio::sync::watch::Sender<u64>,
+    generation_tx: Arc<tokio::sync::watch::Sender<u64>>,
     /// #824: count of successful sessions with an owner device, inbound or
     /// outbound. Home provisioning waits for one before minting, because a
     /// completed session means that device's records, including any
@@ -816,7 +920,7 @@ pub struct OwnerSyncStore {
     /// synced: memory/disk agreement is no longer reconstructable by
     /// rollback, so every further mutation and session fails until the
     /// process reloads from disk (review R5 finding 2).
-    poisoned: std::sync::Mutex<Option<String>>,
+    poisoned: Arc<std::sync::Mutex<Option<String>>>,
     /// Test injection: make the next durable writes fail AFTER the rename
     /// (simulates a post-rename fsync failure). Never set in production.
     fail_after_rename: std::sync::atomic::AtomicBool,
@@ -840,23 +944,199 @@ pub struct OwnerSyncStore {
     /// which wraps it), [`Self::mint`], and
     /// [`Self::records_insert_for_testing`]. Writes that touch no
     /// `HomePointer` record skip the gate, so ordinary name and journal sync
-    /// is never serialized behind a seat.
+    /// is never serialized behind a seat. Session commits
+    /// (`commit_session_batch`) and `unenroll` are the #1055 RC1 exception:
+    /// both take the gate UNCONDITIONALLY, because the session commit
+    /// re-validates peer admission while holding it and `unenroll`'s removal
+    /// must not land between that check and the records mutation.
     ///
     /// **Lock order, never to be violated.** Readers:
     /// `canonical_home_gate` → per-group membership lock → `named_groups`
-    /// and persistence. Writers: `canonical_home_gate` → `records`. The two
-    /// cannot cycle because `commit_batch`, `mint` and `apply_record` never
-    /// take a membership lock or `named_groups` (`apply_record`'s
-    /// `HomePointer` arm is a no-op and its names arm spawns), and the
-    /// reader never touches `records` while holding a membership lock.
+    /// and persistence. Writers: `canonical_home_gate` → `records`. Removal:
+    /// `canonical_home_gate` → `unenroll_tombstones` → `devices`. The
+    /// orders cannot cycle because `commit_batch`, `mint` and `apply_record`
+    /// never take a membership lock or `named_groups` (`apply_record`'s
+    /// `HomePointer` arm is a no-op and its names arm spawns), the reader
+    /// never touches `records` while holding a membership lock, and no path
+    /// acquires the gate while already holding `unenroll_tombstones` or
+    /// `devices` (the enrollment and `is_enrolled` paths touch those maps
+    /// without the gate and never take it).
     ///
     /// This is a LOCAL linearization boundary only. It claims nothing about
     /// cross-device election ordering.
-    canonical_home_gate: tokio::sync::RwLock<()>,
+    canonical_home_gate: Arc<tokio::sync::RwLock<()>>,
+    /// #1542: the one serializer of the `IssuanceJournal` register and the
+    /// issuance journal file. Two writers move values between them:
+    /// [`Self::commit_batch`] (for an accepted inbound record) and the
+    /// reconcile `mint_journal_lines`. Both write the journal file first
+    /// and the register second, and each holds this lock for its whole
+    /// read-and-write, so neither sees the other half done. Thus every
+    /// durable register value is in the journal file, or the journal file
+    /// holds a newer line that the next reconcile publishes. A failure or
+    /// a restart between the two writes leaves the journal ahead, never
+    /// behind: a register ahead of the journal would make the reconcile
+    /// mint the journal's older line over it. The commit also writes a
+    /// journal intent before the journal file, so a restart can finish an
+    /// interrupted commit (`recover_journal_commit`), and the reconcile
+    /// mints only from a durable journal read. Lock order: `journal_apply` →
+    /// `canonical_home_gate` → `records`, and `journal_apply` → the
+    /// profile journal writer lock.
+    ///
+    /// #1545: each write of the journal intent and each register write
+    /// of a commit runs in a task that owns this lock until the write is
+    /// done (`run_to_completion`). A cancelled caller cannot release it
+    /// while one of its writes can still land.
+    journal_apply: Arc<tokio::sync::Mutex<()>>,
+    /// The local issuance journal that accepted `IssuanceJournal` records
+    /// are applied to (set by the service; unset in a bare store).
+    journal_file: std::sync::OnceLock<PathBuf>,
+    /// #1545: the committed name records that live daemon state may not
+    /// show yet, keyed by kind, key and record hash; a mirror of `APPLY_PENDING_FILE`.
+    /// A commit adds its name records here and to the file before its
+    /// register write, and only a durable save of the daemon profile
+    /// removes them (see [`Self::pending_applies`]). A restart before
+    /// that applies them again, so the reconcile never mints the old live
+    /// names over them. A new record of a key does not replace an older
+    /// one: until the new record's commit is durable, the older one can
+    /// still be the register's winner. Lock order: `records` →
+    /// `pending_apply`.
+    ///
+    /// Every change of the obligations and every live-name mint is
+    /// checked against the register under `records`, with this lock
+    /// inside it:
+    /// - a commit adds its names under the `records` write lock, before
+    ///   its register write (`add_pending_applies`);
+    /// - a retirement (`discharge_applies`, `settle_saved`) holds the
+    ///   `records` read lock, so no commit can change a winner between
+    ///   its check and its removal;
+    /// - a live-name mint (`mint_live_name`) holds the `records` write
+    ///   lock, and mints only when no winner is owed and the epoch
+    ///   (`PendingApplies::epoch`) is the one read before the live names
+    ///   were read.
+    ///
+    /// Each write of `APPLY_PENDING_FILE` runs in a task that owns this
+    /// lock until the write and the memory update are done
+    /// (`replace_pending`).
+    pending_apply: Arc<tokio::sync::Mutex<PendingApplies>>,
+    /// #1545: the custody of this store's files. Each durable write of a
+    /// store file holds a read guard of it for the whole write
+    /// (`run_to_completion`); the value is `true` once the store has
+    /// given up its files (`release_write_custody`). Shutdown takes the
+    /// write guard, so it waits for every write in flight, and every write
+    /// after it is refused. No write can then land after the daemon has
+    /// released its data directory to a restarted daemon.
+    write_custody: Arc<tokio::sync::RwLock<bool>>,
+    /// Test injection: hold a synced journal append after its decision
+    /// read until the test releases it.
+    #[cfg(test)]
+    journal_check_pause: std::sync::Mutex<Option<JournalCheckPause>>,
+    /// Test injection: hold the reconcile's journal mint after it reads
+    /// the journal until the test releases it.
+    #[cfg(test)]
+    journal_read_pause: std::sync::Mutex<Option<JournalCheckPause>>,
+    /// Test injection: hold the reconcile's name mint after it reads the
+    /// live names until the test releases it.
+    #[cfg(test)]
+    name_mint_pause: std::sync::Mutex<Option<JournalCheckPause>>,
+    /// Test injection: hold the next discharge of pending applies before
+    /// it takes any lock until the test releases it.
+    #[cfg(test)]
+    discharge_pause: std::sync::Mutex<Option<JournalCheckPause>>,
+    /// Test injection: fail the next register write before its rename.
+    #[cfg(test)]
+    fail_next_register_write: std::sync::atomic::AtomicBool,
+    /// Test injection: fail every synced journal append.
+    #[cfg(test)]
+    fail_journal_append: std::sync::atomic::AtomicBool,
+    /// Test injection: fail the write of the next discharge of pending
+    /// applies.
+    #[cfg(test)]
+    fail_next_discharge: std::sync::atomic::AtomicBool,
+    /// Test injection: stop the next journal-applying commit after the
+    /// first of its two writes (register and journal file), as a crash
+    /// between them would.
+    #[cfg(test)]
+    stop_between_journal_writes: std::sync::atomic::AtomicBool,
     /// ADR-0074 §4: woken when the owner device set changes (an enrollment
     /// or unenrollment).
     device_change_notify: std::sync::Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
 }
+
+/// The key of a pending apply (`OwnerSyncStore::pending_apply`).
+type PendingKey = (SyncKind, String, [u8; 32]);
+
+fn pending_key(record: &VersionedRecord) -> PendingKey {
+    (record.kind, record.key.clone(), record.record_hash())
+}
+
+/// The names of a profile save (`OwnerSyncStore::note_profile_save`). A
+/// private copy of [`SyncProfileNames`], so the public type gets no serde
+/// impls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SavedNames {
+    human_name: Option<String>,
+    display_name: Option<String>,
+    machine_name: Option<String>,
+}
+
+impl From<&SyncProfileNames> for SavedNames {
+    fn from(names: &SyncProfileNames) -> Self {
+        Self {
+            human_name: names.human_name.clone(),
+            display_name: names.display_name.clone(),
+            machine_name: names.machine_name.clone(),
+        }
+    }
+}
+
+/// #1545: a pending apply (`OwnerSyncStore::pending_apply`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingApply {
+    record: VersionedRecord,
+    /// The names of each profile save that started with `record` folded
+    /// in, written durably before the save. A durable profile with one of
+    /// these names holds `record` or a later local edit over it, so
+    /// `record` is not owed any more (`OwnerSyncStore::settle_saved`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    saved_in: Vec<SavedNames>,
+    /// `record` is not owed any more, but no write of `APPLY_PENDING_FILE`
+    /// without it has succeeded yet. No pass applies it, and every write
+    /// of the file leaves it out; the first write that succeeds removes
+    /// it from memory (`OwnerSyncStore::persist_and_prune`). Until then a
+    /// profile save must write the file first (`note_profile_save`), or
+    /// the stale file entry can come back at the next start over that
+    /// save.
+    #[serde(skip)]
+    discharged: bool,
+}
+
+/// #1545: the pending applies (`OwnerSyncStore::pending_apply`).
+#[derive(Debug, Clone, Default)]
+struct PendingApplies {
+    applies: BTreeMap<PendingKey, PendingApply>,
+    /// The generation of `applies`. It changes at each commit that adds
+    /// names and at each retirement. A retirement means that the live
+    /// profile now holds a committed name (or that the name is no longer
+    /// owed), so live names read before it can be older than the
+    /// register. The reconcile reads it before it reads the live names
+    /// ([`OwnerSyncStore::names_epoch`]), and its mint compares it
+    /// (`OwnerSyncStore::mint_live_name`).
+    epoch: u64,
+}
+
+/// The contents of `APPLY_PENDING_FILE`.
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct PersistedPendingApplies {
+    #[serde(default)]
+    applies: Vec<PendingApply>,
+}
+
+/// The two ends of [`OwnerSyncStore::pause_next_journal_check`].
+#[cfg(test)]
+type JournalCheckPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
 
 /// Per-device sync status surfaced by `GET /sync/devices`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -877,6 +1157,36 @@ struct PersistedDevices {
     devices: Vec<OwnerEnrollment>,
 }
 
+/// A persisted unenroll tombstone (#1055, ADR 0084 finding 3): the owner
+/// deleted `machine_id` from the device set at `deleted_at_ms`. Enroll
+/// refuses any enrollment for the machine with
+/// `enrolled_at_ms <= deleted_at_ms`, so a stale owner-signed record
+/// cannot re-open admission after a local restore or an enroll replay.
+/// Local only — enrollments are never accepted from the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct UnenrollTombstone {
+    machine_id: [u8; 32],
+    deleted_at_ms: u64,
+}
+
+/// Persisted shape of [`TOMBSTONES_FILE`] — a JSON envelope with an
+/// explicit `version` (ADR 0085): an unknown version fails the load
+/// closed instead of decoding into a guessed shape.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTombstones {
+    version: u32,
+    tombstones: Vec<UnenrollTombstone>,
+}
+
+impl Default for PersistedTombstones {
+    fn default() -> Self {
+        Self {
+            version: TOMBSTONES_FORMAT_VERSION,
+            tombstones: Vec::new(),
+        }
+    }
+}
+
 /// Result of a batch commit: what the caller should apply/count.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommitOutcome {
@@ -895,14 +1205,18 @@ impl OwnerSyncStore {
     }
 
     fn notify_device_change(&self) {
-        if let Some(notify) = self
-            .device_change_notify
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(notify) = self.device_change_notifier() {
             notify.notify_one();
         }
+    }
+
+    /// The listener that `notify_device_change` wakes, for a task that
+    /// owns no `&self`.
+    fn device_change_notifier(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.device_change_notify
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Load (or start empty under) `<data_dir>/sync`, creating the
@@ -921,8 +1235,40 @@ impl OwnerSyncStore {
         tokio::fs::create_dir_all(&dir).await.map_err(|e| {
             SyncError::Io(format!("failed to create sync dir {}: {e}", dir.display()))
         })?;
+        // #1545: a write can stop after its rename and before its
+        // directory fsync. Its bytes are then visible but not durable, and
+        // a host crash can take them back after this start has acted on
+        // them (a journal recovery removes its intent, a settle removes an
+        // obligation). So make every state file durable before it is read.
+        for file in [
+            RECORDS_FILE,
+            DEVICES_FILE,
+            APPLY_PENDING_FILE,
+            TOMBSTONES_FILE,
+            JOURNAL_INTENT_FILE,
+        ] {
+            let path = dir.join(file);
+            crate::profile::make_durable(&path).await.map_err(|e| {
+                SyncError::Io(format!(
+                    "cannot make sync state file {} durable: {e} — refusing to start",
+                    path.display()
+                ))
+            })?;
+        }
         let persisted_records: PersistedRecords = Self::load_json(&dir.join(RECORDS_FILE)).await?;
         let persisted_devices: PersistedDevices = Self::load_json(&dir.join(DEVICES_FILE)).await?;
+        let pending_apply: PersistedPendingApplies =
+            Self::load_json(&dir.join(APPLY_PENDING_FILE)).await?;
+        let persisted_tombstones: PersistedTombstones =
+            Self::load_json(&dir.join(TOMBSTONES_FILE)).await?;
+        if persisted_tombstones.version != TOMBSTONES_FORMAT_VERSION {
+            // ADR 0085 rule 4: unknown version — refuse, leave the file
+            // untouched, never decode into a guessed shape.
+            return Err(SyncError::Io(format!(
+                "unknown tombstone format version {} in {TOMBSTONES_FILE} — refusing to start",
+                persisted_tombstones.version
+            )));
+        }
         let records = persisted_records
             .records
             .into_iter()
@@ -933,6 +1279,12 @@ impl OwnerSyncStore {
             .into_iter()
             .map(|d| (d.machine_id, d))
             .collect::<BTreeMap<_, _>>();
+        // Keep the LATEST deletion per machine on duplicate entries.
+        let mut unenroll_tombstones: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+        for tombstone in persisted_tombstones.tombstones {
+            let deleted_at = unenroll_tombstones.entry(tombstone.machine_id).or_insert(0);
+            *deleted_at = (*deleted_at).max(tombstone.deleted_at_ms);
+        }
         let evidence_owners = devices
             .iter()
             .filter_map(|(m, e)| {
@@ -945,15 +1297,43 @@ impl OwnerSyncStore {
         let (generation_tx, _) = tokio::sync::watch::channel(0);
         Ok(Self {
             dir,
-            records: tokio::sync::RwLock::new(records),
-            devices: tokio::sync::RwLock::new(devices),
-            evidence_owners: std::sync::RwLock::new(evidence_owners),
+            records: Arc::new(tokio::sync::RwLock::new(records)),
+            devices: Arc::new(tokio::sync::RwLock::new(devices)),
+            unenroll_tombstones: Arc::new(tokio::sync::RwLock::new(unenroll_tombstones)),
+            evidence_owners: Arc::new(std::sync::RwLock::new(evidence_owners)),
             last_session: tokio::sync::RwLock::new(BTreeMap::new()),
-            generation_tx,
+            generation_tx: Arc::new(generation_tx),
             sessions_ok_tx: tokio::sync::watch::channel(0).0,
-            poisoned: std::sync::Mutex::new(None),
+            poisoned: Arc::new(std::sync::Mutex::new(None)),
             fail_after_rename: std::sync::atomic::AtomicBool::new(false),
-            canonical_home_gate: tokio::sync::RwLock::new(()),
+            canonical_home_gate: Arc::new(tokio::sync::RwLock::new(())),
+            journal_apply: Arc::new(tokio::sync::Mutex::new(())),
+            journal_file: std::sync::OnceLock::new(),
+            pending_apply: Arc::new(tokio::sync::Mutex::new(PendingApplies {
+                applies: pending_apply
+                    .applies
+                    .into_iter()
+                    .map(|p| (pending_key(&p.record), p))
+                    .collect(),
+                epoch: 0,
+            })),
+            write_custody: Arc::new(tokio::sync::RwLock::new(false)),
+            #[cfg(test)]
+            journal_check_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            journal_read_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            name_mint_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            discharge_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_next_register_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_journal_append: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_discharge: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            stop_between_journal_writes: std::sync::atomic::AtomicBool::new(false),
             device_change_notify: std::sync::Mutex::new(None),
         })
     }
@@ -1010,7 +1390,7 @@ impl OwnerSyncStore {
             .await
             .map_err(DurableWriteError::BeforeRename)?;
         drop(file);
-        tokio::fs::rename(&tmp, path)
+        crate::profile::rename_file(&tmp, path)
             .await
             .map_err(DurableWriteError::BeforeRename)?;
         // Everything below runs with the NEW state already visible.
@@ -1040,68 +1420,252 @@ impl OwnerSyncStore {
         }
         #[cfg(not(unix))]
         let _ = path.parent();
+        #[cfg(test)]
+        crate::profile::crash_sim::note_durable(path);
         Ok(())
     }
 
-    /// Persist the winning records. `Poisoned` tells the caller the write
-    /// crossed the rename but could not be made durable — memory must NOT
-    /// be rolled back (disk already advanced); the store must be poisoned.
-    /// Errors PROPAGATE — callers never report success on a swallowed
-    /// write (review R2 finding 2).
-    async fn persist_records(
-        &self,
-        records: &BTreeMap<(SyncKind, String), VersionedRecord>,
-    ) -> Result<(), SyncError> {
-        let persisted = PersistedRecords {
-            records: records.values().cloned().collect(),
-        };
-        let bytes = serde_json::to_vec(&persisted)
-            .map_err(|e| SyncError::Io(format!("encode records: {e}")))?;
-        Self::write_atomically(
-            &self.dir.join(RECORDS_FILE),
-            &bytes,
-            self.fail_after_rename_for_testing(),
-        )
-        .await
-        .map_err(|e| match e {
-            DurableWriteError::BeforeRename(io) => SyncError::Io(format!("persist records: {io}")),
-            DurableWriteError::AfterRename(io) => {
-                SyncError::Poisoned(format!("records replaced but not durable: {io}"))
-            }
-        })
+    /// #1545: take a hold of the store's write custody for one durable
+    /// write. Shutdown waits for every hold (`release_write_custody`), so
+    /// the write that owns it ends before the daemon releases its data
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the store has released its files.
+    pub(crate) async fn write_custody(&self) -> Result<WriteCustody, SyncError> {
+        let custody = Arc::clone(&self.write_custody).read_owned().await;
+        if *custody {
+            return Err(SyncError::Io(
+                "owner sync store has released its files: write refused".into(),
+            ));
+        }
+        Ok(WriteCustody { _custody: custody })
     }
 
-    /// Persist the device set; errors propagate (see [`Self::persist_records`]).
-    async fn persist_devices(
+    /// #1545: run `work` to its end in its own task, and wait for its
+    /// output. A cancelled caller stops only its wait. Every durable write
+    /// of the store runs in this way: the register, the device set and
+    /// the tombstones through `replace_state`, the pending applies and the
+    /// journal intent directly, and the profile save through the server.
+    /// The owned guards of the state that a write changes move into
+    /// `work`, and stay held until the write and the memory update after
+    /// it are done: no later writer can start before the write lands, and
+    /// memory ends as the disk holds it.
+    ///
+    /// The task also holds a hold of the write custody
+    /// (`write_custody`) until `work` ends, so shutdown waits for it.
+    /// After shutdown, `work` does not run.
+    ///
+    /// # Errors
+    ///
+    /// The error of `work`; [`SyncError::Io`] when its task fails, or when
+    /// the store has released its files.
+    pub(crate) async fn run_to_completion<T: Send + 'static>(
         &self,
-        devices: &BTreeMap<[u8; 32], OwnerEnrollment>,
-    ) -> Result<(), SyncError> {
-        let persisted = PersistedDevices {
-            devices: devices.values().cloned().collect(),
+        work: impl std::future::Future<Output = Result<T, SyncError>> + Send + 'static,
+    ) -> Result<T, SyncError> {
+        let custody = self.write_custody().await?;
+        tokio::spawn(async move {
+            let out = work.await;
+            drop(custody);
+            out
+        })
+        .await
+        .map_err(|e| SyncError::Io(format!("durable write task failed: {e}")))?
+    }
+
+    /// #1545: give up the store's files before the daemon releases its
+    /// data directory. Waits for every durable write in flight, including
+    /// one whose caller shutdown aborted, and refuses every later write
+    /// (`write_custody`). The wait has no bound: a write cannot be stopped
+    /// once it has started, and only the end of the process (which also
+    /// ends the write) may come first.
+    pub(crate) async fn release_write_custody(&self) {
+        *self.write_custody.write().await = true;
+    }
+
+    /// #1545: the one write path of a state file. Write `bytes` (the
+    /// encoding of `next`) durably to `file`, then make `next` the state in
+    /// memory and call `landed`. All of this runs to its end in
+    /// one task (`run_to_completion`), which owns `state` and `held` until
+    /// then. A caller builds `next` from a copy of the state, so a caller
+    /// cancelled before this call leaves the state as it was. `state` and
+    /// `held` come back on success, so a caller can keep them across a
+    /// second write.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the write fails before its rename: the state
+    /// does not change. [`SyncError::Poisoned`] when it fails after its
+    /// rename: the disk holds `next`, so memory takes it too (and `landed`
+    /// runs), and the store is poisoned (review R5 finding 2). Errors
+    /// PROPAGATE — callers never report success on a swallowed write
+    /// (review R2 finding 2).
+    async fn replace_state<T, H>(
+        &self,
+        mut state: tokio::sync::OwnedRwLockWriteGuard<T>,
+        next: T,
+        file: &'static str,
+        bytes: Vec<u8>,
+        held: H,
+        landed: impl FnOnce() + Send + 'static,
+    ) -> Result<(tokio::sync::OwnedRwLockWriteGuard<T>, H), SyncError>
+    where
+        T: Send + Sync + 'static,
+        H: Send + 'static,
+    {
+        let path = self.dir.join(file);
+        let fail_after_rename = self.fail_after_rename_for_testing();
+        let poisoned = Arc::clone(&self.poisoned);
+        self.run_to_completion(async move {
+            let written = Self::write_atomically(&path, &bytes, fail_after_rename).await;
+            if let Err(DurableWriteError::BeforeRename(io)) = written {
+                return Err(SyncError::Io(format!("persist {file}: {io}")));
+            }
+            // The disk holds `next`: memory takes it, even when the write
+            // is not durable. Never roll memory back below an advanced
+            // disk.
+            *state = next;
+            landed();
+            if let Err(DurableWriteError::AfterRename(io)) = written {
+                let e = SyncError::Poisoned(format!("{file} replaced but not durable: {io}"));
+                Self::poison_slot(&poisoned, e.to_string());
+                return Err(e);
+            }
+            Ok((state, held))
+        })
+        .await
+    }
+
+    /// Write `next` durably as the register, and then make it the register
+    /// in memory (`replace_state`). `held` comes back on success.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::replace_state`].
+    async fn replace_records<H: Send + 'static>(
+        &self,
+        records: tokio::sync::OwnedRwLockWriteGuard<RecordMap>,
+        next: RecordMap,
+        held: H,
+    ) -> Result<H, SyncError> {
+        let bytes = serde_json::to_vec(&PersistedRecords {
+            records: next.values().cloned().collect(),
+        })
+        .map_err(|e| SyncError::Io(format!("encode records: {e}")))?;
+        #[cfg(test)]
+        if self
+            .fail_next_register_write
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(SyncError::Io("injected register write failure".into()));
+        }
+        let generation = Arc::clone(&self.generation_tx);
+        let landed = move || Self::kick_generation(&generation);
+        self.replace_state(records, next, RECORDS_FILE, bytes, held, landed)
+            .await
+            .map(|(_, held)| held)
+    }
+
+    /// Write `next` durably as the device set, and then make it the device
+    /// set in memory (`replace_state`). The memory update after the write
+    /// sets the verified owner of `machine` to `verified`
+    /// ([`Self::devices_landed`]).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::replace_state`].
+    async fn replace_devices<H: Send + 'static>(
+        &self,
+        devices: tokio::sync::OwnedRwLockWriteGuard<BTreeMap<[u8; 32], OwnerEnrollment>>,
+        next: BTreeMap<[u8; 32], OwnerEnrollment>,
+        held: H,
+        machine: [u8; 32],
+        verified: Option<(UserId, OwnerEnrollment)>,
+    ) -> Result<H, SyncError> {
+        let landed = self.devices_landed(machine, verified);
+        let bytes = serde_json::to_vec(&PersistedDevices {
+            devices: next.values().cloned().collect(),
+        })
+        .map_err(|e| SyncError::Io(format!("encode devices: {e}")))?;
+        self.replace_state(devices, next, DEVICES_FILE, bytes, held, landed)
+            .await
+            .map(|(_, held)| held)
+    }
+
+    /// The memory update after a device set write: set the verified owner
+    /// of `machine` to `verified` (or remove it), kick a sync pass and wake
+    /// the device-change listener. It runs in the write task, so a
+    /// cancelled caller cannot skip it.
+    fn devices_landed(
+        &self,
+        machine: [u8; 32],
+        verified: Option<(UserId, OwnerEnrollment)>,
+    ) -> impl FnOnce() + Send + 'static {
+        let evidence = Arc::clone(&self.evidence_owners);
+        let generation = Arc::clone(&self.generation_tx);
+        let notify = self.device_change_notifier();
+        move || {
+            if let Ok(mut owners) = evidence.write() {
+                match verified {
+                    Some(entry) => {
+                        owners.insert(machine, entry);
+                    }
+                    None => {
+                        owners.remove(&machine);
+                    }
+                }
+            }
+            Self::kick_generation(&generation);
+            if let Some(notify) = notify {
+                notify.notify_one();
+            }
+        }
+    }
+
+    /// Write `next` durably as the unenroll tombstones, and then make them
+    /// the tombstones in memory (`replace_state`). The tombstone guard and
+    /// `held` come back on success.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::replace_state`].
+    async fn replace_tombstones<H: Send + 'static>(
+        &self,
+        tombstones: tokio::sync::OwnedRwLockWriteGuard<BTreeMap<[u8; 32], u64>>,
+        next: BTreeMap<[u8; 32], u64>,
+        held: H,
+    ) -> Result<
+        (
+            tokio::sync::OwnedRwLockWriteGuard<BTreeMap<[u8; 32], u64>>,
+            H,
+        ),
+        SyncError,
+    > {
+        let persisted = PersistedTombstones {
+            version: TOMBSTONES_FORMAT_VERSION,
+            tombstones: next
+                .iter()
+                .map(|(machine_id, deleted_at_ms)| UnenrollTombstone {
+                    machine_id: *machine_id,
+                    deleted_at_ms: *deleted_at_ms,
+                })
+                .collect(),
         };
         let bytes = serde_json::to_vec(&persisted)
-            .map_err(|e| SyncError::Io(format!("encode devices: {e}")))?;
-        Self::write_atomically(
-            &self.dir.join(DEVICES_FILE),
-            &bytes,
-            self.fail_after_rename_for_testing(),
-        )
-        .await
-        .map_err(|e| match e {
-            DurableWriteError::BeforeRename(io) => SyncError::Io(format!("persist devices: {io}")),
-            DurableWriteError::AfterRename(io) => {
-                SyncError::Poisoned(format!("devices replaced but not durable: {io}"))
-            }
-        })
+            .map_err(|e| SyncError::Io(format!("encode tombstones: {e}")))?;
+        self.replace_state(tombstones, next, TOMBSTONES_FILE, bytes, held, || {})
+            .await
     }
 
     /// Poison the store: a durable write crossed the rename but could not
     /// be synced, so memory/disk agreement is not reconstructable — all
     /// further mutations and sessions fail until a fresh `load` (review R5
-    /// finding 2).
-    fn poison(&self, reason: String) {
-        *self
-            .poisoned
+    /// finding 2). The write task calls it (`replace_state`), so it takes
+    /// the slot, not `&self`.
+    fn poison_slot(slot: &std::sync::Mutex<Option<String>>, reason: String) {
+        *slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
     }
@@ -1124,6 +1688,207 @@ impl OwnerSyncStore {
         self.poisoned_reason().map(SyncError::Poisoned)
     }
 
+    /// Whether the test armed a stop between a commit's two writes;
+    /// disarms it.
+    #[cfg(test)]
+    fn stop_after_first_journal_write(&self) -> bool {
+        self.stop_between_journal_writes
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Hold the next synced journal append after its decision read: it
+    /// signals `checked` and then waits for `release`.
+    #[cfg(test)]
+    fn pause_next_journal_check(
+        &self,
+        checked: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        Self::arm_pause(&self.journal_check_pause, checked, release);
+    }
+
+    #[cfg(test)]
+    async fn pause_after_journal_check(&self) {
+        Self::take_pause(&self.journal_check_pause).await;
+    }
+
+    /// Hold the next reconcile journal mint after it reads the journal: it
+    /// signals `read` and then waits for `release`.
+    #[cfg(test)]
+    fn pause_next_journal_read(
+        &self,
+        read: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        Self::arm_pause(&self.journal_read_pause, read, release);
+    }
+
+    #[cfg(test)]
+    async fn pause_after_journal_read(&self) {
+        Self::take_pause(&self.journal_read_pause).await;
+    }
+
+    /// Hold the next reconcile name mint after it reads the live names:
+    /// it signals `read` and then waits for `release`.
+    #[cfg(test)]
+    pub(crate) fn pause_next_name_mint(
+        &self,
+        read: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        Self::arm_pause(&self.name_mint_pause, read, release);
+    }
+
+    #[cfg(test)]
+    async fn pause_before_name_mint(&self) {
+        Self::take_pause(&self.name_mint_pause).await;
+    }
+
+    /// Hold the next discharge of pending applies before it takes any
+    /// lock: it signals `reached` and then waits for `release`.
+    #[cfg(test)]
+    pub(crate) fn pause_next_discharge(
+        &self,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        Self::arm_pause(&self.discharge_pause, reached, release);
+    }
+
+    /// Test injection: fail the next register write before its rename, so
+    /// the commit rolls back after its pending applies are durable.
+    #[cfg(test)]
+    pub(crate) fn fail_next_register_write(&self) {
+        self.fail_next_register_write
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn arm_pause(
+        slot: &std::sync::Mutex<Option<JournalCheckPause>>,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    async fn take_pause(slot: &std::sync::Mutex<Option<JournalCheckPause>>) {
+        let pause = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+
+    /// Append the line for the register value `value` to the journal file
+    /// at `path` when this device needs it ([`synced_line_needed`]).
+    /// `published` is the register's value before the commit that accepted
+    /// `value`. `held` holds `journal_apply`, so the register cannot
+    /// change and no reconcile can read the journal until this returns.
+    /// `held` moves into the append and comes back after it (#1545).
+    ///
+    /// # Errors
+    ///
+    /// The IO error of a failed append. The caller must not then persist
+    /// `value` to the register (see `journal_apply`).
+    async fn apply_journal_value<H: Send + 'static>(
+        &self,
+        path: &Path,
+        owner_hex: &str,
+        value: &SyncValue,
+        published: Option<SyncValue>,
+        held: H,
+    ) -> std::io::Result<H> {
+        let SyncValue::IssuanceJournal {
+            agent_id,
+            cert_digest,
+            issued_at,
+            not_after,
+        } = value
+        else {
+            return Ok(held);
+        };
+        #[cfg(test)]
+        if self
+            .fail_journal_append
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(std::io::Error::other("injected append failure"));
+        }
+        let published_digest = match published {
+            Some(SyncValue::IssuanceJournal { cert_digest, .. }) => Some(cert_digest),
+            _ => None,
+        };
+        // #1545: the journal write holds the store's write custody, and
+        // `held`, until it lands, so shutdown waits for it even when this
+        // caller is aborted, and a write after shutdown is refused.
+        let custody = self
+            .write_custody()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let (_, (_, held)) = crate::profile::IssuedCertRecord::append_when(
+            path,
+            (custody, held),
+            |existing| async move {
+                #[cfg(test)]
+                self.pause_after_journal_check().await;
+                synced_line_needed(
+                    &existing,
+                    owner_hex,
+                    agent_id,
+                    cert_digest,
+                    *issued_at,
+                    *not_after,
+                    published_digest.as_deref(),
+                )
+                .then(|| {
+                    synced_journal_line(
+                        owner_hex.to_string(),
+                        agent_id.clone(),
+                        cert_digest.clone(),
+                        *issued_at,
+                        *not_after,
+                    )
+                })
+            },
+        )
+        .await?;
+        Ok(held)
+    }
+
+    /// Apply accepted `IssuanceJournal` records to the issuance journal at
+    /// `path` (the service sets it once, at construction).
+    pub(crate) fn set_journal_path(&self, path: PathBuf) {
+        let _ = self.journal_file.set(path);
+    }
+
+    /// Test injection: fail (or stop failing) every synced journal append.
+    #[cfg(test)]
+    pub(crate) fn set_fail_journal_append(&self, fail: bool) {
+        self.fail_journal_append
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test injection: fail the write of the next discharge of pending
+    /// applies.
+    #[cfg(test)]
+    pub(crate) fn fail_next_discharge(&self) {
+        self.fail_next_discharge
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The file of the pending applies.
+    #[cfg(test)]
+    pub(crate) fn pending_applies_path(&self) -> PathBuf {
+        self.dir.join(APPLY_PENDING_FILE)
+    }
+
     fn fail_after_rename_for_testing(&self) -> bool {
         self.fail_after_rename
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1140,13 +1905,23 @@ impl OwnerSyncStore {
     /// Every stored enrollment is (re-)verified against `owner` and its
     /// expiry checked here — a corrupt, foreign-key, or stale record fails
     /// closed, so persistence poison or an expired grant cannot wedge the
-    /// gate open (review R2 finding 1).
+    /// gate open (review R2 finding 1). #1055: an enrollment at or before
+    /// the machine's persisted tombstone fails closed too, so a restored
+    /// `devices.json` cannot resurrect a deleted machine.
     #[must_use]
     pub async fn is_enrolled(&self, machine: &MachineId, owner: &UserId) -> bool {
+        // Read order (tombstones → devices) never opposes a writer: every
+        // mutation takes the two locks in this same order (see
+        // `unenroll_tombstones`).
+        let tombstones = self.unenroll_tombstones.read().await;
         let devices = self.devices.read().await;
-        devices
-            .get(&machine.0)
-            .is_some_and(|e| e.verify_owner(owner).is_ok() && e.is_current_at(now_unix_ms()))
+        devices.get(&machine.0).is_some_and(|e| {
+            e.verify_owner(owner).is_ok()
+                && e.is_current_at(now_unix_ms())
+                && tombstones
+                    .get(&machine.0)
+                    .is_none_or(|deleted_at| e.enrolled_at_ms > *deleted_at)
+        })
     }
 
     /// [`Self::evidence_enrolled`] without ever blocking (x0x #1150 r7c,
@@ -1157,19 +1932,25 @@ impl OwnerSyncStore {
         owner: &UserId,
         now: u64,
     ) -> Option<bool> {
+        // #1055: a tombstoned enrollment contributes no evidence either.
+        let Ok(tombstones) = self.unenroll_tombstones.try_read() else {
+            return None;
+        };
         let Ok(devices) = self.devices.try_read() else {
             return None;
         };
         let Ok(verified) = self.evidence_owners.try_read() else {
             return None;
         };
-        Some(
-            verified.get(&machine.0).is_some_and(|(u, record)| {
-                u == owner && devices.get(&machine.0).is_some_and(|e| e == record)
-            }) && devices
+        Some(devices.get(&machine.0).is_some_and(|e| {
+            verified
                 .get(&machine.0)
-                .is_some_and(|e| e.is_current_at(now)),
-        )
+                .is_some_and(|(u, record)| u == owner && e == record)
+                && e.is_current_at(now)
+                && tombstones
+                    .get(&machine.0)
+                    .is_none_or(|deleted_at| e.enrolled_at_ms > *deleted_at)
+        }))
     }
 
     /// Current enrollment for evidence policy, with zero signature checks.
@@ -1181,35 +1962,59 @@ impl OwnerSyncStore {
         owner: &UserId,
         now: u64,
     ) -> Option<bool> {
+        // #1055: a tombstoned enrollment contributes no evidence either.
+        let Ok(tombstones) = self.unenroll_tombstones.try_read() else {
+            return None;
+        };
         let Ok(devices) = self.devices.try_read() else {
             return None;
         };
         let Ok(verified) = self.evidence_owners.read() else {
             return None;
         };
-        Some(
-            verified.get(&machine.0).is_some_and(|(u, record)| {
-                u == owner && devices.get(&machine.0).is_some_and(|e| e == record)
-            }) && devices
+        Some(devices.get(&machine.0).is_some_and(|e| {
+            verified
                 .get(&machine.0)
-                .is_some_and(|e| e.is_current_at(now)),
-        )
+                .is_some_and(|(u, record)| u == owner && e == record)
+                && e.is_current_at(now)
+                && tombstones
+                    .get(&machine.0)
+                    .is_none_or(|deleted_at| e.enrolled_at_ms > *deleted_at)
+        }))
     }
 
     /// Store a (verified-by-caller) enrollment, keeping the latest
     /// `enrolled_at_ms` per machine so a replayed older enrollment cannot
-    /// rewind the clock. The new expiry replaces any previous one.
+    /// rewind the clock. The new expiry replaces any previous one. #1055:
+    /// an enrollment at or before the machine's persisted unenroll
+    /// tombstone is refused — a restore or an enroll replay must not
+    /// re-open admission for a machine the owner deleted.
     ///
     /// # Errors
     ///
-    /// [`SyncError::Io`] when persistence failed BEFORE the rename (the
-    /// in-memory set is rolled back); [`SyncError::Poisoned`] when the
-    /// write crossed the rename but was not durable — the mutation STAYS
-    /// (disk already advanced) and the store refuses further sync until
-    /// reload (review R5 finding 2).
+    /// [`SyncError::EnrollmentTombstoned`] when the enrollment predates
+    /// the machine's tombstone; [`SyncError::Io`] when persistence failed
+    /// BEFORE the rename (the in-memory set does not change);
+    /// [`SyncError::Poisoned`] when the write crossed the rename but was
+    /// not durable — the mutation STAYS (disk already advanced) and the
+    /// store refuses further sync until reload (review R5 finding 2).
     pub async fn enroll(&self, enrollment: OwnerEnrollment) -> Result<(), SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
+        }
+        // #1055 (ADR 0084 finding 3): the tombstone read is held across the
+        // whole mutation, so `unenroll`'s tombstone write cannot land
+        // between this check and the device insert — enrollment and
+        // deletion are serialized by `unenroll_tombstones` (RC1; lock
+        // order: tombstones → devices).
+        let tombstones = Arc::clone(&self.unenroll_tombstones).read_owned().await;
+        if tombstones
+            .get(&enrollment.machine_id)
+            .is_some_and(|deleted_at| enrollment.enrolled_at_ms <= *deleted_at)
+        {
+            return Err(SyncError::EnrollmentTombstoned {
+                machine: enrollment.machine_id,
+            });
         }
         // Preserve the store's verified-by-caller contract. Invalid material
         // stays incapable of contributing evidence, just as is_enrolled denies it.
@@ -1217,77 +2022,95 @@ impl OwnerSyncStore {
             .ok()
             .map(|key| UserId(derive_peer_id_from_public_key(&key).0))
             .filter(|owner| enrollment.verify_owner(owner).is_ok());
-        let mut devices = self.devices.write().await;
-        let previous = devices.get(&enrollment.machine_id).cloned();
-        let keep = previous
-            .as_ref()
+        let devices = Arc::clone(&self.devices).write_owned().await;
+        let keep = devices
+            .get(&enrollment.machine_id)
             .is_none_or(|old| enrollment.enrolled_at_ms >= old.enrolled_at_ms);
-        if keep {
-            devices.insert(enrollment.machine_id, enrollment.clone());
-            if let Err(e) = self.persist_devices(&devices).await {
-                if matches!(e, SyncError::Poisoned(_)) {
-                    // Disk already holds the new device set: keep the
-                    // mutation (memory matches disk) and poison.
-                    drop(devices);
-                    self.poison(e.to_string());
-                    self.notify_device_change();
-                    return Err(e);
-                }
-                // Pre-rename failure: roll back so memory matches the
-                // unchanged disk (review R2 finding 2).
-                match previous {
-                    Some(old) => {
-                        devices.insert(old.machine_id, old);
-                    }
-                    None => {
-                        devices.remove(&enrollment.machine_id);
-                    }
-                }
-                return Err(e);
-            }
-            if let Ok(mut verified) = self.evidence_owners.write() {
-                if let Some(owner) = verified_owner {
-                    verified.insert(enrollment.machine_id, (owner, enrollment.clone()));
-                } else {
-                    verified.remove(&enrollment.machine_id);
-                }
-            }
+        if !keep {
+            drop(devices);
+            self.kick();
+            self.notify_device_change();
+            return Ok(());
         }
-        drop(devices);
-        self.kick();
-        self.notify_device_change();
-        Ok(())
+        // #1545: the write and its memory update run to their end in one
+        // task that owns the device lock and the tombstone read
+        // (`replace_state`), so a cancelled enroll cannot land after a
+        // later device change. A write that fails before its rename leaves
+        // memory and disk as they were (review R2 finding 2).
+        let mut next = devices.clone();
+        next.insert(enrollment.machine_id, enrollment.clone());
+        let verified = verified_owner.map(|owner| (owner, enrollment.clone()));
+        self.replace_devices(devices, next, tombstones, enrollment.machine_id, verified)
+            .await
+            .map(drop)
     }
 
     /// Remove a machine from the owner device set (the DELETE
-    /// `/sync/devices/:id` path; review R2 finding 1). Poisoning semantics
-    /// match [`Self::enroll`]. Returns `Ok(false)` when not enrolled.
+    /// `/sync/devices/:id` path; review R2 finding 1) and persist a
+    /// deletion tombstone: from the deletion moment on, enroll refuses any
+    /// enrollment for the machine with `enrolled_at_ms <= deleted_at_ms`
+    /// (#1055, ADR 0084 finding 3). RC1: `deleted_at_ms` is at least the
+    /// deleted enrollment's OWN `enrolled_at_ms` (max with the wall clock),
+    /// so a clock rollback cannot make a restore or replay of that
+    /// enrollment clear the tombstone. The tombstone advances monotonically —
+    /// a repeat DELETE never rewinds it — and is written even when the
+    /// machine is not currently enrolled, so a stale enrollment signed
+    /// before the delete cannot slip in behind a no-op delete. Poisoning
+    /// semantics match [`Self::enroll`]. Returns `Ok(false)` when not
+    /// enrolled.
     pub async fn unenroll(&self, machine: &MachineId) -> Result<bool, SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
-        let mut devices = self.devices.write().await;
-        if let Some(previous) = devices.remove(&machine.0) {
-            if let Err(e) = self.persist_devices(&devices).await {
-                if matches!(e, SyncError::Poisoned(_)) {
-                    // Disk already holds the removal: keep it and poison.
-                    drop(devices);
-                    self.poison(e.to_string());
-                    self.notify_device_change();
-                    return Err(e);
-                }
-                devices.insert(previous.machine_id, previous);
-                return Err(e);
-            }
+        // #1055 RC1: removal is linearized against session commits by the
+        // canonical-home gate — a commit that already re-validated
+        // admission under the gate finishes before the tombstone lands,
+        // and a commit that waits takes the gate only after this removal,
+        // so its re-validation sees the tombstone
+        // (see `commit_session_batch`).
+        let removal_gate = Arc::clone(&self.canonical_home_gate).write_owned().await;
+        // Tombstone FIRST (#1055): a crash between the two writes leaves
+        // the machine blocked (fail closed) instead of re-admittable from
+        // a stale enrollment. RC2: the tombstone write lock is held through
+        // the removal AND its persistence — an `enroll` that slipped into
+        // the gap after the tombstone write would otherwise insert a newer
+        // enrollment that this removal deletes WITHOUT the tombstone
+        // covering its timestamp, and replaying that enrollment would
+        // restore admission. Holding the lock here serializes `enroll`
+        // (which holds the read lock across its insert) for the whole
+        // removal — see `unenroll_tombstones`.
+        let tombstones = Arc::clone(&self.unenroll_tombstones).write_owned().await;
+        let enrollment_at = self
+            .devices
+            .read()
+            .await
+            .get(&machine.0)
+            .map_or(0, |enrollment| enrollment.enrolled_at_ms);
+        let deleted_at = now_unix_ms().max(enrollment_at);
+        // #1545: each write and its memory update run to their end in a
+        // task that owns the lock of the state it writes
+        // (`replace_state`), so a cancelled unenroll cannot land after a
+        // later one. The tombstone lock and the gate come back from the
+        // tombstone write and move into the device write: RC2 holds.
+        let (tombstones, removal_gate) = if tombstones
+            .get(&machine.0)
+            .is_none_or(|old| *old < deleted_at)
+        {
+            let mut next = tombstones.clone();
+            next.insert(machine.0, deleted_at);
+            self.replace_tombstones(tombstones, next, removal_gate)
+                .await?
         } else {
+            (tombstones, removal_gate)
+        };
+        let devices = Arc::clone(&self.devices).write_owned().await;
+        if !devices.contains_key(&machine.0) {
             return Ok(false);
         }
-        if let Ok(mut verified) = self.evidence_owners.write() {
-            verified.remove(&machine.0);
-        }
-        drop(devices);
-        self.kick();
-        self.notify_device_change();
+        let mut next = devices.clone();
+        next.remove(&machine.0);
+        self.replace_devices(devices, next, (removal_gate, tombstones), machine.0, None)
+            .await?;
         Ok(true)
     }
 
@@ -1298,7 +2121,12 @@ impl OwnerSyncStore {
 
     /// On-change trigger: bump the generation the periodic task waits on.
     pub fn kick(&self) {
-        self.generation_tx.send_modify(|g| *g = g.wrapping_add(1));
+        Self::kick_generation(&self.generation_tx);
+    }
+
+    /// [`Self::kick`] for a task that owns no `&self`.
+    fn kick_generation(generation: &tokio::sync::watch::Sender<u64>) {
+        generation.send_modify(|g| *g = g.wrapping_add(1));
     }
 
     /// Subscribe to generation changes.
@@ -1330,19 +2158,17 @@ impl OwnerSyncStore {
     }
 
     /// Commit a verified batch atomically (review R2 finding 4): all
-    /// classification decisions are made against the live map, all accepted
-    /// records inserted, and ONE file write persists the result. On any
-    /// failure the in-memory map is rolled back to its **pre-batch** state
-    /// — each key's pre-batch value is captured ONCE, on its first touch
-    /// in the batch, so a key replaced twice in a failing batch restores
-    /// the original, not an intermediate replacement (review R3 finding 4)
-    /// — and the error propagates. A partial batch is never committed or
-    /// advertised.
+    /// classification decisions are made against a copy of the register,
+    /// all accepted records inserted into it, and ONE file write persists
+    /// the result. The copy becomes the register only once that write is
+    /// done (`replace_records`). On any failure the register keeps its
+    /// **pre-batch** state, and the error propagates. A partial batch is
+    /// never committed or advertised.
     ///
     /// Records must have been verified (`verify_owner`) by the caller.
-    /// Callers must NOT hold this future inside a cancellable timeout: the
-    /// rollback paths assume the await completes (the session wrapper
-    /// commits outside its time budget for exactly that reason).
+    /// #1545: a caller that is cancelled leaves the register as before
+    /// the batch, or, once the register write has started, as that write
+    /// leaves it; memory always ends as the disk holds it.
     ///
     /// # Errors
     ///
@@ -1353,130 +2179,620 @@ impl OwnerSyncStore {
         batch: Vec<VersionedRecord>,
         owner: &UserId,
     ) -> Result<CommitOutcome, SyncError> {
+        self.commit_admitted(batch, owner, None).await
+    }
+
+    /// The #1055 RC1 session commit: [`Self::commit_batch`] plus admission
+    /// re-validation AFTER the commit locks are held. The pre-commit
+    /// boundary inside `negotiate_sync_session` cannot cover the gate wait
+    /// in front of a commit — a HomePointer batch can wait behind a seat
+    /// mint — so the delivering peer's admission is re-checked under the
+    /// gate, which `unenroll` also takes first: a removal either finishes
+    /// before this commit's check, or is fully visible to it. RC2: the
+    /// check runs AFTER the records lock too (a revocation, expiry or
+    /// delete that lands while this commit waited for the records lock is
+    /// seen), and the revocation read guard is HELD across the mutation —
+    /// a concurrent revocation either precedes the check (commit refused,
+    /// nothing stored) or follows the commit (applies after it cleanly).
+    /// Fail-closed.
+    async fn commit_session_batch(
+        &self,
+        batch: Vec<VersionedRecord>,
+        admission: &SessionAdmission<'_>,
+    ) -> Result<CommitOutcome, SyncError> {
+        self.commit_admitted(batch, admission.owner, Some(admission))
+            .await
+    }
+
+    /// [`Self::commit_batch`], with the admission of a session commit
+    /// (`commit_session_batch`) when there is one.
+    async fn commit_admitted(
+        &self,
+        batch: Vec<VersionedRecord>,
+        owner: &UserId,
+        admission: Option<&SessionAdmission<'_>>,
+    ) -> Result<CommitOutcome, SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
+        // #1542: a batch that can change the IssuanceJournal register holds
+        // `journal_apply` until its accepted values are in the journal file.
+        let journal = self
+            .journal_file
+            .get()
+            .filter(|_| batch.iter().any(|r| r.kind == SyncKind::IssuanceJournal));
+        let held = match journal {
+            Some(_) => {
+                let guard = Arc::clone(&self.journal_apply).lock_owned().await;
+                Some(self.recover_journal_commit(guard, owner).await?)
+            }
+            None => None,
+        };
+        self.commit_locked(batch, owner, admission, journal, held)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// [`Self::commit_batch`] after its `journal_apply` step. `journal` is
+    /// the journal file to apply accepted `IssuanceJournal` values to;
+    /// `held` then holds `journal_apply`. `admission` is the session
+    /// admission to re-validate under the gate and the records lock.
+    ///
+    /// #1545: every guard the commit holds (the gate, the records lock,
+    /// the revocation read guard and `held`) moves into each of its
+    /// durable writes (`run_to_completion`) and comes back after it. A
+    /// cancelled caller thus releases no guard while a write of the commit
+    /// can still land; `held` comes back on success.
+    async fn commit_locked<H: Send + 'static>(
+        &self,
+        batch: Vec<VersionedRecord>,
+        owner: &UserId,
+        admission: Option<&SessionAdmission<'_>>,
+        journal: Option<&PathBuf>,
+        held: H,
+    ) -> Result<(CommitOutcome, H), SyncError> {
         // #449 r3 P2: an inbound batch that can change the canonical Home
         // register waits behind any in-flight seat mint, and blocks the next
         // one until this batch is durable. Batches that touch no HomePointer
-        // record skip the gate entirely (lock order: gate → records).
-        let _canonical_gate = if batch.iter().any(|r| r.kind == SyncKind::HomePointer) {
-            Some(self.canonical_home_gate.write().await)
-        } else {
-            None
+        // record skip the gate entirely (lock order: gate → records), except
+        // a session commit (#1055 RC1, see `canonical_home_gate`).
+        let canonical_gate =
+            if admission.is_some() || batch.iter().any(|r| r.kind == SyncKind::HomePointer) {
+                Some(Arc::clone(&self.canonical_home_gate).write_owned().await)
+            } else {
+                None
+            };
+        let records = Arc::clone(&self.records).write_owned().await;
+        // #1055 RC1/RC2: a session commit re-validates the peer's admission
+        // under the gate and the records lock, and holds the revocation
+        // read guard to the end of the commit (see `commit_session_batch`).
+        let revocations = match admission {
+            Some(admission) => {
+                admission.enrollment_current().await?;
+                admission.revocations_checked().await?
+            }
+            None => None,
         };
-        let mut records = self.records.write().await;
-        // (kind, key) → the value held BEFORE this batch first touched it.
-        let mut touched: BTreeMap<(SyncKind, String), Option<VersionedRecord>> = BTreeMap::new();
+        let mut next = records.clone();
+        // The keys this batch changes; `records` keeps their values before
+        // the batch until `replace_records`.
+        let mut touched: BTreeSet<(SyncKind, String)> = BTreeSet::new();
         let mut outcome = CommitOutcome::default();
-        let result = (|| -> Result<(), SyncError> {
-            for record in batch {
-                // Re-verify inside the lock: the caller's verification and
-                // the commit must not be separated by a store mutation.
-                record.verify_owner(owner)?;
-                if records.len() >= MAX_STORED_RECORDS
-                    && !records.contains_key(&(record.kind, record.key.clone()))
+        for record in batch {
+            // Re-verify inside the lock: the caller's verification and
+            // the commit must not be separated by a store mutation.
+            record.verify_owner(owner)?;
+            if next.len() >= MAX_STORED_RECORDS
+                && !next.contains_key(&(record.kind, record.key.clone()))
+            {
+                return Err(SyncError::StoreLimit(format!(
+                    "store at capacity ({MAX_STORED_RECORDS} records)"
+                )));
+            }
+            let key = (record.kind, record.key.clone());
+            let stored = next.get(&key);
+            // Equal clock with ANY differing signed bytes (different
+            // value, or the same value double-signed) is an
+            // equivocation whichever side wins the hash tie-break —
+            // surfaced, never silently merged (review R2 finding 3,
+            // extended in R5 to signature-only differences).
+            if let Some(existing) = stored {
+                if existing.clock == record.clock && existing.record_hash() != record.record_hash()
                 {
-                    return Err(SyncError::StoreLimit(format!(
-                        "store at capacity ({MAX_STORED_RECORDS} records)"
-                    )));
-                }
-                let key = (record.kind, record.key.clone());
-                let stored = records.get(&key);
-                // Equal clock with ANY differing signed bytes (different
-                // value, or the same value double-signed) is an
-                // equivocation whichever side wins the hash tie-break —
-                // surfaced, never silently merged (review R2 finding 3,
-                // extended in R5 to signature-only differences).
-                if let Some(existing) = stored {
-                    if existing.clock == record.clock
-                        && existing.record_hash() != record.record_hash()
-                    {
-                        outcome.equivocations += 1;
-                        let values_differ = existing.value != record.value;
-                        tracing::warn!(
-                            target: "x0x::owner_sync",
-                            kind = ?existing.kind,
-                            key = %existing.key,
-                            values_differ,
-                            "equal-clock equivocation resolved deterministically by record hash"
-                        );
-                    }
-                }
-                let decision = stored.map(|existing| Self::classify(&record, existing));
-                match decision {
-                    None => {
-                        // First touch of a fresh key: pre-batch value None.
-                        touched.entry(key.clone()).or_insert(None);
-                        records.insert(key, record.clone());
-                        outcome.accepted.push(record);
-                    }
-                    Some(MergeOutcome::Accepted) => {
-                        // Capture the pre-batch value ONCE (entry.or_insert
-                        // keeps the first capture even on repeat touches).
-                        touched
-                            .entry(key.clone())
-                            .or_insert_with(|| stored.cloned());
-                        records.insert(key, record.clone());
-                        outcome.accepted.push(record);
-                    }
-                    Some(MergeOutcome::Superseded) => {
-                        outcome.superseded += 1;
-                    }
+                    outcome.equivocations += 1;
+                    let values_differ = existing.value != record.value;
+                    tracing::warn!(
+                        target: "x0x::owner_sync",
+                        kind = ?existing.kind,
+                        key = %existing.key,
+                        values_differ,
+                        "equal-clock equivocation resolved deterministically by record hash"
+                    );
                 }
             }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                if outcome.accepted.is_empty() {
-                    return Ok(outcome); // nothing new — no write needed
+            match stored.map(|existing| Self::classify(&record, existing)) {
+                None | Some(MergeOutcome::Accepted) => {
+                    touched.insert(key.clone());
+                    next.insert(key, record.clone());
+                    outcome.accepted.push(record);
                 }
-                match self.persist_records(&records).await {
-                    Ok(()) => {
-                        drop(records);
-                        self.kick();
-                        Ok(outcome)
-                    }
-                    Err(e) if matches!(e, SyncError::Poisoned(_)) => {
-                        // The batch crossed the rename but was not durable:
-                        // disk already holds it — KEEP the mutations (memory
-                        // matches the advanced disk) and poison the store;
-                        // never roll memory back below an advanced disk
-                        // (review R5 finding 2).
-                        drop(records);
-                        self.poison(e.to_string());
-                        Err(e)
-                    }
-                    Err(e) => {
-                        Self::rollback(&mut records, &touched);
-                        Err(e)
-                    }
+                Some(MergeOutcome::Superseded) => {
+                    outcome.superseded += 1;
                 }
-            }
-            Err(e) => {
-                Self::rollback(&mut records, &touched);
-                Err(e)
             }
         }
+        if outcome.accepted.is_empty() {
+            return Ok((outcome, held)); // nothing new — no write needed
+        }
+        // #1542: the journal file first, then the register (see
+        // `journal_apply`). A failed append commits nothing; a later
+        // session delivers the records again.
+        let updates = match journal {
+            Some(_) => Self::journal_updates(&records, &next, &touched),
+            None => Vec::new(),
+        };
+        let mut hold = (records, canonical_gate, revocations, held);
+        if let Some(path) = journal.filter(|_| !updates.is_empty()) {
+            // The intent first: after a stop between the two writes, the
+            // journal holds lines that came from these records, and the
+            // restart must not take them for unpublished local issuance
+            // (see `recover_journal_commit`). The intent holds every
+            // accepted record of the batch, not only the journal ones, so
+            // the recovery commits all of it or none.
+            hold = self
+                .persist_journal_intent(hold, outcome.accepted.clone())
+                .await?;
+            let owner_hex = hex::encode(owner.0);
+            for (record, published) in &updates {
+                hold = self
+                    .apply_journal_value(path, &owner_hex, &record.value, published.clone(), hold)
+                    .await
+                    .map_err(|e| {
+                        SyncError::Io(format!("failed to append synced journal line: {e}"))
+                    })?;
+            }
+            #[cfg(test)]
+            if self.stop_after_first_journal_write() {
+                return Err(SyncError::Io("stopped between writes".into()));
+            }
+        }
+        // #1545: the obligation to apply the names before the register
+        // holds them (see `pending_apply`).
+        let (records, canonical_gate, revocations, held) =
+            self.add_pending_applies(&outcome.accepted, hold).await?;
+        let mut guards = self
+            .replace_records(records, next, (canonical_gate, revocations, held))
+            .await?;
+        if !updates.is_empty() {
+            guards = self.remove_journal_intent(guards).await?;
+        }
+        let (_, _, held) = guards;
+        Ok((outcome, held))
     }
 
-    /// Restore the in-memory map to its pre-batch state: every touched key
-    /// returns to the value captured on its FIRST touch in the batch.
-    fn rollback(
-        records: &mut BTreeMap<(SyncKind, String), VersionedRecord>,
-        touched: &BTreeMap<(SyncKind, String), Option<VersionedRecord>>,
-    ) {
-        for ((kind, key), previous) in touched {
-            match previous {
-                Some(prev) => {
-                    records.insert((*kind, key.clone()), prev.clone());
+    /// The `IssuanceJournal` records a committed batch changed: each is the
+    /// key's record now, with the value the register held before the batch.
+    fn journal_updates(
+        before: &RecordMap,
+        after: &RecordMap,
+        touched: &BTreeSet<(SyncKind, String)>,
+    ) -> Vec<(VersionedRecord, Option<SyncValue>)> {
+        touched
+            .iter()
+            .filter(|(kind, _)| *kind == SyncKind::IssuanceJournal)
+            .filter_map(|key| {
+                let now = after.get(key)?;
+                let previous = before.get(key).map(|r| r.value.clone());
+                (previous.as_ref() != Some(&now.value)).then(|| (now.clone(), previous))
+            })
+            .collect()
+    }
+
+    /// Durably record the accepted records of a commit that is about to
+    /// write `IssuanceJournal` values to the journal file and then the
+    /// whole batch to the register (#1542). `held` holds `journal_apply`
+    /// until the write is done (`run_to_completion`), and comes back.
+    async fn persist_journal_intent<H: Send + 'static>(
+        &self,
+        held: H,
+        records: Vec<VersionedRecord>,
+    ) -> Result<H, SyncError> {
+        let bytes = serde_json::to_vec(&PersistedRecords { records })
+            .map_err(|e| SyncError::Io(format!("encode journal intent: {e}")))?;
+        let path = self.dir.join(JOURNAL_INTENT_FILE);
+        self.run_to_completion(async move {
+            Self::write_atomically(&path, &bytes, false)
+                .await
+                .map_err(|e| match e {
+                    DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
+                        SyncError::Io(format!("persist journal intent: {io}"))
+                    }
+                })?;
+            Ok(held)
+        })
+        .await
+    }
+
+    /// Remove the journal intent once its records are in the register. A
+    /// left-over intent is harmless: its recovery finds the records already
+    /// there. `held` holds `journal_apply` until the removal is done, so a
+    /// late removal cannot take the intent of a later commit; it comes
+    /// back.
+    async fn remove_journal_intent<H: Send + 'static>(&self, held: H) -> Result<H, SyncError> {
+        let path = self.dir.join(JOURNAL_INTENT_FILE);
+        self.run_to_completion(async move {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to remove the journal intent");
                 }
-                None => {
-                    records.remove(&(*kind, key.clone()));
+            }
+            Ok(held)
+        })
+        .await
+    }
+
+    /// #1542: finish an interrupted commit (`recover_journal_commit`)
+    /// outside of a commit, for the reconcile pass. The daemon calls this
+    /// before it mints any record from live state: a mint before the
+    /// recovery can put an old live value over a recovered record.
+    ///
+    /// # Errors
+    ///
+    /// See `recover_journal_commit`.
+    pub(crate) async fn recover_interrupted_commit(&self, owner: &UserId) -> Result<(), SyncError> {
+        let guard = Arc::clone(&self.journal_apply).lock_owned().await;
+        self.recover_journal_commit(guard, owner).await.map(drop)
+    }
+
+    /// Add the name records of a commit to `pending_apply` and its file.
+    /// `held` holds the guards of the commit; it moves into the write and
+    /// comes back (`replace_pending`).
+    async fn add_pending_applies<H: Send + 'static>(
+        &self,
+        accepted: &[VersionedRecord],
+        held: H,
+    ) -> Result<H, SyncError> {
+        let names: Vec<&VersionedRecord> = accepted
+            .iter()
+            .filter(|r| matches!(r.kind, SyncKind::OwnerProfile | SyncKind::MachineNames))
+            .collect();
+        if names.is_empty() {
+            return Ok(held);
+        }
+        let pending = Arc::clone(&self.pending_apply).lock_owned().await;
+        let mut next = pending.clone();
+        for record in names {
+            let entry = next
+                .applies
+                .entry(pending_key(record))
+                .or_insert_with(|| PendingApply {
+                    record: (*record).clone(),
+                    saved_in: Vec::new(),
+                    discharged: false,
+                });
+            // A record retired as not the winner (its earlier commit did
+            // not complete), whose removal did not reach the file yet, is
+            // owed again now that a commit accepts it.
+            if entry.discharged {
+                entry.discharged = false;
+                entry.saved_in.clear();
+            }
+        }
+        next.epoch = next.epoch.wrapping_add(1);
+        self.replace_pending(pending, next, held).await
+    }
+
+    /// #1545: the generation of the pending applies
+    /// (`PendingApplies::epoch`). The reconcile reads it after its apply
+    /// step and before it reads the live names, and passes it to
+    /// [`Self::mint_live_name`].
+    pub(crate) async fn names_epoch(&self) -> u64 {
+        self.pending_apply.lock().await.epoch
+    }
+
+    /// Whether `record` is the winner in `records`.
+    fn is_winner(
+        records: &BTreeMap<(SyncKind, String), VersionedRecord>,
+        record: &VersionedRecord,
+    ) -> bool {
+        records
+            .get(&(record.kind, record.key.clone()))
+            .is_some_and(|stored| stored.record_hash() == record.record_hash())
+    }
+
+    /// Write the owed records of `next` durably to `APPLY_PENDING_FILE`,
+    /// and then make `next`, without its discharged records, the pending
+    /// applies (see `PendingApply::discharged`). An empty set is written
+    /// too, not unlinked: an unlink without a directory fsync can come
+    /// back after a crash with the obligations it removed.
+    ///
+    /// The write and the update run to their end in one task
+    /// (`run_to_completion`), which owns `pending` and `held` (the other
+    /// guards of the caller, such as the `records` lock) until then. A
+    /// caller cancelled during the write stops only its wait: no later
+    /// change of the pending applies, and no change that a guard in
+    /// `held` keeps out, can start before the write lands, and memory ends
+    /// as the disk holds it (Codex review of #1545, b17cd8bf, 17e0dae3).
+    /// `held` comes back on success.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the file cannot be written; `pending` does
+    /// not change.
+    async fn replace_pending<H: Send + 'static>(
+        &self,
+        mut pending: tokio::sync::OwnedMutexGuard<PendingApplies>,
+        mut next: PendingApplies,
+        held: H,
+    ) -> Result<H, SyncError> {
+        let path = self.dir.join(APPLY_PENDING_FILE);
+        let bytes = serde_json::to_vec(&PersistedPendingApplies {
+            applies: next
+                .applies
+                .values()
+                .filter(|p| !p.discharged)
+                .cloned()
+                .collect(),
+        })
+        .map_err(|e| SyncError::Io(format!("encode pending applies: {e}")))?;
+        self.run_to_completion(async move {
+            Self::write_atomically(&path, &bytes, false)
+                .await
+                .map_err(|e| match e {
+                    DurableWriteError::BeforeRename(io) | DurableWriteError::AfterRename(io) => {
+                        SyncError::Io(format!("persist pending applies: {io}"))
+                    }
+                })?;
+            next.applies.retain(|_, p| !p.discharged);
+            *pending = next;
+            Ok(held)
+        })
+        .await
+    }
+
+    /// #1545: the committed name records that live daemon state may not
+    /// show yet (see `pending_apply`). The flag is `true` for a record that
+    /// is still the register's winner; the caller applies only those. A
+    /// record that a later commit replaced, or whose commit failed after
+    /// the obligation was written, is `false`.
+    pub(crate) async fn pending_applies(&self) -> Vec<(VersionedRecord, bool)> {
+        let pending: Vec<VersionedRecord> = self
+            .pending_apply
+            .lock()
+            .await
+            .applies
+            .values()
+            .filter(|p| !p.discharged)
+            .map(|p| p.record.clone())
+            .collect();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let records = self.records.read().await;
+        pending
+            .into_iter()
+            .map(|r| {
+                let winner = records
+                    .get(&(r.kind, r.key.clone()))
+                    .is_some_and(|stored| stored.record_hash() == r.record_hash());
+                (r, winner)
+            })
+            .collect()
+    }
+
+    /// #1545: whether any of `records` is still owed: a save of its names
+    /// has not discharged it yet.
+    pub(crate) async fn owes_any(&self, records: &[(VersionedRecord, bool)]) -> bool {
+        let pending = self.pending_apply.lock().await;
+        records.iter().any(|(record, _)| {
+            pending
+                .applies
+                .get(&pending_key(record))
+                .is_some_and(|entry| !entry.discharged)
+        })
+    }
+
+    /// #1545: record that a profile save with `names` starts with
+    /// `folded` in it. Each entry of `folded` is a record of
+    /// [`Self::pending_applies`] with its winner flag at the fold; only a
+    /// winner was applied to the profile, so only a winner is noted. The
+    /// caller holds the profile write lock, and saves only after this
+    /// returns `Ok`: then a durable profile with `names` shows that the
+    /// applied records are not owed any more, even when the discharge
+    /// after the save does not reach the disk (`settle_saved`). A record
+    /// that was not the winner is not in the profile; a retried commit
+    /// can make it the winner later, so no save may settle it.
+    ///
+    /// It also writes the file when a record is discharged but its removal
+    /// from the file failed: else the file keeps the record with the names
+    /// of an older save only, and the next start applies it over this
+    /// save.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the file cannot be written; the caller must
+    /// not save the profile.
+    pub(crate) async fn note_profile_save(
+        &self,
+        folded: &[(VersionedRecord, bool)],
+        names: &SyncProfileNames,
+    ) -> Result<(), SyncError> {
+        let saved = SavedNames::from(names);
+        let pending = Arc::clone(&self.pending_apply).lock_owned().await;
+        let mut next = pending.clone();
+        let mut changed = next.applies.values().any(|p| p.discharged);
+        for (record, _) in folded.iter().filter(|(_, applied)| *applied) {
+            if let Some(entry) = next.applies.get_mut(&pending_key(record)) {
+                if !entry.discharged && !entry.saved_in.contains(&saved) {
+                    entry.saved_in.push(saved.clone());
+                    changed = true;
                 }
             }
         }
+        if !changed {
+            return Ok(());
+        }
+        self.replace_pending(pending, next, ()).await
+    }
+
+    /// #1545: remove `done` from the pending applies, after the daemon has
+    /// durably saved the winners among them. Each entry of `done` is a
+    /// record of [`Self::pending_applies`] with its winner flag at the
+    /// read; `true` means the caller applied it. A record that a commit
+    /// added after `done` was read stays.
+    ///
+    /// The check is made again here, under the `records` read lock: a
+    /// record that was not the winner at the read, and so was not
+    /// applied, is retired only if it is still not the winner. A retried
+    /// commit can have made it the winner since; it then stays owed, and
+    /// the next pass applies it.
+    ///
+    /// When the file write fails, the records stay in memory as
+    /// discharged (`PendingApply::discharged`): no later pass applies them
+    /// over a newer local edit, and the next write of the file, at the
+    /// latest the note of the next profile save, removes them. A crash
+    /// before that keeps the noted names of their save on disk, so
+    /// `settle_saved` removes them at the next start.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the file cannot be written.
+    pub(crate) async fn discharge_applies(
+        &self,
+        done: &[(VersionedRecord, bool)],
+    ) -> Result<(), SyncError> {
+        #[cfg(test)]
+        Self::take_pause(&self.discharge_pause).await;
+        let records = Arc::clone(&self.records).read_owned().await;
+        let mut pending = Arc::clone(&self.pending_apply).lock_owned().await;
+        let mut retired = false;
+        for (record, applied) in done {
+            if !applied && Self::is_winner(&records, record) {
+                continue;
+            }
+            if let Some(entry) = pending.applies.get_mut(&pending_key(record)) {
+                if !entry.discharged {
+                    entry.discharged = true;
+                    retired = true;
+                }
+            }
+        }
+        if retired {
+            pending.epoch = pending.epoch.wrapping_add(1);
+        }
+        if !pending.applies.values().any(|p| p.discharged) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_discharge
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(SyncError::Io("injected discharge failure".into()));
+        }
+        let next = pending.clone();
+        self.replace_pending(pending, next, records).await.map(drop)
+    }
+
+    /// #1545: remove the pending applies that a durable profile with
+    /// `durable` holds (see `PendingApply::saved_in`). The daemon calls
+    /// this at start, with the profile it loaded, before any pass applies
+    /// them: a discharge before the restart can have failed to reach the
+    /// disk.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the file cannot be written; the records
+    /// stay in memory as discharged, as in `discharge_applies`.
+    pub(crate) async fn settle_saved(&self, durable: &SyncProfileNames) -> Result<(), SyncError> {
+        let saved = SavedNames::from(durable);
+        let records = Arc::clone(&self.records).read_owned().await;
+        let mut pending = Arc::clone(&self.pending_apply).lock_owned().await;
+        let mut settled = false;
+        for entry in pending.applies.values_mut() {
+            if !entry.discharged && entry.saved_in.contains(&saved) {
+                entry.discharged = true;
+                settled = true;
+            }
+        }
+        if !settled {
+            return Ok(());
+        }
+        pending.epoch = pending.epoch.wrapping_add(1);
+        let next = pending.clone();
+        self.replace_pending(pending, next, records).await.map(drop)
+    }
+
+    /// #1542: finish a commit that stopped after its journal intent was
+    /// durable but before its register write. `guard` holds
+    /// `journal_apply`, and comes back on success. The caller calls this
+    /// before any other change of the `IssuanceJournal` register or any
+    /// reconcile of the journal.
+    ///
+    /// Without this, the journal can hold a line that came from the
+    /// register (from another device) while the register still holds the
+    /// value before it. That line then looks like a local issuance that no
+    /// reconcile has published: a later same-second record is not
+    /// appended, and the reconcile publishes the older line over it. The
+    /// recovery commits the original signed records again, so the register
+    /// keeps their versions and every device keeps the same order.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] or [`SyncError::Poisoned`] when the intent cannot
+    /// be read or decoded, or the recovery cannot be written; the error of
+    /// the commit when the intent's records do not verify or do not fit.
+    /// The intent stays for the next attempt. Only an intent whose records
+    /// verify under another owner is dropped.
+    async fn recover_journal_commit(
+        &self,
+        guard: JournalGuard,
+        owner: &UserId,
+    ) -> Result<JournalGuard, SyncError> {
+        if let Some(err) = self.poison_refusal() {
+            return Err(err);
+        }
+        let Some(journal) = self.journal_file.get() else {
+            return Ok(guard);
+        };
+        let bytes = match tokio::fs::read(self.dir.join(JOURNAL_INTENT_FILE)).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(guard),
+            Err(e) => return Err(SyncError::Io(format!("read journal intent: {e}"))),
+        };
+        // An undecodable intent fails closed and stays in place. Without
+        // it, a journal line of the interrupted commit looks like an
+        // unpublished local issuance, and the reconcile publishes it over
+        // a later same-second record.
+        let batch = serde_json::from_slice::<PersistedRecords>(&bytes)
+            .map_err(|e| SyncError::Io(format!("undecodable journal intent: {e}")))?
+            .records;
+        // The commit verifies each record in order and stops at the first
+        // failure; the same check here decides the intent's fate first,
+        // while `guard` is still held for its removal.
+        match batch.iter().find_map(|r| r.verify_owner(owner).err()) {
+            None => {}
+            Some(SyncError::OwnerMismatch) => {
+                // The records verify, but under another owner (after an
+                // owner rotation): no session would deliver them either.
+                // `verify_owner` checks the signature first, so a changed
+                // record cannot get here.
+                tracing::warn!(target: "x0x::owner_sync", "dropped a journal intent of a previous owner");
+                return self.remove_journal_intent(guard).await;
+            }
+            // Any other failure (a bad signature, a kind mismatch) fails
+            // closed and keeps the intent, as for an undecodable intent.
+            Some(e) => return Err(e),
+        }
+        // A failure here (a full store, I/O) fails closed and keeps the
+        // intent too. The commit adds the recovered names to
+        // `pending_apply`.
+        let (_, guard) = self
+            .commit_locked(batch, owner, None, Some(journal), guard)
+            .await?;
+        self.remove_journal_intent(guard).await
     }
 
     /// Merge one verified inbound record — a single-record batch commit.
@@ -1513,6 +2829,48 @@ impl OwnerSyncStore {
         owner: &UserKeypair,
         writer_machine: MachineId,
     ) -> Result<(), SyncError> {
+        self.mint_when(kind, key, desired, owner, writer_machine, None)
+            .await
+    }
+
+    /// #1545: [`Self::mint`] for a name read from live daemon state.
+    /// `epoch` is [`Self::names_epoch`], read before the live names. The
+    /// mint is skipped when a committed name that is still the register's
+    /// winner is owed to that state (`pending_applies`), or when the
+    /// pending applies changed since `epoch`: a commit or a retirement
+    /// after the read can mean that the names read are older than the
+    /// register, and the mint would put them over a synced name at a
+    /// higher version. The check and the mint hold the register write
+    /// lock together, and every change of the pending applies holds the
+    /// same lock (see `pending_apply`). A mint skipped for a changed
+    /// epoch kicks the next pass, which reads the names again.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::mint`].
+    pub(crate) async fn mint_live_name(
+        &self,
+        kind: SyncKind,
+        key: &str,
+        desired: &SyncValue,
+        owner: &UserKeypair,
+        writer_machine: MachineId,
+        epoch: u64,
+    ) -> Result<(), SyncError> {
+        self.mint_when(kind, key, desired, owner, writer_machine, Some(epoch))
+            .await
+    }
+
+    /// [`Self::mint`]; with `live_epoch`, see [`Self::mint_live_name`].
+    async fn mint_when(
+        &self,
+        kind: SyncKind,
+        key: &str,
+        desired: &SyncValue,
+        owner: &UserKeypair,
+        writer_machine: MachineId,
+        live_epoch: Option<u64>,
+    ) -> Result<(), SyncError> {
         if let Some(err) = self.poison_refusal() {
             return Err(err);
         }
@@ -1528,15 +2886,33 @@ impl OwnerSyncStore {
         // #449 r3 P2: the LOCAL publisher of a canonical Home pointer is
         // fenced on the same gate as inbound commits (lock order: gate →
         // records). Other kinds are unaffected.
-        let _canonical_gate = if kind == SyncKind::HomePointer {
-            Some(self.canonical_home_gate.write().await)
+        let canonical_gate = if kind == SyncKind::HomePointer {
+            Some(Arc::clone(&self.canonical_home_gate).write_owned().await)
         } else {
             None
         };
-        let mut records = self.records.write().await;
+        let records = Arc::clone(&self.records).write_owned().await;
         let stored = records.get(&(kind, key.to_string()));
         if stored.is_some_and(|r| r.value == *desired) {
             return Ok(());
+        }
+        if let Some(epoch) = live_epoch {
+            let pending = self.pending_apply.lock().await;
+            let owed = pending
+                .applies
+                .values()
+                .filter(|p| !p.discharged)
+                .any(|p| Self::is_winner(&records, &p.record));
+            if owed {
+                // The next pass applies the owed names first.
+                return Ok(());
+            }
+            if pending.epoch != epoch {
+                drop(pending);
+                drop(records);
+                self.kick();
+                return Ok(());
+            }
         }
         let version = stored.map_or(1, |r| r.clock.version.saturating_add(1));
         let clock = RecordClock {
@@ -1546,33 +2922,11 @@ impl OwnerSyncStore {
         };
         let record = VersionedRecord::sign(kind, key, desired, clock, owner)
             .map_err(|e| SyncError::BadSignature(format!("mint: {e}")))?;
-        let previous = records.insert((kind, key.to_string()), record);
-        match self.persist_records(&records).await {
-            Ok(()) => {
-                drop(records);
-                self.kick();
-                Ok(())
-            }
-            Err(e) if matches!(e, SyncError::Poisoned(_)) => {
-                // Disk already holds the minted record: keep it and poison.
-                drop(records);
-                self.poison(e.to_string());
-                Err(e)
-            }
-            Err(e) => {
-                // Pre-rename failure: roll back so memory matches the
-                // unchanged disk.
-                match previous {
-                    Some(prev) => {
-                        records.insert((kind, key.to_string()), prev);
-                    }
-                    None => {
-                        records.remove(&(kind, key.to_string()));
-                    }
-                }
-                Err(e)
-            }
-        }
+        let mut next = records.clone();
+        next.insert((kind, key.to_string()), record);
+        self.replace_records(records, next, canonical_gate)
+            .await
+            .map(drop)
     }
 
     /// Hold the canonical-Home admission gate for reading (#449 r3 P2).
@@ -1705,14 +3059,15 @@ impl OwnerSyncStore {
         // #449 r3 P2: the unverified test writer participates in the gate
         // too, so a test cannot accidentally prove a fence that production
         // writers honour but this back door bypasses.
-        let _canonical_gate = if record.kind == SyncKind::HomePointer {
-            Some(self.canonical_home_gate.write().await)
+        let canonical_gate = if record.kind == SyncKind::HomePointer {
+            Some(Arc::clone(&self.canonical_home_gate).write_owned().await)
         } else {
             None
         };
-        let mut records = self.records.write().await;
-        records.insert((record.kind, record.key.clone()), record);
-        let _ = self.persist_records(&records).await;
+        let records = Arc::clone(&self.records).write_owned().await;
+        let mut next = records.clone();
+        next.insert((record.kind, record.key.clone()), record);
+        let _ = self.replace_records(records, next, canonical_gate).await;
     }
 }
 
@@ -1794,6 +3149,43 @@ pub async fn run_sync_session_with_timeout<S, R, F>(
     owner: &UserKeypair,
     local_machine: &MachineId,
     peer_machine: &MachineId,
+    on_accept: F,
+) -> Result<SessionSummary, SyncError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    F: FnMut(&VersionedRecord),
+{
+    run_sync_session_with_recheck(
+        budget,
+        send,
+        recv,
+        store,
+        None,
+        owner,
+        local_machine,
+        peer_machine,
+        on_accept,
+    )
+    .await
+}
+
+/// [`run_sync_session_with_timeout`] with a machine revocation set the
+/// live session re-checks at every phase boundary (#1055): the daemon
+/// paths pass the agent's ADR-0018 set, so a revocation that lands
+/// mid-session aborts the session instead of waiting for the next one.
+/// Local-only change: no new wire frame — an aborted session stops
+/// writing and drops the stream halves, exactly as any other failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_sync_session_with_recheck<S, R, F>(
+    budget: Duration,
+    send: &mut S,
+    recv: &mut R,
+    store: &OwnerSyncStore,
+    revocations: Option<&Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>,
+    owner: &UserKeypair,
+    local_machine: &MachineId,
+    peer_machine: &MachineId,
     mut on_accept: F,
 ) -> Result<SessionSummary, SyncError>
 where
@@ -1805,14 +3197,52 @@ where
     // OUTSIDE it, after the timeout future has completed. Cancelling at the
     // budget can therefore never rip a persistence await out from under
     // commit_batch's rollback paths (review R3 finding 4).
-    let pending = tokio::time::timeout(
+    let negotiated = tokio::time::timeout(
         budget,
-        negotiate_sync_session(send, recv, store, owner, local_machine, peer_machine),
+        negotiate_sync_session(
+            send,
+            recv,
+            store,
+            revocations,
+            owner,
+            local_machine,
+            peer_machine,
+        ),
     )
     .await
-    .map_err(|_| SyncError::SessionTimeout)??;
+    .map_err(|_| SyncError::SessionTimeout)?;
+    let pending = negotiated?;
     let owner_id = owner.user_id();
-    let outcome = store.commit_batch(pending.verified, &owner_id).await?;
+    // #1055 RC1: the commit re-validates the peer's admission AFTER the
+    // commit locks are held — the pre-commit boundary inside
+    // `negotiate_sync_session` cannot cover this commit's own gate wait.
+    let admission = SessionAdmission {
+        store,
+        revocations,
+        owner: &owner_id,
+        peer: peer_machine,
+    };
+    let outcome = store
+        .commit_session_batch(pending.verified, &admission)
+        .await;
+    // #1542: a recovery in the commit can commit records of an earlier,
+    // interrupted commit. Apply the names still owed to live state (the
+    // reconcile pass confirms them), even when this commit fails.
+    let accepted: Vec<[u8; 32]> = outcome
+        .as_ref()
+        .map(|o| {
+            o.accepted
+                .iter()
+                .map(VersionedRecord::record_hash)
+                .collect()
+        })
+        .unwrap_or_default();
+    for (record, winner) in store.pending_applies().await {
+        if winner && !accepted.contains(&record.record_hash()) {
+            on_accept(&record);
+        }
+    }
+    let outcome = outcome?;
     let mut summary = pending.summary;
     summary.accepted = outcome.accepted.len();
     summary.superseded = outcome.superseded;
@@ -1833,10 +3263,12 @@ struct PendingCommit {
 
 /// The network protocol body (no timeout wrapper, no commit — the caller
 /// commits the verified batch outside the time budget).
+#[allow(clippy::too_many_arguments)]
 async fn negotiate_sync_session<S, R>(
     send: &mut S,
     recv: &mut R,
     store: &OwnerSyncStore,
+    revocations: Option<&Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>,
     owner: &UserKeypair,
     local_machine: &MachineId,
     peer_machine: &MachineId,
@@ -1863,6 +3295,14 @@ where
             machine: peer_machine.0,
         });
     }
+    // #1055 (ADR 0084 finding 4): the checks below re-validate this
+    // admission at every phase boundary while the session runs.
+    let admission = SessionAdmission {
+        store,
+        revocations,
+        owner: &owner_id,
+        peer: peer_machine,
+    };
 
     // Hello both ways (each side contributes a fresh nonce).
     let local_nonce = fresh_nonce();
@@ -1873,7 +3313,7 @@ where
         nonce: local_nonce,
     };
     write_frame(send, &hello).await?;
-    let peer_nonce = match read_frame(recv).await? {
+    let peer_nonce = match refuse_unsupported(send, read_frame(recv).await).await? {
         SyncFrame::Hello {
             protocol_version,
             machine_id,
@@ -1919,7 +3359,7 @@ where
         },
     )
     .await?;
-    match read_frame(recv).await? {
+    match refuse_unsupported(send, read_frame(recv).await).await? {
         SyncFrame::Proof { signature } => {
             let expected_msg =
                 proof_message(&local_nonce, &peer_machine.0, &local_machine.0, &owner_id.0);
@@ -1934,11 +3374,20 @@ where
             )));
         }
     }
+    // Phase boundary (post-proof): a session admitted before an unenroll,
+    // expiry or revocation must not ride the exchange out (#1055).
+    admission.still_admissible().await?;
 
     // Paged version vectors both ways (bounded, explicitly terminated).
+    // Both outbound pagers re-check admission at every page boundary (RC1):
+    // a delete or revocation that lands during a blocked page write stops
+    // the rest of the stage, version-vector pages included.
     let local_vector = store.version_vector().await;
-    write_paged_vector(send, &local_vector).await?;
-    let peer_vector = read_paged_vector(recv).await?;
+    write_paged_vector(send, &local_vector, &admission).await?;
+    let peer_vector = refuse_unsupported(send, read_paged_vector(recv, &admission).await).await?;
+    // Phase boundary (pre-ship): nothing leaves this machine after the
+    // admission that justified shipping it has lapsed.
+    admission.still_admissible().await?;
 
     // Compute the outbound set from the FULL peer vector, then ship it in
     // bounded pages, ending with Done ("finished shipping"). Done is sent
@@ -1946,7 +3395,11 @@ where
     // to complete independently of their own send state.
     let to_ship = store.records_for_peer(&peer_vector).await;
     summary.shipped = to_ship.len();
-    write_paged_records(send, &to_ship).await?;
+    write_paged_records(send, &to_ship, &admission).await?;
+    // Last outbound boundary (#1055 RC3): a delete or revocation that
+    // lands while the FINAL record page was blocked must stop Done too —
+    // Done ends the peer's records stage and lets it commit the batch.
+    admission.still_admissible().await?;
     write_frame(send, &SyncFrame::Done).await?;
     // Done ends the application frames; FIN ends the transport send half.
     // An unfinished ant-quic SendStream resets on drop, so the peer can
@@ -1954,10 +3407,16 @@ where
     send.shutdown().await?;
 
     // Receive the peer's paged records (terminated by their Done or an
-    // Abort); verify EVERY record before returning — one forgery aborts
+    // Abort). #1604: the send half is closed from here, so an unsupported
+    // record variant is a local typed error only (no `Abort` reply).
+    // Verify EVERY record before returning — one forgery aborts
     // with nothing stored (review R2 finding 4). The caller commits the
     // verified batch atomically, outside the session's time budget.
-    let inbound = read_paged_records(recv).await?;
+    let inbound = read_paged_records(recv, &admission).await?;
+    // Final boundary (pre-commit): an unenroll, expiry or revocation that
+    // landed during the records stage takes effect HERE, with nothing
+    // committed (#1055).
+    admission.still_admissible().await?;
     let mut verified = Vec::with_capacity(inbound.len());
     for record in inbound {
         record.verify_owner(&owner_id)?;
@@ -1967,10 +3426,13 @@ where
 }
 
 /// Write the version table as bounded pages (always at least one page, so
-/// the reader's stage loop always advances).
+/// the reader's stage loop always advances). #1055 RC1: admission is
+/// re-validated before EVERY page frame — a peer stays entitled to each
+/// page it receives, not just to the first.
 async fn write_paged_vector<S: AsyncWrite + Unpin>(
     send: &mut S,
     vector: &[KindVersions],
+    admission: &SessionAdmission<'_>,
 ) -> Result<(), SyncError> {
     // Each frame carries one kind with at most VV_ENTRIES_PER_FRAME
     // entries AND at most ~VV_PAGE_BYTES of serialized entries (byte
@@ -2004,6 +3466,9 @@ async fn write_paged_vector<S: AsyncWrite + Unpin>(
         }
     }
     for page in pages {
+        // Outbound page boundary (#1055 RC1): a delete or revocation that
+        // lands during a blocked page write stops the rest of the stage.
+        admission.still_admissible().await?;
         write_frame(send, &SyncFrame::VersionVector { kinds: vec![page] }).await?;
     }
     // Explicit stage terminator — see [`SyncFrame::VectorEnd`].
@@ -2011,13 +3476,17 @@ async fn write_paged_vector<S: AsyncWrite + Unpin>(
     Ok(())
 }
 /// Read paged version frames until the explicit [`SyncFrame::VectorEnd`]
-/// terminator. Total entries are capped ([`MAX_VECTOR_ENTRIES`]).
+/// terminator. Total entries are capped ([`MAX_VECTOR_ENTRIES`]). Between
+/// pages the session's admission is re-validated — a peer that dribbles
+/// vector pages cannot extend a lapsed session (#1055).
 async fn read_paged_vector<R: AsyncRead + Unpin>(
     recv: &mut R,
+    admission: &SessionAdmission<'_>,
 ) -> Result<Vec<KindVersions>, SyncError> {
     let mut merged: BTreeMap<SyncKind, Vec<(String, RecordClock, [u8; 32])>> = BTreeMap::new();
     let mut total = 0usize;
     loop {
+        admission.still_admissible().await?;
         match read_frame(recv).await? {
             SyncFrame::VersionVector { kinds } => {
                 for kv in kinds {
@@ -2059,12 +3528,16 @@ async fn read_paged_vector<R: AsyncRead + Unpin>(
 }
 
 /// Read the peer's paged records until `Done`/`Abort`. Capped at
-/// [`MAX_RECORDS_PER_SESSION`].
+/// [`MAX_RECORDS_PER_SESSION`]. Between pages the session's admission is
+/// re-validated — a peer that dribbles record pages cannot extend a
+/// lapsed session (#1055).
 async fn read_paged_records<R: AsyncRead + Unpin>(
     recv: &mut R,
+    admission: &SessionAdmission<'_>,
 ) -> Result<Vec<VersionedRecord>, SyncError> {
     let mut records = Vec::new();
     loop {
+        admission.still_admissible().await?;
         match read_frame(recv).await? {
             SyncFrame::Records { records: page } => {
                 records.extend(page);
@@ -2233,6 +3706,24 @@ pub trait SyncDaemonView: Send + Sync + 'static {
     fn canonical_pointer_is_retired(&self, group_id: &str) -> bool;
 }
 
+/// #1545: a daemon view whose `apply_names` saves the names in the
+/// background. Crate-internal; see [`OwnerSyncService::attach_daemon_view`].
+pub(crate) trait PersistedNames: Send + Sync + 'static {
+    /// Completes when every earlier `apply_names` call has ended, saved
+    /// or not. A save that succeeds discharges the names it holds
+    /// (`OwnerSyncStore::discharge_applies`), so the store, not this
+    /// call, tells whether a name is still owed: a later save, such as
+    /// `PUT /profile`, can discharge a name whose own save failed.
+    fn names_settled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    /// The names of the live profile, read under its lock (waiting for
+    /// a writer), never a cached copy: a copy can be older than a
+    /// retirement of a pending apply (`OwnerSyncStore::names_epoch`).
+    fn live_names(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SyncProfileNames> + Send>>;
+}
+
 /// Current daemon self-profile names, best-effort snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncProfileNames {
@@ -2245,12 +3736,16 @@ pub struct SyncProfileNames {
 /// serialized bytes before flushing, so a page of large (individually
 /// value-capped) records cannot approach the frame limit (review R4).
 /// Always at least one page; a single record always ships (its own size is
-/// value-capped well under [`MAX_FRAME_BYTES`]).
+/// value-capped well under [`MAX_FRAME_BYTES`]). #1055 RC1: admission is
+/// re-validated before EVERY page frame — a peer that is deleted or
+/// revoked while a page write is blocked receives no further pages.
 async fn write_paged_records<S: AsyncWrite + Unpin>(
     send: &mut S,
     records: &[VersionedRecord],
+    admission: &SessionAdmission<'_>,
 ) -> Result<(), SyncError> {
     if records.is_empty() {
+        admission.still_admissible().await?;
         write_frame(
             send,
             &SyncFrame::Records {
@@ -2269,6 +3764,8 @@ async fn write_paged_records<S: AsyncWrite + Unpin>(
         if !page.is_empty()
             && (page.len() >= RECORDS_PER_FRAME || page_bytes + record_bytes > RECORDS_PAGE_BYTES)
         {
+            // Outbound page boundary (#1055 RC1).
+            admission.still_admissible().await?;
             write_frame(
                 send,
                 &SyncFrame::Records {
@@ -2282,6 +3779,9 @@ async fn write_paged_records<S: AsyncWrite + Unpin>(
         page.push(record.clone());
     }
     if !page.is_empty() {
+        // Outbound page boundary (#1055 RC1) — the last page is checked
+        // like every other.
+        admission.still_admissible().await?;
         write_frame(send, &SyncFrame::Records { records: page }).await?;
     }
     Ok(())
@@ -2352,6 +3852,70 @@ async fn inbound_session_admissible(
     }
 }
 
+/// The admission inputs a live session re-validates at every phase
+/// boundary (#1055, ADR 0084 finding 4): the same enrollment and machine
+/// revocation checks that admitted the session, re-run while it runs, so
+/// an unenroll, expiry or revocation that lands mid-session takes effect
+/// at the next boundary — fail-closed, with nothing committed — instead
+/// of at the next admission.
+struct SessionAdmission<'a> {
+    store: &'a OwnerSyncStore,
+    /// Machine revocation set (ADR-0018) when the caller has one: the
+    /// daemon paths pass the agent's set; library sessions pass `None`
+    /// and re-check enrollment currency alone.
+    revocations: Option<&'a Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>>,
+    owner: &'a UserId,
+    peer: &'a MachineId,
+}
+
+impl SessionAdmission<'_> {
+    /// Re-run the admission checks; `Err` aborts the session fail-closed.
+    /// Enrollment covers signature, expiry currency AND the #1055
+    /// tombstone (via [`OwnerSyncStore::is_enrolled`]).
+    async fn still_admissible(&self) -> Result<(), SyncError> {
+        self.enrollment_current().await?;
+        self.revocations_checked().await.map(|_| ())
+    }
+
+    /// The enrollment half of [`Self::still_admissible`].
+    async fn enrollment_current(&self) -> Result<(), SyncError> {
+        if !self.store.is_enrolled(self.peer, self.owner).await {
+            return Err(SyncError::NotEnrolled {
+                machine: self.peer.0,
+            });
+        }
+        Ok(())
+    }
+
+    /// The revocation half of [`Self::still_admissible`], returning the
+    /// read guard so a session commit can HOLD it across its mutation
+    /// (#1055 RC2): a revocation that lands concurrently either precedes
+    /// this check (the commit is refused) or waits for the guard and
+    /// applies after the commit — never between the check and the
+    /// mutation. The guard is owned, so it can move into each durable
+    /// write of the commit (`run_to_completion`) and outlive a cancelled
+    /// caller until the write lands (#1545).
+    async fn revocations_checked(
+        &self,
+    ) -> Result<
+        Option<tokio::sync::OwnedRwLockReadGuard<crate::revocation::RevocationSet>>,
+        SyncError,
+    > {
+        match self.revocations {
+            None => Ok(None),
+            Some(revocations) => {
+                let revoked = Arc::clone(revocations).read_owned().await;
+                if revoked.revocation_resync_required() || revoked.is_machine_revoked(self.peer) {
+                    return Err(SyncError::MachineRevoked {
+                        machine: self.peer.0,
+                    });
+                }
+                Ok(Some(revoked))
+            }
+        }
+    }
+}
+
 /// Daemon-resident Tier-1 sync service (the `ForwardService` pattern for
 /// `SyncV1`): owns the single registered acceptor for
 /// [`crate::streams::StreamProtocol::SyncV1`], gates each inbound stream on
@@ -2366,6 +3930,9 @@ pub struct OwnerSyncService {
     store: Arc<OwnerSyncStore>,
     journal_path: Option<PathBuf>,
     view: std::sync::RwLock<Option<Arc<dyn SyncDaemonView>>>,
+    /// The attached view's save confirmation, when it saves in the
+    /// background (#1545, see [`Self::attach_daemon_view`]).
+    persisted_names: std::sync::RwLock<Option<Arc<dyn PersistedNames>>>,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     session_permits: Arc<tokio::sync::Semaphore>,
 }
@@ -2389,11 +3956,15 @@ impl OwnerSyncService {
         let store = OwnerSyncStore::load(data_dir)
             .await
             .map_err(|e| crate::error::NetworkError::CacheError(format!("sync store: {e}")))?;
+        if let Some(path) = journal_path.as_ref() {
+            store.set_journal_path(path.clone());
+        }
         let service = Arc::new(Self {
             agent,
             store: Arc::new(store),
             journal_path,
             view: std::sync::RwLock::new(None),
+            persisted_names: std::sync::RwLock::new(None),
             tasks: tokio::sync::Mutex::new(Vec::new()),
             session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
         });
@@ -2417,11 +3988,15 @@ impl OwnerSyncService {
         let store = OwnerSyncStore::load(data_dir)
             .await
             .map_err(|e| crate::error::NetworkError::CacheError(format!("sync store: {e}")))?;
+        if let Some(path) = journal_path.as_ref() {
+            store.set_journal_path(path.clone());
+        }
         let service = Arc::new(Self {
             agent,
             store: Arc::new(store),
             journal_path,
             view: std::sync::RwLock::new(None),
+            persisted_names: std::sync::RwLock::new(None),
             tasks: tokio::sync::Mutex::new(Vec::new()),
             session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
         });
@@ -2509,7 +4084,30 @@ impl OwnerSyncService {
 
     /// Install the live daemon view (idempotent; called by the daemon right
     /// after `AppState` construction).
+    ///
+    /// The reconcile pass takes a name record as applied once the view's
+    /// `apply_names` returns.
     pub fn attach_view(&self, view: Arc<dyn SyncDaemonView>) {
+        self.install_view(view, None);
+    }
+
+    /// #1545: [`Self::attach_view`] for a view that saves its names in the
+    /// background. The reconcile pass takes a name record as applied only
+    /// when the view confirms the save.
+    pub(crate) fn attach_daemon_view<V: SyncDaemonView + PersistedNames>(&self, view: Arc<V>) {
+        let persisted: Arc<dyn PersistedNames> = view.clone();
+        self.install_view(view, Some(persisted));
+    }
+
+    fn install_view(
+        &self,
+        view: Arc<dyn SyncDaemonView>,
+        persisted: Option<Arc<dyn PersistedNames>>,
+    ) {
+        *self
+            .persisted_names
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = persisted;
         *self
             .view
             .write()
@@ -2525,6 +4123,15 @@ impl OwnerSyncService {
     /// On-change trigger: wake the periodic pass early.
     pub fn kick(&self) {
         self.store.kick();
+    }
+
+    /// The save confirmation of the daemon view, when installed with
+    /// [`Self::attach_daemon_view`].
+    fn persisted_names(&self) -> Option<Arc<dyn PersistedNames>> {
+        self.persisted_names
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn view(&self) -> Option<Arc<dyn SyncDaemonView>> {
@@ -2656,10 +4263,23 @@ impl OwnerSyncService {
             .ok_or_else(|| ("no_owner_key", "no owner key".to_string()))?;
         let owner_id = owner_kp.user_id();
         let local_machine = self.agent.machine_id();
-        if !self.store.is_enrolled(machine, &owner_id).await {
+        // Same rule as the acceptor's `inbound_session_admissible`
+        // (#1055 RC2): a revoked machine, or one under a pending
+        // revocation resync, costs no session — refuse before dialing.
+        if !inbound_session_admissible(
+            &self.store,
+            &self.agent.revocation_set(),
+            machine,
+            &owner_id,
+        )
+        .await
+        {
             return Err((
                 "not_enrolled",
-                format!("machine {} is not enrolled", hex::encode(machine.0)),
+                format!(
+                    "machine {} is not enrolled or is revoked",
+                    hex::encode(machine.0)
+                ),
             ));
         }
         // Resolve the deterministic first agent on the target machine —
@@ -2843,10 +4463,15 @@ impl OwnerSyncService {
                 }
             }
         }
-        run_sync_session(
+        // #1055: the daemon's live sessions re-check enrollment AND the
+        // ADR-0018 machine revocation set at every phase boundary.
+        let revocations = self.agent.revocation_set();
+        run_sync_session_with_recheck(
+            SESSION_TIMEOUT,
             send,
             recv,
             &self.store,
+            Some(&revocations),
             owner_kp,
             local_machine,
             peer,
@@ -2894,66 +4519,118 @@ impl OwnerSyncService {
         let local_machine = self.agent.machine_id();
         let local_hex = hex::encode(local_machine.0);
 
+        // #1542: finish an interrupted commit and apply its records before
+        // any mint from live state, or the mint puts the old live value
+        // over a recovered record at a higher version.
+        let recovery = self
+            .store
+            .recover_interrupted_commit(&owner_kp.user_id())
+            .await;
+        let names_applied = self.apply_pending().await;
+        recovery?;
+
         // Kinds 1 + 2 + 3: profile names and the Home pointer, via the
         // daemon view when attached.
         if let Some(view) = self.view() {
-            let names = view.profile_names();
-            self.mint_or_log(
-                SyncKind::OwnerProfile,
-                "owner",
-                SyncValue::OwnerProfile {
-                    human_name: names.human_name,
-                },
-                owner_kp,
-                local_machine,
-            )
-            .await;
-            self.mint_or_log(
-                SyncKind::MachineNames,
-                &local_hex,
-                SyncValue::MachineNames {
-                    display_name: names.display_name,
-                    machine_name: names.machine_name,
-                },
-                owner_kp,
-                local_machine,
-            )
-            .await;
+            // The live profile shows every committed name only when they
+            // are applied; until then, its names are not local changes. A
+            // session can commit names, and a profile save can retire
+            // them, after `apply_pending`. So the epoch of the pending
+            // applies is read before the names, and each mint checks, in
+            // one step with its register write, that no name is owed and
+            // that the epoch did not change (`mint_live_name`).
+            let epoch = self.store.names_epoch().await;
+            let names = match self.persisted_names() {
+                Some(persisted) => persisted.live_names().await,
+                None => view.profile_names(),
+            };
+            #[cfg(test)]
+            self.store.pause_before_name_mint().await;
+            if names_applied {
+                self.mint_live_name_or_log(
+                    SyncKind::OwnerProfile,
+                    "owner",
+                    SyncValue::OwnerProfile {
+                        human_name: names.human_name,
+                    },
+                    owner_kp,
+                    local_machine,
+                    epoch,
+                )
+                .await;
+                self.mint_live_name_or_log(
+                    SyncKind::MachineNames,
+                    &local_hex,
+                    SyncValue::MachineNames {
+                        display_name: names.display_name,
+                        machine_name: names.machine_name,
+                    },
+                    owner_kp,
+                    local_machine,
+                    epoch,
+                )
+                .await;
+            }
             self.materialize_local_home_pointer().await;
         }
 
         // Kind 4: issuance journal lines (latest per agent, owner-scoped).
         if let Some(path) = self.journal_path.as_ref() {
-            let owner_hex = hex::encode(owner_kp.user_id().0);
-            let mut latest: BTreeMap<String, crate::profile::IssuedCertRecord> = BTreeMap::new();
-            for record in crate::profile::IssuedCertRecord::load(path).await {
-                if record.user_id != owner_hex {
-                    continue;
-                }
-                let keep = latest
-                    .get(&record.agent_id)
-                    .is_none_or(|old| record.issued_at >= old.issued_at);
-                if keep {
-                    latest.insert(record.agent_id.clone(), record);
-                }
-            }
-            for (agent_hex, record) in latest {
-                self.mint_or_log(
-                    SyncKind::IssuanceJournal,
-                    &agent_hex,
-                    SyncValue::IssuanceJournal {
-                        agent_id: record.agent_id,
-                        cert_digest: record.cert_digest,
-                        issued_at: record.issued_at,
-                        not_after: record.not_after,
-                    },
-                    owner_kp,
-                    local_machine,
-                )
-                .await;
-            }
+            mint_journal_lines(&self.store, path, owner_kp, local_machine).await;
+            // Its recovery can commit names too.
+            self.apply_pending().await;
         }
         Ok(())
+    }
+
+    /// #1545: apply the committed names that live state may not show yet
+    /// (`OwnerSyncStore::pending_applies`), and discharge them once they
+    /// are saved. `true` when none of them are owed any more; `false` when
+    /// no view is attached or a name is not saved yet, so the next pass
+    /// applies it again.
+    ///
+    /// With a view that saves in the background (`PersistedNames`), each
+    /// save discharges the names it holds. A record that sets a local name
+    /// is then confirmed only by its obligation in the store, after the
+    /// earlier saves have ended: a failed save does not count against a
+    /// name that a later save discharged. The other records set no local
+    /// name (`sets_local_name`), so they need no save, and the pass
+    /// discharges them.
+    async fn apply_pending(&self) -> bool {
+        let pending = self.store.pending_applies().await;
+        if pending.is_empty() {
+            return true;
+        }
+        if self.view().is_none() {
+            return false;
+        }
+        for (record, winner) in &pending {
+            if *winner {
+                self.apply_record(record);
+            }
+        }
+        let Some(persisted) = self.persisted_names() else {
+            // The view applied the winners in place. The store retires a
+            // non-winner only if it is still not the winner
+            // (`discharge_applies`).
+            if let Err(e) = self.store.discharge_applies(&pending).await {
+                tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");
+            }
+            return true;
+        };
+        persisted.names_settled().await;
+        let local = self.agent.machine_id();
+        let (saved, unsaved): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|(record, winner)| *winner && sets_local_name(record, &local));
+        if let Err(e) = self.store.discharge_applies(&unsaved).await {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "failed to discharge applied names");
+        }
+        if self.store.owes_any(&saved).await {
+            tracing::warn!(target: "x0x::owner_sync", "synced names not saved yet; retry next pass");
+            return false;
+        }
+        true
     }
 
     /// The owner's CANONICAL Home per the Tier-1 `("home")` register (#449).
@@ -3021,86 +4698,32 @@ impl OwnerSyncService {
         }
     }
 
-    /// Apply an accepted record to live daemon state (post-commit only).
-    ///
-    /// Exhaustive over [`SyncValue`] — Tier-3 kinds cannot reach here.
-    fn apply_record(&self, record: &VersionedRecord) {
-        match &record.value {
-            SyncValue::OwnerProfile { human_name } => {
-                if let Some(view) = self.view() {
-                    view.apply_names(human_name.clone(), None, None);
-                }
-            }
-            SyncValue::MachineNames {
-                display_name,
-                machine_name,
-            } => {
-                let local_hex = hex::encode(self.agent.machine_id().0);
-                if record.key == local_hex {
-                    if let Some(view) = self.view() {
-                        view.apply_names(None, display_name.clone(), machine_name.clone());
-                    }
-                }
-                // Remote machines' names stay in the record store for
-                // future surfacing (ADR-0041 Tier-1 scope).
-            }
-            SyncValue::HomePointer { .. } => {
-                // The register is read on demand (`canonical_home`) by the
-                // Home resolution path rather than pushed here: provisioning,
-                // `GET /home` and adoption all need the CURRENT winner, not
-                // whatever happened to arrive last (#449).
-            }
-            SyncValue::IssuanceJournal {
-                agent_id,
-                cert_digest,
-                issued_at,
-                ..
-            } => {
-                self.apply_journal_line(agent_id, cert_digest, *issued_at);
-            }
+    async fn mint_live_name_or_log(
+        &self,
+        kind: SyncKind,
+        key: &str,
+        value: SyncValue,
+        owner_kp: &UserKeypair,
+        machine: MachineId,
+        epoch: u64,
+    ) {
+        if let Err(e) = self
+            .store
+            .mint_live_name(kind, key, &value, owner_kp, machine, epoch)
+            .await
+        {
+            tracing::warn!(target: "x0x::owner_sync", kind = ?kind, error = %e, "mint failed");
         }
     }
 
-    /// Append a synced journal line to the local file when missing
-    /// (idempotent; fire-and-forget).
-    fn apply_journal_line(&self, agent_hex: &str, cert_digest: &str, issued_at: u64) {
-        let Some(path) = self.journal_path.clone() else {
-            return;
-        };
-        let Some(owner_hex) = self.owner_kp().map(|kp| hex::encode(kp.user_id().0)) else {
-            return;
-        };
-        let agent_hex = agent_hex.to_string();
-        let cert_digest = cert_digest.to_string();
-        tokio::spawn(async move {
-            let existing = crate::profile::IssuedCertRecord::load(&path).await;
-            if existing
-                .iter()
-                .any(|r| r.agent_id == agent_hex && r.cert_digest == cert_digest)
-            {
-                return; // already local
+    /// Apply an accepted record to live daemon state (post-commit only).
+    /// See [`local_names_of`] for what each kind applies.
+    pub(crate) fn apply_record(&self, record: &VersionedRecord) {
+        if let Some(names) = local_names_of(record, &self.agent.machine_id()) {
+            if let Some(view) = self.view() {
+                view.apply_names(names.human_name, names.display_name, names.machine_name);
             }
-            let record = crate::profile::IssuedCertRecord {
-                user_id: owner_hex,
-                agent_id: agent_hex,
-                cert_digest,
-                issued_at,
-                not_after: None,
-                // ADR-0039 fields are not part of the Tier-1 sync value:
-                // a synced line records the issuance fact (digest + time);
-                // mode defaults to Acp (the pre-ADR-0039 line shape) and
-                // no certificate bytes travel Tier 1 (Tier-3 boundary).
-                mode: crate::profile::CertMode::Acp,
-                label: None,
-                cert_b64: None,
-            };
-            if let Err(e) = crate::profile::IssuedCertRecord::append(&path, &record).await {
-                tracing::warn!(
-                    target: "x0x::owner_sync",
-                    "failed to append synced journal line: {e}"
-                );
-            }
-        });
+        }
     }
 
     /// Spawn the periodic + on-change pass loop (owned by the daemon's
@@ -3121,6 +4744,237 @@ impl OwnerSyncService {
             self.sync_all().await;
         }
     }
+}
+
+/// Whether `record` sets a name on the profile of `local_machine`, so that
+/// its apply saves the profile (`SyncDaemonView::apply_names` does nothing
+/// for no names).
+fn sets_local_name(record: &VersionedRecord, local_machine: &MachineId) -> bool {
+    local_names_of(record, local_machine).is_some_and(|names| {
+        names.human_name.is_some() || names.display_name.is_some() || names.machine_name.is_some()
+    })
+}
+
+/// The names that `record` sets on the profile of `local_machine`, with
+/// `None` for a name it leaves unchanged; `None` when it sets no local
+/// name. The names of a remote machine stay in the record store for future
+/// surfacing (ADR-0041 Tier-1 scope).
+pub(crate) fn local_names_of(
+    record: &VersionedRecord,
+    local_machine: &MachineId,
+) -> Option<SyncProfileNames> {
+    match &record.value {
+        SyncValue::OwnerProfile { human_name } => Some(SyncProfileNames {
+            human_name: human_name.clone(),
+            display_name: None,
+            machine_name: None,
+        }),
+        SyncValue::MachineNames {
+            display_name,
+            machine_name,
+        } if record.key == hex::encode(local_machine.0) => Some(SyncProfileNames {
+            human_name: None,
+            display_name: display_name.clone(),
+            machine_name: machine_name.clone(),
+        }),
+        SyncValue::MachineNames { .. } => None,
+        // The register is read on demand (`canonical_home`) by the Home
+        // resolution path rather than pushed here: provisioning,
+        // `GET /home` and adoption all need the CURRENT winner, not
+        // whatever happened to arrive last (#449).
+        SyncValue::HomePointer { .. } => None,
+        // `commit_batch` already wrote the journal file, under the same
+        // `journal_apply` hold as the register change (#1542).
+        SyncValue::IssuanceJournal { .. } => None,
+    }
+}
+
+/// Mint each agent's latest journal line into the `IssuanceJournal`
+/// register (kind 4 of the local reconcile). A failed mint is logged and
+/// retried next pass. Holds `OwnerSyncStore::journal_apply` from the
+/// journal read to the last mint, so no inbound commit changes the
+/// register between them (#1542). It first finishes an interrupted commit
+/// (`recover_journal_commit`), and it mints only from a durable read of
+/// the journal.
+async fn mint_journal_lines(
+    store: &OwnerSyncStore,
+    path: &Path,
+    owner_kp: &UserKeypair,
+    machine: MachineId,
+) {
+    let guard = Arc::clone(&store.journal_apply).lock_owned().await;
+    let _journal_apply = match store
+        .recover_journal_commit(guard, &owner_kp.user_id())
+        .await
+    {
+        Ok(guard) => guard,
+        Err(e) => {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "journal commit recovery failed");
+            return;
+        }
+    };
+    let owner_hex = hex::encode(owner_kp.user_id().0);
+    // A durable read: a line a host crash can take back must not reach the
+    // register first.
+    // #1545: a durable read can rewrite the journal; the rewrite holds the
+    // store's write custody until it lands (see `apply_journal_value`).
+    let custody = match store.write_custody().await {
+        Ok(custody) => custody,
+        Err(e) => {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "journal read refused");
+            return;
+        }
+    };
+    let lines = match crate::profile::IssuedCertRecord::load_durable(path, custody).await {
+        Ok(lines) => lines,
+        Err(e) => {
+            tracing::warn!(target: "x0x::owner_sync", error = %e, "journal is not durable");
+            return;
+        }
+    };
+    #[cfg(test)]
+    store.pause_after_journal_read().await;
+    for (agent_hex, value) in latest_journal_values(lines, &owner_hex) {
+        if let Err(e) = store
+            .mint(
+                SyncKind::IssuanceJournal,
+                &agent_hex,
+                &value,
+                owner_kp,
+                machine,
+            )
+            .await
+        {
+            tracing::warn!(target: "x0x::owner_sync", kind = ?SyncKind::IssuanceJournal, error = %e, "mint failed");
+        }
+    }
+}
+
+/// Whether a synced journal line must be appended to `existing`.
+///
+/// Owner sync calls this only for a value that `commit_batch` has just
+/// made the `IssuanceJournal` register's winner, under `journal_apply`.
+/// `published_digest` is the certificate the register held before that
+/// commit. The line is compared with this owner's CURRENT line for the
+/// agent (see `latest_journal_values`; the owner roster reads the same
+/// last line):
+///
+/// - no current line, or a later second: append;
+/// - an earlier second: never append. A later line for an older
+///   certificate would roll the roster back to it (rollback protection);
+///   this device's next pass mints its newer line over the register;
+/// - the same second and the same digest: append only to supply an expiry
+///   the current line lacks (a line written before #1542);
+/// - the same second and a different digest: `issued_at` has second
+///   precision, so it cannot order the two certificates. If the current
+///   line is the published one, append: the register's clock (version,
+///   signing time, writer) ordered them, and every device follows that
+///   order. Otherwise the current line is a local issuance that no
+///   reconcile has published yet: keep it, and the next reconcile
+///   publishes it over the register at a higher version.
+fn synced_line_needed(
+    existing: &[crate::profile::IssuedCertRecord],
+    owner_hex: &str,
+    agent_hex: &str,
+    cert_digest: &str,
+    issued_at: u64,
+    not_after: Option<u64>,
+    published_digest: Option<&str>,
+) -> bool {
+    let current = latest_journal_values(
+        existing.iter().filter(|r| r.agent_id == agent_hex).cloned(),
+        owner_hex,
+    )
+    .remove(agent_hex);
+    let Some(SyncValue::IssuanceJournal {
+        cert_digest: current_digest,
+        issued_at: current_issued_at,
+        not_after: current_not_after,
+        ..
+    }) = current
+    else {
+        return true;
+    };
+    match issued_at.cmp(&current_issued_at) {
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal if cert_digest == current_digest => {
+            current_not_after.is_none() && not_after.is_some()
+        }
+        std::cmp::Ordering::Equal => published_digest == Some(current_digest.as_str()),
+    }
+}
+
+/// The local journal line for a synced `IssuanceJournal` value. It keeps
+/// the value's `not_after`: a line without it would make this device mint
+/// a different value for the same key (#1542, see
+/// [`latest_journal_values`]).
+fn synced_journal_line(
+    owner_hex: String,
+    agent_hex: String,
+    cert_digest: String,
+    issued_at: u64,
+    not_after: Option<u64>,
+) -> crate::profile::IssuedCertRecord {
+    crate::profile::IssuedCertRecord {
+        user_id: owner_hex,
+        agent_id: agent_hex,
+        cert_digest,
+        issued_at,
+        not_after,
+        // ADR-0039 fields are not part of the Tier-1 sync value: a synced
+        // line records the issuance fact (digest, time and expiry); mode
+        // defaults to Acp (the pre-ADR-0039 line shape) and no certificate
+        // bytes travel Tier 1 (Tier-3 boundary).
+        mode: crate::profile::CertMode::Acp,
+        label: None,
+        cert_b64: None,
+    }
+}
+
+/// The `IssuanceJournal` value each agent's latest journal line mints:
+/// owner-scoped (`owner_hex`), latest `issued_at` per agent, later lines
+/// winning ties.
+///
+/// #1542: a digest names exactly one certificate, so its `not_after` is
+/// fixed. A line with the same digest but no `not_after` (a synced line
+/// written before the expiry travelled with it) does not replace a known
+/// expiry. Otherwise two owner devices mint `Some` and `None` for the same
+/// key in turn: each mint bumps the store generation, which starts the
+/// next sync pass at once, so the pair spins without end.
+fn latest_journal_values(
+    lines: impl IntoIterator<Item = crate::profile::IssuedCertRecord>,
+    owner_hex: &str,
+) -> BTreeMap<String, SyncValue> {
+    let mut latest: BTreeMap<String, crate::profile::IssuedCertRecord> = BTreeMap::new();
+    for mut record in lines {
+        if record.user_id != owner_hex {
+            continue;
+        }
+        if let Some(old) = latest.get(&record.agent_id) {
+            if record.issued_at < old.issued_at {
+                continue;
+            }
+            if record.cert_digest == old.cert_digest {
+                record.not_after = record.not_after.or(old.not_after);
+            }
+        }
+        latest.insert(record.agent_id.clone(), record);
+    }
+    latest
+        .into_iter()
+        .map(|(agent_hex, record)| {
+            (
+                agent_hex,
+                SyncValue::IssuanceJournal {
+                    agent_id: record.agent_id,
+                    cert_digest: record.cert_digest,
+                    issued_at: record.issued_at,
+                    not_after: record.not_after,
+                },
+            )
+        })
+        .collect()
 }
 
 impl Drop for OwnerSyncService {
@@ -3853,6 +5707,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_answers_unsupported_frame_with_abort() {
+        // WHY (#1604 G1): an enrolled peer that sends a frame variant this
+        // node does not know gets the typed `Abort` refusal on the live
+        // session, and the local side fails with `UnsupportedVariant`.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let newer_peer = tokio::spawn(async move {
+            // A frame whose variant index no build has assigned.
+            let mut body = 0xfeed_u32.to_le_bytes().to_vec();
+            body.extend_from_slice(&[0u8; 8]);
+            c_send
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .await
+                .expect("len");
+            c_send.write_all(&body).await.expect("body");
+            let hello = read_frame(&mut c_recv).await.expect("local hello");
+            assert!(matches!(hello, SyncFrame::Hello { .. }), "{hello:?}");
+            read_frame(&mut c_recv).await.expect("refusal frame")
+        });
+        let err = run_sync_session(
+            &mut s_send,
+            &mut s_recv,
+            &store,
+            &owner,
+            &local,
+            &peer,
+            |_| {},
+        )
+        .await
+        .expect_err("unsupported frame is refused");
+        assert!(matches!(err, SyncError::UnsupportedVariant(_)), "{err:?}");
+        let refusal = newer_peer.await.expect("peer task");
+        assert_eq!(
+            refusal,
+            SyncFrame::Abort {
+                reason: "unsupported_variant".into()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn session_times_out_when_peer_stalls() {
         // WHY: review R2 finding 5 — an enrolled peer that stalls after the
         // handshake holds the session only until the budget elapses.
@@ -3918,7 +5823,7 @@ mod tests {
     /// enrollment store installed. The owner-connect re-announcement is
     /// left off, and `join_network` is not called, so the discovery cache
     /// stays empty and the IPv6 route probe does not run.
-    async fn live_owner_device(
+    pub(in crate::owner_sync) async fn live_owner_device(
         dir: &Path,
         name: &str,
         owner_seed: [u8; 32],
@@ -3945,6 +5850,95 @@ mod tests {
         .expect("owner sync service");
         agent.install_owner_device_store(Arc::clone(service.store()));
         (agent, service)
+    }
+
+    /// #1542 (Codex review of #1545): repairing an older certificate's
+    /// line must not hide a newer issuance. The owner roster reads the
+    /// journal's last line per agent, so a synced line for an older digest
+    /// appended after a renewal rolled the roster back to the older
+    /// certificate, its expiry, mode and label.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_synced_line_never_replaces_a_newer_issuance_in_the_roster() {
+        install_loopback_socket_boundary();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = [0x85; 32];
+        let (agent, service) = live_owner_device(dir.path(), "alice", seed).await;
+        let journal = agent
+            .cert_journal_path()
+            .expect("journal path")
+            .to_path_buf();
+        let owner_hex = hex::encode(UserKeypair::from_seed(&seed).expect("owner").user_id().0);
+        let target = "b".repeat(64);
+        let line = |digest: &str, issued_at, not_after, label: Option<&str>| {
+            crate::profile::IssuedCertRecord {
+                user_id: owner_hex.clone(),
+                agent_id: target.clone(),
+                cert_digest: digest.to_string(),
+                issued_at,
+                not_after,
+                mode: crate::profile::CertMode::Acp,
+                label: label.map(str::to_string),
+                cert_b64: None,
+            }
+        };
+        // A pre-fix synced line for d1 (no expiry), then the renewal d2.
+        for record in [
+            line("d1", 100, None, None),
+            line("d2", 200, Some(9_000), Some("renewed")),
+        ] {
+            crate::profile::IssuedCertRecord::append(&journal, &record)
+                .await
+                .expect("append");
+        }
+        // A late sync of d1 that carries its expiry arrives and wins the
+        // register here (this device has not minted d2).
+        let owner = UserKeypair::from_seed(&seed).expect("owner");
+        service
+            .store()
+            .mint(
+                SyncKind::IssuanceJournal,
+                &target,
+                &SyncValue::IssuanceJournal {
+                    agent_id: target.clone(),
+                    cert_digest: "d1".to_string(),
+                    issued_at: 100,
+                    not_after: Some(5_000),
+                },
+                &owner,
+                agent.machine_id(),
+            )
+            .await
+            .expect("commit d1");
+        service
+            .store()
+            .apply_journal_value(
+                &journal,
+                &owner_hex,
+                &SyncValue::IssuanceJournal {
+                    agent_id: target.clone(),
+                    cert_digest: "d1".to_string(),
+                    issued_at: 100,
+                    not_after: Some(5_000),
+                },
+                None,
+                (),
+            )
+            .await
+            .expect("apply d1");
+        let roster = agent.owner_issued_certificates().await;
+        let entry = roster
+            .iter()
+            .find(|cert| cert.agent_id == target)
+            .expect("roster entry");
+        assert_eq!(
+            (
+                entry.digest.as_str(),
+                entry.not_after,
+                entry.label.as_deref()
+            ),
+            ("d2", Some(9_000), Some("renewed")),
+            "the newest issuance stays in the roster"
+        );
     }
 
     async fn loopback_addr(agent: &crate::Agent) -> std::net::SocketAddr {
@@ -4325,7 +6319,7 @@ mod tests {
         );
     }
 
-    fn install_loopback_socket_boundary() {
+    pub(in crate::owner_sync) fn install_loopback_socket_boundary() {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         socket_boundary::install();
     }
@@ -4905,14 +6899,31 @@ mod r3_tests {
 
 #[cfg(test)]
 mod r4_tests {
-    use super::tests::{clock, owner_kp};
+    use super::tests::{clock, machine, owner_kp};
     use super::*;
 
     /// A `Vec<u8>` sink for `write_frame`, decoded back frame-by-frame so
     /// tests can assert the PAGE COUNT and each frame's encoded body size.
+    /// The admission is a live enrolled peer — RC1 made the outbound pager
+    /// re-check admission at every page boundary.
     async fn count_record_frames(records: &[VersionedRecord]) -> Vec<usize> {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(7);
+        let peer = machine(3);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        let owner_id = owner.user_id();
+        let admission = SessionAdmission {
+            store: &store,
+            revocations: None,
+            owner: &owner_id,
+            peer: &peer,
+        };
         let mut sink = Vec::new();
-        write_paged_records(&mut sink, records)
+        write_paged_records(&mut sink, records, &admission)
             .await
             .expect("write pages");
         let mut cursor = std::io::Cursor::new(sink);
@@ -5457,5 +7468,3110 @@ mod home_pointer_election_tests {
         // Stale entries are pruned: memory is bounded by recent machines.
         assert!(limiter.allow(&MachineId([3; 32]), t0 + interval * 3));
         assert_eq!(limiter.last.len(), 1, "expired entries must be pruned");
+    }
+}
+
+/// #1542: an `IssuanceJournal` value must survive the sync round trip, or
+/// two owner devices re-mint it in turn without end.
+#[cfg(test)]
+mod issuance_journal_sync_tests {
+    use super::*;
+
+    const OWNER: &str = "aa";
+
+    /// An issuing device's own journal line (not a synced one).
+    fn line(
+        digest: &str,
+        issued_at: u64,
+        not_after: Option<u64>,
+    ) -> crate::profile::IssuedCertRecord {
+        crate::profile::IssuedCertRecord {
+            user_id: OWNER.to_string(),
+            agent_id: "bb".to_string(),
+            cert_digest: digest.to_string(),
+            issued_at,
+            not_after,
+            mode: crate::profile::CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        }
+    }
+
+    fn fields(value: &SyncValue) -> (String, String, u64, Option<u64>) {
+        match value {
+            SyncValue::IssuanceJournal {
+                agent_id,
+                cert_digest,
+                issued_at,
+                not_after,
+            } => (
+                agent_id.clone(),
+                cert_digest.clone(),
+                *issued_at,
+                *not_after,
+            ),
+            other => panic!("not a journal value: {other:?}"),
+        }
+    }
+
+    /// The issuing device's line has a `not_after`. A receiving device
+    /// writes the synced line and mints from its own journal: it must mint
+    /// the same value, so its mint is a no-op. Before the fix the synced
+    /// line dropped `not_after`, the receiver minted `None`, and the two
+    /// devices replaced each other's record on every pass.
+    #[test]
+    fn a_synced_expiring_line_mints_the_value_it_came_from() {
+        let origin = latest_journal_values(vec![line("d1", 100, Some(5_000))], OWNER);
+        let sent = origin.get("bb").expect("origin value");
+        let (agent, digest, issued_at, not_after) = fields(sent);
+        let received = synced_journal_line(OWNER.to_string(), agent, digest, issued_at, not_after);
+        let receiver = latest_journal_values(vec![received], OWNER);
+        assert_eq!(receiver.get("bb"), Some(sent));
+    }
+
+    /// Codex review of #1545 (42d32a0): `issued_at` has second precision,
+    /// so a renewal can share its predecessor's second. A device that holds
+    /// only `d1@100` must take the synced renewal `d2@100`. If it refuses,
+    /// it mints `d1` again over the register and the issuing device mints
+    /// `d2` again, without end.
+    #[test]
+    fn a_same_second_renewal_replaces_the_current_certificate() {
+        assert!(synced_line_needed(
+            &[line("d1", 100, Some(5_000))],
+            OWNER,
+            "bb",
+            "d2",
+            100,
+            Some(9_000),
+            Some("d1")
+        ));
+    }
+
+    /// Codex review of #1545 (5306e5d): the same-second line is not
+    /// appended over a local issuance that the register has not published
+    /// yet. The next reconcile publishes the local issuance instead.
+    #[test]
+    fn a_same_second_line_keeps_an_unpublished_local_issuance() {
+        let existing = vec![line("d0", 50, Some(1_000)), line("d2", 100, Some(9_000))];
+        for published in [Some("d0"), None] {
+            assert!(!synced_line_needed(
+                &existing,
+                OWNER,
+                "bb",
+                "d1",
+                100,
+                Some(5_000),
+                published
+            ));
+        }
+    }
+
+    /// Codex review of #1545 (42d32a0): the expiry repair of the CURRENT
+    /// certificate runs, also when an earlier certificate has the same
+    /// second.
+    #[test]
+    fn the_current_certificate_is_repaired_beside_a_same_second_predecessor() {
+        let existing = vec![line("d1", 100, Some(5_000)), line("d2", 100, None)];
+        assert!(synced_line_needed(
+            &existing,
+            OWNER,
+            "bb",
+            "d2",
+            100,
+            Some(9_000),
+            Some("d2")
+        ));
+        // The repair still runs when the digest is the only line.
+        assert!(synced_line_needed(
+            &[line("d1", 100, None)],
+            OWNER,
+            "bb",
+            "d1",
+            100,
+            Some(5_000),
+            Some("d1")
+        ));
+    }
+
+    /// Rollback protection: a synced line for a certificate issued in an
+    /// EARLIER second than the current one is never appended.
+    #[test]
+    fn an_earlier_second_never_replaces_the_current_certificate() {
+        let existing = vec![line("d1", 100, None), line("d2", 200, Some(9_000))];
+        assert!(!synced_line_needed(
+            &existing,
+            OWNER,
+            "bb",
+            "d1",
+            100,
+            Some(5_000),
+            Some("d2")
+        ));
+    }
+
+    /// Codex review of #1545 (42d32a0): two owner devices converge after a
+    /// same-second renewal. Device A issued `d1@100` and then `d2@100`;
+    /// device B holds only `d1@100`. Each pass runs the real reconcile
+    /// (`mint_journal_lines`) and the real record merge, which applies an
+    /// accepted record to the journal. The register must stop changing,
+    /// and both devices must hold `d2`.
+    #[tokio::test]
+    async fn two_devices_converge_after_a_same_second_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        struct Device {
+            journal: PathBuf,
+            store: Arc<OwnerSyncStore>,
+            machine: MachineId,
+        }
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_id = owner.user_id();
+        let owner_hex = hex::encode(owner_id.0);
+        let agent = "bb".to_string();
+        let mut devices = Vec::new();
+        for (name, id) in [("a", 1), ("b", 2)] {
+            let (store, journal) = journal_device(&dir.path().join(name)).await;
+            devices.push(Device {
+                journal,
+                store,
+                machine: machine(id),
+            });
+        }
+        let issued = |digest: &str, not_after| crate::profile::IssuedCertRecord {
+            user_id: owner_hex.clone(),
+            agent_id: agent.clone(),
+            cert_digest: digest.to_string(),
+            issued_at: 100,
+            not_after: Some(not_after),
+            mode: crate::profile::CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        };
+        async fn reconcile(device: &Device, owner: &UserKeypair) {
+            mint_journal_lines(&device.store, &device.journal, owner, device.machine).await;
+        }
+        async fn deliver(from: &Device, to: &Device, owner_id: &UserId) {
+            for record in from.store.records_snapshot().await {
+                to.store
+                    .merge_record(record, owner_id)
+                    .await
+                    .expect("merge");
+            }
+        }
+        let (a, b) = (&devices[0], &devices[1]);
+
+        // A issues d1; it syncs to B. Then A renews to d2 in the same second.
+        crate::profile::IssuedCertRecord::append(&a.journal, &issued("d1", 5_000))
+            .await
+            .expect("append d1");
+        reconcile(a, &owner).await;
+        deliver(a, b, &owner_id).await;
+        crate::profile::IssuedCertRecord::append(&a.journal, &issued("d2", 9_000))
+            .await
+            .expect("append d2");
+
+        let mut stable_passes = 0;
+        for _ in 0..8 {
+            let before = (
+                a.store.records_snapshot().await,
+                b.store.records_snapshot().await,
+            );
+            reconcile(a, &owner).await;
+            reconcile(b, &owner).await;
+            deliver(a, b, &owner_id).await;
+            deliver(b, a, &owner_id).await;
+            let after = (
+                a.store.records_snapshot().await,
+                b.store.records_snapshot().await,
+            );
+            stable_passes = if before == after {
+                stable_passes + 1
+            } else {
+                0
+            };
+            if stable_passes == 2 {
+                break;
+            }
+        }
+        assert_eq!(stable_passes, 2, "the register never stopped changing");
+        for (device, who) in [(a, "a"), (b, "b")] {
+            let value = device
+                .store
+                .stored_value(SyncKind::IssuanceJournal, &agent)
+                .await
+                .expect("register value");
+            assert_eq!(fields(&value).1, "d2", "device {who} must hold the renewal");
+        }
+    }
+
+    /// Codex review of #1545 (3b18ea7): the register accepts `d1@100` and
+    /// then `d2@100`. The journal must end on the register's winner `d2`.
+    /// If it ends on `d1`, the next reconcile mints the older certificate
+    /// over the register. One batch carries both, so the commit applies
+    /// only the batch's final value for the key.
+    #[tokio::test]
+    async fn a_batch_applies_only_the_register_winner() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = super::tests::owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let (local, journal) = journal_device(&dir.path().join("local")).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        local
+            .commit_batch(vec![r1, r2], &owner.user_id())
+            .await
+            .expect("commit");
+
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            latest_journal_values(lines, &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the register's winner"
+        );
+    }
+
+    /// Codex review of #1545 (a5ee204): an inbound `d1@100` commits and
+    /// its journal append pauses after it reads the journal. While it
+    /// pauses, this device renews to `d2@100` and reconciles. The renewal
+    /// must land after `d1`, and the reconcile must publish it: the
+    /// delayed append must not put `d1` after `d2`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_repair_does_not_roll_back_a_local_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let (store, journal) = journal_device(&dir.path().join("local")).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        store.pause_next_journal_check(checked_tx, release_rx);
+        let repair = {
+            let (store, owner) = (Arc::clone(&store), owner_kp(7));
+            tokio::spawn(async move { deliver(&store, &owner, r1).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), checked_rx)
+            .await
+            .expect("the repair reaches its journal read")
+            .expect("checked signal");
+
+        // The local renewal and a reconcile pass, while the repair pauses.
+        let renewal = {
+            let (store, journal, owner, owner_hex) = (
+                Arc::clone(&store),
+                journal.clone(),
+                owner_kp(7),
+                owner_hex.clone(),
+            );
+            tokio::spawn(async move {
+                let renewed = crate::profile::IssuedCertRecord {
+                    user_id: owner_hex,
+                    agent_id: "bb".to_string(),
+                    cert_digest: "d2".to_string(),
+                    issued_at: 100,
+                    not_after: Some(9_000),
+                    mode: crate::profile::CertMode::Acp,
+                    label: None,
+                    cert_b64: None,
+                };
+                crate::profile::IssuedCertRecord::append(&journal, &renewed)
+                    .await
+                    .expect("append d2");
+                mint_journal_lines(&store, &journal, &owner, machine(1)).await;
+            })
+        };
+        // Let the renewal run while the repair is held (it blocks).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        release_tx.send(()).expect("release");
+        repair.await.expect("repair task");
+        renewal.await.expect("renewal task");
+
+        // The next reconcile pass.
+        mint_journal_lines(&store, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the renewal: {lines:?}"
+        );
+        assert_eq!(
+            store.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2),
+            "the register must keep the renewal"
+        );
+    }
+
+    /// A pre-fix synced line (same digest, no `not_after`) never hides a
+    /// known expiry, in either order; a newer issuance still wins.
+    #[test]
+    fn a_line_without_expiry_does_not_replace_a_known_one() {
+        for lines in [
+            vec![line("d1", 100, None), line("d1", 100, Some(5_000))],
+            vec![line("d1", 100, Some(5_000)), line("d1", 100, None)],
+        ] {
+            let values = latest_journal_values(lines, OWNER);
+            assert_eq!(fields(&values["bb"]).3, Some(5_000));
+        }
+        let renewed = latest_journal_values(
+            vec![line("d1", 100, Some(5_000)), line("d2", 200, Some(9_000))],
+            OWNER,
+        );
+        assert_eq!(fields(&renewed["bb"]).1, "d2");
+        assert_eq!(fields(&renewed["bb"]).3, Some(9_000));
+        let other_owner = latest_journal_values(
+            vec![synced_journal_line(
+                "cc".into(),
+                "bb".into(),
+                "d1".into(),
+                1,
+                None,
+            )],
+            OWNER,
+        );
+        assert!(other_owner.is_empty());
+    }
+
+    /// One device's view for the #1545 ordering tests: a store whose
+    /// accepted journal records apply to `journal`.
+    async fn journal_device(dir: &Path) -> (Arc<OwnerSyncStore>, PathBuf) {
+        let journal = dir.join(crate::profile::CERT_JOURNAL_FILE);
+        let store = Arc::new(OwnerSyncStore::load(dir).await.expect("store"));
+        store.set_journal_path(journal.clone());
+        (store, journal)
+    }
+
+    /// Mint `value` on the remote `store` and return the signed record, as
+    /// a sync session would carry it.
+    async fn remote_record(
+        store: &OwnerSyncStore,
+        owner: &UserKeypair,
+        value: &SyncValue,
+    ) -> VersionedRecord {
+        store
+            .mint(
+                SyncKind::IssuanceJournal,
+                "bb",
+                value,
+                owner,
+                super::tests::machine(2),
+            )
+            .await
+            .expect("remote mint");
+        store
+            .records_snapshot()
+            .await
+            .into_iter()
+            .find(|r| r.kind == SyncKind::IssuanceJournal && r.key == "bb")
+            .expect("remote record")
+    }
+
+    /// Commit one inbound record the way a sync session does; the commit
+    /// applies an accepted record to the store's journal.
+    async fn deliver(store: &OwnerSyncStore, owner: &UserKeypair, record: VersionedRecord) {
+        store
+            .commit_batch(vec![record], &owner.user_id())
+            .await
+            .expect("commit");
+    }
+
+    fn journal_value(digest: &str, issued_at: u64, not_after: u64) -> SyncValue {
+        SyncValue::IssuanceJournal {
+            agent_id: "bb".to_string(),
+            cert_digest: digest.to_string(),
+            issued_at,
+            not_after: Some(not_after),
+        }
+    }
+
+    /// Codex review of #1545 (5306e5d), P1: a reconcile reads `d1` from
+    /// the journal and pauses. An inbound renewal `d2` then arrives. The
+    /// commit must wait for the reconcile. If it commits first, the
+    /// reconcile mints its stale `d1` over `d2` at a higher version, and
+    /// `d2`'s journal line is then dropped as superseded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_inbound_renewal_is_not_lost_to_a_running_reconcile() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let (local, journal) = journal_device(&dir.path().join("local")).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r1).await;
+
+        let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        local.pause_next_journal_read(read_tx, release_rx);
+        let reconcile = {
+            let (local, journal, owner) = (Arc::clone(&local), journal.clone(), owner_kp(7));
+            tokio::spawn(async move {
+                mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), read_rx)
+            .await
+            .expect("the reconcile reads the journal")
+            .expect("read signal");
+        let inbound = {
+            let (local, owner) = (Arc::clone(&local), owner_kp(7));
+            tokio::spawn(async move { deliver(&local, &owner, r2).await })
+        };
+        // Let the inbound commit run while the reconcile is held (it may block).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        release_tx.send(()).expect("release");
+        reconcile.await.expect("reconcile task");
+        inbound.await.expect("inbound task");
+
+        // The next reconcile pass.
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2.clone()),
+            "the register must keep the renewal: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the renewal: {lines:?}"
+        );
+    }
+
+    /// Codex review of #1545 (5306e5d), P2: this device holds `d0@50` in
+    /// its register and journal. It renews to `d2@100`, and the issuance
+    /// completes. Before its next reconcile publishes `d2`, another
+    /// device's `d1@100` arrives and wins the register. The journal must
+    /// keep the unpublished local `d2`, and the next reconcile must
+    /// publish it. If `d1` is appended after `d2`, the roster and the
+    /// register roll back to `d1`.
+    #[tokio::test]
+    async fn an_unpublished_local_renewal_survives_an_inbound_same_second_line() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let (local, journal) = journal_device(&dir.path().join("local")).await;
+        let d0 = journal_value("d0", 50, 1_000);
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r0 = remote_record(&remote, &owner, &d0).await;
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        deliver(&local, &owner, r0).await;
+
+        // The local renewal completes before the inbound line arrives.
+        let (_, digest, issued_at, not_after) = fields(&d2);
+        crate::profile::IssuedCertRecord::append(
+            &journal,
+            &crate::profile::IssuedCertRecord {
+                user_id: owner_hex.clone(),
+                agent_id: "bb".to_string(),
+                cert_digest: digest,
+                issued_at,
+                not_after,
+                mode: crate::profile::CertMode::Acp,
+                label: Some("renewed".to_string()),
+                cert_b64: None,
+            },
+        )
+        .await
+        .expect("append d2");
+        deliver(&local, &owner, r1).await;
+
+        // The next reconcile pass.
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the local renewal: {lines:?}"
+        );
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2),
+            "the register must publish the local renewal"
+        );
+    }
+
+    /// Codex review of #1545 (deee2c9), P2: this device holds `d1@100` in
+    /// its register and journal. An inbound renewal `d2@100` commits, but
+    /// its journal append fails. A later session delivers `d2` again. The
+    /// next reconcile must not mint `d1` over the register: if the
+    /// register keeps `d2` while the journal keeps `d1`, the reconcile
+    /// publishes `d1` at a higher version and every device rolls back.
+    #[tokio::test]
+    async fn a_failed_journal_append_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let (local, journal) = journal_device(&dir.path().join("local")).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r1).await;
+
+        local
+            .fail_journal_append
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failed = local.commit_batch(vec![r2.clone()], &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal append fails the commit");
+        local
+            .fail_journal_append
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // A later session delivers the renewal again.
+        deliver(&local, &owner, r2).await;
+
+        // The next reconcile pass.
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2.clone()),
+            "the register must keep the renewal: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the renewal: {lines:?}"
+        );
+    }
+
+    /// Codex review of #1545 (55afdf2), P1: an inbound renewal `d2` commits
+    /// in full, then the host crashes. A crash keeps only the writes made
+    /// durable. The register write is durable, so the journal append that
+    /// came before it must be durable too. If the journal came back as
+    /// `d1` beside a `d2` register, the reconcile would publish `d1` over
+    /// the renewal.
+    #[tokio::test]
+    async fn a_host_crash_after_a_commit_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r1).await;
+        // Some time passes: the kernel has flushed the `d1` journal.
+        crate::profile::crash_sim::note_durable(&journal);
+        deliver(&local, &owner, r2).await;
+        drop(local);
+
+        // The host crash, the restart, then the first reconcile pass.
+        crate::profile::crash_sim::crash(&[&journal, &local_dir.join(SYNC_DIR).join(RECORDS_FILE)]);
+        let (local, journal) = journal_device(&local_dir).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2.clone()),
+            "the register must keep the renewal: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the renewal: {lines:?}"
+        );
+    }
+
+    /// Codex review of #1545 (deee2c9), P2: as above, but the daemon stops
+    /// between the commit's register write and its journal write. After a
+    /// restart, the reconcile must not mint `d1` over the register.
+    #[tokio::test]
+    async fn a_restart_between_the_commit_writes_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r1).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r2], &owner.user_id()).await;
+        drop(local);
+
+        // The restart, then the first reconcile pass.
+        let (local, journal) = journal_device(&local_dir).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2.clone()),
+            "the register must keep the renewal: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the renewal: {lines:?}"
+        );
+    }
+
+    /// The local issuance journal line for `value`.
+    fn local_line(owner_hex: &str, value: &SyncValue) -> crate::profile::IssuedCertRecord {
+        let (agent_id, cert_digest, issued_at, not_after) = fields(value);
+        crate::profile::IssuedCertRecord {
+            user_id: owner_hex.to_string(),
+            agent_id,
+            cert_digest,
+            issued_at,
+            not_after,
+            mode: crate::profile::CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        }
+    }
+
+    /// The host crash of the #1545 durability tests: lose every journal and
+    /// register write in `local_dir` that was not made durable.
+    fn crash_device(local_dir: &Path) {
+        crate::profile::crash_sim::crash(&[
+            &local_dir.join(crate::profile::CERT_JOURNAL_FILE),
+            &local_dir.join(SYNC_DIR).join(RECORDS_FILE),
+        ]);
+    }
+
+    /// Restart the device in `local_dir` and run its first reconcile pass.
+    /// The pass must keep the register it published before the restart,
+    /// and the journal must end on that value.
+    async fn assert_restart_keeps_the_register(local_dir: &Path, owner: &UserKeypair) {
+        let (local, journal) = journal_device(local_dir).await;
+        let published = local.stored_value(SyncKind::IssuanceJournal, "bb").await;
+        mint_journal_lines(&local, &journal, owner, super::tests::machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            published,
+            "the reconcile must not roll back the published register: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &hex::encode(owner.user_id().0)).get("bb"),
+            published.as_ref(),
+            "the journal must end on the published register: {lines:?}"
+        );
+    }
+
+    /// Codex review of #1545 (72e8b9f), P1: a local renewal `d2` is between
+    /// its journal rename and its directory fsync, so the line is visible
+    /// but not durable. A reconcile that runs then must not publish `d2`:
+    /// if the host crashes, the register keeps `d2`, the journal comes
+    /// back as `d1`, and the next reconcile mints `d1` over the renewal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconcile_does_not_publish_a_journal_line_before_it_is_durable() {
+        use super::tests::{machine, owner_kp};
+        use crate::profile::journal_faults::PauseEnd;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 200, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        deliver(&local, &owner, r1).await;
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        crate::profile::journal_faults::pause_next(&journal, reached_tx, release_rx);
+        let issuance = {
+            let (journal, line) = (journal.clone(), local_line(&owner_hex, &d2));
+            tokio::spawn(
+                async move { crate::profile::IssuedCertRecord::append(&journal, &line).await },
+            )
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("the issuance renames the journal")
+            .expect("rename signal");
+        let reconcile = {
+            let (local, journal, owner) = (Arc::clone(&local), journal.clone(), owner_kp(7));
+            tokio::spawn(async move {
+                mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+            })
+        };
+        // Let the reconcile run while the issuance is held (it may block).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // The host crashes before the issuance's directory fsync. Stop and
+        // join the reconcile, then the journal writer itself (the append
+        // awaits the task that owns the write), so no write or durable
+        // mark lands after the crash state is restored.
+        reconcile.abort();
+        let _ = reconcile.await;
+        let _ = release_tx.send(PauseEnd::Crash);
+        let issued = issuance.await.expect("issuance task");
+        assert!(issued.is_err(), "the writer stops at the simulated crash");
+        drop(local);
+        crash_device(&local_dir);
+        assert_restart_keeps_the_register(&local_dir, &owner).await;
+    }
+
+    /// Codex review of #1545 (72e8b9f), P1: a local renewal's directory
+    /// fsync fails, so its journal line stays visible but is not durable.
+    /// The next reconcile may publish the line only after it is durable.
+    #[tokio::test]
+    async fn a_failed_journal_fsync_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 200, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        deliver(&local, &owner, r1).await;
+
+        crate::profile::journal_faults::fail_next(&journal);
+        let failed =
+            crate::profile::IssuedCertRecord::append(&journal, &local_line(&owner_hex, &d2)).await;
+        assert!(
+            failed.is_err(),
+            "the injected fsync failure fails the append"
+        );
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+
+        drop(local);
+        crash_device(&local_dir);
+        assert_restart_keeps_the_register(&local_dir, &owner).await;
+    }
+
+    /// Codex review of #1545 (72e8b9f), P1: an inbound renewal's journal
+    /// append fails at the directory fsync, so the commit fails but the
+    /// line stays visible. A later session delivers the renewal again,
+    /// and the commit finds the line already there. It must make the line
+    /// durable before it writes the register.
+    #[tokio::test]
+    async fn a_commit_retry_after_a_failed_journal_fsync_does_not_roll_back_a_renewal() {
+        use super::tests::owner_kp;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r1).await;
+
+        crate::profile::journal_faults::fail_next(&journal);
+        let failed = local.commit_batch(vec![r2.clone()], &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal fsync fails the commit");
+        // A later session delivers the renewal again.
+        deliver(&local, &owner, r2).await;
+
+        drop(local);
+        crash_device(&local_dir);
+        assert_restart_keeps_the_register(&local_dir, &owner).await;
+    }
+
+    /// Codex review of #1545 (72e8b9f), P2: the register holds `d0@v1`. A
+    /// commit of the remote `d1@v2` appends its journal line, then the
+    /// daemon stops before the register write. After the restart, the
+    /// remote `d2@v3` (the same second as `d1`) arrives before any
+    /// reconcile. `d2` is ordered after `d1`, so the register and the
+    /// journal must end on `d2`. If the restart forgets that `d1` came
+    /// from the register, `d1` looks like an unpublished local issuance:
+    /// `d2`'s line is not appended, and the reconcile publishes `d1` at a
+    /// higher version over `d2`.
+    #[tokio::test]
+    async fn an_interrupted_commit_does_not_override_a_later_same_second_renewal() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let d0 = journal_value("d0", 50, 1_000);
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r0 = remote_record(&remote, &owner, &d0).await;
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r0).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r1], &owner.user_id()).await;
+        drop(local);
+
+        // The restart; `d2` arrives before the first reconcile pass.
+        let (local, journal) = journal_device(&local_dir).await;
+        deliver(&local, &owner, r2).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2.clone()),
+            "the register must keep the later renewal: {lines:?}"
+        );
+        assert_eq!(
+            latest_journal_values(lines.clone(), &owner_hex).get("bb"),
+            Some(&d2),
+            "the journal must end on the later renewal: {lines:?}"
+        );
+    }
+
+    /// Codex review of #1545 (758f62c), P2: as in
+    /// `an_interrupted_commit_does_not_override_a_later_same_second_renewal`,
+    /// but the intent of the interrupted `d1` commit cannot be decoded
+    /// after the restart. The recovery must not delete it and go on: the
+    /// journal then holds `d1` with no record that it came from the
+    /// register, so the same-second `d2` is accepted without a journal
+    /// line and the reconcile publishes `d1` over it. The recovery fails
+    /// closed and keeps the intent; no journal commit or mint runs.
+    #[tokio::test]
+    async fn an_undecodable_journal_intent_fails_closed() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let d0 = journal_value("d0", 50, 1_000);
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r0 = remote_record(&remote, &owner, &d0).await;
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r0).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r1], &owner.user_id()).await;
+        drop(local);
+        let intent = local_dir.join(SYNC_DIR).join(JOURNAL_INTENT_FILE);
+        std::fs::write(&intent, b"{\"records\": [").expect("corrupt the intent");
+
+        // The restart; `d2` arrives before the first reconcile pass.
+        let (local, journal) = journal_device(&local_dir).await;
+        let delivered = local.commit_batch(vec![r2], &owner.user_id()).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d0),
+            "no journal commit or mint may change the register: {lines:?}"
+        );
+        assert!(
+            delivered.is_err(),
+            "a journal commit must fail while the intent cannot be decoded"
+        );
+        assert_eq!(
+            std::fs::read(&intent).expect("the intent is kept"),
+            b"{\"records\": [",
+            "the recovery must keep the undecodable intent"
+        );
+    }
+
+    /// Codex review of #1545 (162b724), P2: as in
+    /// `an_undecodable_journal_intent_fails_closed`, but the intent stays
+    /// valid JSON and one signed byte changes, so its record does not
+    /// verify. The recovery must keep the intent and fail closed here too:
+    /// only a record that verifies under another owner can be dropped.
+    #[tokio::test]
+    async fn a_journal_intent_with_a_bad_signature_fails_closed() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let d0 = journal_value("d0", 50, 1_000);
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let r0 = remote_record(&remote, &owner, &d0).await;
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        deliver(&local, &owner, r0).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r1], &owner.user_id()).await;
+        drop(local);
+        let intent = local_dir.join(SYNC_DIR).join(JOURNAL_INTENT_FILE);
+        let mut persisted: PersistedRecords =
+            serde_json::from_slice(&std::fs::read(&intent).expect("the intent")).expect("decode");
+        persisted.records[0].signature[0] ^= 0x01;
+        let corrupted = serde_json::to_vec(&persisted).expect("encode");
+        std::fs::write(&intent, &corrupted).expect("corrupt the intent");
+
+        // The restart; `d2` arrives before the first reconcile pass.
+        let (local, journal) = journal_device(&local_dir).await;
+        let delivered = local.commit_batch(vec![r2], &owner.user_id()).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        let lines = crate::profile::IssuedCertRecord::load(&journal).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d0),
+            "no journal commit or mint may change the register: {lines:?}"
+        );
+        assert!(
+            delivered.is_err(),
+            "a journal commit must fail while the intent does not verify"
+        );
+        assert_eq!(
+            std::fs::read(&intent).expect("the intent is kept"),
+            corrupted,
+            "the recovery must keep the intent that does not verify"
+        );
+    }
+
+    /// Codex review of #1545 (bab382f), P2: a local renewal `d2` is
+    /// cancelled after its journal rename and before the write's
+    /// bookkeeping, as a caller cancellation during the rename await can
+    /// do. The journal was durable before the write, so a stale mark would
+    /// let the reconcile publish `d2` before it is durable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_journal_write_does_not_roll_back_a_renewal() {
+        use super::tests::{machine, owner_kp};
+        use crate::profile::journal_faults::PauseEnd;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let owner_hex = hex::encode(owner.user_id().0);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, journal) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 200, 9_000),
+        );
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        deliver(&local, &owner, r1).await;
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        crate::profile::journal_faults::pause_next(&journal, reached_tx, release_rx);
+        let issuance = {
+            let (journal, line) = (journal.clone(), local_line(&owner_hex, &d2));
+            tokio::spawn(
+                async move { crate::profile::IssuedCertRecord::append(&journal, &line).await },
+            )
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("the issuance renames the journal")
+            .expect("rename signal");
+        // The caller cancels the issuance after the rename.
+        issuance.abort();
+        let _ = issuance.await;
+        // The write goes on without its caller; the reconcile below waits
+        // for it under the journal writer lock.
+        let _ = release_tx.send(PauseEnd::Resume);
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+
+        drop(local);
+        crash_device(&local_dir);
+        assert_restart_keeps_the_register(&local_dir, &owner).await;
+    }
+
+    /// Codex review of #1545 (bab382f), P2: a batch carries a journal
+    /// renewal and an owner profile. The daemon stops after the journal
+    /// write, before the register write. The restart must finish the whole
+    /// batch, not only its journal record: `commit_batch` is all or nothing.
+    #[tokio::test]
+    async fn an_interrupted_mixed_commit_recovers_the_whole_batch() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let local_dir = dir.path().join("local");
+        let (local, _) = journal_device(&local_dir).await;
+        let (d1, d2) = (
+            journal_value("d1", 100, 5_000),
+            journal_value("d2", 100, 9_000),
+        );
+        let profile = SyncValue::OwnerProfile {
+            human_name: Some("Alice".into()),
+        };
+        let r1 = remote_record(&remote, &owner, &d1).await;
+        let r2 = remote_record(&remote, &owner, &d2).await;
+        remote
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &profile,
+                &owner,
+                machine(2),
+            )
+            .await
+            .expect("remote profile mint");
+        let rp = remote
+            .records_snapshot()
+            .await
+            .into_iter()
+            .find(|r| r.kind == SyncKind::OwnerProfile)
+            .expect("remote profile record");
+        deliver(&local, &owner, r1).await;
+
+        local
+            .stop_between_journal_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = local.commit_batch(vec![r2, rp], &owner.user_id()).await;
+        drop(local);
+
+        // The restart, then the first reconcile pass finishes the commit.
+        let (local, journal) = journal_device(&local_dir).await;
+        mint_journal_lines(&local, &journal, &owner, machine(1)).await;
+        assert_eq!(
+            local.stored_value(SyncKind::IssuanceJournal, "bb").await,
+            Some(d2),
+            "the recovery must commit the journal renewal"
+        );
+        assert_eq!(
+            local.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(profile),
+            "the recovery must commit the rest of the batch"
+        );
+    }
+
+    /// A daemon view with a live owner profile name, for the recovery
+    /// tests: `profile_names` reads it, `apply_names` replaces it.
+    struct ProfileView(std::sync::Mutex<Option<String>>);
+
+    impl ProfileView {
+        fn human_name(&self) -> Option<String> {
+            self.0.lock().expect("view").clone()
+        }
+    }
+
+    impl SyncDaemonView for ProfileView {
+        fn profile_names(&self) -> SyncProfileNames {
+            SyncProfileNames {
+                human_name: self.human_name(),
+                ..SyncProfileNames::default()
+            }
+        }
+        fn home_pointer(&self) -> Option<SyncValue> {
+            None
+        }
+        fn home_pointer_definitive(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<SyncValue>, ()>> + Send>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+        fn apply_names(
+            &self,
+            human_name: Option<String>,
+            _display_name: Option<String>,
+            _machine_name: Option<String>,
+        ) {
+            if human_name.is_some() {
+                *self.0.lock().expect("view") = human_name;
+            }
+        }
+        fn canonical_pointer_is_retired(&self, _group_id: &str) -> bool {
+            false
+        }
+    }
+
+    /// A remote store's signed records for the mixed batch of the recovery
+    /// tests: a journal renewal and the owner profile `name` at version 2.
+    async fn remote_mixed_batch(
+        remote: &OwnerSyncStore,
+        owner: &UserKeypair,
+        name: &str,
+    ) -> (VersionedRecord, VersionedRecord) {
+        use super::tests::machine;
+        let journal = remote_record(remote, owner, &journal_value("d2", 100, 9_000)).await;
+        for human_name in ["first", name] {
+            remote
+                .mint(
+                    SyncKind::OwnerProfile,
+                    "owner",
+                    &SyncValue::OwnerProfile {
+                        human_name: Some(human_name.into()),
+                    },
+                    owner,
+                    machine(2),
+                )
+                .await
+                .expect("remote profile mint");
+        }
+        let profile = remote
+            .records_snapshot()
+            .await
+            .into_iter()
+            .find(|r| r.kind == SyncKind::OwnerProfile)
+            .expect("remote profile record");
+        (journal, profile)
+    }
+
+    /// Codex review of #1545 (a19203d), P2: a mixed journal and profile
+    /// commit fails after its journal intent is durable. The same records
+    /// then arrive again in a session. The recovery in that commit commits them, so
+    /// the session's own batch is superseded. The session must still apply
+    /// the recovered profile to the daemon.
+    #[tokio::test]
+    async fn a_session_applies_the_records_its_recovery_commits() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = Arc::new(
+            OwnerSyncStore::load(&dir.path().join("remote"))
+                .await
+                .expect("remote store"),
+        );
+        let (local, _) = journal_device(&dir.path().join("local")).await;
+        super::tests::cross_enroll_for_tests(&local, &remote, &owner).await;
+        let (rj, rp) = remote_mixed_batch(&remote, &owner, "Alice").await;
+        local
+            .fail_journal_append
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failed = local.commit_batch(vec![rj, rp], &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal append fails the commit");
+        local
+            .fail_journal_append
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (mut c_recv, mut c_send) = tokio::io::split(server);
+        let (mut r_recv, mut r_send) = tokio::io::split(client);
+        let responder = {
+            let (remote, owner) = (Arc::clone(&remote), owner_kp(7));
+            tokio::spawn(async move {
+                run_sync_session(
+                    &mut r_send,
+                    &mut r_recv,
+                    &remote,
+                    &owner,
+                    &machine(2),
+                    &machine(1),
+                    |_| {},
+                )
+                .await
+                .expect("responder")
+            })
+        };
+        let mut applied = Vec::new();
+        run_sync_session(
+            &mut c_send,
+            &mut c_recv,
+            &local,
+            &owner,
+            &machine(1),
+            &machine(2),
+            |record| applied.push(record.value.clone()),
+        )
+        .await
+        .expect("initiator");
+        responder.await.expect("responder task");
+        assert!(
+            applied.contains(&SyncValue::OwnerProfile {
+                human_name: Some("Alice".into())
+            }),
+            "the session must apply the recovered profile: {applied:?}"
+        );
+    }
+
+    /// Codex review of #1545 (a19203d), P2: after a mixed journal and
+    /// profile commit fails after its journal intent is durable, the
+    /// reconcile pass recovers it. The live profile must then show the recovered name,
+    /// and the next pass must not publish the old live name over it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reconcile_applies_a_recovered_profile_to_the_daemon() {
+        super::tests::install_loopback_socket_boundary();
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let seed = 0x86;
+        let owner = super::tests::owner_kp(seed);
+        let (_agent, service) =
+            super::tests::live_owner_device(dir.path(), "alice", [seed; 32]).await;
+        let view = Arc::new(ProfileView(std::sync::Mutex::new(Some("Old".into()))));
+        service.attach_view(Arc::clone(&view) as Arc<dyn SyncDaemonView>);
+        service.reconcile_local_state().await.expect("first pass");
+
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let (rj, rp) = remote_mixed_batch(&remote, &owner, "Alice").await;
+        let store = service.store();
+        store
+            .fail_journal_append
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let failed = store.commit_batch(vec![rj, rp], &owner.user_id()).await;
+        assert!(failed.is_err(), "a failed journal append fails the commit");
+        store
+            .fail_journal_append
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        for _ in 0..2 {
+            service.reconcile_local_state().await.expect("pass");
+        }
+        let alice = SyncValue::OwnerProfile {
+            human_name: Some("Alice".into()),
+        };
+        assert_eq!(
+            view.human_name().as_deref(),
+            Some("Alice"),
+            "the daemon must show the recovered profile"
+        );
+        assert_eq!(
+            store.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(alice),
+            "the reconcile must not publish the old live name"
+        );
+    }
+
+    /// Codex review of #1545 (29e2800), P2: a commit writes the apply
+    /// obligation of its name record `B` before its register write. A
+    /// crash between the two leaves the register at the committed `A`.
+    /// The obligation of `A` must stay owed until `B` is committed, or the
+    /// restart has no obligation for the register's winner, and the
+    /// reconcile publishes the old live name over `A`.
+    #[tokio::test]
+    async fn a_crash_before_a_replacing_commit_keeps_the_predecessor_owed() {
+        use super::tests::{machine, owner_kp};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let remote = OwnerSyncStore::load(&dir.path().join("remote"))
+            .await
+            .expect("remote store");
+        let mut records = Vec::new();
+        for name in ["A", "B"] {
+            remote
+                .mint(
+                    SyncKind::OwnerProfile,
+                    "owner",
+                    &SyncValue::OwnerProfile {
+                        human_name: Some(name.into()),
+                    },
+                    &owner,
+                    machine(2),
+                )
+                .await
+                .expect("remote profile mint");
+            records.extend(remote.records_snapshot().await);
+        }
+        let (a, b) = (records[0].clone(), records[1].clone());
+
+        let local_dir = dir.path().join("local");
+        let local = OwnerSyncStore::load(&local_dir).await.expect("local store");
+        local
+            .commit_batch(vec![a.clone()], &owner.user_id())
+            .await
+            .expect("commit A");
+        // The commit of `B` stops after its obligation is durable and
+        // before its register write.
+        local
+            .add_pending_applies(std::slice::from_ref(&b), ())
+            .await
+            .expect("obligation of B");
+        drop(local);
+
+        let local = OwnerSyncStore::load(&local_dir).await.expect("restart");
+        assert_eq!(
+            local.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(a.value.clone()),
+            "the register holds A"
+        );
+        assert!(
+            local.pending_applies().await.contains(&(a.clone(), true)),
+            "A must stay owed as the register's winner"
+        );
+    }
+}
+
+/// #1545 round 7: a caller that is cancelled while a durable write of the
+/// store is in flight. The blocking rename of the write still lands after
+/// the cancel; no later writer may run before it, and memory must agree
+/// with the disk after it.
+#[cfg(test)]
+mod cancellation_tests {
+    use super::tests::{machine, owner_kp};
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn names(human: &str) -> SyncProfileNames {
+        SyncProfileNames {
+            human_name: Some(human.into()),
+            display_name: None,
+            machine_name: None,
+        }
+    }
+
+    fn profile(human: &str) -> SyncValue {
+        SyncValue::OwnerProfile {
+            human_name: Some(human.into()),
+        }
+    }
+
+    /// An owner-signed `OwnerProfile` record of another machine.
+    async fn remote_profile(dir: &Path, owner: &UserKeypair, human: &str) -> VersionedRecord {
+        let remote = OwnerSyncStore::load(dir).await.expect("remote store");
+        remote
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &profile(human),
+                owner,
+                machine(2),
+            )
+            .await
+            .expect("remote mint");
+        remote.records_snapshot().await.remove(0)
+    }
+
+    /// Hold the next rename to `path` on the blocking pool.
+    fn hold_rename(
+        path: &Path,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::profile::journal_faults::pause_next_rename(path, reached_tx, release_rx);
+        (reached_rx, release_tx)
+    }
+
+    /// Start `task`, wait until it holds its rename, and cancel it.
+    async fn cancel_at_rename<T: Send + 'static>(
+        reached: tokio::sync::oneshot::Receiver<()>,
+        task: tokio::task::JoinHandle<T>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .expect("the write reaches its rename")
+            .expect("rename hook");
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// Run `next` for up to a second, release the held rename, and finish
+    /// `next`. Then give the released rename time to land.
+    async fn run_then_release<T: Send + 'static>(
+        mut next: tokio::task::JoinHandle<T>,
+        release: std::sync::mpsc::Sender<()>,
+    ) -> T {
+        let early = tokio::time::timeout(Duration::from_secs(1), &mut next).await;
+        release.send(()).expect("release the held rename");
+        let out = match early {
+            Ok(done) => done.expect("next task"),
+            Err(_) => next.await.expect("next task"),
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        out
+    }
+
+    /// Codex review of #1545 (b17cd8bf), P2: `Alice` is owed. `PUT Bob`
+    /// notes its save and is cancelled during the rename of the pending
+    /// file. `PUT Carol` then notes its save and discharges `Alice`. The
+    /// late rename of Bob's note must not bring `Alice` back on disk: a
+    /// restart would then apply `Alice` over the durable `Carol`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_note_cancelled_during_its_rename_cannot_restore_a_discharged_name() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let alice = remote_profile(&dir.path().join("remote"), &owner, "Alice").await;
+        let local_dir = dir.path().join("local");
+        let local = Arc::new(OwnerSyncStore::load(&local_dir).await.expect("store"));
+        local
+            .commit_batch(vec![alice.clone()], &owner.user_id())
+            .await
+            .expect("commit Alice");
+        let folded = vec![(alice.clone(), true)];
+
+        let (reached, release) = hold_rename(&local.pending_applies_path());
+        let bob = {
+            let (local, folded) = (Arc::clone(&local), folded.clone());
+            tokio::spawn(async move { local.note_profile_save(&folded, &names("Bob")).await })
+        };
+        cancel_at_rename(reached, bob).await;
+
+        let carol = {
+            let (local, folded) = (Arc::clone(&local), folded.clone());
+            tokio::spawn(async move {
+                local.note_profile_save(&folded, &names("Carol")).await?;
+                local.discharge_applies(&folded).await
+            })
+        };
+        run_then_release(carol, release)
+            .await
+            .expect("Carol's note and discharge");
+        assert!(
+            local.pending_applies().await.is_empty(),
+            "Alice is discharged"
+        );
+
+        drop(local);
+        let restarted = OwnerSyncStore::load(&local_dir).await.expect("restart");
+        assert!(
+            restarted.pending_applies().await.is_empty(),
+            "a cancelled note must not restore the discharged Alice on disk"
+        );
+    }
+
+    /// Codex review of #1545 (3a28bef1): once shutdown has released the
+    /// store's files, a write that starts later is refused and leaves the
+    /// disk as it was.
+    #[tokio::test]
+    async fn a_write_after_the_release_of_custody_is_refused() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        store
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &profile("A"),
+                &owner,
+                machine(1),
+            )
+            .await
+            .expect("mint A");
+        store.release_write_custody().await;
+        let refused = store
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &profile("B"),
+                &owner,
+                machine(1),
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(SyncError::Io(e)) if e.contains("released its files")),
+            "a write after the release must be refused by the custody: {refused:?}"
+        );
+        drop(store);
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        assert_eq!(
+            restarted
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(profile("A")),
+            "a refused write leaves the disk as it was"
+        );
+    }
+
+    /// A mint is cancelled during the rename of the register file, and a
+    /// later mint completes. The late rename must not put the older
+    /// register on disk over the later one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mint_cancelled_during_its_rename_cannot_roll_the_register_back() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = Arc::new(owner_kp(7));
+        let local = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+
+        let (reached, release) = hold_rename(&local.dir.join(RECORDS_FILE));
+        let first = {
+            let (local, owner) = (Arc::clone(&local), Arc::clone(&owner));
+            tokio::spawn(async move {
+                local
+                    .mint(
+                        SyncKind::OwnerProfile,
+                        "owner",
+                        &profile("A"),
+                        &owner,
+                        machine(1),
+                    )
+                    .await
+            })
+        };
+        cancel_at_rename(reached, first).await;
+
+        let second = {
+            let (local, owner) = (Arc::clone(&local), Arc::clone(&owner));
+            tokio::spawn(async move {
+                local
+                    .mint(
+                        SyncKind::OwnerProfile,
+                        "owner",
+                        &profile("B"),
+                        &owner,
+                        machine(1),
+                    )
+                    .await
+            })
+        };
+        run_then_release(second, release).await.expect("mint B");
+
+        let live = local.records_snapshot().await;
+        drop(local);
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        assert_eq!(
+            restarted
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(profile("B")),
+            "the late rename of a cancelled mint must not roll the register back"
+        );
+        assert_eq!(
+            restarted.records_snapshot().await,
+            live,
+            "memory agrees with disk"
+        );
+    }
+
+    /// A commit of a synced name is cancelled during the write of its
+    /// obligation, before its register write. Memory must then agree with
+    /// the disk: a register in memory that holds the record without its
+    /// obligation lets the reconcile mint the old live name over it, and
+    /// the next register write publishes the record although its commit
+    /// did not complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_commit_cancelled_before_its_register_write_leaves_memory_as_the_disk() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let alice = remote_profile(&dir.path().join("remote"), &owner, "Alice").await;
+        let local_dir = dir.path().join("local");
+        let local = Arc::new(OwnerSyncStore::load(&local_dir).await.expect("store"));
+
+        let (reached, release) = hold_rename(&local.pending_applies_path());
+        let commit = {
+            let (local, owner) = (Arc::clone(&local), owner.user_id());
+            tokio::spawn(async move { local.commit_batch(vec![alice], &owner).await })
+        };
+        cancel_at_rename(reached, commit).await;
+        release.send(()).expect("release the held rename");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let disk = OwnerSyncStore::load(&local_dir).await.expect("reload");
+        assert_eq!(
+            local.records_snapshot().await,
+            disk.records_snapshot().await,
+            "the register in memory must be the register on disk"
+        );
+        assert_eq!(
+            local.pending_applies().await,
+            disk.pending_applies().await,
+            "the obligations in memory must be the obligations on disk"
+        );
+    }
+
+    /// Codex review of #1545 (1e46704b), P2: an enroll of machine 1 is
+    /// cancelled during the rename of the device file, and an enroll of
+    /// machine 2 then completes. The late rename of the first write must
+    /// not put a device set without machine 2 on disk over the
+    /// acknowledged second enroll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_enroll_cancelled_during_its_rename_cannot_lose_a_later_enroll() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let local = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let enrollment =
+            |id: u8| OwnerEnrollment::sign(machine(id), &owner, 1_000, None).expect("sign");
+
+        let (reached, release) = hold_rename(&local.dir.join(DEVICES_FILE));
+        let first = {
+            let (local, enrollment) = (Arc::clone(&local), enrollment(1));
+            tokio::spawn(async move { local.enroll(enrollment).await })
+        };
+        cancel_at_rename(reached, first).await;
+
+        let second = {
+            let (local, enrollment) = (Arc::clone(&local), enrollment(2));
+            tokio::spawn(async move { local.enroll(enrollment).await })
+        };
+        run_then_release(second, release)
+            .await
+            .expect("enroll machine 2");
+
+        let live = local.enrolled_devices().await;
+        drop(local);
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        assert!(
+            restarted.is_enrolled(&machine(2), &owner.user_id()).await,
+            "the late rename of a cancelled enroll must not lose a later enroll"
+        );
+        assert_eq!(
+            restarted.enrolled_devices().await,
+            live,
+            "the device set in memory is the device set on disk"
+        );
+    }
+
+    /// Codex review of #1545 (1e46704b), P2: an unenroll of machine 1 is
+    /// cancelled during the rename of the tombstone file, and an unenroll
+    /// of machine 2 then completes. The late rename of the first write
+    /// must not lose the tombstone of machine 2: after a restart, a replay
+    /// of the deleted enrollment of machine 2 must still be refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unenroll_cancelled_during_its_rename_cannot_lose_a_later_tombstone() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let local = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let enrollment =
+            |id: u8| OwnerEnrollment::sign(machine(id), &owner, 1_000, None).expect("sign");
+        for id in [1, 2] {
+            local.enroll(enrollment(id)).await.expect("enroll");
+        }
+
+        let (reached, release) = hold_rename(&local.dir.join(TOMBSTONES_FILE));
+        let first = {
+            let local = Arc::clone(&local);
+            tokio::spawn(async move { local.unenroll(&machine(1)).await })
+        };
+        cancel_at_rename(reached, first).await;
+
+        let second = {
+            let local = Arc::clone(&local);
+            tokio::spawn(async move { local.unenroll(&machine(2)).await })
+        };
+        run_then_release(second, release)
+            .await
+            .expect("unenroll machine 2");
+
+        drop(local);
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        let replay = restarted.enroll(enrollment(2)).await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { .. })),
+            "the late rename of a cancelled unenroll must not lose a later tombstone: {replay:?}"
+        );
+    }
+
+    /// Codex review of #1545 (17e0dae3), P2: a session commit from
+    /// machine 2 is cancelled during the rename of the register. Its
+    /// revocation read guard must stay held until the rename lands, as
+    /// for a commit that is not cancelled (#1055 RC2). Otherwise a
+    /// revocation of machine 2 completes first, and the commit of the
+    /// revoked machine lands after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_commit_cancelled_during_its_rename_holds_off_a_revocation() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let alice = remote_profile(&dir.path().join("remote"), &owner, "Alice").await;
+        let local = Arc::new(
+            OwnerSyncStore::load(&dir.path().join("local"))
+                .await
+                .expect("store"),
+        );
+        local
+            .enroll(OwnerEnrollment::sign(machine(2), &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("enroll machine 2");
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+
+        let (reached, release) = hold_rename(&local.dir.join(RECORDS_FILE));
+        let commit = {
+            let (local, revocations) = (Arc::clone(&local), Arc::clone(&revocations));
+            let owner_id = owner.user_id();
+            tokio::spawn(async move {
+                let peer = machine(2);
+                let admission = SessionAdmission {
+                    store: &local,
+                    revocations: Some(&revocations),
+                    owner: &owner_id,
+                    peer: &peer,
+                };
+                local.commit_session_batch(vec![alice], &admission).await
+            })
+        };
+        cancel_at_rename(reached, commit).await;
+        assert!(
+            revocations.try_write().is_err(),
+            "a revocation must wait while the cancelled commit can still land"
+        );
+        release.send(()).expect("release the held rename");
+        let _revoking = tokio::time::timeout(Duration::from_secs(10), revocations.write())
+            .await
+            .expect("the revocation proceeds once the commit has landed");
+        assert_eq!(
+            local.stored_value(SyncKind::OwnerProfile, "owner").await,
+            Some(profile("Alice")),
+            "the commit landed before the revocation"
+        );
+    }
+
+    /// Codex review of #1545 (17e0dae3), P2 class: a register write stops
+    /// after its rename and before its directory fsync, so `New` is
+    /// visible but not durable. A restart loads `New` and can act on it
+    /// (a journal recovery removes its intent, a settle removes an
+    /// obligation). The load must make what it read durable first, or a
+    /// later host crash brings back `Old` under those actions.
+    #[tokio::test]
+    async fn a_restart_makes_the_state_it_loads_durable() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join(SYNC_DIR).join(RECORDS_FILE);
+        let mint = |human: &'static str| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                let store = OwnerSyncStore::load(&dir).await.expect("store");
+                store
+                    .mint(
+                        SyncKind::OwnerProfile,
+                        "owner",
+                        &profile(human),
+                        &owner_kp(7),
+                        machine(1),
+                    )
+                    .await
+                    .expect("mint");
+            }
+        };
+        mint("Old").await;
+        let old = std::fs::read(&path).expect("old register");
+        mint("New").await;
+        let new = std::fs::read(&path).expect("new register");
+        // Model the stop: only `Old` is durable, `New` is visible.
+        std::fs::write(&path, &old).expect("write old");
+        crate::profile::crash_sim::note_durable(&path);
+        std::fs::write(&path, &new).expect("write new");
+
+        let restarted = OwnerSyncStore::load(dir.path()).await.expect("restart");
+        assert_eq!(
+            restarted
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(profile("New"))
+        );
+        drop(restarted);
+        crate::profile::crash_sim::crash(&[&path]);
+        let after_crash = OwnerSyncStore::load(dir.path()).await.expect("reload");
+        assert_eq!(
+            after_crash
+                .stored_value(SyncKind::OwnerProfile, "owner")
+                .await,
+            Some(profile("New")),
+            "a host crash must not take back the register that a restart loaded"
+        );
+    }
+}
+
+/// #1055 (ADR 0084 findings 3–4): unenroll must leave a durable tombstone
+/// so a stale enrollment cannot re-open admission, and a live SyncV1
+/// session must abort fail-closed when its admission no longer holds.
+/// These tests are inert — temp dirs, generated keys, in-memory duplex
+/// pipes; no daemon, no network, no mesh join.
+#[cfg(test)]
+mod issue_1055_tests {
+    use super::tests::{clock, machine, owner_kp, sign_names};
+    use super::*;
+
+    /// WHY (#1055, ADR 0084 finding 3): DELETE leaves a tombstone; an
+    /// old, still-unexpired enrollment for the deleted machine must not
+    /// be re-admitted by `enroll`, while a strictly newer one still is,
+    /// and the tombstone must survive a reload.
+    #[tokio::test]
+    async fn unenroll_tombstone_blocks_stale_enrollment_reinsertion() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let m = machine(6);
+        // Signed long ago, never expires: still "current" by any check
+        // that looks at expiry alone.
+        let stale = OwnerEnrollment::sign(m, &owner, 1_000, None).expect("sign");
+        store.enroll(stale.clone()).await.expect("persist");
+        assert!(store.is_enrolled(&m, &owner_id).await);
+
+        assert!(
+            store.unenroll(&m).await.expect("delete"),
+            "removal reports true"
+        );
+        assert!(!store.is_enrolled(&m, &owner_id).await);
+
+        // Re-running enroll with the SAME old enrollment is a replay of a
+        // deletion the owner already made: it must be refused.
+        assert!(
+            store.enroll(stale.clone()).await.is_err(),
+            "an enrollment at or before the deletion must be refused"
+        );
+        assert!(
+            !store.is_enrolled(&m, &owner_id).await,
+            "no local path may re-open admission for the deleted machine"
+        );
+
+        // A fresh enrollment, minted strictly after the delete, is still
+        // admitted — unenroll must not brick the machine forever.
+        let fresh = OwnerEnrollment::sign(m, &owner, now_unix_ms() + 1, None).expect("sign");
+        store.enroll(fresh).await.expect("fresh re-enroll");
+        assert!(
+            store.is_enrolled(&m, &owner_id).await,
+            "an enrollment strictly newer than the tombstone is admitted"
+        );
+
+        // The tombstone is durable state, not an in-memory flag: after a
+        // second delete and a reload from disk, the old enrollment is
+        // still refused.
+        assert!(store.unenroll(&m).await.expect("second delete"));
+        let reloaded = OwnerSyncStore::load(dir.path()).await.expect("reload");
+        assert!(
+            reloaded.enroll(stale).await.is_err(),
+            "the tombstone must survive a reload"
+        );
+        assert!(!reloaded.is_enrolled(&m, &owner_id).await);
+    }
+
+    /// WHY (#1055, ADR 0084 finding 3): the restore path bypasses `enroll`
+    /// entirely — an old `devices.json` put back in place must not
+    /// resurrect a machine the owner deleted while the tombstone file
+    /// survives from the newer state.
+    #[tokio::test]
+    async fn restored_devices_file_cannot_resurrect_a_deleted_machine() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(2);
+        let owner_id = owner.user_id();
+        let m = machine(3);
+        let stale = OwnerEnrollment::sign(m, &owner, 1_000, None).expect("sign");
+        store.enroll(stale.clone()).await.expect("persist");
+        assert!(store.unenroll(&m).await.expect("delete"));
+
+        // Restore ONLY the device file, as a backup predating the delete
+        // would: the enrollment is owner-signed, current, and unexpired.
+        let devices_json = serde_json::to_vec(&serde_json::json!({
+            "devices": [serde_json::to_value(&stale).expect("serialize enrollment")]
+        }))
+        .expect("encode devices.json");
+        tokio::fs::write(dir.path().join(SYNC_DIR).join(DEVICES_FILE), devices_json)
+            .await
+            .expect("restore devices.json");
+
+        let restored = OwnerSyncStore::load(dir.path()).await.expect("load");
+        assert!(
+            !restored.is_enrolled(&m, &owner_id).await,
+            "a restored enrollment at or before the tombstone must not pass the gate"
+        );
+    }
+
+    /// WHY (#1055, ADR 0084 finding 4): an unenroll that lands while a
+    /// session is live must abort that session at the next phase boundary,
+    /// with nothing committed — not ride it out to completion.
+    ///
+    /// The peer is honest and holds the owner key; it pauses between the
+    /// handshake and its version vector until the delete lands, so the
+    /// local side's next boundary is deterministically AFTER the unenroll.
+    #[tokio::test]
+    async fn live_session_aborts_when_enrollment_is_unenrolled_midway() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let (handshake_done, peer_paused) = tokio::sync::oneshot::channel::<()>();
+        let (release_vector, vector_go) = tokio::sync::oneshot::channel::<()>();
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+                                                   // The local VectorEnd follows; the local side is now blocked
+                                                   // reading our vector. Pause.
+            let _ = read_frame(&mut c_recv).await;
+            handshake_done.send(()).ok();
+            let _ = vector_go.await;
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Records {
+                    records: Vec::new(),
+                },
+            )
+            .await?;
+            write_frame(&mut c_send, &SyncFrame::Done).await?;
+            let _ = read_frame(&mut c_recv).await; // local records or abort
+            Ok::<(), SyncError>(())
+        });
+
+        let session_store = Arc::clone(&store);
+        let session_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+        let session = tokio::spawn(async move {
+            run_sync_session(
+                &mut s_send,
+                &mut s_recv,
+                &session_store,
+                &session_owner,
+                &local,
+                &peer,
+                |_| {},
+            )
+            .await
+        });
+
+        peer_paused.await.expect("peer reached the pause point");
+        // The owner's DELETE lands mid-session (#1055 finding 2).
+        assert!(store.unenroll(&peer).await.expect("delete"));
+        release_vector.send(()).ok();
+
+        let result = session.await.expect("session task");
+        assert!(
+            matches!(result, Err(SyncError::NotEnrolled { .. })),
+            "a mid-session unenroll must abort the session fail-closed, got {result:?}"
+        );
+        assert!(
+            store.records_snapshot().await.is_empty(),
+            "an aborted session commits nothing"
+        );
+        let _ = peer_task.await;
+    }
+
+    /// WHY (#1055, ADR 0084 finding 4): a machine revocation that lands
+    /// mid-session must abort the session at the next phase boundary — the
+    /// same boundary the unenroll test exercises, reached through the
+    /// revocation set the daemon paths pass to the session.
+    #[tokio::test]
+    async fn live_session_aborts_when_machine_is_revoked_midway() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer_kp = crate::identity::MachineKeypair::generate().expect("machine keygen");
+        let peer = peer_kp.machine_id();
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let (handshake_done, peer_paused) = tokio::sync::oneshot::channel::<()>();
+        let (release_vector, vector_go) = tokio::sync::oneshot::channel::<()>();
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+                                                   // The local VectorEnd follows; the local side is now blocked
+                                                   // reading our vector. Pause.
+            let _ = read_frame(&mut c_recv).await;
+            handshake_done.send(()).ok();
+            let _ = vector_go.await;
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Records {
+                    records: Vec::new(),
+                },
+            )
+            .await?;
+            write_frame(&mut c_send, &SyncFrame::Done).await?;
+            let _ = read_frame(&mut c_recv).await; // local records or abort
+            Ok::<(), SyncError>(())
+        });
+
+        let session_store = Arc::clone(&store);
+        let session_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+        let session_revocations = Arc::clone(&revocations);
+        let session = tokio::spawn(async move {
+            run_sync_session_with_recheck(
+                SESSION_TIMEOUT,
+                &mut s_send,
+                &mut s_recv,
+                &session_store,
+                Some(&session_revocations),
+                &session_owner,
+                &local,
+                &peer,
+                |_| {},
+            )
+            .await
+        });
+
+        peer_paused.await.expect("peer reached the pause point");
+        // The ADR-0018 machine revocation lands mid-session.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(peer),
+            peer_kp.public_key(),
+            peer_kp.secret_key(),
+            now_secs,
+            None,
+        )
+        .expect("sign machine revocation");
+        revocations
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("insert machine revocation");
+        release_vector.send(()).ok();
+
+        let result = session.await.expect("session task");
+        assert!(
+            matches!(result, Err(SyncError::MachineRevoked { .. })),
+            "a mid-session revocation must abort the session fail-closed, got {result:?}"
+        );
+        assert!(
+            store.records_snapshot().await.is_empty(),
+            "an aborted session commits nothing"
+        );
+        let _ = peer_task.await;
+    }
+
+    /// WHY (#1055 RC1, review finding 1): the unenroll tombstone must
+    /// cover the deleted enrollment's OWN `enrolled_at_ms`, not just the
+    /// local wall clock. The enrollment below was minted under a clock
+    /// ahead of this machine's current time (a rollback, e.g. an NTP step,
+    /// between enroll and delete); with a wall-clock-only tombstone,
+    /// restoring or replaying that enrollment clears both checks.
+    /// Deterministic: every timestamp is an explicit offset from
+    /// `now_unix_ms()`, so no clock progression is required.
+    #[tokio::test]
+    async fn unenroll_tombstone_covers_enrollment_minted_under_a_rolled_back_clock() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let peer = machine(2);
+        // Enrolled one hour AHEAD of the current wall clock.
+        let enrolled_ahead = now_unix_ms() + 3_600_000;
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, enrolled_ahead, None).expect("sign"))
+            .await
+            .expect("first enroll");
+        assert!(store.unenroll(&peer).await.expect("delete"));
+        // A restore or replay of the deleted enrollment must stay refused.
+        let replay = store
+            .enroll(OwnerEnrollment::sign(peer, &owner, enrolled_ahead, None).expect("sign"))
+            .await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { machine }) if machine == peer.0),
+            "a replay of an enrollment minted under a rolled-back clock must stay tombstoned, got {replay:?}"
+        );
+        assert!(
+            !store.is_enrolled(&peer, &owner.user_id()).await,
+            "the machine must not be admissible after the delete"
+        );
+    }
+
+    /// WHY (#1055 RC1, review finding 2): admission was checked once
+    /// before shipping; a delete that landed while a record page write was
+    /// BLOCKED let the remaining pages ship. The outbound pager must
+    /// re-check admission at every page boundary. Deterministic: the peer
+    /// stops reading after its version vector, so the local writer is
+    /// blocked inside the records stage when the delete lands, and resumes
+    /// only after it.
+    #[tokio::test]
+    async fn outbound_record_pages_stop_after_mid_ship_unenroll() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        // 64 records = 4 pages at RECORDS_PER_FRAME = 16: the ship stage
+        // spans several page boundaries.
+        let batch: Vec<VersionedRecord> = (0..64)
+            .map(|i| {
+                sign_names(
+                    &format!("page-{i}"),
+                    &format!("v{i}"),
+                    clock(1, i, 1),
+                    &owner,
+                )
+            })
+            .collect();
+        store.commit_batch(batch, &owner_id).await.expect("seed");
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let (vector_sent, peer_paused) = tokio::sync::oneshot::channel::<()>();
+        let (release_reader, read_go) = tokio::sync::oneshot::channel::<()>();
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+                                                   // The local vector arrives as pages, then VectorEnd.
+            loop {
+                match read_frame(&mut c_recv).await? {
+                    SyncFrame::VersionVector { .. } => continue,
+                    SyncFrame::VectorEnd => break,
+                    other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+                }
+            }
+            // Empty peer vector: the local side must ship all 64 records
+            // (4 pages of 16).
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            // Read the FIRST record page before pausing: this proves the
+            // records stage actually started, so the delete below cannot
+            // land before the pre-ship check and let every assertion pass
+            // trivially (review RC3 finding 2).
+            match read_frame(&mut c_recv).await? {
+                SyncFrame::Records { .. } => {}
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            }
+            vector_sent.send(()).ok();
+            // Stop reading: the local writer blocks inside the SECOND
+            // page's write (the duplex buffer stays full).
+            let _ = read_go.await;
+            // Resume: count what now arrives. With the page-boundary
+            // checks, the in-flight second page completes and the stream
+            // aborts at the next boundary — no Done. Without the checks,
+            // every remaining page and Done arrives.
+            let mut records_frames = 1usize;
+            let mut saw_done = false;
+            loop {
+                match read_frame(&mut c_recv).await {
+                    Ok(SyncFrame::Records { .. }) => records_frames += 1,
+                    Ok(SyncFrame::Done) => {
+                        saw_done = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            // Complete our own stage so the old head can finish its session
+            // and hit its final boundary (errors after a reset are expected).
+            let _ = write_frame(
+                &mut c_send,
+                &SyncFrame::Records {
+                    records: Vec::new(),
+                },
+            )
+            .await;
+            let _ = write_frame(&mut c_send, &SyncFrame::Done).await;
+            Ok::<(usize, bool), SyncError>((records_frames, saw_done))
+        });
+
+        let session_store = Arc::clone(&store);
+        let session_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+        let session = tokio::spawn(async move {
+            run_sync_session_with_recheck(
+                SESSION_TIMEOUT,
+                &mut s_send,
+                &mut s_recv,
+                &session_store,
+                None,
+                &session_owner,
+                &local,
+                &peer,
+                |_| {},
+            )
+            .await
+        });
+
+        peer_paused.await.expect("peer stopped reading");
+        // The owner's DELETE lands while the writer is blocked mid-page.
+        assert!(store.unenroll(&peer).await.expect("delete"));
+        release_reader.send(()).ok();
+
+        let result = session.await.expect("session task");
+        assert!(
+            matches!(result, Err(SyncError::NotEnrolled { .. })),
+            "a mid-ship unenroll must stop the remaining record pages, got {result:?}"
+        );
+        // The discriminating assertion is on the wire, not the session
+        // result (the final pre-commit boundary also aborts the old head):
+        // after the delete, at most the page already in flight may arrive,
+        // and Done — which ends the records stage — must never arrive.
+        let (records_frames, saw_done) =
+            peer_task.await.expect("peer task").expect("peer protocol");
+        assert!(
+            !saw_done,
+            "no Done may be shipped after the delete (peer saw {records_frames} record pages)"
+        );
+        assert!(
+            records_frames <= 2,
+            "at most the delivered first page plus the in-flight page may arrive after the delete, got {records_frames}"
+        );
+    }
+
+    /// Splices one already-read byte back in front of a reader, so a test
+    /// can peek a single raw byte and then keep using `read_frame`.
+    struct UnreadByte<R> {
+        saved: Option<u8>,
+        inner: R,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for UnreadByte<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(byte) = self.saved.take() {
+                buf.put_slice(&[byte]);
+                return std::task::Poll::Ready(Ok(()));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    /// WHY (#1055 RC3, review finding 1): admission was re-checked at
+    /// every page boundary but not between the LAST record page and Done.
+    /// A delete that landed while the final page's write was blocked let
+    /// the sender ship Done anyway — Done ends the peer's records stage
+    /// and lets it commit the batch. Done now follows one more admission
+    /// check. Deterministic: the batch is ONE page (two records, ~13 KiB
+    /// against a 4 KiB duplex buffer), and the peer reads ONE RAW BYTE of
+    /// that page — proving the page's admission check has passed and its
+    /// write has started. Because the peer then reads nothing, the write
+    /// can never complete: the writer is parked inside the FINAL page
+    /// when the delete lands, and the byte is spliced back so framing
+    /// stays intact afterwards.
+    #[tokio::test]
+    async fn done_is_never_sent_when_removal_lands_during_the_last_page() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        // Two records: ONE page (~13 KiB — a record embeds the owner key
+        // and signature), far beyond the duplex buffer.
+        let batch: Vec<VersionedRecord> = (0..2)
+            .map(|i| {
+                sign_names(
+                    &format!("page-{i}"),
+                    &format!("v{i}"),
+                    clock(1, i, 1),
+                    &owner,
+                )
+            })
+            .collect();
+        store.commit_batch(batch, &owner_id).await.expect("seed");
+
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let (last_page_blocked, peer_paused) = tokio::sync::oneshot::channel::<()>();
+        let (release_reader, read_go) = tokio::sync::oneshot::channel::<()>();
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+            loop {
+                match read_frame(&mut c_recv).await? {
+                    SyncFrame::VersionVector { .. } => continue,
+                    SyncFrame::VectorEnd => break,
+                    other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+                }
+            }
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            // One RAW byte of the single record page: the page's write
+            // has provably started (its admission check has passed) and
+            // cannot complete while this peer reads nothing.
+            let mut one = [0u8; 1];
+            tokio::io::AsyncReadExt::read(&mut c_recv, &mut one)
+                .await
+                .map_err(|e| SyncError::Io(format!("peek one byte: {e}")))?;
+            let mut c_recv = UnreadByte {
+                saved: Some(one[0]),
+                inner: c_recv,
+            };
+            last_page_blocked.send(()).ok();
+            let _ = read_go.await;
+            // Resume: the in-flight final page may complete, but Done must
+            // never arrive — the pre-Done admission check aborts first.
+            let mut saw_done = false;
+            loop {
+                match read_frame(&mut c_recv).await {
+                    Ok(SyncFrame::Done) => {
+                        saw_done = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            Ok::<bool, SyncError>(saw_done)
+        });
+
+        let session_store = Arc::clone(&store);
+        let session_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+        let session = tokio::spawn(async move {
+            run_sync_session_with_recheck(
+                SESSION_TIMEOUT,
+                &mut s_send,
+                &mut s_recv,
+                &session_store,
+                None,
+                &session_owner,
+                &local,
+                &peer,
+                |_| {},
+            )
+            .await
+        });
+
+        peer_paused.await.expect("peer stopped reading");
+        // The owner's DELETE lands while the final page write is blocked.
+        assert!(store.unenroll(&peer).await.expect("delete"));
+        release_reader.send(()).ok();
+
+        let result = session.await.expect("session task");
+        assert!(
+            matches!(result, Err(SyncError::NotEnrolled { .. })),
+            "a removal during the final page must abort the session, got {result:?}"
+        );
+        let saw_done = peer_task.await.expect("peer task").expect("peer protocol");
+        assert!(
+            !saw_done,
+            "Done must not be sent after a removal that lands during the final page"
+        );
+    }
+
+    /// WHY (#1055 RC1, review finding 3): admission was last validated at
+    /// the pre-commit boundary, BEFORE the commit's own lock waits — a
+    /// HomePointer batch waiting behind the canonical-home gate could
+    /// commit after the delivering peer was deleted or revoked. The session
+    /// commit re-validates admission after acquiring the commit locks.
+    /// Deterministic: the session runs to a clean `PendingCommit` while the
+    /// peer is enrolled, the DELETE lands before the commit call, and the
+    /// commit must refuse with nothing stored.
+    #[tokio::test]
+    async fn session_batch_cannot_commit_after_peer_removal() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        let inbound = sign_names("from-peer", "peer-value", clock(1, 1, 2), &owner);
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+                                                   // The local vector arrives as pages, then VectorEnd.
+            loop {
+                match read_frame(&mut c_recv).await? {
+                    SyncFrame::VersionVector { .. } => continue,
+                    SyncFrame::VectorEnd => break,
+                    other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+                }
+            }
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            // One owner-signed record, then Done: the batch this session
+            // will try to commit.
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Records {
+                    records: vec![inbound],
+                },
+            )
+            .await?;
+            write_frame(&mut c_send, &SyncFrame::Done).await?;
+            // The local side's own (empty) records and Done follow.
+            let _ = read_frame(&mut c_recv).await;
+            let _ = read_frame(&mut c_recv).await;
+            Ok::<(), SyncError>(())
+        });
+
+        let pending = negotiate_sync_session(
+            &mut s_send,
+            &mut s_recv,
+            &store,
+            None,
+            &owner,
+            &local,
+            &peer,
+        )
+        .await
+        .expect("negotiate");
+
+        // The owner's DELETE lands after the session's pre-commit boundary
+        // but before the commit — exactly the window the commit's own gate
+        // wait re-opens.
+        assert!(store.unenroll(&peer).await.expect("delete"));
+
+        let admission = SessionAdmission {
+            store: &store,
+            revocations: None,
+            owner: &owner_id,
+            peer: &peer,
+        };
+        let result = store
+            .commit_session_batch(pending.verified, &admission)
+            .await;
+        assert!(
+            matches!(result, Err(SyncError::NotEnrolled { .. })),
+            "a batch from a removed peer must not commit, got {result:?}"
+        );
+        assert!(
+            store.records_snapshot().await.is_empty(),
+            "a refused session commit stores nothing"
+        );
+        let _ = peer_task.await;
+    }
+
+    /// WHY (#1055 RC2, review of RC1): the tombstone write guard ended
+    /// before the device row was removed; an enroll that slipped into that
+    /// gap inserted a newer enrollment that the removal then deleted
+    /// WITHOUT the tombstone covering its timestamp — replaying that
+    /// enrollment restored admission. The guard must be held through the
+    /// removal. Deterministic: the test parks the removal on the devices
+    /// write lock, then waits for the park itself (a queued devices writer
+    /// makes a fresh `try_read` fail — the tokio lock is write-preferring)
+    /// and proves the tombstone lock is still held at that point. The park
+    /// is strictly after the durable tombstone write, so code that dropped
+    /// the tombstone guard when the persist returned (the RC1 shape) has
+    /// released it by then — no timing window at all.
+    #[tokio::test]
+    async fn unenroll_holds_the_tombstone_lock_through_the_removal() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+
+        // Park the removal on a devices READ guard: the floor's read
+        // completes (read-read shares), the tombstone becomes durable, and
+        // the removal's devices WRITE then parks behind the guard.
+        let devices_guard = store.devices.read().await;
+        let removal_store = Arc::clone(&store);
+        let removal = tokio::spawn(async move { removal_store.unenroll(&peer).await });
+
+        // The durable tombstone is the RC1 release point: once the file
+        // exists, the old code had already dropped the tombstone lock.
+        let tombstone_file = dir.path().join(SYNC_DIR).join(TOMBSTONES_FILE);
+        for _ in 0..1_000 {
+            if tombstone_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            tombstone_file.exists(),
+            "the tombstone must be durable first"
+        );
+        // Wait for the PARK, not the file: the removal's devices WRITE is
+        // queued only after the tombstone persist returned, which is
+        // strictly after any code shape that dropped the tombstone guard
+        // with the persist. The queued writer makes this fresh read fail
+        // (write-preferring); the test's own read guard above cannot —
+        // readers coexist.
+        let mut writer_queued = false;
+        for _ in 0..1_000 {
+            if store.devices.try_read().is_err() {
+                writer_queued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            writer_queued,
+            "the removal must reach (and park on) the devices write"
+        );
+
+        // The serialization under test: the tombstone lock is STILL held
+        // while the removal is parked, so no enroll can slip into the gap.
+        assert!(
+            store.unenroll_tombstones.try_read().is_err(),
+            "the tombstone lock must be held through the removal"
+        );
+
+        drop(devices_guard);
+        assert!(removal.await.expect("removal task").expect("delete"));
+        let replay = store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { .. })),
+            "replay of the deleted enrollment must stay refused, got {replay:?}"
+        );
+    }
+
+    /// WHY (#1055 RC2, review of RC1): the session commit validated
+    /// admission BEFORE waiting for the records write lock, and revocation
+    /// writers take no lock the commit holds — a machine revocation that
+    /// landed while the commit waited behind another commit was missed,
+    /// and the batch committed after the peer was revoked. The commit now
+    /// validates after acquiring the records lock and holds the revocation
+    /// read guard across the mutation. Deterministic: the commit is parked
+    /// first on its admission read (empty revocation set, so the check
+    /// passes) and then on the records write; the revocation lands between
+    /// the two parks, its ordering proven by the lock handoffs themselves.
+    #[tokio::test]
+    async fn session_commit_refuses_batch_when_revocation_lands_during_lock_wait() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(OwnerSyncStore::load(dir.path()).await.expect("store"));
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let local = machine(1);
+        let peer_kp = crate::identity::MachineKeypair::generate().expect("machine keygen");
+        let peer = peer_kp.machine_id();
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        let revocations = Arc::new(tokio::sync::RwLock::new(
+            crate::revocation::RevocationSet::new(),
+        ));
+        let inbound = sign_names("from-peer", "peer-value", clock(1, 1, 2), &owner);
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner_id.0;
+        let peer_task = tokio::spawn(async move {
+            // Honest peer: full handshake with a CORRECT owner-key proof.
+            let peer_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            let local_nonce = match read_frame(&mut c_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            let proof = proof_message(&local_nonce, &peer.0, &local.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(peer_owner.secret_key(), &proof)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            let _ = read_frame(&mut c_recv).await; // local proof
+                                                   // The local vector arrives as pages, then VectorEnd.
+            loop {
+                match read_frame(&mut c_recv).await? {
+                    SyncFrame::VersionVector { .. } => continue,
+                    SyncFrame::VectorEnd => break,
+                    other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+                }
+            }
+            write_frame(&mut c_send, &SyncFrame::VectorEnd).await?;
+            // One owner-signed record, then Done: the batch this session
+            // will try to commit.
+            write_frame(
+                &mut c_send,
+                &SyncFrame::Records {
+                    records: vec![inbound],
+                },
+            )
+            .await?;
+            write_frame(&mut c_send, &SyncFrame::Done).await?;
+            // The local side's own (empty) records and Done follow.
+            let _ = read_frame(&mut c_recv).await;
+            let _ = read_frame(&mut c_recv).await;
+            Ok::<(), SyncError>(())
+        });
+
+        let pending = negotiate_sync_session(
+            &mut s_send,
+            &mut s_recv,
+            &store,
+            Some(&revocations),
+            &owner,
+            &local,
+            &peer,
+        )
+        .await
+        .expect("negotiate");
+
+        // Park the commit twice: its admission read waits behind the
+        // revocation write (the set is still empty, so the check passes
+        // once released), and the commit itself then waits behind the
+        // records write.
+        let records_guard = store.records.write().await;
+        let revocation_write = revocations.write().await;
+        let commit_store = Arc::clone(&store);
+        let commit_revocations = Arc::clone(&revocations);
+        let commit_owner = UserKeypair::from_seed(&[1u8; 32]).expect("owner key");
+        let commit_peer = peer;
+        let commit = tokio::spawn(async move {
+            let commit_owner_id = commit_owner.user_id();
+            let admission = SessionAdmission {
+                store: &commit_store,
+                revocations: Some(&commit_revocations),
+                owner: &commit_owner_id,
+                peer: &commit_peer,
+            };
+            commit_store
+                .commit_session_batch(pending.verified, &admission)
+                .await
+        });
+        // Releasing the revocation write lets the commit's check read the
+        // EMPTY set; the settle lets that early check (a ~1 ms ML-DSA
+        // verification plus the set read) finish before the revocation
+        // lands — on the fixed head the check cannot even start until the
+        // records lock is granted, so the settle only orders the OLD
+        // code's pre-records check. Reacquiring the write then proves no
+        // reader holds the set.
+        drop(revocation_write);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut revocation_write = revocations.write().await;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(peer),
+            peer_kp.public_key(),
+            peer_kp.secret_key(),
+            now_secs,
+            None,
+        )
+        .expect("sign machine revocation");
+        revocation_write
+            .verify_and_insert(record, None)
+            .expect("insert machine revocation");
+        drop(revocation_write);
+        // Let the commit proceed: it must refuse under the held locks.
+        drop(records_guard);
+
+        let result = commit.await.expect("commit task");
+        assert!(
+            matches!(result, Err(SyncError::MachineRevoked { .. })),
+            "a revocation that lands during the commit's lock wait must stop the commit, got {result:?}"
+        );
+        assert!(
+            store.records_snapshot().await.is_empty(),
+            "a refused session commit stores nothing"
+        );
+        let _ = peer_task.await;
+    }
+
+    /// WHY (#1055, Codex RC3 verdict at af04889): the R3 corrupt-state test
+    /// covers records.json and devices.json only — the tombstone file was
+    /// the gap. It is the one state whose silent loss re-opens admission
+    /// for a machine the owner deleted, so a corrupt file or an unknown
+    /// envelope version must fail the load closed (never a silent fallback
+    /// to an empty tombstone store) and must leave the file untouched for
+    /// inspection (ADR 0085 rule 4).
+    #[tokio::test]
+    async fn corrupt_or_unknown_version_tombstone_file_fails_loud() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(3);
+        let gone = machine(8);
+        store
+            .enroll(OwnerEnrollment::sign(gone, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        assert!(store.unenroll(&gone).await.expect("delete"));
+        let tombstones_path = dir.path().join(SYNC_DIR).join(TOMBSTONES_FILE);
+        assert!(tombstones_path.exists(), "a real tombstone is on disk");
+
+        // Corrupt bytes: the load must refuse, not start empty.
+        tokio::fs::write(&tombstones_path, b"{ not json")
+            .await
+            .expect("corrupt the tombstone file");
+        let before = tokio::fs::read(&tombstones_path)
+            .await
+            .expect("read before");
+        let err = match OwnerSyncStore::load(dir.path()).await {
+            Err(e) => e,
+            Ok(_) => panic!("a corrupt tombstone file must fail the load"),
+        };
+        assert!(
+            err.to_string().contains("refusing to start")
+                && err.to_string().contains(TOMBSTONES_FILE),
+            "corrupt tombstone file must fail loud, got: {err}"
+        );
+        assert_eq!(
+            tokio::fs::read(&tombstones_path).await.expect("read after"),
+            before,
+            "the refused load must not touch the file"
+        );
+
+        // A well-formed envelope with an UNKNOWN version is still a hard
+        // error; the valid entry inside proves the refusal is about the
+        // version, not the payload.
+        let future_version = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "tombstones": [{
+                "machine_id": machine(7).0.to_vec(),
+                "deleted_at_ms": 1_234,
+            }],
+        }))
+        .expect("encode version-2 envelope");
+        tokio::fs::write(&tombstones_path, future_version)
+            .await
+            .expect("place the version-2 envelope");
+        let before = tokio::fs::read(&tombstones_path)
+            .await
+            .expect("read before");
+        let err = match OwnerSyncStore::load(dir.path()).await {
+            Err(e) => e,
+            Ok(_) => panic!("an unknown tombstone format version must fail the load"),
+        };
+        assert!(
+            err.to_string().contains("unknown tombstone format version"),
+            "unknown version must fail loud, got: {err}"
+        );
+        assert_eq!(
+            tokio::fs::read(&tombstones_path).await.expect("read after"),
+            before,
+            "the refused load must leave the file untouched"
+        );
+    }
+
+    /// WHY (#1055, Codex RC3 verdict at af04889): a persistence failure
+    /// BEFORE the rename on the tombstone write must roll the in-memory
+    /// tombstone back, leave the device row alone (no half-delete), keep
+    /// the store usable (no poison), and keep every PREVIOUS tombstone
+    /// durable. The r5 test covers the post-rename keep-and-poison half on
+    /// a records write; this covers the roll-back half on the tombstone
+    /// write. The chmod gate matches the r3 precedent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_rename_tombstone_persistence_failure_rolls_back_and_loses_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(4);
+        let owner_id = owner.user_id();
+        let deleted = machine(5);
+        let kept = machine(6);
+        store
+            .enroll(OwnerEnrollment::sign(deleted, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("enroll A");
+        assert!(store.unenroll(&deleted).await.expect("delete A"));
+        store
+            .enroll(OwnerEnrollment::sign(kept, &owner, 2_000, None).expect("sign"))
+            .await
+            .expect("enroll B");
+
+        // A read-only sync dir makes the tombstone temp-file create fail
+        // BEFORE the rename: the old state stays on disk.
+        let sync_dir = dir.path().join(SYNC_DIR);
+        std::fs::set_permissions(&sync_dir, std::fs::Permissions::from_mode(0o555))
+            .expect("break tombstone writes");
+        let failed = store.unenroll(&kept).await;
+        std::fs::set_permissions(&sync_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore the sync dir");
+
+        let err = failed.expect_err("the unenroll must fail on the write failure");
+        assert!(
+            !matches!(err, SyncError::Poisoned(_)),
+            "a pre-rename failure must not poison, got: {err:?}"
+        );
+        assert!(
+            matches!(err, SyncError::Io(_)),
+            "a pre-rename failure is a plain io error, got: {err:?}"
+        );
+        assert!(
+            store.poisoned_reason().is_none(),
+            "the store stays usable after a rolled-back write"
+        );
+
+        // Disk truth: B survived the failed delete (no half-delete) and
+        // A's tombstone survived with it.
+        let reloaded = OwnerSyncStore::load(dir.path()).await.expect("reload");
+        let devices = reloaded.enrolled_devices().await;
+        assert_eq!(devices.len(), 1, "exactly one device row remains");
+        assert_eq!(devices[0].machine_id, kept.0, "the failed delete kept B");
+        assert!(
+            reloaded.is_enrolled(&kept, &owner_id).await,
+            "B is still enrolled after the failed unenroll"
+        );
+        let replay = reloaded
+            .enroll(OwnerEnrollment::sign(deleted, &owner, 1_000, None).expect("sign"))
+            .await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { machine }) if machine == deleted.0),
+            "A's tombstone survived the failed write, got {replay:?}"
+        );
+
+        // Recovery: the same unenroll that failed now succeeds.
+        assert!(
+            reloaded.unenroll(&kept).await.expect("recovering unenroll"),
+            "the recovered unenroll removes B"
+        );
+        assert!(!reloaded.is_enrolled(&kept, &owner_id).await);
+    }
+
+    /// WHY (#1055, Codex RC3 verdict at af04889): on the unenroll path the
+    /// tombstone is the FIRST durable write, and a failure AFTER its rename
+    /// means disk already holds it — the store must poison (never roll
+    /// memory back behind an advanced disk), a fresh load must see the
+    /// tombstone (no lost tombstone), and the poisoned instance must refuse
+    /// every further mutation.
+    #[tokio::test]
+    async fn post_rename_tombstone_failure_keeps_tombstone_and_poisons() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(5);
+        let target = machine(9);
+        store
+            .enroll(OwnerEnrollment::sign(target, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+
+        // The tombstone write crosses the rename, then its durability sync
+        // fails: disk holds the tombstone, the caller saw an error.
+        store.set_fail_after_rename_for_testing(true);
+        let err = store
+            .unenroll(&target)
+            .await
+            .expect_err("the post-rename failure must surface");
+        assert!(
+            matches!(err, SyncError::Poisoned(_)),
+            "typed poison error, got: {err:?}"
+        );
+        assert!(store.poisoned_reason().is_some(), "the store is poisoned");
+
+        // The tombstone the caller saw fail IS durable: a fresh load
+        // succeeds and keeps refusing the deleted machine.
+        let reloaded = OwnerSyncStore::load(dir.path()).await.expect("reload");
+        let replay = reloaded
+            .enroll(OwnerEnrollment::sign(target, &owner, 1_000, None).expect("sign"))
+            .await;
+        assert!(
+            matches!(replay, Err(SyncError::EnrollmentTombstoned { machine }) if machine == target.0),
+            "the crossed-rename tombstone must survive the reload, got {replay:?}"
+        );
+        assert!(
+            !reloaded.is_enrolled(&target, &owner.user_id()).await,
+            "the deleted machine stays inadmissible after the reload"
+        );
+
+        // Disable the injector FIRST (R6 discipline, as in the r5 test):
+        // with it left on, the refusals below could come from the injector
+        // firing again instead of the poison flag.
+        store.set_fail_after_rename_for_testing(false);
+        let err = store
+            .unenroll(&target)
+            .await
+            .expect_err("a poisoned store refuses unenroll");
+        assert!(matches!(err, SyncError::Poisoned(_)));
+        let err = store
+            .enroll(OwnerEnrollment::sign(target, &owner, now_unix_ms() + 1, None).expect("sign"))
+            .await
+            .expect_err("a poisoned store refuses enroll");
+        assert!(matches!(err, SyncError::Poisoned(_)));
     }
 }

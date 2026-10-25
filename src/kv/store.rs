@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 /// Access control policy for a KvStore.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AccessPolicy {
     /// Only the owner can write. Anyone can read and replicate.
     /// Incoming deltas from non-owners are silently rejected.

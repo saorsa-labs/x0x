@@ -125,8 +125,10 @@ pub(in crate::server) async fn acl_exec_remove(
 }
 
 /// POST /acl/reload — re-read both TOML floors and API overlays. `200`
-/// when both planes applied; `422` when any plane was rejected (that plane
-/// keeps its last good ACL; see `/diagnostics/{connect,exec}`).
+/// when every plane applied. `422` only when an ACL plane was rejected.
+/// A rejected ACL plane keeps its last good ACL (see
+/// `/diagnostics/{connect,exec}`). `[gui_show]` is still re-read and does
+/// not affect this response.
 pub(in crate::server) async fn acl_reload(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<ActorContext>,
@@ -134,6 +136,7 @@ pub(in crate::server) async fn acl_reload(
     if !actor.is_durable_owner() {
         return forbidden();
     }
+    let _ = state.gui_show.reload_from_disk();
     let report = state.acl_admin.reload().await;
     let status = if report.ok {
         StatusCode::OK
@@ -290,6 +293,7 @@ mod tests {
                     None,
                     None,
                     crate::server::rider_auth::unix_now_secs(),
+                    Vec::new(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("rider token issue: {e}"))?;

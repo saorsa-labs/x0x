@@ -37,6 +37,10 @@ GET /direct/events
 # ── Self-hosted — GUI does not call its own mounting endpoint ──
 GET /gui
 
+# ── ADR 0083 show — agents/CLI trigger POST /gui/show; the GUI receives
+# the `gui.show` WS event and uses WS `gui.block` for the banner control.
+POST /gui/show
+
 # ── Admin/daemon — intentionally absent from end-user GUI ──
 POST /shutdown
 
@@ -55,6 +59,15 @@ GET /grants
 POST /grants
 DELETE /grants/*
 GET /grants/received
+
+# ── ADR-0074 §1 names — durable API token only (petnames are editable only
+# by the local owner, and a resolve pins), like /grants. ──
+GET /names
+POST /names/resolve
+POST /names/owners
+DELETE /names/owners/*
+POST /names/machines
+DELETE /names/pins/*
 
 # ── Identity card — the GUI calls it via the agentCardPath() helper
 # (share links need the query params), so the first argument is a

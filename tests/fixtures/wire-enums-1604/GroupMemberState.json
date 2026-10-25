@@ -1,0 +1,38 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "active",
+      "variant": "Active",
+      "wire": {
+        "bincode": "00000000",
+        "json": "\"active\""
+      }
+    },
+    {
+      "input": "pending",
+      "variant": "Pending",
+      "wire": {
+        "bincode": "01000000",
+        "json": "\"pending\""
+      }
+    },
+    {
+      "input": "removed",
+      "variant": "Removed",
+      "wire": {
+        "bincode": "02000000",
+        "json": "\"removed\""
+      }
+    },
+    {
+      "input": "banned",
+      "variant": "Banned",
+      "wire": {
+        "bincode": "03000000",
+        "json": "\"banned\""
+      }
+    }
+  ],
+  "type": "GroupMemberState"
+}

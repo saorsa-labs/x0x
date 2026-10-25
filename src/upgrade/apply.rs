@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use sha2::{Digest, Sha256};
 
@@ -26,47 +26,96 @@ pub(crate) const HTTP_DEFERRED_RESTART_DELAY: std::time::Duration =
 /// The probe runs with the existing install locks held, before admission.
 type ProbeAdmission = Box<dyn FnOnce(&AtomicBool) -> Result<(), UpgradeError> + Send>;
 
+/// Restart continuation, handed the `(target, fresh backup)` pairs this
+/// transaction actually swapped so a failed flush restores exactly those —
+/// the daemon/CLI pair together or not at all.
+type RestartContinuation = Box<dyn FnOnce(&[(PathBuf, PathBuf)]) + Send>;
+
 #[cfg(unix)]
 async fn inspect_probe_admission(
     install: PathBuf,
     version: String,
+    staging: Option<(super::staging_runtime::Gate, restart::RestartPlan)>,
+    permit: Option<&ReleasePermit>,
 ) -> Result<super::probe::Admission, UpgradeError> {
-    tokio::task::spawn_blocking(move || {
+    run_owned_blocking_with_permit(permit, move |alive| {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
+        if !alive.load(Ordering::Acquire) {
+            return Err(cancelled_release());
+        }
+        if let Some((gate, plan)) = staging {
+            ensure_canonical_install(&install)?;
+            gate.check_apply_policy(&install, &plan)?;
+        }
+        if !alive.load(Ordering::Acquire) {
+            return Err(cancelled_release());
+        }
         super::probe::inspect_admission(&install, &version)
             .map_err(|error| UpgradeError::Other(error.to_string()))
     })
     .await
-    .map_err(|error| UpgradeError::Other(format!("probe admission worker failed: {error}")))?
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 async fn probe_retry_delay_for_install(
     install: PathBuf,
     version: String,
 ) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
-    tokio::task::spawn_blocking(move || {
+    probe_retry_delay_owned(install, version, None).await
+}
+
+#[cfg(unix)]
+async fn probe_retry_delay_owned(
+    install: PathBuf,
+    version: String,
+    permit: Option<&ReleasePermit>,
+) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
+    run_owned_blocking_with_permit(permit, move |alive| {
         let _lock = super::acquire_host_upgrade_lock(&install)?;
-        let admission = super::probe::inspect_admission(&install, &version)
-            .map_err(|error| UpgradeError::Other(error.to_string()))?;
-        // Inspect and read under the same lock. An expired durable
-        // InterruptedWait is an immediate retry, not "no pending work".
-        let state = super::probe::read_state(&install)
-            .map_err(|error| UpgradeError::Other(error.to_string()))?;
-        Ok(state
-            .filter(|state| {
-                state.version == version && state.phase == super::probe::ProbePhase::InterruptedWait
-            })
-            .map(|state| super::probe_retry::RetryWait {
-                delay: match admission {
-                    super::probe::Admission::Ready => std::time::Duration::ZERO,
-                    super::probe::Admission::Waiting { retry_after } => retry_after,
-                },
-                transaction_id: state.transaction_id,
-            }))
+        if !alive.load(Ordering::Acquire) {
+            return Err(cancelled_release());
+        }
+        probe_retry_state_under_lock(&install, &version)
     })
     .await
-    .map_err(|error| UpgradeError::Other(format!("probe retry-state worker failed: {error}")))?
+}
+
+/// The caller holds the install lock and has completed any staging refusal
+/// checks. Inspection can acknowledge durable interrupted-wait clock progress.
+#[cfg(unix)]
+fn probe_retry_state_under_lock(
+    install: &Path,
+    version: &str,
+) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
+    let admission = super::probe::inspect_admission(install, version)
+        .map_err(|error| UpgradeError::Other(error.to_string()))?;
+    // An expired durable InterruptedWait is an immediate retry, not absence.
+    let state = super::probe::read_state(install)
+        .map_err(|error| UpgradeError::Other(error.to_string()))?;
+    Ok(state
+        .filter(|state| {
+            state.version == version && state.phase == super::probe::ProbePhase::InterruptedWait
+        })
+        .map(|state| super::probe_retry::RetryWait {
+            delay: match admission {
+                super::probe::Admission::Ready => std::time::Duration::ZERO,
+                super::probe::Admission::Waiting { retry_after } => retry_after,
+            },
+            transaction_id: state.transaction_id,
+        }))
+}
+
+/// Recheck the carried canonical identity after waiting for its lock. Record
+/// readers must not follow a changed path while holding the previous lock.
+#[cfg(unix)]
+fn ensure_canonical_install(install: &Path) -> Result<(), UpgradeError> {
+    if std::fs::canonicalize(install)
+        .map_err(|error| UpgradeError::Other(format!("staging install unavailable: {error}")))?
+        != install
+    {
+        return Err(UpgradeError::Other("staging install changed".into()));
+    }
+    Ok(())
 }
 
 /// Arm the HTTP deferred-restart owner before any host mutation (#1447 RC5).
@@ -82,23 +131,37 @@ fn arm_http_deferred_restart_owner(
     restart_context: RestartContext,
     restart_plan: restart::RestartPlan,
     version: String,
-) -> Result<Box<dyn FnOnce() + Send>, std::io::Error> {
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    flush_reservation: Option<super::shutdown_flush::Reservation>,
+) -> Result<RestartContinuation, std::io::Error> {
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<Vec<(PathBuf, PathBuf)>>();
+    #[cfg(test)]
+    let test_restart = http_deferred_restart_seam::capture(&restart_plan.executable);
     spawn_http_deferred_restart_thread(move || match go_rx.recv() {
-        Ok(()) => {
+        Ok(swapped) => {
             std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
+            #[cfg(test)]
+            if let Some(restart) = test_restart {
+                restart(&restart_plan, &version);
+                return;
+            }
             let owner = AutoApplyUpgrader::new(&binary_name)
                 .with_stop_on_upgrade(stop_on_upgrade)
                 .with_restart_context(restart_context)
+                .with_flush_reservation(flush_reservation)
+                .with_swapped_artifacts(swapped)
                 .with_restart_on_success(false);
             if let Err(e) = owner.trigger_restart(&restart_plan, &version) {
-                warn!(
+                // Refusal before any flush started (engineer ruling, 24 Oct
+                // 2026): the swapped binaries are restored inside the refusal
+                // and the daemon keeps serving; its log carries the restore
+                // outcome.
+                error!(
                     error = %e,
-                    installed_bytes = true,
                     restart = "not_started",
                     readiness_observed = false,
-                    "Deferred HTTP restart after successful upgrade did not start: {e}; \
-                     old process keeps serving"
+                    "Deferred HTTP restart did not obtain authorization: {e}; \
+                     refused before any flush started, the swapped binaries \
+                     are restored and the daemon keeps serving"
                 );
             }
         }
@@ -106,8 +169,8 @@ fn arm_http_deferred_restart_owner(
             // Pre-admission cancel / apply failure: sender dropped; no restart.
         }
     })?;
-    Ok(Box::new(move || {
-        if go_tx.send(()).is_err() {
+    Ok(Box::new(move |swapped: &[(PathBuf, PathBuf)]| {
+        if go_tx.send(swapped.to_vec()).is_err() {
             warn!(
                 installed_bytes = true,
                 restart = "not_started",
@@ -115,6 +178,47 @@ fn arm_http_deferred_restart_owner(
             );
         }
     }))
+}
+
+/// Replace only the final external restart in the real armed HTTP owner.
+#[cfg(test)]
+pub(crate) mod http_deferred_restart_seam {
+    use super::restart::RestartPlan;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    pub(crate) type Hook = Arc<dyn Fn(&RestartPlan, &str) + Send + Sync>;
+    static INSTALLED: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            INSTALLED
+                .lock()
+                .expect("HTTP restart hook lock")
+                .remove(&self.0);
+        }
+    }
+
+    pub(crate) fn install(target: PathBuf, hook: Hook) -> Guard {
+        assert!(INSTALLED
+            .lock()
+            .expect("HTTP restart hook lock")
+            .insert(target.clone(), hook)
+            .is_none());
+        Guard(target)
+    }
+
+    pub(super) fn capture(target: &Path) -> Option<Hook> {
+        INSTALLED
+            .lock()
+            .expect("HTTP restart hook lock")
+            .get(target)
+            .cloned()
+    }
 }
 
 /// Spawn the parked HTTP deferred-restart thread (test seam can force failure).
@@ -201,24 +305,193 @@ impl Drop for TempDirGuard {
 /// Once the worker admits, restart ownership lives with the worker's
 /// `on_success` continuation — not with this droppable observer.
 /// `spawn_blocking` itself is not cancelled by Drop.
-struct CallerAliveJoin {
+struct CallerAliveJoin<T> {
     caller_alive: Arc<AtomicBool>,
-    join: JoinHandle<Result<UpgradeResult, UpgradeError>>,
+    join: JoinHandle<Result<T, UpgradeError>>,
+    _permit: Option<PermitOperation>,
 }
 
-impl Future for CallerAliveJoin {
-    type Output = Result<Result<UpgradeResult, UpgradeError>, tokio::task::JoinError>;
+impl<T> Future for CallerAliveJoin<T> {
+    type Output = Result<Result<T, UpgradeError>, tokio::task::JoinError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.join).poll(cx)
     }
 }
 
-impl Drop for CallerAliveJoin {
+impl<T> Drop for CallerAliveJoin<T> {
     fn drop(&mut self) {
         // Signal first: the JoinHandle drop does not stop the blocking worker.
         self.caller_alive.store(false, Ordering::Release);
     }
+}
+
+/// A background release may withdraw admission without dropping its queued
+/// worker. Each operation keeps its own caller flag; completing one operation
+/// must not cancel the next observation of the same release.
+#[derive(Clone, Default)]
+pub(crate) struct ReleasePermit {
+    state: Arc<std::sync::Mutex<PermitState>>,
+    wake: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pub observer: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+}
+
+#[derive(Default)]
+struct PermitState {
+    cancelled: bool,
+    operation: Option<std::sync::Weak<AtomicBool>>,
+    http_wait_slot: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+}
+
+impl ReleasePermit {
+    pub(crate) fn for_http(slot: Arc<tokio::sync::OwnedMutexGuard<()>>) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(PermitState {
+                http_wait_slot: Some(slot),
+                ..PermitState::default()
+            })),
+            ..Self::default()
+        }
+    }
+
+    fn http_wait_slot(&self) -> Option<Arc<tokio::sync::OwnedMutexGuard<()>>> {
+        self.state.lock().ok()?.http_wait_slot.clone()
+    }
+
+    pub(crate) fn release_http_wait_slot(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .http_wait_slot = None;
+    }
+
+    pub(crate) fn check(&self) -> Result<(), UpgradeError> {
+        let state = self.state.lock().map_err(|_| cancelled_release())?;
+        if state.cancelled {
+            Err(cancelled_release())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.cancelled = true;
+        if let Some(flag) = state.operation.as_ref().and_then(std::sync::Weak::upgrade) {
+            flag.store(false, Ordering::Release);
+        }
+        drop(state);
+        self.wake.notify_waiters();
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.check().is_err() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn register(&self, flag: &Arc<AtomicBool>) -> Result<PermitOperation, UpgradeError> {
+        let mut state = self.state.lock().map_err(|_| cancelled_release())?;
+        if state.cancelled
+            || state
+                .operation
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some()
+        {
+            return Err(cancelled_release());
+        }
+        state.operation = Some(Arc::downgrade(flag));
+        Ok(PermitOperation {
+            permit: self.clone(),
+            flag: Arc::clone(flag),
+        })
+    }
+}
+
+fn cancelled_release() -> UpgradeError {
+    UpgradeError::Other("background release admission cancelled".into())
+}
+
+struct PermitOperation {
+    permit: ReleasePermit,
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for PermitOperation {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+        if let Ok(mut state) = self.permit.state.lock() {
+            if state
+                .operation
+                .as_ref()
+                .is_some_and(|flag| flag.ptr_eq(&Arc::downgrade(&self.flag)))
+            {
+                state.operation = None;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+struct OperationObservation(Option<Arc<dyn Fn(bool) + Send + Sync>>);
+#[cfg(test)]
+impl Drop for OperationObservation {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.0 {
+            observer(false);
+        }
+    }
+}
+
+/// Retain a blocking operation's cancellation flag until its observer returns.
+/// The operation must check the flag at its own mutation admission boundary.
+pub(crate) async fn run_owned_blocking_with_permit<T, F>(
+    permit: Option<&ReleasePermit>,
+    operation: F,
+) -> Result<T, UpgradeError>
+where
+    T: Send + 'static,
+    F: FnOnce(Arc<AtomicBool>) -> Result<T, UpgradeError> + Send + 'static,
+{
+    let caller_alive = Arc::new(AtomicBool::new(true));
+    let registration = permit
+        .map(|permit| permit.register(&caller_alive))
+        .transpose()?;
+    let worker_alive = Arc::clone(&caller_alive);
+    let http_wait_slot = permit.and_then(ReleasePermit::http_wait_slot);
+    #[cfg(test)]
+    let observer = permit.and_then(|permit| permit.observer.clone());
+    let join = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _observation = {
+            if let Some(observer) = &observer {
+                observer(true);
+            }
+            OperationObservation(observer)
+        };
+        // A cancelled HTTP caller cannot free its bounded request slot while
+        // this operation remains queued on the install lock.
+        let _http_wait_slot = http_wait_slot;
+        operation(worker_alive)
+    });
+    CallerAliveJoin {
+        caller_alive,
+        join,
+        _permit: registration,
+    }
+    .await
+    .map_err(|error| UpgradeError::Other(format!("upgrade worker failed: {error}")))?
 }
 
 /// Companion + primary replace on the blocking pool.
@@ -242,19 +515,76 @@ impl Drop for CallerAliveJoin {
 /// async observer after admission cannot detach installed bytes from that
 /// continuation (#1447 RC3). Extra pre-rename boolean checks only move the
 /// window; ownership transfer at admission closes it.
+#[cfg(test)]
 async fn apply_replacements_offloaded(
     upgrader: Upgrader,
     extracted_path: PathBuf,
     target_version: semver::Version,
     companion: Option<(Upgrader, PathBuf)>,
     temp_guard: TempDirGuard,
-    mut on_success: Option<Box<dyn FnOnce() + Send>>,
+    on_success: Option<RestartContinuation>,
     probe_admission: Option<ProbeAdmission>,
 ) -> Result<UpgradeResult, UpgradeError> {
+    apply_replacements_with_permit(
+        upgrader,
+        extracted_path,
+        target_version,
+        companion,
+        temp_guard,
+        on_success,
+        probe_admission,
+        None,
+        None,
+    )
+    .await
+}
+
+// An unsuccessful replacement releases admission even while a parked HTTP
+// continuation still holds a clone. Success transfers custody to that owner.
+struct UnusedFlushReservation {
+    reservation: super::shutdown_flush::Reservation,
+    handed_off: bool,
+}
+
+impl Drop for UnusedFlushReservation {
+    fn drop(&mut self) {
+        if !self.handed_off {
+            self.reservation.release_unused();
+        }
+    }
+}
+
+// Keep the existing replacement inputs together with its admission custody.
+#[allow(clippy::too_many_arguments)]
+async fn apply_replacements_with_permit(
+    upgrader: Upgrader,
+    extracted_path: PathBuf,
+    target_version: semver::Version,
+    companion: Option<(Upgrader, PathBuf)>,
+    temp_guard: TempDirGuard,
+    mut on_success: Option<RestartContinuation>,
+    probe_admission: Option<ProbeAdmission>,
+    permit: Option<&ReleasePermit>,
+    flush_reservation: Option<super::shutdown_flush::Reservation>,
+) -> Result<UpgradeResult, UpgradeError> {
     let caller_alive = Arc::new(AtomicBool::new(true));
+    let registration = permit
+        .map(|permit| permit.register(&caller_alive))
+        .transpose()?;
     let worker_alive = Arc::clone(&caller_alive);
+    let http_wait_slot = permit.and_then(ReleasePermit::http_wait_slot);
+    #[cfg(test)]
+    let observer = permit.and_then(|permit| permit.observer.clone());
 
     let join = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _observation = {
+            if let Some(observer) = &observer {
+                observer(true);
+            }
+            OperationObservation(observer)
+        };
+        let _http_wait_slot = http_wait_slot;
         // Custody stays with this task through every replace. Dropped
         // explicitly before any on_success continuation that may exit without
         // unwinding (#1447 RC4 P2).
@@ -278,6 +608,8 @@ async fn apply_replacements_offloaded(
         // Take every host lock before any backup/replace. Nested perform_upgrade
         // locks would deadlock; finish_* assumes the caller already holds them.
         let _companion_lock = if let Some((ref x0x_upgrader, _)) = companion {
+            #[cfg(test)]
+            tests::acknowledge_host_lock_attempt(x0x_upgrader.target_path());
             match super::acquire_host_upgrade_lock(x0x_upgrader.target_path()) {
                 Ok(lock) => Some(lock),
                 Err(e) => {
@@ -295,6 +627,8 @@ async fn apply_replacements_offloaded(
             ));
         }
 
+        #[cfg(test)]
+        tests::acknowledge_host_lock_attempt(upgrader.target_path());
         let _daemon_lock = super::acquire_host_upgrade_lock(upgrader.target_path())?;
         if !worker_alive.load(Ordering::Acquire) {
             return Err(UpgradeError::Other(
@@ -314,30 +648,91 @@ async fn apply_replacements_offloaded(
         // Admission: locks held + caller still alive. From here the worker
         // owns mutation through on_success — the async caller is only an
         // observer and may be cancelled without orphaning restart.
+        let mut flush_admission = if let Some(reservation) = &flush_reservation {
+            reservation.activate().map_err(|error| {
+                UpgradeError::Other(format!("shutdown won upgrade admission: {error}"))
+            })?;
+            Some(UnusedFlushReservation {
+                reservation: reservation.clone(),
+                handed_off: false,
+            })
+        } else {
+            None
+        };
+        // (target, fresh backup) pairs this transaction actually swapped.
+        let mut companion_swapped: Vec<(PathBuf, PathBuf)> = Vec::new();
         if let Some((x0x_upgrader, extracted_x0x)) = companion {
             match x0x_upgrader.finish_upgrade_under_host_lock(&extracted_x0x, &target_version) {
-                Ok(_) => info!("x0x companion upgraded successfully"),
+                Ok((_, Some(backup))) => {
+                    info!("x0x companion upgraded successfully");
+                    companion_swapped.push((x0x_upgrader.target_path().to_path_buf(), backup));
+                }
+                Ok((_, None)) => {
+                    info!("x0x companion already matches the incoming bytes; no swap")
+                }
                 Err(e) => warn!("Failed to upgrade x0x companion: {e}"),
             }
         }
 
-        let result = upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version)?;
-        if matches!(result, UpgradeResult::Success { .. }) {
-            if let Some(cont) = on_success.take() {
-                // Clean temp before a continuation that may `_exit` / `exit`
-                // without running Drop (#1447 RC4 P2).
-                drop(temp_custody.take());
-                cont();
+        // Roll the companion back whenever the daemon replace failed or
+        // rolled itself back: a daemon/CLI pair never ends mixed (engineer
+        // ruling, 23 Oct 2026).
+        let restore_companions = |companion_swapped: &[(PathBuf, PathBuf)]| {
+            if companion_swapped.is_empty() {
+                return;
             }
+            match super::restore_swapped_binaries(companion_swapped) {
+                Ok(()) => warn!(
+                    targets = ?companion_swapped
+                        .iter()
+                        .map(|(target, _)| target.display().to_string())
+                        .collect::<Vec<_>>(),
+                    "daemon replace failed; restored the companion binaries this transaction swapped"
+                ),
+                Err(error) => error!(
+                    %error,
+                    "cannot restore the companion binaries this transaction \
+                     swapped; manual recovery applies"
+                ),
+            }
+        };
+
+        let daemon_replace =
+            upgrader.finish_upgrade_under_host_lock(&extracted_path, &target_version);
+        let (result, daemon_backup) = match daemon_replace {
+            Ok(pair) => pair,
+            Err(error) => {
+                restore_companions(&companion_swapped);
+                return Err(error);
+            }
+        };
+        if !matches!(result, UpgradeResult::Success { .. }) {
+            restore_companions(&companion_swapped);
+            return Ok(result);
+        }
+        let mut swapped = companion_swapped;
+        if let Some(backup) = daemon_backup {
+            swapped.push((upgrader.target_path().to_path_buf(), backup));
+        }
+        if let Some(cont) = on_success.take() {
+            // Clean temp before a continuation that may `_exit` / `exit`
+            // without running Drop (#1447 RC4 P2).
+            drop(temp_custody.take());
+            if let Some(admission) = &mut flush_admission {
+                admission.handed_off = true;
+            }
+            cont(&swapped);
         }
         Ok(result)
     });
 
-    CallerAliveJoin { caller_alive, join }
-        .await
-        .map_err(|join_err| {
-            UpgradeError::Other(format!("upgrade replace task failed: {join_err}"))
-        })?
+    CallerAliveJoin {
+        caller_alive,
+        join,
+        _permit: registration,
+    }
+    .await
+    .map_err(|join_err| UpgradeError::Other(format!("upgrade replace task failed: {join_err}")))?
 }
 
 /// Context the restart planner needs from the running daemon: where the
@@ -370,6 +765,15 @@ pub struct AutoApplyUpgrader {
     http_deferred_restart: bool,
     /// Data directory / API address / shutdown hook for the restart planner.
     restart_context: RestartContext,
+    #[cfg(unix)]
+    staging: Option<super::staging_runtime::Gate>,
+    release_permit: Option<ReleasePermit>,
+    flush_reservation: Option<super::shutdown_flush::Reservation>,
+    /// `(target, fresh backup)` pairs for exactly the artifacts this
+    /// transaction swapped. `None` (direct restart callers) restores the
+    /// plan's daemon pair, as before; `Some(..)` is what the apply worker
+    /// recorded, and may be empty when nothing swapped.
+    swapped_artifacts: Option<Vec<(PathBuf, PathBuf)>>,
 }
 
 impl AutoApplyUpgrader {
@@ -380,6 +784,42 @@ impl AutoApplyUpgrader {
             restart_on_success: true,
             http_deferred_restart: false,
             restart_context: RestartContext::default(),
+            #[cfg(unix)]
+            staging: None,
+            release_permit: None,
+            flush_reservation: None,
+            swapped_artifacts: None,
+        }
+    }
+
+    pub(crate) fn with_swapped_artifacts(mut self, artifacts: Vec<(PathBuf, PathBuf)>) -> Self {
+        self.swapped_artifacts = Some(artifacts);
+        self
+    }
+
+    pub(crate) fn with_release_permit(mut self, permit: ReleasePermit) -> Self {
+        self.release_permit = Some(permit);
+        self
+    }
+
+    fn with_flush_reservation(
+        mut self,
+        reservation: Option<super::shutdown_flush::Reservation>,
+    ) -> Self {
+        self.flush_reservation = reservation;
+        self
+    }
+
+    fn check_release(&self) -> Result<(), UpgradeError> {
+        self.release_permit
+            .as_ref()
+            .map_or(Ok(()), ReleasePermit::check)
+    }
+
+    pub(crate) async fn release_cancelled(&self) {
+        match &self.release_permit {
+            Some(permit) => permit.cancelled().await,
+            None => std::future::pending().await,
         }
     }
 
@@ -388,10 +828,191 @@ impl AutoApplyUpgrader {
         self
     }
 
+    /// Select the staged install from the independent executable observation,
+    /// not from the receipt. Carry this path through locks, plan and mutation.
+    /// Legacy unstaged callers and Windows retain their existing raw-path flow.
+    fn install_path(&self) -> Result<PathBuf, UpgradeError> {
+        let observed = current_binary_path()?;
+        #[cfg(unix)]
+        if let Some(gate) = &self.staging {
+            let install = std::fs::canonicalize(&observed).map_err(|error| {
+                UpgradeError::Other(format!("staging install unavailable: {error}"))
+            })?;
+            if install != gate.request.install {
+                return Err(UpgradeError::Other("staging install changed".into()));
+            }
+            return Ok(install);
+        }
+        Ok(observed)
+    }
+
+    /// Capture actual guide policy evidence after download. The writer must
+    /// hold the returned install lock through a fresh observe_locked_at check
+    /// requiring Due and the rename; this snapshot alone authorizes no write.
+    #[cfg(unix)]
+    pub(crate) async fn guide_staging(
+        &self,
+    ) -> Result<
+        Option<(
+            PathBuf,
+            super::staging_runtime::Gate,
+            restart::StagingIdentity,
+        )>,
+        UpgradeError,
+    > {
+        let Some(gate) = &self.staging else {
+            return Ok(None);
+        };
+        self.check_release()?;
+        let install = self.install_path()?;
+        let identity = restart::resolve_staging_identity(
+            self.stop_on_upgrade,
+            &install,
+            self.restart_context.data_dir.as_deref(),
+            self.restart_context.api_addr,
+            self.release_permit
+                .as_ref()
+                .and_then(ReleasePermit::http_wait_slot),
+        )
+        .await
+        .map_err(UpgradeError::from)?;
+        // Drain the actual identity readback before observing cancellation.
+        self.check_release()?;
+        let mut gate = gate.clone();
+        // The HTTP wait override is not authority to change the guide.
+        gate.skip_staging_delay = false;
+        Ok(Some((install, gate, identity)))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_staging_request(mut self, request: super::staging::StagingRequest) -> Self {
+        self.staging = Some(super::staging_runtime::Gate {
+            request,
+            skip_staging_delay: false,
+            #[cfg(test)]
+            clock: None,
+            #[cfg(test)]
+            observed: None,
+        });
+        self
+    }
+
+    /// Authenticated D185 override: keep the receipt and mandatory probe wait.
+    #[cfg(unix)]
+    pub(crate) fn with_staging_now(mut self, now: bool) -> Self {
+        if let Some(gate) = &mut self.staging {
+            gate.skip_staging_delay = now;
+        }
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_staging_clock(
+        mut self,
+        clock: Option<super::staging_runtime::Clock>,
+    ) -> Self {
+        if let Some(gate) = &mut self.staging {
+            gate.clock = clock;
+        }
+        self
+    }
+
+    /// The existing owned caller retains the wait. No apply mutex or OS lock
+    /// remains held across sleep, and cancellation never resets the receipt.
+    #[cfg(unix)]
+    pub(crate) async fn wait_for_staging(
+        &self,
+        shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), UpgradeError> {
+        let Some(gate) = &self.staging else {
+            return Ok(());
+        };
+        let install = self.install_path()?;
+        loop {
+            self.check_release()?;
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
+            }
+            // Resolve actual service identity before the first receipt. A
+            // pending restart rate window does not erase a verified fleet
+            // binding, but it still refuses the later full apply plan.
+            let identity = tokio::select! {
+                biased;
+                _ = shutdown.changed() => return Err(UpgradeError::Other("staging cancelled by shutdown".into())),
+                result = restart::resolve_staging_identity(
+                    self.stop_on_upgrade, &install,
+                    self.restart_context.data_dir.as_deref(), self.restart_context.api_addr,
+                    self.release_permit.as_ref().and_then(ReleasePermit::http_wait_slot),
+                ) => result.map_err(UpgradeError::from)?,
+            };
+            self.check_release()?;
+            let gate = gate.clone();
+            let install = install.clone();
+            let worker_shutdown = shutdown.clone();
+            let worker =
+                run_owned_blocking_with_permit(self.release_permit.as_ref(), move |worker_alive| {
+                    let _lock = super::acquire_host_upgrade_lock(&install)?;
+                    // A queued blocking task outlives a dropped JoinHandle. Recheck
+                    // custody after obtaining the lock and before any record I/O.
+                    let shutdown_value = worker_shutdown.borrow();
+                    if !worker_alive.load(Ordering::Acquire)
+                        || *shutdown_value
+                        || worker_shutdown.has_changed().is_err()
+                    {
+                        return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
+                    }
+                    // Measure receipt time after lock acquisition: time spent
+                    // queued for that lock must not count as durable rollout wait.
+                    let clock = gate
+                        .clock()
+                        .map_err(|error| UpgradeError::Other(error.to_string()))?;
+                    gate.observe_locked_at(&install, &clock, &identity)
+                });
+            let decision = tokio::select! {
+                biased;
+                _ = shutdown.changed() => return Err(UpgradeError::Other("staging cancelled by shutdown".into())),
+                result = worker => result?,
+            };
+            if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
+            }
+            #[cfg(test)]
+            if let Some(observed) = self
+                .staging
+                .as_ref()
+                .and_then(|gate| gate.observed.as_ref())
+            {
+                observed(decision.clone());
+            }
+            self.check_release()?;
+            let super::staging::Decision::Waiting(wait) = decision else {
+                return Ok(());
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait.min(std::time::Duration::from_secs(30))) => {}
+                _ = self.release_cancelled() => return Err(cancelled_release()),
+                _ = shutdown.changed() => {
+                    return Err(UpgradeError::Other("staging cancelled by shutdown".into()));
+                }
+            }
+        }
+    }
+
     /// Supply the daemon-side restart context (data dir, pre-upgrade API
     /// address, graceful-shutdown hook) used by the transactional handoff.
     pub fn with_restart_context(mut self, context: RestartContext) -> Self {
         self.restart_context = context;
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_staging_observer(
+        mut self,
+        observed: Option<super::staging_runtime::Observer>,
+    ) -> Self {
+        if let Some(gate) = &mut self.staging {
+            gate.observed = observed;
+        }
         self
     }
 
@@ -423,6 +1044,11 @@ impl AutoApplyUpgrader {
             restart_on_success: self.restart_on_success,
             http_deferred_restart: self.http_deferred_restart,
             restart_context: self.restart_context.clone(),
+            flush_reservation: self.flush_reservation.clone(),
+            swapped_artifacts: self.swapped_artifacts.clone(),
+            #[cfg(unix)]
+            staging: self.staging.clone(),
+            release_permit: self.release_permit.clone(),
         }
     }
 
@@ -434,9 +1060,47 @@ impl AutoApplyUpgrader {
     ) -> Result<Option<super::probe_retry::RetryWait>, UpgradeError> {
         #[cfg(unix)]
         {
-            let install = current_binary_path()?;
+            let install = self.install_path()?;
             let version = version.to_owned();
-            probe_retry_delay_for_install(install, version).await
+            self.check_release()?;
+            if let Some(gate) = &self.staging {
+                if gate.request.version != version {
+                    return Err(UpgradeError::Other("staging retry release changed".into()));
+                }
+                let identity = restart::resolve_staging_identity(
+                    self.stop_on_upgrade,
+                    &install,
+                    self.restart_context.data_dir.as_deref(),
+                    self.restart_context.api_addr,
+                    self.release_permit
+                        .as_ref()
+                        .and_then(ReleasePermit::http_wait_slot),
+                )
+                .await
+                .map_err(UpgradeError::from)?;
+                self.check_release()?;
+                let gate = gate.clone();
+                run_owned_blocking_with_permit(self.release_permit.as_ref(), move |caller_alive| {
+                    let _lock = super::acquire_host_upgrade_lock(&install)?;
+                    let check_custody = || {
+                        if caller_alive.load(Ordering::Acquire) {
+                            Ok(())
+                        } else {
+                            Err(UpgradeError::Other(
+                                "staging retry cancelled before record I/O".into(),
+                            ))
+                        }
+                    };
+                    check_custody()?;
+                    ensure_canonical_install(&install)?;
+                    gate.check_retry_policy(&install, &identity)?;
+                    check_custody()?;
+                    probe_retry_state_under_lock(&install, &version)
+                })
+                .await
+            } else {
+                probe_retry_delay_owned(install, version, self.release_permit.as_ref()).await
+            }
         }
         #[cfg(not(unix))]
         {
@@ -454,7 +1118,7 @@ impl AutoApplyUpgrader {
     /// be started (helper spawn failure) — the old process keeps running in
     /// both cases.
     pub async fn restart_current_binary(&self, target_version: &str) -> Result<(), UpgradeError> {
-        let target_path = current_binary_path()?;
+        let target_path = self.install_path()?;
         let plan = self.resolve_restart_plan(&target_path).await?;
         self.trigger_restart(&plan, target_version)
     }
@@ -490,19 +1154,25 @@ impl AutoApplyUpgrader {
         binary_path: &Path,
     ) -> Result<restart::RestartPlan, UpgradeError> {
         let signals = restart::SupervisionSignals::sample();
-        let launchd_readback = restart::readback_launchd_policy_offloaded(
+        let launchd_readback = restart::readback_launchd_policy_retaining(
             &signals,
             binary_path,
             &restart::current_argv(),
+            self.release_permit
+                .as_ref()
+                .and_then(ReleasePermit::http_wait_slot),
         )
         .await;
         // #690: the systemd-side twin — no-op (NotApplicable) unless a
         // systemd signal classified this instance, so macOS and unsupervised
         // applies shell out to nothing.
-        let systemd_readback = restart::readback_systemd_policy_offloaded(
+        let systemd_readback = restart::readback_systemd_policy_retaining(
             &signals,
             binary_path,
             &restart::current_argv(),
+            self.release_permit
+                .as_ref()
+                .and_then(ReleasePermit::http_wait_slot),
         )
         .await;
         restart::resolve_restart_plan(
@@ -530,6 +1200,8 @@ impl AutoApplyUpgrader {
         &self,
         manifest: &ReleaseManifest,
     ) -> Result<UpgradeResult, UpgradeError> {
+        self.check_release()?;
+        super::monitor::validate_manifest_timestamp(manifest)?;
         let current_version_str = crate::VERSION;
         let target_version = semver::Version::parse(&manifest.version)
             .map_err(|e| UpgradeError::Other(format!("invalid version: {e}")))?;
@@ -551,7 +1223,7 @@ impl AutoApplyUpgrader {
             .matches_platform(platform_target)
             .ok_or(UpgradeError::NoPlatformAsset)?;
 
-        let target_path = current_binary_path()?;
+        let target_path = self.install_path()?;
 
         // ADR-0061 §1 — resolve before mutation. The restart owner, intended
         // exit behaviour, executable/argv and effective roots are resolved and
@@ -561,6 +1233,34 @@ impl AutoApplyUpgrader {
         // installed binaries untouched. The plan is then carried through
         // replacement and restart — never re-derived post-swap.
         let restart_plan = self.resolve_restart_plan(&target_path).await?;
+        self.check_release()?;
+        // Failed-upgrade hold (engineer ruling, 23 Oct 2026): a release whose
+        // started flush failed is not applied again automatically — neither
+        // here nor on any later check — until a newer release appears or the
+        // operator removes the hold file. Without this, a deterministic flush
+        // failure turns every restart into the same failed apply (an endless
+        // exit loop ADR 0094 §4 forbids).
+        #[cfg(unix)]
+        if let Some(held) =
+            super::shutdown_flush::release_is_held(&restart_plan.data_root, &target_version)
+                .map_err(|error| {
+                    UpgradeError::Other(format!("failed-upgrade hold unreadable: {error}"))
+                })?
+        {
+            error!(
+                held_release = %held,
+                target_version = %target_version,
+                hold = %restart_plan.data_root.join(super::shutdown_flush::HOLD_RECORD).display(),
+                "refusing to apply a release held by a failed acknowledged flush; \
+                 a strictly newer release applies, or stop the daemon and remove \
+                 the hold file"
+            );
+            return Err(UpgradeError::Other(format!(
+                "release {held} is held after a failed acknowledged shutdown flush \
+                 (see docs/upgrade-system.md); remove the hold file or apply a \
+                 newer release"
+            )));
+        }
         #[cfg(unix)]
         let probe_launch = super::probe::ProbeLaunch::capture(&restart_plan.cwd);
         // Refuse a failed Unix record barrier before download or replacement.
@@ -571,13 +1271,50 @@ impl AutoApplyUpgrader {
             UpgradeError::Other(format!("upgrade record barrier unavailable: {error}"))
         })?;
         #[cfg(unix)]
-        if let super::probe::Admission::Waiting { retry_after } =
-            inspect_probe_admission(target_path.clone(), manifest.version.clone()).await?
+        if let Some(gate) = &self.staging {
+            super::monitor::validate_manifest_timestamp(manifest)?;
+            if gate.request.version != manifest.version
+                || gate.request.archive_sha256 != asset.archive_sha256
+                || std::fs::canonicalize(&restart_plan.data_root)
+                    .map_err(|error| UpgradeError::Other(error.to_string()))?
+                    != gate.request.data_root
+            {
+                return Err(UpgradeError::Other(
+                    "staging release or data root changed".into(),
+                ));
+            }
+            let gate = gate.clone();
+            let install = target_path.clone();
+            let staging_plan = restart_plan.clone();
+            run_owned_blocking_with_permit(self.release_permit.as_ref(), move |caller_alive| {
+                let _lock = super::acquire_host_upgrade_lock(&install)?;
+                if !caller_alive.load(Ordering::Acquire) {
+                    return Err(UpgradeError::Other(
+                        "staging admission cancelled before record I/O".into(),
+                    ));
+                }
+                gate.require_due(&install, &staging_plan)
+            })
+            .await?;
+            #[cfg(test)]
+            pre_probe_admission_seam::run(&target_path);
+        }
+        #[cfg(unix)]
+        if let super::probe::Admission::Waiting { retry_after } = inspect_probe_admission(
+            target_path.clone(),
+            manifest.version.clone(),
+            self.staging
+                .clone()
+                .map(|gate| (gate, restart_plan.clone())),
+            self.release_permit.as_ref(),
+        )
+        .await?
         {
             return Err(UpgradeError::Other(
                 super::probe::ProbeRefusal::Waiting { retry_after }.to_string(),
             ));
         }
+        self.check_release()?;
         info!(
             mode = ?restart_plan.mode,
             supervision = restart_plan.supervision_signal.as_deref().unwrap_or("none"),
@@ -602,6 +1339,20 @@ impl AutoApplyUpgrader {
         if let Some(result) = apply_attempt_seam::intercept(&restart_plan, manifest) {
             return Ok(result);
         }
+
+        let flush_reservation = if restart_plan.mode == restart::RestartMode::SupervisedExit
+            && (self.restart_on_success || self.http_deferred_restart)
+        {
+            super::shutdown_flush::ensure_ready(&restart_plan.data_root).map_err(|error| {
+                UpgradeError::Other(format!("shutdown flush unavailable: {error}"))
+            })?;
+            Some(
+                super::shutdown_flush::reserve(&restart_plan.data_root)
+                    .map_err(|error| UpgradeError::Other(error.to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
         let temp_dir = upgrader.create_temp_dir()?;
@@ -732,10 +1483,26 @@ impl AutoApplyUpgrader {
                 cli: probe_cli,
                 launch: probe_launch,
             };
+            let staging = self.staging.clone();
+            let staging_plan = restart_plan.clone();
+            let admitted_manifest = manifest.clone();
+            let reserve_supervised_restart = flush_reservation.is_some();
             Some(Box::new(move |alive| {
+                if let Some(gate) = &staging {
+                    gate.require_due(&request.install, &staging_plan)?;
+                }
                 super::probe::run_before_swap(&request, alive)
                     .map(|_| ())
-                    .map_err(|error| UpgradeError::Other(error.to_string()))
+                    .map_err(|error| UpgradeError::Other(error.to_string()))?;
+                super::monitor::validate_manifest_timestamp(&admitted_manifest)?;
+                if staging_plan.mode == restart::RestartMode::SupervisedExit
+                    && reserve_supervised_restart
+                {
+                    super::shutdown_flush::ensure_ready(&staging_plan.data_root).map_err(
+                        |error| UpgradeError::Other(format!("shutdown flush unavailable: {error}")),
+                    )?;
+                }
+                Ok(())
             }))
         };
         #[cfg(not(unix))]
@@ -755,20 +1522,29 @@ impl AutoApplyUpgrader {
         let binary_name = self.binary_name.clone();
         let stop_on_upgrade = self.stop_on_upgrade;
         let restart_context = self.restart_context.clone();
-        let on_success: Option<Box<dyn FnOnce() + Send>> = if self.restart_on_success {
-            Some(Box::new(move || {
+        let continuation_reservation = flush_reservation.clone();
+        let on_success: Option<RestartContinuation> = if self.restart_on_success {
+            Some(Box::new(move |swapped: &[(PathBuf, PathBuf)]| {
                 let owner = AutoApplyUpgrader::new(&binary_name)
                     .with_stop_on_upgrade(stop_on_upgrade)
                     .with_restart_context(restart_context)
+                    .with_flush_reservation(continuation_reservation)
+                    .with_swapped_artifacts(swapped.to_vec())
                     .with_restart_on_success(false);
                 if let Err(e) = owner.trigger_restart(&restart_plan_for_cont, &version_for_cont) {
-                    warn!(
+                    // Only a refusal can return here: it happened before any
+                    // flush started, so the swapped binaries are restored
+                    // inside the refusal and the daemon keeps serving; the
+                    // refusal log carries the restore outcome. A started
+                    // flush that failed restores and exits EX_TEMPFAIL inside
+                    // trigger_restart instead.
+                    error!(
                         error = %e,
-                        installed_bytes = true,
                         restart = "not_started",
                         readiness_observed = false,
-                        "Restart after successful upgrade did not start: {e}; \
-                         old process keeps serving"
+                        "Restart did not obtain a flush receipt: {e}; refused \
+                         before any flush started, the swapped binaries are \
+                         restored and the daemon keeps serving"
                     );
                 }
             }))
@@ -783,6 +1559,7 @@ impl AutoApplyUpgrader {
                     restart_context,
                     restart_plan_for_cont,
                     version_for_cont,
+                    continuation_reservation,
                 )
                 .map_err(|e| {
                     UpgradeError::Other(format!(
@@ -794,7 +1571,9 @@ impl AutoApplyUpgrader {
             None
         };
 
-        let result = apply_replacements_offloaded(
+        self.check_release()?;
+        super::monitor::validate_manifest_timestamp(manifest)?;
+        let result = apply_replacements_with_permit(
             upgrader,
             extracted_path,
             target_version.clone(),
@@ -802,6 +1581,8 @@ impl AutoApplyUpgrader {
             _temp_guard,
             on_success,
             probe_admission,
+            self.release_permit.as_ref(),
+            flush_reservation,
         )
         .await?;
 
@@ -839,7 +1620,8 @@ impl AutoApplyUpgrader {
     /// before replacement, so this only carries it out.
     ///
     /// - `SupervisedExit` (supervision present **and** `stop_on_upgrade`
-    ///   true) writes the intent record and exits for the external owner.
+    ///   true) writes the intent, awaits a durable flush receipt and exits for
+    ///   the external owner. An error or timeout never requests that restart.
     ///   ADR-0061 §5: no detached helper is spawned on this path, so nothing
     ///   can start a second daemon on the same data root.
     /// - `TransactionalHandoff` (genuinely unsupervised, including the default
@@ -850,21 +1632,167 @@ impl AutoApplyUpgrader {
         plan: &restart::RestartPlan,
         target_version: &str,
     ) -> Result<(), UpgradeError> {
+        self.trigger_restart_with_exit(plan, target_version, |code| std::process::exit(code))
+    }
+
+    fn trigger_restart_with_exit(
+        &self,
+        plan: &restart::RestartPlan,
+        target_version: &str,
+        mut exit: impl FnMut(i32),
+    ) -> Result<(), UpgradeError> {
         let handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
         let handoff_path = plan.handoff_path();
 
         match plan.mode {
             restart::RestartMode::SupervisedExit => {
-                // I3: write the intent file BEFORE exiting so a supervisor
-                // crash loop is diagnosable. Best-effort — the exit contract
-                // with Restart=always units must not depend on disk health.
-                if let Err(e) = handoff.write(&handoff_path) {
-                    warn!(
-                        handoff = %handoff_path.display(),
-                        error = %e,
-                        "Failed to write upgrade intent file before supervised exit"
-                    );
-                }
+                // The live unprotected path binds its existing frozen restart
+                // plan. This receipt permits the restart request, not M2
+                // launcher ownership or protected candidate-start authority.
+                // Its fresh ID binds this call only, not a host transaction.
+                info!("Awaiting acknowledged shutdown flush before supervised restart request");
+                let binding = super::shutdown_flush::Binding::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    1,
+                    &handoff,
+                )
+                .map_err(|error| UpgradeError::Other(error.to_string()))?;
+                let prepare = move || handoff.write(&handoff_path);
+                let receipt = match &self.flush_reservation {
+                    Some(reservation) => super::shutdown_flush::acknowledge_reserved(
+                        &plan.data_root,
+                        binding.clone(),
+                        prepare,
+                        reservation,
+                    ),
+                    None => super::shutdown_flush::acknowledge(
+                        &plan.data_root,
+                        binding.clone(),
+                        prepare,
+                    ),
+                };
+                let receipt = match receipt {
+                    Ok(receipt) => receipt,
+                    Err(super::shutdown_flush::FlushFailure::NotOwned(error)) => {
+                        return Err(UpgradeError::Other(error.to_string()));
+                    }
+                    Err(failure) if failure.started() => {
+                        // Engineer ruling 23 Oct 2026: a flush that started
+                        // and failed or overran left this daemon stopped
+                        // behind the hook (no API, no network). Record the
+                        // failed-release hold first so the restart loop this
+                        // exit creates cannot re-apply the same release,
+                        // restore every binary this transaction swapped, and
+                        // exit EX_TEMPFAIL so the service manager restarts
+                        // the daemon on the old version.
+                        if let Err(hold_error) = super::shutdown_flush::hold_failed_release(
+                            &plan.data_root,
+                            target_version,
+                            &failure.to_string(),
+                        ) {
+                            error!(
+                                error = %hold_error,
+                                "cannot persist the failed-upgrade hold; the next \
+                                 automatic check may retry this release once more"
+                            );
+                        }
+                        // No swap manifest means no fresh backup this
+                        // transaction owns. Restoring `<exe>.backup` could
+                        // install a backup an earlier upgrade left (engineer
+                        // call, 23 Oct 2026), so refuse the restore and log
+                        // it; manual recovery applies.
+                        let restored_bytes = match self.swapped_artifacts.as_deref() {
+                            Some(swapped) => match super::restore_swapped_binaries(swapped) {
+                                Ok(()) => true,
+                                Err(restore_error) => {
+                                    error!(
+                                        error = %restore_error,
+                                        restore_set = ?swapped
+                                            .iter()
+                                            .map(|(target, _)| target.display().to_string())
+                                            .collect::<Vec<_>>(),
+                                        "cannot restore the swapped binaries; \
+                                         manual recovery applies"
+                                    );
+                                    false
+                                }
+                            },
+                            None => {
+                                error!(
+                                    "no swapped-artifact manifest for this transaction; \
+                                     no backup is restored because none is known to be \
+                                     fresh; manual recovery applies"
+                                );
+                                false
+                            }
+                        };
+                        error!(
+                            error = %failure,
+                            installed_bytes = true,
+                            restored_bytes = restored_bytes,
+                            restart = "not_started",
+                            recovery = "exited_tempfail",
+                            "supervised shutdown flush failed after the daemon stopped; \
+                             the process exits EX_TEMPFAIL for a supervisor restart"
+                        );
+                        super::log_flush::flush_before_exit(None);
+                        exit(restart::flush_failure_exit_code());
+                        #[allow(unreachable_code)]
+                        return Err(UpgradeError::Other(format!(
+                            "supervised shutdown flush failed: {failure}"
+                        )));
+                    }
+                    Err(failure) => {
+                        // Engineer ruling, 24 Oct 2026: a flush refused
+                        // before the daemon stops is not a failed start. The
+                        // daemon keeps serving, so it must not keep serving
+                        // from bytes it can no longer restart into: restore
+                        // every binary this transaction swapped (fresh
+                        // backups only, never a stale `.backup`), log the
+                        // refusal reason and return. No failed-release hold:
+                        // the release may be retried on the next normal
+                        // update cycle.
+                        let restored_bytes = match self.swapped_artifacts.as_deref() {
+                            Some(swapped) => match super::restore_swapped_binaries(swapped) {
+                                Ok(()) => true,
+                                Err(restore_error) => {
+                                    error!(
+                                        error = %restore_error,
+                                        restore_set = ?swapped
+                                            .iter()
+                                            .map(|(target, _)| target.display().to_string())
+                                            .collect::<Vec<_>>(),
+                                        "cannot restore the swapped binaries; the daemon \
+                                         keeps serving but the install needs manual recovery"
+                                    );
+                                    false
+                                }
+                            },
+                            None => {
+                                error!(
+                                    "no swapped-artifact manifest for this transaction; \
+                                     no backup is restored because none is known to be \
+                                     fresh; the daemon keeps serving"
+                                );
+                                false
+                            }
+                        };
+                        error!(
+                            error = %failure,
+                            installed_bytes = true,
+                            restored_bytes,
+                            restart = "not_started",
+                            recovery = "kept_serving",
+                            "supervised shutdown flush refused before the daemon stopped; \
+                             the swapped binaries are restored and the daemon keeps serving \
+                             on the previous version"
+                        );
+                        return Err(UpgradeError::Other(format!(
+                            "supervised shutdown flush refused: {failure}"
+                        )));
+                    }
+                };
+                authorize_receipt_after_stop(&receipt, &binding, &mut exit)?;
                 let exit_code = plan
                     .supervised_exit_code
                     .unwrap_or_else(restart::supervised_exit_code);
@@ -872,18 +1800,9 @@ impl AutoApplyUpgrader {
                 // named in `supervision`. It is not health acceptance, and it
                 // arms no automatic rollback — recovery on this path is the
                 // documented manual operator procedure.
-                info!(
-                    exit_code = exit_code,
-                    supervision = plan.supervision_signal.as_deref().unwrap_or("none"),
-                    installed_bytes = true,
-                    restart = "requested_from_supervisor",
-                    readiness_observed = false,
-                    automatic_rollback = false,
-                    "Exiting with code {} to request a restart from the service manager; \
-                     replacement readiness is observed by the supervisor, not by x0xd",
-                    exit_code
-                );
-                std::process::exit(exit_code);
+                // No logs are emitted after their acknowledged barrier.
+                exit(exit_code);
+                Ok(())
             }
             restart::RestartMode::TransactionalHandoff => restart::begin_transactional_handoff(
                 handoff,
@@ -894,11 +1813,44 @@ impl AutoApplyUpgrader {
     }
 }
 
+/// The flush already succeeded, so the daemon is stopped behind the hook.
+/// Any error this late must still end in an exit (engineer ruling,
+/// 23 Oct 2026): returning Err would park a daemon with no API and no
+/// network. The new bytes are installed and durably flushed, so the exit
+/// restarts on them; nothing is restored.
+fn authorize_receipt_after_stop(
+    receipt: &super::shutdown_flush::Receipt,
+    binding: &super::shutdown_flush::Binding,
+    exit: &mut dyn FnMut(i32),
+) -> Result<(), UpgradeError> {
+    if let Err(error) = receipt.authorize(binding) {
+        error!(
+            error = %error,
+            installed_bytes = true,
+            restored_bytes = false,
+            restart = "not_started",
+            recovery = "exited_tempfail",
+            "flush receipt failed authorization after the daemon stopped; \
+             the process exits EX_TEMPFAIL for a supervisor restart"
+        );
+        super::log_flush::flush_before_exit(None);
+        exit(restart::flush_failure_exit_code());
+        #[allow(unreachable_code)]
+        return Err(UpgradeError::Other(error.to_string()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+include!("../../tests/upgrade_shutdown_flush.rs");
+#[cfg(test)]
+shutdown_flush_regression_tests!();
+
 /// Get the path to the currently running binary.
 ///
 /// Handles the `/proc/self/exe (deleted)` suffix on Linux.
 pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
-    let exe = std::env::current_exe()
+    let exe = observe_current_executable()
         .map_err(|e| UpgradeError::Other(format!("failed to resolve current executable: {e}")))?;
 
     // On Linux, /proc/self/exe can have " (deleted)" suffix after an upgrade
@@ -908,6 +1860,94 @@ pub fn current_binary_path() -> Result<PathBuf, UpgradeError> {
         Ok(PathBuf::from(clean))
     } else {
         Ok(exe)
+    }
+}
+
+fn observe_current_executable() -> std::io::Result<PathBuf> {
+    #[cfg(all(test, unix))]
+    if let Some(path) = current_binary_path_seam::observation() {
+        return Ok(path);
+    }
+    std::env::current_exe()
+}
+
+/// Replace only the raw executable observation, before path resolution. Tests
+/// must keep this thread-local guard on their current-thread async runtime.
+#[cfg(all(test, unix))]
+pub(crate) mod current_binary_path_seam {
+    use std::{cell::RefCell, marker::PhantomData, path::PathBuf, rc::Rc};
+
+    thread_local! {
+        static OBSERVATION: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Guard {
+        previous: Option<PathBuf>,
+        _thread: PhantomData<Rc<()>>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVATION.with(|slot| *slot.borrow_mut() = self.previous.take());
+        }
+    }
+
+    pub(crate) fn install(raw: PathBuf) -> Guard {
+        Guard {
+            previous: OBSERVATION.with(|slot| slot.replace(Some(raw))),
+            _thread: PhantomData,
+        }
+    }
+
+    pub(super) fn observation() -> Option<PathBuf> {
+        OBSERVATION.with(|slot| slot.borrow().clone())
+    }
+}
+
+/// Observe the actual gap between staged admission and the separate probe
+/// lock. The hook changes no input and runs after the first lock is released.
+#[cfg(all(test, unix))]
+pub(crate) mod pre_probe_admission_seam {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{LazyLock, Mutex},
+    };
+
+    type Hook = Box<dyn FnOnce(&Path) + Send>;
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) struct Guard {
+        target: PathBuf,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = HOOKS.lock() {
+                hooks.remove(&self.target);
+            }
+        }
+    }
+
+    pub(crate) fn install(target: PathBuf, hook: Hook) -> Guard {
+        let mut hooks = HOOKS.lock().expect("probe admission seam poisoned");
+        assert!(
+            !hooks.contains_key(&target),
+            "probe admission seam already installed"
+        );
+        hooks.insert(target.clone(), hook);
+        Guard { target }
+    }
+
+    pub(super) fn run(target: &Path) {
+        let hook = HOOKS
+            .lock()
+            .expect("probe admission seam poisoned")
+            .remove(target);
+        if let Some(hook) = hook {
+            hook(target);
+        }
     }
 }
 
@@ -1284,9 +2324,105 @@ fn extract_from_zip(
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_http_custody.rs"
+    ));
+    http_custody_regression_tests!();
+    #[cfg(unix)]
+    include!("../../tests/upgrade_background_staging.rs");
+    #[cfg(unix)]
+    background_permit_regression_tests!();
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    async fn check_supervised_unused_reservation_after_replacement(rollback: bool) {
+        use crate::upgrade::shutdown_flush as flush;
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/upgrade-unused-reservation-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = tempfile::tempdir_in(root).unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let primary = root.join("x0xd");
+        let original = b"old daemon";
+        std::fs::write(&primary, original).unwrap();
+        let scratch = root.join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let incoming = scratch.join("candidate");
+        if rollback {
+            // A directory cannot replace the installed file. The real backup
+            // and restore paths run, without a permission or timing seam.
+            std::fs::create_dir(&incoming).unwrap();
+            assert_ne!(
+                std::fs::metadata(&incoming).unwrap().len(),
+                original.len() as u64
+            );
+        }
+        // Otherwise the missing incoming path makes the real comparison return Err.
+        let owner = flush::register(root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
+        let reservation = flush::reserve(&root).unwrap();
+        let retained_observer = reservation.clone();
+        let continuation_reservation = reservation.clone();
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let on_success = Box::new(move |_: &[(PathBuf, PathBuf)]| {
+            observed.store(true, Ordering::SeqCst);
+            drop(continuation_reservation);
+        });
+        let result = apply_replacements_with_permit(
+            Upgrader::new(primary.clone(), semver::Version::new(1, 0, 0)),
+            incoming,
+            semver::Version::new(2, 0, 0),
+            None,
+            TempDirGuard { path: scratch },
+            Some(on_success),
+            None,
+            None,
+            Some(reservation),
+        )
+        .await;
+        if rollback {
+            assert!(
+                matches!(result, Ok(UpgradeResult::RolledBack { .. })),
+                "{result:?}"
+            );
+        } else {
+            assert!(matches!(result, Err(UpgradeError::Other(_))), "{result:?}");
+        }
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "failed replacement must not restart"
+        );
+        assert_eq!(std::fs::read(primary).unwrap(), original);
+        assert!(
+            !root.join(flush::RECORD).exists(),
+            "no acknowledgment started"
+        );
+        // An extra clone can outlive apply (as a parked HTTP owner can). The
+        // finished replacement must release its unused admission immediately.
+        flush::ensure_ready(&root).unwrap();
+        drop(flush::reserve(&root).unwrap());
+        assert!(
+            !owner.seal_admission(),
+            "ordinary shutdown must remain available"
+        );
+        drop(retained_observer);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervised_replacement_error_releases_unused_reservation() {
+        check_supervised_unused_reservation_after_replacement(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervised_replacement_rollback_releases_unused_reservation() {
+        check_supervised_unused_reservation_after_replacement(true).await;
+    }
 
     #[cfg(unix)]
     struct ProbePairFixture {
@@ -1439,7 +2575,7 @@ mod tests {
                 TempDirGuard {
                     path: fixture.stage.clone(),
                 },
-                Some(Box::new(move || marker.store(true, Ordering::Release))),
+                Some(Box::new(move |_| marker.store(true, Ordering::Release))),
                 Some(Box::new(move |alive| {
                     let result = if failure == "timeout" {
                         super::super::probe::run_before_swap_with_options(
@@ -1504,7 +2640,7 @@ mod tests {
             TempDirGuard {
                 path: fixture.stage.clone(),
             },
-            Some(Box::new(move || {
+            Some(Box::new(move |_| {
                 assert_eq!(std::fs::read(primary).unwrap(), daemon_bytes);
                 assert_eq!(std::fs::read(cli).unwrap(), cli_bytes);
                 assert!(!stage.exists());
@@ -1548,7 +2684,7 @@ mod tests {
                     incoming_cli,
                 )),
                 TempDirGuard { path: stage },
-                Some(Box::new(move || marker.store(true, Ordering::Release))),
+                Some(Box::new(move |_| marker.store(true, Ordering::Release))),
                 Some(Box::new(move |alive| {
                     entered.send(()).unwrap();
                     released
@@ -2310,7 +3446,11 @@ mod tests {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "not-a-version".to_string(),
-            timestamp: 0,
+            channel: "stable".to_owned(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             assets: vec![],
             skill_url: String::new(),
             skill_sha256: [0u8; 32],
@@ -2331,7 +3471,11 @@ mod tests {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "0.1.0".to_string(),
-            timestamp: 0,
+            channel: "stable".to_owned(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             assets: vec![],
             skill_url: String::new(),
             skill_sha256: [0u8; 32],
@@ -2349,7 +3493,11 @@ mod tests {
         let manifest = ReleaseManifest {
             schema_version: 1,
             version: "99.99.99".to_string(),
-            timestamp: 0,
+            channel: "stable".to_owned(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             assets: vec![], // No platform assets
             skill_url: String::new(),
             skill_sha256: [0u8; 32],
@@ -2498,12 +3646,51 @@ mod tests {
         holder.join().expect("lock holder thread");
     }
 
-    /// Hold a host lock, prove the offload submitted, abort the caller, then
+    static HOST_LOCK_ATTEMPTS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, tokio::sync::oneshot::Sender<()>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    struct HostLockAttemptGuard(PathBuf);
+
+    impl Drop for HostLockAttemptGuard {
+        fn drop(&mut self) {
+            HOST_LOCK_ATTEMPTS
+                .lock()
+                .expect("host lock attempt hooks")
+                .remove(&self.0);
+        }
+    }
+
+    fn observe_host_lock_attempt(
+        target: &Path,
+    ) -> (HostLockAttemptGuard, tokio::sync::oneshot::Receiver<()>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        assert!(HOST_LOCK_ATTEMPTS
+            .lock()
+            .expect("host lock attempt hooks")
+            .insert(target.to_path_buf(), sender)
+            .is_none());
+        (HostLockAttemptGuard(target.to_path_buf()), receiver)
+    }
+
+    // Each acknowledgement is tied to one fixture path. It fires immediately
+    // before the real lock call, with no intervening cancellation check. Thus
+    // the held lock keeps custody even if the caller cancels after this send.
+    pub(super) fn acknowledge_host_lock_attempt(target: &Path) {
+        let sender = HOST_LOCK_ATTEMPTS
+            .lock()
+            .expect("host lock attempt hooks")
+            .remove(target);
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
+
+    /// Hold a host lock, acknowledge the worker's lock attempt, abort, then
     /// release. After cancel the host must not keep replaced bytes without a
     /// restart continuation (Codex P1 on b937a806 / #1447 RC2).
     async fn cancel_while_lock_held_must_not_orphan_restart(hold_companion: bool) {
         use std::fs::OpenOptions;
-        use std::future::{poll_fn, Future};
         use std::time::Duration;
 
         let root = TempDir::new().unwrap();
@@ -2530,6 +3717,7 @@ mod tests {
             .open(&lock_path)
             .expect("open held host lock");
         held.lock().expect("hold host lock");
+        let (_lock_attempt, waiting_rx) = observe_host_lock_attempt(held_target);
 
         let restart_marker = root.path().join("restart-continuation");
         let marker = restart_marker.clone();
@@ -2541,14 +3729,13 @@ mod tests {
                 incoming_cli,
             )
         });
-        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             // Worker-owned continuation: same ownership site as production
             // restart_on_success (RC3). Pre-admission cancel must not run it.
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
-            let replacement = apply_replacements_offloaded(
+            apply_replacements_offloaded(
                 upgrade,
                 incoming,
                 semver::Version::new(2, 0, 0),
@@ -2558,27 +3745,18 @@ mod tests {
                 },
                 on_success,
                 None,
-            );
-            tokio::pin!(replacement);
-            let mut waiting_tx = Some(waiting_tx);
-            let result = poll_fn(|cx| {
-                let polled = replacement.as_mut().poll(cx);
-                if polled.is_pending() {
-                    if let Some(tx) = waiting_tx.take() {
-                        let _ = tx.send(());
-                    }
-                }
-                polled
-            })
+            )
             .await?;
-            let _ = result;
             Ok::<_, UpgradeError>(())
         });
 
+        // Pending only proves submission. In the daemon-only case a queued
+        // worker can observe cancellation before its lock call and correctly
+        // remove scratch. Wait until that early-return gate is behind it.
         tokio::time::timeout(Duration::from_secs(3), waiting_rx)
             .await
-            .expect("offload submitted within timeout")
-            .expect("waiting signal");
+            .expect("worker reached held host lock within timeout")
+            .expect("host lock attempt acknowledgement");
         assert_eq!(
             std::fs::read(&primary).unwrap(),
             b"old-daemon",
@@ -2620,6 +3798,9 @@ mod tests {
             !installed || restarted,
             "replacement must not outlive its restart continuation"
         );
+        assert!(!restarted, "pre-admission cancel must not restart");
+        assert!(!primary.with_extension("backup").exists());
+        assert!(!cli.with_extension("backup").exists());
         assert_eq!(std::fs::read(&primary).unwrap(), b"old-daemon");
         if hold_companion {
             assert_eq!(std::fs::read(&cli).unwrap(), b"old-cli");
@@ -2634,6 +3815,82 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn cancel_while_companion_lock_held_must_not_orphan_restart() {
         cancel_while_lock_held_must_not_orphan_restart(true).await;
+    }
+
+    /// Force the other legal ordering behind #1537: the worker has entered,
+    /// but cancellation reaches it before the daemon-lock check. Scratch must
+    /// then be removed even while another owner still holds the daemon lock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_before_daemon_lock_releases_scratch_without_mutation() {
+        use std::time::Duration;
+
+        let root = TempDir::new().unwrap();
+        let primary = root.path().join("x0xd");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(&primary, b"old-daemon").unwrap();
+        let incoming = scratch.join("daemon");
+        std::fs::write(&incoming, b"new-daemon").unwrap();
+        let held = super::super::acquire_host_upgrade_lock(&primary).unwrap();
+        let (_lock_attempt, mut lock_attempt) = observe_host_lock_attempt(&primary);
+        let restart_marker = root.path().join("restart-continuation");
+        let marker = restart_marker.clone();
+
+        let (events, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = std::sync::Mutex::new(wait);
+        let permit = ReleasePermit {
+            observer: Some(Arc::new(move |entered| {
+                let _ = events.send(entered);
+                if entered {
+                    // Dropping the sender also releases this worker on panic.
+                    let _ = wait.lock().unwrap().recv();
+                }
+            })),
+            ..ReleasePermit::default()
+        };
+        let mut replacement = Box::pin(apply_replacements_with_permit(
+            Upgrader::new(primary.clone(), semver::Version::new(1, 0, 0)),
+            incoming,
+            semver::Version::new(2, 0, 0),
+            None,
+            TempDirGuard {
+                path: scratch.clone(),
+            },
+            Some(Box::new(move |_| {
+                std::fs::write(marker, b"restart reached").unwrap();
+            })),
+            None,
+            Some(&permit),
+            None,
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                result = &mut replacement => panic!("worker ended before release: {result:?}"),
+                entered = observed.recv() => assert_eq!(entered, Some(true)),
+            }
+        })
+        .await
+        .expect("worker entered");
+
+        drop(replacement);
+        assert!(scratch.exists(), "paused worker still owns scratch");
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .expect("cancelled worker finished without the daemon lock"),
+            Some(false)
+        );
+        assert!(matches!(
+            lock_attempt.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(!scratch.exists(), "finished worker releases scratch");
+        assert_eq!(std::fs::read(&primary).unwrap(), b"old-daemon");
+        assert!(!primary.with_extension("backup").exists());
+        assert!(!restart_marker.exists());
+        drop(held);
     }
 
     /// Live control: with companion lock held then released, both installs and
@@ -2673,7 +3930,7 @@ mod tests {
         let scratch_for_task = scratch.clone();
         let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             let replacement = apply_replacements_offloaded(
@@ -2888,7 +4145,7 @@ mod tests {
         let task = tokio::spawn(async move {
             // Worker-owned restart continuation (production restart_on_success
             // site). Survives abort of this async observer after admission.
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             let result = apply_replacements_offloaded(
@@ -3051,7 +4308,7 @@ mod tests {
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::fs::write(&marker, b"restart reached").unwrap();
             }));
             let replacement = apply_replacements_offloaded(
@@ -3160,6 +4417,7 @@ mod tests {
             RestartContext::default(),
             plan,
             "2.0.0".into(),
+            None,
         );
         assert!(
             arm.is_err(),
@@ -3214,7 +4472,7 @@ mod tests {
             }
         })
         .expect("normal spawn must succeed");
-        let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+        let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
             let _ = go_tx.send(());
         }));
 
@@ -3302,7 +4560,7 @@ mod tests {
         let task = tokio::spawn(async move {
             // Mirrors production HTTP deferred ownership: arm at admission on
             // an OS thread (not a cancellable Tokio task), sleep, then restart.
-            let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+            let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
                 std::thread::spawn(move || {
                     entered_worker.wait();
                     std::thread::sleep(HTTP_DEFERRED_RESTART_DELAY);
@@ -3395,7 +4653,7 @@ mod tests {
         let scratch_watch = scratch.clone();
         let cleaned_before_cont = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cleaned_before_cont);
-        let on_success: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
+        let on_success: Option<RestartContinuation> = Some(Box::new(move |_| {
             flag.store(!scratch_watch.exists(), Ordering::SeqCst);
         }));
 

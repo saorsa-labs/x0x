@@ -55,6 +55,7 @@ impl fmt::Display for ExecRequestId {
 
 /// Exec protocol frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ExecFrame {
     /// Client → server: request command execution.
     Request {
@@ -106,6 +107,7 @@ pub enum ExecFrame {
 
 /// Output stream selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum StreamKind {
     Stdout,
     Stderr,
@@ -113,6 +115,7 @@ pub enum StreamKind {
 
 /// Soft warning type sent to the requester and recorded in diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum WarningKind {
     StdoutCapHit,
     StderrCapHit,
@@ -143,6 +146,7 @@ impl WarningKind {
 
 /// Denial reason returned in the terminal Exit frame and audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DenialReason {
     ExecDisabled,
     UnverifiedSender,
@@ -220,7 +224,11 @@ pub fn decode_frame_payload(payload: &[u8]) -> Result<ExecFrame, ProtocolError> 
     let Some(frame_bytes) = payload.strip_prefix(EXEC_DM_PREFIX) else {
         return Err(ProtocolError::MissingPrefix);
     };
-    bincode::deserialize(frame_bytes).map_err(|e| ProtocolError::Decode(e.to_string()))
+    // #1604: an unknown frame, warning or denial variant is counted and
+    // logged. No refusal is sent: the request id of a frame this node
+    // cannot decode is not known.
+    crate::wire_compat::decode_bincode("ExecFrame", frame_bytes)
+        .map_err(|e| ProtocolError::Decode(e.to_string()))
 }
 
 #[cfg(test)]

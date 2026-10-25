@@ -92,6 +92,40 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Job 120231656380 died with 54 MB free. Record the raw runner before
+      # this job deletes disposable toolchains.
+      - name: Record disk at Test Suite start
+        run: |
+          echo "=== disk at Test Suite start ==="
+          df -h
+
+      # Preinstalled SDKs are not Test Suite inputs. Removing them is the
+      # same headroom the Coverage Gate uses. It is not enough on its own:
+      # the default-feature M2 compile below still needs the all-features
+      # target removed first (#1584).
+      - name: Free preinstalled runner disk
+        run: |
+          echo "=== disk before freeing preinstalled tools ==="
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/powershell \
+            /usr/share/swift \
+            /usr/local/share/chromium \
+            /usr/local/share/vcpkg \
+            /opt/az \
+            /usr/local/.ghcup \
+            /usr/share/miniconda \
+            /usr/local/graalvm \
+            /usr/local/share/boost \
+            || true
+          sudo apt-get clean || true
+          echo "=== disk after freeing preinstalled tools ==="
+          df -h
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
@@ -123,8 +157,11 @@ jobs:
             cargo generate-lockfile
           fi
 
-      - name: Cache target directory
-        uses: actions/cache@v5
+      # Restore here. Save after the all-features lane, before that target
+      # is removed for the default-feature M2 controls (#1584).
+      - name: Restore target directory
+        id: restore_target
+        uses: actions/cache/restore@v5
         with:
           path: target
           # Do not restore a different graph: stale test artifacts can consume the
@@ -137,11 +174,19 @@ jobs:
           tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
 
       - name: Inert shared wrapper argument controls
-        run: python3 -B scripts/ci/test_nextest_isolated.py -v
+        run: |
+          python3 -B scripts/ci/test_nextest_isolated.py -v
+          python3 -B scripts/ci/test_prune_target_cache.py -v
 
       - name: Prepare bounded convergence custody
         id: prepare_convergence
         run: python3 scripts/ci/issue442-convergence-custody.py prepare
+
+      - name: Record disk before Run tests
+        run: |
+          echo "=== disk before Run tests ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" "${HOME}/.cargo/git" 2>/dev/null || true
 
       - name: Run tests
         id: tests
@@ -177,16 +222,25 @@ jobs:
           name: test-results
           path: target/nextest/
 
-      # The workspace all-features lane exercises the debug seam. Also run the
-      # committed H controls with the default production trust root in isolation.
-      - name: M2 default-key and debug-signing controls
+      # Cargo marks the x0x binary test=false. Select its real parser/registry
+      # controls explicitly after preserving the broad suite's results above.
+      - name: M2 CLI apply-now parser and registry controls
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        id: upgrade_now_cli
         env:
-          X0X_ISOLATION_ROLE: m2-signing-controls
-        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --test upgrade_test_signing -- --no-tests=fail
+          X0X_ISOLATION_ROLE: m2-cli-now-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --all-features --bin x0x -- -E 'test(upgrade_now_cli_regressions)' --no-tests=fail
 
+      # Run while the all-features target is still on disk, and after the
+      # workspace artifact upload, so this invocation cannot replace those
+      # results. A voice failure must not skip the default-feature M2 controls.
+      - name: Record disk before Voice pipeline acceptance
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        run: |
+          echo "=== disk before Voice pipeline acceptance ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
 
-      # Run after the workspace artifact is uploaded so this nextest invocation
-      # cannot replace the full-suite results kept above.
       - name: Voice pipeline acceptance
         if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
         env:
@@ -215,10 +269,83 @@ jobs:
           path: ${{ runner.temp }}/voice-pipeline/
           if-no-files-found: error
 
+      # The full target holds ~115 workspace test binaries that change on every
+      # PR; archiving them filled the runner disk (#1543). Cache only the
+      # third-party build output from this all-features lane.
+      - name: Prune target directory for the cache
+        if: steps.restore_target.outputs.cache-hit != 'true'
+        run: |
+          echo "=== disk before pruning the all-features target cache ==="
+          df -h
+          du -sh target || true
+          python3 -B scripts/ci/prune-target-cache.py target
+          du -sh target || true
+
+      - name: Save target directory
+        if: steps.restore_target.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: target
+          key: ${{ steps.restore_target.outputs.cache-primary-key }}
+
+      # The steps above use --all-features. The M2 controls below compile the
+      # default feature set, which is a second graph in the same target.
+      # Job 120231656380 kept both and rustc died at 54 MB free. Remove the
+      # all-features output after the cache save. always() keeps this step
+      # when Voice failed; the outcome checks still require the tests and the
+      # all-features CLI control.
+      - name: Free intermediate target output
+        id: free_intermediate
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success'
+        run: |
+          echo "=== disk before freeing intermediate target output ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+          rm -rf target
+          echo "=== disk after freeing intermediate target output ==="
+          df -h
+
+      # The workspace all-features lane exercises the debug seam. Also run the
+      # committed H controls with the default production trust root in isolation.
+      - name: M2 default-key and debug-signing controls
+        id: m2_signing
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success' && steps.free_intermediate.outcome == 'success'
+        env:
+          X0X_ISOLATION_ROLE: m2-signing-controls
+        run: |
+          echo "=== disk before M2 default-key and debug-signing controls ==="
+          df -h
+          bash scripts/ci/nextest-isolated.sh --locked --workspace --test upgrade_test_signing -- --no-tests=fail
+
+      # Library fleet guards must also use the production key, not the
+      # all-features debug rehearsal key that permits zero-minute windows.
+      - name: Record disk before M2 production fleet staging controls
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success' && steps.m2_signing.outcome == 'success'
+        run: |
+          echo "=== disk before M2 production fleet staging controls ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+
+      - name: M2 production fleet staging controls
+        if: always() && steps.tests.outcome == 'success' && steps.upgrade_now_cli.outcome == 'success' && steps.m2_signing.outcome == 'success'
+        env:
+          X0X_ISOLATION_ROLE: m2-fleet-controls
+        run: bash scripts/ci/nextest-isolated.sh --locked --workspace --lib -- -E 'test(fleet_)' --no-tests=fail
+
+      - name: Record disk at Test Suite end
+        if: always()
+        run: |
+          echo "=== disk at Test Suite end ==="
+          df -h
+          du -sh target "${HOME}/.cargo/registry" 2>/dev/null || true
+
   signing-path-100k:
     name: Signing path 100k acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # Bound concurrent crates and LLVM workers on the standard 16 GiB runner.
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v5
 
@@ -289,7 +416,8 @@ jobs:
           X0X_SLOW_CONSUMER_PROOF: ${{ runner.temp }}/issue703-signing-test/proof.json
         run: |
           set +e
-          bash scripts/ci/nextest-isolated.sh --all-features --lib --cargo-profile signing-acceptance -- \
+          /usr/bin/time -v -o "${RUNNER_TEMP}/issue703-signing-test/build-and-test.time.txt" \
+            bash scripts/ci/nextest-isolated.sh --all-features --lib --cargo-profile signing-acceptance -- \
             --run-ignored ignored-only --no-tests=fail \
             -E 'test(=gossip::pubsub::tests::test_slow_subscriber_isolated_at_100k_messages)'
           status=$?
@@ -312,6 +440,9 @@ jobs:
           fi
           if [[ -f "${artifact}/resources.log" ]]; then
             tail -n 120 "${artifact}/resources.log"
+          fi
+          if [[ -f "${artifact}/build-and-test.time.txt" ]]; then
+            cat "${artifact}/build-and-test.time.txt"
           fi
 
       - name: Upload signing-path acceptance custody
@@ -427,15 +558,42 @@ jobs:
           if-no-files-found: error
 
 
-  w3h-harness:
-    # W3-H (#1164): deterministic simulation harness. Builds the entropy /
-    # wall-clock preload shim, runs every `w3h_` case 20 times in the
-    # isolated namespace, and requires the same verdict in every rerun with
-    # complete receipts (ruling D196). Distinct canonical traces per case
-    # are reported, not required.
-    name: W3-H harness (determinism)
+  w3h-plan:
+    # Names the case groups for the matrix. A case is in exactly one group.
+    # S3 (`w3h_1356_`) and S4 (`w3h_1357_`) each have a group, so more of
+    # those cases extend that shard only. The group is omitted when the
+    # tree has no matching test (main has no S3 cases yet).
+    name: W3-H shard plan
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the shard plan and the trace gate
+        run: |
+          python3 -B scripts/ci/test_w3h_shards.py -v
+          python3 -B scripts/ci/test_w3h_trace_check.py -v
+
+      - id: plan
+        name: Emit the shard matrix
+        run: |
+          # DIAG (#1526, do not merge): the S3 shard only.
+          matrix='{"group":["s3"]}'
+          echo "W3-H shards: ${matrix}"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  w3h-shard:
+    # One group, still `--stress-count 20`. The summary job below is the
+    # D196 gate. `fail-fast: false` so one bad group still uploads traces.
+    name: W3-H shard (${{ matrix.group }})
+    needs: w3h-plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.w3h-plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v5
 
@@ -464,15 +622,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: target
-          key: ${{ runner.os }}-rust-1.95.0-target-w3h-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          # Per shard. Parallel saves of one key race, and each shard's
+          # `target/` differs after its own test run.
+          key: ${{ runner.os }}-rust-1.95.0-target-w3h-${{ matrix.group }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.144  # same exact pin as the Test Suite
-
-      - name: Gate checker unit tests
-        run: python3 -B scripts/ci/test_w3h_trace_check.py -v
 
       - name: Build the W3-H preload shim
         run: |
@@ -483,10 +640,64 @@ jobs:
       - name: Run W3-H cases 20 times
         env:
           X0X_ISOLATION_ROLE: w3h-harness
-          X0X_RUNTIME_TIMEOUT_SECONDS: 4800
+          X0X_RUNTIME_TIMEOUT_SECONDS: 6600
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
-        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --run-ignored all --stress-count 3 -E 'test(/w3h_1356/)'
+        # The profile default-filter still intersects this expression, so
+        # only `w3h_` tests run. Repeat count stays 20.
+        run: |
+          filter="$(python3 -B scripts/ci/w3h-shards.py --filter "${{ matrix.group }}")"
+          echo "W3H-SHARD-START group=${{ matrix.group }} filter=${filter}"
+          python3 -B scripts/ci/w3h-shards.py --list "${{ matrix.group }}"
+          bash scripts/ci/nextest-isolated.sh --all-features --lib -- \
+            --profile w3h-gate --run-ignored all --stress-count 3 -E "$filter"
+          echo "W3H-SHARD-END group=${{ matrix.group }}"
+
+      - name: Upload W3-H shard traces
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: w3h-traces-${{ matrix.group }}
+          path: target/w3h/traces/
+          if-no-files-found: warn
+          retention-days: 7
+
+  w3h-harness:
+    # W3-H (#1164): deterministic simulation harness. The shards above run
+    # every `w3h_` case 20 times. This job merges their traces and requires
+    # the same verdict in every rerun with complete receipts (ruling D196).
+    # Distinct canonical traces per case are reported, not required.
+    # The check name stays `W3-H harness (determinism)`.
+    name: W3-H harness (determinism)
+    needs: w3h-shard
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download shard traces
+        uses: actions/download-artifact@v5
+        with:
+          pattern: w3h-traces-*
+          path: w3h-incoming
+          merge-multiple: true
+
+      - name: Merge shard traces
+        run: |
+          mkdir -p target/w3h/traces
+          find w3h-incoming -type f -print0 | while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            dest="target/w3h/traces/${base}"
+            if [ -e "$dest" ]; then
+              echo "duplicate W3-H trace file ${base}" >&2
+              exit 1
+            fi
+            cp "$file" "$dest"
+          done
+          traces="$(find target/w3h/traces -name '*.trace' | wc -l)"
+          echo "W3H-MERGED traces=${traces}"
+          test "${traces}" -gt 0
 
       # D196: blocking on the verdict (the same in all 20 reruns, every
       # receipt complete); the per-case distinct-trace counts are printed
@@ -508,6 +719,23 @@ jobs:
           --expect w3h_1356_control_s3_forked_node_not_auto_recovered=GREEN
           --require w3h_1356_red_s3_manual_reseat_recovers_forked_node
           --expect w3h_1356_red_s3_manual_reseat_recovers_forked_node=RED
+          --require w3h_1356_red_s3_b_provisional_admin_ata_promotes
+          --expect w3h_1356_red_s3_b_provisional_admin_ata_promotes=RED
+          --require w3h_1356_red_s3_t_typed_waits_name_their_cause
+          --expect w3h_1356_red_s3_t_typed_waits_name_their_cause=RED
+          --require w3h_1356_red_s3_t_deferred_until_host_commit
+          --expect w3h_1356_red_s3_t_deferred_until_host_commit=RED
+          --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
+          --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=RED
+
+      # A shard can upload traces and still exit non-zero (runner error
+      # after the cases). The gate above already fails a short or unstable
+      # case. This step fails the summary check for any other shard failure.
+      - name: Fail unless every shard succeeded
+        if: needs.w3h-shard.result != 'success'
+        run: |
+          echo "W3-H shard matrix result: ${{ needs.w3h-shard.result }}"
+          exit 1
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer

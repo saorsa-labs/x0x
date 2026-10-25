@@ -1,15 +1,17 @@
 //! W3-H cases for #1356 (ADR 0109, S3 of ADR 0088): ownerless attestation,
 //! stale-base self-recovery and manual re-seat. Harness first (D16, D54,
-//! D181): each red arm is committed and shown RED on the S3 base before
-//! the S3 code merges. A red arm that fails with the observation its
-//! `CAUSE_*` names is RED; any other failure is INFRA. Controls are GREEN
-//! before and after S3.
+//! D181): each red arm was committed and shown RED on the S3 base before
+//! the S3 code merged. This branch has the S3 code, so each red arm now
+//! expects GREEN (the ADR 0109 behaviour) and keeps its `_red_` name, as
+//! #1256 and #1357 did. A red arm that fails with the observation its
+//! `CAUSE_*` names (the base's behaviour) is RED; any other failure is
+//! INFRA. Controls are GREEN before and after S3.
 //!
 //! The ADR 0109 H-S3-a row (#818, skewed clocks) is `case_818`'s red
 //! baseline, `w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined`.
-//! Its GREEN end state is H-S3-a's candidate assertion, so the S3 code is
-//! expected to flip it (issue #1356, "the W3-H case for #818 is green").
-//! This file does not repeat it.
+//! Its GREEN end state is H-S3-a's candidate assertion, and it now expects
+//! GREEN too (issue #1356, "the W3-H case for #818 is green"). This file
+//! does not repeat it.
 //!
 //! Join arms. Nodes A (creator and only admin), M1 and M2 (members), J
 //! (joiner), in an ordinary `private_secure` (TreeKEM) group with no owner
@@ -17,7 +19,7 @@
 //! past the last metadata resend, and then J joins with I and A seals J
 //! (r+2).
 //!
-//! - `s3_aligned_stale_joiner` (H-S3-a2, RED on the base). Setup S0′: no
+//! - `s3_aligned_stale_joiner` (H-S3-a2, RED on the base, GREEN with S3). Setup S0′: no
 //!   state-only commits before the mint, so the clocks are aligned and the
 //!   seal's roster clock is above J's seed. Desired (ADR 0109 §2): within
 //!   [`CATCHUP`] J is active at A's state revision and TreeKEM epoch and is
@@ -52,14 +54,26 @@
 //! X renames (r+1′, on X only) and A renames (r+1). X still receives A's
 //! r+1, a sibling of its own head, so X installs a `no_anchor` marker.
 //! After X's resends end, only X's pubsub writes stay held, for the rest
-//! of the run: direct messages (an S3 `group_attest_request`, the re-seat
-//! join) pass. In CI run 39496687111 a full release let X's pubsub cache
-//! replay r+1′ to A about 26 s later, and A was marked too, which is not
-//! this case's shape (H-S3-c "holds" the fork from the main chain). X's head is on no admin's
+//! of the run, except the frames on a DM carrier topic (each node's DM
+//! inbox and the DM bus) that carry a message X did not send during the
+//! hold: new direct messages pass. `Agent::send_direct` sends
+//! by the gossip DM inbox when the recipient advertises it, so X's S3
+//! `group_attest_request` and its re-seat join ride pubsub frames. In DIAG
+//! PR #1530 (run 39532399450) a hold on every pubsub frame dropped them
+//! all: X wrote no direct frame after the release, its `asked` answers
+//! stayed `pending`, and its staged re-seat join ended
+//! (`staged_join_ended`). When the DM carrier passed in full, X's pubsub
+//! layer replayed held DM-bus messages (its r+1′ metadata DMs) at about
+//! 116 s, and A and M1 were marked by X's r+1′; so a frame whose message
+//! ID X sent during the hold stays dropped. In CI run 39496687111 a full release let X's
+//! pubsub cache replay r+1′ to A about 26 s later, and A was marked too,
+//! which is not this case's shape (H-S3-c "holds" the fork from the main
+//! chain). X's head is on no admin's
 //! chain: X is forked (ADR 0109 §3), while A and M1 share one chain and
 //! are unmarked. The case then advances [`ATTEST_ROUND`].
 //!
-//! - `s3_forked_node_shows_reseat_required` (§3 and §8, RED on the base).
+//! - `s3_forked_node_shows_reseat_required` (§3 and §8, RED on the base,
+//!   GREEN with S3).
 //!   Desired: X shows the typed wait `recovery.state = reseat_required`
 //!   with `cause = not_on_chain` (A answered its request), and stays
 //!   marked on its fork. The base ([`CAUSE_TYPED`]): X stays marked, and
@@ -69,7 +83,8 @@
 //!   its marker and its fork head, and A and M1 do not change. No
 //!   attestation resolves a fork.
 //! - `s3_manual_reseat_recovers_forked_node` (§3, an ownerless H-S3-c with
-//!   a `Removal` basis as in H-S3-d8; RED on the base). After the window
+//!   a `Removal` basis as in H-S3-d8; RED on the base, GREEN with S3).
+//!   After the window
 //!   A removes X (r+2) and calls `POST /groups/:id/members/:agent_id/reseat`
 //!   with a reason and basis `Removal(r+2)` ([`reseat_body`]). With no call
 //!   on X's API, X consumes the authorisation and is desired active at
@@ -78,10 +93,11 @@
 //!   exist (404) and X stays forked.
 //!
 //! The `recovery` object is read as `{"state": .., "cause": ..}` and the
-//! re-seat request body as [`reseat_body`]: the harness's reading of ADR
-//! 0109 §3 and §8, which name the fields but not their JSON. The S3 code
-//! sets the API (`docs/api-reference.md`); if it differs, the S3 PR
-//! aligns these two readers in this file.
+//! re-seat request body is [`reseat_body`]. ADR 0109 §3 and §8 name the
+//! fields; the S3 API (`docs/api-reference.md`, "Ownerless attestation and
+//! re-seat") gives the same JSON: `recovery` is `{"state", "cause", "ref",
+//! "last_refusal", "asked"}` for `reseat_required`, and the re-seat body is
+//! `{"reason", "basis": {"kind": "removal", "revision", "state_hash"}}`.
 //!
 //! Receipts use `w3h.receipt/1`. The D196 receipt is 20 verdict-stable
 //! reruns on the W3-H gate.
@@ -94,6 +110,8 @@ use super::receipt::{Receipt, Verdict};
 use super::*;
 use anyhow::ensure;
 use serde_json::{json, Value};
+
+mod gaps;
 
 const JOIN_LABELS: &[&str] = &["A", "M1", "M2", "J"];
 const SETUP: Duration = Duration::from_secs(180);
@@ -128,17 +146,18 @@ const QUEUED_LOG: &str = "queued TreeKEM membership event pending catch-up/repla
 /// changes make the skew. Two would be enough; four keep a margin.
 const POLICY_CHANGES: [&str; 4] = ["admin_only", "members_only", "admin_only", "members_only"];
 const FORK_LABELS: &[&str] = &["A", "X", "M1"];
-/// PLACEHOLDER (ADR 0109 leaves it to measurement): the time a marked,
-/// forked node takes to reach its typed state. It covers the first
-/// `group_attest_request` and two retries at the §11 backoff (60 s, then
-/// 120 s), each with its answer.
+/// The time a marked, forked node takes to reach its typed state. ADR 0109
+/// gives no bound for it; it covers the first `group_attest_request` and
+/// two retries at the §11 backoff (60 s, then 120 s; `request_backoff(0)`
+/// and `request_backoff(1)` in `groups::recovery`), each with its answer,
+/// plus 60 s of margin.
 const ATTEST_ROUND: Duration = Duration::from_secs(240);
 const FINAL_TYPED: &str = "x_shows_reseat_required_not_on_chain_and_stays_contained";
 const CAUSE_TYPED: &str = "X stays marked on its fork, and GET /groups/:id on X has no \
                            recovery object in the whole window";
 const FINAL_NOT_AUTO: &str = "x_stays_marked_on_its_fork_and_a_m1_unchanged";
-/// PLACEHOLDER (ADR 0109 leaves it to measurement): from the admin's
-/// re-seat call to the subject's swap (§3: delivery, the staged join
+/// PLACEHOLDER (ADR 0109 gives no value; it leaves it to measurement):
+/// from the admin's re-seat call to the subject's swap (§3: delivery, the staged join
 /// with ADR 0107's guards, the TreeKEM Welcome and the durable swap).
 const RESEAT_BOUND: Duration = Duration::from_secs(300);
 const RESEAT_REASON: &str = "w3h #1356: X forked off the main chain while partitioned";
@@ -698,41 +717,102 @@ async fn join_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     Ok(())
 }
 
+/// The DM carrier topic IDs among `labels`: each node's gossip DM inbox
+/// and the DM bus.
+fn dm_carrier_topics(sim: &Sim, labels: &[&str]) -> Result<Vec<[u8; 32]>> {
+    let mut topics =
+        vec![
+            saorsa_gossip_types::TopicId::from_entity(crate::dm_inbox::DM_BUS_TOPIC.as_bytes())
+                .to_bytes(),
+        ];
+    for label in labels {
+        let (agent, _) = sim.ids(label)?;
+        topics.push(crate::dm::dm_inbox_topic(&agent).to_bytes());
+    }
+    Ok(topics)
+}
+
+/// The SG key-cache v3 wire marker before a pubsub frame's header.
+const SG_KEY_CACHE_V3_MARKER: &[u8] = b"\xffSGKC\x03";
+
+/// The topic ID and message ID of a pubsub lane write: one stream-type
+/// byte, the optional key-cache v3 marker, then the postcard
+/// `MessageHeader`. `None` when the header does not decode.
+fn pubsub_header(bytes: &[u8]) -> Option<([u8; 32], [u8; 32])> {
+    let frame = bytes.get(1..)?;
+    let frame = frame.strip_prefix(SG_KEY_CACHE_V3_MARKER).unwrap_or(frame);
+    let (header, _) =
+        postcard::take_from_bytes::<saorsa_gossip_types::MessageHeader>(frame).ok()?;
+    Some((header.topic.to_bytes(), header.msg_id))
+}
+
 /// Drops writes from one node, and counts them. The node still receives.
-/// Installed holding every write; [`Self::release`] then holds only its
-/// pubsub writes, so its fork commit never reaches the main chain while
-/// its direct messages pass.
+/// Installed holding every write; [`Self::release`] then passes all but
+/// its pubsub writes. A pubsub write passes only when it is on a DM
+/// carrier topic and carries a message that the node did not send during
+/// the hold, so its fork commit never reaches the main chain (not by
+/// gossip, and not by a replay of a held DM), while its new direct
+/// messages pass by either DM transport.
 struct OutboundHold {
     held: Arc<std::sync::atomic::AtomicBool>,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
     pubsub_dropped: Arc<std::sync::atomic::AtomicUsize>,
+    replay_dropped: Arc<std::sync::atomic::AtomicUsize>,
+    dm_passed: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl OutboundHold {
-    fn install(sim: &Sim, node: &str) -> Result<Self> {
+    fn install(sim: &Sim, node: &str, dm_topics: Vec<[u8; 32]>) -> Result<Self> {
         use crate::network::sim::{Fault, LaneClass};
+        use std::collections::HashSet;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let machine = sim.peer(node)?.0;
         let held = Arc::new(AtomicBool::new(true));
         let dropped = Arc::new(AtomicUsize::new(0));
         let pubsub_dropped = Arc::new(AtomicUsize::new(0));
-        let (rule_held, rule_dropped, rule_pubsub) = (
+        let replay_dropped = Arc::new(AtomicUsize::new(0));
+        let dm_passed = Arc::new(AtomicUsize::new(0));
+        let held_messages: Mutex<HashSet<[u8; 32]>> = Mutex::new(HashSet::new());
+        let (rule_held, rule_dropped, rule_pubsub, rule_replay, rule_dm) = (
             Arc::clone(&held),
             Arc::clone(&dropped),
             Arc::clone(&pubsub_dropped),
+            Arc::clone(&replay_dropped),
+            Arc::clone(&dm_passed),
         );
         sim.fabric().add_rule(move |write| {
             if write.lane.src != machine {
                 return Fault::Pass;
             }
+            let pubsub = (write.lane.class == LaneClass::PubSub)
+                .then(|| pubsub_header(&write.bytes))
+                .flatten();
+            let Ok(mut held_ids) = held_messages.lock() else {
+                return Fault::Drop;
+            };
             if rule_held.load(Ordering::SeqCst) {
+                if let Some((_, msg_id)) = pubsub {
+                    held_ids.insert(msg_id);
+                }
                 rule_dropped.fetch_add(1, Ordering::SeqCst);
-                Fault::Drop
-            } else if write.lane.class == LaneClass::PubSub {
-                rule_pubsub.fetch_add(1, Ordering::SeqCst);
-                Fault::Drop
-            } else {
-                Fault::Pass
+                return Fault::Drop;
+            }
+            if write.lane.class != LaneClass::PubSub {
+                return Fault::Pass;
+            }
+            match pubsub {
+                Some((_, msg_id)) if held_ids.contains(&msg_id) => {
+                    rule_replay.fetch_add(1, Ordering::SeqCst);
+                    Fault::Drop
+                }
+                Some((topic, _)) if dm_topics.contains(&topic) => {
+                    rule_dm.fetch_add(1, Ordering::SeqCst);
+                    Fault::Pass
+                }
+                _ => {
+                    rule_pubsub.fetch_add(1, Ordering::SeqCst);
+                    Fault::Drop
+                }
             }
         });
         sim.fabric()
@@ -741,13 +821,17 @@ impl OutboundHold {
             held,
             dropped,
             pubsub_dropped,
+            replay_dropped,
+            dm_passed,
         })
     }
 
     fn release(&self, sim: &Sim, node: &str) {
         self.held.store(false, std::sync::atomic::Ordering::SeqCst);
-        sim.fabric()
-            .mark(format!("fault: writes from {node} released, except pubsub"));
+        sim.fabric().mark(format!(
+            "fault: writes from {node} released, except pubsub off the DM carrier \
+             and replays of held messages"
+        ));
     }
 
     fn dropped(&self) -> usize {
@@ -757,6 +841,15 @@ impl OutboundHold {
     fn pubsub_dropped(&self) -> usize {
         self.pubsub_dropped
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn replay_dropped(&self) -> usize {
+        self.replay_dropped
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn dm_passed(&self) -> usize {
+        self.dm_passed.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -902,7 +995,7 @@ async fn fork_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     settled(sim, &["X", "M1"], &group, "X and M1 hold A's revision").await?;
     let base = view(sim, "A", &group).await?;
 
-    let hold = OutboundHold::install(sim, "X")?;
+    let hold = OutboundHold::install(sim, "X", dm_carrier_topics(sim, FORK_LABELS)?)?;
     rename(sim, "X", &group, "w3h fork X").await?;
     let fork_at = sim
         .fabric()
@@ -1031,10 +1124,12 @@ async fn fork_scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result
     );
     receipt.note(format!(
         "arm={arm:?} after the window: X {x_status_text}; X {}; X recovered: {x_recovered:?}; \
-         X recovery first seen: {x_recovery_seen:?}; X pubsub writes held since the \
-         release: {}",
+         X recovery first seen: {x_recovery_seen:?}; X pubsub writes since the release: \
+         {} held, {} held as replays of a held message, {} passed on the DM carrier",
         x1.describe(),
-        hold.pubsub_dropped()
+        hold.pubsub_dropped(),
+        hold.replay_dropped(),
+        hold.dm_passed()
     ));
     let contained = x1.marker.is_some() && x_recovered.is_none();
     let (final_name, passed) = match arm {
@@ -1109,7 +1204,7 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
     Ok(())
 }
 
-/// H-S3-a2 (#818, aligned clocks): RED until ADR 0109 S3 lands.
+/// H-S3-a2 (#818, aligned clocks): RED on the base; GREEN with ADR 0109 S3.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1141,7 +1236,8 @@ async fn w3h_1356_control_s3_attestation_touches_only_the_subject() -> Result<()
     .await
 }
 
-/// ADR 0109 §3 and §8: a forked node shows `reseat_required {not_on_chain}`.
+/// ADR 0109 §3 and §8: a forked node shows `reseat_required {not_on_chain}`
+/// (RED on the base; GREEN with S3).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1173,7 +1269,8 @@ async fn w3h_1356_control_s3_forked_node_not_auto_recovered() -> Result<()> {
     .await
 }
 
-/// ADR 0109 §3: an admin's manual re-seat recovers a forked node.
+/// ADR 0109 §3: an admin's manual re-seat recovers a forked node (RED on
+/// the base; GREEN with S3).
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[cfg_attr(
     not(target_os = "linux"),

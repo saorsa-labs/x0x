@@ -14,11 +14,15 @@ pub use acl_admin::AclReloadTrigger;
 mod api_watchdog;
 pub(crate) use api_watchdog::ApiWatchdogConfig;
 mod auth;
+pub(crate) use auth::SESSION_TOKEN_TTL;
 pub mod config;
 mod crdt_subscriptions;
 mod delegations;
 mod delivery_gate;
 mod group_access;
+#[cfg(test)]
+mod gui_show_pair;
+mod gui_show_remote;
 /// M1 structured `/health` verdict (#1380). `pub` because the `x0xd`
 /// binary installs [`health_verdict::ErrorCountLayer`] in its tracing
 /// registry — the ERROR-event count is the verdict's log input.
@@ -30,6 +34,8 @@ mod routes;
 mod sse;
 mod state;
 mod update_check;
+#[cfg(unix)]
+mod upgrade_flush;
 pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
 // `#![cfg(test)]` inside the module).
@@ -78,30 +84,31 @@ use routes::{
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
     gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_control_blob_message,
-    handle_file_message, handle_treekem_catchup_request, handle_treekem_catchup_response, health,
-    history_diagnostics, history_list, history_message, history_policy, history_purge,
-    history_retain, history_scopes, history_search, history_stats, identity_revocations,
-    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
-    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
-    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
-    list_named_groups, list_revocations, list_task_lists, list_tasks, listener_restart_context,
-    load_causal_approval_queue, load_named_groups_merged, load_predecessor_relay_outbox,
-    load_requester_offer_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    handle_file_message, health, history_diagnostics, history_list, history_message,
+    history_policy, history_purge, history_retain, history_scopes, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
+    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
+    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
+    list_tasks, listener_restart_context, load_causal_approval_queue, load_named_groups_merged,
+    load_predecessor_relay_outbox, load_requester_offer_outbox, load_treekem_member_key_packages,
+    machine_for_agent_handler, machines_by_user_handler,
+    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, network_status, now_millis_u64, owner_agents,
-    owner_agents_issue, owner_agents_revoke, owner_machines, owner_riders_issue, owner_riders_list,
-    owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
-    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust,
-    recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
-    reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
-    remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
-    restore_treekem_groups, revoke_contact, run_direct_metadata_listener, run_fallback_github_poll,
-    run_gossip_update_listener, run_startup_update_check, save_named_groups_checked,
-    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
-    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
-    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
-    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
+    owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
+    owner_riders_issue, owner_riders_list, owner_riders_revoke, peer_health_handler, peers,
+    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
+    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
+    rebind_member_certificate, recover_home_suite_sidecar_journals, recover_treekem_named_journals,
+    reject_join_request, reject_unverified_direct_public_message, relay_diagnostics,
+    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
+    requester_offer_step, restore_treekem_groups, revoke_contact, run_direct_metadata_listener,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    save_named_groups_checked, save_named_groups_checked_unlocked,
+    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
+    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
+    send_group_public_message, set_group_display_name, shutdown_handler,
+    spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
     state_sync_diagnostics, status, store_named_group_info, streams_diagnostics, subscribe,
     transport_diagnostics, unban_group_member, unenroll_device, unpin_machine, unsubscribe,
@@ -109,13 +116,12 @@ use routes::{
     update_task, upgrade_diagnostics, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage,
     ControlBlobState, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
     PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
-    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime, TreeKemCatchupRequest,
-    TreeKemCatchupResponse, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
-    KV_STORE_DELTA_DM_PREFIX,
+    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -129,12 +135,18 @@ async fn finish_startup_error(
     agent: &x0x::Agent,
     shutdown_notify: &watch::Sender<bool>,
     forward_service: Option<&x0x::forward::ForwardService>,
+    socks: Option<&x0x::socks::SocksService>,
     background_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     primary: anyhow::Error,
 ) -> anyhow::Error {
+    // Release the SOCKS listen port before exec, forward, and agent teardown.
+    // A later startup error must not leave the accept loop holding the bind.
+    if let Some(socks) = socks {
+        socks.shutdown_and_wait().await;
+    }
     exec_service.shutdown().await;
     if let Some(forward_service) = forward_service {
-        forward_service.shutdown();
+        forward_service.shutdown_and_release().await;
     }
     agent.begin_shutdown();
     let _ = shutdown_notify.send(true);
@@ -150,6 +162,36 @@ async fn finish_startup_error(
         Err(shutdown) => primary.context(format!(
             "agent shutdown also failed after startup rejection: {shutdown}"
         )),
+    }
+}
+
+/// Drain the axum accept task with a 2 s bound. The returned result keeps
+/// the ordinary-shutdown exit-0 contract (#261/#363): a drain that misses
+/// the bound is aborted and joined, not turned into a process error. The
+/// companion flag reports whether every HTTP producer finished on its own;
+/// an abort does not join request-owned blocking writes (ADR 0094 §4), so
+/// only the acknowledged-flush receipt consumes the flag, never the exit.
+async fn drain_http_server(
+    mut server: tokio::task::JoinHandle<std::io::Result<()>>,
+) -> (anyhow::Result<()>, bool) {
+    match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+        Ok(Ok(Ok(()))) => (Ok(()), true),
+        Ok(Ok(Err(error))) => (
+            Err(anyhow::Error::new(error).context("API server error")),
+            true,
+        ),
+        Ok(Err(error)) => (
+            Err(anyhow::Error::new(error).context("API server task failed")),
+            true,
+        ),
+        Err(_) => {
+            tracing::warn!(
+                "API server did not shut down within 2s; aborting lingering connections"
+            );
+            server.abort();
+            let _ = server.await;
+            (Ok(()), false)
+        }
     }
 }
 
@@ -494,6 +536,8 @@ pub async fn serve_with_options(
         exec_policy,
         connect_policy,
         self_update_enabled,
+        daemon_config_path,
+        gui_show_write_path,
     } = options;
     // `--skip-update-check` is process-scoped updater suppression. Compute one
     // effective capability before any updater path is considered, then use it
@@ -901,6 +945,9 @@ pub async fn serve_with_options(
     // ADR-0070 §2: durable typed route for share-grant deliveries.
     let (share_grant_dm_tx, mut share_grant_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
+    // ADR 0083 slice 3: one channel, three prefixes. No validator — a
+    // validator would parse the body before owner trust.
+    let (gui_show_dm_tx, mut gui_show_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -993,6 +1040,7 @@ pub async fn serve_with_options(
                     &agent,
                     &shutdown_notify,
                     None,
+                    None,
                     &mut startup_tasks,
                     primary,
                 )
@@ -1001,6 +1049,57 @@ pub async fn serve_with_options(
         };
         fs.spawn_inbound();
         Some(fs)
+    } else {
+        None
+    };
+
+    // ADR-0074 §3: optional loopback SOCKS5 listener. Needs ForwardService
+    // (CONNECT opens ForwardV2). Non-loopback listen was refused at config load.
+    let socks_cancel = tokio_util::sync::CancellationToken::new();
+    let socks_service = if config.socks.enabled() {
+        match &forward_service {
+            Some(fs) => {
+                let connector = std::sync::Arc::new(x0x::socks::ForwardSocksConnector::new(
+                    std::sync::Arc::clone(fs),
+                ));
+                match x0x::socks::SocksService::spawn(
+                    &config.socks,
+                    std::sync::Arc::new(api_token.clone()),
+                    connector,
+                    socks_cancel.clone(),
+                )
+                .await
+                {
+                    Ok(svc) => {
+                        if let Some(listen) = config.socks.listen {
+                            tracing::info!(
+                                listen = %listen,
+                                "SOCKS5 listener started (ADR-0074 §3)"
+                            );
+                        }
+                        Some(svc)
+                    }
+                    Err(e) => {
+                        return Err(finish_startup_error(
+                            &exec_service,
+                            &agent,
+                            &shutdown_notify,
+                            forward_service.as_deref(),
+                            None,
+                            &mut startup_tasks,
+                            anyhow::anyhow!("failed to bind SOCKS5 listener: {e}"),
+                        )
+                        .await);
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "socks.listen is set but connect ACL is disabled — SOCKS5 not started"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -1027,6 +1126,7 @@ pub async fn serve_with_options(
                 &agent,
                 &shutdown_notify,
                 forward_service.as_deref(),
+                socks_service.as_ref(),
                 &mut startup_tasks,
                 primary,
             )
@@ -1053,6 +1153,7 @@ pub async fn serve_with_options(
                         &agent,
                         &shutdown_notify,
                         forward_service.as_deref(),
+                        socks_service.as_ref(),
                         &mut startup_tasks,
                         primary,
                     )
@@ -1104,6 +1205,35 @@ pub async fn serve_with_options(
             connect_diagnostics: Arc::clone(&connect_diagnostics),
         })
         .await;
+
+    #[cfg(unix)]
+    let upgrade_staging = if self_update_enabled && config.update.enabled {
+        match async {
+            let identity_root = match identity_dir.clone() {
+                Some(path) => path,
+                None => crate::storage::x0x_dir().await?,
+            };
+            Ok::<_, anyhow::Error>(routes::StartupStagingContext {
+                install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                identity_root: identity_root.canonicalize()?,
+                machine_id: *agent.machine_id().as_bytes(),
+                #[cfg(test)]
+                clock: None,
+                #[cfg(test)]
+                observed: None,
+            })
+        }
+        .await
+        {
+            Ok(context) => Some(context),
+            Err(error) => {
+                tracing::warn!(%error, "HTTP upgrade staging identity is unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
@@ -1189,6 +1319,8 @@ pub async fn serve_with_options(
         control_blobs: ControlBlobState::default(),
         treekem_pending_events: RwLock::new(HashMap::new()),
         parked_role_updates: StdMutex::new(HashMap::new()),
+        parked_gss_removals: StdMutex::new(HashMap::new()),
+        gss_share_holds: crate::server::routes::named_groups::GssShareHolds::default(),
         join_result_staging_guards: StdMutex::new(HashMap::new()),
         owner_cert_pending_joins: RwLock::new(HashMap::new()),
         pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
@@ -1213,10 +1345,14 @@ pub async fn serve_with_options(
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
+        treekem_catchup_serve_slots: Arc::new(tokio::sync::Semaphore::new(
+            routes::named_groups::TREEKEM_CATCHUP_SERVE_SLOTS,
+        )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
+        revocation_evictions: routes::named_groups::S4Runtime::default(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -1238,6 +1374,9 @@ pub async fn serve_with_options(
         self_update_enabled,
         upgrade_check_cache: Mutex::new(None),
         upgrade_apply_lock: Arc::new(Mutex::new(())),
+        http_upgrade_wait_lock: Arc::new(Mutex::new(())),
+        #[cfg(unix)]
+        upgrade_staging,
         api_token,
         sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
         rider_tokens: tokio::sync::Mutex::new(
@@ -1248,9 +1387,31 @@ pub async fn serve_with_options(
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         acl_admin: Arc::clone(&acl_admin),
+        gui_show: {
+            let runtime =
+                x0x::gui::GuiShowRuntime::with_defaults(config.gui_show.clone(), &config.data_dir);
+            runtime.set_config_path(daemon_config_path);
+            runtime.set_write_path(gui_show_write_path);
+            // `with_defaults` applies a side-file stop before the config path
+            // is known. Apply again once the path is attached. The marker
+            // still forces show off when the loaded file already says
+            // `local_enabled = true`.
+            runtime.apply_persisted_local_stop();
+            runtime
+        },
         connect_diagnostics,
         forward_service,
+        socks_service,
         owner_sync,
+        names: Arc::new(
+            x0x::names::NameStore::load(x0x::names::NameStore::path_in(&config.data_dir)).await,
+        ),
+        forwards: Arc::new(
+            x0x::forward::store::ForwardStore::load(x0x::forward::store::ForwardStore::path_in(
+                &config.data_dir,
+            ))
+            .await,
+        ),
         startup_catchup_obligations: std::sync::Mutex::new(std::collections::HashMap::new()),
         startup_catchup_gates_ready: std::sync::atomic::AtomicBool::new(true),
         startup_catchup_backoff_owner: std::sync::atomic::AtomicU64::new(0),
@@ -1288,11 +1449,47 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut startup_tasks,
             primary,
         )
         .await);
     }
+
+    // Startup recovery (engineer ruling 23 Oct 2026): a receipt-less
+    // upgrade-flush.json or an upgrade-flush-rollback.json whose owning
+    // process is gone is debris from a failed or interrupted flush. The
+    // instance lock taken above proves that owner exited (it held the lock
+    // for its whole flush); clear the debris, log the cause and leave that
+    // upgrade failed so a later apply is not refused forever.
+    #[cfg(unix)]
+    crate::upgrade::shutdown_flush::clear_stale_records(&config.data_dir);
+
+    // The control listener survives the HTTP drain, so a peer can receive
+    // its durable receipt after every normal request and producer has stopped.
+    #[cfg(unix)]
+    let upgrade_flush = if self_update_enabled {
+        let setup = async {
+            let identity_root = match identity_dir.clone() {
+                Some(root) => root,
+                None => crate::storage::x0x_dir().await?,
+            };
+            let exit: std::sync::Arc<dyn Fn(i32) + Send + Sync> =
+                std::sync::Arc::new(|code| std::process::exit(code));
+            upgrade_flush::FlushOwner::start(&state, &config.data_dir, &identity_root, exit)
+                .map_err(anyhow::Error::from)
+        }
+        .await;
+        match setup {
+            Ok(owner) => Some(owner),
+            Err(error) => {
+                tracing::warn!(%error, "Acknowledged flush unavailable; supervised apply disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let port_file = config.data_dir.join("api.port");
 
@@ -1302,6 +1499,34 @@ pub async fn serve_with_options(
     // are owned by the Agent/ExecService and stopped by their own `shutdown()`
     // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks = startup_tasks;
+
+    // ADR-0074 §2: bring persisted forwards back. Each named forward is
+    // re-resolved through the name store (its pin applies) and comes up
+    // only on exactly its pinned ids; anything else stays down with a
+    // reason in `GET /forwards`. Local work only — it never blocks startup
+    // on the network. Names of peers not yet discovered resolve later, so
+    // transient failures use a bounded backoff. Permanent failures stay down
+    // until owner action; retries can only bring up the pinned ids.
+    if state.forward_service.is_some() {
+        let restore_state = Arc::clone(&state);
+        let mut shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            let mut next = tokio::time::Instant::now();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(next) => {}
+                    _ = shutdown_rx.changed() => return,
+                }
+                if *shutdown_rx.borrow() {
+                    return;
+                }
+                let Some(deadline) = routes::connect::restore_forwards(&restore_state).await else {
+                    return;
+                };
+                next = deadline;
+            }
+        }));
+    }
 
     // Issue #600: keep the peer-table traversal that `/health` used to do
     // inline OFF the request path. The watchdog probes `/health` with a 3 s
@@ -1410,7 +1635,7 @@ pub async fn serve_with_options(
         std::sync::atomic::Ordering::Release,
     );
     let evidence_state = Arc::downgrade(&state);
-    agent.start_peer_evidence(
+    if let Err(error) = agent.start_peer_evidence(
         config.data_dir.clone(),
         config.evidence.clone(),
         Arc::new(move |peer| {
@@ -1426,12 +1651,24 @@ pub async fn serve_with_options(
                     && g.members_v2.get(&peer).is_some_and(|m| m.is_active())
             }))
         }),
-    )?;
+    ) {
+        let primary = anyhow::Error::new(error);
+        return Err(finish_startup_error(
+            &exec_service,
+            &agent,
+            &state.shutdown_notify,
+            state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
+            &mut bg_tasks,
+            primary,
+        )
+        .await);
+    }
 
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
     if let Some(sync) = state.owner_sync.as_ref() {
-        sync.attach_view(Arc::new(routes::DaemonView::new(Arc::clone(&state))));
+        routes::DaemonView::attach(sync, &state).await;
         let service = Arc::clone(sync);
         let shutdown_rx = state.shutdown_notify.subscribe();
         bg_tasks.push(tokio::spawn(async move {
@@ -1453,6 +1690,7 @@ pub async fn serve_with_options(
                 &agent,
                 &state.shutdown_notify,
                 state.forward_service.as_deref(),
+                state.socks_service.as_ref(),
                 &mut bg_tasks,
                 primary,
             )
@@ -1476,6 +1714,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1495,6 +1734,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1507,6 +1747,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1529,6 +1770,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1546,6 +1788,7 @@ pub async fn serve_with_options(
             &agent,
             &state.shutdown_notify,
             state.forward_service.as_deref(),
+            state.socks_service.as_ref(),
             &mut bg_tasks,
             primary,
         )
@@ -1717,6 +1960,7 @@ pub async fn serve_with_options(
     let dm_inbox_public_group_bootstrap_route_tx = public_group_bootstrap_dm_tx.clone();
     let dm_inbox_predecessor_relay_route_tx = predecessor_relay_dm_tx.clone();
     let dm_inbox_share_grant_route_tx = share_grant_dm_tx.clone();
+    let dm_inbox_gui_show_route_tx = gui_show_dm_tx.clone();
     bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
@@ -1726,6 +1970,7 @@ pub async fn serve_with_options(
         dm_inbox_kv_store_delta_route_tx,
         dm_inbox_predecessor_relay_route_tx,
         dm_inbox_share_grant_route_tx,
+        dm_inbox_gui_show_route_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -1808,8 +2053,36 @@ pub async fn serve_with_options(
         let startup_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let startup_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let startup_shutdown_watch = state.shutdown_notify.subscribe();
+        #[cfg(unix)]
+        let startup_identity_dir = identity_dir.clone();
+        #[cfg(unix)]
+        let startup_machine_id = *state.agent.machine_id().as_bytes();
         bg_tasks.push(tokio::spawn(async move {
             let data_dir = startup_check_config.data_dir.clone();
+            #[cfg(unix)]
+            let staging = match async {
+                let identity_root = match startup_identity_dir {
+                    Some(path) => path,
+                    None => crate::storage::x0x_dir().await?,
+                };
+                Ok::<_, anyhow::Error>(routes::StartupStagingContext {
+                    install: crate::upgrade::apply::current_binary_path()?.canonicalize()?,
+                    identity_root: identity_root.canonicalize()?,
+                    machine_id: startup_machine_id,
+                    #[cfg(test)]
+                    clock: None,
+                    #[cfg(test)]
+                    observed: None,
+                })
+            }
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    tracing::warn!(%error, "Startup upgrade staging identity is unavailable");
+                    return;
+                }
+            };
             if let Err(e) = run_startup_update_check(
                 &startup_check_config,
                 None,
@@ -1821,6 +2094,8 @@ pub async fn serve_with_options(
                     ),
                     upgrade_apply_lock: startup_apply_lock,
                     shutdown_watch: startup_shutdown_watch,
+                    #[cfg(unix)]
+                    staging,
                 }),
             )
             .await
@@ -1830,33 +2105,64 @@ pub async fn serve_with_options(
         }));
     }
 
+    // One background apply owner serves both discovery paths. Actual boot
+    // identity is carried into receipts; neither source invents a participant.
+    let background_submit = if self_update_enabled
+        && config.update.enabled
+        && (config.update.gossip_updates || config.update.fallback_check_interval_minutes > 0)
+    {
+        let runtime = routes::BackgroundRuntime::from_boot(
+            &config,
+            state.api_address,
+            (
+                daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx),
+                state.shutdown_notify.subscribe(),
+            ),
+            Arc::clone(&state.upgrade_apply_lock),
+            #[cfg(unix)]
+            identity_dir.clone(),
+            #[cfg(unix)]
+            *state.agent.machine_id().as_bytes(),
+        )
+        .await;
+        match runtime {
+            Ok(runtime) => {
+                let (submit, owner) = routes::background_channel(runtime);
+                bg_tasks.push(tokio::spawn(owner.run()));
+                Some(submit)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Background upgrade apply disabled: staging identity is unavailable; release discovery remains enabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Gossip-based release subscription (primary update mechanism). This
     // listener can download + install + restart, so it is gated on
     // `self_update_enabled` — embedders never replace the host binary.
-    if self_update_enabled && config.update.enabled && config.update.gossip_updates {
-        let update_config = config.update.clone();
-        let agent_for_gossip = Arc::clone(&state.agent);
-        let data_dir = config.data_dir.clone();
-        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
-        let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
-        // #261: the listener's restart planner needs the bound API address
-        // (health commit) and the graceful-shutdown hook (bounded cancel).
-        let gossip_api_addr = state.api_address;
-        let gossip_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
-        let gossip_shutdown_watch = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
-            run_gossip_update_listener(
-                agent_for_gossip,
-                update_config,
-                data_dir,
-                upgrade_apply_lock,
-                self_published_for_gossip,
-                gossip_api_addr,
-                (gossip_shutdown, gossip_shutdown_watch),
-            )
-            .await;
-        }));
-    }
+    bg_tasks.extend(routes::BackgroundRuntime::spawn_source(
+        self_update_enabled && config.update.enabled && config.update.gossip_updates,
+        background_submit.clone(),
+        |submit| {
+            let agent_for_gossip = Arc::clone(&state.agent);
+            let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
+            // Restart context stays with the shared owner; this source only
+            // discovers verified releases and observes daemon shutdown.
+            let gossip_shutdown_watch = state.shutdown_notify.subscribe();
+            async move {
+                run_gossip_update_listener(
+                    agent_for_gossip,
+                    submit,
+                    self_published_for_gossip,
+                    gossip_shutdown_watch,
+                )
+                .await;
+            }
+        },
+    ));
 
     // Broadcast current manifest to gossip after joining the network.
     // Ensures nodes that missed the initial gossip window can still receive it.
@@ -1884,31 +2190,28 @@ pub async fn serve_with_options(
 
     // GitHub fallback poll (safety net, default every 48h). Install/restart
     // capable, so gated on `self_update_enabled` (embedders opt out).
-    if self_update_enabled
-        && config.update.enabled
-        && config.update.fallback_check_interval_minutes > 0
-    {
-        let update_config = config.update.clone();
-        let agent_for_poll = Arc::clone(&state.agent);
-        let data_dir_for_poll = config.data_dir.clone();
-        let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
-        let self_published_for_poll = Arc::clone(&self_published_release_manifests);
-        let poll_api_addr = state.api_address;
-        let poll_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
-        let poll_shutdown_watch = state.shutdown_notify.subscribe();
-        bg_tasks.push(tokio::spawn(async move {
-            run_fallback_github_poll(
-                agent_for_poll,
-                update_config,
-                data_dir_for_poll,
-                upgrade_apply_lock,
-                self_published_for_poll,
-                poll_api_addr,
-                (poll_shutdown, poll_shutdown_watch),
-            )
-            .await;
-        }));
-    }
+    bg_tasks.extend(routes::BackgroundRuntime::spawn_source(
+        self_update_enabled
+            && config.update.enabled
+            && config.update.fallback_check_interval_minutes > 0,
+        background_submit,
+        |submit| {
+            let update_config = config.update.clone();
+            let agent_for_poll = Arc::clone(&state.agent);
+            let self_published_for_poll = Arc::clone(&self_published_release_manifests);
+            let poll_shutdown_watch = state.shutdown_notify.subscribe();
+            async move {
+                run_fallback_github_poll(
+                    agent_for_poll,
+                    update_config,
+                    submit,
+                    self_published_for_poll,
+                    poll_shutdown_watch,
+                )
+                .await;
+            }
+        },
+    ));
 
     // Background rendezvous re-advertisement (re-advertise every validity_ms / 2)
     if config.rendezvous_enabled && config.rendezvous_validity_ms > 0 {
@@ -2019,6 +2322,12 @@ pub async fn serve_with_options(
                 let Ok(join_msg) = serde_json::from_slice::<JoinResultMessage>(&msg.payload) else {
                     continue;
                 };
+                // #1604 G5: refuse a held unknown variant before any check.
+                let Ok(join_msg) =
+                    crate::wire_compat::reject_unknown("JoinResultMessage", join_msg)
+                else {
+                    continue;
+                };
                 tracing::debug!(
                     target: "treekem.trace",
                     stage = "direct_classified_join_result",
@@ -2076,8 +2385,11 @@ pub async fn serve_with_options(
             let mut rx = control_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                let Ok(control_msg) = serde_json::from_slice::<ControlBlobMessage>(&msg.payload)
-                else {
+                let Ok(control_msg) = crate::wire_compat::decode_json::<ControlBlobMessage>(
+                    "ControlBlobMessage",
+                    "control_blob_",
+                    &msg.payload,
+                ) else {
                     continue;
                 };
                 handle_control_blob_message(&control_state, &msg.sender, msg.verified, control_msg)
@@ -2095,42 +2407,15 @@ pub async fn serve_with_options(
             let mut rx = catchup_state.agent.subscribe_direct();
             loop {
                 let Some(msg) = rx.recv().await else { break };
-                if let Ok(request) = serde_json::from_slice::<TreeKemCatchupRequest>(&msg.payload) {
-                    if request.message_type == "treekem_catchup_request" {
-                        handle_treekem_catchup_request(
-                            &catchup_state,
-                            &msg.sender,
-                            msg.verified,
-                            request,
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-                if let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(&msg.payload)
+                if !routes::named_groups::dispatch_treekem_catchup_message(
+                    &catchup_state,
+                    &msg.sender,
+                    msg.verified,
+                    &msg.payload,
+                )
+                .await
                 {
-                    if response.message_type == "treekem_catchup_response" {
-                        // #1275: the response's events are applied and
-                        // persisted, so the apply runs shielded; awaiting it
-                        // keeps the responses in arrival order.
-                        let apply_state = Arc::clone(&catchup_state);
-                        let sender = msg.sender;
-                        let verified = msg.verified;
-                        let applied = catchup_state
-                            .run_shielded(Box::pin(async move {
-                                handle_treekem_catchup_response(
-                                    &apply_state,
-                                    &sender,
-                                    verified,
-                                    response,
-                                )
-                                .await;
-                            }))
-                            .await;
-                        if applied.is_none() {
-                            break;
-                        }
-                    }
+                    break;
                 }
             }
         }));
@@ -2227,6 +2512,11 @@ pub async fn serve_with_options(
         }));
     }
 
+    // ADR 0110 S4: revocation eviction, designated first.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),
+    ));
+
     // Background signed public-message listener for typed gossip-DM fallback
     // delivery. Per-group pubsub is still the primary fan-out path; this route
     // handles the same signed message when the sender additionally direct-
@@ -2240,8 +2530,11 @@ pub async fn serve_with_options(
                     continue;
                 };
 
-                let Ok(msg) = serde_json::from_slice::<x0x::groups::GroupPublicMessage>(payload)
-                else {
+                let Ok(msg) = crate::wire_compat::decode_json::<x0x::groups::GroupPublicMessage>(
+                    "GroupPublicMessage",
+                    "",
+                    payload,
+                ) else {
                     tracing::debug!(
                         sender = %hex::encode(typed.sender.as_bytes()),
                         "typed group-public DM payload was not a GroupPublicMessage"
@@ -2445,6 +2738,18 @@ pub async fn serve_with_options(
         }));
     }
 
+    // ADR 0083 slice 3: remote GUI show. Trust runs in the handler, before
+    // the body is decoded. Displays and reply sends run on detached tasks,
+    // so one opener wait does not hold the next result or activity message.
+    {
+        let gui_show_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = gui_show_dm_rx.recv().await {
+                crate::server::gui_show_remote::handle_gui_show_typed(&gui_show_state, typed).await;
+            }
+        }));
+    }
+
     // #926: grant redelivery worker. Each pass drops revoked/expired entries
     // and sends at most a bounded batch of due ones on the #924 durable DM
     // route; a newly queued or nudged entry wakes it early.
@@ -2541,6 +2846,10 @@ pub async fn serve_with_options(
             post(owner_riders_issue).get(owner_riders_list),
         )
         .route("/owner/riders/:id", delete(owner_riders_revoke))
+        .route(
+            "/owner/groups/:id/recovery-mandate",
+            post(owner_group_recovery_mandate),
+        )
         .route("/.well-known/agent-card.json", get(get_a2a_agent_card))
         .route("/agent/card/import", post(import_agent_card))
         .route("/agent/sign", post(agent_sign))
@@ -2636,6 +2945,10 @@ pub async fn serve_with_options(
         .route(
             "/groups/:id/members/:agent_id/role",
             patch(update_member_role),
+        )
+        .route(
+            "/groups/:id/members/:agent_id/certificate/rebind",
+            post(rebind_member_certificate),
         )
         .route("/groups/:id/ban/:agent_id", post(ban_group_member))
         .route("/groups/:id/ban/:agent_id", delete(unban_group_member))
@@ -2794,6 +3107,13 @@ pub async fn serve_with_options(
         )
         .route("/grants/received", get(routes::grants_received))
         .route("/grants/:id", delete(routes::grants_revoke))
+        // ADR-0074 §1: names (owner petnames, TOFU pins, resolution)
+        .route("/names", get(routes::names_list))
+        .route("/names/resolve", post(routes::names_resolve))
+        .route("/names/owners", post(routes::names_owner_bind))
+        .route("/names/owners/:label", delete(routes::names_owner_unbind))
+        .route("/names/machines", post(routes::names_machine_label))
+        .route("/names/pins/:name", delete(routes::names_unpin))
         // Peer observability (ant-quic 0.27.1/0.27.2 surface)
         .route("/peers/:peer_id/probe", post(probe_peer_handler))
         .route("/peers/:peer_id/health", get(peer_health_handler))
@@ -2815,6 +3135,8 @@ pub async fn serve_with_options(
         // Embedded GUI
         .route("/gui", get(serve_gui))
         .route("/gui/", get(serve_gui))
+        // ADR 0083 slice 1: local show (no remote target).
+        .route("/gui/show", post(routes::gui_show))
         // Session-token exchange (#127 / WS1.6): durable bearer → short-lived
         // browser session token, the only kind valid in ?token= query strings.
         .route("/auth/session", post(auth::create_session))
@@ -2922,22 +3244,12 @@ pub async fn serve_with_options(
 
         // Drain the axum server result and propagate any failure. If the select
         // already observed it ending, `server` was consumed there and its result
-        // captured above; otherwise await it (with a bound) and propagate.
-        let server_result: anyhow::Result<()> = match server_result {
-            Some(res) => res,
-            None => match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
-                Ok(Ok(Ok(()))) => Ok(()),
-                Ok(Ok(Err(e))) => Err(anyhow::Error::new(e).context("API server error")),
-                Ok(Err(e)) => Err(anyhow::Error::new(e).context("API server task failed")),
-                Err(_) => {
-                    tracing::warn!(
-                        "API server did not shut down within 2s; aborting lingering connections"
-                    );
-                    server.abort();
-                    let _ = server.await;
-                    Ok(())
-                }
-            },
+        // captured above; otherwise await it (with a bound) and propagate. The
+        // drain flag records whether every HTTP producer finished on its own;
+        // it feeds only the flush receipt below, never the exit code.
+        let (server_result, _http_drained) = match server_result {
+            Some(res) => (res, true),
+            None => drain_http_server(server).await,
         };
 
         // Fix C (Issue #110 Phase 2 + 2b): tear down the server-owned tasks, the
@@ -2954,7 +3266,17 @@ pub async fn serve_with_options(
         // 0b. Forwarder listeners + inbound consumer (issue #132): stop
         //     accepting/bridging while the Agent transport is still alive.
         if let Some(forwarder) = &state.forward_service {
-            forwarder.shutdown();
+            // Drain add/remove/restore before cancelling listeners. A
+            // transaction still inside bind publishes its accept loop
+            // before it returns; the release below then waits for that
+            // socket to drop. A bind that resumes after this cancel is
+            // refused.
+            forwarder.shutdown_and_release().await;
+        }
+        if let Some(socks) = &state.socks_service {
+            // Join the accept loop so the listen port is free before the
+            // process continues. Handshake sessions observe the same token.
+            socks.shutdown_and_wait().await;
         }
         // 1. `Agent::begin_shutdown()` (issue #116 Codex finding 1): cancel the
         //    Agent's shutdown token and close its tracked-task registry NOW,
@@ -2975,7 +3297,7 @@ pub async fn serve_with_options(
         //    returns a `JoinError`; that is expected, never unwrap it. Draining
         //    here (after begin_shutdown, before Agent shutdown) guarantees
         //    join_network has fully stopped before the Agent stops are run.
-        drain_server_tasks(&state, bg_tasks).await;
+        let _server_tasks_finished = drain_server_tasks(&state, bg_tasks).await;
         let backfill_release_incomplete = ws::backfill_release_incomplete(&state.ws_outbound_stats);
         // 3. Now that join_network is stopped (and the token cancelled so any
         //    in-flight start_* no-ops), tear the Agent down: stop heartbeat /
@@ -3043,7 +3365,21 @@ pub async fn serve_with_options(
         } else {
             server_result
         };
-        combine_server_shutdown_results(server_result, agent_shutdown_result)
+        let result = combine_server_shutdown_results(server_result, agent_shutdown_result);
+        #[cfg(unix)]
+        if let Some(owner) = &upgrade_flush {
+            // An HTTP producer aborted at the drain bound is as unfinished as
+            // an aborted background task (ADR 0094 §4): the receipt refuses,
+            // while the ordinary-shutdown exit above stays 0 (#261/#363).
+            owner
+                .finish(
+                    &result,
+                    _server_tasks_finished && _http_drained,
+                    &supervisor_cancel,
+                )
+                .await;
+        }
+        result
     });
 
     Ok(ServerHandle {
@@ -3075,10 +3411,18 @@ const JOIN_ARTIFACT_EGRESS_ABORT_BOUND: Duration = Duration::from_secs(5);
 /// maps, the REST `/subscribe` forwarders, the detached registry, the
 /// join-attempt registry and, in place, the join-artifact egress registry),
 /// then await, never abort, the shielded group-state applies.
-async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::JoinHandle<()>>) {
+async fn drain_server_tasks(
+    state: &AppState,
+    mut bg_tasks: Vec<tokio::task::JoinHandle<()>>,
+) -> bool {
+    let mut complete = true;
     // #1269 r2: end the network waits of applies in progress first (they
     // fail as on a lost peer), so the shielded wait below stays short.
     state.shutdown_started.cancel();
+    // Browser launches sit on the blocking pool, which abort does not stop.
+    // Tell them to return before the join below. The launch task does not
+    // hold `AppState`.
+    state.gui_show.stop_opening();
     // #1288 row 2: REST `/subscribe` forwarders. A topic in
     // `[history] record_topics` makes the forwarder clone `HistoryHandle`,
     // which holds `history.db`. Dropping the map would detach that task and
@@ -3110,7 +3454,8 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // public-message fan-out race, the one-shot predecessor-relay fallback
     // offer, the member-keyed KeyPackage catch-up requests, the KV-store
     // delta direct deliveries, the outgoing file-chunk streams, and since
-    // #1288 the WebSocket session loop and its writer and forwarders, and the
+    // #1288 the WebSocket session loop and its writer and forwarders, the
+    // queued GUI reveal that waits on a full outbound queue, and the
     // startup self-leave catch-up backoff) and the
     // joiner's join-attempt polls and sends hold the Agent or this AppState.
     // Left running, one asleep before a delayed delivery keeps the Agent, and
@@ -3172,13 +3517,21 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     let grace_end = tokio::time::Instant::now() + SERVER_TASK_GRACE;
     let mut join = futures::future::join_all(bg_tasks);
     tokio::select! {
-        _results = &mut join => {}
+        results = &mut join => {
+            complete &= results.iter().all(|r| r.as_ref().err().is_none_or(|e| e.is_cancelled()));
+        }
         _ = tokio::time::sleep_until(grace_end) => {
             tracing::warn!("background tasks did not stop within grace; aborting stragglers");
             for handle in &abort_handles {
                 handle.abort();
             }
-            let _results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+            let results: Vec<Result<(), tokio::task::JoinError>> = join.await;
+            // ADR 0094 §4: an abort cancels a task's next await; it does not
+            // stop blocking work the task already started. A straggler that
+            // missed the grace window is therefore never a finished producer,
+            // whatever its cancelled JoinError says. Only a task that returned
+            // on its own counts as finished here.
+            complete &= results.iter().all(Result::is_ok);
         }
     }
     // #1288: history backfills outlive the session that started them. The
@@ -3218,6 +3571,7 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
         .await
         .is_err()
         {
+            complete = false;
             tracing::warn!(
                 bound_secs = JOIN_ARTIFACT_EGRESS_ABORT_BOUND.as_secs(),
                 "a join-artifact egress task did not end after its abort"
@@ -3235,16 +3589,28 @@ async fn drain_server_tasks(state: &AppState, mut bg_tasks: Vec<tokio::task::Joi
     // aborted), and the AppState it holds then outlives this supervisor.
     if !shielded.is_empty() {
         let applies = futures::future::join_all(shielded);
-        if tokio::time::timeout(SHIELDED_APPLY_DRAIN_BOUND, applies)
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                bound_secs = SHIELDED_APPLY_DRAIN_BOUND.as_secs(),
-                "a group-state apply is still running at shutdown; it is left to finish, not aborted"
-            );
+        match tokio::time::timeout(SHIELDED_APPLY_DRAIN_BOUND, applies).await {
+            Ok(results) => complete &= results.iter().all(Result::is_ok),
+            Err(_) => {
+                complete = false;
+                tracing::warn!(
+                    bound_secs = SHIELDED_APPLY_DRAIN_BOUND.as_secs(),
+                    "a group-state apply is still running at shutdown; it is left to finish, not aborted"
+                );
+            }
         }
     }
+    // #1545: the owner-sync store runs each durable write in its own task,
+    // so an abort above stops only the wait of its caller. Wait for those
+    // writes, and refuse new ones, before the instance locks are released:
+    // a daemon restarted on this data dir must not see a late write land
+    // over its own state. The issuance journal writer runs each write in
+    // its own task too; wait for one in flight from any other caller.
+    if let Some(sync) = state.owner_sync.as_ref() {
+        sync.store().release_write_custody().await;
+    }
+    crate::profile::IssuedCertRecord::wait_for_writes().await;
+    complete
 }
 
 /// Whether two directory paths refer to the same directory, tolerating
@@ -3369,6 +3735,7 @@ async fn start_dm_inbox_when_gossip_ready(
     kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     share_grant_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    gui_show_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -3412,10 +3779,25 @@ async fn start_dm_inbox_when_gossip_ready(
         // ADR-0070 §2: durable, never validated-and-fallthrough — a
         // malformed grant must fail the handler (ACK withheld), never be
         // shown as a generic DM.
-        let dm_inbox_config = dm_inbox_config.with_durable_typed_payload_route(
-            x0x::share_grant::SHARE_GRANT_DM_PREFIX,
-            share_grant_route_tx.clone(),
-        );
+        let dm_inbox_config = dm_inbox_config
+            .with_durable_typed_payload_route(
+                x0x::share_grant::SHARE_GRANT_DM_PREFIX,
+                share_grant_route_tx.clone(),
+            )
+            // ADR 0083 slice 3: durable, not validated. A validator would
+            // parse the body before owner trust.
+            .with_durable_typed_payload_route(
+                x0x::gui::remote::SHOW_REQUEST_PREFIX,
+                gui_show_route_tx.clone(),
+            )
+            .with_durable_typed_payload_route(
+                x0x::gui::remote::SHOW_RESULT_PREFIX,
+                gui_show_route_tx.clone(),
+            )
+            .with_durable_typed_payload_route(
+                x0x::gui::remote::ACTIVITY_PREFIX,
+                gui_show_route_tx.clone(),
+            );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
             .await
@@ -3695,7 +4077,11 @@ async fn handle_predecessor_relay_typed_payload_inner(
     let Some(sender) = msg.sender else {
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
-    let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
+    let Ok(event) = crate::wire_compat::decode_json::<NamedGroupMetadataEvent>(
+        "NamedGroupMetadataEvent",
+        "",
+        &msg.payload,
+    ) else {
         return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
     };
 
@@ -4353,10 +4739,7 @@ async fn handle_predecessor_relay_typed_payload_inner(
                 .map(|info| {
                     info.members_v2
                         .iter()
-                        .filter(|(id, m)| {
-                            m.state == x0x::groups::GroupMemberState::Active
-                                && **id != local_agent_hex
-                        })
+                        .filter(|(id, m)| m.is_active() && **id != local_agent_hex)
                         .map(|(id, _)| id.clone())
                         .collect::<Vec<_>>()
                 })
@@ -5706,6 +6089,93 @@ mod startup_update_check_tests {
             .await
             .expect("shutdown must complete despite the hung update check")
             .expect("clean shutdown");
+    }
+}
+
+#[cfg(test)]
+mod socks_startup_port_release_tests {
+    use std::time::Duration;
+
+    use crate::server::{serve_with_options, DaemonConfig, ServeOptions};
+
+    /// A startup failure after the SOCKS listener binds must drop that
+    /// listener. The old path returned from `finish_startup_error` without
+    /// cancelling SOCKS, so the accept task kept the port.
+    #[tokio::test]
+    async fn startup_failure_after_socks_bind_releases_the_port() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DaemonConfig {
+            data_dir: dir.path().to_path_buf(),
+            identity_dir: Some(dir.path().join("identity")),
+            api_address: "127.0.0.1:0".parse().expect("loopback api address"),
+            bind_address: "127.0.0.1:0".parse().expect("loopback quic address"),
+            bootstrap_peers: Some(Vec::new()),
+            network_id: Some("socks.startup-port-release".to_string()),
+            mdns_enabled: false,
+            ..DaemonConfig::default()
+        };
+        config.history.enabled = false;
+        config.socks.listen = Some(
+            format!("127.0.0.1:{port}")
+                .parse()
+                .expect("loopback socks address"),
+        );
+
+        let profile_path = crate::profile::SelfProfile::path_in(&config.data_dir);
+        std::fs::create_dir_all(&config.data_dir).expect("data dir");
+        // `{}` parses as an empty profile. Non-JSON is what `load_from` rejects.
+        std::fs::write(&profile_path, b"not-json").expect("corrupt self-profile");
+
+        let acl = "\
+[connect]
+enabled = true
+
+[[connect.allow]]
+agent_id = \"abababababababababababababababababababababababababababababababab\"
+machine_id = \"abababababababababababababababababababababababababababababababab\"
+targets = [\"127.0.0.1:22\"]
+";
+        let connect_policy =
+            crate::connect::parse_connect_policy(std::path::Path::new("connect-acl.toml"), 0, acl)
+                .expect("minimal loopback connect acl");
+        let options = ServeOptions {
+            skip_update_check: true,
+            cli_no_port_mapping: true,
+            cli_disable_peer_cache: true,
+            self_update_enabled: false,
+            connect_policy,
+            ..ServeOptions::default()
+        };
+
+        let started =
+            tokio::time::timeout(Duration::from_secs(45), serve_with_options(config, options))
+                .await
+                .expect("startup failure must not hang");
+        let err = match started {
+            Err(err) => err,
+            Ok(_handle) => panic!("corrupt self-profile must fail startup"),
+        };
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("self-profile"),
+            "startup must fail at self-profile load after SOCKS bind, got: {chain}"
+        );
+
+        let rebound = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(listener) => return listener,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .expect("SOCKS port must be free after startup failure");
+        drop(rebound);
     }
 }
 

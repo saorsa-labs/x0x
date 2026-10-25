@@ -1,0 +1,30 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "members_only",
+      "variant": "MembersOnly",
+      "wire": {
+        "bincode": "00000000",
+        "json": "\"members_only\""
+      }
+    },
+    {
+      "input": "moderated_public",
+      "variant": "ModeratedPublic",
+      "wire": {
+        "bincode": "01000000",
+        "json": "\"moderated_public\""
+      }
+    },
+    {
+      "input": "admin_only",
+      "variant": "AdminOnly",
+      "wire": {
+        "bincode": "02000000",
+        "json": "\"admin_only\""
+      }
+    }
+  ],
+  "type": "GroupWriteAccess"
+}

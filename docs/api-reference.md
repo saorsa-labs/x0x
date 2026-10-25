@@ -78,16 +78,25 @@ Auth-class labels used throughout this reference:
   (metadata presence is the marker — never the current policy axes, so
   the Home cannot be policy-flipped around the rename gate), and
   (#1228) `POST /groups/:id/quarantine/clear` and every `/mls/groups*`
-  route. The join-request list, approve and reject are not on this list.
-  They take one class that depends on the group: see **Join-request admin
+  route, (#1386) `POST /forwards` in every case (including plain hex
+  `peer_agent`), (#1392) `POST /gui/show` (a GUI session bearer is still
+  refused; a rider token is admitted only with `gui:show`),
+  `DELETE /forwards/:local_addr` (David, 20 Oct 2026, 17:54 BST: a session
+  token or a rider token is refused, the same rule as `POST /forwards`),
+  and every `/names*` route.
+  The join-request list, approve and reject are not on this list. They
+  take one class that depends on the group: see **Join-request admin
   (#1347)** below.
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
   `send_direct` carrying a reserved `x0x-exec-v1\0` exec frame.
-- **rider-allowed** — the three surfaces a rider token may reach (see the
-  harness-boundary section below). Rider tokens authenticate in the
-  `Authorization` header only.
+  The same two generic send paths refuse `x0x-gui-show-v1\0`,
+  `x0x-gui-show-result-v1\0`, and `x0x-gui-activity-v1\0` for every
+  token class. Only `POST /gui/show` emits those frames.
+- **rider-allowed** — the surfaces a rider token may reach (see the
+  harness-boundary section below). `POST /gui/show` needs `gui:show`.
+  Rider tokens authenticate in the `Authorization` header only.
 
 **#446 resolution notes:** `POST /announce` without
 `include_user_identity` and `PATCH /groups/:id` on ordinary
@@ -617,8 +626,9 @@ authority evidence), and the response returns the certificate
 (`certificate.storage_b64`) for ACP-attached harness instances.
 
 **Rider tokens** (`{ "sub_agent_id": <hex>, "groups": [gid…], "label"?:
-string, "ttl_secs"?: ≤ 90 days, default 7, "delegation": {
-"payload_b64", "signature" } }`) are stored hashed at rest (SHA-256),
+string, "ttl_secs"?: ≤ 90 days, default 7, "scopes"?: ["gui:show"],
+"delegation": { "payload_b64", "signature" } }`) are stored hashed at
+rest (SHA-256),
 expire, and are revocable per-token or by revoking their sub-agent.
 The `delegation` capability is REQUIRED — a request without it answers
 `400 delegation is required…`. The CLI `x0x owner riders issue` mints
@@ -641,6 +651,7 @@ authenticates as a distinct principal that may reach exactly:
   must be listed explicitly like any other group (`rider_allows_group`
   checks the explicit list only)
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
+- `POST /gui/show` — only when the token's `scopes` contain `gui:show`
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
 `/shutdown`, and the rest of the `/history` family (`/history/search`,
@@ -659,18 +670,42 @@ per-message envelope carries the certificate (~10 KB overhead) so
 verification is self-contained. `/agent/sign` stays owner-only. Rider
 Home encrypts record the sub-agent id as the history row's author.
 
-**Verified rider lifecycle** (run against a live daemon this campaign):
+`scopes` on `POST /owner/riders` is optional. It is the rider-token
+permission list. It is not the group list inside the delegation
+capability. Omit the field, or send `[]`, and the rider has no scopes.
+The only allowed value is the exact string `gui:show`. A repeated
+`gui:show` is stored once. Any other string, including a different case
+or added whitespace, is rejected before a certificate lookup or a disk
+write. The mint response is HTTP 400 and nothing is stored:
 
 ```json
-// POST /owner/riders -> 200 (token secret returned exactly once)
-{"ok":true,"sub_agent_id":"df4eca…","token_id":1,"label":"…",
- "groups":["home"],"issued_at_unix":1788091312,"expires_at_unix":1788092212,
- "token":"bfc14e49…"}
+{"error":"unknown rider scope: <value>","ok":false,"reason":"unknown_scope"}
 ```
 
-- `GET /owner/riders` lists records with **no secrets** — `token_id`,
-  `sub_agent_id`, `cert_digest`, `groups`, `issued_at_unix`,
-  `expires_at_unix`, `revoked_at_unix`. Durable-owner only.
+The issue response returns the secret once. `scopes` is the stored list.
+`label` is JSON `null` when the request omits it. This build serializes
+object keys in alphabetical order. The body from `owner_riders_issue` is:
+
+```json
+{"expires_at_unix":1788696112,"groups":["home"],"issued_at_unix":1788091312,
+ "label":null,"ok":true,"scopes":["gui:show"],"sub_agent_id":"<64 hex>",
+ "token":"<secret>","token_id":1}
+```
+
+`GET /owner/riders` is durable-owner only. It returns the same records
+with no secret. Each item from `owner_riders_list` is:
+
+```json
+{"ok":true,"riders":[{"cert_digest":"<hex>","expires_at_unix":1788696112,
+ "groups":["home"],"issued_at_unix":1788091312,"label":null,
+ "revoked_at_unix":null,"scopes":["gui:show"],"sub_agent_id":"<64 hex>",
+ "token_id":1}]}
+```
+
+A token minted with no `scopes` lists `"scopes": []`.
+
+**Rider lifecycle:**
+
 - With the rider token: `GET /history?scope=group:home` → `200`;
   `GET /owner/agents` → `403`; `POST /agent/sign` → `403`.
 - `DELETE /owner/riders/:id` → the very next rider request answers `401`
@@ -684,7 +719,35 @@ Home encrypts record the sub-agent id as the history row's author.
   `min(cert expiry, token expiry)` — a longer `not_after` answers
   `400` with the bound named.
 
+### Owner recovery of a group (ADR 0110 §4b(1))
 
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/owner/groups/:id/recovery-mandate` | `x0x owner groups recovery-mandate <GROUP_ID> --promoted <AGENT_ID>` | Owner-sign an `OwnerRecoveryMandateV1` for an `OwnerCertified` group whose admins are all revoked |
+
+Body: `{ "promoted_agent_id": <hex agent ID> }`. Requires the durable API
+token and a node that holds the owner's user key U (`~/.x0x/user.key` is
+never auto-generated; `409` without it). The group's admission must be
+`OwnerCertified(U)`.
+
+The mandate names the group ID, the current head, each revoked
+Admin-or-higher Active seat with the hashes of its verified Agent-subject
+revocation records, and the promoted member with its committed certificate
+digest. The daemon sends it to the promoted member over the direct-message
+carrier, only when that member's current verified advert sets
+`owner_recovery_v1`.
+
+- `202 Accepted` — `{"ok": true, "group_id", "state":
+  "waiting_for_recovery_member", "promoted_member", "mandate_id",
+  "parent_head", "parent_revision", "revoked_admins": [...]}`. The state
+  stays on the group's `admin_availability.owner_recovery.owner` until the
+  promoted member commits.
+- `409 Conflict` — `{"ok": false, "error": "recovery_not_needed" |
+  "recovery_member_ineligible" | "recovery_group_quarantined" |
+  "recovery_head_mismatch", "group_id"}`.
+- `403 Forbidden` — a session token, or `recovery_signer_not_owner` (the
+  group's owner is not this node's user key).
+- `404 Not Found` — the group is not known on this node.
 
 ## Owner profile and naming (ADR-0036)
 
@@ -957,7 +1020,11 @@ open the sync gate; non-enrolled machines are refused at stream accept.
 omitted = enroll THIS machine), `ttl_secs` optional (bounds the enrollment's
 lifetime; omitted = until deleted). Response: `machine_id`, `enrolled_at_ms`,
 `expires_at_ms` (null = no expiry), `device_count`. A persistence failure is a
-`500` — success is never reported on a swallowed write.
+`500` — success is never reported on a swallowed write. A `409
+enrollment_tombstoned` means the machine has an unenroll tombstone at or after
+this enrollment's `enrolled_at_ms` (it was deleted after being enrolled, or
+the enrollment is a restore/replay): re-enroll with a freshly issued
+enrollment whose `enrolled_at_ms` is strictly later than the delete time.
 
 **GET /owner/machines (#1383, M1 census)** — the owner's machine census over
 owner-sync. One row per enrolled device with its last-sync status; the local
@@ -1013,10 +1080,18 @@ synced as the issuance fact only (digest + time) — `mode` defaults to `acp`,
 boundary), so a synced roster row is not itself mint-capable for riders.
 
 **DELETE /sync/devices/:machine_id** — the *next* inbound stream from that
-machine is refused; existing streams are not torn down mid-flight. `404` when
-the machine is not enrolled; `400` for a malformed id — but the owner gate runs
-FIRST: on a daemon with no owner identity the DELETE answers `409 no owner
-identity configured` regardless of the id's shape.
+machine is refused, and a live session from it stops at its next admission
+re-check (phase or page boundary, or before its commit — #1055). The DELETE
+also writes a durable unenroll tombstone (persisted in
+`<data_dir>/sync/unenroll_tombstones.json`, a versioned envelope) — including
+on the `404` (not enrolled) path — that refuses any later enroll, restore or
+replay whose `enrolled_at_ms` is at or before the delete time; re-enrolling
+requires a freshly issued enrollment with a strictly later `enrolled_at_ms`.
+A corrupt tombstone file or an unknown envelope version fails the daemon
+load closed — never a silent fallback to an empty tombstone store. `404` when
+the machine is not enrolled; `400` for a malformed id — but the owner gate
+runs FIRST: on a daemon with no owner identity the DELETE answers `409 no
+owner identity configured` regardless of the id's shape.
 
 ## Placement and agent key-move (ADR-0043)
 
@@ -1353,7 +1428,7 @@ Notable codes:
 | 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. A peer you hold **any** contact card for lands here rather than on the 404 — including one whose advert has not converged yet, since that peer is known and may simply need upgrading. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
 | 409 | `idempotency_conflict` | The recipient already holds this `logical_id` bound to different bytes. **Retrying cannot succeed.** Either resend the original bytes under this id, or pick a new `logical_id`. |
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
-| 504 | `timeout` | No application ACK within the retry budget. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. Durable 200 and 504 also include recipient ACK-publish diagnostics `last_ack_publish_ms` and `ack_publish_route_failed` (same fields on `GET /diagnostics/dm`). These are diagnostics, not a latency SLA. |
+| 504 | `timeout` | The overall send budget ended the send. `DmError::Timeout` can come from the raw-QUIC path, the known-recipient redial, or the relay fallback, as well as from an application ACK that does not arrive within the retry budget. Those paths are capped by the overall send budget. The error variant and the wire format are unchanged. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. Durable 200 and 504 also include recipient ACK-publish diagnostics `last_ack_publish_ms` and `ack_publish_route_failed` (same fields on `GET /diagnostics/dm`). These are diagnostics, not a latency SLA. |
 
 The two 409s prescribe opposite repairs and must not be conflated in client
 code: `recipient_ack_semantics_unavailable` means *retry later or tell the user
@@ -1469,6 +1544,7 @@ token. A session token is refused before the body is read.
 | PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
 | PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role <group_id> <agent_id> <role>` | Assign `admin` or `member` (admin-authored) |
+| POST | `/groups/:id/members/:agent_id/certificate/rebind` | `x0x group rebind-certificate <group_id> <agent_id> [--certificate <b64>]` | Self-rebind this agent's renewed certificate into its own seat (ADR 0110 §4a). See [Certificate rebind](#certificate-rebind-adr-0110-4a) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban <group_id> <agent_id>` | Ban a member (admin-authored) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban <group_id> <agent_id>` | Unban a member (admin-authored) |
 | GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests. Requires a local admin seat. Token class: [join-request admin](#authentication-and-token-classes) (#1347). A session token is accepted, except on a Home or an `OwnerCertified` group, which needs the durable API token |
@@ -1600,6 +1676,272 @@ directly.
   (an alternate commit at a retained revision, signature-verified, committed
   by an active admin in the retained base roster); first evidence wins and
   replays do not overwrite it.
+
+### Revocation eviction (ADR 0110, S4)
+
+When a member's agent is revoked, its selected certificate expires
+(`OwnerCertified` groups), or it leaves while its TreeKEM leaf is still in
+the tree, the daemon opens one obligation for that (group, member). The
+lowest eligible admin on the roster does the exclusion first. The other
+admins wait for their ranked fallback time. These fields show the work and
+every wait. A wait always names its cause; it does not stop silently.
+
+`GET /groups/:id` adds four fields:
+
+```json
+"revocation_evictions": [
+  {
+    "target": "<64-hex agent id>",
+    "phase": "pending",
+    "triggers": ["agent_revocation", "self_leave", "certificate_expiry"],
+    "termination_cause": null,
+    "designated_admin": "<64-hex agent id>",
+    "fallback_ranks": ["<64-hex agent id>"],
+    "waiting": {
+      "cause": "waiting_for_designated_admin",
+      "named": ["<64-hex agent id>"],
+      "designated_admin": "<64-hex agent id>",
+      "detail": "rank",
+      "remaining_ms": 9000
+    },
+    "queued_requests": [{"request": "remove", "queued_at_unix_ms": 1788091312000}],
+    "observed_at_unix_ms": 1788091300000,
+    "result_head": null,
+    "result_epoch": null,
+    "receiver_upgrade_members": [
+      {
+        "cause": "waiting_for_receiver_upgrade",
+        "agent_id": "<64-hex agent id>",
+        "gap_revision": 12,
+        "advert": "lacking"
+      }
+    ]
+  }
+],
+"revocation_eviction_store": {
+  "state": "ok",
+  "file": "revocation-evictions.evs",
+  "detail": null,
+  "rebuilt_from": []
+},
+"admin_availability": null,
+"certificate_evidence_waits": [
+  {
+    "cause": "waiting_for_certificate_evidence",
+    "agent_id": "<64-hex agent id>",
+    "certificate_digest": "<hex digest>"
+  }
+]
+```
+
+- `phase` — `pending`, `prepared`, `committed_delivery_pending`, `complete`
+  or `terminated`. `termination_cause` is `group_deleted` or
+  `certificate_valid` for a `terminated` row.
+- `waiting.cause` — one of:
+  - `waiting_for_designated_admin` — another admin is designated. `detail`
+    is `rank` (this node waits for its fallback time, `remaining_ms`) or
+    `designated_admin_unsupported` (the designated admin's advert lacks
+    `eviction_handoff_v1`).
+  - `unresolved_designated_admin` — the hand-off has not reached the
+    designated admin yet.
+  - `local_committer_ineligible` — this admin may not seal (demoted,
+    removed, revoked, left, or its own certificate expired).
+  - `waiting_for_durable_intake` — the obligation is not on disk yet; the
+    daemon retries.
+  - `waiting_for_head_sync` — a catch-up round must finish first (for
+    example after a restart).
+  - `waiting_for_member_key_package` — the TreeKEM removal needs the
+    member's KeyPackage; the daemon asks for it.
+  - `waiting_for_fork_resolution` — a competing branch exists. A saved
+    exclusion is kept as evidence and is not published.
+  - `waiting_for_receiver_upgrade` — the crypto-only exclusion of a member
+    that already left is held. `named` lists each Active member whose
+    current verified advert lacks `crypto_exclusion_v1`. The hold ends when
+    each one upgrades, stops being Active, or its advert expires.
+  - `waiting_for_eligible_admin_revocation` — every Admin-or-higher seat is
+    revoked; `named` lists them.
+  - `waiting_for_active_admin` — the roster has no Active admin.
+  - `waiting_for_admin_certificate_renewal` — every other admin's
+    certificate is expired.
+  - `waiting_for_certificate_expiry` — the local clock is not past the
+    certificate's signed `not_after` yet.
+  - `waiting_for_host_commit` — an upgrade trial is running.
+  - `rebuilding_obligation_store` — the `.evs` file is being rebuilt.
+- `receiver_upgrade_members` — on the admin that committed a crypto-only
+  exclusion: each Active member that could not take it yet. `advert` is
+  `lacking` (its current verified advert lacks `crypto_exclusion_v1`; it
+  stays stranded until it upgrades) or `unknown` (no current verified
+  advert; the daemon asked for a refresh). `gap_revision` is the revision
+  it cannot cross.
+- `revocation_eviction_store.state` — `ok`, `rebuilt`,
+  `sidecar_unavailable`, `sidecar_newer_format` or
+  `sidecar_quarantine_failed` (ADR 0108 §5a).
+- `admin_availability` — `null` while an eligible admin exists. When
+  verified revocations cover every Admin-or-higher seat:
+  - `OwnerCertified` groups:
+    `{"state": "waiting_for_eligible_admin_revocation", "revoked_admins": [...], "exit": "owner_recovery"}`.
+  - Other groups, after a catch-up round:
+    `{"state": "group_admin_revoked", "revoked_admins": [...], "exit": "group_admin_revoked", "recreate_offer": {"members": [...], "name": "...", "policy": {...}}}`.
+    The group stays readable. To continue, a member makes a new group with
+    the existing create API and invites the listed members.
+  - In the `OwnerCertified` case the object also has `owner_recovery`:
+    `null`, or `{"owner", "promoted_member", "receiver_upgrade_members"}`.
+    On the owner's node, `owner` is
+    `{"state": "waiting_for_recovery_member" | "waiting_for_receiver_upgrade", "promoted_member", "mandate_id", "parent_head", "advert"}`
+    until the promoted member commits. On the promoted member,
+    `promoted_member` is `{"state", "named", "parent_head"}`; `state` is
+    `mandate_received`, `waiting_for_receiver_upgrade` (D76 hold, `named`
+    lists each Active member whose current advert lacks bit 7),
+    `waiting_for_member_key_package` or `recovery_not_needed` (the named
+    revocation records have not arrived yet). After the commit,
+    `receiver_upgrade_members` lists the stranded members with
+    `gap_revision`.
+
+**New status codes.**
+
+| Route | Status | Body |
+|---|---|---|
+| `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": "waiting_for_designated_admin", "group_id", "target", "request": "remove" \| "ban" \| "seal", "waiting": {"cause", "designated_admin", "detail": "rank", "local_rank", "remaining_ms", "fallback_at_unix_ms"}}`. The target has an open obligation and this admin's fallback time has not come. The request is queued. It does not rekey early. |
+| `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
+| Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
+| Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
+
+**Wire and capabilities.** The daemon advertises three more ADR 0093
+application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
+(bit 5) and `owner_recovery_v1` (bit 7). The new frames ride the
+direct-message carrier only. They are
+not on the metadata topic and not in a legacy-decoded container:
+
+- `X0XEVH1` — `EvictionHandoffV1`, signed evidence from one admin to the
+  others. It carries no key material.
+- `X0XCE1` — `CryptoExclusionV1`. It removes the retained TreeKEM leaf of
+  a member that is already `Removed`. The roster does not change; the
+  revision and the epoch advance together. The body is signed in domain
+  `x0x.crypto-exclusion.v1`. A daemon sends it only to a member whose
+  current verified advert sets bit 5, and it checks the recipient's agent,
+  machine and binding revocations just before each send. A capable member
+  that asks for TreeKEM catch-up gets held frames on this same carrier.
+
+- `X0XORC1` — owner recovery (ADR 0110 §4b(1), bit 7
+  `owner_recovery_v1`). One postcard frame type with two variants: the
+  owner's `OwnerRecoveryMandateV1` (signed by user key U in domain
+  `x0x.owner-recovery.v1`) and the promoted member's `OwnerRecoveryV1`
+  commit (agent signature in domain `x0x.owner-recovery.commit.v1` over the
+  body, which embeds the mandate). The commit removes each revoked admin's
+  seat (with its TreeKEM leaf, with one GSS rotation, or the roster seat
+  alone in a `SignedPublic` group) and makes the promoted member Admin.
+  Receivers accept it only under the §4b(1) rule. Typed refusals:
+  `recovery_not_needed`, `recovery_head_mismatch`,
+  `recovery_signer_not_owner`, `recovery_member_ineligible`,
+  `recovery_proof_invalid`, `recovery_group_quarantined`. The promoted
+  member holds the commit while a known Active member's current advert
+  lacks bit 7 (D76).
+
+DM history does not record these frames: they are protocol traffic. A user
+message that only starts with the same letters stays history.
+
+### Certificate rebind (ADR 0110 §4a)
+
+In an `OwnerCertified` group, a renewed certificate keeps a member's seat
+only through a `CertificateRebindV1` commit. The commit changes only that
+seat's committed certificate and digest. Role, membership, TreeKEM leaf and
+epoch do not change. An announced renewal alone does not keep a seat.
+
+`POST /groups/:id/members/:agent_id/certificate/rebind` is the agent's
+self-rebind. `:agent_id` must be this daemon's own agent. Body (optional):
+
+```json
+{"certificate": "<base64 storage encoding, the certificate.storage_b64 of POST /owner/agents/issue>"}
+```
+
+Without a body the daemon uses the agent certificate it uses now. The
+**cutoff** is `not_after − τ` (τ = 300 s) of the seat's committed
+certificate, on this daemon's clock.
+
+| Case | Status | Body |
+|---|---|---|
+| Before the cutoff, every other Active member's current verified advert sets `certificate_rebind_v1` | `200 OK` | `{"ok": true, "group_id", "agent_id", "certificate_digest", "not_after", "state_revision", "state_hash"}` |
+| After the cutoff | `409 Conflict` | `{"ok": false, "error": "rebind_window_closed", "state": "waiting_for_admin_rebind", "designated_admin", "renewal_digest", "handed_to": [...]}`. The daemon sends the renewal to every eligible admin in an `EvictionHandoffV1`. At expiry the designated admin commits the rebind instead of the removal. |
+| Another Active member's advert does not set `certificate_rebind_v1` (lacking or unknown) | `409 Conflict` | `{"ok": false, "error": "waiting_for_receiver_upgrade", "named": [...]}`. Rebinding is off; at expiry the seat is evicted. |
+| This replica's head is not synced (§2): no completed catch-up round for the current head, or unresolved higher-head evidence | `409 Conflict` | `{"ok": false, "error": "waiting_for_head_sync", "state": "waiting_for_head_sync", "detail"}`. Nothing is sealed. The daemon holds the rebind and runs a head catch-up round; it checks the rules above again and commits the rebind when the head is synced. `GET /groups/:id` lists it in `held_self_rebinds` with cause `waiting_for_head_sync`. |
+| Every other admin's certificate is expired (§4b(2)) and this agent is an admin | as above | The self-rebind runs after the cutoff too. A known Active member whose current advert lacks the bit holds it: `409` with `waiting_for_receiver_upgrade` and `named`; the held rebind commits when the hold lifts. Unknown or offline members do not hold it. |
+| `:agent_id` is another agent, or this agent is revoked | `403 Forbidden` | `{"error": "rebind_signer_ineligible"}` |
+| The seat is not Active | `409 Conflict` | `{"error": "rebind_seat_not_active"}` |
+| The renewal does not verify against the group owner for this agent, is expired, or the group has no owner | `422` | `{"error": "rebind_certificate_invalid"}` |
+| The renewal's `not_after` is not later than the committed one | `422` | `{"error": "rebind_not_later"}` |
+| The `certificate` field is not a base64 storage-encoded `AgentCertificate`, or there is no body and no loaded agent certificate | `400 Bad Request` | `{"error": "rebind_certificate_invalid", "detail"}` |
+| The encoded rebind frame is larger than the frame limit | `413 Payload Too Large` | `{"error": "rebind_frame_oversized", "group_id"}`. Nothing is committed. |
+
+Receivers refuse a frame with the same typed reasons, plus
+`rebind_digest_mismatch` when the seat's committed digest is not the old
+digest in the frame. Receivers do not enforce the cutoff.
+
+**Effect on this daemon's own certificate (#1357).** When the renewal
+passes the checks above (the `422` rows do not apply), the daemon also
+starts to use it as its own agent certificate. This occurs whatever the
+seat outcome is: `200`, `rebind_window_closed`, or a held rebind. It also
+occurs when this daemon receives a committed rebind of its own seat. The
+daemon adopts the renewal only if all of these are true:
+
+- it binds this daemon's own agent;
+- its owner signature verifies;
+- the user that issued the certificate in use issued it;
+- it is not expired;
+- its `not_after` is strictly later than the `not_after` of the
+  certificate in use. A certificate with no expiry counts as latest, so
+  the daemon never downgrades.
+
+The daemon writes the renewal atomically to `agent.cert`, so a restart
+keeps it. Its later announcements carry the renewal. If you consented to
+user-identity disclosure (`POST /announce` with both flags), the daemon
+re-announces at once. If a check fails, the daemon keeps its certificate,
+and the route response does not change.
+
+This is necessary for an expiring certificate. Before this change, the
+daemon used the certificate that it loaded at startup until a restart.
+After that certificate expired, the daemon announced an expired binding.
+Thus no peer's pinned send reached the daemon (ADR 0107/0115), and the
+designated admin's post-cutoff rebind never arrived. There is no change
+to the wire format, and there is no new route or field. The Engineer made
+this decision on 24 Oct 2026, and it is pending ZCode's concurrence.
+
+`GET /groups/:id` adds:
+
+```json
+"certificate_rebind": {
+  "waiting_for_admin_rebind": [
+    {
+      "cause": "waiting_for_admin_rebind",
+      "agent_id": "<64-hex agent id>",
+      "designated_admin": "<64-hex agent id>",
+      "old_certificate_digest": "<hex digest>",
+      "renewal_digest": "<hex digest>",
+      "since_unix_ms": 1788091300000
+    }
+  ],
+  "held_self_rebinds": [
+    {"cause": "waiting_for_receiver_upgrade", "agent_id": "<64-hex>", "named": ["<64-hex>"]}
+  ],
+  "held_renewals": ["<64-hex agent id>"]
+}
+```
+
+`waiting_for_admin_rebind` ends when a rebind or a removal for the seat
+lands. A `held_self_rebinds` entry has cause `waiting_for_receiver_upgrade`
+while a §4b(2) hold names members, and `waiting_for_head_sync` with an
+empty `named` while it waits only for the §2 head sync. `held_renewals` lists the seats for which this admin holds a
+verified renewal from a hand-off. A verified rebind ends the seat's expiry
+row with `termination_cause` `certificate_valid`. While every admin other
+than the target is expired, the row shows `waiting_for_admin_certificate_renewal`
+naming those admins, or `waiting_for_receiver_upgrade` while a §4b(2)
+self-rebind is held.
+
+**Wire.** `X0XCRB1` — `CertificateRebindV1`, signed in domain
+`x0x.certificate-rebind.v1`, capability `certificate_rebind_v1` (bit 6). It
+rides the direct-message carrier only, to members whose current verified
+advert sets bit 6, with the same per-send revocation checks as
+`CryptoExclusionV1`. It carries no key material. A capable member that asks
+for TreeKEM catch-up gets held frames on this carrier.
 
 ### Roles
 
@@ -2655,6 +2997,25 @@ authenticated `POST /upgrade/apply` through the normal daemon client, using
 the selected `--name` or `--api` and its bearer token. It does not install
 from the CLI process. Apply fails if no daemon is available.
 
+On Unix, apply waits for the durable staging receipt without holding the
+apply mutex or install lock. The optional query `now=true`, sent by
+`x0x upgrade --apply --now`, skips only the staging delay. It retains release
+eligibility, fleet receipt checks, durable holds, probe retry waits and
+transaction checks. It does not reset or discard a receipt. The query
+defaults to `false` and requires the same durable owner token as ordinary
+apply. `--now` requires `--apply` and conflicts with `--check`.
+
+The CLI bounds connection setup to 30 seconds but sets no total timeout for
+these apply requests. A staging wait can exceed an hour. Other CLI requests
+retain their normal timeout.
+
+The GUI **Apply update** control sends ordinary `POST /upgrade/apply` with
+no `now` query. While that request is pending, the page says the request can
+wait for the rollout window before it installs and that this may take over
+an hour. That text gives no phase, progress percentage, or ETA. The control
+stays disabled until the response, including when the home view redraws the
+banner from its cached upgrade status.
+
 Bare `x0x upgrade` and `x0x upgrade --force` stay read-only and refuse
 installation. `x0x upgrade --check` is a standalone GitHub release check and
 needs **no running daemon**. `--check` takes precedence over `--apply`;
@@ -2905,6 +3266,48 @@ does not appear in `x0x routes`. What ships today is **point-to-point
 |---|---|---|---|
 | GET | `/gui` | `x0x gui` | Open the embedded browser UI |
 | GET | `/gui/` | — | Alias for `/gui` |
+| POST | `/gui/show` | `x0x show <view> [--on <machine\|active>]` | Show a validated GUI view to the human (ADR 0083). An owner token must be the durable API token. A GUI session bearer receives a typed `403`. A rider token with `gui:show` is admitted. A rider without that scope receives HTTP 403 `reason: missing_scope`. Omit `target_machine`, or send `null` or `""`, to show on this machine. A 64-hex `MachineId` names one enrolled owner machine. `active` names the owner machine whose GUI was visible most recently. `x0x show <view> [--on <machine\|active>]` sends that value as `target_machine`. The JSON response is `{ outcome, machine_id, request_id }` and **never** carries a URL or session token. `reason` is present only for `target_needs_upgrade`. `candidates` is present only for `no_active_machine`. `navigated` means a visible GUI tab accepted the `gui.show` frame on its outbound queue (`gui=1` only while the tab is visible; the tab then sends `gui.visible`). A full queue does not accept the frame. An agent socket, a hidden tab, a tab whose session has expired, and a visible tab that cannot take the frame do not count, and the daemon opens a browser instead. A blocked sender, including this daemon's agent, is `refused`. Outcomes include `opened`, `navigated`, `invalid_view`, `disabled`, `rate_limited`, `no_display`, `refused`, `no_active_machine`, `unconfirmed`, `stale_request`, and `wrong_machine`. The untrusted-refusal cap is global. This daemon sends at most one refusal per minute for every sender that is not owner-trusted. An unenrolled same-owner machine usually sees `unconfirmed`. Config: `[gui_show] local_enabled` and `[gui_show] remote_enabled` (both default on). The daemon reads `[gui_show]` at startup and re-reads it from the file startup loaded when it serves `POST /acl/reload`. The reload response has no `gui_show` field. That route answers `422` only when an ACL plane fails. |
+
+#### Example: local show
+
+```bash
+# Open or navigate the local GUI to the People view.
+# $TOKEN is the durable owner API token, or a rider token with gui:show.
+# A GUI session bearer receives a typed 403. A rider without gui:show
+# receives HTTP 403 reason missing_scope.
+curl -s -X POST http://127.0.0.1:12700/gui/show \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"view":"people"}'
+# { "outcome": "opened", "machine_id": "<hex>", "request_id": "<hex>" }
+
+x0x show people
+x0x show groups/<group_id>/board
+```
+
+David approved rider `scopes` on 22 Oct 2026 at 22:22 BST. That ruling narrows the 22 Oct 2026 13:30 BST rule (`POST /gui/show` needs the durable owner token) for one case only. Admission is:
+
+- A durable owner API token is admitted.
+- A rider token whose stored `scopes` contain `gui:show` is admitted. `x0x show` posts this route. The response is still `{ "outcome", "machine_id", "request_id" }`. It never carries a URL or a session token.
+- A rider token without `gui:show` is HTTP 403. The body has no `ok` field:
+
+```json
+{"error":"rider token is missing scope gui:show","reason":"missing_scope"}
+```
+
+- A GUI session bearer is HTTP 403. The body has no `reason` field:
+
+```json
+{"error":"/gui/show requires the durable API token (not a session token)"}
+```
+
+A rider show is attributed to that token's `sub_agent_id`. The origin banner, the block check, the rate limit, and the `gui.show` `agent_id` use that id. Stop on a rider id adds that agent to the block list. It does not write `gui_show_local_disabled`. The rider banner tells the human to remove that agent's id from `gui_show_blocked.json` and restart the daemon. The button on this machine reads "Stop shows from this rider". Other riders on this machine and this daemon's own shows continue. Stop on the daemon's own agent still turns local show off. The local banner still names `gui_show_local_disabled`.
+
+View grammar (Rust `gui::view_route::parse`, mirrors `applyHashRoute` in the GUI): `dm/<hex>`, `groups/<hex>[/<app>]` with `<app>` in `chat|board|files|swarm|feed|wiki|web`, or a singleton in `home|homespace|discover|people|network|presence|mls|admin|settings|constitution|about`.
+
+`target_machine` chooses the machine that displays the view. Omit the field, or send `null` or an empty string, and this daemon shows it. Send a 64-character hex `MachineId` to show on that machine. This daemon must have an owner, and `OwnerSyncStore::is_enrolled` must be true for that machine. Otherwise the outcome is `refused` and no direct message is sent. Send `active` to choose the enrolled owner machine whose GUI reported visible activity most recently. This machine is a candidate. The daemon asks each other enrolled machine that has an authenticated agent binding and a verified `gui_show_v1` capability. An announce-only discovery entry is not a target. Gossip delivery is enough for that query. The queries run in parallel and share one 10 second budget with their replies. A reply that has already arrived counts when its gossip ACK times out. A GUI tab that is still visible counts as active even when its stored stamp is older than 15 minutes, when that socket holds a live session token. A hidden tab keeps that stamp. A session refresh does not set the stamp. Clock skew beyond 120 seconds is outcome `stale_request`. This daemon also applies its own Stop and block list before it sends: `local_enabled = false` answers `disabled`, and a blocked requesting agent answers `refused`. A rider request carries that sub-agent id as `subject`. The target names that id on the banner, using a local contact label when it has one and the short id otherwise. The envelope stays signed by the originating daemon. David approved `GuiShowRequest.subject`, the daemon-signed envelope, and the limit that an owner-trusted originator can set any `subject` within the per-machine 30-per-hour cap, on 23 Oct 2026 14:27 BST. The originating daemon appends the selected machine id to that signed payload as `target`. The receiving daemon compares `target` with its own `MachineId` before it displays. A different id is outcome `wrong_machine`, and no view opens. A change to `target` after the ADR 0050 signature fails that signature. David approved this field on 24 Oct 2026 03:07 BST. `GuiShowOutcome` and `GuiActivityBody` are `#[non_exhaustive]`. An unknown variant index fails decode and does not open a view. David approved that rule on 24 Oct 2026 03:34 BST. An expired GUI session does not refresh `last_gui_visible_at`, including a reveal that waited for a queue slot. The target refuses the show when the envelope signer is in `gui_show_blocked`, including when `via_rider` is set. A rider show spends one rate-limit token for the envelope signer and one for `subject`, and one slot of the hourly cap. Stop on a remote rider show blocks shows from that machine. It writes the envelope signer, the originating daemon, to `gui_show_blocked`. Later shows from that daemon are refused, including other riders and that daemon's own shows. The receiver cannot verify `subject`, so Stop does not block only that subject. It records the `(signer, subject)` pair and does not add `subject`. That agent's direct shows from another machine continue. The banner says "Stop blocks shows from that machine." The button reads "Stop shows from this machine". `no_active_machine` means no machine qualifies. The response then includes `candidates`, an array of hex machine ids, and the daemon sends no show. A show sent to another machine waits up to 10 seconds for that machine's result. The outcome is `unconfirmed` when that wait ends with no result, or when the send fails before a result arrives. A result that has already arrived is kept when the gossip ACK times out. There is no automatic retry. A target with no verified `gui_show_v1` capability returns outcome `refused` and `reason` `target_needs_upgrade`, and the daemon sends nothing. `[gui_show] remote_enabled` defaults to true. The daemon reads it at startup and again on `POST /acl/reload`. `false` makes that machine answer `disabled` and answer an activity query with no timestamp. A remote response carries no URL and no session token. The local rate-limit bucket is spent only when this machine displays the view. David approved this wire and API surface on 22 Oct 2026 18:31 BST.
+
+Stop does not rewrite the daemon config file. Stop turns local show off in memory first, then writes `gui_show_local_disabled` in the data directory. If that write fails, shows are already off in this process. The WebSocket error frame reports the failure. To turn local show back on, delete `gui_show_local_disabled`. The next show, and `POST /acl/reload`, see that the marker is gone. A daemon config that already sets `local_enabled = true` does not cancel Stop, because Stop does not change that file. After the marker is gone, that config applies again. A file that sets `local_enabled = false` stays off. A file that omits the key uses the default, which is on. There is no new unblock route. Stop on this daemon's own agent does not write `gui_show_blocked.json`. A local rider Stop writes that rider id to the file. A remote rider Stop blocks shows from that machine. It writes the envelope signer, as the previous paragraph says. The opener does not inherit daemon stderr. A failed launch revokes the fresh session. The daemon queues the origin banner before it starts the platform opener. It removes that banner when the opener reports a confirmed failure (`no_display`). A queued origin banner stays until the current session token expires. That token lasts 10 minutes, and a refresh starts those 10 minutes again. That includes a hidden tab revealed later. The daemon delivers the banner when the tab sends `gui.visible` with `visible: true`. An opener that is still running at the 2 second deadline counts as `opened` and is not killed. `gui.block` has no success frame. A GUI tab whose session refresh fails sends `gui.visible` with `visible: false` and stops offering `gui=1`, so a later show opens a browser.
 
 ## Error handling
 
@@ -3020,11 +3423,11 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 |---|---|---|---|
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
-| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped` and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
+| GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) plus Leaf/Full participation (`participation.mode`, `passthrough_refresh_runs`, C0 `relay_bytes` = non-subscribed forward, `unsubscribed_refused_frames`), plus [experimental named egress meters](504-slice1-experimental.md) (`subscribed_topics`, `outbound_by_topic_named`, `egress_budget` — including effective `egress_budget.byte_policy`, requested `byte_policy_requested`, and sg's `egress_budget.leaf_egress` snapshot with `shed_suppressed`), plus the first-class Leaf-egress summary (#945, ADR-0078 precondition) `leaf_egress` — `byte_policy` (the effective, sg-accepted policy), `applies_to_leaf`, `soft_exceeded` / `hard_exceeded` (EgressMeter exceed-sample counters), `subscribed_outbound_bytes_per_sec_60s`, `epidemic_forward_bytes` / `epidemic_forward_msgs` (the subscribed-topic epidemic-forward totals from `participation`), and `leaf_egress_snapshot` (the sg snapshot verbatim) — plus inbound attribution (`inbound_by_topic`, keys documented in [diagnostics.md](diagnostics.md#inbound-by-topic-counters-674)), plus [#1170 per-kind efficiency counters](diagnostics.md#per-kind-efficiency-counters-1170--track-e-m1) (`per_kind.current` and `per_kind.last_completed`, each with `since_ts`, `window_secs`, `kinds.<kind>.{bus_dispatched,bus_dropped,delivered,published}`, and `health.bus_pressure_kinds`; `last_completed` is null until the first rotation), plus [#288 soak instrumentation](diagnostics.md#soak-instrumentation-288): `uptime_secs`, `inner_envelope_verify.{count,failed,total_ns}`, `dispatcher.<lane>.over_100ms_count`, plus ADR 0115 `identity_authority` — `identity_announce_unauthenticated`, `activation_bundle_owner_unauthenticated`, `revocation_future_dropped` and `quarantine.{enabled,started_at,pending_records,pending_bundles,lapsed}` |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm [--agent <id>]` | Bounded local per-peer digest observations plus direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), recipient ACK-publish diagnostics (`last_ack_publish_ms`, `stats.ack_publish_route_failed`), capability-advert freshness pre-check counter (`caps_advert_prefiltered_stale`, #674) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
-| GET | `/diagnostics/state-sync` | `x0x diagnostics state-sync` | Cumulative local counters for currently open KV stores. `stores` is keyed by local store topic and includes `requests_sent`, `request_seal_failed`, `requests_received`, `requests_answered`, `retained_pages_served`, `incoming_record_merges`, `incomplete_retained_images_pruned` (paged retained images discarded after the inflight TTL), and fixed rejection buckets: `rejected_verify`, `rejected_unauthorized_request`, `rejected_unauthorized_control`, `rejected_authorization_version`, `rejected_cooldown`, `rejected_no_retained`, `rejected_other`. Verify includes malformed or unverifiable control messages of any kind; authorization-version failures may have an unknown message type. `incoming_record_merges` includes live main-topic records and receives on any local role, and is not tied to a state request. Counters reset on store close or process restart; snapshots are approximate and contain no keys or payloads. |
+| GET | `/diagnostics/state-sync` | `x0x diagnostics state-sync` | Cumulative local counters for currently open KV stores. `stores` is keyed by local store topic and includes `requests_sent`, `request_seal_failed`, `requests_received`, `requests_answered`, `retained_pages_served`, `incoming_record_merges`, `incomplete_retained_images_pruned` (paged retained images discarded after the inflight TTL), `digest_beacons_sent` (post-convergence sealed-plane digest beacons published; #1117), `digest_beacon_divergences` (peer beacons that disagreed with local state and re-armed the bounded repair tail), `digest_beacon_wakes_deferred` (divergent peer beacons whose wake the gate damped — pair suppression, the per-author rate cap, or the per-group wake budget; #1601; added to `digest_beacon_divergences` it gives the store's total divergence pressure), and fixed rejection buckets: `rejected_verify`, `rejected_unauthorized_request`, `rejected_unauthorized_control`, `rejected_authorization_version`, `rejected_cooldown`, `rejected_no_retained`, `rejected_other`. Verify includes malformed or unverifiable control messages of any kind; authorization-version failures may have an unknown message type. On mixed-version fleets, `rejected_verify` also rises about once per sealed sender per 30 s while an older peer skips the additive #1117 beacon variant. `incoming_record_merges` includes live main-topic records and receives on any local role, and is not tied to a state request. Counters reset on store close or process restart; snapshots are approximate and contain no keys or payloads. |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
@@ -3149,22 +3552,140 @@ Local `ssh -L`-style port forwarding over x0x byte-streams. The forwarder runs o
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| POST | `/forwards` | `x0x forward add` | Register a local loopback listener that tunnels to a peer's loopback service |
-| GET | `/forwards` | `x0x forward list` | List registered forwards |
-| DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address |
-| GET | `/streams` | `x0x streams` | Active forward-stream count + connect-failed counter + connect-ACL snapshot |
+| POST | `/forwards` | `x0x forward add [--ephemeral]` | Register a local loopback listener that tunnels to a peer's loopback service (persisted unless `--ephemeral`; **durable-owner** in every case) |
+| GET | `/forwards` | `x0x forward list` | List registered forwards, including persisted forwards that are down |
+| DELETE | `/forwards/:local_addr` | `x0x forward rm <local_addr>` | Tear down a forward by its local bind address and delete its persisted record (**durable-owner**) |
+| GET | `/streams` | `x0x streams` | Active forward-stream count, `connect_failed`, `machine_mismatch`, `socks_denied`, and the connect-ACL snapshot |
+
+`socks_denied` counts SOCKS CONNECT replies of `0x02` (the peer connect gate denied the target). The field is `0` when the SOCKS listener is off.
+
+### Loopback SOCKS5 listener
+
+The `[socks]` table is daemon config. It is not a connect-ACL entry. Full rules are in [Daemon SOCKS listener](connect-acl.md#daemon-socks-listener).
+
+```toml
+[socks]
+listen = "127.0.0.1:1080"
+```
+
+`listen` must be a loopback address (`127.0.0.0/8` or `::1`). The config loader and the listener both refuse any other address. The listener stays off until `listen` is set.
+
+Clients must use RFC 1929 username/password. The password is the daemon API token. The username is ignored. `NO AUTH` is refused with `0xFF`. A wrong token, or an empty or absent token, is refused before any ForwardV2 stream opens.
+
+CONNECT is the only command. The target is `<64-hex-agent-id>.x0x:port`. A peer connect-gate denial is SOCKS `0x02`, and that target receives zero bytes.
+
+Owner connect-ACL entries may list an inclusive loopback port range. Pair and grant targets stay exact host:port. See [docs/connect-acl.md](connect-acl.md).
+
+In the Rust API, `ConnectOwnerEntry.targets` is `Vec<OwnerTarget>` (exact address or inclusive port range). Pair `ConnectAllowEntry.targets` stays `Vec<SocketAddr>`. David approved this break on 20 Oct 2026 at 18:50 BST. The public module is `x0x::socks`.
 
 ### `POST /forwards` request body
 
 ```json
 {
   "local_addr": "127.0.0.1:8022",
-  "peer_agent": "<peer agent id hex>",
+  "peer_agent": "<peer agent id hex, or a name>",
   "target_host": "127.0.0.1",
-  "target_port": 22
+  "target_port": 22,
+  "ephemeral": false
 }
 ```
 
-`local_addr` must be loopback; `target_host` must be a numeric loopback IP (no DNS). Returns `409` when connect is disabled (no ACL loaded). The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
+`POST /forwards` and `DELETE /forwards/:local_addr` require the durable owner API token (**durable-owner**). David ruled this for `DELETE /forwards/:local_addr` on 20 Oct 2026 at 17:54 BST: a session token or a rider token receives a typed `403`, the same rule as `POST /forwards`. That includes a plain hex `peer_agent` that writes no name or pin, and a delete of an ephemeral forward. This is a breaking change from earlier behaviour, where a session token could register a hex-only forward and could delete any forward.
+
+`local_addr` must be loopback. `target_host` must be a numeric loopback IP (no DNS). `POST /forwards` returns `409` when connect is disabled (no ACL loaded). `DELETE /forwards/:local_addr` still removes a saved record in that state and returns `404` when the address is not saved. No running forwarder is required. The peer denies (and the local TCP closes) if its connect ACL does not allow the `(agent, machine, target)` triple.
+
+`peer_agent` also accepts a name (`studio.me`, `agent:studio.bob`, `machine:box.me`; see [Names](#names-adr-0074)). The name is resolved locally, and pinned the first time it is used. A machine name opens streams to the one agent that machine's daemon announces. The response carries the canonical `name`, its `kind`, `pinned_machine_id` and `persistent`. Name errors use the codes listed under Names.
+
+**Machine binding (ADR-0074 §1).** A forward with a pinned machine (every machine-name forward and every persistent forward) checks, on every stream, that the stream reached that `MachineId` before any forward-header byte is sent. On a mismatch (the agent moved, or discovery changed) the stream is reset with zero header bytes, the local TCP connection closes, and `GET /streams` `machine_mismatch` counts it.
+
+**Persistence (ADR-0074 §2).** Forwards persist by default in `<data_dir>/forwards.json` (versioned JSON, unknown fields rejected, mode `0600`, written durably). `"ephemeral": true` (`x0x forward add --ephemeral`) keeps a forward in memory only. A persistent forward records `{id, local_addr, name?, kind, pinned_agent_id, pinned_machine_id, target_host, target_port}`, where `id` is the bound `local_addr`. For an agent or hex target, the pinned machine is the machine the agent is bound to when the forward is added; if that is not known yet, a persistent add returns `409` `machine_unknown` (retry once the peer is discovered, or add it as ephemeral). A persistent add returns `503` `forward_store` when `forwards.json` is unreadable or cannot be written, and `409` `forward_store_full` at 1024 forwards. An unreadable file does not block an ephemeral add, and it does not block deletion of a live ephemeral forward. Deleting a persistent forward still returns `503` `forward_store` until the file can be updated. The corrupt file is never overwritten.
+
+At daemon start each persisted forward is re-bound. A named forward is first re-resolved through the name store, where its pin applies, and comes up only if the name still denotes exactly its pinned agent (and, for a machine name, its pinned machine). Otherwise it stays down and is never retargeted: `GET /forwards` lists it with `enabled: false` and an `error` starting with a code — `name_changed` (the name now resolves to another key; delete and re-add the forward to re-pin), a name error code such as `unknown_name`, or `bind_failed` (the port is busy). Startup never waits for these forwards.
+
+Restore failures are either permanent or transient:
+
+- A permanent failure (`name_changed`, invalid or reserved names, ambiguous kind, or an unsupported target kind) is never retried during this daemon run. Check the reported reason, correct the target or name if needed, then delete and re-add the forward to accept its ids and restore it. A later name change back to the saved ids does not clear this failure.
+- A transient failure (an unknown name, an unverified owner, ambiguous name candidates, a name-store failure, or `bind_failed`) gets five retries after the initial attempt. The delays are 10, 20, 40, 80 and 160 seconds. After the fifth retry, the daemon retries every 10 minutes indefinitely, until the forward listens, the owner deletes it, or a retry finds a permanent failure. A peer discovered much later can therefore recover without owner action. Every attempt still checks the saved ids; a retry never retargets the forward.
+
+The retry schedule is per forward and held only in memory. A committed owner add or delete resets it. A daemon restart starts a new schedule. The background restore task stays active while any transient forward is down, and stops when no retry remains (or the daemon shuts down).
+
+An unreadable `forwards.json` restores nothing, is never overwritten, and is reported as `store_error` in `GET /forwards`. When connect is disabled (no ACL loaded) the file is kept and nothing is restored. `GET /forwards` still lists each saved record, with `enabled` false and `error` `connect_disabled: connect forwarding is disabled (no connect ACL loaded)`. `DELETE /forwards/:local_addr` still removes the saved record. No forwarder is required. A persistent add whose record would not load back (for example a non-loopback `target_host`) is refused with `400` `invalid_forward` before the port is bound.
+
+`GET /forwards` returns:
+
+```json
+{
+  "forwards": [
+    {
+      "local_addr": "127.0.0.1:8022",
+      "peer_agent": "<hex>",
+      "target_host": "::1",
+      "target_port": 22,
+      "name": "machine:box.me",
+      "kind": "machine",
+      "pinned_machine_id": "<hex>",
+      "persistent": true,
+      "enabled": true,
+      "error": null
+    }
+  ],
+  "store_error": null
+}
+```
+
+## Names (ADR-0074)
+
+These are local names for agents and machines: `[agent:|machine:]<label>.<owner>`. Labels are lowercase DNS labels (`[a-z0-9-]`, 1–63 characters, no leading or trailing `-`). `me`, `agent` and `machine` are reserved. A 64-character hex agent id stays valid wherever a name is accepted.
+
+- **Owner label.** `me` is this install's owner. Any other owner label is a local petname for a `UserId`, never a network claim. A petname is bound in one of two ways:
+  - importing a signed agent card that carries `user_id` and `owner_name`. The `owner_name` becomes a DNS label, so "Bob Smith" becomes `bob-smith`, and the import response reports `owner_label`. A signed card binds that label only when the contact is Known or Trusted and that user has no petname yet. Unknown and Blocked stay unbound: `owner_label` is null and the name store is unchanged. `POST /names/owners` still binds a label explicitly.
+  - `POST /names/owners`.
+
+  A petname is frozen at first bind. Binding it to another key returns `409` `pin_mismatch` until the label is removed.
+- **Agent label.** This is the announced self-name, mapped to a label the same way. It resolves only to an agent whose valid, unexpired, unrevoked `AgentCertificate` chains to the owner.
+- **Machine label, own machines (`me`).** This is the ADR-0036 `machine_name` synced across your devices. It resolves only for a machine with a current ADR-0041 `OwnerEnrollment` by you.
+- **Machine label, shared machines.** You label these yourself with `POST /names/machines`. They resolve only while the machine hosts a certified agent of an active, unrevoked `ShareGrant` you received from that owner.
+- **Pinned at first use.** The first successful resolution records the id the name resolved to. A later resolution to a different id returns `409` `pin_mismatch`, and the pin is never rewritten. A bare name that matches both an agent and a machine returns `409` `ambiguous_kind`, even when a pin already exists. Retry with `agent:` or `machine:`. `pin_mismatch` is returned only when the single remaining candidate's kind differs from the existing pin, and that call does not write a second pin. To re-pin on purpose, delete the pin.
+
+Resolution is local and makes no network query. It adds no trust: every identity, contact and connect-ACL gate still applies. All `/names` routes need the durable API token. Session and rider tokens get `403`. Names persist in `<data_dir>/names.json` (versioned JSON, mode `0600`). If that file is unreadable, every name operation fails with `503` `name_store`, but hex ids keep working.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/names` | `x0x names list` | Owner petnames and pins |
+| POST | `/names/resolve` | `x0x names resolve <NAME>` | Resolve a name; pins it at first use |
+| POST | `/names/owners` | `x0x names owner add <LABEL> <USER_ID>` | Bind an owner petname |
+| DELETE | `/names/owners/:label` | `x0x names owner rm <LABEL>` | Remove a petname and every pin under it |
+| POST | `/names/machines` | `x0x names machine label <NAME> <MACHINE_ID>` | Label a shared machine (`machine:<label>.<owner>`) |
+| DELETE | `/names/pins/:name` | `x0x names unpin <NAME>` | Drop a pin (e.g. `agent:studio.bob`) |
+
+`POST /names/resolve` takes `{"name": "studio.me"}` and returns:
+
+```json
+{
+  "ok": true,
+  "name": "agent:studio.me",
+  "kind": "agent",
+  "owner_user_id": "<hex>",
+  "agent_id": "<hex>",
+  "machine_id": null,
+  "newly_pinned": true
+}
+```
+
+For a machine name, `machine_id` is the machine. `agent_id` is the one agent that a stream to that machine would open to, or `null` when no single agent qualifies. For a shared machine, only a granted agent can qualify.
+
+Refusals are `{"ok": false, "error", "code"}`:
+
+| Code | Status | Meaning |
+|---|---|---|
+| `invalid_name` | 400 | Outside the grammar |
+| `reserved_label` | 400 | `me`/`agent`/`machine` used as a label |
+| `machine_target_unsupported` | 400 | A machine name where the caller asked for an agent only |
+| `unknown_name` | 404 | Unbound owner label, or nothing carries the name (for a forward to a machine name: no single agent is announced on that machine) |
+| `unverified_owner` | 422 | The name is claimed only without a valid certificate chain, enrollment or grant |
+| `ambiguous_name` | 409 | Two candidates of one kind. `candidates` lists their hex ids |
+| `ambiguous_kind` | 409 | A bare label names both an agent and a machine, even when a pin exists. Retry with `agent:` or `machine:` |
+| `pin_mismatch` | 409 | The name is pinned to another key. The body carries `pinned` and `current` |
+| `name_store` | 503 | `names.json` is unreadable (fail closed) |
 
 See also: [docs/api.md](api.md), [troubleshooting.md](troubleshooting.md), [patterns.md](patterns.md)

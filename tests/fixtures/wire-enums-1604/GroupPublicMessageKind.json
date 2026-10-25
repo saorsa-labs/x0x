@@ -1,0 +1,36 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "kind": "chat"
+      },
+      "variant": "Chat",
+      "wire": {
+        "bincode": "040000000000000063686174",
+        "json": "{\"kind\":\"chat\"}"
+      }
+    },
+    {
+      "input": {
+        "kind": "announcement"
+      },
+      "variant": "Announcement",
+      "wire": {
+        "bincode": "0c00000000000000616e6e6f756e63656d656e74",
+        "json": "{\"kind\":\"announcement\"}"
+      }
+    },
+    {
+      "input": {
+        "kind": "delegation"
+      },
+      "variant": "Delegation",
+      "wire": {
+        "bincode": "0a0000000000000064656c65676174696f6e",
+        "json": "{\"kind\":\"delegation\"}"
+      }
+    }
+  ],
+  "type": "GroupPublicMessageKind"
+}

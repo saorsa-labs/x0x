@@ -148,6 +148,19 @@ impl SessionConnection {
         }
     }
 
+    /// The connection's current remote UDP address (#1112): the address
+    /// the guards compare against rejected and pinned seed addresses —
+    /// the winner-map view, which does not depend on the
+    /// `connected_peers()` metadata a freshly materialized internal
+    /// connection may not have registered yet.
+    fn remote_address(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Quic(connection) => Some(connection.remote_address()),
+            #[cfg(test)]
+            Self::Sim(connection) => Some(connection.remote_address()),
+        }
+    }
+
     fn is_closed(&self) -> bool {
         match self {
             Self::Quic(connection) => connection.close_reason().is_some(),
@@ -491,6 +504,20 @@ pub const MAX_MESSAGE_DESERIALIZE_SIZE: u64 = 4 * 1024 * 1024;
 /// MTU caveat: UDP/443 mitigates port throttling/DPI but does not raise a
 /// path's MTU. A path that cannot carry QUIC's 1200-byte Initial cannot run
 /// QUIC on any port.
+///
+/// ## Seed identity pinning (issue #1112)
+///
+/// The crate-private `SEED_PEER_ID_PINS` table pins a seed address's
+/// expected PeerIds. A dial that a pinned address answers with a PeerId
+/// outside the pin set is a failed hint: dropped, never a trust anchor
+/// (see `seed_pin_check`; the enforcement seam is
+/// `NetworkNode::connect_addr_with_origin`, and the join paths re-check
+/// the verdict on every tier). An empty pin set keeps trust-on-first-use
+/// for that hint, exactly as before #1112. The pin set is per address,
+/// never per host: the two listeners on one host are separate `x0xd`
+/// instances with separate machine keys, and a key rotation pins old and
+/// new PeerIds together for the overlap window. The rotation policy
+/// lives in `docs/trust-and-connectivity.md`.
 pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     // ── UDP/443 (preferred; traverses WARP / full-tunnel VPN / CGNAT / DPI) ──
     // IPv4
@@ -523,6 +550,388 @@ pub const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     "[2400:6180:0:d2:0:2:d30b:d000]:5483",   // Singapore
     "[2400:6180:10:200::ba69:b000]:5483",    // Sydney
 ];
+
+/// One pinned seed identity row (issue #1112).
+///
+/// `addr` is the exact seed `"ip:port"` string from
+/// [`DEFAULT_BOOTSTRAP_PEERS`]. `expected_peer_ids` is that seed's pinned
+/// machine identity set: a join dial that this address answers with a
+/// PeerId outside the set is a failed hint — dropped, never a trust
+/// anchor. An empty set keeps trust-on-first-use for the hint, as before
+/// #1112. A key rotation pins the old and the new PeerId together for the
+/// overlap window, so a pin is a set, not a single id. The table is kept
+/// separate from the address list so the list's public type is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeedPeerPin {
+    /// Seed socket address, byte-identical to its DEFAULT_BOOTSTRAP_PEERS row.
+    pub(crate) addr: &'static str,
+    /// Pinned expected PeerIds for `addr`; empty = TOFU hint.
+    pub(crate) expected_peer_ids: &'static [&'static [u8; 32]],
+}
+
+/// Compiled-in seed PeerId pins (issue #1112), filled 23 Oct 2026 from
+/// live-verified production keys: 22 of the 24 seed addresses. Per-row
+/// provenance: 16 ids from a fresh ephemeral handshake probe on 22 Oct
+/// (ant-quic 0.27.61, `peer_connected`), 6 from a live direct session on
+/// a production daemon at that exact address (22–23 Oct); the six
+/// `:5483` ids also match the April 2026 v0.19.0 sustained-watch
+/// captures, so they have been stable for six months. Two addresses —
+/// `65.21.157.229:443` and `116.203.101.172:5483` (the Hetzner IPv4
+/// rows) — are deliberately NOT pinned: their PeerIds rest on the local
+/// bootstrap cache only, and fresh handshake probes to the Hetzner hosts
+/// time out from this network (22–23 Oct), so those rows keep
+/// trust-on-first-use until a handshake at that exact address verifies
+/// them. A row's set carries more than one id only across a key rotation
+/// (the overlap window); the rotation policy lives in
+/// `docs/trust-and-connectivity.md`.
+// One identity per host LISTENER: the :443 and :5483 instances on a host
+// hold separate machine keys, while the IPv4 and IPv6 addresses of the
+// same listener answer with the same PeerId.
+const SEED_ID_NYC_443: [u8; 32] = [
+    0x57, 0x55, 0x30, 0x26, 0xdb, 0x95, 0x18, 0xeb, 0xfd, 0x4e, 0x07, 0x73, 0x6b, 0x94, 0x7a, 0x12,
+    0x61, 0x72, 0xd6, 0xf2, 0x0e, 0xda, 0xf3, 0xdb, 0xe3, 0x79, 0xf6, 0x7f, 0xdf, 0x67, 0xc4, 0x22,
+];
+const SEED_ID_SFO_443: [u8; 32] = [
+    0xd5, 0x2e, 0x23, 0xd0, 0xae, 0x49, 0x42, 0xd3, 0x9c, 0x14, 0xb4, 0x6d, 0x50, 0x80, 0x23, 0x1e,
+    0x5f, 0x84, 0xfb, 0x08, 0x9d, 0x40, 0xb8, 0xc1, 0x86, 0xd8, 0x21, 0xf2, 0x3f, 0x9d, 0x6c, 0xe3,
+];
+const SEED_ID_SGP_443: [u8; 32] = [
+    0x3d, 0x51, 0x59, 0x50, 0xad, 0x61, 0x0e, 0xfe, 0x75, 0xfa, 0x3f, 0x79, 0x14, 0x62, 0x92, 0x65,
+    0x55, 0x36, 0xd7, 0x08, 0xe7, 0xd5, 0x2b, 0x78, 0xc9, 0x50, 0x74, 0xa7, 0x4e, 0x7b, 0xc5, 0x68,
+];
+const SEED_ID_SYD_443: [u8; 32] = [
+    0xcd, 0x5b, 0xad, 0xfb, 0x86, 0xc1, 0xed, 0xd0, 0xbe, 0xb6, 0x63, 0x0a, 0xe4, 0x12, 0x8c, 0x96,
+    0xff, 0x5b, 0x1c, 0x23, 0x65, 0x9f, 0xd8, 0xb3, 0xd2, 0x1c, 0x48, 0xf0, 0x27, 0x3a, 0x91, 0x73,
+];
+const SEED_ID_HEL_443: [u8; 32] = [
+    0x61, 0xbd, 0x01, 0xaa, 0x5a, 0xec, 0xd5, 0x09, 0x1d, 0x53, 0xa8, 0x3e, 0xac, 0x41, 0xc5, 0xf0,
+    0xc8, 0x74, 0x96, 0xf1, 0xc9, 0x00, 0x7c, 0x11, 0x98, 0x0e, 0x56, 0xfc, 0xa7, 0x1f, 0x6b, 0x2d,
+];
+const SEED_ID_NUR_443: [u8; 32] = [
+    0x9b, 0xd7, 0xa4, 0xd5, 0xd3, 0x90, 0x62, 0x1b, 0xc9, 0x7f, 0x83, 0x62, 0x71, 0xef, 0x67, 0x76,
+    0x3b, 0xef, 0x3d, 0xc0, 0x83, 0x4e, 0x6e, 0x88, 0xb3, 0x80, 0xf4, 0xc7, 0x6e, 0xe4, 0x68, 0x52,
+];
+const SEED_ID_NYC_5483: [u8; 32] = [
+    0x0b, 0x7b, 0xb5, 0xa3, 0xb9, 0x95, 0x1f, 0x8a, 0x63, 0x01, 0xbe, 0xbc, 0xc4, 0x99, 0xb1, 0xac,
+    0x2d, 0xbd, 0x93, 0xd1, 0x18, 0x5b, 0xf1, 0x9b, 0xc1, 0x09, 0x06, 0x61, 0x45, 0x38, 0x0c, 0x5c,
+];
+const SEED_ID_SFO_5483: [u8; 32] = [
+    0xdc, 0x09, 0x0f, 0xd3, 0xd0, 0x58, 0x88, 0xa3, 0xb6, 0x22, 0x8c, 0xdf, 0xce, 0x54, 0x83, 0x0d,
+    0x41, 0x40, 0xe5, 0x33, 0x22, 0x48, 0x08, 0x7c, 0x9b, 0x04, 0x28, 0x41, 0x61, 0x61, 0x9b, 0x31,
+];
+const SEED_ID_SGP_5483: [u8; 32] = [
+    0xbc, 0xf4, 0x3d, 0xc0, 0x2a, 0x77, 0xa0, 0x58, 0x77, 0x77, 0xd4, 0x5f, 0xb0, 0x31, 0x4e, 0xa4,
+    0x06, 0x00, 0x82, 0x00, 0x8d, 0x5a, 0x1d, 0xf4, 0x76, 0x05, 0xd0, 0x35, 0x7c, 0x76, 0x5a, 0xdc,
+];
+const SEED_ID_SYD_5483: [u8; 32] = [
+    0xb7, 0xa2, 0x3e, 0x48, 0xaa, 0xe4, 0x60, 0x82, 0xf9, 0xc9, 0x52, 0xde, 0x2f, 0x22, 0x5c, 0x7c,
+    0x4b, 0xaf, 0xee, 0xe5, 0x0f, 0xea, 0x88, 0xef, 0x50, 0xc5, 0x1b, 0xd0, 0xa6, 0xc4, 0x7c, 0xe8,
+];
+const SEED_ID_HEL_5483: [u8; 32] = [
+    0x16, 0xf0, 0xbf, 0x03, 0x37, 0xc6, 0x34, 0xed, 0xfd, 0xcf, 0x8a, 0xad, 0xcd, 0xd5, 0x96, 0x8d,
+    0x2d, 0x33, 0xab, 0xbf, 0x0a, 0xc2, 0xa4, 0x7c, 0x34, 0x67, 0x10, 0x61, 0x64, 0xe2, 0xd2, 0x2c,
+];
+const SEED_ID_NUR_5483: [u8; 32] = [
+    0x6a, 0x24, 0xbd, 0xed, 0xdd, 0x82, 0x8e, 0x1e, 0x85, 0x9b, 0x63, 0xd7, 0x2f, 0x0d, 0xae, 0x63,
+    0x55, 0x57, 0xc5, 0xf2, 0x12, 0x07, 0xb4, 0xba, 0xc5, 0xf2, 0x4a, 0xa3, 0xed, 0x54, 0x37, 0x6e,
+];
+pub(crate) const SEED_PEER_ID_PINS: &[SeedPeerPin] = &[
+    // ── UDP/443, IPv4 ──
+    SeedPeerPin {
+        addr: "142.93.199.50:443",
+        expected_peer_ids: &[&SEED_ID_NYC_443],
+    },
+    SeedPeerPin {
+        addr: "147.182.234.192:443",
+        expected_peer_ids: &[&SEED_ID_SFO_443],
+    },
+    // 65.21.157.229:443 (Helsinki, IPv4): cache-only PeerId — no handshake
+    // at this exact address yet (probes time out); stays TOFU until one.
+    SeedPeerPin {
+        addr: "116.203.101.172:443",
+        expected_peer_ids: &[&SEED_ID_NUR_443],
+    },
+    SeedPeerPin {
+        addr: "152.42.210.67:443",
+        expected_peer_ids: &[&SEED_ID_SGP_443],
+    },
+    SeedPeerPin {
+        addr: "170.64.176.102:443",
+        expected_peer_ids: &[&SEED_ID_SYD_443],
+    },
+    // ── UDP/443, IPv6 ──
+    SeedPeerPin {
+        addr: "[2604:a880:400:d1:0:3:7db3:f001]:443",
+        expected_peer_ids: &[&SEED_ID_NYC_443],
+    },
+    SeedPeerPin {
+        addr: "[2604:a880:4:1d0:0:1:6ba1:f000]:443",
+        expected_peer_ids: &[&SEED_ID_SFO_443],
+    },
+    SeedPeerPin {
+        addr: "[2a01:4f9:c012:684b::1]:443",
+        expected_peer_ids: &[&SEED_ID_HEL_443],
+    },
+    SeedPeerPin {
+        addr: "[2a01:4f8:1c1a:31e6::1]:443",
+        expected_peer_ids: &[&SEED_ID_NUR_443],
+    },
+    SeedPeerPin {
+        addr: "[2400:6180:0:d2:0:2:d30b:d000]:443",
+        expected_peer_ids: &[&SEED_ID_SGP_443],
+    },
+    SeedPeerPin {
+        addr: "[2400:6180:10:200::ba69:b000]:443",
+        expected_peer_ids: &[&SEED_ID_SYD_443],
+    },
+    // ── UDP/5483, IPv4 ──
+    SeedPeerPin {
+        addr: "142.93.199.50:5483",
+        expected_peer_ids: &[&SEED_ID_NYC_5483],
+    },
+    SeedPeerPin {
+        addr: "147.182.234.192:5483",
+        expected_peer_ids: &[&SEED_ID_SFO_5483],
+    },
+    SeedPeerPin {
+        addr: "65.21.157.229:5483",
+        expected_peer_ids: &[&SEED_ID_HEL_5483],
+    },
+    // 116.203.101.172:5483 (Nuremberg, IPv4): cache-only PeerId — no
+    // handshake at this exact address yet; stays TOFU until one.
+    SeedPeerPin {
+        addr: "152.42.210.67:5483",
+        expected_peer_ids: &[&SEED_ID_SGP_5483],
+    },
+    SeedPeerPin {
+        addr: "170.64.176.102:5483",
+        expected_peer_ids: &[&SEED_ID_SYD_5483],
+    },
+    // ── UDP/5483, IPv6 ──
+    SeedPeerPin {
+        addr: "[2604:a880:400:d1:0:3:7db3:f001]:5483",
+        expected_peer_ids: &[&SEED_ID_NYC_5483],
+    },
+    SeedPeerPin {
+        addr: "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",
+        expected_peer_ids: &[&SEED_ID_SFO_5483],
+    },
+    SeedPeerPin {
+        addr: "[2a01:4f9:c012:684b::1]:5483",
+        expected_peer_ids: &[&SEED_ID_HEL_5483],
+    },
+    SeedPeerPin {
+        addr: "[2a01:4f8:1c1a:31e6::1]:5483",
+        expected_peer_ids: &[&SEED_ID_NUR_5483],
+    },
+    SeedPeerPin {
+        addr: "[2400:6180:0:d2:0:2:d30b:d000]:5483",
+        expected_peer_ids: &[&SEED_ID_SGP_5483],
+    },
+    SeedPeerPin {
+        addr: "[2400:6180:10:200::ba69:b000]:5483",
+        expected_peer_ids: &[&SEED_ID_SYD_5483],
+    },
+];
+
+/// How long a seed-pin mismatch refuses its address (issue #1112): a
+/// scoped, bounded, expiring backoff — never a process-lifetime
+/// tombstone. The window outlives a redial burst but self-heals after an
+/// operator re-keys a seed host and fixes its pin row.
+const SEED_PIN_REJECTION_TTL: Duration = Duration::from_secs(600);
+
+/// One live seed-pin rejection (issue #1112), scoped to the address that
+/// mismatched. `answered` is the identity the pinned address presented and
+/// `generation` the transport connection generation the mismatch arrived
+/// on — the "session". Guards refuse that exact session (or a fresh
+/// session that re-presents the rejected identity at the same address,
+/// matched by generation) while a valid connection of the same identity
+/// elsewhere stays admitted, whatever the dial completion order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeedPinRejection {
+    /// The pinned address that mismatched (map key, repeated for
+    /// snapshots that carry values only).
+    addr: SocketAddr,
+    /// The identity the pinned address answered with.
+    answered: [u8; 32],
+    /// The rejected connection's generation, when the transport exposed
+    /// one at record time.
+    generation: Option<u64>,
+    /// When the backoff window ends.
+    expires_at: Instant,
+}
+
+/// Verdict for one answered dial against a seed pin (issue #1112).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeedPinVerdict {
+    /// The address has no pin: the answered identity stands (TOFU).
+    Unpinned,
+    /// The answer is inside the pin set.
+    Match([u8; 32]),
+    /// The answer is outside the pin set: a failed hint. The join path
+    /// drops it and continues with the other hints.
+    Mismatch { answered: [u8; 32] },
+}
+
+/// Decide one answered dial against one address's pin set.
+///
+/// Pure, so the hint-drop decision is unit-testable without a dial
+/// (issue #1112 acceptance). David's 20 Oct 2026 ruling: a mismatch is a
+/// failed hint, hint dropped — never a trust anchor. An empty set pins
+/// nothing (TOFU).
+pub(crate) fn seed_pin_check(expected: &[&[u8; 32]], answered: [u8; 32]) -> SeedPinVerdict {
+    if expected.is_empty() {
+        SeedPinVerdict::Unpinned
+    } else if expected.iter().any(|pin| **pin == answered) {
+        SeedPinVerdict::Match(answered)
+    } else {
+        SeedPinVerdict::Mismatch { answered }
+    }
+}
+
+/// The pin set for `addr` within `pins`; empty when the row is unpinned
+/// or the address is not a pinned row. Both sides are v4-mapped-normalized
+/// (#484/#1380 rule, review round 2): a pin configured as
+/// `[::ffff:142.93.199.50]:443` must answer for a dial to
+/// `142.93.199.50:443` and vice versa.
+///
+/// Reads the table it is GIVEN, never the process-global test override:
+/// a test that needs the compiled-in production pins passes
+/// [`SEED_PEER_ID_PINS`] here, so a concurrently-running override test in
+/// a shared libtest process cannot empty or rewrite the read (Codex
+/// 23 Oct 2026 review).
+pub(crate) fn pinned_peer_ids_in(
+    pins: &[SeedPeerPin],
+    addr: SocketAddr,
+) -> &'static [&'static [u8; 32]] {
+    let addr = normalize_v4_mapped_addr(addr);
+    pins.iter()
+        .find(|pin| {
+            pin.addr
+                .parse::<SocketAddr>()
+                .is_ok_and(|pin_addr| normalize_v4_mapped_addr(pin_addr) == addr)
+        })
+        .map_or(&[], |pin| pin.expected_peer_ids)
+}
+
+/// Test-only override for the dial seam's pin table (issue #1112, round
+/// 8): a `'static` slice standing in for the compiled-in table so the
+/// seam and the guards run end-to-end against a populated table without a
+/// production pin row. Hold the [`TestPinTableGuard`] to restore.
+#[cfg(test)]
+static TEST_DIAL_PIN_TABLE: std::sync::Mutex<Option<&'static [SeedPeerPin]>> =
+    std::sync::Mutex::new(None);
+
+/// RAII restore for [`TEST_DIAL_PIN_TABLE`]: the override is unset when
+/// the guard drops, so a panicking test cannot leak pins into the next
+/// one.
+#[cfg(test)]
+pub(crate) struct TestPinTableGuard;
+
+#[cfg(test)]
+impl TestPinTableGuard {
+    fn set(pins: &'static [SeedPeerPin]) -> Self {
+        *TEST_DIAL_PIN_TABLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pins);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestPinTableGuard {
+    fn drop(&mut self) {
+        *TEST_DIAL_PIN_TABLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// The pin table the dial seam and the guards read (issue #1112). The
+/// production answer is the compiled-in [`SEED_PEER_ID_PINS`]; test builds
+/// may substitute a populated table (see [`TEST_DIAL_PIN_TABLE`]). The
+/// lib.rs hint selector and cache-consumption fence call this once and
+/// pass the result down, so production keeps one live table while lib
+/// tests inject their own table and never read the override (Codex
+/// 23 Oct 2026 review).
+pub(crate) fn dial_pin_table() -> &'static [SeedPeerPin] {
+    #[cfg(test)]
+    if let Some(pins) = *TEST_DIAL_PIN_TABLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return pins;
+    }
+    SEED_PEER_ID_PINS
+}
+
+/// Whether `peer` is OUTSIDE the pin set of the (pinned) address `addr`
+/// (issue #1112, round 8): the timeless pair verdict, independent of any
+/// recorded rejection or its backoff window. This is what catches a
+/// connection that never passed the dial seam — an ant-quic-internal
+/// coordinator redial of a rejected seed — after the backoff entry
+/// expires.
+fn seed_pin_mismatch_at(addr: SocketAddr, peer: [u8; 32]) -> bool {
+    matches!(seed_pin_gate(addr, peer), SeedPinVerdict::Mismatch { .. })
+}
+
+/// The compiled-in pin set for a dial address. Empty = TOFU hint
+/// (issue #1112).
+#[must_use]
+pub(crate) fn pinned_seed_peer_ids(addr: SocketAddr) -> &'static [&'static [u8; 32]] {
+    pinned_peer_ids_in(dial_pin_table(), addr)
+}
+
+/// The per-address seed-pin gate the dial seam and the hint selector
+/// share (#1112 round 5): the verdict for "identity `answered` dialled or
+/// observed at `addr`". Composes the pin lookup with [`seed_pin_check`];
+/// unpinned addresses and non-seed addresses stay TOFU.
+pub(crate) fn seed_pin_gate(addr: SocketAddr, answered: [u8; 32]) -> SeedPinVerdict {
+    seed_pin_check(pinned_seed_peer_ids(addr), answered)
+}
+
+/// The same gate over an injected table: the form the hint selector and
+/// the cache-consumption fence use, so their verdicts come from the table
+/// they are handed (the live [`dial_pin_table`] in production, the test's
+/// own table in tests) and never from the process-global override.
+pub(crate) fn seed_pin_gate_in(
+    pins: &[SeedPeerPin],
+    addr: SocketAddr,
+    answered: [u8; 32],
+) -> SeedPinVerdict {
+    seed_pin_check(pinned_peer_ids_in(pins, addr), answered)
+}
+
+/// `dial_bootstrap`'s pinned-set rule: an empty set pins nothing (TOFU,
+/// the x0xd default); a non-empty set admits only member identities.
+/// Issue #1112 reuses these semantics for the per-address join pins.
+fn bootstrap_pin_set_allows(
+    pinned: &std::collections::HashSet<[u8; 32]>,
+    answered: [u8; 32],
+) -> bool {
+    pinned.is_empty() || pinned.contains(&answered)
+}
+
+/// One connected peer with the locally OBSERVED origin of its connection
+/// (issue #1112 review round 1).
+///
+/// `remote_addr` is the socket address the local endpoint actually talks
+/// to — ant-quic's transport view, not anything the peer announced.
+/// `direct` is true only when ant-quic reports the path as directly
+/// reachable (no relay in between), so the observed address names the peer
+/// itself rather than a relay in front of it. This is the only address
+/// evidence the capability-hint selection trusts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerOrigin {
+    /// The connected peer's authenticated identity.
+    pub(crate) peer_id: AntPeerId,
+    /// The locally observed remote socket address, when the transport
+    /// exposes one (UDP paths do).
+    pub(crate) remote_addr: Option<SocketAddr>,
+    /// Whether the path is direct (no relay): an observed address behind a
+    /// relay names the relay, not the peer.
+    pub(crate) direct: bool,
+}
 
 /// x0x network node configuration.
 ///
@@ -2001,19 +2410,30 @@ async fn forward_gossip_payload(
         // EXCEPT when the frame's topic is Critical: sender-side `ShedNormal`
         // already protects Critical control on the wire, and dropping the
         // receiver-side IHAVE/IWANT repair under saturation would re-open the
-        // #807 black hole. Both peeks are gated on the shed threshold, so
-        // the steady-state path keeps ADR 0009's flat try_send behavior with
-        // no decode cost. Kind eligibility keeps the cheap pre-#810 peek; the
-        // structural topic inspection only runs for already-eligible frames,
-        // and a frame whose header will not inspect falls back to the
-        // pre-#810 Normal treatment (review item 3).
-        if channel_pressure_exceeds_shed_threshold(tx.capacity(), max)
-            && saorsa_gossip_pubsub::peek_message_kind(&message.data)
-                .is_some_and(is_pubsub_shed_eligible)
+        // #807 black hole. The kind peek runs only after the shed threshold
+        // (or after `try_send` reports Full), so the steady-state path keeps
+        // ADR 0009's flat try_send behavior with no decode cost. Kind
+        // eligibility keeps the cheap pre-#810 peek; the structural topic
+        // inspection only runs for already-eligible frames, and a frame whose
+        // header will not inspect falls back to the pre-#810 Normal treatment
+        // (review item 3). `bus_dispatched` is recorded later from the header
+        // inspection `handle_incoming` already performs. A closed channel is
+        // not a `bus_dropped` event.
+        let under_pressure = channel_pressure_exceeds_shed_threshold(tx.capacity(), max);
+        let peeked_kind = if under_pressure {
+            saorsa_gossip_pubsub::peek_message_kind(&message.data)
+        } else {
+            None
+        };
+        if under_pressure
+            && peeked_kind.is_some_and(is_pubsub_shed_eligible)
             && !is_critical_pubsub_control(&message.data, topic_priority)
         {
             let depth = channel_depth(tx);
             diagnostics.record_shed_priority(stream_type, depth, max);
+            if let Some(kind) = peeked_kind {
+                crate::gossip::per_kind::per_kind_counters().record_bus_dropped(kind);
+            }
             if channel_drop_warn_limiter().should_emit(
                 channel_pressure_key(channel_name, Some(stream_type)),
                 Instant::now(),
@@ -2035,9 +2455,14 @@ async fn forward_gossip_payload(
                 diagnostics.record_enqueued(stream_type, channel_depth(tx), max);
                 Ok(ForwardGossipOutcome::Enqueued)
             }
-            Err(mpsc::error::TrySendError::Full(_message)) => {
+            Err(mpsc::error::TrySendError::Full(returned)) => {
                 let depth = channel_depth(tx);
                 diagnostics.record_dropped_full(peer_id, stream_type, depth, max);
+                let kind =
+                    peeked_kind.or_else(|| saorsa_gossip_pubsub::peek_message_kind(&returned.data));
+                if let Some(kind) = kind {
+                    crate::gossip::per_kind::per_kind_counters().record_bus_dropped(kind);
+                }
                 if channel_drop_warn_limiter().should_emit(
                     channel_pressure_key(channel_name, Some(stream_type)),
                     Instant::now(),
@@ -2254,6 +2679,26 @@ pub struct NetworkNode {
     /// churning an LRU eviction, or ignoring an operator teardown. See
     /// [`DisconnectReason`] and [`NetworkNode::is_reconnect_suppressed`].
     reconnect_suppressions: Arc<Mutex<HashMap<[u8; 32], ReconnectSuppression>>>,
+    /// #1112: live seed-pin rejections, scoped to the address that
+    /// mismatched (never the whole identity) and expiring after
+    /// [`SEED_PIN_REJECTION_TTL`] — a bounded backoff, not a
+    /// process-lifetime tombstone. The guards (`peer_admission`, the recv
+    /// pump, the guarded-send policy) refuse only the mismatching
+    /// connection/session, so a valid connection of the same identity at
+    /// another address stays admitted whatever the dial completion order.
+    /// A leaf mutex: never held across an await or another lock.
+    seed_pin_rejections:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, SeedPinRejection>>>,
+    /// #1112 (round 11): the address each recently observed connection
+    /// GENERATION of a peer lived on — the source-session evidence the
+    /// frame guard needs when a frame was queued and its connection
+    /// closed before dispatch. Capped per peer (generations are never
+    /// reused); a leaf mutex never held across an await or another lock.
+    session_addr_ledger: Arc<Mutex<SessionAddrLedger>>,
+    /// Test-only per-node override of the rejection TTL, so the expiry
+    /// path is testable without real-time waits (`#[cfg(test)]`).
+    #[cfg(test)]
+    test_seed_pin_rejection_ttl: Arc<Mutex<Option<Duration>>>,
     /// Per-node, per-peer interlock for the real suppressed-inbound close.
     #[cfg(test)]
     suppressed_inbound_probe: Arc<Mutex<Option<SuppressedInboundProbe>>>,
@@ -2557,7 +3002,10 @@ impl NetworkNode {
 
         // Single-cache architecture: the endpoint owns the bootstrap cache;
         // x0x borrows the same instance below instead of opening a second
-        // cache on the same directory.
+        // cache on the same directory. The sim backend (test builds) keeps
+        // its own copy of the config — see the sim claim below.
+        #[cfg(test)]
+        let sim_cache_config = bootstrap_cache_config.clone();
         if let Some(cache_config) = bootstrap_cache_config {
             builder = builder.bootstrap_cache(cache_config);
         }
@@ -2576,14 +3024,27 @@ impl NetworkNode {
 
         // W3-H (#1164): a test-build node whose plane has a registered
         // simulation fabric runs on it instead of binding a QUIC socket.
+        // #1112 (round 22): the sim backend honors the cache config too
+        // (in-memory while `persist` is off), so cached-dial paths are
+        // exercisable end to end on the fabric. The endpoint-owned cache
+        // maintenance loop is absent on this backend; tests do not rely
+        // on it.
         #[cfg(test)]
         if let Some(link) = sim::claim(&config, expected_peer_id) {
+            let cache = match sim_cache_config {
+                Some(cfg) => Some(Arc::new(
+                    ant_quic::BootstrapCache::open(cfg).await.map_err(|e| {
+                        NetworkError::NodeCreation(format!("bootstrap cache open failed: {e}"))
+                    })?,
+                )),
+                None => None,
+            };
             return Ok(Self::assemble(
                 config,
                 LinkNode::Sim(link),
                 expected_peer_id,
                 transport_signing_key,
-                None,
+                cache,
             )
             .await);
         }
@@ -2705,6 +3166,12 @@ impl NetworkNode {
             #[cfg(test)]
             one_sided_redial_pause: Arc::new(Mutex::new(Duration::ZERO)),
             reconnect_suppressions: Arc::new(Mutex::new(HashMap::new())),
+            seed_pin_rejections: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            session_addr_ledger: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            test_seed_pin_rejection_ttl: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             suppressed_inbound_probe: Arc::new(Mutex::new(None)),
             plane_peers: Arc::new(Mutex::new(HashMap::new())),
@@ -2726,18 +3193,23 @@ impl NetworkNode {
         let accept = network_node.spawn_accept_loop();
         let eviction = network_node.spawn_connection_pool_eviction();
         let plane_gatekeeper = network_node.spawn_plane_gatekeeper();
+        let ledger_watcher = network_node.spawn_session_ledger_watcher();
         // Record the handles so `shutdown` can abort and join their endpoint
         // operations before consuming the node. This runs
         // at construction before the node is shared, so there is no contention;
         // if the lock is somehow poisoned, recover the guard rather than panic
         // (the handles are only used for clean teardown).
         match network_node.background_tasks.lock() {
-            Ok(mut tasks) => tasks.extend([receiver, accept, eviction, plane_gatekeeper]),
-            Err(poisoned) => {
-                poisoned
-                    .into_inner()
-                    .extend([receiver, accept, eviction, plane_gatekeeper])
+            Ok(mut tasks) => {
+                tasks.extend([receiver, accept, eviction, plane_gatekeeper, ledger_watcher])
             }
+            Err(poisoned) => poisoned.into_inner().extend([
+                receiver,
+                accept,
+                eviction,
+                plane_gatekeeper,
+                ledger_watcher,
+            ]),
         }
 
         // #368 gate 2: pure-observation churn counters over ant-quic's
@@ -3804,7 +4276,11 @@ impl NetworkNode {
     /// # Errors
     ///
     /// Returns `NetworkError` if the peer is not cached or none of its cached
-    /// addresses lead back to the expected peer.
+    /// addresses lead back to the expected peer. #1112 (round 22): cached
+    /// candidates the pin verdict refuses for this identity are never
+    /// socketed — a fully poisoned row fails without a dial — and an answered
+    /// landing on a pinned seed address outside its pin set is refused and
+    /// closed by the peer-authenticated dial underneath (`connect_peer_with_addrs`).
     pub async fn connect_cached_peer(&self, peer_id: AntPeerId) -> NetworkResult<SocketAddr> {
         // Issue #292 invariant C: the gate outranks the connected
         // fast-path below — a suppressed peer refuses even while a
@@ -3839,6 +4315,14 @@ impl NetworkNode {
                         _ => None,
                     })
                 {
+                    // #1112 (round 23, Codex P2: the connected fast path
+                    // bypassed pin enforcement): an EXISTING connection
+                    // the pins refuse — an ant-quic-internal establishment
+                    // or a pre-pin leftover — is refused and closed here,
+                    // never reported as a cached-dial success the
+                    // coordination plane can reuse.
+                    self.enforce_seed_pin_on_answered_id_dial(&node, addr, &peer_id, "cached_peer")
+                        .await?;
                     return Ok(addr);
                 }
             }
@@ -3869,10 +4353,22 @@ impl NetworkNode {
         // cached addresses observed as mapped-v6 wedge sends with
         // "No route to host" on hosts whose mapped-v6 egress is refused
         // (durable fix ant-quic#269).
+        //
+        // #1112 (round 22, Codex P2: a mismatching cached address must
+        // not cost the row its valid siblings): candidates the pin
+        // verdict refuses are skipped BEFORE the dial — the loop falls
+        // through to the row's next address instead of socketing the
+        // rejected pair. Dormant while no pin row exists.
         let candidate_addrs: Vec<SocketAddr> = cached_peer
             .preferred_addresses()
             .into_iter()
             .map(normalize_v4_mapped_addr)
+            .filter(|addr| {
+                !matches!(
+                    seed_pin_gate(*addr, peer_id.0),
+                    SeedPinVerdict::Mismatch { .. }
+                )
+            })
             .collect();
         for addr in &candidate_addrs {
             match self.connect_peer_with_addrs(peer_id, vec![*addr]).await {
@@ -3943,6 +4439,22 @@ impl NetworkNode {
         // suppressed cache entry, refuse pre-socket so the handshake
         // cannot write cache success (shared ant-quic BootstrapCache).
         self.dial_gated_cached_addr(addr, origin).await?;
+        // #1112 (review round 7): the bounded, expiring backoff — a
+        // pinned address whose pin mismatched is not re-socketed until
+        // the window expires or a dial matches its pin set again, so NAT
+        // traversal assistance and join tiers cannot keep re-probing a
+        // rejected seed through the address-dial seam.
+        if self.seed_pin_addr_rejected(addr) {
+            tracing::warn!(
+                target: "x0x::connect",
+                origin,
+                %addr,
+                "dial refused: address is in the seed-pin mismatch backoff (issue #1112)"
+            );
+            return Err(NetworkError::ConnectionFailed(format!(
+                "#1112: seed pin mismatch backoff active for {addr}; dial refused ({origin})"
+            )));
+        }
         let node = self.require_node().await?;
         let family = if addr.is_ipv4() { "v4" } else { "v6" };
         tracing::debug!(
@@ -3967,7 +4479,34 @@ impl NetworkNode {
                 self.dial_gated_answered(&node, &peer_conn.peer_id, origin)
                     .await?;
 
+                // #1112 (review round 4): per-address seed pin, enforced at
+                // the shared address-dial boundary BEFORE the cache write,
+                // success record, and PeerConnected event — a pinned seed
+                // address that answers outside its pin set never reaches
+                // any bookkeeping or admission. Every address dial (manual
+                // connects, join dials, HyParView bootstrap dials) routes
+                // through here.
+                match seed_pin_gate(addr, peer_conn.peer_id.0) {
+                    SeedPinVerdict::Mismatch { .. } => {
+                        return Err(self
+                            .refuse_seed_pin_mismatch(&node, addr, &peer_conn.peer_id, origin)
+                            .await);
+                    }
+                    // A MATCH at this address clears THIS address's
+                    // rejection (review round 7): the address hosts a
+                    // pinned identity again, so the backoff ends at once.
+                    // Pair-scoped — a match elsewhere leaves this address's
+                    // rejection in force, so no completion order suppresses
+                    // a valid connection or erases another address's
+                    // rejection.
+                    SeedPinVerdict::Match(_) => self.clear_seed_pin_rejection(addr),
+                    SeedPinVerdict::Unpinned => {}
+                }
+
                 let rtt_ms = dur_ms as u32;
+                // #1112 (round 11): leave source-session evidence for the
+                // frame guard.
+                self.note_observed_connection(&node, &peer_conn.peer_id, addr);
                 if let Some(ref cache) = self.bootstrap_cache {
                     cache
                         .add_from_connection(peer_conn.peer_id, vec![addr], None)
@@ -4018,6 +4557,160 @@ impl NetworkNode {
                 );
                 Err(NetworkError::ConnectionFailed(e.to_string()))
             }
+        }
+    }
+
+    /// The shared refusal for a pinned seed address that answered outside
+    /// its pin set (issue #1112, review round 7). Scoped to the
+    /// mismatching address/session:
+    ///
+    /// - records the bounded, expiring backoff entry for the address, with
+    ///   the answered identity and the connection generation it arrived on;
+    /// - closes the answered connection with a plain transport disconnect
+    ///   (the #292 invariant-F tool — never [`Self::disconnect_with_reason`],
+    ///   whose `suppress_reconnect` would write a #292 tombstone). The
+    ///   rejected path must not stay live as transport coordinator or
+    ///   relay assistance: ant-quic's coordinator selection reuses any
+    ///   connection to the seed address and never consults x0x's
+    ///   rejection set, so the connection itself has to go. The close is
+    ///   identity-scoped because that is the only close API; if the same
+    ///   identity holds a valid connection at another address, the
+    ///   seed/keepalive redial paths re-establish it and the
+    ///   session-scoped guards admit it again at once;
+    /// - evicts the answered identity's cached capability evidence from
+    ///   the shared `BootstrapCache`, so coordinator/relay selection that
+    ///   reads the cache (`select_coordinators`) never surfaces it while
+    ///   the backoff lives;
+    /// - fails the dial.
+    async fn refuse_seed_pin_mismatch(
+        &self,
+        node: &LinkNode,
+        addr: SocketAddr,
+        answered: &AntPeerId,
+        origin: &'static str,
+    ) -> NetworkError {
+        Self::refuse_seed_pin_mismatch_in(
+            node,
+            addr,
+            answered,
+            origin,
+            &self.seed_pin_rejections,
+            #[cfg(test)]
+            &self.test_seed_pin_rejection_ttl,
+            self.bootstrap_cache.as_ref(),
+        )
+        .await
+    }
+
+    /// The refusal core over shared handles (#1112 round 23): the dial
+    /// seams run it through [`Self::refuse_seed_pin_mismatch`]; the
+    /// inbound accept gate calls it directly (its task holds no `&self`).
+    async fn refuse_seed_pin_mismatch_in(
+        node: &LinkNode,
+        addr: SocketAddr,
+        answered: &AntPeerId,
+        origin: &'static str,
+        rejections: &Arc<Mutex<HashMap<SocketAddr, SeedPinRejection>>>,
+        #[cfg(test)] test_ttl: &Arc<Mutex<Option<Duration>>>,
+        cache: Option<&Arc<ant_quic::BootstrapCache>>,
+    ) -> NetworkError {
+        // Capture the session before the close removes it — but only when
+        // the live session actually sits on the mismatching address
+        // (round 8): ant-quic may have reused the identity's existing
+        // connection from ANOTHER address as this dial's winner, and that
+        // valid session's generation must not be recorded as the rejected
+        // one. Without address evidence the entry stays address-scoped
+        // (generation `None`), so it can never refuse a session
+        // elsewhere.
+        let mismatched_addr = normalize_v4_mapped_addr(addr);
+        let session_on_mismatched_addr = node
+            .session_connection(answered)
+            .and_then(|conn| conn.remote_address())
+            .is_some_and(|remote| normalize_v4_mapped_addr(remote) == mismatched_addr);
+        let generation = if session_on_mismatched_addr {
+            node.current_connection_generation(answered)
+        } else {
+            None
+        };
+        let ttl = {
+            #[cfg(test)]
+            {
+                test_ttl
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .unwrap_or(SEED_PIN_REJECTION_TTL)
+            }
+            #[cfg(not(test))]
+            {
+                SEED_PIN_REJECTION_TTL
+            }
+        };
+        let expires_at = Instant::now() + ttl;
+        rejections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                mismatched_addr,
+                SeedPinRejection {
+                    addr: mismatched_addr,
+                    answered: answered.0,
+                    generation,
+                    expires_at,
+                },
+            );
+        tracing::warn!(
+            target: "x0x::connect",
+            origin,
+            %addr,
+            answered = %hex_prefix(&answered.0, 8),
+            "seed pin mismatch: closing the answered connection and refusing the dial (issue #1112)"
+        );
+        if let Err(e) = node.disconnect(answered).await {
+            tracing::debug!(
+                target: "x0x::connect",
+                origin,
+                %addr,
+                peer_id_prefix = %hex_prefix(&answered.0, 4),
+                error = %e,
+                "close of pin-mismatched dial failed"
+            );
+        }
+        if let Some(cache) = cache {
+            cache.remove(answered).await;
+        }
+        NetworkError::ConnectionFailed(format!(
+            "#1112: seed pin mismatch at {addr}; dial refused ({origin})"
+        ))
+    }
+
+    /// #1112 (round 22, Codex P2: id dials answered outside the address
+    /// seam): the pin pair verdict for an ANSWERED id dial, run on the
+    /// connection's own remote address. Id dials (`connect_peer`,
+    /// `connect_peer_with_addrs`, and the cached dial's fallback, which
+    /// lets ant-quic enrich the address internally) never pass the
+    /// address-dial seam, so a pinned seed address that answers outside
+    /// its pin set must be refused HERE, before any bookkeeping, event,
+    /// or transport-assistance reuse of the connection: entry recorded,
+    /// answered connection closed, cache row evicted, dial failed.
+    /// Ant-quic-INTERNAL coordinator dials (no x0x hook) stay the
+    /// fenced residual. A MATCH clears this address's rejection,
+    /// pair-scoped, like the seam.
+    async fn enforce_seed_pin_on_answered_id_dial(
+        &self,
+        node: &LinkNode,
+        addr: SocketAddr,
+        answered: &AntPeerId,
+        origin: &'static str,
+    ) -> NetworkResult<()> {
+        match seed_pin_gate(addr, answered.0) {
+            SeedPinVerdict::Mismatch { .. } => Err(self
+                .refuse_seed_pin_mismatch(node, addr, answered, origin)
+                .await),
+            SeedPinVerdict::Match(_) => {
+                self.clear_seed_pin_rejection(addr);
+                Ok(())
+            }
+            SeedPinVerdict::Unpinned => Ok(()),
         }
     }
 
@@ -4084,6 +4777,14 @@ impl NetworkNode {
 
         // Record in bootstrap cache so future connections use the cached address
         let rtt_ms = start.elapsed().as_millis() as u32;
+        // #1112 (round 22): this dial has no address hints — ant-quic
+        // picked the address internally, so the pin verdict can only run
+        // on the ANSWERED connection's remote address.
+        self.enforce_seed_pin_on_answered_id_dial(&node, addr, &peer_conn.peer_id, "peer")
+            .await?;
+        // #1112 (round 11): leave source-session evidence for the frame
+        // guard — id-based dials never pass the address-dial seam.
+        self.note_observed_connection(&node, &peer_conn.peer_id, addr);
         if let Some(ref cache) = self.bootstrap_cache {
             cache
                 .add_from_connection(peer_conn.peer_id, vec![addr], None)
@@ -4231,6 +4932,23 @@ impl NetworkNode {
 
         let family = if addr.is_ipv4() { "v4" } else { "v6" };
         let rtt_ms = dur_ms as u32;
+        // #1112 (round 22, Codex P2: id dials answered outside the
+        // address seam): the identity gate above proved WHO answered;
+        // this proves the pair is allowed where it answered — the
+        // answered connection's own remote address, so an
+        // internally-enriched landing on a pinned seed address is
+        // refused (closed, never reusable as transport assistance)
+        // exactly like an address-seam dial.
+        self.enforce_seed_pin_on_answered_id_dial(
+            &node,
+            addr,
+            &peer_conn.peer_id,
+            "peer_with_addrs",
+        )
+        .await?;
+        // #1112 (round 11): leave source-session evidence for the frame
+        // guard — id-based dials never pass the address-dial seam.
+        self.note_observed_connection(&node, &peer_conn.peer_id, addr);
         if let Some(ref cache) = self.bootstrap_cache {
             cache
                 .add_from_connection(peer_conn.peer_id, vec![addr], None)
@@ -4382,6 +5100,15 @@ impl NetworkNode {
         if self.is_reconnect_suppressed(peer_id.0) {
             return PeerAdmission::Suppressed;
         }
+        // #1112 (review round 7): a live seed-pin rejection suppresses the
+        // mismatching connection/session — never the whole identity. A peer
+        // whose CURRENT session is the rejected one (or re-presents the
+        // rejected identity at the mismatching address) never reads
+        // gossip-admitted, on any path that left such a connection live;
+        // a valid connection of the same identity elsewhere stays admitted.
+        if self.seed_pin_rejected_session(peer_id).await {
+            return PeerAdmission::Suppressed;
+        }
         if !self.is_connected(peer_id).await {
             return PeerAdmission::NotConnected;
         }
@@ -4399,6 +5126,301 @@ impl NetworkNode {
     /// keepalives) must use this instead of raw [`Self::is_connected`].
     pub async fn is_peer_admitted(&self, peer_id: &AntPeerId) -> bool {
         self.peer_admission(peer_id).await == PeerAdmission::Admitted
+    }
+
+    /// Record a seed-pin rejection (issue #1112), scoped to the pinned
+    /// address that mismatched. Test-only direct insert — every
+    /// production refusal runs [`Self::refuse_seed_pin_mismatch_in`],
+    /// which owns the TTL and the entry shape.
+    #[cfg(test)]
+    fn record_seed_pin_rejection(
+        &self,
+        addr: SocketAddr,
+        answered: [u8; 32],
+        generation: Option<u64>,
+    ) {
+        let ttl = self
+            .test_seed_pin_rejection_ttl
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(SEED_PIN_REJECTION_TTL);
+        let expires_at = Instant::now() + ttl;
+        let addr = normalize_v4_mapped_addr(addr);
+        let mut rejected = self
+            .seed_pin_rejections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        rejected.insert(
+            addr,
+            SeedPinRejection {
+                addr,
+                answered,
+                generation,
+                expires_at,
+            },
+        );
+    }
+
+    /// Clear the seed-pin rejection for `addr` (#1112): a dial that
+    /// MATCHED this address's pin set proves the address hosts a pinned
+    /// identity again. Pair-scoped — a match at another address leaves
+    /// this address's rejection in force, so no dial completion order can
+    /// suppress a valid connection or resurrect a rejected one.
+    fn clear_seed_pin_rejection(&self, addr: SocketAddr) {
+        self.seed_pin_rejections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&normalize_v4_mapped_addr(addr));
+    }
+
+    /// Live (unexpired) rejection entries, pruning expired ones.
+    fn live_seed_pin_rejections(&self) -> Vec<SeedPinRejection> {
+        let now = Instant::now();
+        let mut rejected = self
+            .seed_pin_rejections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        rejected.retain(|_, entry| entry.expires_at > now);
+        rejected.values().copied().collect()
+    }
+
+    /// Whether any live rejection entry names `peer_id` as the answered
+    /// identity. Cheap pre-check so guards skip the transport read when
+    /// nothing was rejected.
+    fn any_live_seed_pin_rejection_for(&self, peer_id: [u8; 32]) -> bool {
+        self.live_seed_pin_rejections()
+            .iter()
+            .any(|entry| entry.answered == peer_id)
+    }
+
+    /// Whether a live rejection refuses further dials of `addr`: the
+    /// bounded backoff at the shared address-dial boundary (#1112). A
+    /// pinned address that answered outside its pin set is not re-socketed
+    /// until the window expires. The pair-scoped clear on a MATCH cannot
+    /// end a live backoff in production — the pre-socket gate refuses the
+    /// address while the entry lives, so no matching dial can run; the
+    /// clear is defensive for paths that bypass the gate.
+    fn seed_pin_addr_rejected(&self, addr: SocketAddr) -> bool {
+        let addr = normalize_v4_mapped_addr(addr);
+        self.live_seed_pin_rejections()
+            .iter()
+            .any(|entry| entry.addr == addr)
+    }
+
+    /// Whether a live seed-pin rejection refuses `peer`'s CURRENT
+    /// transport session (#1112): the entry recorded for the identity
+    /// names this session's generation — the connection the mismatch
+    /// arrived on — or the session's remote address IS the rejected
+    /// address (a fresh connection on the same bad address, e.g. an
+    /// ant-quic internal coordinator dial that never passed x0x's seam).
+    /// A generation is per-connection, so a valid connection of the same
+    /// identity at another address — a different generation and address —
+    /// stays admitted. An entry with no generation evidence stays
+    /// ADDRESS-scoped (round 8): it refuses only a session on the
+    /// rejected address, never the identity's sessions elsewhere. The
+    /// final clause is the timeless pair verdict (round 8): a session
+    /// whose remote address is a pinned address whose pin set excludes
+    /// this identity is refused regardless of any recorded entry or its
+    /// expiry — what catches an ant-quic-internal redial of a rejected
+    /// seed after the backoff window lapses.
+    fn seed_pin_rejects_current_session(&self, node: &LinkNode, peer: &AntPeerId) -> bool {
+        // Cheapest gate first (round 17): with nothing pinned and nothing
+        // recorded the guard is a no-op before the session lookups.
+        if dial_pin_table().is_empty()
+            && self
+                .seed_pin_rejections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        {
+            return false;
+        }
+        let session_addr = node
+            .session_connection(peer)
+            .and_then(|conn| conn.remote_address())
+            .map(normalize_v4_mapped_addr);
+        if session_addr.is_some_and(|addr| seed_pin_mismatch_at(addr, peer.0)) {
+            return true;
+        }
+        let entries: Vec<_> = self
+            .live_seed_pin_rejections()
+            .into_iter()
+            .filter(|entry| entry.answered == peer.0)
+            .collect();
+        if entries.is_empty() {
+            return false;
+        }
+        let current_generation = node.current_connection_generation(peer);
+        entries.iter().any(|entry| {
+            let generation_matches = match entry.generation {
+                Some(generation) => current_generation == Some(generation),
+                // No generation evidence: the address clause below is the
+                // only refusal (round 8) — never the whole identity.
+                None => false,
+            };
+            generation_matches || session_addr.is_some_and(|addr| addr == entry.addr)
+        })
+    }
+
+    /// Remember the address a connection GENERATION of `peer` lives on
+    /// (#1112, round 11). Recorded wherever x0x observes a connection —
+    /// the dial seams, the accept loop, and the receive pump while the
+    /// frame's source generation is current — so the frame guard can
+    /// evaluate the pin for a frame's OWN source session after that
+    /// session closes, with no rejection entry needed.
+    fn note_session_address(&self, peer: AntPeerId, generation: u64, addr: SocketAddr) {
+        note_session_address_in(&self.session_addr_ledger, peer, generation, addr);
+    }
+
+    /// The address `generation` of `peer` was observed on, if any
+    /// (#1112, round 11; read-time expiry, round 16: an entry past
+    /// [`SESSION_ADDR_LEDGER_TTL`] reads as absent even when no later
+    /// write pruned it).
+    fn session_addr_for(&self, peer: &AntPeerId, generation: u64) -> Option<SocketAddr> {
+        let now = Instant::now();
+        let mut ledger = self
+            .session_addr_ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entries = ledger.get_mut(peer)?;
+        entries.retain(|(_, _, at)| now.duration_since(*at) < SESSION_ADDR_LEDGER_TTL);
+        let addr = entries
+            .iter()
+            .find(|(gen, _, _)| *gen == generation)
+            .map(|(_, addr, _)| *addr);
+        if entries.is_empty() {
+            ledger.remove(peer);
+        }
+        addr
+    }
+
+    /// Ledger an observed connection (#1112, round 11): the answered
+    /// peer's CURRENT generation and the address the observation came
+    /// from — the dial seams, so id-based dials (which never pass the
+    /// address-dial seam) leave source-session evidence the frame guard
+    /// can use after the session closes. Rounds 16-17: the generation is
+    /// read on BOTH sides of the address read and must AGREE — a
+    /// replacement landing in between would record the observed address
+    /// against the replacement's generation.
+    fn note_observed_connection(&self, node: &LinkNode, peer: &AntPeerId, addr: SocketAddr) {
+        let observed = normalize_v4_mapped_addr(addr);
+        let before = node.current_connection_generation(peer);
+        let still_on_observed = node
+            .session_connection(peer)
+            .and_then(|conn| conn.remote_address())
+            .is_some_and(|current| normalize_v4_mapped_addr(current) == observed);
+        let after = node.current_connection_generation(peer);
+        if still_on_observed && before.is_some() && before == after {
+            self.note_session_address(*peer, before.unwrap_or_default(), observed);
+        }
+    }
+
+    /// Whether a live rejection refuses a frame by its SOURCE session
+    /// (#1112, rounds 10-14), cheapest clauses first so ordinary peers
+    /// pay two short-lock map lookups:
+    ///
+    /// 1. a recorded rejection entry names this frame's generation (the
+    ///    address-dial refusal's record, which outlives the close);
+    /// 2. the session-address ledger (seed-address sessions only, round
+    ///    14) maps the frame's generation to the address it lived on and
+    ///    the timeless pair verdict decides on that (identity, address)
+    ///    pair — covering id-based dials and internal redials, which
+    ///    never pass the address-dial seam;
+    /// 3. the frame rides the peer's CURRENT session: its address
+    ///    decides, and an unpinned address admits (TOFU);
+    /// 4. unknown provenance: ONLY a peer with a live rejection entry is
+    ///    held to the fail-closed rule. Seed-address history alone never
+    ///    refuses a frame of unknown provenance (Engineer ruling, 23 Oct
+    ///    2026): the ledger makes provenance KNOWN where it can (clause
+    ///    2), and a pin-matching seed's frames of an unobserved
+    ///    generation keep flowing instead of being guessed at.
+    fn seed_pin_rejects_frame(
+        &self,
+        node: &LinkNode,
+        peer_id: &AntPeerId,
+        source_generation: u64,
+    ) -> bool {
+        // Cheapest gate first (round 15): with nothing pinned and no
+        // recorded entries the guard is a no-op before any lock.
+        if dial_pin_table().is_empty()
+            && self
+                .seed_pin_rejections
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        {
+            return false;
+        }
+        if self
+            .live_seed_pin_rejections()
+            .iter()
+            .any(|entry| entry.answered == peer_id.0 && entry.generation == Some(source_generation))
+        {
+            return true;
+        }
+        if let Some(addr) = self.session_addr_for(peer_id, source_generation) {
+            return seed_pin_mismatch_at(addr, peer_id.0);
+        }
+        if node.current_connection_generation(peer_id) == Some(source_generation) {
+            return node
+                .session_connection(peer_id)
+                .and_then(|conn| conn.remote_address())
+                .is_some_and(|addr| seed_pin_mismatch_at(addr, peer_id.0));
+        }
+        self.any_live_seed_pin_rejection_for(peer_id.0)
+    }
+
+    /// [`Self::seed_pin_rejects_current_session`] for callers that hold
+    /// only the node: resolves the transport backend first, then adds the
+    /// any-connection clause — a frame or admission lookup names a peer,
+    /// not a connection, so ANY current connection of the identity on a
+    /// rejected address is refused, and so is any current connection on a
+    /// pinned address whose pin set excludes the identity (the timeless
+    /// pair verdict, round 8 — independent of backoff entries). The
+    /// session check runs whenever pins exist, entry or not (round 9):
+    /// `connected_peers()` metadata can lag a freshly materialized
+    /// internal connection, and the session lookup reads the winner map
+    /// the reader actually uses. Returns `false` before the transport
+    /// read when the pin table is empty and no live rejection names the
+    /// identity, so today's hot paths (no pins, nothing rejected) pay
+    /// nothing.
+    async fn seed_pin_rejected_session(&self, peer_id: &AntPeerId) -> bool {
+        let has_entries = self.any_live_seed_pin_rejection_for(peer_id.0);
+        if dial_pin_table().is_empty() && !has_entries {
+            return false;
+        }
+        let node_guard = self.node.read().await;
+        let Some(node) = node_guard.as_ref() else {
+            return false;
+        };
+        if self.seed_pin_rejects_current_session(node, peer_id) {
+            return true;
+        }
+        // The any-connection walk is confined to identities with a LIVE
+        // REJECTION entry (Engineer ruling, 23 Oct 2026): a pin mismatch
+        // refuses at every seam and records one, so entry-less identities
+        // — including every pin-matching seed, whatever its ledger
+        // history — never pay the connection-list scan on the receive
+        // path.
+        if !self.any_live_seed_pin_rejection_for(peer_id.0) {
+            return false;
+        }
+        let rejected_addrs: Vec<SocketAddr> = self
+            .live_seed_pin_rejections()
+            .iter()
+            .filter(|entry| entry.answered == peer_id.0)
+            .map(|entry| entry.addr)
+            .collect();
+        node.connected_peers().await.iter().any(|conn| {
+            if conn.peer_id != *peer_id {
+                return false;
+            }
+            let TransportAddr::Udp(addr) = conn.remote_addr else {
+                return false;
+            };
+            let addr = normalize_v4_mapped_addr(addr);
+            rejected_addrs.contains(&addr) || seed_pin_mismatch_at(addr, peer_id.0)
+        })
     }
 
     /// `set_at` of the live suppression tombstone for `peer_id`, if any.
@@ -4571,6 +5593,20 @@ impl NetworkNode {
             )));
         }
         Ok(())
+    }
+
+    /// The guarded-send admission policy (#292/#206/#1112), recomputed at
+    /// EVERY enforcement point — the pre-wait refusal in
+    /// `send_to_peer_guarded` and the post-`open_uni` callback. The
+    /// callback recheck is what stops a rejection that lands while the
+    /// stream waits for credit from admitting gossip bytes (#1112 review
+    /// round 7): the seed-pin term reads the live rejection map against
+    /// the CURRENT session, so state that changed during the wait changes
+    /// the verdict.
+    fn guarded_send_policy_allows(&self, node: &LinkNode, ant_peer: &AntPeerId) -> bool {
+        !self.is_reconnect_suppressed(ant_peer.0)
+            && !self.seed_pin_rejects_current_session(node, ant_peer)
+            && self.plane_gate_allows(ant_peer)
     }
 
     /// Gossip-plane gate (issue #206).
@@ -4891,6 +5927,33 @@ impl NetworkNode {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Connected peers with the locally observed origin of each connection
+    /// (issue #1112): the transport's remote address and whether the path
+    /// is direct. This is observation, not announcement — the address came
+    /// from the socket, and a relayed path marks `direct = false` because
+    /// then the observed address names the relay.
+    pub(crate) async fn connected_peer_origins(&self) -> Vec<PeerOrigin> {
+        let node = self.node.read().await.as_ref().cloned();
+        let Some(node) = node else {
+            return Vec::new();
+        };
+        node.connected_peers()
+            .await
+            .into_iter()
+            .map(|conn| PeerOrigin {
+                peer_id: conn.peer_id,
+                // #484/#1380 (review round 2): a dual-stack socket
+                // reports IPv4 peers in v4-mapped form; normalize so the
+                // observed IP compares equal to the seed/announced forms.
+                remote_addr: match conn.remote_addr {
+                    TransportAddr::Udp(addr) => Some(normalize_v4_mapped_addr(addr)),
+                    _ => None,
+                },
+                direct: conn.traversal_method.is_direct(),
+            })
+            .collect()
     }
 
     /// Check if connected to a specific peer.
@@ -5690,7 +6753,38 @@ impl NetworkNode {
                 };
 
                 let recv_result = node_ref.recv_with_generation().await;
-                // Release this endpoint clone before any channel backpressure.
+                // #1112 (round 11): while the frame's source generation is
+                // the peer's CURRENT one, remember the address that
+                // generation lives on — the evidence the frame guard needs
+                // if the frame is queued and the session closes before
+                // dispatch. Gated on a populated pin table: nothing to
+                // evaluate while no address is pinned. Done before the
+                // handle drop: the session lookups need the endpoint.
+                if let Ok((peer_id, source_generation, _)) = &recv_result {
+                    if !dial_pin_table().is_empty()
+                        && node_ref.current_connection_generation(peer_id)
+                            == Some(*source_generation)
+                    {
+                        if let Some(addr) = node_ref
+                            .session_connection(peer_id)
+                            .and_then(|conn| conn.remote_address())
+                        {
+                            // Round 16: re-verify after the address read —
+                            // a replacement between the two reads would
+                            // describe a different connection.
+                            if node_ref.current_connection_generation(peer_id)
+                                == Some(*source_generation)
+                            {
+                                plane_node.note_session_address(*peer_id, *source_generation, addr);
+                            }
+                        }
+                    }
+                }
+                // A cheap clone for the frame guard below; the read guard
+                // itself is released before any channel backpressure
+                // (shutdown aborts this task, so the clone cannot outlive
+                // the endpoint).
+                let guard_node = node_ref.clone();
                 drop(node_handle);
 
                 match recv_result {
@@ -5829,22 +6923,31 @@ impl NetworkNode {
                             continue;
                         }
 
-                        // Issue #292 invariant B: a suppressed peer's gossip
-                        // frames are not answered. The accept loop closes the
-                        // transient inbound, but a frame already delivered
-                        // inside the accept-to-close window must not reach
-                        // the gossip plane either. Checked BEFORE the plane
-                        // gate so a suppressed peer never seeds plane state.
-                        // (DM bytes (0x10/0x11) above stay out of #206/#292
-                        // gossip-plane scope.)
+                        // Issue #292 invariant B + #1112: a suppressed
+                        // peer's gossip frames are not answered, and a
+                        // frame off a seed-pin-rejected session is not
+                        // admitted either — by the CURRENT session, or by
+                        // the frame's SOURCE generation (round 10), which
+                        // outlives the rejected connection's close: frames
+                        // queued before the close drain after it and must
+                        // not reach the gossip plane. Checked BEFORE the
+                        // plane gate so a suppressed peer never seeds plane
+                        // state. (DM bytes (0x10/0x11) above stay out of
+                        // #206/#292 gossip-plane scope.)
                         if GossipStreamType::from_byte(type_byte).is_some()
-                            && plane_node.is_reconnect_suppressed(peer_id.0)
+                            && (plane_node.is_reconnect_suppressed(peer_id.0)
+                                || plane_node.seed_pin_rejects_frame(
+                                    &guard_node,
+                                    &peer_id,
+                                    source_generation,
+                                )
+                                || plane_node.seed_pin_rejected_session(&peer_id).await)
                         {
                             tracing::warn!(
                                 target: "x0x::connect",
                                 origin = "recv",
                                 peer_id_prefix = %hex_prefix(&peer_id.0, 4),
-                                "dropping gossip frame from reconnect-suppressed peer (issue #292)"
+                                "dropping gossip frame from reconnect-suppressed or seed-pin-rejected session (issues #292/#1112)"
                             );
                             #[cfg(test)]
                             if let Some(probe) = plane_node
@@ -6001,6 +7104,82 @@ impl NetworkNode {
         })
     }
 
+    /// #1112 (round 12): always-on lifecycle watcher that ledgers every
+    /// ESTABLISHED and REPLACED connection generation with its session
+    /// address. This is the source-session evidence that survives a
+    /// connection closing BEFORE the receive pump ever sees one of its
+    /// frames — including ant-quic-internal connections, which never pass
+    /// an x0x seam. A broadcast lag is fine: the seams, the accept loop
+    /// and the pump ledger as well; a missed event only narrows the
+    /// evidence window. Skips all work while the pin table is empty.
+    fn spawn_session_ledger_watcher(&self) -> tokio::task::JoinHandle<()> {
+        let node = Arc::clone(&self.node);
+        let ledger = Arc::clone(&self.session_addr_ledger);
+        tokio::spawn(async move {
+            let mut lifecycle = {
+                let guard = node.read().await;
+                guard.as_ref().map(|link| link.subscribe_all_peer_events())
+            };
+            let Some(lifecycle) = lifecycle.as_mut() else {
+                return;
+            };
+            loop {
+                // The EVENT's generation, not the current one (round 13):
+                // by the time this task runs, a newer connection may have
+                // replaced the established one. A broadcast lag only
+                // narrows the evidence window — keep listening.
+                let event = match lifecycle.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                // Round 16: a connection's FIRST registration emits
+                // `Established`; subsequent registrations (promoted or
+                // re-dialled connections) emit `Replaced` with the NEW
+                // generation — ledger both, or a replacement can lose its
+                // source-address evidence even when the watcher processes
+                // every event.
+                let (peer, generation) = match event {
+                    (peer, ant_quic::PeerLifecycleEvent::Established { generation }) => {
+                        (peer, generation)
+                    }
+                    (peer, ant_quic::PeerLifecycleEvent::Replaced { new_generation, .. }) => {
+                        (peer, new_generation)
+                    }
+                    _ => continue,
+                };
+                if dial_pin_table().is_empty() {
+                    continue;
+                }
+                let node_handle = node.read().await.as_ref().cloned();
+                let Some(link) = node_handle else {
+                    break;
+                };
+                // Round 14-15: only ledger while the event's generation is
+                // the current one, and RE-CHECK after the address read —
+                // a replacement landing between the two reads would
+                // describe a different connection than the event's. The
+                // nanosecond-scale residue of this check-sequence is a
+                // transport limitation: ant-quic exposes no atomic
+                // (generation, address) snapshot (see the PR's
+                // FOR-ENGINEER fenced-dependency note).
+                if link.current_connection_generation(&peer) != Some(generation) {
+                    continue;
+                }
+                let Some(addr) = link
+                    .session_connection(&peer)
+                    .and_then(|conn| conn.remote_address())
+                else {
+                    continue;
+                };
+                if link.current_connection_generation(&peer) != Some(generation) {
+                    continue;
+                }
+                note_session_address_in(&ledger, peer, generation, addr);
+            }
+        })
+    }
+
     /// Spawn a background task that accepts inbound connections.
     ///
     /// Without this, only outbound connections (initiated by `connect_addr`)
@@ -6014,6 +7193,10 @@ impl NetworkNode {
         let reconnect_suppressions = Arc::clone(&self.reconnect_suppressions);
         let connection_pool = Arc::clone(&self.connection_pool);
         let inbound_allowlist = self.config.inbound_allowlist.clone();
+        let session_addr_ledger = Arc::clone(&self.session_addr_ledger);
+        let seed_pin_rejections = Arc::clone(&self.seed_pin_rejections);
+        #[cfg(test)]
+        let test_seed_pin_rejection_ttl = Arc::clone(&self.test_seed_pin_rejection_ttl);
         #[cfg(test)]
         let suppressed_inbound_probe = Arc::clone(&self.suppressed_inbound_probe);
 
@@ -6113,6 +7296,59 @@ impl NetworkNode {
                             ant_quic::TransportAddr::Udp(addr) => Some(addr),
                             _ => None,
                         };
+                        // #1112 (round 11, validated rounds 16-17):
+                        // inbound connections never pass the dial seam —
+                        // leave source-session evidence for the frame
+                        // guard, but only when the generation read on
+                        // BOTH sides of the address read agrees (a
+                        // replacement in between would mis-attribute).
+                        if let Some(addr) = addr {
+                            let before = node_ref.current_connection_generation(&peer_conn.peer_id);
+                            let still_on_accepted = node_ref
+                                .session_connection(&peer_conn.peer_id)
+                                .and_then(|conn| conn.remote_address())
+                                .is_some_and(|current| {
+                                    normalize_v4_mapped_addr(current)
+                                        == normalize_v4_mapped_addr(addr)
+                                });
+                            let after = node_ref.current_connection_generation(&peer_conn.peer_id);
+                            if still_on_accepted && before.is_some() && before == after {
+                                note_session_address_in(
+                                    &session_addr_ledger,
+                                    peer_conn.peer_id,
+                                    before.unwrap_or_default(),
+                                    addr,
+                                );
+                            }
+                        }
+                        // #1112 (round 23, Codex P2: an inbound mismatch
+                        // stayed usable as a coordinator): the ledger note
+                        // above keeps the frame guard armed across the
+                        // close window; the pair verdict then refuses the
+                        // inbound session BEFORE any cache write or
+                        // admission — a rejected seed dialling back in
+                        // gets the dial seams' refusal (bounded entry,
+                        // closed connection, evicted cache row), so
+                        // ant-quic's coordinator selection cannot reuse
+                        // the live connection as transport assistance.
+                        if let Some(addr) = addr {
+                            if let SeedPinVerdict::Mismatch { .. } =
+                                seed_pin_gate(addr, peer_conn.peer_id.0)
+                            {
+                                let _ = NetworkNode::refuse_seed_pin_mismatch_in(
+                                    node_ref,
+                                    addr,
+                                    &peer_conn.peer_id,
+                                    "accept",
+                                    &seed_pin_rejections,
+                                    #[cfg(test)]
+                                    &test_seed_pin_rejection_ttl,
+                                    bootstrap_cache.as_ref(),
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
                         if let (Some(ref cache), Some(addr)) = (&bootstrap_cache, addr) {
                             if reconnect_suppression_is_live(
                                 reconnect_suppressions.as_ref(),
@@ -7057,6 +8293,79 @@ fn drain_plane_lifecycle(
     }
 }
 
+/// #1112 (round 11): per-peer ledger of (connection generation, observed
+/// address) pairs — the source-session evidence the frame guard reads.
+/// Round 12: entries carry a timestamp and expire, and the ledger has a
+/// global peer bound, so churn cannot grow it without limit.
+type SessionAddrLedger = std::collections::HashMap<AntPeerId, Vec<(u64, SocketAddr, Instant)>>;
+
+/// How long a session-address entry stays readable (#1112 round 12):
+/// generous against queue drainage, bounded against growth.
+const SESSION_ADDR_LEDGER_TTL: Duration = Duration::from_secs(3600);
+
+/// Upper bound on ledgered identities (#1112 round 12). Reached only
+/// after an hour of heavy churn; the oldest-touched peers leave first.
+const SESSION_ADDR_LEDGER_MAX_PEERS: usize = 512;
+
+/// Write into the session-address ledger (#1112, rounds 11-14): the
+/// address a connection generation of a peer lives on. SCOPED TO PINNED
+/// ADDRESSES (round 14): evidence for an unpinned address can never
+/// refuse a frame — the pair verdict is TOFU there — so only
+/// seed-address sessions enter the ledger. That keeps it tiny and keeps
+/// the pump's per-frame write work off every ordinary peer. Entries keep
+/// the most recent few generations per peer (a RECONNECT at the same
+/// address never deletes an earlier generation's evidence — queued
+/// frames of the old generation still need it), expire on
+/// [`SESSION_ADDR_LEDGER_TTL`], and the identity count is bounded by
+/// [`SESSION_ADDR_LEDGER_MAX_PEERS`]. A no-op while the pin table is
+/// empty. The ledger records matching and mismatching identities alike:
+/// it is the KNOWN-provenance source the frame guard's pair verdict
+/// reads, never a refusal trigger on its own (Engineer ruling, 23 Oct
+/// 2026).
+fn note_session_address_in(
+    ledger: &Arc<Mutex<SessionAddrLedger>>,
+    peer: AntPeerId,
+    generation: u64,
+    addr: SocketAddr,
+) {
+    if dial_pin_table().is_empty() {
+        return;
+    }
+    let addr = normalize_v4_mapped_addr(addr);
+    // Only pinned addresses: evidence elsewhere cannot refuse anything.
+    if pinned_seed_peer_ids(addr).is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut ledger = ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entries = ledger.entry(peer).or_default();
+    entries.retain(|(gen, _, at)| {
+        *gen != generation && now.duration_since(*at) < SESSION_ADDR_LEDGER_TTL
+    });
+    entries.push((generation, addr, now));
+    const PER_PEER_GENERATIONS: usize = 8;
+    let excess = entries.len().saturating_sub(PER_PEER_GENERATIONS);
+    entries.drain(..excess);
+    if ledger.len() > SESSION_ADDR_LEDGER_MAX_PEERS {
+        // Evict the peer whose newest entry is the oldest.
+        if let Some(oldest) = ledger
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .min_by_key(|(_, v)| {
+                v.iter()
+                    .map(|(_, _, at)| *at)
+                    .max()
+                    .unwrap_or_else(Instant::now)
+            })
+            .map(|(k, _)| *k)
+        {
+            ledger.remove(&oldest);
+        }
+    }
+}
+
 /// Convert ant-quic PeerId to saorsa-gossip PeerId
 fn ant_to_gossip_peer_id(ant_id: &AntPeerId) -> GossipPeerId {
     GossipPeerId::new(ant_id.0)
@@ -7132,9 +8441,9 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             .map_err(|e| anyhow::anyhow!("bootstrap dial failed: {}", e))?;
 
         // Reject bootstrap peers not in the pinned set (when configured).
-        if !self.config.pinned_bootstrap_peers.is_empty()
-            && !self.config.pinned_bootstrap_peers.contains(&ant_peer_id.0)
-        {
+        // `bootstrap_pin_set_allows` carries the set semantics the join
+        // path's per-address pins reuse (issue #1112).
+        if !bootstrap_pin_set_allows(&self.config.pinned_bootstrap_peers, ant_peer_id.0) {
             warn!(
                 "SECURITY: Bootstrap peer at {} has unexpected ID {:?} — not in pinned set",
                 addr, ant_peer_id
@@ -7176,61 +8485,76 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         }
         let ant_peer = gossip_to_ant_peer_id(&peer);
 
-        // Issue #292 invariant B: no gossip stream is opened toward a
-        // reconnect-suppressed peer. Reported as success for the same
-        // reason as the plane-pending hold below — the peer is already
-        // excluded from `gossip_plane_peers`, so there is no overlay view
-        // to protect, and a suppressed peer must never receive gossip.
-        if self.is_reconnect_suppressed(ant_peer.0) {
-            debug!(
-                "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} is reconnect-suppressed",
-                stream_type,
-                data.len(),
-                peer
-            );
-            return Ok(());
-        }
-
-        // Issue #206: hold gossip sends to peers that have not cleared the
-        // plane gate (hello outstanding / legacy grace). Reported as success
-        // so a briefly-pending same-plane peer is not pruned from overlay
-        // views for what is effectively a sub-second handshake delay; gossip
-        // is loss-tolerant and the frames flow once the peer clears.
-        if !self.plane_gate_allows(&ant_peer) {
-            debug!(
-                "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} not plane-cleared",
-                stream_type,
-                data.len(),
-                peer
-            );
-            return Ok(());
-        }
-
-        // Prepare message: [stream_type_byte | data]
-        let mut buf = Vec::with_capacity(1 + data.len());
-        buf.push(stream_type.to_byte());
-        buf.extend_from_slice(&data);
-
-        // Send via ant-quic Node
-        //
-        // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
-        // per-peer sends in a small timeout; a multi-second liveness repair on
-        // this path turns healthy gossip degradation into a timeout/log storm.
+        // Issue #292 invariant B + #1112: no gossip stream is opened toward
+        // a reconnect-suppressed peer or a seed-pin-rejected session.
+        // Reported as success for the same reason as the plane-pending hold
+        // below — the peer is already excluded from `gossip_plane_peers`,
+        // so there is no overlay view to protect, and a suppressed peer
+        // must never receive gossip.
         {
             let node = self.require_node().await?;
+            // #1112 (round 11): bind the policy check to the session it
+            // examined. The send below rides THAT generation or none: a
+            // connection replaced between the check and the send fails
+            // (generation superseded) instead of silently riding the new,
+            // unchecked winner.
+            let checked_generation = node.current_connection_generation(&ant_peer);
+            if self.is_reconnect_suppressed(ant_peer.0)
+                || self.seed_pin_rejected_session(&ant_peer).await
+                || !self.plane_gate_allows(&ant_peer)
+            {
+                debug!(
+                    "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} is suppressed or not admitted",
+                    stream_type,
+                    data.len(),
+                    peer
+                );
+                return Ok(());
+            }
 
-            node.send(&ant_peer, &buf)
-                .await
-                .map_err(|e| map_gossip_send_error(e, peer))?;
+            // Prepare message: [stream_type_byte | data]
+            let mut buf = Vec::with_capacity(1 + data.len());
+            buf.push(stream_type.to_byte());
+            buf.extend_from_slice(&data);
+
+            // Send via ant-quic Node
+            //
+            // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
+            // per-peer sends in a small timeout; a multi-second liveness repair on
+            // this path turns healthy gossip degradation into a timeout/log storm.
+            let send_result = if dial_pin_table().is_empty() {
+                // #1112 (round 13): generation binding is a pin-era
+                // behaviour. With nothing pinned it guards nothing and
+                // would only turn reconnect-race sends into failures, so
+                // the pre-#1112 plain send stands.
+                node.send(&ant_peer, &buf).await
+            } else {
+                match checked_generation {
+                    Some(generation) => node.send_on_generation(&ant_peer, generation, &buf).await,
+                    // No live session at capture time (#1112 round 12):
+                    // the structured PeerNotConnected — the #380 contract
+                    // (saorsa evicts on it), never a plain error that
+                    // would cool instead of evicting.
+                    None => {
+                        return Err(
+                            saorsa_gossip_transport::GossipTransportError::PeerNotConnected {
+                                peer_id: peer,
+                            }
+                            .into(),
+                        );
+                    }
+                }
+            };
+            send_result.map_err(|e| map_gossip_send_error(e, peer))?;
+
+            debug!(
+                "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
+                buf.len(),
+                stream_type,
+                peer
+            );
         }
         self.note_connection_pool_activity(ant_peer).await;
-
-        debug!(
-            "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
-            buf.len(),
-            stream_type,
-            peer
-        );
 
         Ok(())
     }
@@ -7286,11 +8610,14 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // the same policy the callback enforces, without allocating a
         // stream first. Still an error with zero bytes admitted — guarded
         // egress never silently holds like the ordinary path's `Ok(())`.
-        if self.is_reconnect_suppressed(ant_peer.0) || !self.plane_gate_allows(&ant_peer) {
-            return Err(anyhow::anyhow!(
-                "gossip plane policy refuses guarded send to peer {:?}",
-                peer
-            ));
+        {
+            let node = self.require_node().await?;
+            if !self.guarded_send_policy_allows(&node, &ant_peer) {
+                return Err(anyhow::anyhow!(
+                    "gossip plane policy refuses guarded send to peer {:?}",
+                    peer
+                ));
+            }
         }
 
         {
@@ -7307,7 +8634,11 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                         self.session_registry_cap(),
                         &ant_peer,
                     ),
-                    !self.is_reconnect_suppressed(ant_peer.0) && self.plane_gate_allows(&ant_peer),
+                    // Authoritative post-wait recheck (#1112 round 7): the
+                    // same policy as the pre-wait refusal, re-read AFTER
+                    // the stream waited for credit, so a rejection that
+                    // landed during the wait refuses the bytes here.
+                    self.guarded_send_policy_allows(&node, &ant_peer),
                     &admit,
                 )
             })
@@ -9910,6 +11241,1499 @@ mod tests {
             peer.parse::<SocketAddr>()
                 .unwrap_or_else(|_| panic!("Bootstrap peer '{}' is not a valid SocketAddr", peer));
         }
+    }
+
+    // ── Issue #1112: seed PeerId pinning ────────────────────────────────────
+
+    #[test]
+    fn issue1112_seed_list_content_is_unchanged() {
+        // #1112: the seed list's public type is unchanged; pins live in
+        // the separate SEED_PEER_ID_PINS table and must not change the
+        // production seed list. These are the exact 24 address strings
+        // that shipped before pinning existed
+        // (ADR-0011: 6 hosts x {443, 5483} x {IPv4, IPv6}).
+        const EXPECTED: &[&str] = &[
+            "142.93.199.50:443",
+            "147.182.234.192:443",
+            "65.21.157.229:443",
+            "116.203.101.172:443",
+            "152.42.210.67:443",
+            "170.64.176.102:443",
+            "[2604:a880:400:d1:0:3:7db3:f001]:443",
+            "[2604:a880:4:1d0:0:1:6ba1:f000]:443",
+            "[2a01:4f9:c012:684b::1]:443",
+            "[2a01:4f8:1c1a:31e6::1]:443",
+            "[2400:6180:0:d2:0:2:d30b:d000]:443",
+            "[2400:6180:10:200::ba69:b000]:443",
+            "142.93.199.50:5483",
+            "147.182.234.192:5483",
+            "65.21.157.229:5483",
+            "116.203.101.172:5483",
+            "152.42.210.67:5483",
+            "170.64.176.102:5483",
+            "[2604:a880:400:d1:0:3:7db3:f001]:5483",
+            "[2604:a880:4:1d0:0:1:6ba1:f000]:5483",
+            "[2a01:4f9:c012:684b::1]:5483",
+            "[2a01:4f8:1c1a:31e6::1]:5483",
+            "[2400:6180:0:d2:0:2:d30b:d000]:5483",
+            "[2400:6180:10:200::ba69:b000]:5483",
+        ];
+        assert_eq!(DEFAULT_BOOTSTRAP_PEERS, EXPECTED);
+    }
+
+    #[test]
+    fn issue1112_every_pinned_seed_address_has_exactly_one_pin() {
+        // #1112: the pin table is filled per address. Every pinned row
+        // must name a real seed address (byte-identical to its
+        // DEFAULT_BOOTSTRAP_PEERS entry), a pinned address must appear in
+        // exactly ONE row — a second row would be a silent override, not
+        // an error — and a row must pin at least one PeerId (an empty set
+        // is the unpinned/TOFU state and has no business in the table).
+        for pin in SEED_PEER_ID_PINS {
+            assert!(
+                DEFAULT_BOOTSTRAP_PEERS.contains(&pin.addr),
+                "pin row '{}' is not a DEFAULT_BOOTSTRAP_PEERS address",
+                pin.addr
+            );
+            assert!(
+                !pin.expected_peer_ids.is_empty(),
+                "pin row '{}' pins no PeerId; remove the row to keep TOFU",
+                pin.addr
+            );
+            let rows = SEED_PEER_ID_PINS
+                .iter()
+                .filter(|other| other.addr == pin.addr)
+                .count();
+            assert_eq!(
+                rows, 1,
+                "pin row '{}' must be the only row for that address",
+                pin.addr
+            );
+            let mut ids = pin.expected_peer_ids.iter().collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                pin.expected_peer_ids.len(),
+                "pin row '{}' lists a PeerId twice",
+                pin.addr
+            );
+        }
+    }
+
+    #[test]
+    fn issue1112_seed_pin_check_drops_a_mismatched_answer() {
+        // Acceptance (#1112): a seed address answering with an unexpected
+        // PeerId is not treated as a bootstrap peer. `Mismatch` is the
+        // verdict the join path turns into a dropped hint.
+        let old_key = [0x11; 32];
+        let new_key = [0x12; 32];
+        let answered = [0x22; 32];
+        // A rotation pins old and new together for the overlap window
+        // (docs/trust-and-connectivity.md); both are accepted.
+        let overlap_pin: [&[u8; 32]; 2] = [&old_key, &new_key];
+        assert_eq!(
+            seed_pin_check(&overlap_pin, old_key),
+            SeedPinVerdict::Match(old_key)
+        );
+        assert_eq!(
+            seed_pin_check(&overlap_pin, new_key),
+            SeedPinVerdict::Match(new_key)
+        );
+        // An answer outside the pin set is a failed hint: dropped.
+        assert_eq!(
+            seed_pin_check(&overlap_pin, answered),
+            SeedPinVerdict::Mismatch { answered }
+        );
+        // No pin: trust-on-first-use, behaviour unchanged.
+        assert_eq!(seed_pin_check(&[], answered), SeedPinVerdict::Unpinned);
+    }
+
+    #[test]
+    fn issue1112_pinned_lookup_resolves_only_pinned_seed_rows() {
+        const PIN: [&[u8; 32]; 1] = [&[0x33; 32]];
+        const ROTATION_PINS: [&[u8; 32]; 2] = [&[0x33; 32], &[0x34; 32]];
+        let table = [
+            SeedPeerPin {
+                addr: "198.51.100.7:5483",
+                expected_peer_ids: &PIN,
+            },
+            SeedPeerPin {
+                addr: "198.51.100.8:5483",
+                expected_peer_ids: &ROTATION_PINS,
+            },
+            SeedPeerPin {
+                addr: "198.51.100.9:5483",
+                expected_peer_ids: &[],
+            },
+        ];
+        // A pinned row resolves to its pin set, old and new together.
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.7:5483".parse().unwrap()),
+            &PIN[..]
+        );
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.8:5483".parse().unwrap()),
+            &ROTATION_PINS[..]
+        );
+        // An unpinned row and an unknown address resolve to an empty pin
+        // set (TOFU).
+        const NO_PINS: [&[u8; 32]; 0] = [];
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.9:5483".parse().unwrap()),
+            &NO_PINS[..]
+        );
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.10:5483".parse().unwrap()),
+            &NO_PINS[..]
+        );
+        // The compiled-in table's live state: the first seed is pinned,
+        // and the two cache-only Hetzner IPv4 rows stay TOFU until a
+        // handshake at that exact address verifies them (see the pins
+        // content test). The read goes to the table itself, never the
+        // live `pinned_seed_peer_ids`: a seam test holding the override
+        // in a shared libtest process must not be able to mask these
+        // rows (Codex 23 Oct 2026 review).
+        let first_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
+        assert!(!pinned_peer_ids_in(SEED_PEER_ID_PINS, first_seed).is_empty());
+        assert!(
+            pinned_peer_ids_in(SEED_PEER_ID_PINS, "65.21.157.229:443".parse().unwrap()).is_empty()
+        );
+        assert!(
+            pinned_peer_ids_in(SEED_PEER_ID_PINS, "116.203.101.172:5483".parse().unwrap())
+                .is_empty()
+        );
+        // Review round 2: v4-mapped and plain forms of the same address
+        // resolve to the same pin row.
+        let table = [SeedPeerPin {
+            addr: "198.51.100.7:5483",
+            expected_peer_ids: &PIN,
+        }];
+        assert_eq!(
+            pinned_peer_ids_in(&table, "198.51.100.7:5483".parse().unwrap()),
+            &PIN[..]
+        );
+        assert_eq!(
+            pinned_peer_ids_in(&table, "[::ffff:198.51.100.7]:5483".parse().unwrap()),
+            &PIN[..]
+        );
+        let mapped_table = [SeedPeerPin {
+            addr: "[::ffff:198.51.100.7]:5483",
+            expected_peer_ids: &PIN,
+        }];
+        assert_eq!(
+            pinned_peer_ids_in(&mapped_table, "198.51.100.7:5483".parse().unwrap()),
+            &PIN[..]
+        );
+    }
+
+    #[test]
+    fn issue1112_gate_scopes_the_verdict_to_the_address_and_identity() {
+        // Review round 5: the shared gate composes the pin lookup with
+        // the verdict, so the selector (which sees inbound connections
+        // the dial seam never gated) can validate the observed
+        // (address, identity) pair itself.
+        const PIN: [&[u8; 32]; 1] = [&[0x71; 32]];
+        const OTHER: [u8; 32] = [0x72; 32];
+        let table = [SeedPeerPin {
+            addr: "198.51.100.7:5483",
+            expected_peer_ids: &PIN,
+        }];
+        let pinned_addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
+        let other_addr: SocketAddr = "198.51.100.99:5483".parse().unwrap();
+        // Pinned address, member identity: admitted.
+        assert!(matches!(
+            seed_pin_gate_in(&table, pinned_addr, *PIN[0]),
+            SeedPinVerdict::Match(_)
+        ));
+        // Pinned address, non-member identity: mismatch — the pair check
+        // the selector runs on inbound connections.
+        assert!(matches!(
+            seed_pin_gate_in(&table, pinned_addr, OTHER),
+            SeedPinVerdict::Mismatch { .. }
+        ));
+        // Unpinned address: TOFU regardless of identity.
+        assert_eq!(
+            seed_pin_gate_in(&table, other_addr, OTHER),
+            SeedPinVerdict::Unpinned
+        );
+        // v4-mapped form of the pinned address resolves to the same row.
+        assert!(matches!(
+            seed_pin_gate_in(
+                &table,
+                "[::ffff:198.51.100.7]:5483".parse().unwrap(),
+                *PIN[0]
+            ),
+            SeedPinVerdict::Match(_)
+        ));
+        // The compiled-in table is live: at a pinned seed a non-member
+        // identity is a mismatch, and the two cache-only Hetzner IPv4
+        // rows are still TOFU (see the pins content test).
+        let pinned_seed: SocketAddr = DEFAULT_BOOTSTRAP_PEERS[0].parse().unwrap();
+        assert!(matches!(
+            seed_pin_gate(pinned_seed, OTHER),
+            SeedPinVerdict::Mismatch { .. }
+        ));
+        assert_eq!(
+            seed_pin_gate("65.21.157.229:443".parse().unwrap(), OTHER),
+            SeedPinVerdict::Unpinned
+        );
+    }
+
+    #[test]
+    fn issue1112_bootstrap_pin_set_membership_semantics() {
+        // dial_bootstrap's pinned-set path (#16), reused by the join-path
+        // pinning (#1112): an empty set pins nothing; a non-empty set
+        // admits only member identities.
+        let mut set = std::collections::HashSet::new();
+        assert!(
+            bootstrap_pin_set_allows(&set, [0x44; 32]),
+            "empty pinned set = trust-on-first-use (x0xd default)"
+        );
+        set.insert([0x44; 32]);
+        assert!(bootstrap_pin_set_allows(&set, [0x44; 32]));
+        assert!(!bootstrap_pin_set_allows(&set, [0x55; 32]));
+    }
+
+    // ── Issue #1112, review round 7: scoped rejections, teardown, guards ──
+
+    /// A two-node sim-fabric pair (distinct plane per test so the global
+    /// fabric registry stays isolated), joined by a real `connect_addr`
+    /// dial: the seam, sessions and plane state are production paths.
+    async fn issue1112_sim_pair(
+        plane: &'static str,
+        fabric_seed: u64,
+    ) -> (NetworkNode, NetworkNode, SocketAddr) {
+        let fabric = sim::SimFabric::new(fabric_seed);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let seed = NetworkNode::new(config(2), None, None).await.unwrap();
+        let joiner = NetworkNode::new(config(1), None, None).await.unwrap();
+        let seed_addr = SocketAddr::from(([198, 18, 0, 2], 5483));
+        (seed, joiner, seed_addr)
+    }
+
+    /// Round 22: the sim pair with an in-memory (`persist(false)`)
+    /// bootstrap cache on the JOINER, so the cached id-dial path
+    /// (`connect_cached_peer`) runs end to end over the fabric — the
+    /// production cache-config branch of the sim backend.
+    async fn issue1112_sim_pair_with_joiner_cache(
+        plane: &'static str,
+        fabric_seed: u64,
+    ) -> (NetworkNode, NetworkNode, SocketAddr) {
+        let fabric = sim::SimFabric::new(fabric_seed);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let cache_config = ant_quic::BootstrapCacheConfig::builder()
+            .persist(false)
+            .build();
+        let seed = NetworkNode::new(config(2), None, None).await.unwrap();
+        let joiner = NetworkNode::new(config(1), Some(cache_config), None)
+            .await
+            .unwrap();
+        let seed_addr = SocketAddr::from(([198, 18, 0, 2], 5483));
+        (seed, joiner, seed_addr)
+    }
+
+    /// Review round 7 P2 (rejected seeds remain transport coordinators):
+    /// the mismatch refusal must close the answered connection. ant-quic's
+    /// coordinator selection reuses any live connection to a seed address
+    /// and never consults x0x's rejection set, so a live leftover kept the
+    /// rejected seed usable as transport assistance. Runtime-RED before
+    /// round 7: the refusal only recorded state and the connection stayed
+    /// open (`is_connected` still true after the refusal).
+    #[tokio::test]
+    async fn issue1112_mismatch_refusal_closes_the_answered_connection() {
+        let plane = "issue1112-r7-teardown";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_121).await;
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        assert!(joiner.is_connected(&seed_peer).await);
+
+        let link = joiner.node.read().await.clone().expect("live link");
+        let err = joiner
+            .refuse_seed_pin_mismatch(&link, seed_addr, &seed_peer, "test")
+            .await;
+        assert!(matches!(err, NetworkError::ConnectionFailed(_)));
+
+        assert!(
+            !joiner.is_connected(&seed_peer).await,
+            "the pin-mismatched connection must not stay usable as coordinator/relay assistance"
+        );
+        // The bounded backoff refuses a re-dial of the rejected address
+        // pre-socket. Runtime-RED before round 7: the re-dial succeeded.
+        assert!(joiner.seed_pin_addr_rejected(seed_addr));
+        assert!(
+            joiner.connect_addr(seed_addr).await.is_err(),
+            "the rejected address is not re-socketed inside the backoff window"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Review round 7: the rejection is a scoped, bounded, EXPIRING
+    /// backoff, not a process-lifetime tombstone — once the window ends
+    /// the address is dialable again (the operator may have re-keyed the
+    /// host or fixed its pin row).
+    #[tokio::test]
+    async fn issue1112_rejection_backoff_expires_and_the_address_redials() {
+        let plane = "issue1112-r7-expiry";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_122).await;
+        // A 20 ms window keeps the test real-time cheap.
+        *joiner
+            .test_seed_pin_rejection_ttl
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Duration::from_millis(20));
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        let link = joiner.node.read().await.clone().expect("live link");
+        let _ = joiner
+            .refuse_seed_pin_mismatch(&link, seed_addr, &seed_peer, "test")
+            .await;
+        assert!(joiner.connect_addr(seed_addr).await.is_err());
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !joiner.seed_pin_addr_rejected(seed_addr),
+            "the backoff window must expire"
+        );
+        assert!(
+            joiner.connect_addr(seed_addr).await.is_ok(),
+            "after the window the address is dialable again"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Review round 7 P2 (guarded sends can bypass a late rejection): the
+    /// guarded-send policy is recomputed inside the post-`open_uni`
+    /// callback, so a rejection that lands while the stream waits for
+    /// credit refuses the bytes there. The state asserted between the two
+    /// evaluations is exactly what the seam writes first — the rejection
+    /// entry against the live session's generation, before the close
+    /// lands. Runtime-RED before round 7: the callback recomputed only the
+    /// suppression and plane terms, so the late rejection admitted bytes.
+    #[tokio::test]
+    async fn issue1112_guarded_send_recheck_refuses_a_late_rejection() {
+        let plane = "issue1112-r7-delayed";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_123).await;
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        joiner.plane_handle_hello(seed_peer, plane).await;
+        let link = joiner.node.read().await.clone().expect("live link");
+
+        // The pre-wait refusal passes: nothing is rejected yet.
+        assert!(
+            joiner.guarded_send_policy_allows(&link, &seed_peer),
+            "the clean session must pass the pre-wait policy"
+        );
+
+        // The rejection lands while open_uni() waits — between the two
+        // policy evaluations — naming the live session's generation.
+        let live_generation = link.current_connection_generation(&seed_peer);
+        joiner.record_seed_pin_rejection(seed_addr, seed_peer.0, live_generation);
+
+        // The post-wait recheck (the callback's evaluation) refuses.
+        assert!(
+            !joiner.guarded_send_policy_allows(&link, &seed_peer),
+            "a rejection that landed during the stream wait must not admit gossip bytes"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Review round 7 P2 (rejection is identity-wide and completion-order
+    /// dependent): the rejection is scoped to the mismatching
+    /// address/session. A match at one address neither suppresses nor
+    /// erases a mismatch recorded at another, in EITHER completion order.
+    /// Runtime-RED before round 7: a match cleared the identity's whole
+    /// rejection set (erasing the other address's mismatch) and a mismatch
+    /// suppressed the identity's valid connection too.
+    #[tokio::test]
+    async fn issue1112_rejection_scoping_survives_both_completion_orders() {
+        let plane = "issue1112-r7-scoping";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_124).await;
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        joiner.plane_handle_hello(seed_peer, plane).await;
+        let link = joiner.node.read().await.clone().expect("live link");
+        // The identity's VALID path: the live session, on its own
+        // generation, at `seed_addr`. The bad path: a dial to
+        // `mismatch_addr` answered the same identity outside its pins,
+        // on another connection (generation 999 by construction).
+        let mismatch_addr: SocketAddr = "198.51.100.99:5483".parse().unwrap();
+        let mismatch_generation = 999;
+
+        for mismatch_first in [true, false] {
+            if mismatch_first {
+                // Order 1: mismatch at the other address, THEN a match on
+                // the valid path.
+                joiner.record_seed_pin_rejection(
+                    mismatch_addr,
+                    seed_peer.0,
+                    Some(mismatch_generation),
+                );
+                joiner.clear_seed_pin_rejection(seed_addr);
+            } else {
+                // Order 2: match on the valid path first, THEN the
+                // mismatch at the other address.
+                joiner.clear_seed_pin_rejection(seed_addr);
+                joiner.record_seed_pin_rejection(
+                    mismatch_addr,
+                    seed_peer.0,
+                    Some(mismatch_generation),
+                );
+            }
+            assert!(
+                joiner.seed_pin_addr_rejected(mismatch_addr),
+                "a match at another address must not erase this address's rejection (order {mismatch_first})"
+            );
+            assert!(
+                joiner.guarded_send_policy_allows(&link, &seed_peer),
+                "the valid session (its own generation, another address) stays admitted (order {mismatch_first})"
+            );
+            joiner.clear_seed_pin_rejection(mismatch_addr);
+        }
+
+        // The same-address scope: an entry naming the LIVE session's
+        // generation refuses it, and a later MATCH at that same address
+        // (the seam's pair-scoped clear) lifts the refusal at once.
+        let live_generation = link.current_connection_generation(&seed_peer);
+        joiner.record_seed_pin_rejection(seed_addr, seed_peer.0, live_generation);
+        assert!(!joiner.guarded_send_policy_allows(&link, &seed_peer));
+        joiner.clear_seed_pin_rejection(seed_addr);
+        assert!(joiner.guarded_send_policy_allows(&link, &seed_peer));
+
+        // The any-connection clause (round 7): a NEW connection of the
+        // identity on the rejected address — what an ant-quic internal
+        // coordinator dial produces, on a generation the entry never saw —
+        // is still refused where a frame or admission lookup names only
+        // the peer. Runtime-RED without the clause: the fresh generation
+        // slipped past the generation match.
+        joiner.record_seed_pin_rejection(seed_addr, seed_peer.0, Some(mismatch_generation));
+        assert!(
+            joiner.seed_pin_rejected_session(&seed_peer).await,
+            "a fresh connection on the rejected address must stay refused"
+        );
+        joiner.clear_seed_pin_rejection(seed_addr);
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Review round 7 P2 (cached capability evidence): the mismatch
+    /// refusal evicts the answered identity from the shared bootstrap
+    /// cache, so cache-reading coordinator selection
+    /// (`select_coordinators`) cannot surface the rejected identity while
+    /// the backoff lives. Runtime-RED before round 7: the cached row, with
+    /// its capability record, survived the refusal.
+    #[tokio::test]
+    async fn issue1112_mismatch_refusal_evicts_cached_capability_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("peers");
+        let cache_config = ant_quic::BootstrapCacheConfig::builder()
+            .cache_dir(&cache_dir)
+            .min_peers_to_save(1)
+            .persist(false)
+            .build();
+        let node = NetworkNode::new(test_network_config(), Some(cache_config), None)
+            .await
+            .unwrap();
+        let cache = node.bootstrap_cache().expect("shared endpoint cache");
+        let rejected = test_ant_peer(0x77);
+        let addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
+        cache.add_seed(rejected, vec![addr]).await;
+        cache
+            .update_capabilities(
+                &rejected,
+                ant_quic::bootstrap_cache::PeerCapabilities {
+                    supports_relay: true,
+                    supports_coordination: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(cache.get_peer(&rejected).await.is_some());
+
+        let link = node.node.read().await.clone().expect("live link");
+        let err = node
+            .refuse_seed_pin_mismatch(&link, addr, &rejected, "test")
+            .await;
+        assert!(matches!(err, NetworkError::ConnectionFailed(_)));
+        assert!(
+            cache.get_peer(&rejected).await.is_none(),
+            "the rejected identity's cached capability evidence must not survive the refusal"
+        );
+
+        node.try_shutdown().await.unwrap();
+    }
+
+    /// Round 8 (Claude finding 1): the seam itself, end to end, over a
+    /// POPULATED pin table (test override): a pinned seed address that
+    /// answers outside its pin set fails the dial, closes the connection,
+    /// never emits `PeerConnected`, never writes the cache, and backs the
+    /// address off. Runtime-RED before the injectable table: the seam's
+    /// mismatch branch could not be exercised by any test.
+    #[tokio::test]
+    async fn issue1112_seam_refuses_a_mismatched_dial_end_to_end() {
+        const NOT_THE_SEED: [u8; 32] = [0xAB; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r8-seam";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_131).await;
+        let mut events = joiner.subscribe();
+        let _pins = TestPinTableGuard::set(&PINS);
+
+        let dial = joiner.connect_addr(seed_addr).await;
+        assert!(
+            matches!(dial, Err(NetworkError::ConnectionFailed(_))),
+            "a pinned address answering outside its pin set is refused at the seam"
+        );
+        assert!(
+            !joiner.is_connected(&seed.peer_id()).await,
+            "the answered connection is closed, not left as transport assistance"
+        );
+        assert!(joiner.seed_pin_addr_rejected(seed_addr));
+        assert!(
+            joiner.connect_addr(seed_addr).await.is_err(),
+            "the rejected address is not re-socketed inside the backoff"
+        );
+        // No bookkeeping ran: no PeerConnected event for the refused dial.
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    &event,
+                    NetworkEvent::PeerConnected { peer_id, .. } if *peer_id == seed.peer_id().0
+                ),
+                "a refused dial must not emit PeerConnected"
+            );
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 22 (Codex P2: id dials answered outside the address seam):
+    /// `connect_peer_with_addrs` — the peer-authenticated dial the
+    /// cached loop and its no-hint fallback use — takes the seam's pin
+    /// verdict on the ANSWERED connection's own remote address. A
+    /// pinned seed address that answers outside its pin set is refused:
+    /// backoff entry recorded, answered connection closed (no live
+    /// transport-assistance path for ant-quic's coordinator selection),
+    /// cache row evicted, dial failed. Runtime-RED before round 22: the
+    /// dial returned Ok((seed_addr, seed)) and left the connection
+    /// live.
+    #[tokio::test]
+    async fn issue1112_id_dial_landing_on_a_pinned_address_is_refused_and_closed() {
+        const NOT_THE_SEED: [u8; 32] = [0xD1; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r22-iddial";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_141).await;
+        let mut events = joiner.subscribe();
+        let _pins = TestPinTableGuard::set(&PINS);
+
+        let dial = joiner
+            .connect_peer_with_addrs(seed.peer_id(), vec![seed_addr])
+            .await;
+        assert!(
+            matches!(dial, Err(NetworkError::ConnectionFailed(_))),
+            "a pinned address answering outside its pin set is refused on the id-dial path"
+        );
+        assert!(
+            !joiner.is_connected(&seed.peer_id()).await,
+            "the answered connection is closed, not left as transport assistance"
+        );
+        assert!(
+            joiner.seed_pin_addr_rejected(seed_addr),
+            "the refusal records the bounded address backoff"
+        );
+        // No bookkeeping ran: no PeerConnected event for the refused dial.
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    &event,
+                    NetworkEvent::PeerConnected { peer_id, .. } if *peer_id == seed.peer_id().0
+                ),
+                "a refused id dial must not emit PeerConnected"
+            );
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 22 (Codex P2, mixed cache rows): the cached id dial never
+    /// sockets a candidate the pin verdict refuses — a fully poisoned
+    /// row (every address mismatches a pin set that excludes the
+    /// identity) contributes no candidate at all: no socket, no
+    /// answered connection, no PeerConnected, failed dial. Runtime-RED
+    /// before round 22: `connect_cached_peer` dialled the row, returned
+    /// Ok((seed_addr, seed)) and left the connection live.
+    #[tokio::test]
+    async fn issue1112_cached_dial_never_sockets_a_fully_poisoned_row() {
+        const NOT_THE_SEED: [u8; 32] = [0xD2; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r22-poisoned";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair_with_joiner_cache(plane, 11_142).await;
+        let mut events = joiner.subscribe();
+        let _pins = TestPinTableGuard::set(&PINS);
+        // The poisoned row: the seed's own id at a pinned address whose
+        // pin set excludes it (whatever wrote the row).
+        let cache = joiner.bootstrap_cache.clone().expect("joiner cache");
+        cache
+            .add_from_connection(seed.peer_id(), vec![seed_addr], None)
+            .await;
+        assert!(
+            cache.get_peer(&seed.peer_id()).await.is_some(),
+            "the poisoned row exists"
+        );
+
+        let dial = joiner.connect_cached_peer(seed.peer_id()).await;
+        assert!(
+            matches!(dial, Err(NetworkError::ConnectionFailed(_))),
+            "a fully poisoned row is never dialled"
+        );
+        assert!(
+            !joiner.is_connected(&seed.peer_id()).await,
+            "no connection was made to the rejected pair"
+        );
+        assert!(
+            !joiner.seed_pin_addr_rejected(seed_addr),
+            "the skip never sockets the pair, so no backoff entry is written"
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    &event,
+                    NetworkEvent::PeerConnected { peer_id, .. } if *peer_id == seed.peer_id().0
+                ),
+                "a skipped row must not emit PeerConnected"
+            );
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 22 companion (Codex P2: "test the complete mixed-row
+    /// connection path"): a row listing a pinned address that excludes
+    /// the identity AND the identity's own valid address reaches the
+    /// VALID sibling through `connect_cached_peer`, and the pinned
+    /// address never keeps a connection. (Also green before round 22 —
+    /// the identity gate already refused the different-id landing; the
+    /// RED halves of the scenario are the refused-landing and
+    /// fully-poisoned tests above.)
+    #[tokio::test]
+    async fn issue1112_mixed_cache_row_id_dial_reaches_the_valid_sibling() {
+        const NOT_THE_SEED: [u8; 32] = [0xD3; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.3:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r22-mixed";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair_with_joiner_cache(plane, 11_143).await;
+        // A third node occupies the pinned address; the pin set there
+        // excludes the seed's identity.
+        let third = NetworkNode::new(
+            NetworkConfig {
+                bind_addr: Some(SocketAddr::from(([198, 18, 0, 3], 5483))),
+                network_id: Some(plane.to_string()),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let pinned_addr: SocketAddr = "198.18.0.3:5483".parse().unwrap();
+        let _pins = TestPinTableGuard::set(&PINS);
+        // The mixed row: the pinned address the pins refuse for this
+        // identity, then the identity's valid listener.
+        let cache = joiner.bootstrap_cache.clone().expect("joiner cache");
+        cache
+            .add_from_connection(seed.peer_id(), vec![pinned_addr, seed_addr], None)
+            .await;
+        assert_eq!(
+            cache
+                .get_peer(&seed.peer_id())
+                .await
+                .expect("the mixed row exists")
+                .preferred_addresses()
+                .len(),
+            2,
+            "the row keeps both addresses"
+        );
+
+        let dial = joiner.connect_cached_peer(seed.peer_id()).await;
+        assert_eq!(
+            dial.expect("the valid sibling is reached"),
+            seed_addr,
+            "the mismatching sibling costs itself, never the valid address"
+        );
+        assert!(joiner.is_connected(&seed.peer_id()).await);
+        assert!(
+            !joiner.is_connected(&third.peer_id()).await,
+            "the pinned address never keeps a connection"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+        third.try_shutdown().await.unwrap();
+    }
+
+    /// Round 23 (Codex P2: inbound pin mismatches remained usable as
+    /// coordinators): the accept gate refuses a rejected seed dialling
+    /// back in — bounded entry recorded, connection closed BEFORE any
+    /// cache write or admission (no PeerConnected), so ant-quic's
+    /// coordinator selection cannot reuse the live connection as
+    /// transport assistance. Runtime-RED before round 23: the inbound
+    /// session stayed connected and no entry existed.
+    #[tokio::test]
+    async fn issue1112_inbound_mismatch_is_refused_at_accept() {
+        const NOT_THE_SEED: [u8; 32] = [0xE1; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r23-accept";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_151).await;
+        let mut events = joiner.subscribe();
+        let _pins = TestPinTableGuard::set(&PINS);
+        // The mismatched seed dials in; its own seam check runs on the
+        // JOINER's (unpinned) address, so the dial itself succeeds.
+        let joiner_addr = SocketAddr::from(([198, 18, 0, 1], 5483));
+        seed.connect_addr(joiner_addr).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(5_000), async {
+            loop {
+                if !joiner.is_connected(&seed.peer_id()).await
+                    && joiner.seed_pin_addr_rejected(seed_addr)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the inbound mismatch is refused at accept: closed and recorded");
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(
+                    &event,
+                    NetworkEvent::PeerConnected { peer_id, .. } if *peer_id == seed.peer_id().0
+                ),
+                "a refused inbound session must not emit PeerConnected"
+            );
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 23 (Codex P2: the cached dial's connected fast path
+    /// bypassed pin enforcement): an EXISTING mismatched connection — an
+    /// ant-quic-internal establishment or a pre-pin leftover — is refused
+    /// and closed by the fast path, never reported as a cached-dial
+    /// success the coordination plane can reuse. Runtime-RED before
+    /// round 23: the fast path returned Ok(seed_addr) and left the
+    /// connection live.
+    #[tokio::test]
+    async fn issue1112_cached_dial_fast_path_refuses_a_live_mismatched_session() {
+        const NOT_THE_SEED: [u8; 32] = [0xE2; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r23-fastpath";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_152).await;
+        // TOFU while the table is empty — the internal/pre-pin leftover.
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        assert!(joiner.is_connected(&seed_peer).await);
+        // The pins land; the cached dial touches the live mismatched
+        // session through its connected fast path (no cache needed —
+        // the fast path runs before the row lookup).
+        let _pins = TestPinTableGuard::set(&PINS);
+        let dial = joiner.connect_cached_peer(seed_peer).await;
+        assert!(
+            matches!(dial, Err(NetworkError::ConnectionFailed(_))),
+            "the connected fast path refuses the pair the pins reject"
+        );
+        assert!(
+            !joiner.is_connected(&seed_peer).await,
+            "the mismatched connection is closed, not left as transport assistance"
+        );
+        assert!(
+            joiner.seed_pin_addr_rejected(seed_addr),
+            "the refusal records the bounded address backoff"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 8 (Codex P2: internal redials bypass rejection): pin
+    /// eligibility is enforced against the LIVE connection set,
+    /// independent of the backoff. A connection on a pinned address whose
+    /// pin set excludes the identity — what an ant-quic-internal
+    /// coordinator redial of a rejected seed produces, never passing
+    /// x0x's seam — reads Suppressed with NO rejection entry at all, and
+    /// still reads Suppressed after an entry EXPIRES. Runtime-RED before
+    /// the timeless pair clause: after expiry (or with no entry) the
+    /// connection read Admitted.
+    #[tokio::test]
+    async fn issue1112_internal_redial_after_backoff_still_refused() {
+        const NOT_THE_SEED: [u8; 32] = [0xAC; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r8-redial";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_132).await;
+        // TOFU connect with no pin table — the connection exists, exactly
+        // like an internal redial would leave behind.
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        joiner.plane_handle_hello(seed_peer, plane).await;
+        assert_eq!(
+            joiner.peer_admission(&seed_peer).await,
+            PeerAdmission::Admitted
+        );
+
+        // Pins land: the existing connection now mismatches its address's
+        // pin set. No rejection entry exists — the pair verdict alone
+        // must refuse it.
+        let _pins = TestPinTableGuard::set(&PINS);
+        assert_eq!(
+            joiner.peer_admission(&seed_peer).await,
+            PeerAdmission::Suppressed,
+            "pin eligibility is independent of the backoff entries"
+        );
+
+        // And after a recorded entry EXPIRES, the connection is still
+        // refused — the pair verdict is timeless.
+        *joiner
+            .test_seed_pin_rejection_ttl
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Duration::from_millis(20));
+        joiner.record_seed_pin_rejection(seed_addr, seed_peer.0, Some(999));
+        assert_eq!(
+            joiner.peer_admission(&seed_peer).await,
+            PeerAdmission::Suppressed
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !joiner.seed_pin_addr_rejected(seed_addr),
+            "the backoff window itself has expired"
+        );
+        assert_eq!(
+            joiner.peer_admission(&seed_peer).await,
+            PeerAdmission::Suppressed,
+            "an expired entry must not re-admit a connection the pins refuse"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 8 (Codex P2: a missing generation blocked the whole
+    /// identity): an entry whose generation evidence was lost (the
+    /// mismatching connection closed before capture) stays
+    /// ADDRESS-scoped — it refuses a session on its own address only,
+    /// never the identity's valid session elsewhere. Runtime-RED before
+    /// the address-scoped fallback: the `None` branch refused every live
+    /// session of the identity for the whole window.
+    #[tokio::test]
+    async fn issue1112_missing_generation_stays_address_scoped() {
+        let plane = "issue1112-r8-nogen";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_133).await;
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        joiner.plane_handle_hello(seed_peer, plane).await;
+        let link = joiner.node.read().await.clone().expect("live link");
+        let other_addr: SocketAddr = "198.51.100.99:5483".parse().unwrap();
+
+        // A generation-less entry at ANOTHER address must not refuse this
+        // session, sync or async.
+        joiner.record_seed_pin_rejection(other_addr, seed_peer.0, None);
+        assert!(
+            joiner.guarded_send_policy_allows(&link, &seed_peer),
+            "a generation-less entry at another address must not refuse this session"
+        );
+        assert!(
+            !joiner.seed_pin_rejected_session(&seed_peer).await,
+            "the identity check stays address-scoped too"
+        );
+
+        // On its own address it still refuses (the any-connection clause).
+        joiner.record_seed_pin_rejection(seed_addr, seed_peer.0, None);
+        assert!(
+            joiner.seed_pin_rejected_session(&seed_peer).await,
+            "a generation-less entry still refuses a session on its own address"
+        );
+        joiner.clear_seed_pin_rejection(seed_addr);
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 11 (Codex P2: queued frames can bypass pin rejection after
+    /// disconnect, un-refused-session variant; reworked rounds 22-23): a
+    /// session the pins mismatch but no seam or accept gate refused
+    /// records NO rejection entry, so a frame it queues and drains after
+    /// its close slipped past the recorded-entry clause. Rounds 22-23
+    /// refuse such sessions on every OUTBOUND dial and INBOUND accept,
+    /// so the session is created the way an ant-quic-internal
+    /// coordinator dial would — a RAW transport dial beneath x0x's
+    /// seams, ledgered by the always-on lifecycle watcher. The
+    /// session-address ledger maps the frame's source generation to its
+    /// address, and the timeless pair verdict refuses it — no manual
+    /// rejection inserted. Runtime-RED before the ledger clause: the
+    /// drained frame reached the gossip channels.
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue1112_inbound_queued_frame_refused_without_a_recorded_entry() {
+        const NOT_THE_SEED: [u8; 32] = [0xAF; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r11-iddial";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_135).await;
+        let _pins = TestPinTableGuard::set(&PINS);
+        // Round 23: inbound mismatches are refused at accept too, so the
+        // no-entry session is created the way an ant-quic-INTERNAL
+        // coordinator dial would — a RAW transport dial beneath x0x's
+        // seams (`LinkNode::connect_addr`, exactly what the address seam
+        // calls after its gates). The always-on lifecycle watcher — not a
+        // dial seam, not the accept loop — leaves the ledger evidence; no
+        // rejection entry exists anywhere.
+        let joiner_peer = joiner.peer_id();
+        let link = joiner.node.read().await.clone().expect("live link");
+        link.connect_addr(seed_addr)
+            .await
+            .expect("raw transport dial beneath the seams");
+        let seed_peer = seed.peer_id();
+        let generation = tokio::time::timeout(Duration::from_millis(5_000), async {
+            loop {
+                if let Some(generation) = link.current_connection_generation(&seed_peer) {
+                    if joiner.session_addr_for(&seed_peer, generation).is_some() {
+                        return generation;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the lifecycle watcher ledgered the raw session");
+
+        // The peer queues a Bulk frame, then the connection closes.
+        let seed_link = seed.node.read().await.clone().expect("live link");
+        let mut frame = vec![saorsa_gossip_transport::GossipStreamType::Bulk.to_byte()];
+        frame.extend_from_slice(b"queued before the close");
+        seed_link.send(&joiner_peer, &frame).await.unwrap();
+        let _ = link.disconnect(&seed_peer).await;
+
+        // No rejection entry was ever recorded...
+        assert!(joiner.live_seed_pin_rejections().is_empty());
+        // ...but the frame's source session is ledgered, and the pair
+        // verdict refuses it.
+        assert_eq!(
+            joiner.session_addr_for(&seed_peer, generation),
+            Some(seed_addr),
+            "the lifecycle watcher ledgered the raw session"
+        );
+        assert!(joiner.seed_pin_rejects_frame(&link, &seed_peer, generation));
+
+        // End to end: nothing from the closed, pin-mismatched session
+        // reaches the gossip channels.
+        match tokio::time::timeout(Duration::from_millis(250), joiner.receive_message()).await {
+            Err(_elapsed) => {}
+            Ok(Ok((peer, stream_type, _))) => panic!(
+                "queued frame from the pin-mismatched session reached the gossip plane ({stream_type:?} from {peer:?})"
+            ),
+            Ok(Err(e)) => panic!("gossip receive failed: {e}"),
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 11 (Codex P2: ordinary gossip sends can bypass the check
+    /// during connection replacement): the ordinary send path binds its
+    /// bytes to the generation it examined — a send pinned to a
+    /// superseded generation fails instead of silently riding the
+    /// replacement connection the policy never checked. Runtime-RED
+    /// before the binding (plain `send` rode whatever connection was
+    /// current at write time).
+    #[tokio::test]
+    async fn issue1112_ordinary_send_binds_to_the_checked_generation() {
+        let plane = "issue1112-r11-bind";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_136).await;
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        let link = joiner.node.read().await.clone().expect("live link");
+        let first = link
+            .current_connection_generation(&seed_peer)
+            .expect("live generation");
+        // A send pinned to the live generation rides it.
+        link.send_on_generation(&seed_peer, first, &[0x00, 0x01])
+            .await
+            .unwrap();
+
+        // Replacement: disconnect, then re-dial — a NEW generation.
+        let _ = link.disconnect(&seed_peer).await;
+        joiner.connect_addr(seed_addr).await.unwrap();
+        let second = link
+            .current_connection_generation(&seed_peer)
+            .expect("replacement generation");
+        assert_ne!(first, second, "the re-dial must be a new generation");
+
+        assert!(
+            link.send_on_generation(&seed_peer, first, &[0x00, 0x01])
+                .await
+                .is_err(),
+            "a send bound to the superseded generation must not ride the replacement"
+        );
+        link.send_on_generation(&seed_peer, second, &[0x00, 0x01])
+            .await
+            .unwrap();
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 12 (Codex P2: reconnecting at the same address deleted the
+    /// previous generation's evidence): a reconnect at the SAME address
+    /// must not erase the earlier generation's ledger entry — frames
+    /// queued on the old generation still drain after the reconnect, and
+    /// their evidence is what refuses them. Runtime-RED before the fix:
+    /// the same-address dedup clause removed the old entry on the new
+    /// note.
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue1112_same_address_reconnect_keeps_old_generation_evidence() {
+        const NOT_THE_SEED: [u8; 32] = [0xB1; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r12-reconnect";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_137).await;
+        let _pins = TestPinTableGuard::set(&PINS);
+        // Rounds 22-23: outbound dials at the mismatching address are
+        // refused at every seam and inbound ones at accept, so BOTH
+        // generations are RAW transport dials beneath x0x's seams — the
+        // ant-quic-internal reconnect model. From the joiner's ledger
+        // view each session's remote address IS the pinned seed address:
+        // a same-address reconnect, the round-12 scenario. The lifecycle
+        // watcher leaves the ledger evidence for each generation.
+        let seed_peer = seed.peer_id();
+        let link = joiner.node.read().await.clone().expect("live link");
+        link.connect_addr(seed_addr).await.expect("first raw dial");
+        let first = tokio::time::timeout(Duration::from_millis(5_000), async {
+            loop {
+                if let Some(generation) = link.current_connection_generation(&seed_peer) {
+                    if joiner.session_addr_for(&seed_peer, generation).is_some() {
+                        return generation;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first raw session is ledgered");
+        // A frame queues on the old generation, then the connection
+        // closes and the peer RECONNECTS at the same address.
+        let joiner_peer = joiner.peer_id();
+        let seed_link = seed.node.read().await.clone().expect("live link");
+        let mut frame = vec![saorsa_gossip_transport::GossipStreamType::Bulk.to_byte()];
+        frame.extend_from_slice(b"queued on the old generation");
+        seed_link.send(&joiner_peer, &frame).await.unwrap();
+        let _ = link.disconnect(&seed_peer).await;
+        link.connect_addr(seed_addr)
+            .await
+            .expect("reconnect raw dial");
+        let second = tokio::time::timeout(Duration::from_millis(5_000), async {
+            loop {
+                if let Some(generation) = link.current_connection_generation(&seed_peer) {
+                    if generation != first
+                        && joiner.session_addr_for(&seed_peer, generation).is_some()
+                    {
+                        return generation;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the replacement session is ledgered");
+        assert_ne!(first, second);
+
+        // Both generations keep their evidence at the shared address.
+        assert_eq!(
+            joiner.session_addr_for(&seed_peer, first),
+            Some(seed_addr),
+            "a reconnect at the same address must not erase the old generation's evidence"
+        );
+        assert_eq!(joiner.session_addr_for(&seed_peer, second), Some(seed_addr));
+        // The OLD generation's queued frame is refused by the pair
+        // verdict over its own evidence.
+        assert!(joiner.seed_pin_rejects_frame(&link, &seed_peer, first));
+        match tokio::time::timeout(Duration::from_millis(250), joiner.receive_message()).await {
+            Err(_elapsed) => {}
+            Ok(Ok((peer, stream_type, _))) => panic!(
+                "queued frame from the replaced session reached the gossip plane ({stream_type:?} from {peer:?})"
+            ),
+            Ok(Err(e)) => panic!("gossip receive failed: {e}"),
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Round 12-13 (Codex P2 + Claude: the `None`-generation fallback
+    /// restored the unchecked send path, and the failure must keep the
+    /// #380 error contract): with no live session at capture time, the
+    /// ordinary send fails with the STRUCTURED PeerNotConnected —
+    /// saorsa-gossip evicts on it (a plain error would only cool) —
+    /// while the pins-empty path keeps the plain pre-#1112 send.
+    #[tokio::test]
+    async fn issue1112_ordinary_send_without_a_live_session_fails() {
+        const NOT_THE_SEED: [u8; 32] = [0xB3; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let plane = "issue1112-r12-nosession";
+        let (seed, joiner, _seed_addr) = issue1112_sim_pair(plane, 11_138).await;
+        // A plane-cleared peer with NO live connection: the hold branches
+        // do not mask the send, so the missing session is the outcome.
+        let peer = seed.peer_id();
+        assert!(!joiner.is_connected(&peer).await);
+        joiner.plane_handle_hello(peer, plane).await;
+
+        // Pin era: the structured PeerNotConnected, never a plain error.
+        let _pins = TestPinTableGuard::set(&PINS);
+        let result = joiner
+            .send_to_peer(
+                ant_to_gossip_peer_id(&peer),
+                saorsa_gossip_transport::GossipStreamType::Membership,
+                bytes::Bytes::from_static(b"membership-frame"),
+            )
+            .await;
+        let err = result.expect_err("a send with no live session must fail");
+        let transport_error = err
+            .downcast::<saorsa_gossip_transport::GossipTransportError>()
+            .expect("the failure keeps the structured transport error");
+        assert!(
+            transport_error.is_peer_not_connected(),
+            "PeerNotConnected carries the #380 eviction contract, got {transport_error:?}"
+        );
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
+    }
+
+    /// Rounds 13-14, reworked 23 Oct 2026 (Engineer ruling on Claude's
+    /// review: the fail-closed rule must not swallow VALID seeds): with
+    /// pins in force, a frame of unknown provenance is refused ONLY for
+    /// a peer with a LIVE REJECTION entry — never on seed-address
+    /// history alone. Known provenance (a ledgered generation, the
+    /// current session) still decides by the pair verdict. Runtime-RED
+    /// before the rework: a pin-matching seed's frames of an unobserved
+    /// or evicted generation were refused by history alone.
+    #[tokio::test]
+    async fn issue1112_unknown_provenance_flows_without_a_live_rejection() {
+        const NOT_THE_SEED: [u8; 32] = [0xB4; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let pinned_addr: SocketAddr = "198.18.0.2:5483".parse().unwrap();
+        let node = NetworkNode::new(test_network_config(), None, None)
+            .await
+            .unwrap();
+        let link = node.node.read().await.clone().expect("live link");
+        let implicated = test_ant_peer(0x9);
+        let ordinary = test_ant_peer(0xA);
+
+        // Pins empty: the guard is dormant for everyone.
+        assert!(!node.seed_pin_rejects_frame(&link, &implicated, 42));
+
+        let _pins = TestPinTableGuard::set(&PINS);
+        // Ordinary peer, unknown provenance: outside the threat model.
+        assert!(
+            !node.seed_pin_rejects_frame(&link, &ordinary, 42),
+            "a peer with no seed-address history keeps flowing under pins"
+        );
+        // A PIN-MATCHING seed (Claude review of bd831aa, risk 2): the
+        // ledger records its sessions at the pinned address like anyone
+        // else's, and BOTH its ledgered generations (pair verdict: Match)
+        // and its unknown-provenance generations must keep flowing.
+        let matching = NOT_THE_SEED;
+        node.note_session_address(ant_quic::PeerId(matching), 7, pinned_addr);
+        assert!(!node.seed_pin_rejects_frame(&link, &ant_quic::PeerId(matching), 7));
+        assert!(
+            !node.seed_pin_rejects_frame(&link, &ant_quic::PeerId(matching), 42),
+            "a pin-matching seed's unknown-provenance frames keep flowing"
+        );
+        // Seed-address history ALONE (Engineer ruling, 23 Oct 2026) never
+        // refuses unknown provenance — this is what keeps a PIN-MATCHING
+        // seed's frames flowing when the ledger bounds evicted their
+        // generation's row, and what keeps the mismatched identity out of
+        // the receive path's fail-closed guesswork: provenance is decided
+        // by KNOWN evidence (below) or a live rejection (further below),
+        // never by history alone.
+        node.note_session_address(implicated, 100, pinned_addr);
+        assert!(
+            !node.seed_pin_rejects_frame(&link, &implicated, 42),
+            "seed-address history alone must not refuse unknown provenance"
+        );
+        // Evidence evicted by the per-peer bound: nine generations push
+        // the first out (cap 8), and its unknown provenance flows too.
+        for generation in 0..9u64 {
+            node.note_session_address(implicated, generation, pinned_addr);
+        }
+        assert!(
+            node.session_addr_for(&implicated, 0).is_none(),
+            "the first generation's evidence was evicted by the bound"
+        );
+        assert!(!node.seed_pin_rejects_frame(&link, &implicated, 0));
+        // A generation WITH evidence at the mismatching address: refused
+        // by the pair verdict — known provenance still decides.
+        assert!(node.seed_pin_rejects_frame(&link, &implicated, 8));
+        // A LIVE REJECTION entry restores the fail-closed rule for
+        // unknown generations: a seam refused this identity, so nothing
+        // of unknown provenance may flow until the entry expires.
+        node.record_seed_pin_rejection(pinned_addr, implicated.0, None);
+        assert!(node.seed_pin_rejects_frame(&link, &implicated, 42));
+        node.clear_seed_pin_rejection(pinned_addr);
+        assert!(!node.seed_pin_rejects_frame(&link, &implicated, 42));
+        // History alone also never triggers the any-connection scan.
+        assert!(
+            !node.seed_pin_rejected_session(&implicated).await,
+            "the connection scan needs a live rejection, not history"
+        );
+
+        node.try_shutdown().await.unwrap();
+    }
+
+    /// Round 16 (Codex P2: ledger expiry was not enforced on reads): a
+    /// peer's KNOWN source-session evidence stops refusing its frames
+    /// once it passes [`SESSION_ADDR_LEDGER_TTL`] — the reads enforce
+    /// the bound even when no later write pruned the entries.
+    #[tokio::test]
+    async fn issue1112_idle_peer_evidence_expires_on_read() {
+        const NOT_THE_SEED: [u8; 32] = [0xB6; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let pinned_addr: SocketAddr = "198.18.0.2:5483".parse().unwrap();
+        let node = NetworkNode::new(test_network_config(), None, None)
+            .await
+            .unwrap();
+        let link = node.node.read().await.clone().expect("live link");
+        let peer = test_ant_peer(0xC);
+        let _pins = TestPinTableGuard::set(&PINS);
+
+        // Fresh evidence: the frame's OWN generation is ledgered at the
+        // pinned address, and the pair verdict refuses it.
+        node.note_session_address(peer, 1, pinned_addr);
+        assert!(node.seed_pin_rejects_frame(&link, &peer, 1));
+
+        // Age every entry past the TTL (as an idle period would).
+        {
+            let past = Instant::now() - SESSION_ADDR_LEDGER_TTL - Duration::from_secs(1);
+            let mut ledger = node
+                .session_addr_ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for entries in ledger.values_mut() {
+                for (_, _, at) in entries.iter_mut() {
+                    *at = past;
+                }
+            }
+        }
+        // The reads enforce the bound: the known evidence is gone, so
+        // the frame's provenance is unknown — and unknown provenance
+        // alone never refuses.
+        assert!(node.session_addr_for(&peer, 1).is_none());
+        assert!(!node.seed_pin_rejects_frame(&link, &peer, 1));
+
+        node.try_shutdown().await.unwrap();
+    }
+
+    /// Round 14 (Codex P2: a delayed watcher event across DIFFERENT
+    /// addresses): the watcher only ledgers while the event's generation
+    /// is still current, so a late event can never mis-attribute the
+    /// replacement connection's address to the old generation. The old
+    /// generation keeps its own evidence and its queued frames stay
+    /// refused; the peer's frames of generations with NO evidence ride
+    /// the CURRENT session clause (an unpinned address admits — the pins
+    /// govern pinned addresses only), and unknown provenance never
+    /// refuses without a live rejection (23 Oct 2026 ruling).
+    #[tokio::test]
+    async fn issue1112_late_lifecycle_event_across_addresses_keeps_evidence_true() {
+        const NOT_THE_SEED: [u8; 32] = [0xB5; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.18.0.2:5483",
+            expected_peer_ids: &[&NOT_THE_SEED],
+        }];
+        let pinned_addr: SocketAddr = "198.18.0.2:5483".parse().unwrap();
+        let node = NetworkNode::new(test_network_config(), None, None)
+            .await
+            .unwrap();
+        let link = node.node.read().await.clone().expect("live link");
+        let peer = test_ant_peer(0xB);
+        let _pins = TestPinTableGuard::set(&PINS);
+
+        // Generation 1 lived on the pinned address (observed by a seam).
+        node.note_session_address(peer, 1, pinned_addr);
+        // The pinned generation's frames stay refused by their own
+        // evidence — a late watcher event cannot rewrite it.
+        assert!(node.seed_pin_rejects_frame(&link, &peer, 1));
+        // Another generation of the same peer, no evidence for it:
+        // history alone never refuses (Engineer ruling, 23 Oct 2026) —
+        // its live traffic flows via the current-session clause, and a
+        // generation the ledger never observed is not guessed at.
+        assert!(
+            !node.seed_pin_rejects_frame(&link, &peer, 2),
+            "unknown provenance without a live rejection keeps flowing"
+        );
+
+        node.try_shutdown().await.unwrap();
+    }
+
+    /// Round 12 (Codex P2 + Claude: the session ledger grows without a
+    /// global bound): writes are no-ops while the pin table is empty
+    /// (production pays nothing today), each peer keeps at most 8
+    /// generations, and the identity count never exceeds the global cap.
+    #[test]
+    fn issue1112_session_ledger_is_bounded_and_dormant_without_pins() {
+        let addr: SocketAddr = "198.51.100.7:5483".parse().unwrap();
+        let ledger = Arc::new(Mutex::new(SessionAddrLedger::new()));
+        // No pin table: writes no-op.
+        note_session_address_in(&ledger, test_ant_peer(1), 1, addr);
+        assert!(
+            ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "ledger writes are dormant while nothing is pinned"
+        );
+
+        const NOT_IT: [u8; 32] = [0xB2; 32];
+        const PINS: [SeedPeerPin; 1] = [SeedPeerPin {
+            addr: "198.51.100.7:5483",
+            expected_peer_ids: &[&NOT_IT],
+        }];
+        let _pins = TestPinTableGuard::set(&PINS);
+        // Per-peer generation cap (checked before the global loop can
+        // evict this peer as oldest-touched).
+        for generation in 0..20u64 {
+            note_session_address_in(&ledger, test_ant_peer(1), generation, addr);
+        }
+        assert!(
+            ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&test_ant_peer(1))
+                .is_some_and(|entries| entries.len() <= 8),
+            "each peer keeps at most a few generations"
+        );
+        // Global identity cap.
+        let distinct = |n: u32| {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&n.to_le_bytes());
+            ant_quic::PeerId(id)
+        };
+        for n in 0..(SESSION_ADDR_LEDGER_MAX_PEERS as u32 + 64) {
+            note_session_address_in(&ledger, distinct(n), 1, addr);
+        }
+        let ledger = ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            ledger.len() <= SESSION_ADDR_LEDGER_MAX_PEERS,
+            "the identity count stays inside the global cap"
+        );
+    }
+
+    /// Round 10 (Codex P2: queued frames bypass rejection after
+    /// disconnect): a gossip frame queued by the peer BEFORE the refusal
+    /// closes the connection drains AFTER the close — when the
+    /// CURRENT-session lookup answers nothing — and must still be
+    /// refused, by its SOURCE generation, which outlives the connection.
+    /// Runtime-RED before the frame-generation term: the pump's guard
+    /// consulted only the current session, so the drained frame reached
+    /// the gossip channels.
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue1112_queued_frames_from_a_rejected_session_drain_refused() {
+        let plane = "issue1112-r10-drain";
+        let (seed, joiner, seed_addr) = issue1112_sim_pair(plane, 11_134).await;
+        let seed_peer = joiner.connect_addr(seed_addr).await.unwrap();
+        let joiner_peer = joiner.peer_id();
+        let link = joiner.node.read().await.clone().expect("live link");
+        let generation = link
+            .current_connection_generation(&seed_peer)
+            .expect("live generation");
+
+        // The peer queues a Bulk gossip frame (no await yet: the receiver
+        // task cannot run before the test yields).
+        let seed_link = seed.node.read().await.clone().expect("live link");
+        let mut frame = vec![saorsa_gossip_transport::GossipStreamType::Bulk.to_byte()];
+        frame.extend_from_slice(b"queued before the refusal");
+        seed_link.send(&joiner_peer, &frame).await.unwrap();
+
+        // The seam refusal: record the entry naming the live session's
+        // generation, then close the connection. The queued frame stays
+        // queued; the receiver task runs during the awaits below.
+        joiner.record_seed_pin_rejection(seed_addr, seed_peer.0, Some(generation));
+        let _ = link.disconnect(&seed_peer).await;
+
+        // The current-session truth is gone — that is exactly the window
+        // the drained frame rides in — but the frame's source generation
+        // is still refused.
+        assert!(
+            !joiner.seed_pin_rejected_session(&seed_peer).await,
+            "the current-session check alone cannot see the closed session"
+        );
+        assert!(
+            joiner.seed_pin_rejects_frame(&link, &seed_peer, generation),
+            "the frame's source generation is still refused"
+        );
+
+        // End to end: nothing from the rejected session reaches the
+        // gossip channels.
+        match tokio::time::timeout(Duration::from_millis(250), joiner.receive_message()).await {
+            Err(_elapsed) => {}
+            Ok(Ok((peer, stream_type, _))) => panic!(
+                "queued frame from the rejected session reached the gossip plane ({stream_type:?} from {peer:?})"
+            ),
+            Ok(Err(e)) => panic!("gossip receive failed: {e}"),
+        }
+
+        joiner.try_shutdown().await.unwrap();
+        seed.try_shutdown().await.unwrap();
     }
 
     #[tokio::test]

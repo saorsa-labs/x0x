@@ -83,6 +83,24 @@ impl CapabilityRegistry {
     /// reject. Bit 3. Recorded in the accepted transient A10 decision.
     /// ADR 0093's bytes stay unchanged.
     pub const FILE_CONTROL_ACK_V1: u64 = 1 << 3;
+    /// ADR 0110 §4: understands typed `EvictionHandoffV1` (`X0XEVH1`) on
+    /// the direct-message carrier. Bit 4.
+    pub const EVICTION_HANDOFF_V1: u64 = 1 << 4;
+    /// ADR 0110 §4: understands signed `CryptoExclusionV1` (`X0XCE1`).
+    /// Bit 5.
+    pub const CRYPTO_EXCLUSION_V1: u64 = 1 << 5;
+    /// ADR 0110 §4a: understands signed `CertificateRebindV1` (`X0XCRB1`).
+    /// Bit 6.
+    pub const CERTIFICATE_REBIND_V1: u64 = 1 << 6;
+    /// ADR 0110 §4b(1): understands `OwnerRecoveryMandateV1` and
+    /// `OwnerRecoveryV1` (`X0XORC1`). Bit 7.
+    pub const OWNER_RECOVERY_V1: u64 = 1 << 7;
+    /// Understands remote GUI show typed DMs (ADR 0083 slice 3).
+    ///
+    /// Bit 10. The canonical registry in `docs/adr/README.md` already
+    /// gives bits 4–9 to ADR 0110 and ADR 0109. Bit 4 is
+    /// `eviction_handoff_v1`.
+    pub const GUI_SHOW_V1: u64 = 1 << 10;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
@@ -91,7 +109,12 @@ impl CapabilityRegistry {
             bits: Self::SHARE_GRANT_V1
                 | Self::PREDECESSOR_OFFER_V1
                 | Self::PEER_EVIDENCE_V1
-                | Self::FILE_CONTROL_ACK_V1,
+                | Self::FILE_CONTROL_ACK_V1
+                | Self::EVICTION_HANDOFF_V1
+                | Self::CRYPTO_EXCLUSION_V1
+                | Self::CERTIFICATE_REBIND_V1
+                | Self::OWNER_RECOVERY_V1
+                | Self::GUI_SHOW_V1,
         }
     }
 
@@ -110,6 +133,19 @@ impl CapabilityRegistry {
             Some((Self::SHARE_GRANT_V1, "share_grant_v1"))
         } else if payload.starts_with(b"X0X-GROUP-PREDECESSOR-RELAY-V1\n") {
             Some((Self::PREDECESSOR_OFFER_V1, "predecessor_offer_v1"))
+        } else if payload.starts_with(crate::groups::eviction::EVICTION_HANDOFF_PREFIX) {
+            Some((Self::EVICTION_HANDOFF_V1, "eviction_handoff_v1"))
+        } else if payload.starts_with(crate::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX) {
+            Some((Self::CRYPTO_EXCLUSION_V1, "crypto_exclusion_v1"))
+        } else if payload.starts_with(crate::groups::cert_rebind::CERTIFICATE_REBIND_PREFIX) {
+            Some((Self::CERTIFICATE_REBIND_V1, "certificate_rebind_v1"))
+        } else if payload.starts_with(crate::groups::owner_recovery::OWNER_RECOVERY_PREFIX) {
+            Some((Self::OWNER_RECOVERY_V1, "owner_recovery_v1"))
+        } else if payload.starts_with(crate::gui::remote::SHOW_REQUEST_PREFIX)
+            || payload.starts_with(crate::gui::remote::SHOW_RESULT_PREFIX)
+            || payload.starts_with(crate::gui::remote::ACTIVITY_PREFIX)
+        {
+            Some((Self::GUI_SHOW_V1, "gui_show_v1"))
         } else {
             None
         }
@@ -362,6 +398,7 @@ pub struct DmEnvelope {
 
 /// Envelope body — either a payload DM or an acknowledgement of a prior one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DmBody {
     /// Encrypted user payload.
     Payload(DmPayload),
@@ -413,6 +450,7 @@ pub struct DmAckBody {
 /// Per-design-doc ACK semantics — "recipient agent accepted" or policy
 /// rejection. Never implies durable storage or user read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum DmAckOutcome {
     /// Envelope decrypted, signature verified, trust-policy passed, and
     /// enqueued to the recipient's DM handler / inbox.
@@ -1705,8 +1743,14 @@ impl DmEnvelope {
                 MAX_ENVELOPE_BYTES
             )));
         }
-        postcard::from_bytes(bytes)
-            .map_err(|e| IdentityError::Serialization(format!("DM envelope decode: {e}")))
+        postcard::from_bytes(bytes).map_err(|e| {
+            // #1604: an unknown body or ACK-outcome variant is counted and
+            // logged, not dropped silently.
+            match crate::wire_compat::dm_envelope_unknown_variant(bytes) {
+                Some(unknown) => IdentityError::Serialization(format!("DM envelope: {unknown}")),
+                None => IdentityError::Serialization(format!("DM envelope decode: {e}")),
+            }
+        })
     }
 
     /// Dedupe key for this envelope.

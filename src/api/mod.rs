@@ -511,9 +511,9 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/owner/riders",
         cli_name: "owner riders issue",
-        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
+        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty, only gui:show is defined; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
         category: "identity",
-        request: RequestSpec::Fields(&[RequestField::body_as("sub_agent_id", true, "AGENT_ID"), RequestField::body_as("groups", false, "--group"), RequestField::body("label", false), RequestField::body("ttl_secs", false), RequestField::body_as("delegation", true, "--delegation-payload-b64")]),
+        request: RequestSpec::Fields(&[RequestField::body_as("sub_agent_id", true, "AGENT_ID"), RequestField::body_as("groups", false, "--group"), RequestField::body_as("scopes", false, "--scope"), RequestField::body("label", false), RequestField::body("ttl_secs", false), RequestField::body_as("delegation", true, "--delegation-payload-b64")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -530,6 +530,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Revoke a rider token; it fails on the next request",
         category: "identity",
         request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/owner/groups/:id/recovery-mandate",
+        cli_name: "owner groups recovery-mandate",
+        description: "ADR 0110 §4b(1): owner-sign an OwnerRecoveryMandateV1 promoting one certified member when every admin of an OwnerCertified group is revoked",
+        category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("promoted_agent_id", true, "--promoted")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1420,6 +1428,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Post,
+        path: "/groups/:id/members/:agent_id/certificate/rebind",
+        cli_name: "group rebind-certificate",
+        description: "Self-rebind this agent's renewed certificate into its seat before the cutoff (ADR 0110 §4a)",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body("certificate", false)]),
+    },
+    EndpointDef {
+        method: Method::Post,
         path: "/groups/:id/ban/:agent_id",
         cli_name: "group ban",
         description: "Ban a member (admin+)",
@@ -1762,7 +1778,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "upgrade --apply",
         description: "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)",
         category: "upgrade",
-        request: RequestSpec::None,
+        request: RequestSpec::Fields(&[RequestField::query("now", false)]),
     },
     // ── WebSocket ───────────────────────────────────────────────────────
     EndpointDef {
@@ -1797,6 +1813,17 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         category: "websocket",
         request: RequestSpec::None,
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/gui/show",
+        cli_name: "show",
+        description: "Show a GUI view on this machine or, with --on, on an owner machine",
+        category: "gui",
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("view", true, "VIEW"),
+            RequestField::body_as("target_machine", false, "--on"),
+        ]),
+    },
     // ── Tailnet forwarding (#132 T6) ────────────────────────────────────
     EndpointDef {
         method: Method::Post,
@@ -1804,7 +1831,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "forward add",
         description: "Add a local port forward to a peer's loopback service",
         category: "connect",
-        request: RequestSpec::Fields(&[RequestField::body_as("local_addr", true, "--local"), RequestField::body_as("peer_agent", true, "--peer"), RequestField::body_as("target_host", true, "--target"), RequestField::body_as("target_port", true, "--target-port")]),
+        request: RequestSpec::Fields(&[RequestField::body_as("local_addr", true, "--local"), RequestField::body_as("peer_agent", true, "--peer"), RequestField::body_as("target_host", true, "--target"), RequestField::body_as("target_port", true, "--target-port"), RequestField::body_as("ephemeral", false, "--ephemeral")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1927,6 +1954,64 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "grant received",
         description: "List share grants that name this install as grantee",
         category: "grants",
+        request: RequestSpec::None,
+    },
+    // ── Names (ADR-0074 §1; durable owner token only) ───────────────────
+    EndpointDef {
+        method: Method::Get,
+        path: "/names",
+        cli_name: "names list",
+        description: "List owner petnames and pinned names",
+        category: "names",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/resolve",
+        cli_name: "names resolve",
+        description: "Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use",
+        category: "names",
+        // Positional NAME — dump-request must not synthesize `--name`
+        // (collides with the global instance `--name` flag).
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/owners",
+        cli_name: "names owner add",
+        description: "Bind a local owner petname to a user id (frozen at first bind)",
+        category: "names",
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("label", true, "LABEL"),
+            RequestField::body_as("user_id", true, "USER_ID"),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/names/owners/:label",
+        cli_name: "names owner rm",
+        description: "Remove a local owner petname and every pin under it",
+        category: "names",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/names/machines",
+        cli_name: "names machine label",
+        description: "Label a shared machine (machine:<label>.<owner> -> machine id)",
+        category: "names",
+        // Same positional NAME rule as `/names/resolve` (global `--name` clash).
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("name", true, "NAME"),
+            RequestField::body_as("machine_id", true, "MACHINE_ID"),
+        ]),
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/names/pins/:name",
+        cli_name: "names unpin",
+        description: "Drop a TOFU pin so the name re-pins at next use",
+        category: "names",
         request: RequestSpec::None,
     },
 ];

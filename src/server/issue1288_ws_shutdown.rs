@@ -267,6 +267,45 @@ impl Daemon {
     }
 }
 
+/// A full outbound queue starts the queued GUI banner worker. That worker
+/// holds `AppState` until the frame fits. The receiver in `hold` stays
+/// alive across shutdown, so the worker remains blocked on send. The drain
+/// must abort it. `shutdown_and_wait` then releases the Agent and
+/// `history.db`, and the same directory can serve again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_queue_banner_worker_releases_owner_at_shutdown() -> Result<()> {
+    let (daemon, state) = start_daemon().await?;
+    let hold = super::ws::arm_full_queue_banner_reveal(&state).await;
+    assert_eq!(
+        hold.reveal_inflight, 1,
+        "the reveal must still be waiting on the full queue"
+    );
+    assert!(
+        !hold.visible,
+        "the tab stays hidden until the banner frame is queued"
+    );
+    assert!(
+        !hold.pending,
+        "the worker must be holding the banner, not the pending queue"
+    );
+    drop(state);
+
+    let outcome = daemon.stop_and_relaunch().await?;
+    assert_eq!(
+        outcome.at_return,
+        (0, 0),
+        "a full-queue banner worker must not hold the AppState or the Agent \
+         when shutdown_and_wait returns (outcome: {outcome:?})"
+    );
+    assert!(
+        outcome.relaunch.is_ok(),
+        "a full-queue banner worker must release history.db before shutdown \
+         returns (outcome: {outcome:?})"
+    );
+    drop(hold);
+    Ok(())
+}
+
 /// A subscribed client that is still connected at shutdown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn issue1288_connected_ws_session_releases_owner_at_shutdown() -> Result<()> {

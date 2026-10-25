@@ -743,6 +743,142 @@ impl Drop for FailDurableBeforeRenameGuard {
     }
 }
 
+/// Test-only pause at the durable rename, so a caller can be cancelled
+/// while the publish is still in progress. Path-scoped, like the
+/// parent-directory fsync seam: threaded `cargo test` runs the suite in
+/// one process, and one armed path must not release or skip another.
+#[cfg(test)]
+struct DurableRenamePause {
+    path: std::path::PathBuf,
+    entered: bool,
+}
+
+#[cfg(test)]
+static DURABLE_RENAME_PAUSE_FOR_TESTING: std::sync::Mutex<Vec<DurableRenamePause>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm the pause. Drop releases it, including after a panic.
+#[cfg(test)]
+pub(crate) struct DurableRenamePauseGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+pub(crate) fn arm_durable_rename_pause_for_testing(path: &Path) -> DurableRenamePauseGuard {
+    DURABLE_RENAME_PAUSE_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(DurableRenamePause {
+            path: path.to_path_buf(),
+            entered: false,
+        });
+    DurableRenamePauseGuard {
+        path: path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn durable_rename_pause_entered_for_testing(path: &Path) -> bool {
+    DURABLE_RENAME_PAUSE_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|pause| pause.path == path && pause.entered)
+}
+
+#[cfg(test)]
+fn release_durable_rename_pause(path: &Path) {
+    DURABLE_RENAME_PAUSE_FOR_TESTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|pause| pause.path != path);
+}
+
+#[cfg(test)]
+impl Drop for DurableRenamePauseGuard {
+    fn drop(&mut self) {
+        release_durable_rename_pause(&self.path);
+    }
+}
+
+/// When `path` is armed, signal entry and wait until the guard is dropped.
+/// An unarmed path returns on the first poll, so the caller can rename in
+/// that same poll.
+#[cfg(test)]
+async fn pause_durable_rename_for_testing(path: &Path) {
+    {
+        let mut slot = DURABLE_RENAME_PAUSE_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(pause) = slot.iter_mut().find(|pause| pause.path == path) else {
+            return;
+        };
+        pause.entered = true;
+    }
+    loop {
+        tokio::task::yield_now().await;
+        let slot = DURABLE_RENAME_PAUSE_FOR_TESTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !slot.iter().any(|pause| pause.path == path) {
+            return;
+        }
+    }
+}
+
+/// Rename that still publishes, and still runs `on_renamed`, when the
+/// caller is cancelled while the rename is in progress.
+///
+/// `tokio::fs::rename` waits on a blocking task. Dropping that wait does
+/// not stop the task, so the new name can appear after the callback and
+/// the caller's lock are already gone. This rename is synchronous, and
+/// its drop finishes the same publish and callback before it returns.
+struct DurableRename<F: FnOnce()> {
+    tmp: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    on_renamed: Option<F>,
+    pending: bool,
+}
+
+impl<F: FnOnce()> DurableRename<F> {
+    fn prepare(tmp: &Path, dest: &Path, on_renamed: F) -> Self {
+        Self {
+            tmp: tmp.to_path_buf(),
+            dest: dest.to_path_buf(),
+            on_renamed: Some(on_renamed),
+            pending: true,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.pending = false;
+        if let Some(callback) = self.on_renamed.take() {
+            callback();
+        }
+    }
+
+    fn abandon(&mut self) {
+        self.pending = false;
+        self.on_renamed.take();
+    }
+}
+
+impl<F: FnOnce()> Drop for DurableRename<F> {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        self.pending = false;
+        if std::fs::rename(&self.tmp, &self.dest).is_ok() {
+            if let Some(callback) = self.on_renamed.take() {
+                callback();
+            }
+        } else {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
 /// Crash-atomic durable write for secret bytes (review r3, PR #465 item 1):
 /// temp file (0600) → `sync_all` the file → atomic rename into place →
 /// `sync_all` the parent directory. Unlike [`write_private_bytes`], a power
@@ -783,11 +919,27 @@ pub async fn write_private_bytes_durable_typed(
     path: &Path,
     bytes: Vec<u8>,
 ) -> std::result::Result<(), DurableWriteError> {
+    write_private_bytes_durable_typed_after_rename(path, bytes, || {}).await
+}
+
+/// Like [`write_private_bytes_durable_typed`], but runs `on_renamed`
+/// synchronously once the new bytes are visible (after rename, before
+/// parent-directory fsync). NameStore uses this so a cancelled await
+/// cannot skip installing in-memory state that already matches disk.
+///
+/// The rename itself is not a detached blocking task. Cancellation while
+/// it is in progress still publishes the file and still runs `on_renamed`
+/// before this future returns from drop.
+pub async fn write_private_bytes_durable_typed_after_rename(
+    path: &Path,
+    bytes: Vec<u8>,
+    on_renamed: impl FnOnce() + Send,
+) -> std::result::Result<(), DurableWriteError> {
     let guard = revocation_write_guard(path)
         .await
         .map_err(guard_refusal_before_rename)?;
     let bytes = monotonic_v1_v2_bytes(path, bytes).await?;
-    write_private_bytes_durable_guarded(path, bytes, guard).await
+    write_private_bytes_durable_guarded_after_rename(path, bytes, guard, on_renamed).await
 }
 
 /// Unite `incoming` with verified records in a readable v1 or v2 file.
@@ -1214,7 +1366,16 @@ fn durable_write_identity_error(error: DurableWriteError) -> IdentityError {
 async fn write_private_bytes_durable_guarded(
     path: &Path,
     bytes: Vec<u8>,
+    revocation_guard: Option<RevocationWriteGuard>,
+) -> std::result::Result<(), DurableWriteError> {
+    write_private_bytes_durable_guarded_after_rename(path, bytes, revocation_guard, || {}).await
+}
+
+async fn write_private_bytes_durable_guarded_after_rename(
+    path: &Path,
+    bytes: Vec<u8>,
     _revocation_guard: Option<RevocationWriteGuard>,
+    on_renamed: impl FnOnce() + Send,
 ) -> std::result::Result<(), DurableWriteError> {
     // Production uses tokio::fs::File + AsyncWriteExt; test builds use
     // w3h_fs::File's inherent write_all (inline under the shim).
@@ -1278,12 +1439,23 @@ async fn write_private_bytes_durable_guarded(
         )));
     }
 
-    if let Err(err) = fs::rename(&tmp_path, path).await {
-        let _ = fs::remove_file(&tmp_path).await;
+    // Synchronous rename: a `tokio::fs::rename` await can be cancelled
+    // while the blocking rename still completes, which drops `on_renamed`
+    // and the caller's lock. Prepare first so drop publishes and installs
+    // memory if this future is cancelled at the test pause below.
+    let mut publication = DurableRename::prepare(&tmp_path, path, on_renamed);
+    #[cfg(test)]
+    pause_durable_rename_for_testing(path).await;
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        publication.abandon();
+        let _ = std::fs::remove_file(&tmp_path);
         return Err(DurableWriteError::BeforeRename(err));
     }
+    // NEW bytes are visible — stage caller memory before parent-dir fsync
+    // so cancellation cannot leave disk ahead of every in-memory copy.
+    publication.finish();
+    drop(publication);
 
-    // Everything below runs with the NEW bytes already visible on disk.
     sync_published_file(path).await
 }
 
@@ -1328,6 +1500,18 @@ async fn sync_published_file(path: &Path) -> std::result::Result<(), DurableWrit
         .await
         .map_err(DurableWriteError::AfterRename)?;
     Ok(())
+}
+
+/// Confirm that a file already visible at `path` is durable.
+///
+/// Fsync the file, then fsync its parent directory. [`DurableWriteError::AfterRename`]
+/// means the bytes are visible and the directory entry is not confirmed.
+/// Name-store load uses this so a restart after a failed parent-directory
+/// fsync does not clear the pending-durability flag.
+pub(crate) async fn confirm_published_durability(
+    path: &Path,
+) -> std::result::Result<(), DurableWriteError> {
+    sync_published_file(path).await
 }
 
 /// Write arbitrary secret bytes to `path` with the same protection x0x gives
@@ -1710,6 +1894,11 @@ pub async fn save_agent_certificate(cert: &AgentCertificate) -> Result<()> {
     let path = dir.join(AGENT_CERT_FILE);
     let bytes = cert.to_storage_bytes()?;
     write_private_file(&path, bytes).await
+}
+
+/// The default `agent.cert` path (`~/.x0x/agent.cert`).
+pub(crate) async fn default_agent_certificate_path() -> Result<std::path::PathBuf> {
+    Ok(x0x_dir().await?.join(AGENT_CERT_FILE))
 }
 
 /// Load an AgentCertificate from the default storage location (`~/.x0x/agent.cert`).

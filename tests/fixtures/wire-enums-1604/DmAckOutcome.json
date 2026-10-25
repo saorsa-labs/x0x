@@ -1,0 +1,46 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "Accepted",
+      "variant": "Accepted",
+      "wire": {
+        "postcard": "00"
+      }
+    },
+    {
+      "input": {
+        "RejectedByPolicy": {
+          "reason": "r"
+        }
+      },
+      "variant": "RejectedByPolicy",
+      "wire": {
+        "postcard": "010172"
+      }
+    },
+    {
+      "input": {
+        "AckSemanticsUnavailable": {
+          "reason": "s"
+        }
+      },
+      "variant": "AckSemanticsUnavailable",
+      "wire": {
+        "postcard": "020173"
+      }
+    },
+    {
+      "input": {
+        "IdempotencyConflict": {
+          "reason": "c"
+        }
+      },
+      "variant": "IdempotencyConflict",
+      "wire": {
+        "postcard": "030163"
+      }
+    }
+  ],
+  "type": "DmAckOutcome"
+}

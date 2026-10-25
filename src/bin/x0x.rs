@@ -300,6 +300,9 @@ enum Commands {
         /// With --check, only a read-only release check is performed.
         #[arg(long)]
         apply: bool,
+        /// Skip the staging delay. Eligibility, holds and transaction checks still apply.
+        #[arg(long, requires = "apply", conflicts_with = "check")]
+        now: bool,
         /// With --check, fetch the current manifest regardless of version.
         /// Does not bypass the daemon's apply checks.
         #[arg(long)]
@@ -317,6 +320,14 @@ enum Commands {
         /// `groups/<group_id>`, `groups/<group_id>/board` or `people`.
         #[arg(long)]
         view: Option<String>,
+    },
+    /// Show a GUI view to the human (ADR 0083). Local only in slice 1.
+    Show {
+        /// View route, e.g. `people`, `dm/<agent_id>`, `groups/<id>/board`.
+        view: String,
+        /// Target machine hex id or `active` (remote show; later slice).
+        #[arg(long = "on")]
+        on: Option<String>,
     },
     /// Print all API routes. [dev]
     #[command(hide = true)]
@@ -416,6 +427,76 @@ enum Commands {
     Grant {
         #[command(subcommand)]
         sub: GrantSub,
+    },
+    /// Names for agents and machines: `[agent:|machine:]<label>.<owner>`
+    /// (ADR-0074; local petnames pinned at first use; durable API token only).
+    Names {
+        #[command(subcommand)]
+        sub: NamesSub,
+    },
+}
+
+/// `x0x names` sub-actions.
+#[derive(Subcommand)]
+enum NamesSub {
+    /// List owner petnames and pinned names.
+    List,
+    /// Resolve a name locally (no network query); pins it at first use.
+    Resolve {
+        /// `[agent:|machine:]<label>.<owner>`, e.g. `studio.me`, or a hex agent id.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Owner petnames (label -> user id), frozen at first bind.
+    Owner {
+        #[command(subcommand)]
+        sub: NamesOwnerSub,
+    },
+    /// Label machines shared with you by a received grant.
+    Machine {
+        #[command(subcommand)]
+        sub: NamesMachineSub,
+    },
+    /// Drop a pin (e.g. `agent:studio.bob`) so the name re-pins at next use.
+    Unpin {
+        /// Canonical pinned name, with its `agent:` or `machine:` prefix.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+/// `x0x names owner` sub-actions.
+#[derive(Subcommand)]
+enum NamesOwnerSub {
+    /// Bind a petname to an owner's user id.
+    Add {
+        /// Petname (lowercase DNS label; not `me`, `agent` or `machine`).
+        #[arg(value_name = "LABEL")]
+        label: String,
+        /// The owner's user id (64 hex chars).
+        #[arg(value_name = "USER_ID")]
+        user_id: String,
+    },
+    /// Remove a petname and every pin under it.
+    #[command(alias = "remove")]
+    Rm {
+        /// Petname to remove.
+        #[arg(value_name = "LABEL")]
+        label: String,
+    },
+}
+
+/// `x0x names machine` sub-actions.
+#[derive(Subcommand)]
+enum NamesMachineSub {
+    /// Label a shared machine: `machine:<label>.<owner>` -> machine id.
+    Label {
+        /// `machine:<label>.<owner>` (owner is a bound petname).
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The machine id (64 hex chars).
+        #[arg(value_name = "MACHINE_ID")]
+        machine_id: String,
     },
 }
 
@@ -615,6 +696,26 @@ enum OwnerSub {
     Machines,
     /// Derived placement ledger (ADR-0043 Pinned/Roaming + mint status).
     Placement,
+    /// Owner actions on named groups (ADR 0110 §4b(1) recovery).
+    Groups {
+        #[command(subcommand)]
+        sub: OwnerGroupsSub,
+    },
+}
+
+/// `x0x owner groups` subcommands.
+#[derive(Subcommand)]
+enum OwnerGroupsSub {
+    /// Sign an owner recovery mandate for a group whose admins are all
+    /// revoked; the promoted member becomes its admin (ADR 0110 §4b(1)).
+    RecoveryMandate {
+        /// Group ID.
+        #[arg(value_name = "GROUP_ID")]
+        group_id: String,
+        /// Hex agent ID of the Active certified member to promote.
+        #[arg(long = "promoted", value_name = "AGENT_ID")]
+        promoted: String,
+    },
 }
 
 /// `x0x move` subcommands (ADR-0043 agent key-move ceremony).
@@ -738,6 +839,10 @@ enum OwnerRidersSub {
         /// Token lifetime seconds (default 7 days, max 90 days).
         #[arg(long, value_name = "SECS")]
         ttl_secs: Option<u64>,
+        /// Rider-token scope. Repeat the flag to pass more than one.
+        /// The only defined scope is `gui:show`.
+        #[arg(long = "scope", value_name = "SCOPE")]
+        scopes: Vec<String>,
         /// Base64 canonical rider-delegation payload
         /// (`rider_delegation_bytes(sub, daemon, scopes, not_after)`,
         /// ADR-0039 review r3 option B). REQUIRED together with
@@ -1040,7 +1145,8 @@ enum ForwardSub {
         /// Local bind address, e.g. `127.0.0.1:8022`.
         #[arg(long)]
         local: String,
-        /// Peer agent id (hex).
+        /// Peer agent: hex agent id or a name (`[agent:|machine:]<label>.<owner>`,
+        /// ADR-0074).
         #[arg(long)]
         peer: String,
         /// Loopback target host on the peer (numeric IP). Default `127.0.0.1`.
@@ -1049,6 +1155,9 @@ enum ForwardSub {
         /// Loopback target port on the peer.
         #[arg(long)]
         target_port: u16,
+        /// Keep the forward in memory only (do not persist to forwards.json).
+        #[arg(long, default_value_t = false)]
+        ephemeral: bool,
     },
     /// List registered forwards.
     List,
@@ -1601,6 +1710,19 @@ enum GroupSub {
         /// Role to assign: admin | member.
         role: String,
     },
+    /// Self-rebind this agent's renewed certificate into its seat before
+    /// the cutoff `not_after − τ` (ADR 0110 §4a).
+    RebindCertificate {
+        /// Group ID.
+        group_id: String,
+        /// This agent's hex ID (the seat to rebind).
+        agent_id: String,
+        /// Renewed certificate, base64 storage encoding (the
+        /// `certificate.storage_b64` of `x0x owner agents issue`). Defaults
+        /// to the daemon's loaded agent certificate.
+        #[arg(long)]
+        certificate: Option<String>,
+    },
     /// Ban a member (admin+).
     Ban {
         /// Group ID.
@@ -2121,6 +2243,7 @@ async fn run(
             check,
             apply,
             force,
+            ..
         } if *check || !*apply => {
             return commands::upgrade::run(*check, *force).await;
         }
@@ -2281,6 +2404,7 @@ async fn run(
             }
             Ok(())
         }
+        Commands::Show { view, on } => commands::show::show(&client, &view, on.as_deref()).await,
         Commands::Profile { sub } => match sub {
             None => commands::identity::profile(&client).await,
             Some(ProfileSub::Set {
@@ -2306,6 +2430,12 @@ async fn run(
         },
         Commands::Owner { sub } => match sub {
             None => commands::identity::owner_agents(&client).await,
+            Some(OwnerSub::Groups {
+                sub: OwnerGroupsSub::RecoveryMandate { group_id, promoted },
+            }) => {
+                commands::identity::owner_group_recovery_mandate(&client, &group_id, &promoted)
+                    .await
+            }
             Some(OwnerSub::Agents { sub: None }) => commands::identity::owner_agents(&client).await,
             Some(OwnerSub::Agents {
                 sub:
@@ -2345,6 +2475,7 @@ async fn run(
                         ttl_secs,
                         delegation_payload_b64,
                         delegation_signature,
+                        scopes,
                     }),
             }) => {
                 commands::identity::owner_riders_issue(
@@ -2355,6 +2486,7 @@ async fn run(
                     ttl_secs,
                     delegation_payload_b64.as_deref(),
                     delegation_signature.as_deref(),
+                    &scopes,
                 )
                 .await
             }
@@ -2893,6 +3025,19 @@ async fn run(
                 agent_id,
                 role,
             }) => commands::group::set_role(&client, &group_id, &agent_id, &role).await,
+            Some(GroupSub::RebindCertificate {
+                group_id,
+                agent_id,
+                certificate,
+            }) => {
+                commands::group::rebind_certificate(
+                    &client,
+                    &group_id,
+                    &agent_id,
+                    certificate.as_deref(),
+                )
+                .await
+            }
             Some(GroupSub::Ban { group_id, agent_id }) => {
                 commands::group::ban(&client, &group_id, &agent_id).await
             }
@@ -3158,11 +3303,16 @@ async fn run(
                 .await
             }
         },
-        Commands::Upgrade { .. } => {
+        Commands::Upgrade { now, .. } => {
             // The serving daemon owns installation and its writer lock. The
             // existing client carries the selected instance and bearer token.
             // --force only affects read-only checks; it cannot bypass apply.
-            let response = client.post_empty("/upgrade/apply").await?;
+            let path = if now {
+                "/upgrade/apply?now=true"
+            } else {
+                "/upgrade/apply"
+            };
+            let response = client.post_empty(path).await?;
             x0x::cli::print_value(client.format(), &response);
             Ok(())
         }
@@ -3223,13 +3373,15 @@ async fn run(
                 peer,
                 target,
                 target_port,
+                ephemeral,
             } => {
-                commands::forward::add(
+                commands::forward::add_with_ephemeral(
                     &client,
                     &local,
                     &peer,
                     target.as_deref().unwrap_or("127.0.0.1"),
                     target_port,
+                    ephemeral,
                 )
                 .await
             }
@@ -3253,6 +3405,22 @@ async fn run(
             GrantSub::List => commands::grant::list(&client).await,
             GrantSub::Revoke { id } => commands::grant::revoke(&client, &id).await,
             GrantSub::Received => commands::grant::received(&client).await,
+        },
+        Commands::Names { sub } => match sub {
+            NamesSub::List => commands::names::list(&client).await,
+            NamesSub::Resolve { name } => commands::names::resolve(&client, &name).await,
+            NamesSub::Owner { sub } => match sub {
+                NamesOwnerSub::Add { label, user_id } => {
+                    commands::names::owner_add(&client, &label, &user_id).await
+                }
+                NamesOwnerSub::Rm { label } => commands::names::owner_remove(&client, &label).await,
+            },
+            NamesSub::Machine { sub } => match sub {
+                NamesMachineSub::Label { name, machine_id } => {
+                    commands::names::machine_label(&client, &name, &machine_id).await
+                }
+            },
+            NamesSub::Unpin { name } => commands::names::unpin(&client, &name).await,
         },
         Commands::Onboard {
             json,
@@ -3453,6 +3621,7 @@ x0x (v{VERSION})
     |   +-- --apply        Apply through the running daemon
     |   +-- --force        Fetch current manifest with --check
     +-- gui                Open embedded web GUI
+    +-- show <view>        Show a GUI view (ADR 0083; local)
     +-- routes             Print all 130 REST API routes
     +-- tree               This command tree
     +-- ws sessions        List WebSocket sessions
@@ -3704,6 +3873,11 @@ async fn purge() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/upgrade_now_cli.rs"
+    ));
+    upgrade_now_cli_regression_tests!();
     use super::*;
 
     #[test]

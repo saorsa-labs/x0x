@@ -191,6 +191,15 @@ pub const fn supervised_exit_code() -> i32 {
     }
 }
 
+/// Exit status after a failed or overrunning acknowledged shutdown flush
+/// (engineer ruling 23 Oct 2026): `EX_TEMPFAIL`. The previous binary has
+/// been restored, the upgrade is marked failed, and the service manager
+/// restarts the daemon on the old version instead of finding a live process
+/// with no API and no network.
+pub(crate) const fn flush_failure_exit_code() -> i32 {
+    75
+}
+
 // ---------------------------------------------------------------------------
 // I0b — loaded launchd policy readback (ADR-0061 §3, #615)
 // ---------------------------------------------------------------------------
@@ -378,23 +387,133 @@ pub async fn readback_launchd_policy_offloaded(
     executable: &Path,
     argv: &[String],
 ) -> LaunchdPolicyReadback {
-    let signals = signals.clone();
-    let executable = executable.to_path_buf();
-    let argv = argv.to_vec();
-    spawn_readback_offloaded(move || readback_launchd_policy(&signals, &executable, &argv)).await
+    readback_launchd_policy_retaining(signals, executable, argv, None).await
 }
 
-/// spawn_blocking core of [`readback_launchd_policy_offloaded`], split so the
-/// offload itself is testable with a stand-in readback closure instead of the
-/// real plutil/launchctl subprocesses.
-async fn spawn_readback_offloaded(
-    readback: impl FnOnce() -> LaunchdPolicyReadback + Send + 'static,
+/// Internal HTTP custody; the public readback contract remains unchanged.
+pub(crate) type ReadbackLease = std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadbackKind {
+    Launchd,
+    SystemdPolicy,
+    #[cfg(unix)]
+    SystemdIdentity,
+}
+
+/// Every actual readback closure owns its lease before it enters the blocking
+/// queue. Dropping the async observer cannot free HTTP capacity before exit.
+async fn spawn_readback_retaining<T: Send + 'static>(
+    _target: PathBuf,
+    _kind: ReadbackKind,
+    lease: Option<ReadbackLease>,
+    readback: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    #[cfg(test)]
+    let hook = readback_custody_seam::capture(&_target);
+    #[cfg(test)]
+    let queued_hook = hook.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        // Drop the lease before publishing Exited, including unwind paths.
+        #[cfg(test)]
+        let _exit = readback_custody_seam::Exit(hook.clone(), _kind);
+        let _lease = lease;
+        #[cfg(test)]
+        readback_custody_seam::observe(&hook, _kind, readback_custody_seam::ReadbackEvent::Entered);
+        readback()
+    });
+    #[cfg(test)]
+    readback_custody_seam::observe(
+        &queued_hook,
+        _kind,
+        readback_custody_seam::ReadbackEvent::Queued,
+    );
+    task.await
+}
+
+pub(crate) async fn readback_launchd_policy_retaining(
+    signals: &SupervisionSignals,
+    executable: &Path,
+    argv: &[String],
+    lease: Option<ReadbackLease>,
 ) -> LaunchdPolicyReadback {
-    match tokio::task::spawn_blocking(readback).await {
+    let signals = signals.clone();
+    let executable = executable.to_path_buf();
+    let target = executable.clone();
+    let argv = argv.to_vec();
+    match spawn_readback_retaining(target, ReadbackKind::Launchd, lease, move || {
+        readback_launchd_policy(&signals, &executable, &argv)
+    })
+    .await
+    {
         Ok(verdict) => verdict,
         Err(join_err) => LaunchdPolicyReadback::NotGuaranteed {
             detail: format!("launchd policy readback task failed: {join_err}"),
         },
+    }
+}
+
+/// Retain the existing offload-thread/failure tests on the same spawn path.
+#[cfg(test)]
+async fn spawn_readback_offloaded(
+    readback: impl FnOnce() -> LaunchdPolicyReadback + Send + 'static,
+) -> LaunchdPolicyReadback {
+    match spawn_readback_retaining(PathBuf::new(), ReadbackKind::Launchd, None, readback).await {
+        Ok(verdict) => verdict,
+        Err(join_err) => LaunchdPolicyReadback::NotGuaranteed {
+            detail: format!("launchd policy readback task failed: {join_err}"),
+        },
+    }
+}
+
+/// Target-keyed observations of actual blocking readbacks. Tests may pause at
+/// Entered; the real readback then continues through its existing inert seam.
+#[cfg(test)]
+pub(crate) mod readback_custody_seam {
+    use super::ReadbackKind;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ReadbackEvent {
+        Queued,
+        Entered,
+        Exited,
+    }
+    pub(crate) type Hook = Arc<dyn Fn(ReadbackKind, ReadbackEvent) + Send + Sync>;
+
+    fn hooks() -> &'static Mutex<HashMap<PathBuf, Hook>> {
+        static HOOKS: OnceLock<Mutex<HashMap<PathBuf, Hook>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    pub(crate) struct Guard(PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if let Ok(mut hooks) = hooks().lock() {
+                hooks.remove(&self.0);
+            }
+        }
+    }
+    pub(crate) fn install(target: PathBuf, hook: Hook) -> Guard {
+        let mut hooks = hooks().lock().expect("readback hooks");
+        assert!(!hooks.contains_key(&target), "duplicate readback hook");
+        hooks.insert(target.clone(), hook);
+        Guard(target)
+    }
+    pub(super) fn capture(target: &Path) -> Option<Hook> {
+        hooks().lock().ok()?.get(target).cloned()
+    }
+    pub(super) fn observe(hook: &Option<Hook>, kind: ReadbackKind, event: ReadbackEvent) {
+        if let Some(hook) = hook {
+            hook(kind, event);
+        }
+    }
+    pub(super) struct Exit(pub Option<Hook>, pub ReadbackKind);
+    impl Drop for Exit {
+        fn drop(&mut self) {
+            observe(&self.0, self.1, ReadbackEvent::Exited);
+        }
     }
 }
 
@@ -932,7 +1051,7 @@ fn parse_invocation_id_hex(value: &str) -> Option<[u8; 16]> {
 type SystemctlShow<'a> = dyn FnMut(bool, &str) -> Result<Option<String>, String> + 'a;
 
 /// Structured `ExecStart` lookup injected into
-/// [`readback_systemd_policy_in`]: given the manager kind and unit name,
+/// [`readback_systemd_observation_in`]: given the manager kind and unit name,
 /// return the busctl/D-Bus structured snapshot or an error string (every
 /// error fails closed).
 #[cfg(any(test, target_os = "linux"))]
@@ -950,13 +1069,38 @@ struct SystemdReadbackInput<'a> {
     monotonic_now_us: Option<u64>,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+struct SystemdObservation {
+    policy: SystemdPolicyReadback,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    verified_identity: Option<SystemdVerifiedUnit>,
+}
+
+impl From<SystemdPolicyReadback> for SystemdObservation {
+    fn from(policy: SystemdPolicyReadback) -> Self {
+        Self {
+            policy,
+            verified_identity: None,
+        }
+    }
+}
+
+#[cfg(test)]
 fn readback_systemd_policy_in(
     input: SystemdReadbackInput<'_>,
     show: &mut SystemctlShow<'_>,
     exec_start_lookup: &mut BusctlExecStartLookup<'_>,
     same_executable: &SameExecutable<'_>,
 ) -> SystemdPolicyReadback {
+    readback_systemd_observation_in(input, show, exec_start_lookup, same_executable).policy
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn readback_systemd_observation_in(
+    input: SystemdReadbackInput<'_>,
+    show: &mut SystemctlShow<'_>,
+    exec_start_lookup: &mut BusctlExecStartLookup<'_>,
+    same_executable: &SameExecutable<'_>,
+) -> SystemdObservation {
     let SystemdReadbackInput {
         cgroup,
         pid,
@@ -965,7 +1109,8 @@ fn readback_systemd_policy_in(
         argv,
         monotonic_now_us,
     } = input;
-    let refuse = |detail: String| SystemdPolicyReadback::NotGuaranteed { detail };
+    let refuse =
+        |detail: String| SystemdObservation::from(SystemdPolicyReadback::NotGuaranteed { detail });
     let Some((unit, user_manager)) = unit_from_cgroup(cgroup) else {
         return refuse(format!(
             "the process cgroup ({}) does not name a service unit for this instance",
@@ -1205,6 +1350,26 @@ fn readback_systemd_policy_in(
         );
     }
 
+    // Template identity for drift detection — recorded, never required (a
+    // pre-template unit is legacy, not unsupported; the policy+binding
+    // checks above are what establish support). Unparseable versions stay
+    // `None` rather than guessing.
+    let template_version = show_property(&show_output, "Environment").and_then(|env| {
+        env.split(&[',', ' '][..])
+            .find_map(|tok| {
+                tok.strip_prefix(SYSTEMD_TEMPLATE_ENV_KEY)?
+                    .strip_prefix('=')
+            })
+            .and_then(|v| v.trim().parse::<u32>().ok())
+    });
+
+    let verified_identity = SystemdVerifiedUnit {
+        unit,
+        user_manager,
+        restart: restart.to_string(),
+        template_version,
+    };
+
     // Start-rate limiting (man systemd.service, StartLimitIntervalSec=/
     // StartLimitBurst=): restarts are subject to a rate limit — a unit at
     // the limit does NOT respawn even with Restart=always. Bound the claim
@@ -1258,13 +1423,16 @@ fn readback_systemd_policy_in(
                     // readback's own remaining window, never a hard-coded
                     // interval) so the daemon's startup check can wait it
                     // out and retry once; other callers keep refusing.
-                    return SystemdPolicyReadback::StartRateWindowPending {
-                        detail: "the unit's current activation has not outlived \
+                    return SystemdObservation {
+                        verified_identity: Some(verified_identity),
+                        policy: SystemdPolicyReadback::StartRateWindowPending {
+                            detail: "the unit's current activation has not outlived \
                                  StartLimitIntervalUSec; a restart now could hit the \
                                  start-rate limit and leave the service down (man \
                                  systemd.service)"
-                            .to_string(),
-                        retry_after: Duration::from_micros(interval_us - elapsed_us),
+                                .to_string(),
+                            retry_after: Duration::from_micros(interval_us - elapsed_us),
+                        },
                     };
                 }
             }
@@ -1278,25 +1446,10 @@ fn readback_systemd_policy_in(
         }
     }
 
-    // Template identity for drift detection — recorded, never required (a
-    // pre-template unit is legacy, not unsupported; the policy+binding
-    // checks above are what establish support). Unparseable versions stay
-    // `None` rather than guessing.
-    let template_version = show_property(&show_output, "Environment").and_then(|env| {
-        env.split(&[',', ' '][..])
-            .find_map(|tok| {
-                tok.strip_prefix(SYSTEMD_TEMPLATE_ENV_KEY)?
-                    .strip_prefix('=')
-            })
-            .and_then(|v| v.trim().parse::<u32>().ok())
-    });
-
-    SystemdPolicyReadback::Verified(Box::new(SystemdVerifiedUnit {
-        unit,
-        user_manager,
-        restart: restart.to_string(),
-        template_version,
-    }))
+    SystemdObservation {
+        policy: SystemdPolicyReadback::Verified(Box::new(verified_identity.clone())),
+        verified_identity: Some(verified_identity),
+    }
 }
 
 /// Executable identity for the readback: canonical absolute paths on both
@@ -1823,19 +1976,28 @@ fn monotonic_now_us() -> Option<u64> {
     seconds.checked_mul(1_000_000)?.checked_add(nanos / 1_000)
 }
 
-/// Driver half of the systemd readback (Linux): read this process's cgroup
-/// and `INVOCATION_ID`, then verify the loaded policy through
-/// `readback_systemd_policy_in`. Returns
-/// [`SystemdPolicyReadback::NotApplicable`] unless a systemd signal
-/// classified this instance, so non-systemd applies shell out to nothing.
-#[cfg(target_os = "linux")]
+/// Read back the loaded restart policy without exposing staging-only identity.
 pub fn readback_systemd_policy(
     signals: &SupervisionSignals,
     executable: &Path,
     argv: &[String],
 ) -> SystemdPolicyReadback {
+    readback_systemd_observation(signals, executable, argv).policy
+}
+
+/// Driver half of the systemd readback (Linux): read this process's cgroup
+/// and `INVOCATION_ID`, then verify the loaded policy through
+/// `readback_systemd_observation_in`. Returns
+/// [`SystemdPolicyReadback::NotApplicable`] unless a systemd signal
+/// classified this instance, so non-systemd applies shell out to nothing.
+#[cfg(target_os = "linux")]
+fn readback_systemd_observation(
+    signals: &SupervisionSignals,
+    executable: &Path,
+    argv: &[String],
+) -> SystemdObservation {
     if systemd_signal_name(signals).is_none() {
-        return SystemdPolicyReadback::NotApplicable;
+        return SystemdPolicyReadback::NotApplicable.into();
     }
     // #1196 round 2 test seam (cfg(test) only): an in-process test that
     // installed a [`systemd_readback_seam::Scenario`] answers the readback
@@ -1852,7 +2014,8 @@ pub fn readback_systemd_policy(
         Err(e) => {
             return SystemdPolicyReadback::NotGuaranteed {
                 detail: format!("cannot read /proc/self/cgroup: {e}"),
-            };
+            }
+            .into();
         }
     };
     let invocation = std::env::var("INVOCATION_ID")
@@ -1860,7 +2023,7 @@ pub fn readback_systemd_policy(
         .filter(|v| !v.is_empty());
     let pid = std::process::id();
     let deadline = Instant::now() + SYSTEMCTL_SHOW_BOUND;
-    readback_systemd_policy_in(
+    readback_systemd_observation_in(
         SystemdReadbackInput {
             cgroup: &cgroup,
             pid,
@@ -1877,11 +2040,11 @@ pub fn readback_systemd_policy(
 
 /// Non-Linux: there is no systemd to read back.
 #[cfg(not(target_os = "linux"))]
-pub fn readback_systemd_policy(
+fn readback_systemd_observation(
     _signals: &SupervisionSignals,
     _executable: &Path,
     _argv: &[String],
-) -> SystemdPolicyReadback {
+) -> SystemdObservation {
     // #1196 round 2 test seam (cfg(test) only): the non-Linux twin of the
     // driver seam above, behind the same signal gate, so an in-process
     // test drives the real readback decision table on any platform.
@@ -1893,7 +2056,7 @@ pub fn readback_systemd_policy(
             return verdict;
         }
     }
-    SystemdPolicyReadback::NotApplicable
+    SystemdPolicyReadback::NotApplicable.into()
 }
 
 /// [`readback_systemd_policy`] on the blocking pool (the twin of
@@ -1904,20 +2067,32 @@ pub async fn readback_systemd_policy_offloaded(
     executable: &Path,
     argv: &[String],
 ) -> SystemdPolicyReadback {
+    readback_systemd_policy_retaining(signals, executable, argv, None).await
+}
+
+pub(crate) async fn readback_systemd_policy_retaining(
+    signals: &SupervisionSignals,
+    executable: &Path,
+    argv: &[String],
+    lease: Option<ReadbackLease>,
+) -> SystemdPolicyReadback {
     let signals = signals.clone();
     let executable = executable.to_path_buf();
+    let target = executable.clone();
     let argv = argv.to_vec();
-    tokio::task::spawn_blocking(move || readback_systemd_policy(&signals, &executable, &argv))
-        .await
-        .unwrap_or_else(|e| SystemdPolicyReadback::NotGuaranteed {
-            detail: format!("systemd readback task failed: {e}"),
-        })
+    spawn_readback_retaining(target, ReadbackKind::SystemdPolicy, lease, move || {
+        readback_systemd_policy(&signals, &executable, &argv)
+    })
+    .await
+    .unwrap_or_else(|e| SystemdPolicyReadback::NotGuaranteed {
+        detail: format!("systemd readback task failed: {e}"),
+    })
 }
 
 /// #1196 round 2 test seam (cfg(test) only; no env vars, no cargo
 /// features): lets an in-process test drive the daemon's startup update
 /// check END TO END against the REAL readback decision logic
-/// ([`readback_systemd_policy_in`]) by injecting the world the Linux
+/// ([`readback_systemd_observation_in`]) by injecting the world the Linux
 /// driver would have sampled — the `systemctl show` property text, the
 /// structured `ExecStart` snapshot derived from it, the monotonic clock,
 /// the cgroup and the invocation id — instead of shelling out to a real
@@ -1928,8 +2103,8 @@ pub async fn readback_systemd_policy_offloaded(
 #[cfg(test)]
 pub(crate) mod systemd_readback_seam {
     use super::{
-        parse_invocation_id_hex, readback_systemd_policy_in, BusctlExecStart,
-        SystemdPolicyReadback, SystemdReadbackInput,
+        parse_invocation_id_hex, readback_systemd_observation_in, BusctlExecStart,
+        SystemdObservation, SystemdReadbackInput,
     };
     use std::path::Path;
     use std::sync::Mutex;
@@ -2006,7 +2181,7 @@ pub(crate) mod systemd_readback_seam {
 
     /// The readback verdict for the n-th call of an installed scenario, or
     /// `None` when no scenario is installed (fall through to the driver).
-    pub(crate) fn intercept(executable: &Path, argv: &[String]) -> Option<SystemdPolicyReadback> {
+    pub(super) fn intercept(executable: &Path, argv: &[String]) -> Option<SystemdObservation> {
         let (show_output, monotonic_now_us, cgroup, invocation_id) = {
             let mut slot = INSTALLED.lock().expect("systemd readback seam poisoned");
             let installed = slot.as_mut()?;
@@ -2025,7 +2200,7 @@ pub(crate) mod systemd_readback_seam {
         };
         let pid = std::process::id();
         let structured = structured_from_show(&show_output, pid, invocation_id.as_deref());
-        Some(readback_systemd_policy_in(
+        Some(readback_systemd_observation_in(
             SystemdReadbackInput {
                 cgroup: &cgroup,
                 pid,
@@ -2258,6 +2433,73 @@ impl RestartPlan {
     }
 }
 
+/// Independently verified service/install evidence for rollout policy only.
+#[cfg(unix)]
+#[derive(Clone)]
+pub(crate) struct StagingIdentity {
+    pub(crate) executable: PathBuf,
+    pub(crate) data_root: PathBuf,
+    pub(crate) systemd_verified: Option<SystemdVerifiedUnit>,
+}
+
+struct ResolvedRestartIdentity {
+    mode: RestartMode,
+    supervised_exit_code: Option<i32>,
+    supervision_signal: Option<String>,
+    executable: PathBuf,
+    argv: Vec<String>,
+    cwd: PathBuf,
+    data_root: PathBuf,
+    api_addr: SocketAddr,
+    launchd_verified: Option<LaunchdVerifiedJob>,
+    systemd_verified: Option<SystemdVerifiedUnit>,
+}
+
+/// Obtain fleet classification evidence while a verified unit's restart rate
+/// window is still pending. This cannot create a restart plan or grant apply.
+#[cfg(unix)]
+pub(crate) async fn resolve_staging_identity(
+    stop_on_upgrade: bool,
+    executable: &Path,
+    data_root_hint: Option<&Path>,
+    api_addr: Option<SocketAddr>,
+    lease: Option<ReadbackLease>,
+) -> Result<StagingIdentity, RestartOwnershipError> {
+    let signals = SupervisionSignals::sample();
+    let argv = current_argv();
+    let launchd =
+        readback_launchd_policy_retaining(&signals, executable, &argv, lease.clone()).await;
+    let observed_signals = signals.clone();
+    let observed_executable = executable.to_path_buf();
+    let systemd = spawn_readback_retaining(
+        executable.to_path_buf(),
+        ReadbackKind::SystemdIdentity,
+        lease,
+        move || readback_systemd_observation(&observed_signals, &observed_executable, &argv),
+    )
+    .await
+    .unwrap_or_else(|error| {
+        SystemdPolicyReadback::NotGuaranteed {
+            detail: format!("systemd readback task failed: {error}"),
+        }
+        .into()
+    });
+    let identity = resolve_restart_identity(
+        stop_on_upgrade,
+        &signals,
+        executable,
+        data_root_hint,
+        api_addr,
+        &launchd,
+        (&systemd.policy, systemd.verified_identity.as_ref()),
+    )?;
+    Ok(StagingIdentity {
+        executable: identity.executable,
+        data_root: identity.data_root,
+        systemd_verified: identity.systemd_verified,
+    })
+}
+
 /// Resolve and validate the full restart contract before mutation (ADR-0061 §1).
 ///
 /// `executable` is the binary that will be replaced; `data_root_hint` is the
@@ -2278,6 +2520,41 @@ pub fn resolve_restart_plan(
     launchd_readback: &LaunchdPolicyReadback,
     systemd_readback: &SystemdPolicyReadback,
 ) -> Result<RestartPlan, RestartOwnershipError> {
+    // Only the strict path can produce a public plan: it carries no
+    // staging-only unit identity past a pending start-rate window.
+    let identity = resolve_restart_identity(
+        stop_on_upgrade,
+        signals,
+        executable,
+        data_root_hint,
+        api_addr,
+        launchd_readback,
+        (systemd_readback, None),
+    )?;
+    Ok(RestartPlan {
+        mode: identity.mode,
+        supervised_exit_code: identity.supervised_exit_code,
+        supervision_signal: identity.supervision_signal,
+        executable: identity.executable,
+        argv: identity.argv,
+        cwd: identity.cwd,
+        data_root: identity.data_root,
+        api_addr: identity.api_addr,
+        launchd_verified: identity.launchd_verified,
+        systemd_verified: identity.systemd_verified,
+    })
+}
+
+fn resolve_restart_identity(
+    stop_on_upgrade: bool,
+    signals: &SupervisionSignals,
+    executable: &Path,
+    data_root_hint: Option<&Path>,
+    api_addr: Option<SocketAddr>,
+    launchd_readback: &LaunchdPolicyReadback,
+    systemd: (&SystemdPolicyReadback, Option<&SystemdVerifiedUnit>),
+) -> Result<ResolvedRestartIdentity, RestartOwnershipError> {
+    let (systemd_readback, staging_unit) = systemd;
     let mode = plan_restart_mode(stop_on_upgrade, signals)?;
 
     // ADR-0061 §3 (#615): the launchd marker is an operator assertion, not a
@@ -2301,11 +2578,12 @@ pub fn resolve_restart_plan(
     // mutation on every NotGuaranteed path.
     let systemd_verified = match systemd_readback {
         SystemdPolicyReadback::Verified(unit) => Some((**unit).clone()),
+        SystemdPolicyReadback::StartRateWindowPending { .. } => staging_unit.cloned(),
         _ => None,
     };
     if mode == RestartMode::SupervisedExit {
         if let Some(signal) = systemd_signal_name(signals) {
-            if !matches!(systemd_readback, SystemdPolicyReadback::Verified(_)) {
+            if systemd_verified.is_none() {
                 let (detail, retry_after) = match systemd_readback {
                     SystemdPolicyReadback::NotGuaranteed { detail } => (detail.clone(), None),
                     // #1196: the start-rate window is the single unmet
@@ -2394,7 +2672,7 @@ pub fn resolve_restart_plan(
         });
     }
 
-    Ok(RestartPlan {
+    Ok(ResolvedRestartIdentity {
         mode,
         supervised_exit_code: match mode {
             RestartMode::SupervisedExit => Some(supervised_exit_code()),

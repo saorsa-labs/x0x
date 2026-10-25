@@ -1,0 +1,20 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": "Claim",
+      "variant": "Claim",
+      "wire": {
+        "bincode": "00000000"
+      }
+    },
+    {
+      "input": "Complete",
+      "variant": "Complete",
+      "wire": {
+        "bincode": "01000000"
+      }
+    }
+  ],
+  "type": "OpKind"
+}

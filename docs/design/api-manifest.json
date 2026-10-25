@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 205,
+  "endpoint_count": 214,
   "endpoints": [
     {
       "category": "status",
@@ -624,7 +624,7 @@
     {
       "category": "identity",
       "cli_name": "owner riders issue",
-      "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
+      "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty, only gui:show is defined; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
       "method": "POST",
       "path": "/owner/riders",
       "request": {
@@ -639,6 +639,12 @@
             "cli": "--group",
             "in": "body",
             "name": "groups",
+            "required": false
+          },
+          {
+            "cli": "--scope",
+            "in": "body",
+            "name": "scopes",
             "required": false
           },
           {
@@ -681,6 +687,24 @@
       "path": "/owner/riders/:id",
       "request": {
         "kind": "none"
+      }
+    },
+    {
+      "category": "identity",
+      "cli_name": "owner groups recovery-mandate",
+      "description": "ADR 0110 §4b(1): owner-sign an OwnerRecoveryMandateV1 promoting one certified member when every admin of an OwnerCertified group is revoked",
+      "method": "POST",
+      "path": "/owner/groups/:id/recovery-mandate",
+      "request": {
+        "fields": [
+          {
+            "cli": "--promoted",
+            "in": "body",
+            "name": "promoted_agent_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
@@ -2535,6 +2559,24 @@
     },
     {
       "category": "named-groups",
+      "cli_name": "group rebind-certificate",
+      "description": "Self-rebind this agent's renewed certificate into its seat before the cutoff (ADR 0110 §4a)",
+      "method": "POST",
+      "path": "/groups/:id/members/:agent_id/certificate/rebind",
+      "request": {
+        "fields": [
+          {
+            "cli": "default",
+            "in": "body",
+            "name": "certificate",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "named-groups",
       "cli_name": "group ban",
       "description": "Ban a member (admin+)",
       "method": "POST",
@@ -3178,7 +3220,15 @@
       "method": "POST",
       "path": "/upgrade/apply",
       "request": {
-        "kind": "none"
+        "fields": [
+          {
+            "cli": "default",
+            "in": "query",
+            "name": "now",
+            "required": false
+          }
+        ],
+        "kind": "fields"
       }
     },
     {
@@ -3230,6 +3280,30 @@
       }
     },
     {
+      "category": "gui",
+      "cli_name": "show",
+      "description": "Show a GUI view on this machine or, with --on, on an owner machine",
+      "method": "POST",
+      "path": "/gui/show",
+      "request": {
+        "fields": [
+          {
+            "cli": "VIEW",
+            "in": "body",
+            "name": "view",
+            "required": true
+          },
+          {
+            "cli": "--on",
+            "in": "body",
+            "name": "target_machine",
+            "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
       "category": "connect",
       "cli_name": "forward add",
       "description": "Add a local port forward to a peer's loopback service",
@@ -3260,6 +3334,12 @@
             "in": "body",
             "name": "target_port",
             "required": true
+          },
+          {
+            "cli": "--ephemeral",
+            "in": "body",
+            "name": "ephemeral",
+            "required": false
           }
         ],
         "kind": "fields"
@@ -3451,6 +3531,102 @@
       "description": "List share grants that name this install as grantee",
       "method": "GET",
       "path": "/grants/received",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names list",
+      "description": "List owner petnames and pinned names",
+      "method": "GET",
+      "path": "/names",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names resolve",
+      "description": "Resolve [agent:|machine:]<label>.<owner> locally; pins the name at first use",
+      "method": "POST",
+      "path": "/names/resolve",
+      "request": {
+        "fields": [
+          {
+            "cli": "NAME",
+            "in": "body",
+            "name": "name",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names owner add",
+      "description": "Bind a local owner petname to a user id (frozen at first bind)",
+      "method": "POST",
+      "path": "/names/owners",
+      "request": {
+        "fields": [
+          {
+            "cli": "LABEL",
+            "in": "body",
+            "name": "label",
+            "required": true
+          },
+          {
+            "cli": "USER_ID",
+            "in": "body",
+            "name": "user_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names owner rm",
+      "description": "Remove a local owner petname and every pin under it",
+      "method": "DELETE",
+      "path": "/names/owners/:label",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names machine label",
+      "description": "Label a shared machine (machine:<label>.<owner> -> machine id)",
+      "method": "POST",
+      "path": "/names/machines",
+      "request": {
+        "fields": [
+          {
+            "cli": "NAME",
+            "in": "body",
+            "name": "name",
+            "required": true
+          },
+          {
+            "cli": "MACHINE_ID",
+            "in": "body",
+            "name": "machine_id",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names unpin",
+      "description": "Drop a TOFU pin so the name re-pins at next use",
+      "method": "DELETE",
+      "path": "/names/pins/:name",
       "request": {
         "kind": "none"
       }

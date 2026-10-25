@@ -756,6 +756,7 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/routes/mod.rs",
     "src/server/routes/acl.rs",
     "src/server/routes/grants.rs",
+    "src/server/routes/names.rs",
     "src/server/routes/calls.rs",
     "src/server/routes/connect.rs",
     "src/server/routes/contacts.rs",
@@ -771,6 +772,7 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/routes/machines.rs",
     "src/server/routes/messaging.rs",
     "src/server/routes/named_groups.rs",
+    "src/server/routes/named_groups/revocation_eviction/rebind.rs",
     "src/server/routes/network.rs",
     "src/server/routes/owner.rs",
     "src/server/routes/presence.rs",
@@ -782,6 +784,9 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/routes/tasks.rs",
     "src/server/routes/trust.rs",
     "src/server/routes/upgrade.rs",
+    // ADR 0083: handler lives here; `GuiShowRequest` lives in src/gui/show.rs.
+    "src/server/routes/gui_show.rs",
+    "src/gui/show.rs",
 ];
 
 /// How a handler consumes request data, from its extractor signature.

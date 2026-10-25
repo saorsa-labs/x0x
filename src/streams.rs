@@ -423,6 +423,7 @@ pub const PREFIX_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// prefix cannot be mistaken for a valid protocol.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamProtocol {
     /// Local port-forwarding — legacy header (`ForwardV1`, no attestation).
     /// The opener's identity is resolved from the discovery cache by machine
@@ -918,7 +919,9 @@ mod tests {
         if let crate::connect::ConnectPolicy::Enabled(acl) = &mut with_owner_entry {
             acl.owner_allow.push(crate::connect::ConnectOwnerEntry {
                 description: None,
-                targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
+                targets: vec![crate::connect::OwnerTarget::Exact(
+                    "127.0.0.1:22".parse().expect("loopback literal"),
+                )],
             });
         }
         // Owner entry + owner-trusted agent ⇒ pass.

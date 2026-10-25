@@ -7,7 +7,7 @@
 
 mod acl;
 pub(super) mod calls;
-mod connect;
+pub(super) mod connect;
 mod contacts;
 mod direct;
 mod discovery;
@@ -15,6 +15,7 @@ mod exec;
 mod files;
 mod grants;
 mod groups;
+pub(super) mod gui_show;
 pub(in crate::server) mod history;
 pub mod home;
 mod identity;
@@ -22,6 +23,7 @@ mod key_move;
 mod machines;
 mod messaging;
 pub(crate) mod named_groups;
+pub(in crate::server) mod names;
 mod network;
 mod owner;
 mod presence;
@@ -33,6 +35,8 @@ mod sync;
 pub(in crate::server) mod tasks;
 mod trust;
 mod upgrade;
+#[cfg(test)]
+mod wire_golden_tests;
 
 pub(super) use acl::{
     acl_connect_add, acl_connect_list, acl_connect_remove, acl_exec_add, acl_exec_list,
@@ -64,6 +68,7 @@ pub(super) use groups::{
     add_mls_member, create_mls_group, create_mls_welcome, get_mls_group, list_mls_groups,
     mls_decrypt, mls_encrypt, remove_mls_member,
 };
+pub(super) use gui_show::gui_show;
 pub(super) use history::{
     history_diagnostics, history_list, history_message, history_policy, history_purge,
     history_retain, history_scopes, history_search, history_stats, HISTORY_RETAIN_BODY_LIMIT,
@@ -92,34 +97,37 @@ pub(super) use named_groups::{
     discover_groups_nearby, dispatch_join_result_message, dispatch_welcome_blob_message,
     ensure_named_group_listeners, get_group_card, get_group_join_status, get_group_public_messages,
     get_group_state, get_group_state_commits, get_named_group, get_named_group_members,
-    group_membership_lock, handle_control_blob_message, handle_treekem_catchup_request,
-    handle_treekem_catchup_response, import_group_card, ingest_public_message,
+    group_membership_lock, handle_control_blob_message, import_group_card, ingest_public_message,
     join_group_via_invite, leave_group, list_discovery_subscriptions, list_join_requests,
     list_named_groups, load_causal_approval_queue, load_named_groups_merged,
     load_predecessor_relay_outbox, load_requester_offer_outbox, load_treekem_member_key_packages,
     migrate_unsplit_home_suite_store_if_needed, named_group_metadata_event_group_id,
-    now_millis_u64, publish_group_card_to_discovery, recover_home_suite_sidecar_journals,
-    recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
-    remove_named_group_member, replay_pending_causal_approvals, requester_offer_step,
-    restore_treekem_groups, run_direct_metadata_listener, save_named_groups_checked,
-    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
-    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
-    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
-    spawn_directory_resubscribe, spawn_global_discovery_listener,
-    spawn_global_public_message_listener, spawn_listed_to_contacts_listener,
-    store_named_group_info, unban_group_member, update_group_policy, update_member_role,
-    update_named_group, withdraw_group_state, AtomicWriteOutcome, ControlBlobMessage,
-    ControlBlobState, ExpectedJoinResultInviter, JoinRefusalSignLimiter, JoinResultMessage,
-    LastJoinOutcome, ListenerRegistration, NamedGroupMetadataEvent, ParkedRoleUpdate,
-    PendingCausalApproval, PendingJoinAttempt, PendingJoinRefusal, PendingJoinResult,
-    PendingListenerAdmission, PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive,
-    PredecessorRelayObligation, PublicGroupBootstrap, TreeKemCatchupRequest,
-    TreeKemCatchupResponse, TreeKemMemberKeyPackageCache, WelcomeFetchWaiter,
-    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
+    now_millis_u64, publish_group_card_to_discovery, rebind_member_certificate,
+    recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
+    reject_unverified_direct_public_message, remove_named_group_member,
+    replay_pending_causal_approvals, requester_offer_step, restore_treekem_groups,
+    run_direct_metadata_listener, save_named_groups_checked, save_named_groups_checked_unlocked,
+    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
+    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
+    send_group_public_message, set_group_display_name, spawn_directory_resubscribe,
+    spawn_global_discovery_listener, spawn_global_public_message_listener,
+    spawn_listed_to_contacts_listener, store_named_group_info, unban_group_member,
+    update_group_policy, update_member_role, update_named_group, withdraw_group_state,
+    AtomicWriteOutcome, ControlBlobMessage, ControlBlobState, ExpectedJoinResultInviter,
+    JoinRefusalSignLimiter, JoinResultMessage, LastJoinOutcome, ListenerRegistration,
+    NamedGroupMetadataEvent, ParkedRoleUpdate, PendingCausalApproval, PendingJoinAttempt,
+    PendingJoinRefusal, PendingJoinResult, PendingListenerAdmission, PendingTreeKemMetadataEvent,
+    PendingWelcome, PendingWelcomeReceive, PredecessorRelayObligation, PublicGroupBootstrap,
+    TreeKemMemberKeyPackageCache, WelcomeFetchWaiter, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
+};
+pub(super) use names::{
+    names_list, names_machine_label, names_owner_bind, names_owner_unbind, names_resolve,
+    names_unpin,
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
@@ -128,8 +136,8 @@ pub(super) use network::{
     upgrade_diagnostics,
 };
 pub(super) use owner::{
-    owner_agents_issue, owner_agents_revoke, owner_machines, owner_riders_issue, owner_riders_list,
-    owner_riders_revoke,
+    owner_agents_issue, owner_agents_revoke, owner_group_recovery_mandate, owner_machines,
+    owner_riders_issue, owner_riders_list, owner_riders_revoke,
 };
 pub(super) use presence::{
     presence, presence_find, presence_foaf, presence_online, presence_status,
@@ -149,8 +157,11 @@ pub(super) use tasks::{
     legacy_space_board_retired, list_task_lists, list_tasks, update_task,
 };
 pub(super) use trust::evaluate_trust;
+#[cfg(unix)]
+pub(super) use upgrade::StartupStagingContext;
 pub(super) use upgrade::{
-    apply_upgrade, broadcast_current_manifest, check_upgrade, daemon_shutdown_hook,
-    listener_restart_context, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, SelfPublishedReleaseManifests, StartupUpdateCheckRuntime,
+    apply_upgrade, background_channel, broadcast_current_manifest, check_upgrade,
+    daemon_shutdown_hook, listener_restart_context, run_fallback_github_poll,
+    run_gossip_update_listener, run_startup_update_check, BackgroundRuntime,
+    SelfPublishedReleaseManifests, StartupUpdateCheckRuntime,
 };

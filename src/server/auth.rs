@@ -196,7 +196,14 @@ pub(super) async fn auth_middleware(
                 )
                     .into_response();
             }
-            if !super::rider_auth::rider_route_allowed(&method, &path) {
+            if !super::rider_auth::rider_route_allowed(&method, &path, &rider.scopes) {
+                if method == axum::http::Method::POST && path == "/gui/show" {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(super::rider_auth::missing_gui_show_scope_body()),
+                    )
+                        .into_response();
+                }
                 return (
                     StatusCode::FORBIDDEN,
                     Json(serde_json::json!({
@@ -210,6 +217,7 @@ pub(super) async fn auth_middleware(
                 token_id: rider.token_id,
                 token_hash: rider.token_hash,
                 groups: rider.groups,
+                scopes: rider.scopes,
             };
             let mut req = req;
             req.extensions_mut().insert(actor);
@@ -289,14 +297,23 @@ pub(super) async fn refresh_session(
         );
     }
     match state.sessions.refresh(&bearer, Instant::now()) {
-        Ok(token) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "session_token": token,
-                "expires_in": SESSION_TOKEN_TTL_SECS,
-            })),
-        )
-            .into_response(),
+        Ok(token) => {
+            // The GUI may refresh before the socket reconnects. The pending
+            // banner and any hidden socket still holding this token must
+            // follow the new token, or the view opens with no origin banner.
+            state.gui_show.rebind_pending_session(&bearer, &token);
+            super::ws::rebind_gui_ws_tokens(&state, &bearer, &token).await;
+            // A hidden tab refreshes during bootstrap. Visibility comes from
+            // a live GUI socket, not from this refresh.
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "session_token": token,
+                    "expires_in": SESSION_TOKEN_TTL_SECS,
+                })),
+            )
+                .into_response()
+        }
         Err(SessionRefreshError::Unknown) => session_refresh_refused(
             StatusCode::UNAUTHORIZED,
             "session token is invalid or expired; reopen with `x0x gui`",
@@ -375,6 +392,11 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
     if is_grants_path(path) {
         return true;
     }
+    // ADR-0074 §1: owner petnames are editable only by the local owner, and
+    // resolving pins a name; every names route is durable-token only.
+    if is_names_path(path) {
+        return true;
+    }
     // #1228: legacy MLS control is an owner act on every method. The
     // quarantine clear is an owner act too. #1347: the join-request list,
     // approve and reject are NOT in this table. Their class depends on the
@@ -398,10 +420,20 @@ pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
                     | "/groups/secure/open-envelope"
                     // ADR 0116 §4: the runtime history trim.
                     | "/history/retain"
+                    // ADR-0074 §1: named forwards resolve (and pin) a name.
+                    | "/forwards"
+                    // #1392: David approved 22 Oct 2026 13:30 BST. An owner
+                    // token must be the durable API token. A GUI session
+                    // bearer is refused here. A rider is not an owner
+                    // token; `gui:show` admission is the rider scope check.
+                    | "/gui/show"
             ) || is_two_segment_action(path, "delegate")
                 || is_group_quarantine_clear(path)
         }
-        Method::DELETE => is_sync_device_path(path),
+        // DELETE /forwards/:local_addr removes the owner's persisted
+        // forward. Session and rider tokens must not reach it. GET
+        // /forwards stays readable.
+        Method::DELETE => is_sync_device_path(path) || is_forward_addr_path(path),
         // ADR 0116 §3: the local history policy, with its counters and the
         // fork-quarantine pins, is an owner-only read.
         Method::GET => path == "/history/policy",
@@ -433,6 +465,21 @@ fn is_grants_path(path: &str) -> bool {
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
+/// `true` for the ADR-0074 §1 name routes: `/names`, `/names/resolve`,
+/// `/names/owners`, `/names/machines`, and `/names/{owners,pins}/<segment>`.
+fn is_names_path(path: &str) -> bool {
+    if matches!(
+        path,
+        "/names" | "/names/resolve" | "/names/owners" | "/names/machines"
+    ) {
+        return true;
+    }
+    ["/names/owners/", "/names/pins/"].iter().any(|base| {
+        path.strip_prefix(base)
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+    })
+}
+
 /// `true` for exactly `/groups/<nonempty-id>/quarantine/clear`.
 fn is_group_quarantine_clear(path: &str) -> bool {
     match path.strip_prefix("/groups/") {
@@ -461,6 +508,14 @@ fn is_two_segment_action(path: &str, action: &str) -> bool {
                 && segs.next() == Some(action)
                 && segs.next().is_none()
         }
+        None => false,
+    }
+}
+
+/// `true` for exactly `/forwards/<nonempty-local-addr>` (one path segment).
+fn is_forward_addr_path(path: &str) -> bool {
+    match path.strip_prefix("/forwards/") {
+        Some(addr) => !addr.is_empty() && !addr.contains('/'),
         None => false,
     }
 }
@@ -546,7 +601,7 @@ fn ct_eq(a: &str, b: &str) -> bool {
 // ── Session-token store ──────────────────────────────────────────────────
 
 /// Lifetime of a browser session token issued by `POST /auth/session`.
-pub(super) const SESSION_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
+pub(crate) const SESSION_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
 /// Same value in seconds, surfaced in the `expires_in` JSON field.
 const SESSION_TOKEN_TTL_SECS: u64 = 10 * 60;
 /// Hard cap on a refreshed session chain (#893): refresh is refused once
@@ -653,6 +708,24 @@ impl SessionStore {
         Ok(fresh)
     }
 
+    /// Remove one session token. An unknown token is left unchanged.
+    ///
+    /// The lookup hashes the candidate and compares with
+    /// [`subtle::ConstantTimeEq`], the same way as [`Self::refresh`].
+    pub(super) fn revoke(&self, token: &str) {
+        use subtle::ConstantTimeEq;
+        let candidate = Sha256::digest(token.as_bytes());
+        let Ok(mut guard) = self.sessions.lock() else {
+            return;
+        };
+        if let Some(index) = guard
+            .iter()
+            .position(|s| bool::from(candidate.ct_eq(&s.token_hash)))
+        {
+            guard.swap_remove(index);
+        }
+    }
+
     /// Original mint time of a live token's refresh chain (tests only).
     #[cfg(test)]
     fn minted_at(&self, token: &str, now: Instant) -> Option<Instant> {
@@ -668,7 +741,11 @@ impl SessionStore {
     /// Validate a candidate token: constant-time compare against every active
     /// session digest, pruning expired entries along the way. Returns `true`
     /// only if an unexpired entry matches.
-    fn is_valid(&self, token: &str, now: Instant) -> bool {
+    ///
+    /// `POST /gui/show` calls this at the navigate decision. A WebSocket
+    /// stays up after the token expires, and visibility alone is not a
+    /// live GUI session.
+    pub(super) fn is_valid(&self, token: &str, now: Instant) -> bool {
         use subtle::ConstantTimeEq;
         let candidate = Sha256::digest(token.as_bytes());
         let Ok(mut guard) = self.sessions.lock() else {
@@ -677,6 +754,30 @@ impl SessionStore {
         // Prune expired first (fail-closed: an expired token is never valid).
         guard.retain(|s| s.expires_at > now);
         guard.iter().any(|s| candidate.ct_eq(&s.token_hash).into())
+    }
+
+    /// Whether `token` is a live session.
+    #[cfg(test)]
+    pub(super) fn is_live_for_test(&self, token: &str, now: std::time::Instant) -> bool {
+        self.is_valid(token, now)
+    }
+
+    /// Mark one session expired. The next [`Self::is_valid`] drops it.
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&self, token: &str) {
+        use subtle::ConstantTimeEq;
+        let candidate = Sha256::digest(token.as_bytes());
+        let Ok(mut guard) = self.sessions.lock() else {
+            return;
+        };
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        for session in guard.iter_mut() {
+            if bool::from(candidate.ct_eq(&session.token_hash)) {
+                session.expires_at = past;
+            }
+        }
     }
 }
 
@@ -857,6 +958,7 @@ mod tests {
             (Method::POST, "/home/rename"),
             (Method::POST, "/home/seat"),
             (Method::POST, "/upgrade/apply"),
+            (Method::POST, "/gui/show"),
         ] {
             // The route is classified durable-owner…
             assert!(
@@ -1447,5 +1549,71 @@ mod tests {
         for path in ["/grant", "/grants/", "/grants/a/b", "/grantsx"] {
             assert!(!is_grants_path(path), "{path} must not be classified");
         }
+    }
+
+    #[test]
+    fn name_routes_require_durable_owner_for_every_method() {
+        // ADR-0074 §1: petnames are editable only by the local owner and a
+        // resolve pins; a session or rider token must reach none of them.
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for path in [
+                "/names",
+                "/names/resolve",
+                "/names/owners",
+                "/names/machines",
+                "/names/owners/bob",
+                "/names/pins/agent:studio.bob",
+            ] {
+                assert!(
+                    requires_durable_owner(&method, path),
+                    "{method} {path} must require the durable token"
+                );
+            }
+        }
+        for path in [
+            "/name",
+            "/names/",
+            "/namesx",
+            "/names/owners/",
+            "/names/pins/a/b",
+        ] {
+            assert!(!is_names_path(path), "{path} must not be classified");
+        }
+    }
+
+    #[test]
+    fn forward_add_and_delete_require_durable_owner() {
+        // ADR-0074 §1: POST /forwards resolves a peer name and pins it at
+        // first use. DELETE /forwards/:local_addr removes the owner's
+        // persisted record. Session and rider bearers must not reach
+        // either. GET /forwards stays readable. Card import stays
+        // session-reachable (contacts only; bind is gated in the handler).
+        assert!(requires_durable_owner(&Method::POST, "/forwards"));
+        assert!(requires_durable_owner(
+            &Method::DELETE,
+            "/forwards/127.0.0.1:8022"
+        ));
+        assert!(requires_durable_owner(
+            &Method::DELETE,
+            "/forwards/[::1]:8022"
+        ));
+        assert!(!requires_durable_owner(&Method::GET, "/forwards"));
+        assert!(!requires_durable_owner(&Method::DELETE, "/forwards"));
+        assert!(!requires_durable_owner(
+            &Method::DELETE,
+            "/forwards/127.0.0.1:8022/extra"
+        ));
+        assert!(!requires_durable_owner(&Method::POST, "/agent/card/import"));
+    }
+
+    #[test]
+    fn gui_show_requires_durable_owner() {
+        // #1392: David approved 22 Oct 2026 13:30 BST. POST /gui/show
+        // requires the durable owner token. GET /gui stays a browser surface.
+        assert!(requires_durable_owner(&Method::POST, "/gui/show"));
+        assert!(!requires_durable_owner(&Method::GET, "/gui"));
+        assert!(!requires_durable_owner(&Method::GET, "/gui/"));
+        assert!(!requires_durable_owner(&Method::POST, "/gui"));
+        assert!(!requires_durable_owner(&Method::GET, "/gui/show"));
     }
 }

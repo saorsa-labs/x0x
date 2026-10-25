@@ -1243,6 +1243,9 @@ fn deliver_copied_notification(
                 stats
                     .delivered_to_subscriber
                     .fetch_add(1, Ordering::Relaxed);
+                // PlumTree delivered an Eager payload to a subscriber (#1170).
+                // `local:` topics do not use this path.
+                crate::gossip::per_kind::per_kind_counters().record_delivered(MessageKind::Eager);
                 index += 1;
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -3270,6 +3273,8 @@ impl PubSubManager {
         match self.publish_plumtree_and_pump(topic_id, encoded).await {
             Ok(counts) => {
                 self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
+                // Local publish onto the mesh is an Eager wire frame (#1170).
+                crate::gossip::per_kind::per_kind_counters().record_published(MessageKind::Eager);
                 let attempted = counts.map(|c| c.attempted).unwrap_or(0);
                 let fan_out = u32::try_from(attempted).unwrap_or(u32::MAX);
                 #[cfg(test)]
@@ -3318,6 +3323,8 @@ impl PubSubManager {
                     self.stats
                         .delivered_to_subscriber
                         .fetch_add(1, Ordering::Relaxed);
+                    // `local:` hand-offs never enter PlumTree. Do not count
+                    // them as Eager deliveries (#1170).
                     true
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -3362,6 +3369,12 @@ impl PubSubManager {
         // counters (#674), the Leaf refuse gate, and the IWANT repair
         // tracker — no crypto.
         let inspected = saorsa_gossip_pubsub::inspect_message_header(&data);
+        // #1170: the worker already inspected this header for routing. Count
+        // the frame as bus-dispatched here so the receive pump can keep ADR
+        // 0013's steady-state path free of a kind peek.
+        if let Some(header) = inspected.as_ref() {
+            crate::gossip::per_kind::per_kind_counters().record_bus_dispatched(header.kind);
+        }
         let ordinary_frame = inspected
             .as_ref()
             .filter(|header| !header.hop_local_control);
@@ -3394,7 +3407,12 @@ impl PubSubManager {
         // the other receive workers (ADR 0009). A completed plain delivery
         // stamps one exclusive payload when it is the sole producer.
         // Recovery, cancellation, a replay, and a failed verification drain
-        // with the id absent. This path does not snapshot stage stats.
+        // with the id absent.
+        //
+        // Outer ML-DSA verify stays inside saorsa-gossip. Do not call
+        // `stage_stats()` or re-count verifies on this hot path. This slice
+        // does not publish per-kind verify CPU: the pinned crate has no
+        // per-kind verify meter.
         let hop_local = inspected
             .as_ref()
             .is_some_and(|header| header.hop_local_control);
@@ -4889,6 +4907,7 @@ mod tests {
     use super::*;
     use crate::identity::AgentKeypair;
     use crate::network::NetworkConfig;
+    use saorsa_gossip_types::MessageKind;
 
     /// A fresh signing context. Production managers always sign, and since
     /// #1114 nothing unsigned is delivered, so a fixture whose test relies on
@@ -9942,6 +9961,106 @@ mod tests {
         assert_eq!(decoded.sender, Some(kp.agent_id()));
         assert_eq!(decoded.topic, topic);
         assert_eq!(decoded.payload, Bytes::from("signed-modern"));
+    }
+
+    /// #1170: `handle_incoming` counts bus dispatch from the header it already
+    /// inspects. It does not sample `stage_stats` for verify time.
+    #[tokio::test]
+    async fn issue1170_handle_incoming_counts_inspected_kind_as_dispatched() {
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
+        let topic = "issue1170-verify-wire";
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let _sub = manager.subscribe(topic.to_string()).await;
+        // Lifetime totals ignore a rolling-window rotation between the two
+        // reads. A window snapshot can reset under plain `cargo test`.
+        let counters = crate::gossip::per_kind::per_kind_counters();
+        let before = counters.lifetime_bus_dispatched(MessageKind::Eager);
+
+        let inner = remote_signed_inner(topic, Bytes::from("verify-wire"));
+        let frame = signed_outer_frame(&outer_signing_key(), topic_id, inner, true);
+        manager
+            .handle_incoming(PeerId::new([0x17; 32]), None, frame)
+            .await;
+
+        let after = counters.lifetime_bus_dispatched(MessageKind::Eager);
+        assert!(
+            after > before,
+            "inspected Eager frame must count as bus_dispatched: before={before} after={after}"
+        );
+    }
+
+    /// #1170: local publish/deliver paths record Eager-only published/delivered.
+    #[tokio::test]
+    async fn issue1170_publish_and_forward_wire_eager_delivered_published() {
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
+        let topic = "issue1170-forward-wire".to_string();
+        let mut sub = manager.subscribe(topic.clone()).await;
+        *manager.transport.recorder.lock().unwrap() = Some(super::super::egress::Recorder {
+            peers: vec![PeerId::new([0x42; 32])],
+            sends: Vec::new(),
+        });
+
+        // Lifetime totals ignore a rolling-window rotation between the two
+        // reads. A window snapshot can reset under plain `cargo test`.
+        let counters = crate::gossip::per_kind::per_kind_counters();
+        let pub_before = counters.lifetime_published(MessageKind::Eager);
+        let del_before = counters.lifetime_delivered(MessageKind::Eager);
+
+        manager
+            .publish(topic.clone(), Bytes::from("forward-wire"))
+            .await
+            .expect("publish");
+        let _ = tokio::time::timeout(Duration::from_millis(500), sub.recv())
+            .await
+            .expect("local delivery timeout")
+            .expect("subscriber closed");
+
+        let pub_after = counters.lifetime_published(MessageKind::Eager);
+        let del_after = counters.lifetime_delivered(MessageKind::Eager);
+        assert!(
+            pub_after > pub_before,
+            "publish path must record Eager published: before={pub_before} after={pub_after}"
+        );
+        assert!(
+            del_after > del_before,
+            "forward/deliver path must record Eager delivered: before={del_before} after={del_after}"
+        );
+    }
+
+    /// #1170: a `local:` hand-off stays on this daemon and is not an Eager
+    /// PlumTree delivery.
+    #[tokio::test]
+    async fn issue1170_local_handoff_is_not_an_eager_delivery() {
+        let manager = PubSubManager::new(test_node().await, test_support::signing_context())
+            .expect("manager");
+        let topic = "local:issue1170-not-eager".to_string();
+        let mut sub = manager.subscribe(topic.clone()).await;
+        let counters = crate::gossip::per_kind::per_kind_counters();
+        let delivered_before = counters.lifetime_delivered(MessageKind::Eager);
+        let published_before = counters.lifetime_published(MessageKind::Eager);
+
+        manager
+            .publish(topic, Bytes::from("local-only"))
+            .await
+            .expect("local publish");
+        let message = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("local delivery")
+            .expect("subscriber closed");
+        assert_eq!(message.payload, Bytes::from("local-only"));
+
+        assert_eq!(
+            counters.lifetime_delivered(MessageKind::Eager),
+            delivered_before,
+            "local: hand-off must not count as Eager delivered"
+        );
+        assert_eq!(
+            counters.lifetime_published(MessageKind::Eager),
+            published_before,
+            "local: hand-off must not count as Eager published"
+        );
     }
 
     /// A broken signer must refuse every network entrypoint before PlumTree.

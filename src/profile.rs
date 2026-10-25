@@ -17,6 +17,7 @@
 //! Both files are plain JSON with `#[serde(default)]` on every field so
 //! older payloads (and partial PUT bodies) deserialize without error.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -195,6 +196,45 @@ impl SelfProfile {
     }
 }
 
+/// Rename `from` to `to` on the blocking pool. A test can hold it before
+/// it lands (`journal_faults::pause_next_rename`).
+pub(crate) async fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (from, to) = (from.to_path_buf(), to.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        journal_faults::before_rename(&to);
+        std::fs::rename(&from, &to)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// #1545: make the file at `path`, as it is now, durable: fsync the file
+/// when it exists, and then its parent directory. A reader that acts on
+/// what it loads calls this before the load. After a stop between a
+/// rename and its directory fsync, the bytes are visible but not durable,
+/// and a host crash can take them back after the reader acted on them.
+///
+/// # Errors
+/// Returns the IO error of an fsync, or of an open other than a missing
+/// file.
+pub(crate) async fn make_durable(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::File::open(path).await {
+        Ok(file) => file.sync_all().await?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        tokio::fs::File::open(dir).await?.sync_all().await?;
+    }
+    #[cfg(test)]
+    if path.exists() {
+        crash_sim::note_durable(path);
+    }
+    Ok(())
+}
+
 /// Write `bytes` to `path` via a unique temp file + rename (atomic on both
 /// unix and windows for same-directory renames). The temp name embeds the
 /// pid + a counter so concurrent writers never collide.
@@ -217,14 +257,27 @@ pub(crate) async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Resu
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    tokio::fs::write(&tmp, bytes).await?;
-    match tokio::fs::rename(&tmp, path).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            Err(e)
-        }
+    // #1545: a successful save is durable. Owner sync discharges its
+    // obligation to apply synced names once the profile save returns, so
+    // a host crash must not bring back the old profile after that. fsync
+    // the temp file before the rename, and the directory after it.
+    let written = async {
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        rename_file(&tmp, path).await
     }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    #[cfg(unix)]
+    tokio::fs::File::open(dir).await?.sync_all().await?;
+    #[cfg(test)]
+    crash_sim::note_durable(path);
+    Ok(())
 }
 
 /// One line of the append-only owner certificate journal (ADR-0036,
@@ -296,6 +349,24 @@ pub fn cert_storage_digest(cert: &crate::identity::AgentCertificate) -> String {
     hex::encode(blake3::hash(&bytes).as_bytes())
 }
 
+/// Serialises every read-modify-write of the issuance journal in this
+/// process ([`IssuedCertRecord::append`], [`IssuedCertRecord::append_when`])
+/// and every durable read ([`IssuedCertRecord::load_durable`]). An append
+/// is a whole-file rewrite, so two writers that interleave lose a line or
+/// put an older line last.
+///
+/// The set holds each journal whose visible bytes this process made
+/// durable (#1542). Any other journal may show bytes that a host crash can
+/// take back: an append renamed its new file into place but its directory
+/// fsync failed, or an earlier process wrote it. A durable read or a
+/// decided append makes such a journal durable before it uses its lines.
+static JOURNAL_WRITER: tokio::sync::Mutex<BTreeSet<PathBuf>> =
+    tokio::sync::Mutex::const_new(BTreeSet::new());
+
+/// A held [`JOURNAL_WRITER`]. It is owned, not borrowed, so that a journal
+/// write can move it into the task that does the I/O.
+type JournalWriter = tokio::sync::MutexGuard<'static, BTreeSet<PathBuf>>;
+
 impl IssuedCertRecord {
     /// Build the record for a certificate about to be journaled, scoped to
     /// the issuing owner.
@@ -354,13 +425,74 @@ impl IssuedCertRecord {
     /// the issuance call sites (warn + continue): a missing journal line
     /// degrades the roster to discovery-derived, it never blocks startup.
     pub async fn append(path: &Path, record: &Self) -> std::io::Result<()> {
+        Self::append_locked(path, record, JOURNAL_WRITER.lock().await, ()).await
+    }
+
+    /// [`Self::append`] for a caller that holds `JOURNAL_WRITER`. `held`
+    /// moves into the write task (see [`Self::replace_locked`]).
+    async fn append_locked<H: Send + 'static>(
+        path: &Path,
+        record: &Self,
+        writer: JournalWriter,
+        held: H,
+    ) -> std::io::Result<H> {
+        let line = serde_json::to_string(record)
+            .map_err(|e| std::io::Error::other(format!("serialize journal record: {e}")))?;
+        // Append via read-modify-write under a temp+rename: JSONL appends
+        // through File::open(append) are single-write atomic in practice,
+        // but the temp+rename shape keeps the file NEVER partially written
+        // even on weird filesystems.
+        let mut content = tokio::fs::read(path).await.unwrap_or_default();
+        content.extend_from_slice(line.as_bytes());
+        content.push(b'\n');
+        Self::replace_locked(path, content, writer, held)
+            .await
+            .map(|(_, held)| held)
+    }
+
+    /// Replace the journal at `path` with `content`, durably, and give the
+    /// writer and `held` back. This is the one write path of the journal.
+    /// The write runs in its own task, which owns `writer` and `held`
+    /// until the I/O and the durable mark are done. A cancelled caller
+    /// stops only its wait: no other journal writer can run while a
+    /// blocking write of this one can still land (#1542). A writer that
+    /// must not outlive a custody (owner sync's write custody, #1545)
+    /// passes its hold as `held`, so the custody waits for the write.
+    async fn replace_locked<H: Send + 'static>(
+        path: &Path,
+        content: Vec<u8>,
+        mut writer: JournalWriter,
+        held: H,
+    ) -> std::io::Result<(JournalWriter, H)> {
+        let path = path.to_path_buf();
+        tokio::spawn(async move {
+            Self::replace_durably(&path, &content, &mut writer).await?;
+            Ok((writer, held))
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// #1545: wait for the journal write in flight, if any. Shutdown calls
+    /// this before the daemon releases its data directory, so a write
+    /// whose caller was aborted cannot land after it.
+    pub(crate) async fn wait_for_writes() {
+        drop(JOURNAL_WRITER.lock().await);
+    }
+
+    /// The I/O of [`Self::replace_locked`]. Once the rename is done, the
+    /// new bytes are visible; only once the directory fsync is done are
+    /// they recorded in `durable`.
+    async fn replace_durably(
+        path: &Path,
+        content: &[u8],
+        durable: &mut BTreeSet<PathBuf>,
+    ) -> std::io::Result<()> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         if let Some(dir) = path.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
-        let line = serde_json::to_string(record)
-            .map_err(|e| std::io::Error::other(format!("serialize journal record: {e}")))?;
         let tmp = path.with_file_name(format!(
             ".{}.{}.journal.tmp",
             path.file_name().map_or_else(
@@ -369,21 +501,110 @@ impl IssuedCertRecord {
             ),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        // Append via read-modify-write under a temp+rename: JSONL appends
-        // through File::open(append) are single-write atomic on practice,
-        // but the temp+rename shape keeps the file NEVER partially written
-        // even on weird filesystems.
-        let mut content = tokio::fs::read(path).await.unwrap_or_default();
-        content.extend_from_slice(line.as_bytes());
-        content.push(b'\n');
-        tokio::fs::write(&tmp, &content).await?;
-        match tokio::fs::rename(&tmp, path).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                Err(e)
-            }
+        // Clear the durable mark before the first change: a failure after
+        // the rename leaves new bytes that are not durable (#1542).
+        durable.remove(path);
+        if let Err(e) = Self::write_synced(&tmp, content).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
         }
+        if let Err(e) = rename_file(&tmp, path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        #[cfg(test)]
+        journal_faults::after_rename(path).await?;
+        // #1542: owner sync persists its register only after this append
+        // returns, so the new line must survive a host crash. fsync the
+        // parent directory to make the rename durable.
+        #[cfg(unix)]
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::File::open(dir).await?.sync_all().await?;
+        }
+        durable.insert(path.to_path_buf());
+        #[cfg(test)]
+        crash_sim::note_durable(path);
+        Ok(())
+    }
+
+    /// Make the journal at `path` durable unless this process already did.
+    /// The caller holds `JOURNAL_WRITER`. A new write of the same bytes is
+    /// used, not a second fsync of the old file: after a failed fsync, a
+    /// later fsync can report success for data that was not written.
+    async fn make_durable_locked<H: Send + 'static>(
+        path: &Path,
+        writer: JournalWriter,
+        held: H,
+    ) -> std::io::Result<(JournalWriter, H)> {
+        if writer.contains(path) {
+            return Ok((writer, held));
+        }
+        match tokio::fs::read(path).await {
+            Ok(content) => Self::replace_locked(path, content, writer, held).await,
+            // No journal: no line to publish.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((writer, held)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Write `bytes` to a new file at `path` and fsync it.
+    async fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let mut file = tokio::fs::File::create(path).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await
+    }
+
+    /// Append the record `decide` returns for the journal's current lines,
+    /// or nothing when it returns `None`. Returns whether a line was
+    /// appended. A writer that decides from what is already in the journal
+    /// (owner sync's repair of a synced line) uses this, so the read, the
+    /// decision and the append are one step: every journal writer in this
+    /// process holds the journal writer lock for its read-modify-write.
+    /// `decide` runs under that lock, so it must not append to the journal.
+    /// `held` moves into each write (see [`Self::replace_locked`]), and
+    /// comes back with the result.
+    ///
+    /// # Errors
+    /// Returns the underlying IO error of the append.
+    pub(crate) async fn append_when<F, Fut, H>(
+        path: &Path,
+        held: H,
+        decide: F,
+    ) -> std::io::Result<(bool, H)>
+    where
+        F: FnOnce(Vec<Self>) -> Fut,
+        Fut: std::future::Future<Output = Option<Self>>,
+        H: Send + 'static,
+    {
+        let writer = JOURNAL_WRITER.lock().await;
+        // #1542: the decision may skip the append because the line is
+        // already there, and the caller then writes its register. So the
+        // lines it decides from must be durable.
+        let (writer, held) = Self::make_durable_locked(path, writer, held).await?;
+        let existing = Self::load(path).await;
+        let Some(record) = decide(existing).await else {
+            return Ok((false, held));
+        };
+        let held = Self::append_locked(path, &record, writer, held).await?;
+        Ok((true, held))
+    }
+
+    /// Load the journal for a writer that publishes its lines (owner
+    /// sync's reconcile, #1542). Unlike [`Self::load`], it waits for any
+    /// append in progress, and it makes the journal durable first, so a
+    /// host crash cannot take back a line it returned.
+    ///
+    /// # Errors
+    /// Returns the IO error when the journal cannot be made durable.
+    pub(crate) async fn load_durable<H: Send + 'static>(
+        path: &Path,
+        held: H,
+    ) -> std::io::Result<Vec<Self>> {
+        let writer = JOURNAL_WRITER.lock().await;
+        // Hold the writer (and `held`) across the load.
+        let _writer_and_held = Self::make_durable_locked(path, writer, held).await?;
+        Ok(Self::load(path).await)
     }
 
     /// Load the journal; malformed lines are skipped (the journal is
@@ -405,11 +626,280 @@ impl IssuedCertRecord {
     }
 }
 
+/// A test model of a host crash. A write is durable only after the file
+/// and its parent directory are fsynced; the durable writers record the
+/// file's bytes here at that point. [`crash_sim::crash`] puts each file
+/// back to its last durable bytes, or removes it, as a host crash can.
+#[cfg(test)]
+pub(crate) mod crash_sim {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn ledger() -> &'static Mutex<HashMap<PathBuf, Vec<u8>>> {
+        static LEDGER: OnceLock<Mutex<HashMap<PathBuf, Vec<u8>>>> = OnceLock::new();
+        LEDGER.get_or_init(Mutex::default)
+    }
+
+    /// Record the bytes now at `path` as durable. The durable writers call
+    /// this after their fsyncs; a test calls it to model the kernel
+    /// flushing a file some time after an unsynced write.
+    pub(crate) fn note_durable(path: &Path) {
+        let bytes = std::fs::read(path).expect("read durable file");
+        ledger().lock().unwrap().insert(path.to_path_buf(), bytes);
+    }
+
+    /// Lose every write to `paths` that was not made durable.
+    pub(crate) fn crash(paths: &[&Path]) {
+        let ledger = ledger().lock().unwrap();
+        for path in paths {
+            match ledger.get(*path) {
+                Some(bytes) => std::fs::write(path, bytes).expect("restore durable bytes"),
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
+
+/// Test faults for a journal write after its rename, before the directory
+/// fsync: a pause (the new line is visible but not yet durable) or a
+/// failed fsync (the new line stays visible but is not durable).
+#[cfg(test)]
+pub(crate) mod journal_faults {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    /// How a paused write ends.
+    pub(crate) enum PauseEnd {
+        /// The write goes on to its directory fsync.
+        Resume,
+        /// The host crashes at the pause: the write stops before its
+        /// directory fsync and returns an error.
+        Crash,
+    }
+
+    type Pause = (oneshot::Sender<()>, oneshot::Receiver<PauseEnd>);
+
+    static PAUSES: Mutex<BTreeMap<PathBuf, Pause>> = Mutex::new(BTreeMap::new());
+    static FAILURES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+    /// Hold the next write of `path` after its rename: it signals
+    /// `reached` and then waits for `release`. A dropped `release` resumes
+    /// the write.
+    pub(crate) fn pause_next(
+        path: &Path,
+        reached: oneshot::Sender<()>,
+        release: oneshot::Receiver<PauseEnd>,
+    ) {
+        PAUSES
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), (reached, release));
+    }
+
+    /// Fail the directory fsync of the next write of `path`.
+    pub(crate) fn fail_next(path: &Path) {
+        FAILURES.lock().unwrap().insert(path.to_path_buf());
+    }
+
+    type BlockingPause = (oneshot::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+    static RENAME_PAUSES: Mutex<BTreeMap<PathBuf, BlockingPause>> = Mutex::new(BTreeMap::new());
+
+    /// Hold the next rename to `path` on the blocking pool, before it
+    /// lands: it signals `reached` and then waits for `release`. A caller
+    /// that is cancelled meanwhile does not stop the rename.
+    pub(crate) fn pause_next_rename(
+        path: &Path,
+        reached: oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        RENAME_PAUSES
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), (reached, release));
+    }
+
+    pub(super) fn before_rename(path: &Path) {
+        let pause = RENAME_PAUSES.lock().unwrap().remove(path);
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
+    }
+
+    pub(super) async fn after_rename(path: &Path) -> std::io::Result<()> {
+        let pause = PAUSES.lock().unwrap().remove(path);
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            if let Ok(PauseEnd::Crash) = release.await {
+                return Err(std::io::Error::other("simulated host crash"));
+            }
+        }
+        if FAILURES.lock().unwrap().remove(path) {
+            return Err(std::io::Error::other("injected directory fsync failure"));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// Codex review of #1545 (29e2800), P2: owner sync discharges its
+    /// obligation to apply synced names when the profile save returns. A
+    /// host crash after the save must keep the saved profile, or the
+    /// restart loads the old names with no obligation left to apply them.
+    #[tokio::test]
+    async fn a_saved_profile_survives_a_host_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.json");
+        let profile = SelfProfile {
+            human_name: Some("Alice".into()),
+            ..SelfProfile::default()
+        };
+        profile.save_to(&path).await.unwrap();
+        crash_sim::crash(&[&path]);
+        assert_eq!(
+            SelfProfile::load_from(&path).await.unwrap(),
+            Some(profile),
+            "a host crash must keep a profile that save_to returned"
+        );
+    }
+
+    /// Codex review of #1545 (a19203d), P2: an append is cancelled while
+    /// its rename is in flight on the blocking pool. A durable read then
+    /// runs before the rename lands. The read must not mark the journal
+    /// durable while the cancelled rename can still put unsynced bytes in
+    /// place: every line a durable read returns must survive a host crash.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_append_cannot_land_unsynced_bytes_under_a_durable_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CERT_JOURNAL_FILE);
+        let line = |digest: &str| IssuedCertRecord {
+            user_id: "aa".to_string(),
+            agent_id: "bb".to_string(),
+            cert_digest: digest.to_string(),
+            issued_at: 100,
+            not_after: Some(5_000),
+            mode: CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        };
+        IssuedCertRecord::append(&path, &line("d1")).await.unwrap();
+
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        journal_faults::pause_next_rename(&path, reached_tx, release_rx);
+        let issuance = {
+            let (path, d2) = (path.clone(), line("d2"));
+            tokio::spawn(async move { IssuedCertRecord::append(&path, &d2).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("the append reaches its rename")
+            .unwrap();
+        // The caller cancels the append; its rename is still in flight.
+        issuance.abort();
+        let _ = issuance.await;
+
+        // A durable read: before the rename lands if nothing holds it off.
+        let mut read = {
+            let path = path.clone();
+            tokio::spawn(async move { IssuedCertRecord::load_durable(&path, ()).await })
+        };
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), &mut read).await;
+        release_tx.send(()).unwrap();
+        match first {
+            Ok(done) => {
+                done.unwrap().unwrap();
+            }
+            Err(_) => {
+                read.await.unwrap().unwrap();
+            }
+        }
+        // Let the cancelled rename land.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let published = IssuedCertRecord::load_durable(&path, ()).await.unwrap();
+        crash_sim::crash(&[&path]);
+        let after = IssuedCertRecord::load(&path).await;
+        assert_eq!(
+            after, published,
+            "a host crash must keep every line a durable read returned"
+        );
+    }
+
+    /// Codex review of #1545 (69fe33e): a writer that decides from the
+    /// journal (`append_when`) and an issuance append must not interleave.
+    /// Here the decision sees only `d1`'s history and appends `d1` again;
+    /// a renewal `d2` is issued while it decides. `d2` must end up last,
+    /// because readers take the last line per agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_decided_append_and_an_issuance_append_do_not_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CERT_JOURNAL_FILE);
+        let line = |digest: &str| IssuedCertRecord {
+            user_id: "aa".to_string(),
+            agent_id: "bb".to_string(),
+            cert_digest: digest.to_string(),
+            issued_at: 100,
+            not_after: Some(5_000),
+            mode: CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        };
+        IssuedCertRecord::append(&path, &line("d1")).await.unwrap();
+        let (deciding_tx, deciding_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let decided = {
+            let path = path.clone();
+            let repair = line("d1");
+            tokio::spawn(async move {
+                IssuedCertRecord::append_when(&path, (), move |existing| {
+                    let saw_d2 = existing.iter().any(|r| r.cert_digest == "d2");
+                    deciding_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    std::future::ready((!saw_d2).then_some(repair))
+                })
+                .await
+                .unwrap()
+                .0
+            })
+        };
+        deciding_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let issuance = {
+            let path = path.clone();
+            let renewal = line("d2");
+            tokio::spawn(async move { IssuedCertRecord::append(&path, &renewal).await })
+        };
+        // Give the issuance time to run while the decision is held.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        release_tx.send(()).unwrap();
+        decided.await.unwrap();
+        issuance.await.unwrap().unwrap();
+        let lines = IssuedCertRecord::load(&path).await;
+        assert_eq!(
+            lines.last().map(|r| r.cert_digest.as_str()),
+            Some("d2"),
+            "the renewal stays the last line: {lines:?}"
+        );
+    }
 
     #[tokio::test]
     async fn owner_profile_round_trips_on_disk() {

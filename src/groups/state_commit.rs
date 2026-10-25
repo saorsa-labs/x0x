@@ -339,6 +339,8 @@ fn role_byte(role: GroupRole) -> u8 {
         GroupRole::Moderator => 2,
         GroupRole::Member => 1,
         GroupRole::Guest => 0,
+        // #1604: never committed; decoders refuse an unknown role first.
+        GroupRole::Unknown => u8::MAX,
     }
 }
 
@@ -348,6 +350,8 @@ fn state_byte(state: GroupMemberState) -> u8 {
         GroupMemberState::Banned => 2,
         GroupMemberState::Removed => 3,
         GroupMemberState::Pending => 4,
+        // #1604: never committed; decoders refuse an unknown state first.
+        GroupMemberState::Unknown => u8::MAX,
     }
 }
 
@@ -1096,7 +1100,16 @@ pub fn validate_alternate_chain(
         if commit_link.policy_hash != base.policy_hash {
             return Err("policy changed inside the gap (unreconstructable without the event)");
         }
-        if !active_admin_in_projection(&roster, &commit_link.committed_by) {
+        // ADR 0110 §4 named exception (D129): a self-rebind link, signed by
+        // the seat's own agent and changing only its certificate digest,
+        // is accepted under the same checks. It is never an owner anchor.
+        let self_rebind = compute_public_meta_hash(&meta) == commit_link.public_meta_hash
+            && super::cert_rebind::is_self_rebind_link(
+                &roster,
+                &link.roster,
+                &commit_link.committed_by,
+            );
+        if !self_rebind && !active_admin_in_projection(&roster, &commit_link.committed_by) {
             return Err(
                 "link committer is not an active admin in the RECONSTRUCTED predecessor roster",
             );

@@ -1,0 +1,52 @@
+{
+  "captured_from": "origin/main 545b781 (before #1604 changes)",
+  "cases": [
+    {
+      "input": {
+        "group_id": "g",
+        "member_agent_id": "m",
+        "type": "fetch_request"
+      },
+      "variant": "FetchRequest",
+      "wire": {
+        "json": "{\"type\":\"fetch_request\",\"group_id\":\"g\",\"member_agent_id\":\"m\"}"
+      }
+    },
+    {
+      "input": {
+        "event": {
+          "actor": "a",
+          "agent_id": "m",
+          "event": "member_removed",
+          "group_id": "g",
+          "revision": 2
+        },
+        "type": "result"
+      },
+      "variant": "Result",
+      "wire": {
+        "json": "{\"type\":\"result\",\"event\":{\"event\":\"member_removed\",\"group_id\":\"g\",\"revision\":2,\"actor\":\"a\",\"agent_id\":\"m\",\"treekem_commit_b64\":null,\"treekem_epoch\":null,\"secret_epoch\":null,\"commit\":null}}"
+      }
+    },
+    {
+      "input": {
+        "receipt": {
+          "attempt_id": "t",
+          "group_id": "g",
+          "issued_at_ms": 1,
+          "member_agent_id": "m",
+          "nonce": "n",
+          "reason": "invite_expired",
+          "signature_b64": "sig",
+          "signer_agent_id": "s"
+        },
+        "type": "refused"
+      },
+      "variant": "Refused",
+      "wire": {
+        "json": "{\"type\":\"refused\",\"receipt\":{\"group_id\":\"g\",\"member_agent_id\":\"m\",\"signer_agent_id\":\"s\",\"attempt_id\":\"t\",\"reason\":\"invite_expired\",\"issued_at_ms\":1,\"nonce\":\"n\",\"signature_b64\":\"sig\"}}"
+      }
+    }
+  ],
+  "type": "JoinResultMessage"
+}

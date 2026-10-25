@@ -19,7 +19,7 @@
 //! `/owner/*` route before any handler runs.
 
 use super::super::state::AppState;
-use super::super::{api_error, parse_agent_id_hex};
+use super::super::{api_error, api_error_with_reason, parse_agent_id_hex};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -348,6 +348,10 @@ pub(in crate::server) struct IssueRiderRequest {
     /// Token lifetime in seconds (default 7 days, max 90 days).
     #[serde(default)]
     ttl_secs: Option<u64>,
+    /// Rider-token scopes. Empty is the default. The only defined value
+    /// is `gui:show`. This is not the group `delegation` scope list.
+    #[serde(default)]
+    scopes: Vec<String>,
     /// The sub-agent-signed delegation capability (review r3, option B)
     /// — REQUIRED: without it the daemon could assert any sub-agent and
     /// receivers would have no proof.
@@ -447,6 +451,17 @@ pub(in crate::server) async fn owner_riders_issue(
             "owner-admin endpoints require the durable API token (not a session token)",
         );
     }
+    // Reject an unknown scope before any certificate lookup or disk write.
+    let scopes = match crate::server::rider_auth::parse_rider_scopes(&req.scopes) {
+        Ok(scopes) => scopes,
+        Err(scope) => {
+            return api_error_with_reason(
+                StatusCode::BAD_REQUEST,
+                format!("unknown rider scope: {scope}"),
+                "unknown_scope",
+            );
+        }
+    };
     let Some(user_kp) = state.agent.identity().user_keypair() else {
         return owner_missing();
     };
@@ -605,14 +620,22 @@ pub(in crate::server) async fn owner_riders_issue(
             cert_not_after,
             Some(delegation),
             now,
+            scopes,
         )
         .await;
     let (token, record) = match issued {
         Ok(issued) => issued,
-        Err(e) => {
+        Err(crate::server::rider_auth::IssueRiderError::UnknownScope(scope)) => {
+            return api_error_with_reason(
+                StatusCode::BAD_REQUEST,
+                format!("unknown rider scope: {scope}"),
+                "unknown_scope",
+            );
+        }
+        Err(crate::server::rider_auth::IssueRiderError::Persist(error)) => {
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to persist rider token: {e}"),
+                format!("failed to persist rider token: {error}"),
             );
         }
     };
@@ -626,6 +649,7 @@ pub(in crate::server) async fn owner_riders_issue(
             "token_id": record.token_id,
             "sub_agent_id": target_hex,
             "groups": groups,
+            "scopes": record.scopes,
             "label": req.label,
             "issued_at_unix": record.issued_at,
             "expires_at_unix": record.expires_at,
@@ -671,6 +695,7 @@ pub(in crate::server) async fn owner_riders_list(
                 "token_id": record.token_id,
                 "sub_agent_id": record.sub_agent_id,
                 "groups": record.groups,
+                "scopes": record.scopes,
                 "label": record.label,
                 "issued_at_unix": record.issued_at,
                 "expires_at_unix": record.expires_at,
@@ -836,6 +861,7 @@ mod revocation_persistence_tests {
                 None,
                 None,
                 now,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -1040,5 +1066,246 @@ mod owner_machines_tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
 
         agent.shutdown().await;
+    }
+}
+
+/// Request body for `POST /owner/groups/:id/recovery-mandate`.
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct RecoveryMandateRequest {
+    /// Hex agent ID of the Active certified member to promote to Admin.
+    promoted_agent_id: String,
+}
+
+/// POST /owner/groups/:id/recovery-mandate — ADR 0110 §4b(1).
+///
+/// For an `OwnerCertified` group (Home included) whose Admin-or-higher
+/// Active seats all hold verified Agent-subject revocations, the owner's
+/// user key U signs an `OwnerRecoveryMandateV1` that names the group, its
+/// current head, each revoked admin with its revocation record hashes, and
+/// one promoted member with its committed certificate digest. The daemon
+/// sends it to that member, gated on `owner_recovery_v1`, and returns
+/// `202` with `waiting_for_recovery_member`. Only a node that holds U's
+/// key can sign (`409` otherwise); typed `recovery_*` refusals are `409`
+/// (`403` for `recovery_signer_not_owner`).
+pub(in crate::server) async fn owner_group_recovery_mandate(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
+    Path(group_id): Path<String>,
+    Json(req): Json<RecoveryMandateRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "owner-admin endpoints require the durable API token (not a session token)",
+        );
+    }
+    let Some(user_kp) = state.agent.identity().user_keypair() else {
+        return owner_missing();
+    };
+    super::named_groups::sign_recovery_mandate(&state, user_kp, &group_id, &req.promoted_agent_id)
+        .await
+}
+
+#[cfg(test)]
+mod owner_recovery_mandate_tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::post, Router};
+    use tower::ServiceExt;
+
+    async fn post_mandate(
+        state: &Arc<AppState>,
+        durable: bool,
+        group_id: &str,
+        promoted: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = Router::new()
+            .route(
+                "/owner/groups/:id/recovery-mandate",
+                post(owner_group_recovery_mandate),
+            )
+            .layer(axum::Extension(
+                crate::server::rider_auth::ActorContext::Owner { durable },
+            ))
+            .with_state(Arc::clone(state));
+        let body = serde_json::json!({ "promoted_agent_id": promoted }).to_string();
+        let response = app
+            .oneshot(
+                Request::post(format!("/owner/groups/{group_id}/recovery-mandate"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// ADR 0110 §4b(1): the owner route refuses while an eligible admin
+    /// remains (`recovery_not_needed`) and refuses a session token; once
+    /// every admin holds a verified revocation it signs a mandate naming
+    /// the revoked admin and the promoted member, and the owner node shows
+    /// `waiting_for_recovery_member`.
+    #[tokio::test]
+    async fn owner_group_recovery_mandate_signs_only_when_every_admin_is_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let user =
+            crate::identity::UserKeypair::from_seed(&[0x5E; 32]).expect("deterministic user key");
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_identity_dir(dir.path().join("identity"))
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(crate::identity::AgentKeypair::generate().unwrap())
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .with_peer_cache_disabled()
+                .with_network_config(crate::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..Default::default()
+                })
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&agent),
+        )
+        .await
+        .unwrap();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let admin = crate::identity::AgentKeypair::generate().unwrap();
+        let local = state.agent.identity().agent_keypair();
+        let seat = |agent: &crate::identity::AgentKeypair, role: crate::groups::GroupRole| {
+            let cert = crate::identity::AgentCertificate::issue(owner, agent).unwrap();
+            let id = hex::encode(agent.agent_id().as_bytes());
+            let mut member = crate::groups::GroupMember::new_member(id, None, None, 1);
+            member.role = role;
+            member.certificate_digest =
+                Some(crate::groups::owner_cert::certificate_digest_hex(&cert));
+            member.certificate = Some(cert);
+            member
+        };
+        let mut info = crate::groups::GroupInfo::new(
+            "recovery".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "cd".repeat(16),
+        );
+        info.policy.admission =
+            crate::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        info.policy.confidentiality = crate::groups::policy::GroupConfidentiality::SignedPublic;
+        info.members_v2.clear();
+        for member in [
+            seat(&admin, crate::groups::GroupRole::Admin),
+            seat(local, crate::groups::GroupRole::Member),
+        ] {
+            info.members_v2.insert(member.agent_id.clone(), member);
+        }
+        info.recompute_state_hash();
+        let group_id = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        let local_hex = hex::encode(local.agent_id().as_bytes());
+
+        let (status, body) = post_mandate(&state, false, &group_id, &local_hex).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+        let (status, body) = post_mandate(&state, true, &group_id, &local_hex).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "recovery_not_needed");
+
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Agent(admin.agent_id()),
+            admin.public_key(),
+            admin.secret_key(),
+            1,
+            None,
+        )
+        .unwrap();
+        assert!(state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .unwrap());
+
+        let stranger = hex::encode([0x11; 32]);
+        let (status, body) = post_mandate(&state, true, &group_id, &stranger).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "recovery_member_ineligible");
+
+        let (status, body) = post_mandate(&state, true, &group_id, &local_hex).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert_eq!(body["state"], "waiting_for_recovery_member");
+        assert_eq!(body["promoted_member"], local_hex);
+        assert_eq!(
+            body["revoked_admins"],
+            serde_json::json!([hex::encode(admin.agent_id().as_bytes())])
+        );
+        assert_eq!(body["parent_head"], info.state_hash);
+        state.agent.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod rider_scope_mint_tests {
+    use super::*;
+    use crate::server::routes::named_groups::tests::secure_endpoint_test_state;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::post;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn unknown_rider_scope_is_400_and_not_persisted() -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let app = axum::Router::new()
+            .route("/owner/riders", post(owner_riders_issue))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/owner/riders")
+            .header("authorization", "Bearer test-token")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "sub_agent_id": "aa".repeat(32),
+                    "scopes": ["not-a-scope"],
+                    "delegation": {"payload_b64": "YQ==", "signature": "00"}
+                })
+                .to_string(),
+            ))?;
+        let resp = app.oneshot(req).await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(body["reason"], "unknown_scope");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not-a-scope"),
+            "{body}"
+        );
+        assert!(state.rider_tokens.lock().await.list().is_empty());
+        Ok(())
     }
 }

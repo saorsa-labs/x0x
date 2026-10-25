@@ -129,6 +129,14 @@ pub struct ServeOptions {
     /// never replace or restart the host application. Updater-owned manifest
     /// broadcast/listener side effects are gated with the install paths.
     pub self_update_enabled: bool,
+    /// Path of the daemon TOML that produced `DaemonConfig`, when known.
+    /// Used by ADR 0083 to re-read `[gui_show]` on `POST /acl/reload`.
+    pub daemon_config_path: Option<std::path::PathBuf>,
+    /// Config path `POST /acl/reload` can read.
+    ///
+    /// The daemon passes the loaded config, or the default config path
+    /// when startup loaded no file. Stop does not create or modify it.
+    pub gui_show_write_path: Option<std::path::PathBuf>,
 }
 
 pub(super) const fn effective_self_update_enabled(
@@ -447,6 +455,11 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) forward: x0x::forward::ForwardConfig,
 
+    /// SOCKS5 front-end (TOML: `[socks]`). Off until `listen` is set.
+    /// Bind address must be loopback (ADR-0074 §3).
+    #[serde(default)]
+    pub socks: x0x::socks::SocksConfig,
+
     /// ADR-0043 agent key-move configuration (TOML: `[key_move]`).
     /// `ceremony_enabled` defaults to **false** — the roaming-move
     /// ceremony is experimental in v1; machine ML-KEM enrollment, the
@@ -506,6 +519,10 @@ pub struct DaemonConfig {
     /// WebSocket session tuning (`[ws]` in TOML).
     #[serde(default)]
     pub ws: DaemonWsConfig,
+
+    /// ADR 0083 agent-initiated GUI show (`[gui_show]`).
+    #[serde(default)]
+    pub gui_show: x0x::gui::GuiShowConfig,
 }
 
 /// WebSocket session tuning (`[ws]` in the daemon TOML).
@@ -815,9 +832,11 @@ impl Default for DaemonConfig {
             group_card_republish_interval_secs: None,
             directory_resubscribe_jitter_ms: None,
             forward: x0x::forward::ForwardConfig::default(),
+            socks: x0x::socks::SocksConfig::default(),
             network_id: None,
             zero_peer_restart_secs: None,
             api_watchdog: super::ApiWatchdogConfig::default(),
+            gui_show: x0x::gui::GuiShowConfig::default(),
         }
     }
 }
@@ -977,8 +996,9 @@ pub(super) struct AppState {
     /// catch-up requests, the KV-store delta direct deliveries and the
     /// outgoing file-chunk streams, and since #1288 the WebSocket session
     /// loop and its child tasks (the writer, the direct-message, call, and
-    /// keepalive forwarders, and the shared and per-session topic
-    /// forwarders). None of them owns a write that an abort
+    /// keepalive forwarders, the shared and per-session topic forwarders,
+    /// and the queued GUI reveal that waits on a full outbound queue). None
+    /// of them owns a write that an abort
     /// could cut: the most a send leaves behind is the outbound DM history
     /// row that `Agent::send_direct_with_history` enqueues synchronously
     /// after a successful send, and the history writer owns that
@@ -1062,6 +1082,17 @@ pub(super) struct AppState {
     /// never dropped; replayed after the group's next accepted
     /// `MemberAdded`. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
     pub(super) parked_role_updates: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
+    /// #1573 (ADR 0110 §3): signed GSS `MemberRemoved`/`MemberBanned`
+    /// events that rotate the secret epoch and arrived before this
+    /// survivor holds the new epoch's secret. The head stays at the parent
+    /// until the `SecureShareDelivered` share installs; the share replays
+    /// them. Bounded per group (`PARKED_ROLE_UPDATE_CAP`).
+    pub(super) parked_gss_removals: StdMutex<HashMap<String, Vec<ParkedRoleUpdate>>>,
+    /// #1573 (#1508/#1533 rc13): the durable side of the GSS share hold.
+    /// Parked removals above and held crypto-only exclusions are written to
+    /// `gss-share-holds/` and loaded again at restart, so no time limit or
+    /// restart resumes sealing under the removed member's secret.
+    pub(in crate::server) gss_share_holds: crate::server::routes::named_groups::GssShareHolds,
     /// #447: `MemberJoined` events rejected ONLY for missing OwnerCertified
     /// certificate evidence (retryable), retained so the authority can
     /// re-apply them once the joiner's announce blob resolves. Keyed by
@@ -1205,6 +1236,11 @@ pub(super) struct AppState {
     /// Anti-spam throttle for outbound catch-up requests. It runs on the
     /// runtime clock, as the catch-up rounds do (#1427).
     pub(super) treekem_catchup_throttle: RwLock<HashMap<String, tokio::time::Instant>>,
+    /// #1357 (ADR 0110 §2): the catch-up pages this daemon is sending now.
+    /// Each served request sends its page on its own task, so a slow or
+    /// unreachable requester never holds the catch-up listener (and the
+    /// head-round answers queued behind it). The permits bound those tasks.
+    pub(super) treekem_catchup_serve_slots: Arc<tokio::sync::Semaphore>,
     /// #1427: per group key, the epoch-ahead traffic seen while an
     /// epoch-ahead catch-up task runs for that group. An entry means one
     /// task runs; each later observation updates the entry.
@@ -1233,6 +1269,8 @@ pub(super) struct AppState {
     /// Directory holding `<group_id>.snap` snapshots and `<group_id>.journal`
     /// TreeKEM persistence journals (mode 0600).
     pub(super) treekem_dir: PathBuf,
+    /// ADR 0110 S4: revocation-eviction obligations and budgets.
+    pub(super) revocation_evictions: super::routes::named_groups::S4Runtime,
     /// Active WebSocket sessions.
     pub(super) ws_sessions: RwLock<HashMap<String, WsSession>>,
     /// Shared WS topic state (single lock for channel + subscribers + forwarder per topic).
@@ -1284,6 +1322,11 @@ pub(super) struct AppState {
     pub(super) upgrade_check_cache: Mutex<Option<CachedUpgradeCheck>>,
     /// Serializes all destructive binary replacement attempts.
     pub(super) upgrade_apply_lock: Arc<Mutex<()>>,
+    /// Bounds HTTP staging waits without holding the shared replacement lock.
+    pub(super) http_upgrade_wait_lock: Arc<Mutex<()>>,
+    /// Actual boot identity; unavailable identity refuses HTTP update only.
+    #[cfg(unix)]
+    pub(super) upgrade_staging: Option<super::routes::StartupStagingContext>,
     /// API bearer token for authenticating local clients.
     pub(super) api_token: String,
     /// Short-lived browser session tokens (#127 / WS1.6). The only tokens
@@ -1305,6 +1348,8 @@ pub(super) struct AppState {
     /// ADR-0070 §3: API-managed connect/exec ACL entries over the TOML
     /// floor, and hot reload (`/acl/*`).
     pub(super) acl_admin: Arc<super::acl_admin::AclAdmin>,
+    /// ADR 0083: local GUI show runtime (`[gui_show]`, rate limit, opener).
+    pub(super) gui_show: x0x::gui::GuiShowRuntime,
     /// Connect-ACL allow/deny counters + policy summary for
     /// `/diagnostics/connect`. Counters reflect live forwards when connect is
     /// enabled (the forwarder calls `record_allowed`/`record_denied`) and read
@@ -1314,11 +1359,22 @@ pub(super) struct AppState {
     /// consumer + outbound local-port listeners. `None` when connect is
     /// disabled (no policy) so the daemon runs zero forwarder tasks.
     pub(super) forward_service: Option<Arc<x0x::forward::ForwardService>>,
+    /// ADR-0074 §3 SOCKS5 listener. `None` when `[socks] listen` is unset
+    /// or connect/forward is disabled (SOCKS needs ForwardV2).
+    pub(super) socks_service: Option<x0x::socks::SocksService>,
     /// ADR-0041 Tier-1 owner-state sync service: owns the `SyncV1` stream
     /// acceptor, the owner device set, and the winning versioned records.
     /// `None` when the install has no owner key (ownerless installs sync
     /// nothing and register no acceptor).
     pub(super) owner_sync: Option<Arc<x0x::owner_sync::OwnerSyncService>>,
+    /// ADR-0074 §1 name store: owner petnames and TOFU name pins
+    /// (`<data_dir>/names.json`). An unreadable file refuses every name
+    /// operation (fail closed); hex ids keep working.
+    pub(super) names: Arc<x0x::names::NameStore>,
+    /// ADR-0074 §2 persistent forwards (`<data_dir>/forwards.json`),
+    /// restored at start. An unreadable file restores nothing and refuses
+    /// persistent adds (fail closed); `--ephemeral` forwards still work.
+    pub(super) forwards: Arc<x0x::forward::store::ForwardStore>,
     /// Per-instance fault-injection cell for `save_named_groups_checked_unlocked`.
     /// Each test that calls `set_save_fault` arms and RAII-clears this; because it
     /// lives on the `AppState` rather than in a process-global static, parallel
@@ -1509,6 +1565,20 @@ pub(super) struct NamedGroupTestRecorders {
     /// #1113 startup catch-up: tests that want a page send to count as
     /// delivered set this. Production builds omit the recorders.
     pub(super) catchup_page_force_ok: std::sync::atomic::AtomicBool,
+    /// #1573: install a GSS removal head before its share, as a released
+    /// receiver does (`legacy_gss_removal_receiver`).
+    pub(super) legacy_gss_removal_receiver: std::sync::atomic::AtomicBool,
+    /// #1508 rc14: whether the group's sends were held at each step of a
+    /// parked GSS removal replay (`gss_replay_probe`).
+    pub(super) gss_replay_holds: StdMutex<Vec<bool>>,
+    /// #1508 rc16: a one-shot pause after a GSS encrypt reads its key
+    /// (`gss_encrypt_after_key_probe`): `(reached, resume)`.
+    pub(super) gss_encrypt_pause:
+        StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// #1508 rc18: a one-shot pause after a GSS encrypt checks the hold
+    /// under its publication permit (`gss_encrypt_after_hold_probe`).
+    pub(super) gss_encrypt_hold_pause:
+        StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }

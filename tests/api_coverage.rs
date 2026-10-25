@@ -125,6 +125,11 @@ const COVERED: &[CoveredEndpoint] = &[
         "/owner/riders/:id",
         rider_revoked_token_fails_on_next_request
     ),
+    covered!(
+        Post,
+        "/owner/groups/:id/recovery-mandate",
+        owner_group_recovery_mandate_signs_only_when_every_admin_is_revoked
+    ),
     covered!(Get, "/peers", daemon_api_peers),
     // ── Presence ────────────────────────────────────────────────────────
     covered!(Get, "/presence", "GET /presence"),
@@ -438,6 +443,11 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(
         Post,
+        "/groups/:id/members/:agent_id/certificate/rebind",
+        self_rebind_route_refuses_another_agents_seat
+    ),
+    covered!(
+        Post,
         "/groups/:id/ban/:agent_id",
         d4_stateful_events_converge_via_signed_commits
     ),
@@ -604,6 +614,7 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/ws/direct", ws_direct_endpoint),
     covered!(Get, "/ws/sessions", daemon_api_ws_sessions),
     covered!(Get, "/gui", gui_html_contains_brand),
+    covered!(Post, "/gui/show", registry_lists_gui_show),
     // ── Tailnet forwarding (#132 T6) ────────────────────────────────────
     covered!(Post, "/forwards", daemon_api_forwards_add_disabled),
     covered!(Get, "/forwards", daemon_api_forwards_list),
@@ -626,6 +637,13 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Post, "/grants", grant_routes_wired),
     covered!(Delete, "/grants/:id", grant_routes_wired),
     covered!(Get, "/grants/received", grant_routes_wired),
+    // ── Names (ADR-0074 §1) ─────────────────────────────────────────────
+    covered!(Get, "/names", names_routes_wired),
+    covered!(Post, "/names/resolve", names_routes_wired),
+    covered!(Post, "/names/owners", names_routes_wired),
+    covered!(Delete, "/names/owners/:label", names_routes_wired),
+    covered!(Post, "/names/machines", names_routes_wired),
+    covered!(Delete, "/names/pins/:name", names_routes_wired),
 ];
 
 const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
@@ -664,6 +682,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
         "src/server/routes/named_groups/tests/owner_mandate.rs",
         include_str!("../src/server/routes/named_groups/tests/owner_mandate.rs"),
     ),
+    // ADR 0110 §4a: the self-rebind route's coverage lives in the
+    // named_groups lib tests.
+    (
+        "src/server/routes/named_groups/tests/adr0110_certificate_rebind.rs",
+        include_str!("../src/server/routes/named_groups/tests/adr0110_certificate_rebind.rs"),
+    ),
     // #477: the join-status route's coverage lives in the named_groups
     // lib tests (the wp_b_477 T-matrix: T7 drives the live terminal path).
     (
@@ -691,6 +715,15 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/grants.rs",
         include_str!("../src/server/routes/grants.rs"),
+    ),
+    // ADR 0083 slice 1: POST /gui/show coverage lives in the route lib tests.
+    (
+        "src/server/routes/gui_show.rs",
+        include_str!("../src/server/routes/gui_show.rs"),
+    ),
+    (
+        "src/server/routes/names/tests.rs",
+        include_str!("../src/server/routes/names/tests.rs"),
     ),
     (
         "tests/peer_lifecycle_integration.rs",
@@ -1159,6 +1192,8 @@ fn categories_are_valid() {
         "history",
         "acl",
         "grants",
+        "gui",
+        "names",
     ];
 
     for ep in ENDPOINTS {
