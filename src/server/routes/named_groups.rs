@@ -17930,13 +17930,17 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
             })
             .map(|held| {
                 let (cause, raw_cause) = display_join_pending_cause(&held.cause);
-                serde_json::json!({
+                let mut value = serde_json::json!({
                     "cause": cause,
-                    "raw_cause": raw_cause,
                     "detail": held.detail,
                     "issued_at_ms": held.issued_at_ms,
                     "signer_agent_id": held.signer_agent_id,
-                })
+                });
+                // `raw_cause` rides only on an unrecognized name.
+                if let Some(raw) = raw_cause {
+                    value["raw_cause"] = serde_json::Value::String(raw.to_string());
+                }
+                value
             })
         } else {
             None
@@ -45051,8 +45055,24 @@ async fn handle_join_result_message_bound(
                                 )
                                 .await;
                                 if let Some(response) = response {
-                                    send_join_result_response(state, sender, &response).await;
+                                    // The payload is built under the
+                                    // critical section (local work + one
+                                    // lazy signature, like the refusal
+                                    // path); the SEND happens after the
+                                    // section is released — a direct send
+                                    // waits out its full ack timeout and
+                                    // must never hold the group's
+                                    // membership lock (PR #1639 review
+                                    // round 2). One direct exchange, no
+                                    // hidden resend (D145).
                                     drop(notice_section);
+                                    #[cfg(test)]
+                                    join_egress_test_barrier::park(
+                                        &member_agent_id,
+                                        "join_pending_notice",
+                                    )
+                                    .await;
+                                    send_join_result_response(state, sender, &response).await;
                                     return;
                                 }
                             }

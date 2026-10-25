@@ -869,6 +869,10 @@ async fn join_status_reports_the_held_pending_cause() -> Result<()> {
     assert_eq!(body["pending_cause"]["detail"]["count"], 3);
     assert_eq!(body["pending_cause"]["issued_at_ms"], issued);
     assert_eq!(body["pending_cause"]["signer_agent_id"], inviter_hex);
+    assert!(
+        body["pending_cause"].get("raw_cause").is_none(),
+        "raw_cause is omitted for a known cause"
+    );
 
     // An unknown well-formed cause is displayed as unrecognized_cause with
     // the raw name — never a decode failure (§8).
@@ -909,4 +913,125 @@ async fn insert_verified_advert(state: &Arc<AppState>, agent: &AgentId, bits: u6
         ),
         "the advert inserts"
     );
+}
+
+/// PR #1639 review round 2 (blocking): the `Pending` reply must be SENT
+/// outside the group's membership critical section — a direct send waits
+/// out its full ack timeout and would stall every other lock user (seat
+/// applies, seals, other joiners' fetches) for that group. The payload is
+/// built under the lock (local work + the one lazy signature, like the
+/// refusal path), the lock is released, and only then does the send run.
+/// The deterministic proof parks the handler at the send point through the
+/// egress test barrier and takes the group's membership mutex while it is
+/// parked: with the send under the lock, `try_lock` fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pending_reply_is_sent_outside_the_membership_section() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let joiner = AgentKeypair::generate()?;
+    let joiner_id = joiner.agent_id();
+    let joiner_hex = hex::encode(joiner_id.as_bytes());
+    let group_key = "732".repeat(10);
+    let admin = AgentKeypair::generate()?;
+    {
+        let mut info = x0x::groups::GroupInfo::new(
+            "1575w".to_string(),
+            String::new(),
+            admin.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+    }
+    let (_, _, _, joined_event) = signed_member_joined_event_for_test(
+        &joiner,
+        &group_key,
+        &hex::encode(state.agent.agent_id().as_bytes()),
+        "1575w-secret",
+        x0x::groups::GroupRole::Member,
+    )?;
+    let attempt = member_joined_event_attempt_id(&joined_event).expect("attempt id");
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING,
+        JoinPendingNoticeDetail {
+            count: Some(1),
+            ..JoinPendingNoticeDetail::default()
+        },
+        None,
+    )
+    .await;
+    insert_verified_advert(
+        &state,
+        &joiner_id,
+        x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1,
+    )
+    .await;
+
+    let armed = join_egress_test_barrier::arm(&joiner_hex, "join_pending_notice");
+    let handler_state = Arc::clone(&state);
+    let handler_joiner = joiner_id;
+    let handler_group = group_key.clone();
+    let handler = tokio::spawn(async move {
+        handle_join_result_message(
+            &handler_state,
+            &handler_joiner,
+            true,
+            JoinResultMessage::FetchRequest {
+                group_id: handler_group.clone(),
+                member_agent_id: joiner_hex.clone(),
+                from_revision: None,
+                base_state_hash: None,
+                accepts_refusal: true,
+                accepts_control_blob_ref: false,
+                attempt_id: Some(attempt.clone()),
+                accepts_pending_notice: true,
+                held_notice_hash: None,
+                notice_only: false,
+                attempt_evidence: None,
+            },
+        )
+        .await;
+    });
+    // Wait until the handler is parked AT the send point.
+    let mut parked_at_send = false;
+    for _ in 0..200 {
+        if armed.gate.reached() {
+            parked_at_send = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        parked_at_send,
+        "the handler never reached the notice send point"
+    );
+    // While the send is pending, the group's membership mutex must be FREE.
+    let membership_arc = group_membership_lock_for_known_group(&state, &group_key)
+        .await
+        .expect("the group has a membership lock");
+    let lock_free_while_sending = membership_arc.try_lock().is_ok();
+    drop(armed);
+    handler
+        .await
+        .expect("the handler completes once the gate releases");
+    assert!(
+        lock_free_while_sending,
+        "the Pending reply send held the group's membership critical section"
+    );
+    Ok(())
 }
