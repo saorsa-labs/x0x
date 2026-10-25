@@ -4569,7 +4569,6 @@ pub(in crate::server) async fn reseat_group_member(
         invite_base_revision: invite.base_state_revision.unwrap_or_default(),
         invite_base_state_hash: invite.base_state_hash.clone().unwrap_or_default(),
         signer: local.clone(),
-        signer_public_key: hex::encode(keypair.public_key().as_bytes()),
         reason_hash: s3::reason_hash(request.reason.trim()),
         expires_at_ms,
     };
@@ -4941,7 +4940,6 @@ pub(super) async fn reseat_mandate_for_seat(
         certificate_digest: x0x::groups::owner_cert::certificate_digest_hex(certificate),
         policy_hash: x0x::groups::compute_policy_hash(&parent.policy),
         role,
-        signer_public_key: hex::encode(keypair.public_key().as_bytes()),
     };
     match x0x::groups::recovery::ReseatMandateV1::sign(fields, keypair) {
         Ok(mandate) => ReseatSeal::Mandate(Box::new(mandate)),
@@ -4983,7 +4981,7 @@ pub(super) async fn verify_reseat_mandate_on_receive(
                         .eq_ignore_ascii_case(&mandate.fields.signer)
             });
         if !consumed
-            || mandate.verify_signature().is_err()
+            || mandate.verify_signature(&commit.signer_public_key).is_err()
             || !commit
                 .committed_by
                 .eq_ignore_ascii_case(&mandate.fields.signer)
@@ -5344,7 +5342,27 @@ async fn consume_reseat(
         return;
     }
     let refs = live_refs(state, &info).await;
-    if let Err(cause) = authorisation.check_for_subject(&stable, &local, &refs, now_ms()) {
+    // The authorisation carries no key (§3): it is checked under the
+    // paired invite's inline inviter key, which must hash to the signer.
+    let Ok(invite) = x0x::groups::invite::SignedInvite::from_link(&invite_link) else {
+        drop(membership_guard);
+        refuse_authorisation(state, &stable, info.state_revision, "invite_malformed").await;
+        return;
+    };
+    let inviter_key = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(invite.inviter_public_key_b64.as_bytes())
+            .map(hex::encode)
+            .unwrap_or_default()
+    };
+    if let Err(cause) = authorisation.check_for_subject(
+        &stable,
+        &local,
+        &refs,
+        now_ms(),
+        (&invite.inviter, &inviter_key),
+    ) {
         drop(membership_guard);
         refuse_authorisation(state, &stable, info.state_revision, cause).await;
         return;
@@ -5363,14 +5381,6 @@ async fn consume_reseat(
         refuse_authorisation(state, &stable, info.state_revision, cause).await;
         return;
     }
-    let invite = match x0x::groups::invite::SignedInvite::from_link(&invite_link) {
-        Ok(invite) => invite,
-        Err(_) => {
-            drop(membership_guard);
-            refuse_authorisation(state, &stable, info.state_revision, "invite_malformed").await;
-            return;
-        }
-    };
     if let Err(cause) = check_reseat_invite(&invite, &authorisation, &stable, &local) {
         drop(membership_guard);
         refuse_authorisation(state, &stable, info.state_revision, cause).await;
@@ -6129,7 +6139,6 @@ pub(in crate::server) async fn open_staging_journal_for_test(
             invite_base_revision: original.state_revision,
             invite_base_state_hash: original.state_hash.clone(),
             signer: local,
-            signer_public_key: hex::encode(keypair.public_key().as_bytes()),
             reason_hash: s3::reason_hash("r"),
             expires_at_ms: u64::MAX / 2,
         },
@@ -6240,7 +6249,6 @@ mod tests {
                 invite_base_revision: info.state_revision,
                 invite_base_state_hash: info.state_hash.clone(),
                 signer,
-                signer_public_key: hex::encode(keypair.public_key().as_bytes()),
                 reason_hash: s3::reason_hash("r"),
                 expires_at_ms: 10_000,
             },
@@ -6750,7 +6758,6 @@ mod tests {
                 invite_base_revision: 4,
                 invite_base_state_hash: "h4".to_string(),
                 signer: admin_hex.clone(),
-                signer_public_key: hex::encode(admin.public_key().as_bytes()),
                 reason_hash: s3::reason_hash("r"),
                 expires_at_ms: u64::MAX,
             },
@@ -7211,7 +7218,6 @@ mod tests {
                         invite_base_revision: info.state_revision,
                         invite_base_state_hash: info.state_hash.clone(),
                         signer: local.clone(),
-                        signer_public_key: hex::encode(keypair.public_key().as_bytes()),
                         reason_hash: s3::reason_hash("r"),
                         expires_at_ms,
                     },
@@ -7473,7 +7479,6 @@ mod tests {
                 invite_base_revision: info.state_revision,
                 invite_base_state_hash: info.state_hash.clone(),
                 signer: local.clone(),
-                signer_public_key: hex::encode(keypair.public_key().as_bytes()),
                 reason_hash: s3::reason_hash("r"),
                 expires_at_ms: u64::MAX / 2,
             },
@@ -9958,7 +9963,6 @@ mod tests {
                 invite_base_revision: base.0,
                 invite_base_state_hash: base.1.to_string(),
                 signer: signer_hex.clone(),
-                signer_public_key: hex::encode(signer.public_key().as_bytes()),
                 reason_hash: s3::reason_hash("r"),
                 expires_at_ms: u64::MAX / 2,
             },

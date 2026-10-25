@@ -886,10 +886,10 @@ pub struct ReseatAuthorisationFields {
     pub invite_base_revision: u64,
     /// The invite base state hash.
     pub invite_base_state_hash: String,
-    /// The signing admin (hex agent ID).
+    /// The signing admin (hex agent ID). The fields carry no public key
+    /// (ADR 0109 §3 lists none): the subject verifies under the re-seat
+    /// invite's inline inviter key, whose SHA-256 must equal this ID.
     pub signer: String,
-    /// The signer's agent public key (hex).
-    pub signer_public_key: String,
     /// The BLAKE3 hash (hex) of the operator's reason.
     pub reason_hash: String,
     /// The expiry (unix ms).
@@ -907,7 +907,6 @@ impl ReseatAuthorisationFields {
             .u64(self.invite_base_revision)
             .str(&self.invite_base_state_hash)
             .str(&self.signer)
-            .str(&self.signer_public_key)
             .str(&self.reason_hash)
             .u64(self.expires_at_ms)
             .finish()
@@ -934,24 +933,25 @@ impl ReseatAuthorisation {
         fields: ReseatAuthorisationFields,
         keypair: &AgentKeypair,
     ) -> Result<Self, RecoveryRefusal> {
-        if hex::encode(keypair.agent_id().as_bytes()) != fields.signer
-            || hex::encode(keypair.public_key().as_bytes()) != fields.signer_public_key
-        {
+        if hex::encode(keypair.agent_id().as_bytes()) != fields.signer {
             return Err(RecoveryRefusal::BadSignature);
         }
         let signature = sign_agent(keypair, &fields.preimage())?;
         Ok(Self { fields, signature })
     }
 
-    /// The signature verifies under a key whose SHA-256 is `signer`.
+    /// The signature verifies under `signer_public_key` (hex), the
+    /// re-seat invite's inline inviter key, whose SHA-256 must be `signer`.
+    /// The signed `signer` ID fixes the key, so the preimage need not
+    /// carry it.
     ///
     /// # Errors
     ///
     /// [`RecoveryRefusal::BadSignature`].
-    pub fn verify_signature(&self) -> Result<(), RecoveryRefusal> {
+    pub fn verify_signature(&self, signer_public_key: &str) -> Result<(), RecoveryRefusal> {
         verify_agent_signature(
             &self.fields.signer,
-            &self.fields.signer_public_key,
+            signer_public_key,
             &self.fields.preimage(),
             &self.signature,
         )
@@ -972,6 +972,11 @@ impl ReseatAuthorisation {
     /// a live `RecoveryRef`, expiry. The inviter and base-roster checks run
     /// against the invite.
     ///
+    /// `inviter` is the paired re-seat invite's inviter ID and its inline
+    /// public key (hex). The signature is checked under that key. An
+    /// authorisation whose signer is not the inviter cannot be checked,
+    /// and is refused as `signer_not_inviter`.
+    ///
     /// # Errors
     ///
     /// The typed cause of the first failed check.
@@ -981,8 +986,14 @@ impl ReseatAuthorisation {
         subject_hex: &str,
         live_refs: &[RecoveryRef],
         now_ms: u64,
+        inviter: (&str, &str),
     ) -> Result<(), &'static str> {
-        self.verify_signature().map_err(|_| "signature")?;
+        let (inviter_id, inviter_key) = inviter;
+        if !inviter_id.eq_ignore_ascii_case(&self.fields.signer) {
+            return Err("signer_not_inviter");
+        }
+        self.verify_signature(inviter_key)
+            .map_err(|_| "signature")?;
         if self.fields.group != group {
             return Err("group_mismatch");
         }
@@ -1229,8 +1240,6 @@ pub struct ReseatMandateFields {
     pub policy_hash: String,
     /// (11) The exact role the subject receives.
     pub role: GroupRole,
-    /// The signer's agent public key (hex); its SHA-256 is `signer`.
-    pub signer_public_key: String,
 }
 
 impl ReseatMandateFields {
@@ -1253,7 +1262,6 @@ impl ReseatMandateFields {
             .str(&self.certificate_digest)
             .str(&self.policy_hash)
             .str(&role)
-            .str(&self.signer_public_key)
             .finish()
     }
 }
@@ -1278,24 +1286,26 @@ impl ReseatMandateV1 {
         fields: ReseatMandateFields,
         keypair: &AgentKeypair,
     ) -> Result<Self, RecoveryRefusal> {
-        if hex::encode(keypair.agent_id().as_bytes()) != fields.signer
-            || hex::encode(keypair.public_key().as_bytes()) != fields.signer_public_key
-        {
+        if hex::encode(keypair.agent_id().as_bytes()) != fields.signer {
             return Err(RecoveryRefusal::BadSignature);
         }
         let signature = sign_agent(keypair, &fields.preimage())?;
         Ok(Self { fields, signature })
     }
 
-    /// The signature verifies under a key whose SHA-256 is the signer.
+    /// The signature verifies under `signer_public_key` (hex), the
+    /// carrying commit's `signer_public_key`, whose SHA-256 must be the
+    /// signer. Acceptance check 1 also requires the commit's
+    /// `committed_by` to be the signer, so the commit's key is the
+    /// signer's key, and the §3a preimage need not carry it.
     ///
     /// # Errors
     ///
     /// [`RecoveryRefusal::BadSignature`].
-    pub fn verify_signature(&self) -> Result<(), RecoveryRefusal> {
+    pub fn verify_signature(&self, signer_public_key: &str) -> Result<(), RecoveryRefusal> {
         verify_agent_signature(
             &self.fields.signer,
-            &self.fields.signer_public_key,
+            signer_public_key,
             &self.fields.preimage(),
             &self.signature,
         )
@@ -1379,7 +1389,9 @@ pub fn verify_reseat_mandate(
     let fields = &mandate.fields;
     let parent = check.parent;
     // 1.
-    if mandate.verify_signature().is_err()
+    if mandate
+        .verify_signature(&check.commit.signer_public_key)
+        .is_err()
         || !check
             .commit
             .committed_by
@@ -2528,7 +2540,6 @@ mod tests {
                 invite_base_revision: original.state_revision,
                 invite_base_state_hash: original.state_hash.clone(),
                 signer: hex::encode(admin.agent_id().as_bytes()),
-                signer_public_key: hex::encode(admin.public_key().as_bytes()),
                 reason_hash: reason_hash("r"),
                 expires_at_ms: u64::MAX,
             },
@@ -2650,7 +2661,6 @@ mod tests {
                 invite_base_revision: 7,
                 invite_base_state_hash: "h7".to_string(),
                 signer: hex::encode(admin.agent_id().as_bytes()),
-                signer_public_key: hex::encode(admin.public_key().as_bytes()),
                 reason_hash: reason_hash("forked"),
                 expires_at_ms: 2_000,
             },
@@ -2663,25 +2673,42 @@ mod tests {
             terminal_revision: 9,
             terminal_state_hash: "t".to_string(),
         }];
-        assert_eq!(auth.check_for_subject("g", &subject, &live, 1_000), Ok(()));
+        let signer = hex::encode(admin.agent_id().as_bytes());
+        let key = hex::encode(admin.public_key().as_bytes());
+        let inviter = (signer.as_str(), key.as_str());
+        let check = |auth: &ReseatAuthorisation, subject: &str, live: &[RecoveryRef], now| {
+            auth.check_for_subject("g", subject, live, now, inviter)
+        };
+        assert_eq!(check(&auth, &subject, &live, 1_000), Ok(()));
+        assert_eq!(check(&auth, &subject, &[], 1_000), Err("basis_not_live"));
+        assert_eq!(check(&auth, &subject, &live, 2_000), Err("expired"));
         assert_eq!(
-            auth.check_for_subject("g", &subject, &[], 1_000),
-            Err("basis_not_live")
-        );
-        assert_eq!(
-            auth.check_for_subject("g", &subject, &live, 2_000),
-            Err("expired")
-        );
-        assert_eq!(
-            auth.check_for_subject("g", &"cd".repeat(32), &live, 1_000),
+            check(&auth, &"cd".repeat(32), &live, 1_000),
             Err("subject_mismatch")
         );
         let mut tampered = auth.clone();
         tampered.fields.expires_at_ms = 9_000;
+        assert_eq!(check(&tampered, &subject, &live, 1_000), Err("signature"));
+        // The key comes from the paired invite. Another agent's key, even
+        // one named as the inviter, fails the signature; an invite from
+        // another inviter is refused before any signature check.
+        let other = keypair();
+        let other_id = hex::encode(other.agent_id().as_bytes());
+        let other_key = hex::encode(other.public_key().as_bytes());
         assert_eq!(
-            tampered.check_for_subject("g", &subject, &live, 1_000),
+            auth.check_for_subject("g", &subject, &live, 1_000, (&signer, &other_key)),
             Err("signature")
         );
+        assert_eq!(
+            auth.check_for_subject("g", &subject, &live, 1_000, (&other_id, &other_key)),
+            Err("signer_not_inviter")
+        );
+        // ADR 0109 §3 lists no public key in the preimage.
+        assert!(!auth
+            .fields
+            .preimage()
+            .windows(key.len())
+            .any(|window| window == key.as_bytes()));
         assert_ne!(auth.digest(), tampered.digest());
     }
 
@@ -3187,7 +3214,6 @@ mod tests {
                 certificate_digest: fixture.subject_cert_digest.clone(),
                 policy_hash: crate::groups::compute_policy_hash(&fixture.info.policy),
                 role,
-                signer_public_key: hex::encode(fixture.admin.public_key().as_bytes()),
             },
             &fixture.admin,
         )
