@@ -78,6 +78,9 @@ pub(in crate::server) struct S3Runtime {
     restored: tokio::sync::watch::Sender<bool>,
     /// [`restore_containment`] runs once.
     restore_started: std::sync::atomic::AtomicBool,
+    /// W3-H only: this node models a release without S3 ([`Self::model_pre_s3`]).
+    #[cfg(test)]
+    pre_s3: std::sync::atomic::AtomicBool,
 }
 
 impl Default for S3Runtime {
@@ -103,6 +106,31 @@ impl S3Runtime {
             staging: std::sync::Mutex::new(HashMap::new()),
             restored: tokio::sync::watch::Sender::new(restored),
             restore_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            pre_s3: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// W3-H (ADR 0109 Validation, "A on the previous release"): from now
+    /// on this node acts, for S3, as a release without S3. It drops every
+    /// `X0XGRC1` frame (as a released node drops the unknown DM), carries
+    /// no join ATA and sends no request. The caller also clears bits 8 and
+    /// 9 from the node's advert. Nothing else changes, so a case that uses
+    /// it models S3's absence only, not every difference between releases.
+    #[cfg(test)]
+    pub(in crate::server) fn model_pre_s3(&self) {
+        self.pre_s3.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether this node runs S3: always in a release build.
+    fn runs_s3(&self) -> bool {
+        #[cfg(test)]
+        {
+            !self.pre_s3.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            true
         }
     }
 
@@ -2005,7 +2033,7 @@ pub(in crate::server) fn spawn_receipt(
     verified: bool,
     payload: Vec<u8>,
 ) {
-    if !verified {
+    if !verified || !state.group_recovery.runs_s3() {
         return;
     }
     let task_state = Arc::clone(state);
@@ -2443,7 +2471,7 @@ pub(super) async fn join_carry_attestation(
     else {
         return None;
     };
-    if owner_terminal_served || chain.is_empty() {
+    if owner_terminal_served || chain.is_empty() || !state.group_recovery.runs_s3() {
         return None;
     }
     if chain
@@ -3664,6 +3692,9 @@ async fn send_request(
     refs: &[RecoveryRef],
     target: AgentId,
 ) {
+    if !state.group_recovery.runs_s3() {
+        return;
+    }
     let Some(requester) = parse_raw(local) else {
         return;
     };
@@ -4522,9 +4553,16 @@ pub(in crate::server) async fn reseat_group_member(
         }
     }
     // One authorisation per `(group, subject)` (§3): the one this call
-    // replaces loses its invite first, durably, so the replaced pairing can
-    // never reach a seal (§3a).
-    if !revoke_replaced_reseat_invite(&state, &group_key, &stable, &subject_hex).await {
+    // replaces loses its invite durably before the new authorisation is
+    // stored, so the replaced pairing can never reach a seal (§3a). The
+    // revocation never comes after the store: a failed revocation would
+    // then leave the old invite consumable with no paired authorisation,
+    // and it would seal as an ordinary add. On the promoted path the
+    // revocation is in the same roster write as the new invite, so a
+    // signing or encoding failure changes nothing durable. The owner path
+    // mints through the shared invite transaction, so it revokes first.
+    let replaced = replaced_reseat_secrets(&state, &group_key, &stable, &subject_hex).await;
+    if !promoted && !revoke_replaced_reseat_invite(&state, &group_key, &replaced).await {
         return reseat_refusal(
             StatusCode::SERVICE_UNAVAILABLE,
             "not_durable",
@@ -4533,7 +4571,7 @@ pub(in crate::server) async fn reseat_group_member(
     }
     let expiry_secs = s3::RESEAT_AUTHORISATION_LIFETIME.as_secs();
     let minted = if promoted {
-        match mint_reseat_invite(&state, &group_key, subject, expiry_secs).await {
+        match mint_reseat_invite(&state, &group_key, subject, expiry_secs, &replaced).await {
             Ok(minted) => minted,
             Err(reason) => {
                 return reseat_refusal(
@@ -4890,8 +4928,9 @@ pub(super) async fn reseat_mandate_for_seat(
     // #1533 rc22 (ZCode MAJOR-2): a re-seat invite whose authorisation
     // expired before the seal is still a re-seat invite. It seals nothing;
     // it never falls through to an ordinary add with no mandate. A
-    // replaced authorisation's invite is revoked by the route
-    // ([`revoke_replaced_reseat_invite`]), so it never reaches the seal.
+    // replaced authorisation's invite is revoked by
+    // [`reseat_group_member`] (owner path) or in [`mint_reseat_invite`]'s
+    // roster write (promoted path), so it never reaches the seal.
     let Some(issued) =
         recorded_reseat_for_secret(state, parent.stable_group_id(), subject_hex, invite_secret)
             .await
@@ -5101,17 +5140,16 @@ async fn promoted_admin_checks(
     Ok(())
 }
 
-/// §3 "one per `(group, subject)`": before the route replaces the issued
-/// re-seat for `subject_hex`, revoke the unconsumed invite that the old
-/// authorisation pairs with, so a join with it fails invite consumption
-/// before any seal. Returns whether the roster is durable (or nothing was
-/// to revoke). The caller holds the group's membership lock.
-async fn revoke_replaced_reseat_invite(
+/// §3 "one per `(group, subject)`": the unconsumed invite secrets that
+/// the issued re-seat for `subject_hex` pairs with, which the route
+/// revokes before, or in the same roster write as, the replacement, so a join with one fails
+/// invite consumption before any seal.
+async fn replaced_reseat_secrets(
     state: &AppState,
     group_key: &str,
     stable_group_id: &str,
     subject_hex: &str,
-) -> bool {
+) -> Vec<String> {
     let hashes: Vec<String> = sidecar_snapshot(state, stable_group_id)
         .await
         .map(|body| {
@@ -5129,26 +5167,48 @@ async fn revoke_replaced_reseat_invite(
         })
         .unwrap_or_default();
     if hashes.is_empty() {
+        return Vec::new();
+    }
+    state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .map(|info| {
+            info.issued_invites
+                .iter()
+                .filter(|(secret, record)| {
+                    record.consumed_by.is_none() && hashes.contains(&s3::invite_secret_hash(secret))
+                })
+                .map(|(secret, _)| secret.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Drop `secrets` from both issued-invite maps of `info`.
+fn drop_issued_invites(info: &mut GroupInfo, secrets: &[String]) {
+    for secret in secrets {
+        info.issued_invites.remove(secret);
+        info.issued_invite_secrets.remove(secret);
+    }
+}
+
+/// Remove `secrets` from the group's issued invites in a durable roster
+/// write. Returns whether the roster is durable (or nothing was to
+/// revoke). The caller holds the group's membership lock.
+async fn revoke_replaced_reseat_invite(
+    state: &AppState,
+    group_key: &str,
+    secrets: &[String],
+) -> bool {
+    if secrets.is_empty() {
         return true;
     }
     let Some(mut next) = state.named_groups.read().await.get(group_key).cloned() else {
         return true;
     };
-    let secrets: Vec<String> = next
-        .issued_invites
-        .iter()
-        .filter(|(secret, record)| {
-            record.consumed_by.is_none() && hashes.contains(&s3::invite_secret_hash(secret))
-        })
-        .map(|(secret, _)| secret.clone())
-        .collect();
-    if secrets.is_empty() {
-        return true;
-    }
-    for secret in &secrets {
-        next.issued_invites.remove(secret);
-        next.issued_invite_secrets.remove(secret);
-    }
+    drop_issued_invites(&mut next, secrets);
     matches!(
         super::persist_named_group_info(state, group_key, next).await,
         Ok(super::AtomicWriteOutcome::Durable)
@@ -5160,11 +5220,14 @@ async fn revoke_replaced_reseat_invite(
 /// addressed to the subject and recorded as an ordinary issued invite. Its
 /// re-seat scope is the paired authorisation: only the named subject, at
 /// this admin, with the matching unconsumed authorisation, can redeem it.
+/// The same roster write revokes the `replaced` invite secrets, so an
+/// error before it changes nothing durable.
 async fn mint_reseat_invite(
     state: &AppState,
     group_key: &str,
     subject: AgentId,
     expiry_secs: u64,
+    replaced: &[String],
 ) -> Result<(x0x::groups::invite::SignedInvite, String), &'static str> {
     let info = state
         .named_groups
@@ -5189,6 +5252,7 @@ async fn mint_reseat_invite(
         .map_err(|_| "invite_sign_failed")?;
     let link = invite.encode_link().map_err(|_| "invite_too_large")?;
     let mut next = info.clone();
+    drop_issued_invites(&mut next, replaced);
     next.record_issued_invite_v2(
         invite.invite_secret.clone(),
         invite.created_at,
@@ -6100,20 +6164,27 @@ pub(in crate::server) async fn held_join_state(
     // join is not held, so its poll ends as an ordinary join.
     let own_marker =
         info.fork_quarantine.is_some() && state.group_recovery.held_reseat_marker(info).is_none();
-    if !(armed || (own_marker && kept_chain)) {
+    // H-S3-t (4), §8: inside an uncommitted ADR 0094 trial S3 cannot keep
+    // the served chain (no new sidecar before host commit), but the wait
+    // is typed: the attempt holds as `recovery_deferred`, not a bare
+    // `timed_out` that drops the contained stub.
+    let view = inner.subjects.get(info.stable_group_id()).map(|s| &s.view);
+    let deferred = matches!(
+        view,
+        Some(SubjectView::Deferred { cause }) if *cause == HOST_COMMIT_PENDING
+    );
+    if !(armed || (own_marker && (kept_chain || deferred))) {
         return None;
     }
-    Some(
-        match inner.subjects.get(info.stable_group_id()).map(|s| &s.view) {
-            Some(SubjectView::CatchingUp { .. }) => "catching_up",
-            Some(SubjectView::Readmission { .. }) => "readmission_required",
-            Some(SubjectView::Reseat { .. } | SubjectView::ReseatInProgress { .. }) => {
-                "reseat_required"
-            }
-            Some(SubjectView::Deferred { .. }) => "recovery_deferred",
-            _ => "awaiting_attestation",
-        },
-    )
+    Some(match view {
+        Some(SubjectView::CatchingUp { .. }) => "catching_up",
+        Some(SubjectView::Readmission { .. }) => "readmission_required",
+        Some(SubjectView::Reseat { .. } | SubjectView::ReseatInProgress { .. }) => {
+            "reseat_required"
+        }
+        Some(SubjectView::Deferred { .. }) => "recovery_deferred",
+        _ => "awaiting_attestation",
+    })
 }
 
 /// Test only: open a `Staging` re-seat journal for `original` (live key
@@ -7185,6 +7256,416 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
         assert!(!on_disk.issued_invites.contains_key(&first[0]));
         assert!(on_disk.issued_invites.contains_key(&second[0]));
+        Ok(())
+    }
+
+    /// Call the re-seat route with the durable owner token. Returns the
+    /// status and the JSON body.
+    async fn call_reseat(
+        state: &Arc<AppState>,
+        key: &str,
+        subject: &str,
+        basis: &serde_json::Value,
+    ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let request: ReseatRequest = serde_json::from_value(serde_json::json!({
+            "reason": "forked while partitioned", "basis": basis,
+        }))?;
+        let response = reseat_group_member(
+            State(Arc::clone(state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((key.to_string(), subject.to_string())),
+            Json(request),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await?)?;
+        Ok((status, body))
+    }
+
+    /// The issued re-seats' invite secret hashes, and the unconsumed live
+    /// invite secrets, of one group.
+    async fn reseat_pairing(
+        state: &AppState,
+        key: &str,
+        stable: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let paired = sidecar_snapshot(state, stable)
+            .await
+            .map(|body| {
+                body.issued_reseats
+                    .iter()
+                    .map(|issued| issued.authorisation.fields.invite_secret_hash.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(key)
+            .map(|info| {
+                info.issued_invites
+                    .iter()
+                    .filter(|(_, record)| record.consumed_by.is_none())
+                    .map(|(secret, _)| secret.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        (paired, live)
+    }
+
+    /// #1533 review (ZCode), ADR 0109 §3a route checks and D170: on an
+    /// owner-axis group where this node holds no owner USER key, a
+    /// promoted admin re-seats only a removal that it committed itself. A
+    /// `Removal` basis that another admin committed is refused
+    /// `reseat_removal_not_own`, and nothing is signed, stored or minted.
+    /// Control: this admin's own removal passes that check and meets the
+    /// next one, the capability floor (`reseat_receiver_upgrade_required`
+    /// names the other admin, which has no current verified advert). Inert.
+    #[tokio::test]
+    async fn a_promoted_admin_reseats_only_its_own_removal() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        assert!(state.agent.identity().user_keypair().is_none());
+        let keypair = state.agent.identity().agent_keypair();
+        let local = local_hex(&state);
+        let peer = x0x::identity::AgentKeypair::generate()?;
+        let peer_hex = hex::encode(peer.agent_id().as_bytes());
+        let theirs = "ab".repeat(32);
+        let mine = "cd".repeat(32);
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?;
+        let mut info = GroupInfo::with_policy(
+            "adr0109-reseat-d170".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "1700".repeat(16),
+            x0x::groups::GroupPolicy {
+                discoverability: x0x::groups::GroupDiscoverability::Hidden,
+                admission: x0x::groups::GroupAdmission::InviteOnly,
+                confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+                ..x0x::groups::GroupPolicy::default()
+            },
+        );
+        for (member, role) in [
+            (&peer_hex, x0x::groups::GroupRole::Admin),
+            (&theirs, x0x::groups::GroupRole::Member),
+            (&mine, x0x::groups::GroupRole::Member),
+        ] {
+            info.add_member(member.clone(), role, Some(local.clone()), None);
+        }
+        info.seal_commit(keypair, 1_000)?;
+        // The other admin removes `theirs`; this node removes `mine`.
+        info.remove_member(&theirs, Some(peer_hex.clone()));
+        info.seal_commit(&peer, 2_000)?;
+        let theirs_basis = serde_json::json!({
+            "kind": "removal", "revision": info.state_revision, "state_hash": info.state_hash,
+        });
+        info.remove_member(&mine, Some(local.clone()));
+        info.seal_commit(keypair, 3_000)?;
+        let mine_basis = serde_json::json!({
+            "kind": "removal", "revision": info.state_revision, "state_hash": info.state_hash,
+        });
+        // The owner axis is set after the seals, which would otherwise
+        // need certificate evidence.
+        info.policy.admission = x0x::groups::GroupAdmission::OwnerCertified(owner.user_id());
+        let key = info.mls_group_id.clone();
+        let stable = info.stable_group_id().to_string();
+        state.named_groups.write().await.insert(key.clone(), info);
+
+        let (status, body) = call_reseat(&state, &key, &theirs, &theirs_basis).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "reseat_removal_not_own", "{body}");
+        assert_eq!(
+            reseat_pairing(&state, &key, &stable).await,
+            (Vec::new(), Vec::new()),
+            "no authorisation stored and no invite minted"
+        );
+        assert!(!tokio::fs::try_exists(sidecar_path(&state, &stable)).await?);
+
+        let (status, body) = call_reseat(&state, &key, &mine, &mine_basis).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "reseat_receiver_upgrade_required", "{body}");
+        assert_eq!(body["detail"]["members"], serde_json::json!([peer_hex]));
+        assert_eq!(
+            reseat_pairing(&state, &key, &stable).await,
+            (Vec::new(), Vec::new())
+        );
+        Ok(())
+    }
+
+    /// ADR 0109 §3 route checks: a contained admin (`admin_contained`) and
+    /// a banned or revoked subject (`subject_banned_or_revoked`) are
+    /// refused, and nothing is stored or minted. Control: the same call on
+    /// the clean record succeeds. Inert.
+    #[tokio::test]
+    async fn the_reseat_route_refuses_a_contained_admin_and_a_banned_or_revoked_subject(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let subject_kp = x0x::identity::AgentKeypair::generate()?;
+        let subject = hex::encode(subject_kp.agent_id().as_bytes());
+        let (key, info, basis) = removed_subject_group(&state, &subject, None).await?;
+        let stable = info.stable_group_id().to_string();
+        let set_live = |live: GroupInfo| {
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            async move {
+                state.named_groups.write().await.insert(key, live);
+            }
+        };
+
+        let mut contained = info.clone();
+        contained.fork_quarantine = Some(original_marker(&state, &info));
+        set_live(contained).await;
+        let (status, body) = call_reseat(&state, &key, &subject, &basis).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "admin_contained", "{body}");
+        assert_eq!(
+            reseat_pairing(&state, &key, &stable).await,
+            (Vec::new(), Vec::new())
+        );
+
+        let mut banned = info.clone();
+        banned.ban_member(&subject, Some(local));
+        set_live(banned).await;
+        let (status, body) = call_reseat(&state, &key, &subject, &basis).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "subject_banned_or_revoked", "{body}");
+        assert_eq!(
+            reseat_pairing(&state, &key, &stable).await,
+            (Vec::new(), Vec::new())
+        );
+
+        // Control: the clean record.
+        set_live(info).await;
+        let (status, body) = call_reseat(&state, &key, &subject, &basis).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let issued = reseat_pairing(&state, &key, &stable).await;
+        assert_eq!(issued.1.len(), 1);
+
+        // The subject's agent is revoked (a self-signed revocation).
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(subject_kp.agent_id()),
+            subject_kp.public_key(),
+            subject_kp.secret_key(),
+            now_ms() / 1000,
+            None,
+        )?;
+        state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)?;
+        let (status, body) = call_reseat(&state, &key, &subject, &basis).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "subject_banned_or_revoked", "{body}");
+        assert_eq!(
+            reseat_pairing(&state, &key, &stable).await,
+            issued,
+            "the refusal changes nothing"
+        );
+        Ok(())
+    }
+
+    /// An owner-axis group with no owner key here, and `subject` removed
+    /// by this node with its owner certificate kept on the seat: the
+    /// promoted-admin path reaches its mint. Returns the key, the stable
+    /// ID and the basis.
+    async fn promoted_reseat_group(
+        state: &Arc<AppState>,
+        subject: &x0x::identity::AgentKeypair,
+    ) -> anyhow::Result<(String, String, serde_json::Value)> {
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?;
+        let subject_hex = hex::encode(subject.agent_id().as_bytes());
+        let cert = x0x::identity::AgentCertificate::issue(&owner, subject)?;
+        let (key, info, basis) =
+            removed_subject_group(state, &subject_hex, Some(owner.user_id())).await?;
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&key)
+            .ok_or_else(|| anyhow::anyhow!("group"))?
+            .set_member_certificate(&subject_hex, cert)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        Ok((key, info.stable_group_id().to_string(), basis))
+    }
+
+    /// #1533 review (ZCode minor), ADR 0109 §3 "one per `(group,
+    /// subject)`": on the promoted-admin path the replaced invite is
+    /// revoked in the same roster write as the new invite. So a 503 from
+    /// the mint (`invite_sign_failed` or `invite_too_large`, or
+    /// `not_durable` when the roster write is refused) leaves the previous authorisation and its invite intact and
+    /// consumable. Before the fix the revocation was durable first, and the
+    /// 503 left the subject with neither. A later success still revokes the
+    /// replaced invite, durably. Inert.
+    #[tokio::test]
+    async fn a_failed_promoted_reseat_mint_keeps_the_previous_pairing() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let subject_kp = x0x::identity::AgentKeypair::generate()?;
+        let subject = hex::encode(subject_kp.agent_id().as_bytes());
+        let (key, stable, basis) = promoted_reseat_group(&state, &subject_kp).await?;
+
+        let (status, body) = call_reseat(&state, &key, &subject, &basis).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (paired, live) = reseat_pairing(&state, &key, &stable).await;
+        assert_eq!(live.len(), 1, "one re-seat invite");
+        assert_eq!(paired, vec![s3::invite_secret_hash(&live[0])]);
+        let first = (paired, live);
+
+        // `invite_sign_failed`: a group name over the invite limit does not
+        // sign (the same pre-write error path as `invite_too_large`).
+        let name = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .map(|info| info.name.clone())
+            .unwrap_or_default();
+        if let Some(info) = state.named_groups.write().await.get_mut(&key) {
+            info.name = "n".repeat(x0x::groups::invite::INVITE_MAX_GROUP_NAME + 1);
+        }
+        let (status, body) = call_reseat(&state, &key, &subject, &basis).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["reason"], "invite_sign_failed", "{body}");
+        assert_eq!(
+            reseat_pairing(&state, &key, &stable).await,
+            first,
+            "the previous authorisation and its invite are intact"
+        );
+        if let Some(info) = state.named_groups.write().await.get_mut(&key) {
+            info.name = name;
+        }
+
+        // `not_durable`: the roster write is refused (`NotReplaced`).
+        let seq = std::sync::atomic::Ordering::SeqCst;
+        state.named_groups_save_fault.store(1, seq);
+        let refused = call_reseat(&state, &key, &subject, &basis).await;
+        state.named_groups_save_fault.store(0, seq);
+        let (status, body) = refused?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["reason"], "not_durable", "{body}");
+        assert_eq!(reseat_pairing(&state, &key, &stable).await, first);
+        // An owner-axis record is kept in the Home-suite store.
+        let on_disk = legacy_entry(&state.home_suite_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("home-suite entry"))?;
+        assert!(on_disk.issued_invites.contains_key(&first.1[0]));
+
+        // A success replaces the pairing and revokes the old invite durably.
+        let (status, body) = call_reseat(&state, &key, &subject, &basis).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (paired, live) = reseat_pairing(&state, &key, &stable).await;
+        assert_eq!(live.len(), 1, "the replaced invite is revoked");
+        assert_ne!(live[0], first.1[0]);
+        assert_eq!(paired, vec![s3::invite_secret_hash(&live[0])]);
+        // An owner-axis record is kept in the Home-suite store.
+        let on_disk = legacy_entry(&state.home_suite_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("home-suite entry"))?;
+        assert!(!on_disk.issued_invites.contains_key(&first.1[0]));
+        assert!(on_disk.issued_invites.contains_key(&live[0]));
+        Ok(())
+    }
+
+    /// ADR 0109 §4 (D120): after a damaged sidecar is quarantined and
+    /// rebuilt, `GET /groups/:id/recovery` on an Active admin shows
+    /// `issued_reseats_lost: true`, since the unconsumed authorisations
+    /// were in the lost file. Controls: `false` before the rebuild, and
+    /// `false` when this node holds no admin seat. Inert.
+    #[tokio::test]
+    async fn a_rebuilt_admin_sidecar_reports_issued_reseats_lost() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let subject = "ab".repeat(32);
+        let (key, info, _basis) = removed_subject_group(&state, &subject, None).await?;
+        let stable = info.stable_group_id().to_string();
+        let recovery = || {
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            async move {
+                let response = get_group_recovery(State(state), Path(key))
+                    .await
+                    .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 1 << 20).await?,
+                )?;
+                anyhow::Ok(body)
+            }
+        };
+        assert_eq!(recovery().await?["issued_reseats_lost"], false);
+
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::create_dir_all(sidecar_dir(&state)).await?;
+        tokio::fs::write(&path, [b"JUNKJUNK".as_slice(), &[0u8; 56]].concat()).await?;
+        load_sidecars(&state).await;
+        resume_deferred_quarantine(&state).await;
+        assert_eq!(
+            sidecar_on_disk(&state, &stable).await?.rebuilt_from.len(),
+            1
+        );
+        let body = recovery().await?;
+        assert_eq!(body["issued_reseats_lost"], true, "{body}");
+        assert_eq!(
+            body["sidecar"]["rebuilt_from"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        if let Some(live) = state.named_groups.write().await.get_mut(&key) {
+            live.set_member_role(&local_hex(&state), x0x::groups::GroupRole::Member);
+        }
+        assert_eq!(recovery().await?["issued_reseats_lost"], false);
+        Ok(())
+    }
+
+    /// ADR 0109 §4 "Rebuild source" (D147): a pre-Welcome joiner whose
+    /// sidecar was rebuilt without its served chain, admin-armed and with
+    /// no progress for `GATE_STALL`, shows `readmission_required {cause:
+    /// local_state_lost}`. Controls: no rebuild, an Active seat, and a
+    /// stall shorter than `GATE_STALL` each stay out of it. Inert.
+    #[tokio::test]
+    async fn a_rebuilt_pre_welcome_joiner_stalls_into_local_state_lost() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let now = Instant::now();
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .insert(stable.clone(), SubjectState::new(now, info.state_revision));
+        let mut pre_welcome = info.clone();
+        pre_welcome.remove_member(&local, None);
+        assert!(update_sidecar(&state, &stable, move |body| body.active_ata = Some(ata)).await);
+        assert!(armed_admin_ata(&state, &pre_welcome).await.is_some());
+
+        // No rebuild: no loss, however long the stall.
+        assert!(!local_state_lost(&state, &key, &pre_welcome, now + s3::GATE_STALL).await);
+        assert!(update_sidecar(&state, &stable, |body| body.rebuilt_from.push([7; 16])).await);
+        // An Active seat is not pre-Welcome.
+        assert!(!local_state_lost(&state, &key, &info, now + s3::GATE_STALL).await);
+        // The stall must reach `GATE_STALL`.
+        assert!(!local_state_lost(&state, &key, &pre_welcome, now).await);
+        assert!(local_state_lost(&state, &key, &pre_welcome, now + s3::GATE_STALL).await);
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Readmission {
+                cause: "local_state_lost"
+            })
+        );
+        let recovery = recovery_json(&state, &pre_welcome)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("recovery object"))?;
+        assert_eq!(recovery["state"], "readmission_required");
+        assert_eq!(recovery["cause"], "local_state_lost");
+        assert_eq!(recovery["exit"], "manual_remove_and_reinvite");
         Ok(())
     }
 

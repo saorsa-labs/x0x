@@ -823,6 +823,14 @@ jobs:
           --expect w3h_1356_control_s3_forked_node_not_auto_recovered=GREEN
           --require w3h_1356_red_s3_manual_reseat_recovers_forked_node
           --expect w3h_1356_red_s3_manual_reseat_recovers_forked_node=GREEN
+          --require w3h_1356_red_s3_b_provisional_admin_ata_promotes
+          --expect w3h_1356_red_s3_b_provisional_admin_ata_promotes=GREEN
+          --require w3h_1356_red_s3_t_typed_waits_name_their_cause
+          --expect w3h_1356_red_s3_t_typed_waits_name_their_cause=GREEN
+          --require w3h_1356_red_s3_t_deferred_until_host_commit
+          --expect w3h_1356_red_s3_t_deferred_until_host_commit=GREEN
+          --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
+          --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable

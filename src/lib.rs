@@ -15876,6 +15876,16 @@ impl Agent {
             .send_replace(dm::DmCapabilities::pending());
     }
 
+    /// W3-H only: advertise `registry` in place of this release's
+    /// application registry, to model a node on an older release. The
+    /// advert service republishes on the change. A later DM-inbox start
+    /// replaces it, so call it once the inbox runs.
+    #[cfg(test)]
+    pub(crate) fn set_application_registry_for_test(&self, registry: dm::CapabilityRegistry) {
+        self.dm_capabilities_tx
+            .send_modify(|caps| caps.application_registry = registry);
+    }
+
     /// This agent's currently advertised DM capabilities.
     ///
     /// Mirrors what the advert service publishes and what `runtime_agent_card`

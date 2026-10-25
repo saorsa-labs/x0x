@@ -1894,6 +1894,27 @@ route checks in this order and refuses with the first failure:
 | 409 | `reseat_receiver_upgrade_required` | Same promoted-admin path: `detail.members` names each Active member without a current verified `group_reseat_mandate_v1` advert (the capability floor). |
 | 409 | `subject_certificate_unavailable`, `subject_certificate_invalid` | Same path: this admin does not hold the subject's owner certificate, or it does not verify against the owner. |
 
+After the checks the route writes durable state. These 503 refusals come
+from storage or invite encoding, not from the request. Try the call again:
+
+| Status | `reason` | Cause |
+|---|---|---|
+| 503 | `not_durable` | The roster write that revokes the replaced re-seat invite (owner path), or that records the new re-seat invite (promoted-admin path), is not durable. |
+| 503 | `invite_sign_failed` | Promoted-admin path: the re-seat invite does not sign (for example, the group name is longer than the invite limit). |
+| 503 | `invite_too_large` | Promoted-admin path: the encoded re-seat invite link is longer than the invite link limit. |
+| 503 | — (`error`: `the re-seat authorisation is not durable`) | The sidecar write that stores the new authorisation is not durable. This body has no `reason` field. |
+
+On the owner path the invite is minted by the ordinary invite
+transaction, so its refusals have the same form as `POST /groups/:id/invite`.
+On the promoted-admin path the three 503 refusals above leave the
+previous authorisation and its invite unchanged: the replaced invite is
+revoked in the same roster write that records the new one. On the owner
+path the replaced invite is revoked first, durably, so a later 503 leaves
+the subject with no consumable re-seat invite; call the route again. The
+route never revokes the replaced invite after it stores the new
+authorisation: if that revocation then failed, the old invite would stay
+consumable with no paired authorisation.
+
 On success (200) the route mints an invite addressed to the subject and
 signs a `ReseatAuthorisation` (domain `x0x.reseat-authorisation.v1`). An
 admin that holds the owner's USER key mints an ordinary owner-countersigned

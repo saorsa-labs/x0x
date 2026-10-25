@@ -111,6 +111,8 @@ use super::*;
 use anyhow::ensure;
 use serde_json::{json, Value};
 
+mod gaps;
+
 const JOIN_LABELS: &[&str] = &["A", "M1", "M2", "J"];
 const SETUP: Duration = Duration::from_secs(180);
 /// Past the last metadata resend (60 s, `GROUP_CONTROL_REDELIVERY_SCHEDULE`).

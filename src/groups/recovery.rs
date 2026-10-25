@@ -1821,10 +1821,13 @@ pub fn is_s3_placeholder(info: &GroupInfo) -> bool {
 }
 
 impl GroupRecoveryV1 {
-    /// Nothing is stored: the file may be removed.
+    /// Nothing is stored: the file may be removed. A rebuilt sidecar is
+    /// never empty: `rebuilt_from` is the D120 loss record that an admin's
+    /// `issued_reseats_lost` reads (§4).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.served_chain.is_empty()
+        self.rebuilt_from.is_empty()
+            && self.served_chain.is_empty()
             && self.active_ata.is_none()
             && self.queued_terminal.is_none()
             && self.authoritative_record.is_none()
@@ -2712,6 +2715,17 @@ mod tests {
         assert_ne!(auth.digest(), tampered.digest());
     }
 
+    /// A rebuilt sidecar keeps its loss record when everything else in it
+    /// is gone, so the admin's `issued_reseats_lost` survives a later
+    /// write.
+    #[test]
+    fn a_rebuilt_sidecar_is_never_empty() {
+        let mut body = GroupRecoveryV1::default();
+        assert!(body.is_empty());
+        body.rebuilt_from.push([7; 16]);
+        assert!(!body.is_empty());
+    }
+
     #[test]
     fn basis_json_round_trips() {
         let removal = ReseatBasis::Removal {
@@ -3110,6 +3124,8 @@ mod tests {
     }
     struct OwnerAxis {
         admin: AgentKeypair,
+        /// A second Active admin, seated with the subject.
+        peer: AgentKeypair,
         certs: Vec<(String, crate::identity::AgentCertificate)>,
         subject_hex: String,
         subject_cert_digest: String,
@@ -3136,11 +3152,29 @@ mod tests {
             .0
     }
 
+    /// How the fixture's revision-2 commit unseats the subject.
+    #[derive(Clone, Copy)]
+    enum Unseat {
+        /// `admin` removes the subject.
+        RemovedByAdmin,
+        /// `peer`, another admin, removes the subject (D170).
+        RemovedByPeer,
+        /// `admin` bans the subject: a ban is not a removal.
+        BannedByAdmin,
+    }
+
     fn owner_axis_group() -> OwnerAxis {
+        owner_axis_group_with(Unseat::RemovedByAdmin)
+    }
+
+    fn owner_axis_group_with(unseat: Unseat) -> OwnerAxis {
         let owner = crate::identity::UserKeypair::generate().expect("owner");
         let admin = keypair();
+        let peer = keypair();
         let subject = keypair();
         let admin_cert = crate::identity::AgentCertificate::issue(&owner, &admin).expect("cert");
+        let peer_cert = crate::identity::AgentCertificate::issue(&owner, &peer).expect("cert");
+        let peer_hex = hex::encode(peer.agent_id().as_bytes());
         let subject_cert =
             crate::identity::AgentCertificate::issue(&owner, &subject).expect("cert");
         let admin_hex = hex::encode(admin.agent_id().as_bytes());
@@ -3158,8 +3192,17 @@ mod tests {
             .expect("admin cert");
         let certs = vec![
             (admin_hex.clone(), admin_cert),
+            (peer_hex.clone(), peer_cert.clone()),
             (subject_hex.clone(), subject_cert.clone()),
         ];
+        info.add_member(
+            peer_hex.clone(),
+            GroupRole::Admin,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.set_member_certificate(&peer_hex, peer_cert)
+            .expect("peer cert");
         info.add_member(
             subject_hex.clone(),
             GroupRole::Member,
@@ -3170,11 +3213,24 @@ mod tests {
             .expect("subject cert");
         sealed(&mut info, &admin, &certs, 1_000);
         let seating_hash = info.state_hash.clone();
-        info.remove_member(&subject_hex, Some(admin_hex));
-        sealed(&mut info, &admin, &certs, 2_000);
+        match unseat {
+            Unseat::RemovedByAdmin => {
+                info.remove_member(&subject_hex, Some(admin_hex));
+                sealed(&mut info, &admin, &certs, 2_000);
+            }
+            Unseat::RemovedByPeer => {
+                info.remove_member(&subject_hex, Some(peer_hex));
+                sealed(&mut info, &peer, &certs, 2_000);
+            }
+            Unseat::BannedByAdmin => {
+                info.ban_member(&subject_hex, Some(admin_hex));
+                sealed(&mut info, &admin, &certs, 2_000);
+            }
+        }
         let removal_hash = info.state_hash.clone();
         OwnerAxis {
             admin,
+            peer,
             certs,
             subject_hex,
             subject_cert_digest: crate::groups::owner_cert::certificate_digest_hex(&subject_cert),
@@ -3189,6 +3245,18 @@ mod tests {
         commit: &crate::groups::state_commit::GroupStateCommit,
         role: GroupRole,
     ) -> ReseatMandateV1 {
+        mandate_by(fixture, commit, role, &fixture.admin, |_| {})
+    }
+
+    /// A mandate signed by `signer` over the fixture, with `edit` applied
+    /// to the fields before the signature (so check 1 still passes).
+    fn mandate_by(
+        fixture: &OwnerAxis,
+        commit: &crate::groups::state_commit::GroupStateCommit,
+        role: GroupRole,
+        signer: &AgentKeypair,
+        edit: impl FnOnce(&mut ReseatMandateFields),
+    ) -> ReseatMandateV1 {
         let owner = fixture
             .info
             .policy
@@ -3196,28 +3264,26 @@ mod tests {
             .owner_certified_user_id()
             .map(|owner| hex::encode(owner.as_bytes()))
             .expect("owner axis");
-        ReseatMandateV1::sign(
-            ReseatMandateFields {
-                owner_user_id: owner,
-                group_id: fixture.info.stable_group_id().to_string(),
-                genesis_hash: genesis_hash(&fixture.info),
-                signer: hex::encode(fixture.admin.agent_id().as_bytes()),
-                subject: fixture.subject_hex.clone(),
-                seating_commit_hash: fixture.seating_hash.clone(),
-                removal_commit_hash: fixture.removal_hash.clone(),
-                parent_commit_hash: fixture.info.state_hash.clone(),
-                terminal_roster_hash: commit.roster_root.clone(),
-                invite_secret_hash: invite_secret_hash("s"),
-                authorisation_digest: "00".repeat(32),
-                key_package_hash: "kp".to_string(),
-                epoch: 0,
-                certificate_digest: fixture.subject_cert_digest.clone(),
-                policy_hash: crate::groups::compute_policy_hash(&fixture.info.policy),
-                role,
-            },
-            &fixture.admin,
-        )
-        .expect("sign")
+        let mut fields = ReseatMandateFields {
+            owner_user_id: owner,
+            group_id: fixture.info.stable_group_id().to_string(),
+            genesis_hash: genesis_hash(&fixture.info),
+            signer: hex::encode(signer.agent_id().as_bytes()),
+            subject: fixture.subject_hex.clone(),
+            seating_commit_hash: fixture.seating_hash.clone(),
+            removal_commit_hash: fixture.removal_hash.clone(),
+            parent_commit_hash: fixture.info.state_hash.clone(),
+            terminal_roster_hash: commit.roster_root.clone(),
+            invite_secret_hash: invite_secret_hash("s"),
+            authorisation_digest: "00".repeat(32),
+            key_package_hash: "kp".to_string(),
+            epoch: 0,
+            certificate_digest: fixture.subject_cert_digest.clone(),
+            policy_hash: crate::groups::compute_policy_hash(&fixture.info.policy),
+            role,
+        };
+        edit(&mut fields);
+        ReseatMandateV1::sign(fields, signer).expect("sign")
     }
 
     #[test]
@@ -3299,6 +3365,207 @@ mod tests {
             parent: &reseated,
             ..check
         };
-        assert!(verify_reseat_mandate(&mandate, &replay).is_err());
+        assert_eq!(
+            verify_reseat_mandate(&mandate, &replay),
+            Err(ReseatMandateCause::RemovalMismatch)
+        );
+    }
+
+    /// The re-seat commit: the subject back as Member on a clone of the
+    /// fixture's record, sealed by `signer`.
+    fn reseat_commit(
+        fixture: &OwnerAxis,
+        signer: &AgentKeypair,
+    ) -> crate::groups::state_commit::GroupStateCommit {
+        let mut next = fixture.info.clone();
+        next.add_member(
+            fixture.subject_hex.clone(),
+            GroupRole::Member,
+            Some(hex::encode(signer.agent_id().as_bytes())),
+            None,
+        );
+        sealed(&mut next, signer, &fixture.certs, 3_000)
+    }
+
+    fn check_for<'a>(
+        fixture: &'a OwnerAxis,
+        commit: &'a crate::groups::state_commit::GroupStateCommit,
+    ) -> ReseatMandateCheck<'a> {
+        ReseatMandateCheck {
+            parent: &fixture.info,
+            commit,
+            subject: &fixture.subject_hex,
+            key_package_hash: Some("kp"),
+            epoch: Some(0),
+            seated_role: GroupRole::Member,
+            certificate_digest: Some(&fixture.subject_cert_digest),
+            certificate_valid: true,
+            subject_revoked: false,
+        }
+    }
+
+    /// #1533 review (ZCode), ADR 0109 §3a check 5 and D170: a promoted
+    /// admin re-seats only a removal it committed itself. A mandate whose
+    /// removal another admin committed is refused `removal_mismatch` by
+    /// every receiver, even when the signer is an admin and every other
+    /// binding holds. Control: the admin that committed the removal passes.
+    #[test]
+    fn reseat_mandate_refuses_a_removal_another_admin_committed() {
+        let fixture = owner_axis_group_with(Unseat::RemovedByPeer);
+        let commit = reseat_commit(&fixture, &fixture.admin);
+        let mandate = mandate_for(&fixture, &commit, GroupRole::Member);
+        assert_eq!(
+            verify_reseat_mandate(&mandate, &check_for(&fixture, &commit)),
+            Err(ReseatMandateCause::RemovalMismatch)
+        );
+        let own_commit = reseat_commit(&fixture, &fixture.peer);
+        let own = mandate_by(
+            &fixture,
+            &own_commit,
+            GroupRole::Member,
+            &fixture.peer,
+            |_| {},
+        );
+        assert_eq!(
+            verify_reseat_mandate(&own, &check_for(&fixture, &own_commit)),
+            Ok(())
+        );
+    }
+
+    /// ADR 0109 §3a checks 2, 3 and 4 each name their own cause. Each
+    /// mandate is signed after the edit, so check 1 passes and the named
+    /// check is the first that fails.
+    #[test]
+    fn reseat_mandate_names_signer_policy_and_seating_failures() {
+        let fixture = owner_axis_group();
+        let commit = reseat_commit(&fixture, &fixture.admin);
+        let check = check_for(&fixture, &commit);
+
+        // (2) A signer with no Admin seat at the parent: an outsider, and
+        // the same admin demoted to Member in the parent.
+        let outsider = keypair();
+        let outsider_commit = reseat_commit(&fixture, &outsider);
+        let by_outsider = mandate_by(
+            &fixture,
+            &outsider_commit,
+            GroupRole::Member,
+            &outsider,
+            |_| {},
+        );
+        assert_eq!(
+            verify_reseat_mandate(&by_outsider, &check_for(&fixture, &outsider_commit)),
+            Err(ReseatMandateCause::SignerNotAdmin)
+        );
+        let mandate = mandate_for(&fixture, &commit, GroupRole::Member);
+        let mut demoted = fixture.info.clone();
+        demoted.set_member_role(
+            &hex::encode(fixture.admin.agent_id().as_bytes()),
+            GroupRole::Member,
+        );
+        assert_eq!(
+            verify_reseat_mandate(
+                &mandate,
+                &ReseatMandateCheck {
+                    parent: &demoted,
+                    ..check
+                }
+            ),
+            Err(ReseatMandateCause::SignerNotAdmin)
+        );
+
+        // (3) Each bound policy field: the policy hash, the owner, the
+        // group and the genesis.
+        let other = "ee".repeat(32);
+        type Edit = fn(&mut ReseatMandateFields, String);
+        let edits: [(&str, Edit); 4] = [
+            ("policy_hash", |f, v| f.policy_hash = v),
+            ("owner_user_id", |f, v| f.owner_user_id = v),
+            ("group_id", |f, v| f.group_id = v),
+            ("genesis_hash", |f, v| f.genesis_hash = v),
+        ];
+        for (field, edit) in edits {
+            let edited = mandate_by(&fixture, &commit, GroupRole::Member, &fixture.admin, |f| {
+                edit(f, other.clone());
+            });
+            assert_eq!(
+                verify_reseat_mandate(&edited, &check),
+                Err(ReseatMandateCause::PolicyMismatch),
+                "{field}"
+            );
+        }
+
+        // (4) The seating commit is not on the chain, or did not seat the
+        // subject (the removal commit unseats it).
+        for seating in ["ff".repeat(32), fixture.removal_hash.clone()] {
+            let edited = mandate_by(&fixture, &commit, GroupRole::Member, &fixture.admin, |f| {
+                f.seating_commit_hash = seating.clone();
+            });
+            assert_eq!(
+                verify_reseat_mandate(&edited, &check),
+                Err(ReseatMandateCause::NotPreviouslySeated),
+                "{seating}"
+            );
+        }
+    }
+
+    /// ADR 0109 §3a check 5: the named removal must be on the chain, must
+    /// remove this subject (a ban is not a removal), and no later commit
+    /// may seat or ban the subject again. Each case breaks one clause only.
+    #[test]
+    fn reseat_mandate_refuses_a_basis_that_is_not_the_live_removal() {
+        let fixture = owner_axis_group();
+        let commit = reseat_commit(&fixture, &fixture.admin);
+        let check = check_for(&fixture, &commit);
+        assert_eq!(
+            verify_reseat_mandate(&mandate_for(&fixture, &commit, GroupRole::Member), &check),
+            Ok(())
+        );
+        // Not on the chain, and a commit that did not remove the subject.
+        for removal in ["ff".repeat(32), fixture.seating_hash.clone()] {
+            let edited = mandate_by(&fixture, &commit, GroupRole::Member, &fixture.admin, |f| {
+                f.removal_commit_hash = removal.clone();
+            });
+            assert_eq!(
+                verify_reseat_mandate(&edited, &check),
+                Err(ReseatMandateCause::RemovalMismatch),
+                "{removal}"
+            );
+        }
+        // A ban, by the signer, is not a removal.
+        let banned = owner_axis_group_with(Unseat::BannedByAdmin);
+        let banned_commit = reseat_commit(&banned, &banned.admin);
+        assert_eq!(
+            verify_reseat_mandate(
+                &mandate_for(&banned, &banned_commit, GroupRole::Member),
+                &check_for(&banned, &banned_commit)
+            ),
+            Err(ReseatMandateCause::RemovalMismatch)
+        );
+        // A later commit bans the subject (the parent's own roster does
+        // not show it, so only the later-commit clause can see it).
+        let mut later = fixture.info.clone();
+        later.ban_member(
+            &fixture.subject_hex,
+            Some(hex::encode(fixture.admin.agent_id().as_bytes())),
+        );
+        let ban_commit = sealed(&mut later, &fixture.admin, &fixture.certs, 2_500);
+        let mut parent = fixture.info.clone();
+        parent
+            .commit_log
+            .push(crate::groups::state_commit::RetainedCommit::capture(
+                ban_commit,
+                &later.members_v2,
+                later.public_meta(),
+            ));
+        assert_eq!(
+            verify_reseat_mandate(
+                &mandate_for(&fixture, &commit, GroupRole::Member),
+                &ReseatMandateCheck {
+                    parent: &parent,
+                    ..check
+                }
+            ),
+            Err(ReseatMandateCause::RemovalMismatch)
+        );
     }
 }
