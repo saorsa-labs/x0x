@@ -1744,8 +1744,9 @@ async fn evaluate_polled_join_pending_notice(
     let (group_blocks, joiner_seat_blocks, this_node_active) = {
         let groups = state.named_groups.read().await;
         let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
-            // An unknown group has nothing to evaluate; the staging TTL
-            // owns any leftover notice.
+            // §8: a deleted (or never-known) group blocks every notice
+            // condition, so any staged notice for it is dropped here.
+            drop_notice();
             return;
         };
         (

@@ -143,7 +143,8 @@ async fn no_eligible_admin_poll_stages_the_d154_notice() -> Result<()> {
         "no_eligible_admin carries no detail"
     );
 
-    // A poll without an attempt id is not attempt-bound: nothing stages.
+    // A poll without an attempt id is not attempt-bound: nothing stages,
+    // and the notice staged for "a3" above is still the only one.
     handle_join_result_message(
         &state,
         &joiner_id,
@@ -159,10 +160,40 @@ async fn no_eligible_admin_poll_stages_the_d154_notice() -> Result<()> {
         },
     )
     .await;
+    {
+        let notices = state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            notices.len(),
+            1,
+            "a poll without an attempt id stages nothing"
+        );
+        assert!(
+            notices.contains_key(&join_refusal_refusal_key(
+                &group_key,
+                &hex::encode(joiner_id.as_bytes()),
+                "a3",
+            )),
+            "the only staged notice is still the attempt-bound one"
+        );
+    }
+
+    // §8: a group that is gone (deleted here) drops its staged notice at
+    // the next poll for the same attempt.
+    poll_as_joiner(&state, &group_key, &joiner_id, "a5").await;
     assert!(
-        staged_join_pending_notice(&state, &group_key, &hex::encode(joiner_id.as_bytes()), "a4")
+        staged_join_pending_notice(&state, &group_key, &hex::encode(joiner_id.as_bytes()), "a5")
+            .is_some(),
+        "staged under the cover"
+    );
+    state.named_groups.write().await.remove(&group_key);
+    poll_as_joiner(&state, &group_key, &joiner_id, "a5").await;
+    assert!(
+        staged_join_pending_notice(&state, &group_key, &hex::encode(joiner_id.as_bytes()), "a5")
             .is_none(),
-        "a poll without an attempt id stages nothing"
+        "a deleted group drops the staged notice"
     );
     Ok(())
 }
