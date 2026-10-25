@@ -430,6 +430,9 @@ const FINAL_T: &str = "j_shows_each_typed_wait_in_turn_never_a_bare_timed_out";
 const FINAL_T4: &str = "j_shows_recovery_deferred_until_host_commit_then_asks";
 const CAUSE_T: &str = "J has no recovery object in the whole run, and join-status ends with \
                        no named S3 cause";
+/// A transition that waits for J's next retry round, which by step (2) can
+/// be 480 s out (the counter carries from step (1)), with margin.
+const RETRY_TRANSITION: Duration = Duration::from_secs(600);
 /// H-S3-t (3): the ADR's "advance 3 h", as a ceiling; the case stops once
 /// it has seen two retry rounds (see [`backoff_doubles`]).
 const PARTITION_WINDOW: Duration = Duration::from_secs(3 * 60 * 60);
@@ -757,13 +760,17 @@ async fn typed_waits(sim: &mut Sim, receipt: &mut Receipt, host_commit: bool) ->
         steps_ok.push(("4-after-host-commit", asked));
     } else if step1 {
         sim.restart("M1", RestartMode::Graceful).await?;
+        // Both ways: a responder with no current advert from the requester
+        // refreshes it and sends nothing on that round (§5), so a fresh M1
+        // would answer only one backoff step later.
         sees_s3(sim, "J", "M1").await?;
+        sees_s3(sim, "M1", "J").await?;
         let not_admin = waits
             .until(
                 sim,
                 &group,
                 "J hears not_an_admin from M1",
-                TRANSITION,
+                RETRY_TRANSITION,
                 |r| waiting_for(r, "not_an_admin"),
             )
             .await?;
