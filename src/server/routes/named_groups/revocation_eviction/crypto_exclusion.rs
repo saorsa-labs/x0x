@@ -1027,8 +1027,10 @@ fn own_seat_cannot_take_a_share(state: &AppState, info: &GroupInfo) -> bool {
 /// this author closes only a seat it itself could not seal, never from
 /// another node's keyless fact. The record is durable in its basis — the
 /// persisted roster and the row's saved frame — so a restarted author
-/// re-derives it each round.
-fn seat_cannot_take_a_share(info: &GroupInfo, recipient: &[u8; 32]) -> bool {
+/// re-derives it each round. #1633 (Engineer call, 25 Oct): the removal,
+/// rebind and owner-recovery delivery rows read the same field and close
+/// such a seat from the same author-own record.
+pub(super) fn seat_cannot_take_a_share(info: &GroupInfo, recipient: &[u8; 32]) -> bool {
     let recipient_hex = hex::encode(recipient);
     info.active_members()
         .any(|member| member.agent_id == recipient_hex && member.kem_public_key_b64.is_none())

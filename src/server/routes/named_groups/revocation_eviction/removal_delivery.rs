@@ -34,7 +34,7 @@
 //!   secret to each survivor again (`SecureShareDelivered`): the crash may
 //!   have lost the legacy shares, and a survivor cannot pull them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +79,12 @@ pub(super) struct RemovalDelivery {
     /// The next round seals the share too. A live delivery's first round
     /// does not: the route published the shares with the event.
     share_due: bool,
+    /// #1633 (Engineer call, 25 Oct): the started seats of the current
+    /// round whose seat this author's roster shows with no KEM public key,
+    /// so [`redeliver_secret_shares`] skipped the seal for them (#1578).
+    /// The carrier's acceptance of the event closes such a seat from this
+    /// author's own record, never from the recipient's report.
+    keyless_seats: BTreeSet<[u8; 32]>,
 }
 
 #[cfg(test)]
@@ -159,6 +165,7 @@ fn new_delivery(
         next_at,
         gss_epoch,
         share_due: resumed,
+        keyless_seats: BTreeSet::new(),
     }
 }
 
@@ -556,6 +563,20 @@ pub(super) async fn drive(state: &Arc<AppState>) {
             let reshare_epoch = stored.gss_epoch.filter(|_| stored.share_due);
             // #1573: every later round seals the share again.
             stored.share_due = true;
+            if stored.gss_epoch.is_some() {
+                // #1633 (Engineer call, 25 Oct): record which started
+                // seats this author cannot seal a share to, from the same
+                // roster the reshare reads. The record is re-derived every
+                // round, so a seat that later publishes a KEM key is
+                // sealed to again.
+                for (recipient, _) in &started {
+                    if crypto_exclusion::seat_cannot_take_a_share(&info, recipient) {
+                        stored.keyless_seats.insert(*recipient);
+                    } else {
+                        stored.keyless_seats.remove(recipient);
+                    }
+                }
+            }
             if crypto_exclusion::all_converged(&stored.recipients) {
                 inner.removals.remove(&key);
                 inner.dirty = true;
@@ -757,7 +778,7 @@ fn spawn_send(
             &event,
         )
         .await;
-        let status = match sent {
+        let mut status = match sent {
             Ok(()) => RecipientDelivery::Sent,
             // The in-process stand-in reports an admitted exchange with its
             // marker error (test builds only), as for the class-K shares.
@@ -774,6 +795,14 @@ fn spawn_send(
         };
         let mut inner = task_state.revocation_evictions.inner.lock().await;
         if let Some(delivery) = inner.removals.get_mut(&key) {
+            // #1633 (Engineer call, 25 Oct): an unsealable seat can never
+            // report delivery (the keyless survivor parks the removal
+            // below it), so the carrier's acceptance of the event is the
+            // last obligation this author has to it. Close it from the
+            // author's own record, not from the recipient's report.
+            if status == RecipientDelivery::Sent && delivery.keyless_seats.contains(&recipient) {
+                status = RecipientDelivery::Converged;
+            }
             crypto_exclusion::finish_attempt(&mut delivery.recipients, &recipient, attempt, status);
         }
     });
@@ -1674,6 +1703,260 @@ mod daemon_tests {
             sent,
             Err(x0x::dm::PINNED_ADMISSION_REFUSED.to_string()),
             "the write after the ban is refused at that write"
+        );
+        Ok(())
+    }
+
+    /// Poll until `seat`'s stored status becomes `want`: a send's
+    /// completion writes it asynchronously.
+    async fn seat_becomes(
+        state: &Arc<AppState>,
+        key: &EvictionKey,
+        seat: &[u8; 32],
+        want: RecipientDelivery,
+    ) -> bool {
+        for _ in 0..250 {
+            let seen = state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .removals
+                .get(key)
+                .and_then(|delivery| delivery.recipients.get(seat).copied());
+            if seen == Some(want) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// A live GSS group at `epoch` whose survivor seat has no KEM key
+    /// (`insert_group` adds none), with its removal event of `target`.
+    async fn keyless_gss_group(
+        state: &Arc<AppState>,
+        group_id: &str,
+        survivor: &AgentId,
+        target: &[u8; 32],
+        epoch: u64,
+    ) -> (GroupInfo, NamedGroupMetadataEvent) {
+        let mut info = insert_group(state, group_id, survivor).await;
+        info.secret_epoch = epoch;
+        info.shared_secret = Some(vec![epoch as u8; 32]);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let mut event = removal_event(group_id, target);
+        if let NamedGroupMetadataEvent::MemberRemoved {
+            secret_epoch,
+            commit,
+            ..
+        } = &mut event
+        {
+            *secret_epoch = Some(epoch);
+            *commit = Some(super::tests::commit("p", &info.state_hash));
+        }
+        (info, event)
+    }
+
+    /// #1633 (Engineer call, 25 Oct): a GSS removal aimed at a seat this
+    /// author's roster shows with no KEM key never converges (the reshare
+    /// skips it; the survivor parks below it). Before the fix the row
+    /// stayed open for good; now the round records the skip from the
+    /// author's own roster and the carrier's acceptance of the event
+    /// closes the seat from that record. A sealed seat keeps the ordinary
+    /// rule: a write is not delivery, so it stays open.
+    #[tokio::test]
+    async fn a_keyless_seat_closes_the_removal_row_from_the_authors_record() -> Result<()> {
+        use base64::Engine as _;
+        let (state, _dir) = state_past_restart_wait().await?;
+        let survivor = AgentId([0x85; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let target = [0x86; 32];
+        let group_id = "d9".repeat(16);
+        let (info, event) = keyless_gss_group(&state, &group_id, &survivor, &target, 5).await;
+        let stable = info.stable_group_id().to_string();
+        let key = EvictionKey::new(stable.clone(), target);
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner
+                .head_rounds
+                .insert(stable, HeadRound::new(&info.state_hash, Instant::now()));
+            inner.removals.insert(
+                key.clone(),
+                new_delivery(
+                    event,
+                    info.state_hash.clone(),
+                    vec![*survivor.as_bytes()],
+                    false,
+                    Instant::now(),
+                ),
+            );
+        }
+        drive(&state).await;
+        assert!(
+            seat_becomes(
+                &state,
+                &key,
+                survivor.as_bytes(),
+                RecipientDelivery::Converged
+            )
+            .await,
+            "the carrier's acceptance closes the keyless seat from the author's own record"
+        );
+        assert_eq!(
+            shares_to(&state, &survivor_hex),
+            0,
+            "no share is sealed to a seat with no KEM key"
+        );
+        if let Some(delivery) = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .removals
+            .get_mut(&key)
+        {
+            delivery.next_at = Instant::now();
+        }
+        drive(&state).await;
+        assert!(
+            !state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .removals
+                .contains_key(&key),
+            "the closed seat ends the delivery with no survivor head report"
+        );
+
+        // Control: the same removal aimed at a seat the author can seal
+        // to. Seating the KEM key moves no head — the key is local data
+        // (#1578) — but a write is not delivery, so the seat stays open
+        // with resends until its share installs.
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        let group_id = "e0".repeat(16);
+        let (info, event) = keyless_gss_group(&state, &group_id, &survivor, &target, 5).await;
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_id)
+            .context("group")?
+            .members_v2
+            .get_mut(&survivor_hex)
+            .context("seat")?
+            .kem_public_key_b64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(&kem.public_bytes));
+        let key = EvictionKey::new(info.stable_group_id().to_string(), target);
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.removals.insert(
+                key.clone(),
+                new_delivery(
+                    event,
+                    info.state_hash.clone(),
+                    vec![*survivor.as_bytes()],
+                    false,
+                    Instant::now(),
+                ),
+            );
+        }
+        drive(&state).await;
+        assert!(
+            seat_becomes(&state, &key, survivor.as_bytes(), RecipientDelivery::Sent).await,
+            "the carrier took the event for the sealed seat"
+        );
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .removals
+                .contains_key(&key),
+            "a seat the author sealed to stays open until its share installs"
+        );
+        Ok(())
+    }
+
+    /// #1633, restart: the skip record's basis — the row's saved event
+    /// and the persisted roster that seats the survivor with no KEM key —
+    /// survives a restart, so the restarted author re-derives it on the
+    /// first resumed round and closes the seat with no head report at
+    /// all.
+    #[tokio::test]
+    async fn a_restarted_author_recloses_a_keyless_removal_seat_from_its_own_record() -> Result<()>
+    {
+        let (state, dir) = state_past_restart_wait().await?;
+        let survivor = AgentId([0x87; 32]);
+        let target = [0x88; 32];
+        let group_id = "da".repeat(16);
+        let (info, event) = keyless_gss_group(&state, &group_id, &survivor, &target, 6).await;
+        let stable = info.stable_group_id().to_string();
+        let result_head = info.state_hash.clone();
+        let bytes = serde_json::to_vec(&event).expect("encode");
+        super::super::super::persist_named_group_info(&state, &stable, info.clone()).await?;
+        let key = EvictionKey::new(stable.clone(), target);
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store.intake(
+                &key,
+                x0x::groups::eviction::EvictionTrigger::AgentRevocation {
+                    record_hash: [7; 32],
+                    record_bytes: vec![7],
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            let row = inner.store.get_mut(&key).context("row")?;
+            row.phase = Phase::CommittedDeliveryPending;
+            row.parent_head = Some("p".to_string());
+            row.result_head = Some(result_head.clone());
+            row.result_epoch = Some(6);
+            row.outgoing_event = Some(bytes);
+            inner.dirty = true;
+        }
+        assert!(
+            super::super::persist_obligations(&state).await,
+            "the saved removal event is durable"
+        );
+
+        // The author restarts mid-delivery: the row and its saved event
+        // persist, and the loaded roster still seats the survivor with no
+        // KEM key — the basis of the skip record.
+        let mut restarted = super::super::super::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&state.agent),
+        )
+        .await?;
+        super::super::zero_restart_wait_for_test(&mut restarted);
+        super::super::load_persisted_obligations(&restarted).await;
+        {
+            let mut inner = restarted.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.removals.contains_key(&key),
+                "the saved event's delivery resumes"
+            );
+            inner
+                .head_rounds
+                .insert(stable, HeadRound::new(&result_head, Instant::now()));
+        }
+        drive(&restarted).await;
+        assert!(
+            seat_becomes(
+                &restarted,
+                &key,
+                survivor.as_bytes(),
+                RecipientDelivery::Converged
+            )
+            .await,
+            "the resumed round re-derives the skip record and closes the seat"
         );
         Ok(())
     }
