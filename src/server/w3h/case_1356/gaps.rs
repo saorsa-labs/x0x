@@ -1063,6 +1063,34 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     Ok(())
 }
 
+/// Start every label in `labels`. The labels in `ranked` get their
+/// pre-generated keys reassigned among themselves so that their agent IDs
+/// rise in that order.
+async fn start_ranked(sim: &mut Sim, labels: &[&str], ranked: &[&str]) -> Result<()> {
+    let mut pairs = Vec::new();
+    for label in ranked {
+        pairs.push(sim.take_keys(label)?);
+    }
+    pairs.sort_by_key(|(_, agent)| agent.agent_id().0);
+    let mut provisions = BTreeMap::new();
+    for (label, (machine, agent)) in ranked.iter().zip(pairs) {
+        provisions.insert(
+            label.to_string(),
+            Provision {
+                machine_key: Some(crate::storage::serialize_machine_keypair(&machine)?),
+                agent_key: Some(crate::storage::serialize_agent_keypair(&agent)?),
+                user_key: None,
+                agent_cert: None,
+            },
+        );
+    }
+    for label in labels {
+        let provision = provisions.remove(*label).unwrap_or_default();
+        sim.start_node_with(label, provision).await?;
+    }
+    Ok(())
+}
+
 // ─── H-S3-d5: sibling marker, manual clear (D80) ──────────────────────────
 
 const D5_LABELS: &[&str] = &["A", "M1", "M2", "B", "C", "J"];
@@ -1080,6 +1108,10 @@ const CAUSE_D5: &str = "C and J hold markers naming B's r+2', with no recovery o
 /// the force clear C has no marker and can send, and J stays
 /// `manual_clear_required`. Main: markers with no recovery object.
 async fn sibling_marker(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+    // J asks capable admins lowest agent ID first (D40) and stops at the
+    // first definitive answer. The row has C refuse J, so C takes the
+    // lowest agent ID of the admins, then B, then A.
+    start_ranked(sim, D5_LABELS, &["C", "B", "A"]).await?;
     mesh(sim, D5_LABELS).await?;
     let group = create_group(sim, "A").await?;
     for member in ["M1", "M2", "B", "C"] {
@@ -1330,7 +1362,11 @@ async fn run_row(case: &str, seed: u64, row: Row) -> Receipt {
         "ADR 0109 S3 (#1356, #1572) {row:?}; a node 'on the previous release' runs this \
          build with S3 off (see the module notes)"
     ));
-    let sim = Sim::start(case, seed, row.labels()).await;
+    let sim = match row {
+        // H-S3-d5 ranks its admins' identities before each start.
+        Row::Sibling => Sim::empty(case, seed, row.labels()),
+        _ => Sim::start(case, seed, row.labels()).await,
+    };
     match sim {
         Ok(mut sim) => {
             let outcome = match row {
