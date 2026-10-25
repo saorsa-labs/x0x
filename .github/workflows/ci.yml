@@ -571,15 +571,41 @@ jobs:
           if-no-files-found: error
 
 
-  w3h-harness:
-    # W3-H (#1164): deterministic simulation harness. Builds the entropy /
-    # wall-clock preload shim, runs every `w3h_` case 20 times in the
-    # isolated namespace, and requires the same verdict in every rerun with
-    # complete receipts (ruling D196). Distinct canonical traces per case
-    # are reported, not required.
-    name: W3-H harness (determinism)
+  w3h-plan:
+    # Names the case groups for the matrix. A case is in exactly one group.
+    # S3 (`w3h_1356_`) and S4 (`w3h_1357_`) each have a group, so more of
+    # those cases extend that shard only. The group is omitted when the
+    # tree has no matching test (main has no S3 cases yet).
+    name: W3-H shard plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the shard plan and the trace gate
+        run: |
+          python3 -B scripts/ci/test_w3h_shards.py -v
+          python3 -B scripts/ci/test_w3h_trace_check.py -v
+
+      - id: plan
+        name: Emit the shard matrix
+        run: |
+          matrix="$(python3 -B scripts/ci/w3h-shards.py --matrix)"
+          echo "W3-H shards: ${matrix}"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  w3h-shard:
+    # One group, still `--stress-count 20`. The summary job below is the
+    # D196 gate. `fail-fast: false` so one bad group still uploads traces.
+    name: W3-H shard (${{ matrix.group }})
+    needs: w3h-plan
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.w3h-plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v5
 
@@ -608,15 +634,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: target
-          key: ${{ runner.os }}-rust-1.95.0-target-w3h-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          # Per shard. Parallel saves of one key race, and each shard's
+          # `target/` differs after its own test run.
+          key: ${{ runner.os }}-rust-1.95.0-target-w3h-${{ matrix.group }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.144  # same exact pin as the Test Suite
-
-      - name: Gate checker unit tests
-        run: python3 -B scripts/ci/test_w3h_trace_check.py -v
 
       - name: Build the W3-H preload shim
         run: |
@@ -630,7 +655,61 @@ jobs:
           X0X_RUNTIME_TIMEOUT_SECONDS: 6600
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
-        run: bash scripts/ci/nextest-isolated.sh --all-features --lib -- --profile w3h-gate --run-ignored all --stress-count 20
+        # The profile default-filter still intersects this expression, so
+        # only `w3h_` tests run. Repeat count stays 20.
+        run: |
+          filter="$(python3 -B scripts/ci/w3h-shards.py --filter "${{ matrix.group }}")"
+          echo "W3H-SHARD-START group=${{ matrix.group }} filter=${filter}"
+          python3 -B scripts/ci/w3h-shards.py --list "${{ matrix.group }}"
+          bash scripts/ci/nextest-isolated.sh --all-features --lib -- \
+            --profile w3h-gate --run-ignored all --stress-count 20 -E "$filter"
+          echo "W3H-SHARD-END group=${{ matrix.group }}"
+
+      - name: Upload W3-H shard traces
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: w3h-traces-${{ matrix.group }}
+          path: target/w3h/traces/
+          if-no-files-found: warn
+          retention-days: 7
+
+  w3h-harness:
+    # W3-H (#1164): deterministic simulation harness. The shards above run
+    # every `w3h_` case 20 times. This job merges their traces and requires
+    # the same verdict in every rerun with complete receipts (ruling D196).
+    # Distinct canonical traces per case are reported, not required.
+    # The check name stays `W3-H harness (determinism)`.
+    name: W3-H harness (determinism)
+    needs: w3h-shard
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download shard traces
+        uses: actions/download-artifact@v5
+        with:
+          pattern: w3h-traces-*
+          path: w3h-incoming
+          merge-multiple: true
+
+      - name: Merge shard traces
+        run: |
+          mkdir -p target/w3h/traces
+          find w3h-incoming -type f -print0 | while IFS= read -r -d '' file; do
+            base="$(basename "$file")"
+            dest="target/w3h/traces/${base}"
+            if [ -e "$dest" ]; then
+              echo "duplicate W3-H trace file ${base}" >&2
+              exit 1
+            fi
+            cp "$file" "$dest"
+          done
+          traces="$(find target/w3h/traces -name '*.trace' | wc -l)"
+          echo "W3H-MERGED traces=${traces}"
+          test "${traces}" -gt 0
 
       # D196: blocking on the verdict (the same in all 20 reruns, every
       # receipt complete); the per-case distinct-trace counts are printed
@@ -744,6 +823,15 @@ jobs:
           --expect w3h_1356_control_s3_forked_node_not_auto_recovered=GREEN
           --require w3h_1356_red_s3_manual_reseat_recovers_forked_node
           --expect w3h_1356_red_s3_manual_reseat_recovers_forked_node=GREEN
+
+      # A shard can upload traces and still exit non-zero (runner error
+      # after the cases). The gate above already fails a short or unstable
+      # case. This step fails the summary check for any other shard failure.
+      - name: Fail unless every shard succeeded
+        if: needs.w3h-shard.result != 'success'
+        run: |
+          echo "W3-H shard matrix result: ${{ needs.w3h-shard.result }}"
+          exit 1
 
       # Traces, receipts, per-thread entropy stats and raw payload dumps
       # (test identities only; the `w3h-gate` profile is the only producer
