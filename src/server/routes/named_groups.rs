@@ -27930,6 +27930,14 @@ pub(in crate::server) async fn seal_group_state(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key. Like the
+    // other §4 routes (invite, remove, ban, approve, reseal), this runs
+    // before the caller's seat gate: every member gets the typed state,
+    // not the seat 403 (#1581, ADR 0110 §4b(3) "seal on B and C").
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     {
         // #1166 S3: the admin trio (the inlined caller_role gate and
@@ -27939,11 +27947,6 @@ pub(in crate::server) async fn seal_group_state(
         if let Err(resp) = group_access::admit_admin_group_route(&groups, &id, &local_hex) {
             return resp;
         }
-    }
-    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
-    // message, admission or key reaches a revoked admin key.
-    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
-        return resp;
     }
     // ADR 0110 §2: a seal that would evict a pending S4 target before
     // this node's fallback time is deferred (`waiting_for_designated_admin`).
