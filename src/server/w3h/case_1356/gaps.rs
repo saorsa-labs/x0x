@@ -762,7 +762,9 @@ async fn typed_waits(sim: &mut Sim, receipt: &mut Receipt, host_commit: bool) ->
         "after 130 s: J recovery {first}; join-status {first_outcome:?}"
     ));
     let mut steps_ok = vec![("1", step1)];
-    if host_commit {
+    // A failed step ends the run: the later steps build on it, and on the
+    // base they would only wait out their budgets (past nextest's kill).
+    if step1 && host_commit {
         upgrade_journal(sim, "J", "host_committed")?;
         let asked = waits
             .until(
@@ -774,7 +776,7 @@ async fn typed_waits(sim: &mut Sim, receipt: &mut Receipt, host_commit: bool) ->
             )
             .await?;
         steps_ok.push(("4-after-host-commit", asked));
-    } else {
+    } else if step1 {
         sim.restart("M1", RestartMode::Graceful).await?;
         let not_admin = waits
             .until(
@@ -786,6 +788,8 @@ async fn typed_waits(sim: &mut Sim, receipt: &mut Receipt, host_commit: bool) ->
             )
             .await?;
         steps_ok.push(("2", not_admin));
+    }
+    if steps_ok.iter().all(|(_, ok)| *ok) && !host_commit {
         sim.set_online("M1", false)?;
         let no_reply = waits
             .until(sim, &group, "J hears no reply", TRANSITION, |r| {
@@ -793,6 +797,8 @@ async fn typed_waits(sim: &mut Sim, receipt: &mut Receipt, host_commit: bool) ->
             })
             .await?;
         steps_ok.push(("3-no_reply", no_reply));
+    }
+    if steps_ok.len() == 3 && steps_ok.iter().all(|(_, ok)| *ok) {
         let held_from = waits.retry_at.len().saturating_sub(1);
         waits
             .until_rounds(
