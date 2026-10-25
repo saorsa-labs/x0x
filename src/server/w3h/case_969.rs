@@ -101,6 +101,34 @@ fn label_in(peers: &[(&'static str, [u8; 32])], key: [u8; 32]) -> String {
 /// `topics` and whose payload is the `(PeerId, record)` envelope. `Err` is a
 /// frame that names a store topic but is none of those things (RED, not a
 /// skip); `Ok(None)` is every other frame.
+/// The saorsa-gossip key-cache v3 wire marker (`key_cache::WIRE_MARKER`,
+/// `pub(crate)` there): frames on the pubsub stream start with it, then a
+/// postcard `WireMessage { header, payload, signature, key }`.
+const SG_V3_MARKER: &[u8] = b"\xffSGKC\x03";
+
+/// Mirror of saorsa-gossip-pubsub's private `WireMessage` (the postcard
+/// field order and variant order are the wire contract; both crates use
+/// plain serde derives).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireV3 {
+    header: saorsa_gossip_types::MessageHeader,
+    payload: Option<bytes::Bytes>,
+    signature: Vec<u8>,
+    key: WireKey,
+}
+
+/// Mirror of `KeyMaterial`: variant 0 carries the full key, 1 a reference.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum WireKey {
+    Full {
+        key_id: saorsa_gossip_types::PeerId,
+        public_key: Vec<u8>,
+    },
+    Ref {
+        key_id: saorsa_gossip_types::PeerId,
+    },
+}
+
 fn decode_sealed(
     write: &Write,
     topics: &[String],
@@ -116,16 +144,23 @@ fn decode_sealed(
     if !topics.iter().any(|topic| contains(body, topic.as_bytes())) {
         return Ok(None);
     }
-    let frame: saorsa_gossip_pubsub::GossipMessage =
-        postcard::from_bytes(body).context("a store-topic frame is not a gossip GossipMessage")?;
+    // Both framings carry the header first and the inner payload in
+    // `payload`: the key-cache v3 marker plus its WireMessage, or a plain
+    // legacy GossipMessage.
+    let (kind, inner) = if let Some(v3_body) = body.strip_prefix(SG_V3_MARKER) {
+        let wire: WireV3 = postcard::from_bytes(v3_body)
+            .context("a store-topic frame is not a key-cache v3 WireMessage")?;
+        (wire.header.kind, wire.payload)
+    } else {
+        let frame: saorsa_gossip_pubsub::GossipMessage = postcard::from_bytes(body)
+            .context("a store-topic frame is not a gossip GossipMessage")?;
+        (frame.header.kind, frame.payload)
+    };
     ensure!(
-        frame.header.kind == saorsa_gossip_types::MessageKind::Eager,
+        kind == saorsa_gossip_types::MessageKind::Eager,
         "a store-topic frame is not an Eager gossip message"
     );
-    let inner = frame
-        .payload
-        .clone()
-        .context("a store-topic Eager frame has no payload")?;
+    let inner = inner.context("a store-topic Eager frame has no payload")?;
     let message = crate::gossip::pubsub::decode_v2(&inner)
         .map_err(|error| anyhow!("store-topic frame is not a signed v2 envelope: {error}"))?;
     ensure!(
@@ -538,7 +573,9 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         if write.lane.src != sim.peer("A")?.0 {
             continue;
         }
-        let Ok(Some(frame)) = decode_sealed(&write, &topics, &label_of) else {
+        // A decode error on a store-topic frame is a harness-visible fault
+        // here too, never a silent skip.
+        let Some(frame) = decode_sealed(&write, &topics, &label_of)? else {
             continue;
         };
         if frame.topic != topic || frame.record.epoch != e0 {
@@ -837,7 +874,7 @@ fn w3h_969_frame_oracle_decodes_a_sealed_transport_frame() -> Result<()> {
     let inner = test_support::signed_inner_v2(&author, topic, &Bytes::from(payload));
     let frame = test_support::outer_v2_frame(
         saorsa_gossip_types::TopicId::from_entity(topic.as_bytes()),
-        inner,
+        inner.clone(),
         [9; 32],
     );
     let lane = |class: LaneClass| crate::network::sim::LaneKey {
@@ -869,6 +906,38 @@ fn w3h_969_frame_oracle_decodes_a_sealed_transport_frame() -> Result<()> {
             && decoded.record.group_id == b"w3h-969-group".to_vec(),
         "wrong record binding: {:?}",
         decoded.record
+    );
+
+    // The key-cache v3 framing the fabric actually recorded in CI: the
+    // marker plus the WireMessage mirror, serialized back through the same
+    // serde derives, must decode through the same path.
+    let mut header = saorsa_gossip_types::MessageHeader {
+        version: 1,
+        payload_hash: None,
+        topic: saorsa_gossip_types::TopicId::from_entity(topic.as_bytes()),
+        msg_id: [9; 32],
+        kind: saorsa_gossip_types::MessageKind::Eager,
+        hop: 0,
+        ttl: 10,
+    };
+    header.seal_payload_hash(Some(&inner));
+    let wire = WireV3 {
+        header,
+        payload: Some(inner.clone()),
+        signature: vec![0xAB; 3309],
+        key: WireKey::Full {
+            key_id: saorsa_gossip_types::PeerId::new([3; 32]),
+            public_key: vec![0xCD; 1952],
+        },
+    };
+    let v3_body = [SG_V3_MARKER, &postcard::to_stdvec(&wire)?].concat();
+    let v3_write = write(LaneClass::PubSub, pubsub_byte, &v3_body);
+    let decoded_v3 = decode_sealed(&v3_write, &[topic.to_string()], &label_of)?
+        .context("a valid v3-framed seal did not decode")?;
+    ensure!(
+        decoded_v3.verified && decoded_v3.topic == topic && decoded_v3.record.epoch == 9,
+        "the v3-framed seal decoded wrong: {:?}",
+        decoded_v3.record
     );
 
     // An unrelated topic never enters the oracle.
