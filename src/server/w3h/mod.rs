@@ -9,9 +9,11 @@
 //! daemon still binds one idle loopback API listener that nothing uses.
 //!
 //! Time (plan §3b): a `spawn_blocking` clock gate inhibits tokio's
-//! auto-advance whenever no named barrier is open, so virtual time moves
-//! only inside [`Sim::within`] / [`Sim::until`] / [`Sim::api`], and every
-//! advance is attributed to a named barrier in the trace. The runtime
+//! auto-advance whenever no named barrier is open, and a second hold keeps
+//! auto-advance inhibited inside the barrier too. Virtual time moves only
+//! inside [`Sim::within`] / [`Sim::until`] / [`Sim::api`], in 1 ms steps
+//! while the barrier is idle, and every advance is attributed to a named
+//! barrier in the trace. The runtime
 //! takes the local queue before any blocking-pool injection, and W3-H
 //! filesystem and history commits run on the caller, so a pool thread
 //! cannot move virtual time while the runtime is idle (#1245). When the
@@ -578,6 +580,57 @@ impl Shim {
     }
 }
 
+/// One blocking task for the whole scenario. Its inhibit stays above zero,
+/// so paused tokio never auto-advances. Auto-advance parks for zero wall
+/// time and then skips the jump when any other thread has woken the
+/// driver (`did_wake`), which moved `offline@` and same-instant admission
+/// between reruns (#1245). [`drive_paused`] moves time instead.
+struct AutoAdvanceHold {
+    release: std::sync::mpsc::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl AutoAdvanceHold {
+    /// Block until the pool thread is inside the closure, so the inhibit
+    /// is held before the caller continues.
+    fn acquire() -> Self {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let task = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            let _ = wait.recv();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W3-H clock hold did not start");
+        Self { release, task }
+    }
+}
+
+impl Drop for AutoAdvanceHold {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        // Detach. Joining here would wait on the pool from a runtime thread.
+        self.task.abort();
+    }
+}
+
+/// Poll `fut`, and when it is still pending after every other ready task
+/// has run, move virtual time forward by 1 ms. The step is smaller than
+/// the harness barriers, so a timer fires at its deadline on every rerun.
+async fn drive_paused<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            output = &mut fut => return output,
+            _ = tokio::task::yield_now() => {
+                tokio::time::advance(Duration::from_millis(1)).await;
+            }
+        }
+    }
+}
+
 /// Holding one blocking task inhibits paused tokio's auto-advance
 /// (tokio `runtime/blocking/schedule.rs`); releasing it allows it again.
 struct ClockGate {
@@ -815,6 +868,9 @@ pub(crate) struct Sim {
     fabric: Arc<SimFabric>,
     nodes: BTreeMap<String, SimNode>,
     gate: Mutex<Option<ClockGate>>,
+    /// Kept for the scenario so auto-advance stays inhibited. Time moves
+    /// only in [`drive_paused`].
+    _clock_hold: AutoAdvanceHold,
     shim: Option<Shim>,
     logs: Arc<Mutex<Vec<CapturedLog>>>,
     /// Keys generated before any daemon started, not yet used by a node.
@@ -1060,6 +1116,7 @@ impl Sim {
             fabric,
             nodes: BTreeMap::new(),
             gate: Mutex::new(Some(ClockGate::close())),
+            _clock_hold: AutoAdvanceHold::acquire(),
             shim,
             logs,
             keys,
@@ -1394,7 +1451,9 @@ impl Sim {
         self.fabric.mark(format!("barrier '{name}' open"));
         gate.open().await;
         // Wall clock is pull-based (`install_virt_time`); no 1 ms ticker.
-        let outcome = tokio::time::timeout(budget, fut).await;
+        // Auto-advance stays inhibited (`AutoAdvanceHold`). This steps
+        // virtual time by 1 ms whenever the barrier is idle.
+        let outcome = drive_paused(tokio::time::timeout(budget, fut)).await;
         *self
             .gate
             .lock()
