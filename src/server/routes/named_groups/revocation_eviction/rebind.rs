@@ -2934,8 +2934,9 @@ pub(super) mod restart_tests {
             })
         }
 
-        /// The admin's signed rebind of the seat, and its result head.
-        fn frame(&self) -> Result<(Vec<u8>, String)> {
+        /// The admin's signed rebind of the seat, its result head, and
+        /// the state the frame installs (the chain it retains).
+        fn frame_with_state(&self) -> Result<(Vec<u8>, String, GroupInfo)> {
             let now_ms = now_unix_ms();
             let renewal = AgentCertificate::issue_with_expiry(
                 &self.owner,
@@ -2946,7 +2947,13 @@ pub(super) mod restart_tests {
             let (next, frame) = cr::seal(&self.info, seat, &renewal, &self.admin, now_ms)
                 .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
             let bytes = cr::encode_frame(&frame)?;
-            Ok((bytes, next.state_hash))
+            Ok((bytes, next.state_hash.clone(), next))
+        }
+
+        /// The admin's signed rebind of the seat, and its result head.
+        fn frame(&self) -> Result<(Vec<u8>, String)> {
+            let (bytes, head, _) = self.frame_with_state()?;
+            Ok((bytes, head))
         }
 
         /// A second, different rebind on the same parent: a competing
@@ -3184,6 +3191,169 @@ pub(super) mod restart_tests {
                 .await;
         assert_eq!(on_disk.len(), 2, "both frames stay durable as evidence");
         restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1579 review: a revision keeps the competing pair and no more. A
+    /// signer can seal many distinct valid frames at one revision;
+    /// without the bound they fill the per-group cap and the oldest
+    /// frames leave — the catch-up window below the head. Four distinct
+    /// frames are written at one revision: the pair and the newest stay,
+    /// the third leaves.
+    #[tokio::test]
+    async fn a_revision_keeps_the_competing_pair_and_no_more() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes1, head1) = fixture.frame()?;
+        let (bytes2, head2) = fixture.competing_frame()?;
+        let mut heads = vec![head1.clone(), head2.clone()];
+        let mut frames_in = vec![bytes1, bytes2];
+        for offset in [9000, 9500] {
+            let now_ms = now_unix_ms();
+            let renewal = AgentCertificate::issue_with_expiry(
+                &fixture.owner,
+                &fixture.seat,
+                Some(now_ms / 1000 + offset),
+            )?;
+            let (next, frame) = cr::seal(
+                &fixture.info,
+                *fixture.seat.agent_id().as_bytes(),
+                &renewal,
+                &fixture.admin,
+                now_ms,
+            )
+            .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+            heads.push(next.state_hash);
+            frames_in.push(cr::encode_frame(&frame)?);
+        }
+        let [h1, h2, h3, h4] = heads.as_slice() else {
+            anyhow::bail!("four frames");
+        };
+        debug_assert!(h1 != h2 && h1 != h3 && h1 != h4 && h2 != h3 && h2 != h4 && h3 != h4);
+
+        let _blocked = block_install(&receiver).await?;
+        for bytes in &frames_in {
+            assert_eq!(
+                receive(&receiver, fixture.admin.agent_id(), bytes).await,
+                ReceiveOutcome::LocalFailure,
+                "the install stays blocked; the writes happen"
+            );
+        }
+        let on_disk =
+            replay_log::tests::frames_on_disk(&receiver, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(
+            on_disk.len(),
+            3,
+            "the pair and the newest frame: the third leaves, not the catch-up window"
+        );
+        assert_eq!(
+            (
+                on_disk[0].result_head.as_str(),
+                on_disk[1].result_head.as_str(),
+                on_disk[2].result_head.as_str()
+            ),
+            (h1.as_str(), h2.as_str(), h4.as_str()),
+            "the pair and the newest stay"
+        );
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1579: a competing frame kept below the head never stops the
+    /// catch-up round. The log holds the installed sibling, the
+    /// competitor and a later on-chain frame; the serving loop's head
+    /// rule serves the first and the third and skips the competitor.
+    /// Without the skip the competitor's send would refuse (it is not on
+    /// this node's chain) and end the round, stranding every frame after
+    /// it — the claim proven here at the loop's own surface: the real
+    /// `catchup_frames` output, filtered by the real `head_rule_admits`
+    /// per frame, in file order.
+    #[tokio::test]
+    async fn the_catchup_round_skips_a_competing_frame_below_the_head() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        let (bytes1, head1, head1_state) = fixture.frame_with_state()?;
+        let (bytes2, head2) = fixture.competing_frame()?;
+        assert_ne!(head1, head2, "the fixture frames compete at one revision");
+        // A later commit on the installed sibling's branch: the pair sits
+        // below the head, and the group is not quarantined (the competitor
+        // was never received, only kept in the log).
+        let now_ms = now_unix_ms();
+        let renewal = AgentCertificate::issue_with_expiry(
+            &fixture.owner,
+            &fixture.seat,
+            Some(now_ms / 1000 + 8000),
+        )?;
+        let (head3_info, frame3) = cr::seal(
+            &head1_state,
+            *fixture.seat.agent_id().as_bytes(),
+            &renewal,
+            &fixture.admin,
+            now_ms,
+        )
+        .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+        let bytes3 = cr::encode_frame(&frame3)?;
+        let head3 = head3_info.state_hash.clone();
+        hold_persisted(&receiver, &head3_info).await?;
+        {
+            let mut inner = receiver.revocation_evictions.inner.lock().await;
+            inner.rebind.log.remember(
+                &stable,
+                head3_info.state_revision.saturating_sub(1),
+                head1.as_str(),
+                Arc::new(bytes1),
+                false,
+            );
+            inner.rebind.log.remember(
+                &stable,
+                head3_info.state_revision.saturating_sub(1),
+                head2.as_str(),
+                Arc::new(bytes2),
+                false,
+            );
+            inner.rebind.log.remember(
+                &stable,
+                head3_info.state_revision,
+                head3.as_str(),
+                Arc::new(bytes3),
+                false,
+            );
+        }
+        let info = receiver
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .cloned()
+            .context("the group")?;
+        let from = fixture.info.state_revision;
+        let frames = receiver
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .log
+            .catchup_frames(std::slice::from_ref(&stable), from);
+        assert_eq!(frames.len(), 3, "the round sees every held frame");
+        let mut served: Vec<String> = Vec::new();
+        for (_, result_head, _) in &frames {
+            if head_rule_admits(&info, &HeadRule::OnChain(result_head.clone())) {
+                served.push(result_head.clone());
+            }
+        }
+        assert_eq!(
+            served,
+            vec![head1, head3],
+            "the competitor is skipped and the frames after it are still served"
+        );
+        receiver.agent.shutdown().await;
         Ok(())
     }
 

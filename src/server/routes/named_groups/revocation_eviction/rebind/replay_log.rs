@@ -273,7 +273,31 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
     ) -> ReplayLogV1 {
         let mut scratch = Self::default();
         if KEEP_COMPETING {
+            // #1579 review: a revision keeps the competing pair and no
+            // more. A signer allowed to commit can seal many distinct
+            // valid frames at one revision; without the bound they fill
+            // the per-group cap and `remember`'s `pop_front` evicts the
+            // frames below the head — the catch-up window this log
+            // serves — and eventually the held frame. Two file-only
+            // frames per revision are the pair this log exists to keep
+            // (before the winner installs, both are file-only); a frame
+            // memory also holds is the installed chain and is never
+            // dropped here.
+            let mut competing: std::collections::BTreeMap<u64, u32> =
+                std::collections::BTreeMap::new();
             for frame in file_frames {
+                let held = self.log.get(stable).is_some_and(|log| {
+                    log.iter().any(|e| {
+                        e.next_revision == frame.next_revision && e.result_head == frame.result_head
+                    })
+                });
+                if !held {
+                    let seen = competing.entry(frame.next_revision).or_insert(0);
+                    *seen += 1;
+                    if *seen > 2 {
+                        continue;
+                    }
+                }
                 scratch.remember(
                     stable,
                     frame.next_revision,
@@ -311,7 +335,23 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
         (refused_revision, refused_head): (u64, &str),
     ) -> ReplayLogV1 {
         let mut scratch = Self::default();
+        // The same competing-pair bound as [`Self::planned`]: this
+        // rewrite is a write of the merged view, so it must not keep a
+        // per-revision pile the cap would evict the held frames for.
+        let mut competing: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
         for frame in file_frames {
+            let held = self.log.get(stable).is_some_and(|log| {
+                log.iter().any(|e| {
+                    e.next_revision == frame.next_revision && e.result_head == frame.result_head
+                })
+            });
+            if !held {
+                let seen = competing.entry(frame.next_revision).or_insert(0);
+                *seen += 1;
+                if *seen > 2 {
+                    continue;
+                }
+            }
             scratch.remember(
                 stable,
                 frame.next_revision,
@@ -590,9 +630,22 @@ async fn write_with<const CAP: usize, const KEEP: bool>(
     // closed), and a damaged file is replaced by this write, as by the
     // first write after the quarantine.
     let file_frames = if KEEP {
-        match tokio::fs::read(&path).await {
+        match crate::w3h_inline::fs::read(&path).await {
             Ok(existing) => decode(&existing).map(|log| log.frames).unwrap_or_default(),
-            Err(_) => Vec::new(),
+            // A missing file is an empty plan. Any other read error must
+            // not become one: planning from memory alone would let the
+            // rename below drop the competing or crash-window frames the
+            // file holds — the loss #1579 exists to prevent — so the
+            // write fails closed and the caller treats it as not durable.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "ADR 0110 S4: held frame log could not be read; the write fails closed"
+                );
+                return false;
+            }
         }
     } else {
         Vec::new()
@@ -628,9 +681,20 @@ pub(in super::super) async fn rewrite_without<const CAP: usize, const KEEP: bool
     let path = log_path(state, stable, extension);
     let write_lock = lock_file_writes(&path).await;
     let _serialized = write_lock.lock().await;
-    let file_frames = match tokio::fs::read(&path).await {
+    let file_frames = match crate::w3h_inline::fs::read(&path).await {
         Ok(existing) => decode(&existing).map(|log| log.frames).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        // A missing file is an empty plan; any other read error keeps the
+        // file as it is (best effort, but never lossy): rewriting from
+        // memory alone could drop the evidence frames the file holds.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "ADR 0110 S4: held frame log could not be read; the refused frame is not un-written"
+            );
+            return;
+        }
     };
     let log = held(&mut *state.revocation_evictions.inner.lock().await).planned_without(
         &file_frames,
@@ -718,7 +782,7 @@ pub(in super::super) mod tests {
     pub(in super::super::super) async fn file_frames_of(
         path: &std::path::Path,
     ) -> Vec<ReplayFrameV1> {
-        match tokio::fs::read(path).await {
+        match crate::w3h_inline::fs::read(path).await {
             Ok(bytes) => decode(&bytes).map(|log| log.frames).unwrap_or_default(),
             Err(_) => Vec::new(),
         }
