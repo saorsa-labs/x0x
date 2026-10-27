@@ -32,6 +32,15 @@
 //! removal request and the completed rekey are legitimately e0-sealed), and
 //! the oracle proves itself first: before the removal it opens A's pre-key
 //! frame under the saved e0 secret.
+//!
+//! A second cut at B's restart opens the restart recovery window: GREEN
+//! also requires B's sealed `StateRequest` on the `/state-sync` side topic
+//! and A's sealed recovery answer on the main topic, both after that
+//! cut — the exchange the restart actually triggers, never a Control frame
+//! B sent before it went down. (A's answer is its retained image when the
+//! responder cooldown allows one, else its sealed re-propagation of B's
+//! restarted-incarnation write; the case spans about 6 virtual seconds,
+//! so the 15-second cooldown usually holds from the bootstrap serve.)
 
 #![cfg(test)]
 
@@ -129,6 +138,18 @@ enum WireKey {
     },
 }
 
+/// Mirror of kv::sync's private `KvSyncMessage`, first variant only: the
+/// bincode discriminant and field order are the sealed Control payload
+/// contract (`wire_compat::decode_bincode`, fixint). A payload that decodes
+/// to this mirror is a `StateRequest` naming its requester; every other
+/// variant fails the discriminant check and is not one.
+#[derive(serde::Deserialize)]
+enum SyncControlPrefix {
+    StateRequest {
+        requester: saorsa_gossip_types::PeerId,
+    },
+}
+
 fn decode_sealed(
     write: &Write,
     topics: &[String],
@@ -209,7 +230,6 @@ fn mutation_mentions(kind: KvMutationKind, payload: &[u8], key: &str) -> Result<
 enum FrameCheck {
     /// Sealed under the current epoch and opened under the current secret.
     Current {
-        kind: KvMutationKind,
         mentions_post: bool,
         mentions_restart: bool,
     },
@@ -264,7 +284,6 @@ fn check_frame(
     if frame.record.epoch == post_epoch {
         return match open_mutation(current, store, &frame.record) {
             Ok(mutation) => FrameCheck::Current {
-                kind: mutation.kind,
                 mentions_post: mutation_mentions(mutation.kind, &mutation.payload, POST_KEY)
                     .unwrap_or(false),
                 mentions_restart: mutation_mentions(mutation.kind, &mutation.payload, RESTART_KEY)
@@ -318,9 +337,7 @@ struct Oracle {
     tolerated: usize,
     defects: Vec<String>,
     a_post_write: bool,
-    b_control: bool,
     b_restart_write: bool,
-    a_retained: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -343,9 +360,7 @@ fn run_oracle(
         tolerated: 0,
         defects: Vec::new(),
         a_post_write: false,
-        b_control: false,
         b_restart_write: false,
-        a_retained: false,
     };
     for (_label, peer) in &peers {
         for write in sim
@@ -358,7 +373,6 @@ fn run_oracle(
             out.relevant += 1;
             match check_frame(&frame, store, group_bytes, previous, current, post_epoch) {
                 FrameCheck::Current {
-                    kind,
                     mentions_post,
                     mentions_restart,
                 } => {
@@ -380,15 +394,111 @@ fn run_oracle(
                         ("B", true, _, true) => out.b_restart_write = true,
                         _ => {}
                     }
-                    if main_topic && frame.from == "A" && kind == KvMutationKind::RetainedState {
-                        out.a_retained = true;
-                    }
-                    if !main_topic && frame.from == "B" && kind == KvMutationKind::Control {
-                        out.b_control = true;
-                    }
                 }
                 FrameCheck::ToleratedReplay => out.tolerated += 1,
                 FrameCheck::Defect(why) => out.defects.push(why),
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The restart recovery exchange after `restart_cut`: when B's sealed
+/// `StateRequest` on the side topic and A's sealed recovery answer were
+/// sent (fabric virtual time), so a GREEN proves the exchange happened,
+/// not merely that both nodes stayed quiet-sealed.
+#[derive(Default)]
+struct RestartExchange {
+    b_request_at: Option<Duration>,
+    a_answer_at: Option<Duration>,
+}
+
+impl RestartExchange {
+    fn happened(&self) -> bool {
+        self.b_request_at.is_some() && self.a_answer_at.is_some()
+    }
+
+    fn describe(&self) -> String {
+        let show = |at: Option<Duration>| {
+            at.map(|at| format!("{}us", at.as_micros()))
+                .unwrap_or_else(|| "never".to_string())
+        };
+        format!(
+            "b_state_request_at={} a_recovery_answer_at={}",
+            show(self.b_request_at),
+            show(self.a_answer_at)
+        )
+    }
+}
+
+/// The restart recovery oracle: over B's and A's writes from `restart_cut`
+/// (taken after B's new incarnation is up), find B's `StateRequest` — a
+/// Control-kind frame on the side topic whose payload decodes to the
+/// mirror's first variant naming B's own peer and whose sealed author is
+/// B's agent — and A's recovery answer: a current-epoch frame of A's on
+/// the main topic that is a retained image (`RetainedState`, the answer
+/// shape when the responder's cooldown allows one) or names the restart
+/// key (A's sealed re-propagation of B's restarted-incarnation write —
+/// in this harness A's full-state answer to the post-restart request is
+/// suppressed by the responder's `STATE_RESPONSE_COOLDOWN_SECS` window:
+/// A's last full serve was the bootstrap about 2.6 virtual seconds
+/// earlier, and the whole case spans about 6 virtual seconds). Either
+/// shape proves A carried B's restarted-incarnation traffic; the trace
+/// artifact records which. Every frame in this window is also judged by
+/// [`run_oracle`], so a frame that fails its authenticated open fails the
+/// case there; here an open failure only means the frame is not one of
+/// the two exchange shapes being classified.
+fn run_restart_exchange(
+    sim: &Sim,
+    restart_cut: usize,
+    topics: &[String],
+    side_topic: &str,
+    store: &KvStoreId,
+    current: &GssKvSecureContext,
+    post_epoch: u64,
+) -> Result<RestartExchange> {
+    let b_peer = sim.peer("B")?.0;
+    let b_agent = sim.agent_hex("B")?;
+    let mut out = RestartExchange::default();
+    for label in ["B", "A"] {
+        let peer_key = sim.peer(label)?.0;
+        let peers = [(label, peer_key)];
+        for write in sim
+            .fabric()
+            .writes_from_between(&ant_quic::PeerId(peer_key), restart_cut..usize::MAX)
+        {
+            let label_of = |key: [u8; 32]| label_in(&peers, key);
+            let Some(frame) = decode_sealed(&write, topics, &label_of)? else {
+                continue;
+            };
+            let Ok(mutation) = open_mutation(current, store, &frame.record) else {
+                continue;
+            };
+            if !frame.verified || mutation.epoch != post_epoch {
+                continue;
+            }
+            if label == "B"
+                && frame.topic == side_topic
+                && mutation.kind == KvMutationKind::Control
+                && hex::encode(mutation.author_id.as_bytes()) == b_agent
+            {
+                let request = bincode::options()
+                    .with_fixint_encoding()
+                    .allow_trailing_bytes()
+                    .deserialize::<SyncControlPrefix>(&mutation.payload)
+                    .ok();
+                if matches!(request, Some(SyncControlPrefix::StateRequest { requester }) if requester.as_bytes() == &b_peer)
+                {
+                    out.b_request_at = Some(out.b_request_at.unwrap_or(write.at));
+                }
+            }
+            if label == "A"
+                && frame.topic != side_topic
+                && (mutation.kind == KvMutationKind::RetainedState
+                    || mutation_mentions(mutation.kind, &mutation.payload, RESTART_KEY)
+                        .unwrap_or(false))
+            {
+                out.a_answer_at = Some(out.a_answer_at.unwrap_or(write.at));
             }
         }
     }
@@ -710,6 +820,12 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         after == before + 1,
         "B restarted as incarnation {after}, expected {before}+1"
     );
+    // The restart recovery window: the fabric refuses writes from B's
+    // stopped incarnation, so a `StateRequest` found from this cut on is
+    // the restarted node's own, never one B sent before it went down.
+    let restart_cut = sim
+        .fabric()
+        .cut("case 969: B is back, the restart recovery window opens");
     wait_seated(sim, "A", "B", &group, "B seated again after its restart").await?;
     let what = "B re-opens the store at the current epoch after its restart";
     let mut last = String::new();
@@ -769,22 +885,41 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         post_epoch,
         &side_topic,
     )?;
+    let exchange = run_restart_exchange(
+        sim,
+        restart_cut,
+        &topics,
+        &side_topic,
+        &store,
+        &current,
+        post_epoch,
+    )?;
     receipt.request_delivered(
-        "B's restart-triggered control request left B sealed at the current epoch",
-        oracle.b_control,
+        "B's restarted incarnation sent a sealed StateRequest on the side topic",
+        exchange.b_request_at.is_some(),
         format!(
-            "relevant={} current={} tolerated_replays={} b_control={}",
-            oracle.relevant, oracle.current, oracle.tolerated, oracle.b_control
+            "restart_window_from_cut={restart_cut} {}",
+            exchange.describe()
         ),
         at(sim),
     );
-    let coverage = oracle.a_post_write && oracle.b_control && oracle.b_restart_write;
     receipt.evidence(
-        "the oracle saw post-rekey sealed traffic from both members on both topics",
+        "A carried B's restarted-incarnation traffic: a sealed retained image or its sealed \
+         re-propagation of B's restart write, after the cut",
+        exchange.a_answer_at.is_some(),
+        exchange.describe(),
+        at(sim),
+    );
+    let coverage = oracle.a_post_write && oracle.b_restart_write && exchange.happened();
+    receipt.evidence(
+        "the oracle saw post-rekey sealed traffic from both members and the restart recovery \
+         exchange",
         coverage,
         format!(
-            "a_post_write={} b_control={} b_restart_write={} a_retained={}",
-            oracle.a_post_write, oracle.b_control, oracle.b_restart_write, oracle.a_retained
+            "a_post_write={} b_restart_write={} {}",
+            oracle.a_post_write,
+            oracle.b_restart_write,
+            exchange.describe()
         ),
         at(sim),
     );
