@@ -184,9 +184,13 @@ pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
 /// is local fact only, it does not prove delivery of the share, and the
 /// author's delivery row must stay open until the share installs (then the
 /// report is the current head again, and it is share-proof). The parent of
-/// the lowest live hold is reported, so a chain of keyless installs names
-/// no keyless result. A superseded install releases its hold, so its head
-/// is reported as before: it proves a later key exists. A node that holds
+/// the lowest *live* hold is reported. In a chain of keyless installs
+/// only the newest hold stays live, so the report is the chain's first
+/// result — itself keyless-installed, though still the newest head this
+/// node's secrets vouch for. A superseded install keeps its hold for
+/// now (the conservative direction: the parent, not a covered head, is
+/// reported until the held chain replays); its release rides the
+/// stacked #1635. A node that holds
 /// a secret, or is held by no exclusion, reports its current head.
 pub(super) async fn reported_head(
     state: &AppState,

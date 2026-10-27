@@ -53,6 +53,11 @@
 //!   the frame again on each round until its verified catch-up answer
 //!   names the result head ([`note_survivor_head`]). Only then is it
 //!   `Converged`, and only a delivery whose recipients all converged ends.
+//!   One exception (Engineer ruling, 25 Oct 00:26, #1578): a seat this
+//!   author's own roster holds keyless — no KEM key to seal a share to —
+//!   closes from the author's skip record on the send's transport ACK;
+//!   whether that becomes a named exception to §3 L228 is with the
+//!   engineer.
 //! - **Restart** (`resume_crypto_exclusions` in the parent). A saved frame
 //!   is resent only after the group's head is synced
 //!   ([`super::group_head_synced`], not elapsed time alone) and only while
@@ -1318,8 +1323,13 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
                 // #1578 (Engineer ruling, 25 Oct 00:26): record, from the
                 // roster this round seals by, which started seats this
                 // author cannot seal a share to. The record is this
-                // author's own; it is re-derived every round, so a seat
-                // that later publishes a KEM key is sealed to again.
+                // author's own and is re-derived every round, so a seat
+                // that publishes a KEM key before the row ends is sealed
+                // to again; once the row completes from the skip record
+                // (the same ruling) it does not reopen — the survivor
+                // whose own view holds the key is on its own to request
+                // the share (the §3 exception question is with the
+                // engineer).
                 for (recipient, _) in &started {
                     if seat_cannot_take_a_share(&info, recipient) {
                         stored.keyless_seats.insert(*recipient);
@@ -4826,6 +4836,106 @@ mod daemon_tests {
         assert_eq!(
             ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
             0
+        );
+        Ok(())
+    }
+
+    /// #1578 review: the other direction of the divergent seat view. The
+    /// author's view of the survivor's seat holds no KEM key (for
+    /// example after an outbound snapshot that strips KEM keys) while
+    /// the survivor's own copy has it, so the survivor takes the
+    /// wait-for-share path. Under the 25 Oct 00:26 ruling the author's
+    /// skip record closes the seat on the send's transport ACK and the
+    /// row completes with no share ever sealed — the survivor holds,
+    /// waiting for a share that will not come. Whether that
+    /// stranded-survivor case must keep the author's row open is with
+    /// the engineer (the PR body's FOR ENGINEER); this test pins today's
+    /// ruled behaviour in that direction.
+    #[tokio::test]
+    async fn an_author_keyless_seat_closes_while_the_keyed_survivor_waits() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_views(None, false, true).await?;
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let decoded = ce::decode_frame(&frame).context("frame")?;
+        let result_head = decoded.body.commit.state_hash.clone();
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        // The author's view of the seat carries no KEM key, so it sealed
+        // no share and recorded the skip instead.
+        assert!(
+            shares_for(&fx.state, &survivor_hex).is_empty(),
+            "the author never sealed a share: its view of the seat has no KEM key"
+        );
+
+        // The survivor's own view seats its key, so it installs the
+        // verified frame and holds for the share it expects.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the keyed survivor installs the frame"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await.as_deref(),
+            Some(result_head.as_str()),
+            "the head moves"
+        );
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            1,
+            "the survivor holds: no share of the new epoch reached it"
+        );
+
+        // The ruling's close: the send's ACK plus the author's own skip
+        // record end the row with the survivor still held.
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        super::super::revocation_eviction_pass(&fx.state).await;
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner.ce.delivering().contains(&key),
+                "the skip record ends the delivery (the 25 Oct 00:26 ruling)"
+            );
+            assert_eq!(
+                inner.store.get(&key).map(|row| row.phase),
+                Some(Phase::Complete),
+                "the obligation completes from the skip record"
+            );
+        }
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            1,
+            "the stranded survivor: its own view holds the key, the author's row is closed"
         );
         Ok(())
     }

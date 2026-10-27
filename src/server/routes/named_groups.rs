@@ -1314,7 +1314,12 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     truncated: bool,
     /// Saved membership head of the responder. Absent on a KeyPackage reply
     /// and on an old peer. A startup self-leave seal trusts this only when
-    /// it equals the local head after the page is applied.
+    /// it equals the local head after the page is applied. #1578: a
+    /// responder that installed a held exclusion's result keyless reports
+    /// the live hold's parent here — the newest head its secrets vouch
+    /// for — not the installed result; the field's wire shape is
+    /// unchanged, but its value can now name a head the responder does
+    /// not hold (pending the engineer's word).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
 }
