@@ -83,9 +83,9 @@ pub struct HistoryCounters {
 
 /// Producer-side handle: cheap to clone, never blocks on the channel.
 ///
-/// Under the W3-H shim, [`Self::inline_store`] is set and inserts run on
-/// the caller. There is no writer thread and no oneshot to wait for, so a
-/// paused runtime does not auto-advance while a commit is in flight (#1245).
+/// Under the W3-H shim, inserts run on the caller. There is no writer
+/// thread and no oneshot to wait for, so a paused runtime does not
+/// auto-advance while a commit is in flight (#1245).
 #[derive(Clone)]
 pub struct WriterHandle {
     tx: mpsc::SyncSender<WriteCommand>,
