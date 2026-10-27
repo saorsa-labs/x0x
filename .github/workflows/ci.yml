@@ -781,6 +781,8 @@ jobs:
           --expect w3h_1161_card_import_invite=GREEN
           --require w3h_1161_control_share_withheld_is_red
           --expect w3h_1161_control_share_withheld_is_red=RED
+          --require w3h_969_leave_rekey_restart_seals_under_the_current_epoch
+          --expect w3h_969_leave_rekey_restart_seals_under_the_current_epoch=GREEN
           --require w3h_1471_forged_card_import_invite
           --expect w3h_1471_forged_card_import_invite=GREEN
           --require w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined

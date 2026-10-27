@@ -207,7 +207,10 @@ impl FlushOwner {
                 if producers_finished {
                     Ok(())
                 } else {
-                    Err(io::Error::other("shutdown producers remain unfinished"))
+                    // The shared marker names the one transient started-flush
+                    // cause that draws the bounded retry budget instead of an
+                    // immediate hold (issue #1595).
+                    Err(io::Error::other(shutdown_flush::PRODUCERS_UNFINISHED))
                 }
             });
             let _ = self.complete.try_send(result);
@@ -428,21 +431,13 @@ fn arm(
         Err(shutdown_flush::FlushFailure::NotOwned(error)) => Err(ArmFailure::Refused(error)),
         Err(failure @ shutdown_flush::FlushFailure::Started(_)) => {
             // The flush started and the daemon stopped behind the hook. Hold
-            // the failed release first (engineer ruling, 23 Oct 2026) so the
-            // restart this exit creates cannot re-apply it, then restore
+            // the failed release first — or spend one of the bounded
+            // producer-drain retries (engineer ruling, 23 Oct 2026;
+            // issue #1595) — so the restart this exit creates cannot
+            // re-apply a release that fails deterministically, then restore
             // every binary the transaction swapped and leave the EX_TEMPFAIL
-            // exit to `finish`.
-            if let Err(error) = shutdown_flush::hold_failed_release(
-                root,
-                &plan.candidate_version,
-                &failure.to_string(),
-            ) {
-                tracing::error!(
-                    %error,
-                    "cannot persist the failed-upgrade hold; the next automatic \
-                     check may retry this release once more"
-                );
-            }
+            // exit to the control loop after its reply.
+            shutdown_flush::hold_or_retry_started_failure(root, &plan.candidate_version, &failure);
             let recovery_complete = match restore_arm(
                 root,
                 *journal,
