@@ -51,6 +51,7 @@ use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 pub(super) mod crypto_exclusion;
 mod frame_stash;
 mod handoff_log;
+mod mandate_store;
 pub(super) mod owner_recovery;
 pub(super) mod rebind;
 mod removal_delivery;
