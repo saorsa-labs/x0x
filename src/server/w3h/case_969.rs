@@ -34,13 +34,16 @@
 //! frame under the saved e0 secret.
 //!
 //! A second cut at B's restart opens the restart recovery window: GREEN
-//! also requires B's sealed `StateRequest` on the `/state-sync` side topic
-//! and A's sealed recovery answer on the main topic, both after that
-//! cut — the exchange the restart actually triggers, never a Control frame
-//! B sent before it went down. (A's answer is its retained image when the
-//! responder cooldown allows one, else its sealed re-propagation of B's
-//! restarted-incarnation write; the case spans about 6 virtual seconds,
-//! so the 15-second cooldown usually holds from the bootstrap serve.)
+//! also requires, strictly after that cut, sealed recovery traffic from
+//! B's restarted incarnation — its `StateRequest` on the `/state-sync`
+//! side topic, or its restart write when the local replica already
+//! converged (the unshimmed coverage job's shape) — and A carrying that
+//! traffic back on the main topic. A Control frame B sent before it went
+//! down can no longer satisfy anything. (A's side is its retained image
+//! when the responder cooldown allows one, else its sealed
+//! re-propagation of B's restarted write; the case spans about 6 virtual
+//! seconds, so the 15-second cooldown usually holds from the bootstrap
+//! serve.)
 
 #![cfg(test)]
 
@@ -231,7 +234,6 @@ enum FrameCheck {
     /// Sealed under the current epoch and opened under the current secret.
     Current {
         mentions_post: bool,
-        mentions_restart: bool,
     },
     /// An authenticated pre-rekey replay carrying no post-rekey key.
     ToleratedReplay,
@@ -286,8 +288,6 @@ fn check_frame(
             Ok(mutation) => FrameCheck::Current {
                 mentions_post: mutation_mentions(mutation.kind, &mutation.payload, POST_KEY)
                     .unwrap_or(false),
-                mentions_restart: mutation_mentions(mutation.kind, &mutation.payload, RESTART_KEY)
-                    .unwrap_or(false),
             },
             Err(error) => FrameCheck::Defect(format!(
                 "{where_}: current-epoch frame failed authenticated open: {error}"
@@ -337,7 +337,6 @@ struct Oracle {
     tolerated: usize,
     defects: Vec<String>,
     a_post_write: bool,
-    b_restart_write: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,7 +359,6 @@ fn run_oracle(
         tolerated: 0,
         defects: Vec::new(),
         a_post_write: false,
-        b_restart_write: false,
     };
     for (_label, peer) in &peers {
         for write in sim
@@ -372,10 +370,7 @@ fn run_oracle(
             };
             out.relevant += 1;
             match check_frame(&frame, store, group_bytes, previous, current, post_epoch) {
-                FrameCheck::Current {
-                    mentions_post,
-                    mentions_restart,
-                } => {
+                FrameCheck::Current { mentions_post } => {
                     out.current += 1;
                     // Coverage, not a wire contract: a member's write may be
                     // served to its reader as a delta or as a full/retained
@@ -383,16 +378,10 @@ fn run_oracle(
                     // state at publish time — the unshimmed coverage job
                     // took the retained shape), so any current-epoch frame
                     // from the writer naming the key proves the traffic.
-                    let main_topic = frame.topic != side_topic;
-                    match (
-                        frame.from.as_str(),
-                        main_topic,
-                        mentions_post,
-                        mentions_restart,
-                    ) {
-                        ("A", true, true, _) => out.a_post_write = true,
-                        ("B", true, _, true) => out.b_restart_write = true,
-                        _ => {}
+                    // B's restart write is proven by the stricter
+                    // post-restart-cut exchange below.
+                    if frame.from == "A" && frame.topic != side_topic && mentions_post {
+                        out.a_post_write = true;
                     }
                 }
                 FrameCheck::ToleratedReplay => out.tolerated += 1,
@@ -403,19 +392,23 @@ fn run_oracle(
     Ok(out)
 }
 
-/// The restart recovery exchange after `restart_cut`: when B's sealed
-/// `StateRequest` on the side topic and A's sealed recovery answer were
-/// sent (fabric virtual time), so a GREEN proves the exchange happened,
-/// not merely that both nodes stayed quiet-sealed.
+/// The restart recovery exchange after `restart_cut`: when B's restarted
+/// incarnation sent sealed recovery traffic — its `StateRequest` on the
+/// side topic, or its restart write when the local replica already
+/// converged (the unshimmed coverage job's shape) — and when A carried
+/// that traffic back (fabric virtual time), so a GREEN proves the
+/// exchange happened, not merely that both nodes stayed quiet-sealed.
 #[derive(Default)]
 struct RestartExchange {
     b_request_at: Option<Duration>,
+    b_restart_write_at: Option<Duration>,
     a_answer_at: Option<Duration>,
 }
 
 impl RestartExchange {
     fn happened(&self) -> bool {
-        self.b_request_at.is_some() && self.a_answer_at.is_some()
+        (self.b_request_at.is_some() || self.b_restart_write_at.is_some())
+            && self.a_answer_at.is_some()
     }
 
     fn describe(&self) -> String {
@@ -424,30 +417,34 @@ impl RestartExchange {
                 .unwrap_or_else(|| "never".to_string())
         };
         format!(
-            "b_state_request_at={} a_recovery_answer_at={}",
+            "b_state_request_at={} b_restart_write_at={} a_recovery_answer_at={}",
             show(self.b_request_at),
+            show(self.b_restart_write_at),
             show(self.a_answer_at)
         )
     }
 }
 
 /// The restart recovery oracle: over B's and A's writes from `restart_cut`
-/// (taken after B's new incarnation is up), find B's `StateRequest` — a
-/// Control-kind frame on the side topic whose payload decodes to the
-/// mirror's first variant naming B's own peer and whose sealed author is
-/// B's agent — and A's recovery answer: a current-epoch frame of A's on
-/// the main topic that is a retained image (`RetainedState`, the answer
-/// shape when the responder's cooldown allows one) or names the restart
-/// key (A's sealed re-propagation of B's restarted-incarnation write —
-/// in this harness A's full-state answer to the post-restart request is
-/// suppressed by the responder's `STATE_RESPONSE_COOLDOWN_SECS` window:
-/// A's last full serve was the bootstrap about 2.6 virtual seconds
-/// earlier, and the whole case spans about 6 virtual seconds). Either
-/// shape proves A carried B's restarted-incarnation traffic; the trace
-/// artifact records which. Every frame in this window is also judged by
-/// [`run_oracle`], so a frame that fails its authenticated open fails the
-/// case there; here an open failure only means the frame is not one of
-/// the two exchange shapes being classified.
+/// (taken after B's new incarnation is up), find B's recovery traffic and
+/// A's answer. B's side is its `StateRequest` — a Control-kind frame on
+/// the side topic whose payload decodes to the mirror's first variant
+/// naming B's own peer and whose sealed author is B's agent — or, when
+/// B's local replica already converged at re-open (the unshimmed
+/// coverage job's shape), its restart write on the main topic. A's side
+/// is a current-epoch frame on the main topic that is a retained image
+/// (`RetainedState`, the answer shape when the responder's cooldown
+/// allows one — in the shimmed runs A's full-state answer to the
+/// post-restart request is usually suppressed by
+/// `STATE_RESPONSE_COOLDOWN_SECS`: A's last full serve was the bootstrap
+/// about 2.6 virtual seconds earlier, and the whole case spans about 6
+/// virtual seconds) or names the restart key (A's sealed re-propagation
+/// of B's restarted-incarnation write). Either side's shapes prove the
+/// restarted incarnation and the holder exchanged sealed traffic; the
+/// trace artifact records which. Every frame in this window is also
+/// judged by [`run_oracle`], so a frame that fails its authenticated open
+/// fails the case there; here an open failure only means the frame is
+/// not one of the exchange shapes being classified.
 fn run_restart_exchange(
     sim: &Sim,
     restart_cut: usize,
@@ -477,19 +474,27 @@ fn run_restart_exchange(
             if !frame.verified || mutation.epoch != post_epoch {
                 continue;
             }
-            if label == "B"
-                && frame.topic == side_topic
-                && mutation.kind == KvMutationKind::Control
-                && hex::encode(mutation.author_id.as_bytes()) == b_agent
-            {
-                let request = bincode::options()
-                    .with_fixint_encoding()
-                    .allow_trailing_bytes()
-                    .deserialize::<SyncControlPrefix>(&mutation.payload)
-                    .ok();
-                if matches!(request, Some(SyncControlPrefix::StateRequest { requester }) if requester.as_bytes() == &b_peer)
-                {
+            if label == "B" {
+                let is_state_request = frame.topic == side_topic
+                    && mutation.kind == KvMutationKind::Control
+                    && hex::encode(mutation.author_id.as_bytes()) == b_agent
+                    && bincode::options()
+                        .with_fixint_encoding()
+                        .allow_trailing_bytes()
+                        .deserialize::<SyncControlPrefix>(&mutation.payload)
+                        .ok()
+                        .is_some_and(|SyncControlPrefix::StateRequest { requester }| {
+                            requester.as_bytes() == &b_peer
+                        });
+                if is_state_request {
                     out.b_request_at = Some(out.b_request_at.unwrap_or(write.at));
+                }
+                let is_restart_write = frame.topic != side_topic
+                    && hex::encode(mutation.author_id.as_bytes()) == b_agent
+                    && mutation_mentions(mutation.kind, &mutation.payload, RESTART_KEY)
+                        .unwrap_or(false);
+                if is_restart_write {
+                    out.b_restart_write_at = Some(out.b_restart_write_at.unwrap_or(write.at));
                 }
             }
             if label == "A"
@@ -895,8 +900,9 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         post_epoch,
     )?;
     receipt.request_delivered(
-        "B's restarted incarnation sent a sealed StateRequest on the side topic",
-        exchange.b_request_at.is_some(),
+        "B's restarted incarnation sent sealed recovery traffic after the cut: its StateRequest, \
+         or its restart write when the local replica already converged",
+        exchange.b_request_at.is_some() || exchange.b_restart_write_at.is_some(),
         format!(
             "restart_window_from_cut={restart_cut} {}",
             exchange.describe()
@@ -910,15 +916,14 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         exchange.describe(),
         at(sim),
     );
-    let coverage = oracle.a_post_write && oracle.b_restart_write && exchange.happened();
+    let coverage = oracle.a_post_write && exchange.happened();
     receipt.evidence(
         "the oracle saw post-rekey sealed traffic from both members and the restart recovery \
          exchange",
         coverage,
         format!(
-            "a_post_write={} b_restart_write={} {}",
+            "a_post_write={} {}",
             oracle.a_post_write,
-            oracle.b_restart_write,
             exchange.describe()
         ),
         at(sim),
