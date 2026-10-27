@@ -1,9 +1,9 @@
 //! #1649: ADR 0109 §3a receiver evidence on the real receive path.
 //!
 //! The #1533 review left the §3a receiver unproven end to end: the pure
-//! verifier tests cover `verify_reseat_mandate` and the route tests cover
-//! the issuer, but nothing drove a forged or tampered `ReseatMandateV1`
-//! through `verify_reseat_mandate_on_receive`, which runs a real
+//! verifier tests cover `verify_reseat_mandate` and the route tests the
+//! issuer, but nothing drove a forged or tampered `ReseatMandateV1` through
+//! `verify_reseat_mandate_on_receive`, which runs a real
 //! `verify_cert_against_owner` on a real receiver.
 //!
 //! Two daemons, in process (no socket, no network config): the admin `A`
@@ -12,9 +12,9 @@
 //! removal commit. The mandate-carrying `MemberAdded` travels the
 //! production DM lane (`DirectMessaging::handle_incoming` →
 //! `run_direct_metadata_listener` → the shielded apply) with the JSON
-//! payload `spawn_named_group_event_delivery` sends. Each bad mandate is
-//! also driven through the listener's own apply entry to prove the typed
-//! refusal cause and a byte-identical committed record.
+//! payload `spawn_named_group_event_delivery` sends; each bad mandate also
+//! goes through the listener's own apply entry, for the typed refusal cause
+//! and a byte-identical committed record.
 
 use super::*;
 
@@ -35,7 +35,6 @@ const QUIET: Duration = Duration::from_millis(300);
 struct Stage {
     receiver: Arc<AppState>,
     admin: Arc<AppState>,
-    /// Kept alive for both daemons' data directories.
     _dirs: (tempfile::TempDir, tempfile::TempDir),
     group_id: String,
     admin_hex: String,
@@ -49,11 +48,6 @@ struct Stage {
     /// The re-seat seat-write the terminal commit covers.
     next: x0x::groups::GroupInfo,
     terminal: x0x::groups::GroupStateCommit,
-}
-
-/// A daemon state with a generated agent key (one per pair member).
-async fn daemon() -> Result<(Arc<AppState>, tempfile::TempDir)> {
-    secure_endpoint_test_state_with_key(AgentKeypair::generate()?).await
 }
 
 /// Seat `agent_hex` as a Member with its committed certificate.
@@ -100,8 +94,8 @@ fn sealed(
 }
 
 async fn stage() -> Result<Stage> {
-    let (receiver, dir_r) = daemon().await?;
-    let (admin, dir_a) = daemon().await?;
+    let (receiver, dir_r) = secure_endpoint_test_state_with_key(AgentKeypair::generate()?).await?;
+    let (admin, dir_a) = secure_endpoint_test_state_with_key(AgentKeypair::generate()?).await?;
     let owner = UserKeypair::generate()?;
     let subject_kp = AgentKeypair::generate()?;
     let subject_hex = hex::encode(subject_kp.agent_id().as_bytes());
@@ -220,7 +214,8 @@ fn mint(fields: ReseatMandateFields, signer: &AgentKeypair) -> ReseatMandateV1 {
     ReseatMandateV1::sign(fields, signer).expect("sign mandate")
 }
 
-/// The valid mandate, and the three bad shapes of #1649.
+/// The valid mandate, and the forged, tampered and wrong-owner shapes.
+#[allow(clippy::type_complexity)]
 fn mandates(
     stage: &Stage,
 ) -> (
@@ -252,15 +247,20 @@ fn mandates(
 }
 
 /// A fourth bad shape: re-signed by the admin, binding the digest of a
-/// certificate a DIFFERENT owner issued for the subject, while the
-/// committed certificate is the real owner's (so the §3a check runs
-/// `verify_cert_against_owner` for real).
-fn wrong_owner_certificate_mandate(stage: &Stage) -> ReseatMandateV1 {
+/// certificate a DIFFERENT owner issued for the subject. Over the DM lane
+/// the committed certificate is still the real owner's (the ADR-0038
+/// ingress gate refuses a foreign one first), so the §3a check refuses the
+/// digest mismatch; called with the foreign certificate itself, the same
+/// rule runs a real `verify_cert_against_owner` and refuses that instead.
+fn wrong_owner_certificate_mandate(stage: &Stage) -> (ReseatMandateV1, AgentCertificate) {
     let foreign = UserKeypair::generate().expect("foreign cert owner");
     let cert = AgentCertificate::issue(&foreign, &stage.subject_kp).expect("foreign cert");
     let mut fields = mandate_fields(stage);
     fields.certificate_digest = crate::groups::owner_cert::certificate_digest_hex(&cert);
-    mint(fields, stage.admin.agent.identity().agent_keypair())
+    (
+        mint(fields, stage.admin.agent.identity().agent_keypair()),
+        cert,
+    )
 }
 
 fn member_added(
@@ -326,24 +326,32 @@ async fn diag_counters(stage: &Stage) -> crate::groups::diagnostics::GroupCounte
         .counters
 }
 
-/// The listener's own apply entry refuses the event, with the typed cause
-/// the receiver rule names, and leaves the committed record byte-identical.
-async fn refused_unchanged(stage: &Stage, mandate: ReseatMandateV1, expected: &str) -> Result<()> {
-    // The receiver rule the receive path runs, on the real receiver state.
-    let cause = group_recovery::verify_reseat_mandate_on_receive(
+/// The receiver rule the receive path runs, on the real receiver state,
+/// with `certificate` as the committed certificate it sees.
+async fn receiver_cause(
+    stage: &Stage,
+    mandate: &ReseatMandateV1,
+    certificate: &AgentCertificate,
+) -> Result<(), &'static str> {
+    group_recovery::verify_reseat_mandate_on_receive(
         stage.receiver.as_ref(),
         &stage.parent,
         &stage.next,
         &stage.terminal,
-        &mandate,
+        mandate,
         &stage.subject_hex,
         None,
         None,
-        Some(&stage.subject_cert),
+        Some(certificate),
     )
-    .await;
+    .await
+}
+
+/// The listener's own apply entry refuses the event, with the typed cause
+/// the receiver rule names, and leaves the committed record byte-identical.
+async fn refused_unchanged(stage: &Stage, mandate: ReseatMandateV1, expected: &str) -> Result<()> {
     assert_eq!(
-        cause,
+        receiver_cause(stage, &mandate, &stage.subject_cert).await,
         Err(expected),
         "the receiver rule must name the {expected} cause"
     );
@@ -401,7 +409,9 @@ async fn wait_seated(stage: &Stage, why: &str) -> Result<()> {
 }
 
 /// Control: the DM lane applies a VALID §3a re-seat, so the refusals below
-/// are refusals of the real acceptance path, not of a dead one.
+/// are refusals of the real acceptance path, not of a dead one. The absent
+/// counter staying 0 proves the §3a rule accepted the mandate — not the
+/// mixed-fleet arm that applies an event with no mandate at all.
 #[tokio::test]
 async fn a_valid_mandate_reseats_the_subject_over_the_dm_lane() -> Result<()> {
     let stage = stage().await?;
@@ -415,6 +425,11 @@ async fn a_valid_mandate_reseats_the_subject_over_the_dm_lane() -> Result<()> {
     let live = live(&stage).await;
     assert_eq!(live.state_revision, stage.parent.state_revision + 1);
     assert_eq!(live.state_hash, stage.terminal.state_hash);
+    assert_eq!(
+        diag_counters(&stage).await.owner_mandate_absent,
+        0,
+        "the §3a rule must accept the mandate, not the absent-mandate arm"
+    );
     crate::server::drain_server_tasks(&stage.receiver, vec![listener]).await;
     Ok(())
 }
@@ -430,7 +445,7 @@ async fn bad_mandates_are_refused_over_the_dm_lane_and_only_the_valid_reseat_app
 {
     let stage = stage().await?;
     let (valid, forged, tampered, wrong_owner) = mandates(&stage);
-    let wrong_owner_cert = wrong_owner_certificate_mandate(&stage);
+    let (wrong_owner_cert, _) = wrong_owner_certificate_mandate(&stage);
     let listener = tokio::spawn(run_direct_metadata_listener(
         Arc::clone(&stage.receiver),
         stage.receiver.agent.subscribe_direct(),
@@ -438,11 +453,11 @@ async fn bad_mandates_are_refused_over_the_dm_lane_and_only_the_valid_reseat_app
     let admin_kp = stage.admin.agent.identity().agent_keypair();
     let bad_terminals = [3_100, 3_200, 3_300, 3_400]
         .map(|at| terminal_commit(&stage.parent, &stage.next, admin_kp, at));
-    for (mandate, commit) in [&forged, &tampered, &wrong_owner, &wrong_owner_cert]
+    for (mandate, commit) in [forged, tampered, wrong_owner, wrong_owner_cert]
         .into_iter()
         .zip(bad_terminals)
     {
-        inject(&stage, &member_added(&stage, mandate.clone(), &commit)).await?;
+        inject(&stage, &member_added(&stage, mandate, &commit)).await?;
     }
     inject(&stage, &member_added(&stage, valid, &stage.terminal)).await?;
     wait_seated(
@@ -458,6 +473,12 @@ async fn bad_mandates_are_refused_over_the_dm_lane_and_only_the_valid_reseat_app
         live.state_revision,
         stage.parent.state_revision + 1,
         "every bad mandate left the record at the parent"
+    );
+    assert_eq!(
+        live.commit_log.last().map(|kept| kept.commit.committed_at),
+        Some(stage.terminal.committed_at),
+        "only the valid terminal is retained (the terminals share a state \
+         hash; their committed_at is what tells them apart)"
     );
     assert_eq!(
         diag_counters(&stage)
@@ -492,10 +513,21 @@ async fn a_wrong_owner_mandate_is_refused_with_cause_policy_mismatch() -> Result
     refused_unchanged(&stage, wrong_owner, "policy_mismatch").await
 }
 
+/// Over the lane the committed certificate is the real owner's, so §3a
+/// check 6 refuses the digest mismatch. Called with the foreign certificate
+/// itself — the branch the lane cannot reach, because the ADR-0038 ingress
+/// gate refuses that certificate first — the rule runs a real
+/// `verify_cert_against_owner`, which rejects it.
 #[tokio::test]
 async fn a_wrong_owner_certificate_mandate_is_refused_with_cause_certificate_invalid() -> Result<()>
 {
     let stage = stage().await?;
-    let wrong_owner_cert = wrong_owner_certificate_mandate(&stage);
-    refused_unchanged(&stage, wrong_owner_cert, "certificate_invalid").await
+    let (wrong_owner_cert, foreign_cert) = wrong_owner_certificate_mandate(&stage);
+    refused_unchanged(&stage, wrong_owner_cert.clone(), "certificate_invalid").await?;
+    assert_eq!(
+        receiver_cause(&stage, &wrong_owner_cert, &foreign_cert).await,
+        Err("certificate_invalid"),
+        "the real owner verification must refuse the foreign certificate"
+    );
+    Ok(())
 }
