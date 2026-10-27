@@ -591,6 +591,28 @@ no longer waits for the server shutdown tail to reach the flush finish, so
 a shutdown that hangs behind an already-stopped daemon cannot park the
 process with the supervisor waiting forever.
 
+A started failure caused **only** by unfinished producers at the drain
+bound — the receipt refusal `finish` reports when an HTTP request, a grace
+straggler or a shielded apply missed its bound — is transient, so it draws
+a fixed bounded retry budget before the per-release hold (issue #1595,
+Claude #1565 finding 4): two retries per release, counted in
+`<data_dir>/upgrade-flush-producer-retries.json`, a constant, not
+configuration. Each such failure still restores and exits `EX_TEMPFAIL`;
+the difference is that no hold is written for the first two, so the
+service-manager restart retries the release instead of parking the host on
+one slow request. The third failure of the same release writes the hold.
+A failure of a different release resets the count; any other failure
+cause never touches the budget and holds immediately, as does a count
+that cannot be persisted.
+
+Before either exit, the flush waits one short fixed window (2 s) for the
+flush worker's completion message after a started failure: receiving it
+proves the worker's last durable write finished (issue #1595, bounded
+rollback-writer join). The exit continues when the window expires — a
+stalled worker must never park a daemon that already stopped. The rollback
+record itself is written on the calling thread, before this wait, so the
+exit can never lose it.
+
 For a started failure on the local arm-and-flush path, the host journal
 first records `rolling_back` with a flush-failure cause. Only then does the
 daemon restore bytes. A complete restore records `restored`, clears each
@@ -666,7 +688,10 @@ failed attempt. At the next startup — after the new process holds the
 instance data-root lock, which proves the flush's owning process is gone —
 the daemon clears this debris, logs the recorded cause, and treats that
 upgrade as failed; a later apply is not refused by these records. A record
-that carries a receipt proves a completed flush and is preserved.
+that carries a receipt proves a completed flush and is preserved. Like the
+failed-upgrade hold, the producer-drain retry count
+(`upgrade-flush-producer-retries.json`) is not debris: it survives the
+restarts that spend it.
 
 #### Failed-upgrade hold
 
@@ -674,7 +699,11 @@ A flush that started (the daemon stopped behind the hook) and then failed
 writes `<data_dir>/upgrade-flush-hold.json` before it restores and exits
 `EX_TEMPFAIL`. The record names the held release and the failure cause.
 Without it, every service-manager restart would re-apply the same release
-and fail the same way — the endless exit loop ADR 0094 §4 forbids.
+and fail the same way — the endless exit loop ADR 0094 §4 forbids. The one
+exception is the producers-only drain failure above, which retries its
+release twice (counted in
+`<data_dir>/upgrade-flush-producer-retries.json`) before this hold
+applies.
 
 The hold is deliberately **not** debris: the startup stale-record cleanup
 above never removes it, and every apply path — the startup check, the
