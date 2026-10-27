@@ -194,6 +194,7 @@ fn member_added_event(
         certificate_b64: Some(BASE64.encode(bincode::serialize(cert).expect("cert"))),
         owner_mandate,
         commit: Some(commit),
+        reseat_mandate: None,
     }
 }
 
@@ -2247,6 +2248,7 @@ async fn treekem_direct_add_mints_epoch_bound_mandate_peer_applies() -> Result<(
             certificate_b64,
             owner_mandate: Some(signed_wrong),
             commit: Some(commit),
+            reseat_mandate: None,
         },
         _ => panic!("shape"),
     };

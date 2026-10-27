@@ -363,6 +363,7 @@ async fn with_pulled_welcome(
             head_attestation,
             roster_certificates_b64,
             intervening_events,
+            admin_attestation: _,
         } => {
             if let NamedGroupMetadataEvent::MemberAdded {
                 treekem_welcome_b64,
@@ -389,6 +390,7 @@ async fn with_pulled_welcome(
                 head_attestation,
                 roster_certificates_b64,
                 intervening_events,
+                admin_attestation: None,
             }
         }
         other => other,

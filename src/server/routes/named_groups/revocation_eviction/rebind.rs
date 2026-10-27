@@ -432,6 +432,16 @@ async fn commit_locked(
         })
         .map_err(CommitError::Refused)?;
     }
+    // ADR 0109 §2 "Conflict" (#1533 Codex P1 2): the author's own commit
+    // passes the one conflict gate too, before anything is persisted. A
+    // recorded attestation conflict contains the group until a re-seat.
+    if !ng::group_recovery::conflict_admits_commit(state, info, &frame.body.commit.to_commit())
+        .await
+    {
+        return Err(CommitError::Refused(
+            cr::CertificateRebindRefusal::GroupContained,
+        ));
+    }
     let bytes = cr::encode_frame(&frame)
         .map_err(|_| CommitError::Refused(cr::CertificateRebindRefusal::Malformed))?;
     if bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES {
@@ -1927,6 +1937,14 @@ pub(in crate::server) async fn receive(
                             sibling = Some(kind);
                             Err(cr::CertificateRebindRefusal::HeadMismatch)
                         }
+                        // #1533 r11: this node's branch no longer holds
+                        // the parent's certificate bytes, so the sibling
+                        // cannot be checked. It stays unvalidated and
+                        // records nothing; a fetch of the current bytes
+                        // would not supply the parent's.
+                        Err(cr::CertificateRebindRefusal::CertificateEvidenceMissing) => {
+                            Err(cr::CertificateRebindRefusal::HeadMismatch)
+                        }
                         Err(refused) => Err(refused),
                     }
                 }
@@ -1973,6 +1991,16 @@ pub(in crate::server) async fn receive(
             return ReceiveOutcome::Refused(refused);
         }
     };
+    // ADR 0109 §2 "Conflict" (#1533 r6): the one conflict gate bounds
+    // this commit as it bounds every metadata route.
+    if !ng::group_recovery::conflict_admits_commit(state, &info, &commit).await {
+        tracing::warn!(
+            group_id = %LogHexId::group(&group_key),
+            revision = commit.revision,
+            "ADR 0109 S3: certificate rebind past the attestation conflict's common prefix refused"
+        );
+        return ReceiveOutcome::Refused(cr::CertificateRebindRefusal::GroupContained);
+    }
     // #1508 review F2: the received frame is durable before the roster it
     // carries is installed, in the held log that the author uses. A
     // restarted receiver then serves it to a survivor that missed it while
@@ -2903,6 +2931,37 @@ pub(super) mod restart_tests {
             .collect()
     }
 
+    /// #1533 r6 (Codex P1 1), ADR 0109 §2 "Conflict": "Nothing past the
+    /// common prefix applies" holds for an S4 rebind too. The receiver
+    /// records an attestation conflict on its head (no fork marker), then
+    /// a valid rebind on that head arrives: it is refused and the head
+    /// does not move. Before the fix the rebind receiver applied the
+    /// commit without the conflict gate. Inert.
+    #[tokio::test]
+    async fn a_recorded_attestation_conflict_refuses_a_valid_rebind() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        anyhow::ensure!(
+            ng::group_recovery::record_conflict_at_head_for_test(&receiver, &fixture.info).await?,
+            "the conflict is durable"
+        );
+        let (bytes, _result_head) = fixture.frame()?;
+        let outcome = receive(&receiver, fixture.admin.agent_id(), &bytes).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::Refused(cr::CertificateRebindRefusal::GroupContained)
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&fixture.info.state_hash),
+            "nothing past the common prefix applies (rebind)"
+        );
+        Ok(())
+    }
+
     /// F2 (a): a survivor installs a rebind, then restarts while the author
     /// is offline. The restarted survivor serves the exact frame to another
     /// survivor that asks for catch-up from the parent revision.
@@ -3762,6 +3821,76 @@ pub(super) mod restart_tests {
             after.members_v2[&local_hex].certificate_digest.as_deref(),
             Some(x0x::groups::owner_cert::certificate_digest_hex(&renewal).as_str()),
             "the held self-rebind committed after the head sync"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1533 Codex P1 2 (ADR 0109 §2 "Conflict"): a locally authored
+    /// rebind passes the same conflict gate as a received one. This node
+    /// holds a recorded attestation conflict on its head (no fork marker)
+    /// and a synced head. The self-rebind route must refuse with
+    /// `group_contained` and persist nothing: no head move and no
+    /// planned frame. Before the fix `commit_locked` sealed and persisted
+    /// the rebind past the common prefix. Inert.
+    #[tokio::test]
+    async fn a_recorded_attestation_conflict_refuses_a_local_self_rebind() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = UserKeypair::generate()?;
+        let survivor = AgentKeypair::generate()?;
+        let survivor_id = survivor.agent_id();
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the fresh state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let me = state.agent.identity().agent_keypair();
+        let info = certified_group(&owner, me, &[&survivor])?;
+        hold_persisted(&state, &info).await?;
+        let stable = info.stable_group_id().to_string();
+        // D129: the survivor's current verified advert sets the bit.
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            survivor_id,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            now_unix_ms(),
+        ));
+        set_evidence(&state, &stable, &info, HeadEvidence::Conflicting, false).await;
+        assert!(
+            super::super::group_head_synced(&state, &stable).await,
+            "the head is synced, so only the conflict gate can refuse"
+        );
+        anyhow::ensure!(
+            ng::group_recovery::record_conflict_at_head_for_test(&state, &info).await?,
+            "the conflict is durable"
+        );
+
+        let me = state.agent.identity().agent_keypair();
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, me, Some(now_unix_ms() / 1000 + 1200))?;
+        let (status, body) = self_rebind(&state, &stable, &renewal).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body["error"],
+            cr::CertificateRebindRefusal::GroupContained.as_str()
+        );
+        assert_eq!(
+            head_of(&state, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "nothing past the common prefix applies (local rebind)"
+        );
+        assert!(
+            served(&state, &stable, info.state_revision)
+                .await
+                .is_empty(),
+            "no rebind frame was planned"
         );
         state.agent.shutdown().await;
         Ok(())

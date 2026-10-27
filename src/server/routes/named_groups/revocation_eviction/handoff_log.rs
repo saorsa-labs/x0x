@@ -124,7 +124,7 @@ pub(super) async fn persist(state: &AppState) {
 /// after host commit quarantines it (§5).
 pub(super) async fn load(state: &AppState, gate_open: bool) {
     let path = path(state);
-    let Ok(bytes) = tokio::fs::read(&path).await else {
+    let Ok(bytes) = crate::w3h_inline::fs::read(&path).await else {
         return;
     };
     let loaded = match decode(&bytes) {
