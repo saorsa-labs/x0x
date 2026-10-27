@@ -9044,6 +9044,114 @@ mod tests {
         Ok(())
     }
 
+    /// `staged`, one sealed metadata commit later.
+    fn staged_metadata_commit(state: &AppState, staged: &GroupInfo) -> anyhow::Result<GroupInfo> {
+        let mut next = staged.clone();
+        next.description = "staged metadata change".to_string();
+        next.seal_commit(state.agent.identity().agent_keypair(), 3_000)?;
+        Ok(next)
+    }
+
+    /// #1567 (ZCode on f9a11b3: the hook had no test): a metadata commit
+    /// on the staged record runs the TreeKEM re-bind
+    /// (`rebind_envelope_for`). While the join is staged, the re-bind
+    /// keeps the original's tree bound to the original record, and for a
+    /// tree-less original writes no snapshot file. Without the cover the
+    /// re-bind writes the staged tree. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_staged_metadata_commit_keeps_the_originals_snapshot_state() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, original_tree, staged, _) = staged_tree_fixture(&state).await?;
+        let next = staged_metadata_commit(&state, &staged)?;
+        super::super::persist_named_group_info(&state, &key, next).await?;
+        let envelope = snapshot_on_disk(&state, &key).await?;
+        assert_eq!(envelope.state_hash, original.state_hash);
+        assert!(
+            envelope.snapshot == original_tree,
+            "Keep: the original's tree"
+        );
+
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, _, staged, _) = treeless_staged_fixture(&state).await?;
+        let next = staged_metadata_commit(&state, &staged)?;
+        super::super::persist_named_group_info(&state, &key, next).await?;
+        assert!(
+            !snapshot_exists(&state, &key).await?,
+            "Absent: no snapshot file"
+        );
+        Ok(())
+    }
+
+    /// #1567: the tree-less staged persist (`Absent`, roster half only)
+    /// keeps the atomic persist's outcomes. `NotReplaced` fails and keeps
+    /// the live record; `ReplacedNotDurable` fails as "epoch installed"
+    /// with the new record live. Neither writes a snapshot file. Inert:
+    /// an offline agent.
+    #[tokio::test]
+    async fn a_treeless_staged_persist_keeps_the_atomic_outcomes() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, _, staged, _) = treeless_staged_fixture(&state).await?;
+        let tree = state
+            .treekem_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("staged tree"))?;
+        let next = staged_metadata_commit(&state, &staged)?;
+        let live_hash = |state: Arc<AppState>, key: String| async move {
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&key)
+                .map(|info| info.state_hash.clone())
+        };
+
+        state.named_groups_save_fault.store(1, Ordering::SeqCst);
+        let refused = super::super::persist_treekem_and_named_groups_atomic_with_info(
+            &state,
+            &key,
+            next.clone(),
+            &*tree.lock().await,
+        )
+        .await;
+        assert!(refused.is_err());
+        assert!(!super::super::self_leave_persist_left_epoch_installed(
+            refused
+                .as_ref()
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("err"))?
+        ));
+        assert_eq!(
+            live_hash(Arc::clone(&state), key.clone()).await,
+            Some(staged.state_hash.clone())
+        );
+
+        state.named_groups_save_fault.store(3, Ordering::SeqCst);
+        let installed = super::super::persist_treekem_and_named_groups_atomic_with_info(
+            &state,
+            &key,
+            next.clone(),
+            &*tree.lock().await,
+        )
+        .await;
+        state.named_groups_save_fault.store(0, Ordering::SeqCst);
+        assert!(super::super::self_leave_persist_left_epoch_installed(
+            installed
+                .as_ref()
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("err"))?
+        ));
+        assert_eq!(
+            live_hash(Arc::clone(&state), key.clone()).await,
+            Some(next.state_hash.clone())
+        );
+        assert!(!snapshot_exists(&state, &key).await?);
+        Ok(())
+    }
+
     /// A group whose admin A seats this node, then two more commits (an
     /// add, then a promotion):
     /// returns A, the group at A's seal (`base`), after one more commit
