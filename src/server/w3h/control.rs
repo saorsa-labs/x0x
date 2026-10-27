@@ -194,62 +194,66 @@ pub(super) async fn put_value(
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn w3h_clock_gate_holds_virtual_time_outside_barriers() -> Result<()> {
-    let start = tokio::time::Instant::now();
-    let gate = ClockGate::close();
-    let sleeper = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(10)).await });
-    // Stay idle for 300 ms of real time with a 10 s virtual timer pending.
-    // Without the gate, paused tokio would auto-advance straight to it.
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let _ = tx.send(());
-    });
-    rx.await?;
-    ensure!(
-        tokio::time::Instant::now() == start,
-        "virtual time moved while the gate was closed"
-    );
-    ensure!(!sleeper.is_finished(), "a 10 s timer fired while gated");
-    gate.open().await;
-    sleeper.await?;
-    ensure!(tokio::time::Instant::now() >= start + Duration::from_secs(10));
-    Ok(())
+#[test]
+fn w3h_clock_gate_holds_virtual_time_outside_barriers() -> Result<()> {
+    super::block_on_paused(async move {
+        let start = tokio::time::Instant::now();
+        let gate = ClockGate::close();
+        let sleeper = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(10)).await });
+        // Stay idle for 300 ms of real time with a 10 s virtual timer pending.
+        // Without the gate, paused tokio would auto-advance straight to it.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = tx.send(());
+        });
+        rx.await?;
+        ensure!(
+            tokio::time::Instant::now() == start,
+            "virtual time moved while the gate was closed"
+        );
+        ensure!(!sleeper.is_finished(), "a 10 s timer fired while gated");
+        gate.open().await;
+        sleeper.await?;
+        ensure!(tokio::time::Instant::now() >= start + Duration::from_secs(10));
+        Ok(())
+    })
 }
 
 /// #1245: pull-based wall offset tracks a virtual-time jump immediately,
 /// without waiting for a 1 ms ticker task to be polled first.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn w3h_wall_offset_tracks_virtual_jump_without_ticker() -> Result<()> {
-    let origin = tokio::time::Instant::now();
-    super::install_virt_clock_for_test(origin);
-    // SAFETY: same callback the shim invokes on every clock_gettime.
-    let before = unsafe { super::virt_offset_ns() };
-    ensure!(
-        before < 1_000_000,
-        "offset at origin should be ~0 ns, got {before}"
-    );
-    tokio::time::advance(Duration::from_secs(5)).await;
-    let after_runtime = unsafe { super::virt_offset_ns() };
-    // Plain OS thread: must enter the owning runtime Handle, not read real time.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // SAFETY: same C ABI callback the shim calls from any thread.
-        let _ = tx.send(unsafe { super::virt_offset_ns() });
-    });
-    let after_os = rx
-        .recv()
-        .map_err(|_| anyhow::anyhow!("OS-thread callback did not return"))?;
-    super::clear_virt_clock_for_test();
-    let expected = Duration::from_secs(5).as_nanos() as u64;
-    for (label, after) in [("runtime", after_runtime), ("os-thread", after_os)] {
+#[test]
+fn w3h_wall_offset_tracks_virtual_jump_without_ticker() -> Result<()> {
+    super::block_on_paused(async move {
+        let origin = tokio::time::Instant::now();
+        super::install_virt_clock_for_test(origin);
+        // SAFETY: same callback the shim invokes on every clock_gettime.
+        let before = unsafe { super::virt_offset_ns() };
         ensure!(
-            after >= expected.saturating_sub(1_000) && after <= expected.saturating_add(1_000),
-            "pull offset after 5s jump on {label} should be ~{expected} ns, got {after}"
+            before < 1_000_000,
+            "offset at origin should be ~0 ns, got {before}"
         );
-    }
-    Ok(())
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let after_runtime = unsafe { super::virt_offset_ns() };
+        // Plain OS thread: must enter the owning runtime Handle, not read real time.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: same C ABI callback the shim calls from any thread.
+            let _ = tx.send(unsafe { super::virt_offset_ns() });
+        });
+        let after_os = rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("OS-thread callback did not return"))?;
+        super::clear_virt_clock_for_test();
+        let expected = Duration::from_secs(5).as_nanos() as u64;
+        for (label, after) in [("runtime", after_runtime), ("os-thread", after_os)] {
+            ensure!(
+                after >= expected.saturating_sub(1_000) && after <= expected.saturating_add(1_000),
+                "pull offset after 5s jump on {label} should be ~{expected} ns, got {after}"
+            );
+        }
+        Ok(())
+    })
 }
 
 /// #1245: with the W3-H shim preloaded, `SystemTime::now()` must follow
@@ -259,100 +263,217 @@ async fn w3h_wall_offset_tracks_virtual_jump_without_ticker() -> Result<()> {
 /// honestly pass without it (ADR 0025 §3–4). The W3-H harness job runs it
 /// via `nextest --profile w3h-gate --run-ignored all`. A missing shim under
 /// that job is a hard failure, never a silent `Ok`.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[ignore = "requires W3-H LD_PRELOAD shim (nextest profile w3h / w3h-gate --run-ignored all)"]
-async fn w3h_system_time_follows_pull_callback_via_shim() -> Result<()> {
-    let shim = super::Shim::detect().map_err(|reason| {
-        anyhow::anyhow!("W3-H shim required for wall-clock interposition: {reason}")
-    })?;
-    let origin = tokio::time::Instant::now();
-    // Install the pull callback before the baseline so both reads go through the
-    // virtual clock (real wall time would make wall_after look like it went
-    // backwards after a jump to the 2026-01-01 epoch).
-    shim.install_virt_time(origin);
-    // Always clear the pull callback, including on early `?` / panic.
-    struct ClearVirt(super::Shim);
-    impl Drop for ClearVirt {
-        fn drop(&mut self) {
-            self.0.clear_virt_time();
+fn w3h_system_time_follows_pull_callback_via_shim() -> Result<()> {
+    super::block_on_paused(async move {
+        let shim = super::Shim::detect().map_err(|reason| {
+            anyhow::anyhow!("W3-H shim required for wall-clock interposition: {reason}")
+        })?;
+        let origin = tokio::time::Instant::now();
+        // Install the pull callback before the baseline so both reads go through the
+        // virtual clock (real wall time would make wall_after look like it went
+        // backwards after a jump to the 2026-01-01 epoch).
+        shim.install_virt_time(origin);
+        // Always clear the pull callback, including on early `?` / panic.
+        struct ClearVirt(super::Shim);
+        impl Drop for ClearVirt {
+            fn drop(&mut self) {
+                self.0.clear_virt_time();
+            }
         }
-    }
-    let _clear = ClearVirt(shim);
-    let wall_before = std::time::SystemTime::now();
-    tokio::time::advance(Duration::from_secs(600)).await;
-    let wall_after = std::time::SystemTime::now();
-    let elapsed = wall_after
-        .duration_since(wall_before)
-        .map_err(|e| anyhow::anyhow!("SystemTime went backwards: {e}"))?;
-    ensure!(
-        elapsed >= Duration::from_secs(599) && elapsed <= Duration::from_secs(601),
-        "SystemTime::now() after 600s virtual jump should advance ~600s, got {elapsed:?} \
+        let _clear = ClearVirt(shim);
+        let wall_before = std::time::SystemTime::now();
+        tokio::time::advance(Duration::from_secs(600)).await;
+        let wall_after = std::time::SystemTime::now();
+        let elapsed = wall_after
+            .duration_since(wall_before)
+            .map_err(|e| anyhow::anyhow!("SystemTime went backwards: {e}"))?;
+        ensure!(
+            elapsed >= Duration::from_secs(599) && elapsed <= Duration::from_secs(601),
+            "SystemTime::now() after 600s virtual jump should advance ~600s, got {elapsed:?} \
          (registration/interposition failure would leave real wall time)"
-    );
-    Ok(())
+        );
+        Ok(())
+    })
 }
 
 /// #1245: one spawned task's `getrandom` stream does not move when a sibling
-/// draws. The shim keys the stream by tokio task id.
+/// draws. The shim keys the stream by the task's lineage key.
 ///
 /// Declared `#[ignore]`: it needs `LD_PRELOAD=libw3h_shim.so` (ADR 0025
 /// §3–4). The W3-H harness runs it via `nextest --profile w3h-gate
 /// --run-ignored all`. A missing shim there is a hard failure.
 #[cfg(target_os = "linux")]
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[ignore = "requires W3-H LD_PRELOAD shim (nextest profile w3h / w3h-gate --run-ignored all)"]
-async fn w3h_task_entropy_stream_ignores_sibling_draws() -> Result<()> {
-    let shim = super::Shim::detect()
-        .map_err(|reason| anyhow!("W3-H shim required for per-task entropy: {reason}"))?;
-    shim.install_entropy_key();
-    struct ClearEntropy(super::Shim);
-    impl Drop for ClearEntropy {
-        fn drop(&mut self) {
-            self.0.clear_entropy_key();
+fn w3h_task_entropy_stream_ignores_sibling_draws() -> Result<()> {
+    super::block_on_paused(async move {
+        let shim = super::Shim::detect()
+            .map_err(|reason| anyhow!("W3-H shim required for per-task entropy: {reason}"))?;
+        shim.install_entropy_key();
+        struct ClearEntropy(super::Shim);
+        impl Drop for ClearEntropy {
+            fn drop(&mut self) {
+                self.0.clear_entropy_key();
+            }
         }
-    }
-    let _clear = ClearEntropy(shim);
+        let _clear = ClearEntropy(shim);
 
-    let sibling = tokio::spawn(async {
-        let mut noise = [0u8; 256];
-        draw_exact(&mut noise)?;
-        Ok::<(), anyhow::Error>(())
-    });
-    sibling
-        .await
-        .map_err(|error| anyhow!("sibling task join: {error}"))??;
+        let sibling = tokio::spawn(async {
+            let mut noise = [0u8; 256];
+            draw_exact(&mut noise)?;
+            Ok::<(), anyhow::Error>(())
+        });
+        sibling
+            .await
+            .map_err(|error| anyhow!("sibling task join: {error}"))??;
 
-    tokio::spawn(async {
-        let id = tokio::task::try_id().ok_or_else(|| anyhow!("spawned task has no id"))?;
-        let key: u64 = id
-            .to_string()
-            .parse()
-            .map_err(|error| anyhow!("task id {id} is not an integer: {error}"))?;
-        ensure!(key != 0, "task id 0 is the thread-stream sentinel");
+        tokio::spawn(async {
+            let key = super::current_task_entropy_key();
+            ensure!(key != 0, "task entropy key 0 is the thread-stream sentinel");
 
-        let fill = shim_test_fill()?;
-        let reset = shim_test_reset_key()?;
-        let mut expected = [0u8; 16];
-        // Drop draws made while resolving this task id. `fill` then samples
-        // the fresh stream, and the second reset makes `getrandom` repeat it.
-        // SAFETY: `expected` is writable for 16 bytes. `reset` drops only the
-        // shim table entry for `key`. The shim does not keep the pointer.
-        unsafe { reset(key) };
-        unsafe { fill(key, expected.as_mut_ptr().cast(), expected.len()) };
-        unsafe { reset(key) };
+            let fill = shim_test_fill()?;
+            let reset = shim_test_reset_key()?;
+            let mut expected = [0u8; 16];
+            // Drop draws made while resolving this task id. `fill` then samples
+            // the fresh stream, and the second reset makes `getrandom` repeat it.
+            // SAFETY: `expected` is writable for 16 bytes. `reset` drops only the
+            // shim table entry for `key`. The shim does not keep the pointer.
+            unsafe { reset(key) };
+            unsafe { fill(key, expected.as_mut_ptr().cast(), expected.len()) };
+            unsafe { reset(key) };
 
-        let mut got = [0u8; 16];
-        draw_exact(&mut got)?;
-        ensure!(
-            got.as_slice() == expected.as_slice(),
-            "task stream diverged from its own seed after a sibling drew \
+            let mut got = [0u8; 16];
+            draw_exact(&mut got)?;
+            ensure!(
+                got.as_slice() == expected.as_slice(),
+                "task stream diverged from its own seed after a sibling drew \
              (got {got:?} expected {expected:?})"
-        );
-        Ok::<(), anyhow::Error>(())
+            );
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|error| anyhow!("entropy task join: {error}"))??;
+        Ok(())
     })
-    .await
-    .map_err(|error| anyhow!("entropy task join: {error}"))??;
-    Ok(())
+}
+
+/// #1245: a spawn at another source line must not move the key of this
+/// spawn site. The process-wide task id still moves. Needs
+/// `--cfg tokio_unstable`, which only the W3-H build sets.
+#[cfg(tokio_unstable)]
+#[test]
+fn w3h_lineage_key_ignores_an_unrelated_root_spawn() {
+    fn noise() {
+        tokio::spawn(async {});
+    }
+    fn worker() -> (u64, u64) {
+        let id = tokio::task::try_id().expect("worker has a task id");
+        let bits = super::task_id_bits(id);
+        (bits, super::current_task_entropy_key())
+    }
+    fn spawn_worker() -> tokio::task::JoinHandle<(u64, u64)> {
+        tokio::spawn(async { worker() })
+    }
+    fn once(extra: bool) -> (u64, u64) {
+        super::block_on_paused(async move {
+            if extra {
+                noise();
+            }
+            spawn_worker().await.expect("worker")
+        })
+    }
+
+    let (id_extra, key_extra) = once(true);
+    let (id_plain, key_plain) = once(false);
+    assert_ne!(
+        id_extra, id_plain,
+        "the extra spawn must move the process-wide task id"
+    );
+    assert_eq!(
+        key_extra, key_plain,
+        "lineage key must stay put when another site spawns"
+    );
+    assert_ne!(key_plain, 0);
+    assert_ne!(key_plain, id_plain);
+    assert_ne!(key_extra, id_extra);
+
+    let (first, second) = super::block_on_paused(async {
+        let first = spawn_worker().await.expect("first");
+        let second = spawn_worker().await.expect("second");
+        (first.1, second.1)
+    });
+    assert_ne!(
+        first, second,
+        "two spawns at one site must not share a stream key"
+    );
+}
+
+/// #1245: a runtime with no spawn hooks does not record lineage. The miss
+/// must fail the case. A silent fallback to the process-wide task id is
+/// the instability this key removes.
+#[cfg(tokio_unstable)]
+#[test]
+fn w3h_lineage_miss_fails_the_case() {
+    super::lineage::reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        tokio::spawn(async {
+            let _ = super::current_task_entropy_key();
+        })
+        .await
+        .expect("worker");
+    });
+    assert!(
+        super::lineage::misses() > 0,
+        "an unhooked runtime must count a lineage miss"
+    );
+    let panicked = std::panic::catch_unwind(super::ensure_lineage_recorded);
+    super::lineage::reset();
+    let payload = panicked.expect_err("a lineage miss must fail the case");
+    let text = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        text.contains("lineage lookup missed"),
+        "panic text was {text}"
+    );
+}
+
+/// #1245: a Tokio blocking task does not run `on_task_spawn`. Its key is
+/// still lineage, not the task id, and a second run keeps that key.
+#[cfg(tokio_unstable)]
+#[test]
+fn w3h_lineage_key_of_a_blocking_task_ignores_the_task_id() {
+    fn once() -> (u64, u64) {
+        super::block_on_paused(async {
+            tokio::task::spawn_blocking(|| {
+                let id = tokio::task::try_id().expect("blocking task has a task id");
+                let bits = super::task_id_bits(id);
+                (bits, super::current_task_entropy_key())
+            })
+            .await
+            .expect("blocking task")
+        })
+    }
+
+    let (id_first, key_first) = once();
+    let (id_second, key_second) = once();
+    assert_ne!(id_first, id_second, "the task id must move across runtimes");
+    assert_ne!(key_first, 0);
+    assert_ne!(key_first, id_first);
+    assert_ne!(key_second, id_second);
+    assert_eq!(
+        key_first, key_second,
+        "blocking-task lineage key must not follow the task id"
+    );
+    assert_eq!(super::lineage::misses(), 0);
 }
 
 #[cfg(target_os = "linux")]
@@ -413,184 +534,193 @@ impl Drop for W3hShimEnvGuard {
 
 /// #1245: with the W3-H shim env set, history `run_blocking` runs inline so
 /// a completion cannot reorder other ready tasks via the blocking pool.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn w3h_run_blocking_is_inline_when_shim_env_set() -> Result<()> {
-    let runtime_tid = std::thread::current().id();
-    let _shim_env = W3hShimEnvGuard::arm();
-    let blocking_tid = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let slot = std::sync::Arc::clone(&blocking_tid);
-    let value = crate::history::run_blocking(move || {
-        *slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::thread::current().id());
-        7u32
-    })
-    .await?;
-    ensure!(value == 7);
-    let got = blocking_tid
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .ok_or_else(|| anyhow::anyhow!("run_blocking body did not run"))?;
-    ensure!(
-        got == runtime_tid,
-        "inline blocking must run on the runtime thread"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "W3-H daemon controls run in the Linux isolated namespace only"
-)]
-async fn w3h_s1_control_group_invite_join_over_public_api() -> Result<()> {
-    let sim = Sim::start(
-        "w3h_s1_control_group_invite_join_over_public_api",
-        0x5100_0001,
-        &["A", "B", "C"],
-    )
-    .await?;
-    mesh(&sim, &["A", "B", "C"]).await?;
-    let group = create_group(&sim, "A").await?;
-    for joiner in ["B", "C"] {
-        let link = invite(&sim, "A", &group).await?;
-        join(&sim, joiner, &link).await?;
-    }
-    let want = [
-        sim.agent_hex("A")?,
-        sim.agent_hex("B")?,
-        sim.agent_hex("C")?,
-    ];
-    sim.until("A lists A, B and C", secs(180), async |s: &Sim| {
-        members(s, "A", &group)
-            .await
-            .is_ok_and(|listed| want.iter().all(|id| listed.contains(id)))
-    })
-    .await?;
-    sim.fabric().mark("checkpoint: membership converged on A");
-
-    // Data-plane delivery: one write on A reaches B and C through the
-    // group store (the same store id on every member). Each joiner must
-    // first be seated locally (`membership_state == active`, the live
-    // fixture's local readiness) and able to open the store, which needs
-    // the group key; both are awaited inside named barriers.
-    for member in ["B", "C"] {
-        sim.until(
-            &format!("{member} reports active membership"),
-            secs(120),
-            async |s: &Sim| local_membership(s, member, &group).await.as_deref() == Some("active"),
-        )
-        .await?;
-    }
-    let store = open_store(&sim, "A", &group).await?;
-    for member in ["B", "C"] {
-        let mut opened = None;
-        let mut last = String::new();
-        sim.until(
-            &format!("{member} opens the group store"),
-            secs(60),
-            async |s: &Sim| match try_open_store(s, member, &group).await {
-                Ok(id) => {
-                    opened = Some(id);
-                    true
-                }
-                Err(error) => {
-                    last = format!("{error:#}");
-                    false
-                }
-            },
-        )
-        .await
-        .with_context(|| format!("{member} last store-open error: {last}"))?;
-        ensure!(
-            opened.as_deref() == Some(store.as_str()),
-            "{member} opened a different store id: {opened:?}"
-        );
-    }
-    let (status, put) = sim
-        .api(
-            "A",
-            Method::PUT,
-            &format!("/stores/{}/w3h-control", path_segment(&store)),
-            Some(json!({"value": BASE64.encode("delivered"), "content_type": "text/plain"})),
-        )
-        .await?;
-    ensure!(status.is_success(), "A put: {status} {put}");
-    sim.until("B and C read A's write", secs(120), async |s: &Sim| {
-        read_value(s, "B", &store, "w3h-control").await.as_deref() == Some("delivered")
-            && read_value(s, "C", &store, "w3h-control").await.as_deref() == Some("delivered")
-    })
-    .await?;
-    sim.fabric()
-        .mark("checkpoint: group data delivered to B and C");
-    sim.finish().await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "W3-H daemon controls run in the Linux isolated namespace only"
-)]
-async fn w3h_s1_negative_control_offline_joiner_is_not_admitted() -> Result<()> {
-    let sim = Sim::start(
-        "w3h_s1_negative_control_offline_joiner_is_not_admitted",
-        0x5100_0002,
-        &["A", "B", "C"],
-    )
-    .await?;
-    mesh(&sim, &["A", "B", "C"]).await?;
-    let group = create_group(&sim, "A").await?;
-    let link = invite(&sim, "A", &group).await?;
-    let c_peer = sim.peer("C")?;
-    let offline_at = sim.fabric().now();
-    sim.set_online("C", false)?;
-    // The join is a valid local attempt: C accepts it and queues the
-    // request (the handler's only refusals are local durability/signing).
-    join(&sim, "C", &link).await?;
-    let c = sim.agent_hex("C")?;
-    let what = "A lists C (must not happen)";
-    // Only an expired budget with every read completed and successful is
-    // "not admitted"; a failed or cut-off read is INFRA.
-    let mut seen = Observations::default();
-    let waited = sim
-        .until(what, secs(60), async |s: &Sim| {
-            match seen.observe(members(s, "A", &group)).await {
-                Some(listed) => listed.contains(&c),
-                None => true,
-            }
+#[test]
+fn w3h_run_blocking_is_inline_when_shim_env_set() -> Result<()> {
+    super::block_on_paused(async move {
+        let runtime_tid = std::thread::current().id();
+        let _shim_env = W3hShimEnvGuard::arm();
+        let blocking_tid = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = std::sync::Arc::clone(&blocking_tid);
+        let value = crate::history::run_blocking(move || {
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(std::thread::current().id());
+            7u32
         })
-        .await;
-    seen.verify(what)?;
-    match waited {
-        Ok(()) => bail!("an offline joiner was admitted"),
-        Err(error) if expired(&error) => {}
-        Err(error) => return Err(error),
-    }
-    // A's view at the frozen instant after the barrier closed.
-    let listed = sim
-        .at_instant("A members after the barrier", members(&sim, "A", &group))
-        .await??;
-    ensure!(!listed.contains(&c), "C is listed: {listed:?}");
-    // The intended refusal: the transport refused C's attempts (dials or
-    // sends) and nothing C wrote after going offline was delivered.
-    let refused = sim.fabric().refused_since(&c_peer, offline_at);
-    let delivered = sim.fabric().delivered_from_since(&c_peer, offline_at);
-    ensure!(
-        !refused.is_empty(),
-        "C's join produced no transport refusal; the window did not exercise the fault"
-    );
-    ensure!(
-        delivered.is_empty(),
-        "{} frames from C were delivered while it was offline",
-        delivered.len()
-    );
-    sim.fabric().mark(format!(
-        "checkpoint: C refused {} times, 0 frames delivered",
-        refused.len()
-    ));
-    sim.finish().await?;
-    Ok(())
+        .await?;
+        ensure!(value == 7);
+        let got = blocking_tid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ok_or_else(|| anyhow::anyhow!("run_blocking body did not run"))?;
+        ensure!(
+            got == runtime_tid,
+            "inline blocking must run on the runtime thread"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon controls run in the Linux isolated namespace only"
+)]
+fn w3h_s1_control_group_invite_join_over_public_api() -> Result<()> {
+    super::block_on_paused(async move {
+        let sim = Sim::start(
+            "w3h_s1_control_group_invite_join_over_public_api",
+            0x5100_0001,
+            &["A", "B", "C"],
+        )
+        .await?;
+        mesh(&sim, &["A", "B", "C"]).await?;
+        let group = create_group(&sim, "A").await?;
+        for joiner in ["B", "C"] {
+            let link = invite(&sim, "A", &group).await?;
+            join(&sim, joiner, &link).await?;
+        }
+        let want = [
+            sim.agent_hex("A")?,
+            sim.agent_hex("B")?,
+            sim.agent_hex("C")?,
+        ];
+        sim.until("A lists A, B and C", secs(180), async |s: &Sim| {
+            members(s, "A", &group)
+                .await
+                .is_ok_and(|listed| want.iter().all(|id| listed.contains(id)))
+        })
+        .await?;
+        sim.fabric().mark("checkpoint: membership converged on A");
+
+        // Data-plane delivery: one write on A reaches B and C through the
+        // group store (the same store id on every member). Each joiner must
+        // first be seated locally (`membership_state == active`, the live
+        // fixture's local readiness) and able to open the store, which needs
+        // the group key; both are awaited inside named barriers.
+        for member in ["B", "C"] {
+            sim.until(
+                &format!("{member} reports active membership"),
+                secs(120),
+                async |s: &Sim| {
+                    local_membership(s, member, &group).await.as_deref() == Some("active")
+                },
+            )
+            .await?;
+        }
+        let store = open_store(&sim, "A", &group).await?;
+        for member in ["B", "C"] {
+            let mut opened = None;
+            let mut last = String::new();
+            sim.until(
+                &format!("{member} opens the group store"),
+                secs(60),
+                async |s: &Sim| match try_open_store(s, member, &group).await {
+                    Ok(id) => {
+                        opened = Some(id);
+                        true
+                    }
+                    Err(error) => {
+                        last = format!("{error:#}");
+                        false
+                    }
+                },
+            )
+            .await
+            .with_context(|| format!("{member} last store-open error: {last}"))?;
+            ensure!(
+                opened.as_deref() == Some(store.as_str()),
+                "{member} opened a different store id: {opened:?}"
+            );
+        }
+        let (status, put) = sim
+            .api(
+                "A",
+                Method::PUT,
+                &format!("/stores/{}/w3h-control", path_segment(&store)),
+                Some(json!({"value": BASE64.encode("delivered"), "content_type": "text/plain"})),
+            )
+            .await?;
+        ensure!(status.is_success(), "A put: {status} {put}");
+        sim.until("B and C read A's write", secs(120), async |s: &Sim| {
+            read_value(s, "B", &store, "w3h-control").await.as_deref() == Some("delivered")
+                && read_value(s, "C", &store, "w3h-control").await.as_deref() == Some("delivered")
+        })
+        .await?;
+        sim.fabric()
+            .mark("checkpoint: group data delivered to B and C");
+        sim.finish().await?;
+        Ok(())
+    })
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon controls run in the Linux isolated namespace only"
+)]
+fn w3h_s1_negative_control_offline_joiner_is_not_admitted() -> Result<()> {
+    super::block_on_paused(async move {
+        let sim = Sim::start(
+            "w3h_s1_negative_control_offline_joiner_is_not_admitted",
+            0x5100_0002,
+            &["A", "B", "C"],
+        )
+        .await?;
+        mesh(&sim, &["A", "B", "C"]).await?;
+        let group = create_group(&sim, "A").await?;
+        let link = invite(&sim, "A", &group).await?;
+        let c_peer = sim.peer("C")?;
+        let offline_at = sim.fabric().now();
+        sim.set_online("C", false)?;
+        // The join is a valid local attempt: C accepts it and queues the
+        // request (the handler's only refusals are local durability/signing).
+        join(&sim, "C", &link).await?;
+        let c = sim.agent_hex("C")?;
+        let what = "A lists C (must not happen)";
+        // Only an expired budget with every read completed and successful is
+        // "not admitted"; a failed or cut-off read is INFRA.
+        let mut seen = Observations::default();
+        let waited = sim
+            .until(what, secs(60), async |s: &Sim| {
+                match seen.observe(members(s, "A", &group)).await {
+                    Some(listed) => listed.contains(&c),
+                    None => true,
+                }
+            })
+            .await;
+        seen.verify(what)?;
+        match waited {
+            Ok(()) => bail!("an offline joiner was admitted"),
+            Err(error) if expired(&error) => {}
+            Err(error) => return Err(error),
+        }
+        // A's view at the frozen instant after the barrier closed.
+        let listed = sim
+            .at_instant("A members after the barrier", members(&sim, "A", &group))
+            .await??;
+        ensure!(!listed.contains(&c), "C is listed: {listed:?}");
+        // The intended refusal: the transport refused C's attempts (dials or
+        // sends) and nothing C wrote after going offline was delivered.
+        let refused = sim.fabric().refused_since(&c_peer, offline_at);
+        let delivered = sim.fabric().delivered_from_since(&c_peer, offline_at);
+        ensure!(
+            !refused.is_empty(),
+            "C's join produced no transport refusal; the window did not exercise the fault"
+        );
+        ensure!(
+            delivered.is_empty(),
+            "{} frames from C were delivered while it was offline",
+            delivered.len()
+        );
+        sim.fabric().mark(format!(
+            "checkpoint: C refused {} times, 0 frames delivered",
+            refused.len()
+        ));
+        sim.finish().await?;
+        Ok(())
+    })
 }
 
 /// Streams (by pair and ordinal) whose opener wrote `prefix` first and
@@ -813,19 +943,21 @@ fn completed_evidence_exchanges(
 /// when `!related`, `evidence_wire.rs:318`). Here X is O's same-owner
 /// device: O enrolls X's machine before X starts, so O sends X a Hello on
 /// connect.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
-async fn w3h_s4_control_evidence_hello_over_sim_streams() -> Result<()> {
-    let mut sim = Sim::empty(
-        "w3h_s4_control_evidence_hello_over_sim_streams",
-        0x5400_0001,
-        &["O", "X"],
-    )?;
-    let outcome = evidence_hello_scenario(&mut sim).await;
-    sim.conclude(outcome).await
+fn w3h_s4_control_evidence_hello_over_sim_streams() -> Result<()> {
+    super::block_on_paused(async move {
+        let mut sim = Sim::empty(
+            "w3h_s4_control_evidence_hello_over_sim_streams",
+            0x5400_0001,
+            &["O", "X"],
+        )?;
+        let outcome = evidence_hello_scenario(&mut sim).await;
+        sim.conclude(outcome).await
+    })
 }
 
 async fn evidence_hello_scenario(sim: &mut Sim) -> Result<()> {
@@ -863,19 +995,21 @@ async fn evidence_hello_scenario(sim: &mut Sim) -> Result<()> {
 /// S4 control: owner sync (Tier-1, `SyncV1`) runs over simulated byte
 /// streams, dialled by the daemons themselves, and delivers the canonical
 /// Home pointer: a second same-owner device yields to the owner's Home.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
-async fn w3h_s4_control_owner_sync_over_sim_streams() -> Result<()> {
-    let mut sim = Sim::empty(
-        "w3h_s4_control_owner_sync_over_sim_streams",
-        0x5400_0002,
-        &["O", "X"],
-    )?;
-    let outcome = owner_sync_scenario(&mut sim).await;
-    sim.conclude(outcome).await
+fn w3h_s4_control_owner_sync_over_sim_streams() -> Result<()> {
+    super::block_on_paused(async move {
+        let mut sim = Sim::empty(
+            "w3h_s4_control_owner_sync_over_sim_streams",
+            0x5400_0002,
+            &["O", "X"],
+        )?;
+        let outcome = owner_sync_scenario(&mut sim).await;
+        sim.conclude(outcome).await
+    })
 }
 
 async fn owner_sync_scenario(sim: &mut Sim) -> Result<()> {

@@ -237,3 +237,9 @@ strip = "none"
 # Embed debuginfo in the binary so gdb / perf on remote VPS can resolve
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
+
+# W3-H test builds pass `--cfg tokio_unstable` so the harness can read
+# spawn hooks. Release binaries and the other CI jobs do not pass it.
+# This line only names that cfg for the unexpected_cfgs lint (#1245).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
