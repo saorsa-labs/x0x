@@ -220,6 +220,44 @@ fn w3h_clock_gate_holds_virtual_time_outside_barriers() -> Result<()> {
     })
 }
 
+/// #1245: a barrier must not spend virtual time while `spawn_blocking`
+/// runs. Stepping on every wake turned a slow pool task into a different
+/// virtual duration on each rerun, and burned barrier budgets.
+#[test]
+#[cfg(tokio_unstable)]
+fn w3h_drive_paused_freezes_while_spawn_blocking_runs() -> Result<()> {
+    super::block_on_paused(async move {
+        let _hold = super::AutoAdvanceHold::acquire();
+        let start = tokio::time::Instant::now();
+        let sleeper = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        super::drive_paused(async {
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            })
+            .await
+            .expect("blocking task");
+            ensure!(
+                tokio::time::Instant::now() == start,
+                "virtual time moved during spawn_blocking"
+            );
+            ensure!(
+                !sleeper.is_finished(),
+                "a 50 ms timer fired while a blocking task held the clock"
+            );
+            Ok(())
+        })
+        .await?;
+        super::drive_paused(sleeper).await.expect("sleeper join");
+        ensure!(
+            tokio::time::Instant::now() >= start + Duration::from_millis(50),
+            "idle barrier did not reach the 50 ms timer"
+        );
+        Ok(())
+    })
+}
+
 /// #1245: pull-based wall offset tracks a virtual-time jump immediately,
 /// without waiting for a 1 ms ticker task to be polled first.
 #[test]
