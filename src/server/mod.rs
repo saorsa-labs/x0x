@@ -376,7 +376,7 @@ async fn enforce_owner_singleton_prebuild(
             None => Ok(()),
         };
     };
-    match tokio::fs::try_exists(&key_path).await {
+    match crate::w3h_inline::fs::try_exists(&key_path).await {
         Ok(true) => {}
         Ok(false) => {
             // R3 fix (regression): a RECORDED owner whose key is absent
@@ -546,7 +546,7 @@ pub async fn serve_with_options(
     // participates in the normal release train.
     let self_update_enabled = effective_self_update_enabled(self_update_enabled, skip_update_check);
     // Ensure data directory exists early so self-update has a working directory.
-    tokio::fs::create_dir_all(&config.data_dir)
+    crate::w3h_inline::fs::create_dir_all(&config.data_dir)
         .await
         .context("failed to create data directory")?;
 
@@ -613,7 +613,7 @@ pub async fn serve_with_options(
     //   3. `None` — default daemon behaviour (keys fall back to `~/.x0x`).
     let identity_dir = match (&config.identity_dir, &instance_name) {
         (Some(dir), _) => {
-            tokio::fs::create_dir_all(dir)
+            crate::w3h_inline::fs::create_dir_all(dir)
                 .await
                 .context("failed to create configured identity directory")?;
             tracing::info!("Identity directory: {} (configured)", dir.display());
@@ -624,7 +624,7 @@ pub async fn serve_with_options(
             // home, so X0X_HOME relocates them too.
             let dir = crate::storage::x0x_instance_dir(name)
                 .context("home directory required for instance identity directory")?;
-            tokio::fs::create_dir_all(&dir)
+            crate::w3h_inline::fs::create_dir_all(&dir)
                 .await
                 .context("failed to create instance identity directory")?;
             tracing::info!("Identity directory: {}", dir.display());
@@ -818,7 +818,7 @@ pub async fn serve_with_options(
     let public_group_bootstrap_outbox_path =
         config.data_dir.join("public_group_bootstrap_outbox.json");
     let treekem_dir = config.data_dir.join("treekem");
-    if let Err(e) = tokio::fs::create_dir_all(&treekem_dir).await {
+    if let Err(e) = crate::w3h_inline::fs::create_dir_all(&treekem_dir).await {
         tracing::warn!(
             "failed to create TreeKEM snapshot dir {}: {e}",
             treekem_dir.display()
@@ -1680,7 +1680,7 @@ pub async fn serve_with_options(
     // Remove it before any fallible causal-state loader runs so a rejected
     // restart cannot leave clients pointing at an address this process never
     // served.
-    match tokio::fs::remove_file(&port_file).await {
+    match crate::w3h_inline::fs::remove_file(&port_file).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -1781,7 +1781,8 @@ pub async fn serve_with_options(
     // completed. A rejected sidecar therefore leaves no listener task and no
     // API advertisement, and the agent/exec loops above are explicitly torn
     // down before returning the startup error.
-    if let Err(error) = tokio::fs::write(&port_file, actual_api_addr.to_string()).await {
+    if let Err(error) = crate::w3h_inline::fs::write(&port_file, actual_api_addr.to_string()).await
+    {
         let primary = anyhow::Error::new(error).context("failed to write api.port");
         return Err(finish_startup_error(
             &exec_service,
@@ -2289,7 +2290,7 @@ pub async fn serve_with_options(
     {
         let file_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
-            if let Err(e) = tokio::fs::create_dir_all(&file_state.transfers_dir).await {
+            if let Err(e) = crate::w3h_inline::fs::create_dir_all(&file_state.transfers_dir).await {
                 tracing::error!("Failed to create transfers dir: {e}");
             }
             let mut rx = file_state.agent.subscribe_direct();
@@ -3323,7 +3324,7 @@ pub async fn serve_with_options(
 
         // Clean up port file on shutdown (kept after task teardown so the
         // existing ordering — port advertisement removed last — is preserved).
-        let _ = tokio::fs::remove_file(&port_file).await;
+        let _ = crate::w3h_inline::fs::remove_file(&port_file).await;
 
         // #661 r2: drop the captured AppState NOW, as the last statement,
         // instead of leaving it to generator teardown. `state` holds the
@@ -3634,7 +3635,7 @@ pub async fn list_instances() -> Result<()> {
         instances.push(("(default)".to_string(), default_port_file));
     }
 
-    if let Ok(mut entries) = tokio::fs::read_dir(&data_base).await {
+    if let Ok(mut entries) = crate::w3h_inline::fs::read_dir(&data_base).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
@@ -3660,7 +3661,7 @@ pub async fn list_instances() -> Result<()> {
         .max(4);
     println!("{:<name_width$}  {:<21}  {:<10}", "NAME", "API", "STATUS");
     for (name, port_file) in &instances {
-        let addr = tokio::fs::read_to_string(port_file)
+        let addr = crate::w3h_inline::fs::read_to_string(port_file)
             .await
             .unwrap_or_default();
         let addr = addr.trim().to_string();
@@ -5436,7 +5437,7 @@ mod owner_singleton_tests {
         enforce_owner_singleton_prebuild(&config, &None)
             .await
             .unwrap();
-        tokio::fs::remove_file(&key_path).await.unwrap();
+        crate::w3h_inline::fs::remove_file(&key_path).await.unwrap();
 
         let err = enforce_owner_singleton_prebuild(&config, &None)
             .await
@@ -5469,7 +5470,7 @@ mod owner_singleton_tests {
     async fn prebuild_enforcement_refuses_corrupt_user_key() {
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("user.key");
-        tokio::fs::write(&key_path, b"garbage-not-a-key")
+        crate::w3h_inline::fs::write(&key_path, b"garbage-not-a-key")
             .await
             .unwrap();
         let config = DaemonConfig {
@@ -5616,7 +5617,7 @@ mod member_certificate_bridge_tests {
 
         // The normal mutation helper persisted the hydrated roster: the
         // durable store carries the member.
-        let on_disk = tokio::fs::read_to_string(state.named_groups_path.clone())
+        let on_disk = crate::w3h_inline::fs::read_to_string(state.named_groups_path.clone())
             .await
             .unwrap();
         assert!(

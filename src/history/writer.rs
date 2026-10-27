@@ -81,8 +81,12 @@ pub struct HistoryCounters {
     pub policy_durable_receipt_withheld_total: AtomicU64,
 }
 
-/// Producer-side handle: cheap to clone, never blocks.
-#[derive(Clone, Debug)]
+/// Producer-side handle: cheap to clone, never blocks on the channel.
+///
+/// Under the W3-H shim, [`Self::inline_store`] is set and inserts run on
+/// the caller. There is no writer thread and no oneshot to wait for, so a
+/// paused runtime does not auto-advance while a commit is in flight (#1245).
+#[derive(Clone)]
 pub struct WriterHandle {
     tx: mpsc::SyncSender<WriteCommand>,
     counters: Arc<HistoryCounters>,
@@ -90,12 +94,27 @@ pub struct WriterHandle {
     /// SQLite. Clones of this handle, including the agent's history handle,
     /// observe the same flag.
     shutdown_incomplete: Arc<std::sync::atomic::AtomicBool>,
+    /// Present only for a W3-H inline writer. Inserts do not use `tx`.
+    inline_store: Option<Arc<Store>>,
+}
+
+impl std::fmt::Debug for WriterHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriterHandle")
+            .field("inline", &self.inline_store.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl WriterHandle {
     /// Enqueue a record; drops (and counts) when the queue is full or the
     /// writer has shut down. Never blocks.
     pub fn record(&self, record: HistoryRecord) {
+        if let Some(store) = &self.inline_store {
+            let result = store.insert(&record);
+            note_insert(&self.counters, &result);
+            return;
+        }
         match self.tx.try_send(WriteCommand::BestEffort(record)) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -110,6 +129,11 @@ impl WriterHandle {
     /// writer queue is returned to the caller so an application-level ACK
     /// cannot get ahead of durable history.
     pub async fn record_committed(&self, record: HistoryRecord) -> HistoryResult<InsertOutcome> {
+        if let Some(store) = &self.inline_store {
+            let result = store.insert(&record);
+            note_insert(&self.counters, &result);
+            return result;
+        }
         let (reply, receipt) = tokio::sync::oneshot::channel();
         match self.tx.try_send(WriteCommand::Commit { record, reply }) {
             Ok(()) => {}
@@ -166,6 +190,9 @@ impl Writer {
     /// [`super::HistoryHandle`], which does.
     #[must_use]
     pub fn spawn(store: Arc<Store>) -> Self {
+        if crate::w3h_inline::shim_active() {
+            return Self::spawn_inline(store);
+        }
         let (tx, rx) = mpsc::sync_channel::<WriteCommand>(WRITER_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let counters = Arc::new(HistoryCounters::default());
@@ -190,10 +217,29 @@ impl Writer {
                 tx,
                 counters,
                 shutdown_incomplete,
+                inline_store: None,
             },
             thread,
             shutdown_tx,
             finished,
+        }
+    }
+
+    /// Insert on the caller. No OS thread and no batch window (#1245).
+    #[must_use]
+    pub(crate) fn spawn_inline(store: Arc<Store>) -> Self {
+        let (tx, _rx) = mpsc::sync_channel::<WriteCommand>(1);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>();
+        Self {
+            handle: WriterHandle {
+                tx,
+                counters: Arc::new(HistoryCounters::default()),
+                shutdown_incomplete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                inline_store: Some(store),
+            },
+            thread: None,
+            shutdown_tx,
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -402,6 +448,21 @@ fn drain_at_shutdown(store: &Store, rx: &mpsc::Receiver<WriteCommand>, counters:
     }
 }
 
+fn note_insert(counters: &HistoryCounters, result: &HistoryResult<InsertOutcome>) {
+    match result {
+        Ok(InsertOutcome::Inserted | InsertOutcome::Replaced) => {
+            counters.written_total.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(InsertOutcome::Duplicate | InsertOutcome::StaleRejected) => {
+            counters.dedup_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(error) => {
+            counters.write_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(%error, "[history] write failed");
+        }
+    }
+}
+
 fn process_command(
     store: &Store,
     command: WriteCommand,
@@ -420,18 +481,7 @@ fn process_command(
             // is committed before the receipt-bearing record.
             flush(store, batch, counters);
             let result = store.insert(&record);
-            match &result {
-                Ok(InsertOutcome::Inserted | InsertOutcome::Replaced) => {
-                    counters.written_total.fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(InsertOutcome::Duplicate | InsertOutcome::StaleRejected) => {
-                    counters.dedup_hits.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(error) => {
-                    counters.write_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(%error, "[history] receipt-bearing write failed");
-                }
-            }
+            note_insert(counters, &result);
             let _ = reply.send(result);
         }
     }
@@ -472,7 +522,8 @@ mod tests {
     use super::{reap_finished_writer_threads, Writer, SHUTDOWN_DRAIN_GRACE};
     use crate::history::record::{Direction, HistoryRecord, Provenance};
     use crate::history::store::{
-        arm_query_lock_park, prepare_query_lock_park, HistoryQuery, QueryLockHold, Store,
+        arm_query_lock_park, prepare_query_lock_park, HistoryQuery, InsertOutcome, QueryLockHold,
+        Store,
     };
     use crate::history::Scope;
 
@@ -506,6 +557,29 @@ mod tests {
             ingress_sender_agent: None,
             logical_request_id: None,
         }
+    }
+
+    #[test]
+    fn w3h_inline_writer_commits_on_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("history.db")).unwrap());
+        let writer = Writer::spawn_inline(Arc::clone(&store));
+        assert!(writer.thread.is_none());
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(writer.handle().record_committed(waiting_record()))
+            .unwrap();
+        assert!(matches!(outcome, InsertOutcome::Inserted));
+        assert_eq!(
+            writer
+                .handle()
+                .counters()
+                .written_total
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     /// A query holds the connection mutex and the writer is blocked in

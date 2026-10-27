@@ -222,7 +222,7 @@ pub(super) async fn ensure_loaded(state: &AppState) {
         return;
     }
     let dir = hold_dir(state);
-    let mut entries = match tokio::fs::read_dir(&dir).await {
+    let mut entries = match crate::w3h_inline::fs::read_dir(&dir).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // No holds saved: a load that succeeds.
@@ -269,7 +269,7 @@ pub(super) async fn ensure_loaded(state: &AppState) {
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let file = match tokio::fs::read(&path)
+        let file = match crate::w3h_inline::fs::read(&path)
             .await
             .map(|bytes| decode_hold_file(&bytes))
         {
@@ -406,7 +406,7 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
         ));
     }
     if removals.is_empty() && exclusions.is_empty() {
-        return match tokio::fs::remove_file(&path).await {
+        return match crate::w3h_inline::fs::remove_file(&path).await {
             Ok(()) => super::sync_parent_dir_for_path(&path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
@@ -420,7 +420,7 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
     };
     let bytes = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+        crate::w3h_inline::fs::create_dir_all(parent).await?;
     }
     crate::storage::save_private_bytes_to(&path, bytes)
         .await
@@ -644,7 +644,7 @@ pub(super) async fn forget_group<'a>(
     }
     for alias in aliases {
         let path = hold_path(state, alias);
-        if tokio::fs::remove_file(&path).await.is_ok() {
+        if crate::w3h_inline::fs::remove_file(&path).await.is_ok() {
             let _ = super::sync_parent_dir_for_path(&path);
         }
     }

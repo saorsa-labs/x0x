@@ -1166,7 +1166,7 @@ fn legacy_space_board_prefix(id: &str) -> Option<&str> {
 /// plaintext board `id`. `false` for any other list.
 pub(in crate::server) async fn legacy_space_board_retired(state: &AppState, id: &str) -> bool {
     legacy_space_board_prefix(id).is_some()
-        && tokio::fs::try_exists(space_board_migration_marker(state, id))
+        && crate::w3h_inline::fs::try_exists(space_board_migration_marker(state, id))
             .await
             .unwrap_or(false)
 }
@@ -1257,7 +1257,10 @@ pub(in crate::server) async fn migrate_space_board_once(state: &Arc<AppState>, i
         return true;
     };
     let marker = space_board_migration_marker(state, &legacy);
-    if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+    if crate::w3h_inline::fs::try_exists(&marker)
+        .await
+        .unwrap_or(false)
+    {
         retire_legacy_space_board(state, &legacy).await;
         return true;
     }
@@ -1293,7 +1296,7 @@ pub(in crate::server) async fn migrate_space_board_once(state: &Arc<AppState>, i
             }
         }
     }
-    if let Err(e) = tokio::fs::write(&marker, b"").await {
+    if let Err(e) = crate::w3h_inline::fs::write(&marker, b"").await {
         tracing::warn!(board = %id, "space board migration marker write failed: {e}");
         return false;
     }

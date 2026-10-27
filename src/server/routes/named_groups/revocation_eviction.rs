@@ -3902,6 +3902,9 @@ async fn write_bytes_durably(
     bytes: &[u8],
     temp_txid: Option<&[u8; 16]>,
 ) -> std::io::Result<()> {
+    // Production `tokio::fs::File::write_all` is a trait method. The test
+    // wrapper's `write_all` is inherent.
+    #[cfg(not(test))]
     use tokio::io::AsyncWriteExt;
     let file_name = path
         .file_name()
@@ -3910,14 +3913,23 @@ async fn write_bytes_durably(
     let suffix = match temp_txid {
         Some(txid) => hex::encode(txid),
         None => {
-            let mut random = [0u8; 8];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random);
-            hex::encode(random)
+            if crate::w3h_inline::shim_active() {
+                // `thread_rng` is one stream for the whole thread. Which
+                // task draws first would move later bytes (#1245).
+                static TEMP_SUFFIX: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                let n = TEMP_SUFFIX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                hex::encode(n.to_le_bytes())
+            } else {
+                let mut random = [0u8; 8];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut random);
+                hex::encode(random)
+            }
         }
     };
     let temp = path.with_file_name(format!("{file_name}.tmp-{suffix}"));
     let write = async {
-        let mut options = tokio::fs::OpenOptions::new();
+        let mut options = crate::w3h_inline::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
@@ -3925,10 +3937,10 @@ async fn write_bytes_durably(
         file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
-        tokio::fs::rename(&temp, path).await
+        crate::w3h_inline::fs::rename(&temp, path).await
     };
     if let Err(error) = write.await {
-        let _ = tokio::fs::remove_file(&temp).await;
+        let _ = crate::w3h_inline::fs::remove_file(&temp).await;
         return Err(error);
     }
     sync_dir_of(path).await
@@ -3936,6 +3948,9 @@ async fn write_bytes_durably(
 
 async fn sync_dir_of(path: &FsPath) -> std::io::Result<()> {
     let path = path.to_path_buf();
+    if crate::w3h_inline::shim_active() {
+        return super::sync_parent_dir_for_path(&path);
+    }
     tokio::task::spawn_blocking(move || super::sync_parent_dir_for_path(&path))
         .await
         .map_err(std::io::Error::other)?
@@ -3959,7 +3974,7 @@ async fn write_evjournal(path: &FsPath, journal: &EvJournalV1) -> bool {
 }
 
 async fn remove_file_durably(path: &FsPath) {
-    match tokio::fs::remove_file(path).await {
+    match crate::w3h_inline::fs::remove_file(path).await {
         Ok(()) => {
             if let Err(error) = sync_dir_of(path).await {
                 tracing::warn!(%error, path = %path.display(), "ADR 0110 S4: directory fsync after journal retire failed");
@@ -3983,11 +3998,13 @@ async fn quarantine_file(path: &FsPath, bytes: &[u8]) -> Result<([u8; 16], PathB
     let mut txid = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut txid);
     let pending = path.with_file_name(s4::quarantine_pending_name(file_name, &txid, bytes));
-    tokio::fs::rename(path, &pending)
+    crate::w3h_inline::fs::rename(path, &pending)
         .await
         .map_err(|_| "rename")?;
     sync_dir_of(path).await.map_err(|_| "fsync")?;
-    let copy = tokio::fs::read(&pending).await.map_err(|_| "verify")?;
+    let copy = crate::w3h_inline::fs::read(&pending)
+        .await
+        .map_err(|_| "verify")?;
     if s4::quarantine_hash_hex(&copy) != s4::quarantine_hash_hex(bytes) {
         return Err("verify");
     }
@@ -4003,7 +4020,10 @@ async fn finalize_quarantine(pending: &FsPath) -> bool {
         return false;
     };
     let history = pending.with_file_name(history);
-    if tokio::fs::rename(pending, &history).await.is_err() {
+    if crate::w3h_inline::fs::rename(pending, &history)
+        .await
+        .is_err()
+    {
         return false;
     }
     sync_dir_of(&history).await.is_ok()
@@ -4018,7 +4038,7 @@ async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bo
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return (Vec::new(), false);
     };
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+    let Ok(mut entries) = crate::w3h_inline::fs::read_dir(dir).await else {
         return (Vec::new(), false);
     };
     let mut found = Vec::new();
@@ -4031,7 +4051,7 @@ async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bo
         let Some((txid, h)) = s4::parse_quarantine_pending_name(file_name, name) else {
             continue;
         };
-        match tokio::fs::read(entry.path()).await {
+        match crate::w3h_inline::fs::read(entry.path()).await {
             Ok(copy) if s4::quarantine_hash_hex(&copy) == h => found.push((txid, entry.path())),
             _ => failed = true,
         }
@@ -4063,7 +4083,7 @@ async fn load_persisted_obligations(state: &AppState) {
     let mut queued_bans = BTreeMap::new();
     let mut covered: Vec<([u8; 16], PathBuf)> = Vec::new();
     let mut finalize: Vec<PathBuf> = Vec::new();
-    match tokio::fs::read(&path).await {
+    match crate::w3h_inline::fs::read(&path).await {
         Ok(bytes) => match s4::decode_evs_with_queued_bans(&bytes) {
             Ok((body, bans)) => {
                 store = ObligationStore::from_rows(body.rows);
@@ -4242,7 +4262,7 @@ async fn reconcile_evjournals(
 ) -> (HashMap<EvictionKey, EvJournalV1>, Vec<std::path::PathBuf>) {
     let mut keys = HashMap::new();
     let mut decoded = Vec::new();
-    let Ok(mut entries) = tokio::fs::read_dir(&state.treekem_dir).await else {
+    let Ok(mut entries) = crate::w3h_inline::fs::read_dir(&state.treekem_dir).await else {
         return (keys, decoded);
     };
     let mut paths = Vec::new();
@@ -4253,7 +4273,7 @@ async fn reconcile_evjournals(
         }
     }
     for path in paths {
-        let Ok(bytes) = tokio::fs::read(&path).await else {
+        let Ok(bytes) = crate::w3h_inline::fs::read(&path).await else {
             continue;
         };
         match s4::decode_evjournal(&bytes) {
@@ -4993,7 +5013,10 @@ mod tests {
         write_bytes_durably(&path, b"two", None)
             .await
             .expect("write two");
-        assert_eq!(tokio::fs::read(&path).await.expect("read"), b"two");
+        assert_eq!(
+            crate::w3h_inline::fs::read(&path).await.expect("read"),
+            b"two"
+        );
         let leftovers = std::fs::read_dir(dir.path())
             .expect("dir")
             .filter_map(Result::ok)
@@ -5032,7 +5055,9 @@ mod tests {
     async fn quarantine_moves_damage_aside_and_finalizes_history() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(s4::EVS_FILE_NAME);
-        tokio::fs::write(&path, b"X0XEVICT1").await.expect("seed");
+        crate::w3h_inline::fs::write(&path, b"X0XEVICT1")
+            .await
+            .expect("seed");
         let (txid, pending) = quarantine_file(&path, b"X0XEVICT1")
             .await
             .expect("quarantine");
@@ -5638,16 +5663,19 @@ mod tests {
             result_head: None,
         };
         let path = evjournal_path(&state, &stable);
-        tokio::fs::write(&path, s4::encode_evjournal(&journal)?).await?;
+        crate::w3h_inline::fs::write(&path, s4::encode_evjournal(&journal)?).await?;
         // The `.evs` cannot be written: its directory is read-only.
         let data_dir = state.data_dir.clone();
-        let before = tokio::fs::metadata(&data_dir).await?.permissions();
-        tokio::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o500)).await?;
+        let before = crate::w3h_inline::fs::metadata(&data_dir)
+            .await?
+            .permissions();
+        crate::w3h_inline::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o500))
+            .await?;
         *state.revocation_evictions.inner.lock().await = S4Inner::default();
         load_persisted_obligations(&state).await;
-        tokio::fs::set_permissions(&data_dir, before).await?;
+        crate::w3h_inline::fs::set_permissions(&data_dir, before).await?;
         assert!(
-            tokio::fs::try_exists(&path).await?,
+            crate::w3h_inline::fs::try_exists(&path).await?,
             "the journal is the only durable copy until the .evs holds its row"
         );
         // With a writable `.evs` the next start writes it and retires the
@@ -5655,7 +5683,7 @@ mod tests {
         *state.revocation_evictions.inner.lock().await = S4Inner::default();
         load_persisted_obligations(&state).await;
         assert!(
-            !tokio::fs::try_exists(&path).await?,
+            !crate::w3h_inline::fs::try_exists(&path).await?,
             "retired after the write"
         );
         Ok(())
@@ -5804,7 +5832,7 @@ mod tests {
             "the row is not durable inside the trial"
         );
         assert!(
-            !tokio::fs::try_exists(evs_path(&state)).await?,
+            !crate::w3h_inline::fs::try_exists(evs_path(&state)).await?,
             "no S4 file is created before host commit"
         );
         write_upgrade_journal(&state.data_dir, "host_committed")?;
@@ -5819,7 +5847,7 @@ mod tests {
             );
         }
         assert!(persist_obligations(&state).await, "durable after commit");
-        assert!(tokio::fs::try_exists(evs_path(&state)).await?);
+        assert!(crate::w3h_inline::fs::try_exists(evs_path(&state)).await?);
         Ok(())
     }
 
@@ -5834,7 +5862,7 @@ mod tests {
         let path = evs_path(&state);
         let mut damaged = s4::EVS_HEADER_V1.to_vec();
         damaged.extend_from_slice(b"not a body");
-        tokio::fs::write(&path, &damaged).await?;
+        crate::w3h_inline::fs::write(&path, &damaged).await?;
         write_upgrade_journal(&state.data_dir, "booting")?;
         *state.revocation_evictions.inner.lock().await = S4Inner::default();
         load_persisted_obligations(&state).await;
@@ -5844,7 +5872,7 @@ mod tests {
             assert!(!inner.sidecar.state.writable(), "memory-only");
         }
         assert_eq!(
-            tokio::fs::read(&path).await?,
+            crate::w3h_inline::fs::read(&path).await?,
             damaged,
             "the damaged file is not rewritten inside the trial"
         );
@@ -5853,7 +5881,7 @@ mod tests {
         load_persisted_obligations(&state).await;
         assert!(!state.revocation_evictions.inner.lock().await.trial_load);
         assert_ne!(
-            tokio::fs::read(&path).await.ok(),
+            crate::w3h_inline::fs::read(&path).await.ok(),
             Some(damaged),
             "after host commit the damaged file is quarantined and replaced"
         );
