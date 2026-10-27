@@ -241,6 +241,7 @@ impl Receipt {
     /// Print `W3H-RECEIPT {json}` and write the receipt file when
     /// `W3H_TRACE_DIR` is set.
     pub(crate) fn emit(&self) {
+        super::ensure_lineage_recorded();
         let json = serde_json::to_string(self).unwrap_or_else(|e| {
             format!("{{\"schema\":\"{RECEIPT_SCHEMA}\",\"serialize_error\":\"{e}\"}}")
         });

@@ -15,7 +15,9 @@
  *     return SplitMix64 output (not a CSPRNG: test processes only). Each
  *     stream is keyed so one draw sequence cannot move another:
  *       - a spawned tokio task uses the key the harness registers
- *         (the task id). Sibling tasks do not share that stream (#1245).
+ *         (spawn lineage: parent, spawn site, and child index). Sibling
+ *         tasks do not share that stream, and a spawn at another site
+ *         does not move this task's key (#1245).
  *       - a thread that is not inside a task (the test body, a blocking
  *         worker) uses a key from its name and a first-draw ordinal.
  *         Spawned tasks do not read that stream, so a worker's ordinal
@@ -451,7 +453,7 @@ typedef uint64_t (*w3h_virt_ns_fn)(void);
 static atomic_uintptr_t virt_ns_fn;
 
 /* Exported for the harness (found with dlsym(RTLD_DEFAULT, ...)). */
-unsigned int w3h_shim_version(void) { return 4; }
+unsigned int w3h_shim_version(void) { return 5; }
 
 int w3h_shim_active(void) { return atomic_load(&shim_active); }
 

@@ -411,17 +411,19 @@ async fn run() -> Receipt {
 /// #1191 on main: remove + re-invite on the same running joiner is 409
 /// `join_already_pending`. The test expects the fixed verdict, so this run
 /// is red until the attempt is retired.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1191_attempt_exit() -> Result<()> {
-    let receipt = run().await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "{CASE}: expected GREEN, got {:?} (RED is the #1191 baseline)",
-        receipt.verdict()
-    );
-    Ok(())
+fn w3h_1191_attempt_exit() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run().await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "{CASE}: expected GREEN, got {:?} (RED is the #1191 baseline)",
+            receipt.verdict()
+        );
+        Ok(())
+    })
 }
