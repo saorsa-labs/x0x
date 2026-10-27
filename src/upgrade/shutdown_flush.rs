@@ -33,6 +33,11 @@ pub(crate) const MAX_LIMIT: Duration = Duration::from_secs(3600);
 /// ordinary refusals (engineer ruling, 23 Oct 2026).
 type Hook = Arc<dyn Fn(Deadline, &AtomicBool) -> io::Result<()> + Send + Sync>;
 
+/// Metadata preflight the flush owner registers with the roots its hook
+/// walks: it names the first path the flush would refuse, so upgrade
+/// admission can surface it before any byte changes (issue #1595).
+pub(crate) type Preflight = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
 /// Failures distinguish a request that never owned admission from an owned
 /// refusal before stop and an owned failure after the stop commit point.
 #[derive(Debug)]
@@ -123,6 +128,21 @@ impl Deadline {
             cancelled: Arc::new(Mutex::new(false)),
         })
     }
+
+    /// Ceiling for the metadata-only admission preflight (issue #1595): no
+    /// fsync runs under it, so the generous bound only stops a walk that is
+    /// not making progress. Built on the same suspend-inclusive clock the
+    /// flush itself checks.
+    pub(crate) fn preflight() -> io::Result<Self> {
+        let limit = LIMIT.saturating_mul(4);
+        let (boot_id, now) = clock()?;
+        Ok(Self {
+            instant: Instant::now() + limit,
+            boot_id,
+            deadline_ms: now.saturating_add(limit.as_millis() as u64),
+            cancelled: Arc::new(Mutex::new(false)),
+        })
+    }
 }
 static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Entry>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -135,6 +155,9 @@ struct Entry {
     shutdown_pending: AtomicBool,
     unused_released: tokio::sync::Notify,
     limit: Duration,
+    /// The owner's metadata preflight over the roots the hook walks. `None`
+    /// for owners that register no tree walk (tests, bare registrations).
+    preflight: Option<Preflight>,
     #[cfg(test)]
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
@@ -188,10 +211,24 @@ impl Drop for Registration {
     }
 }
 
-// Production registers the fixed budget. The explicit-budget registration
-// and acknowledge variants are the regression macros' test seams.
+// Production registers the fixed budget and its preflight. The plain,
+// explicit-budget and acknowledge variants are the regression macros'
+// test seams.
+#[cfg(test)]
 pub(crate) fn register(root: PathBuf, hook: Hook) -> io::Result<Registration> {
-    register_inner(root, hook, LIMIT)
+    register_inner(root, hook, LIMIT, None)
+}
+
+/// Register with the metadata preflight that admission runs before any
+/// upgrade byte changes (issue #1595). The daemon's flush owner uses this
+/// to refuse early — naming the offending path — on state its hook could
+/// never walk.
+pub(crate) fn register_with_preflight(
+    root: PathBuf,
+    hook: Hook,
+    preflight: Preflight,
+) -> io::Result<Registration> {
+    register_inner(root, hook, LIMIT, Some(preflight))
 }
 
 #[cfg(test)]
@@ -200,10 +237,15 @@ pub(crate) fn register_with_limit(
     hook: Hook,
     limit: Duration,
 ) -> io::Result<Registration> {
-    register_inner(root, hook, limit)
+    register_inner(root, hook, limit, None)
 }
 
-fn register_inner(root: PathBuf, hook: Hook, limit: Duration) -> io::Result<Registration> {
+fn register_inner(
+    root: PathBuf,
+    hook: Hook,
+    limit: Duration,
+    preflight: Option<Preflight>,
+) -> io::Result<Registration> {
     // The clamp bounds only test-supplied budgets; production passes LIMIT.
     #[cfg(test)]
     let limit = limit.max(Duration::from_millis(1)).min(MAX_LIMIT);
@@ -223,6 +265,7 @@ fn register_inner(root: PathBuf, hook: Hook, limit: Duration) -> io::Result<Regi
         shutdown_pending: AtomicBool::new(false),
         unused_released: tokio::sync::Notify::new(),
         limit,
+        preflight,
         #[cfg(test)]
         workers: Mutex::new(Vec::new()),
     });
@@ -250,9 +293,28 @@ pub(crate) fn ensure_ready(root: &Path) -> io::Result<()> {
     {
         return Err(io::Error::other("shutdown flush data root changed"));
     }
-    hooks.insert(supplied_root, entry);
+    hooks.insert(supplied_root, Arc::clone(&entry));
     drop(hooks);
-    check_previous(&root)
+    check_previous(&root)?;
+    // Admission preflight (issue #1595): an upgrade whose flush could never
+    // walk the shutdown state must not change bytes first. The owner's scan
+    // names the offending path — an operator's symlink is the known case —
+    // so the refusal surfaces before the swap instead of as a started-flush
+    // failure after the daemon already stopped.
+    if let Some(preflight) = &entry.preflight {
+        if let Err(error) = preflight() {
+            tracing::error!(
+                %error,
+                "shutdown state cannot be flushed; the upgrade is refused before any \
+                 byte changes; remove the offending path (or relocate the store it \
+                 names) so a supervised upgrade can flush"
+            );
+            return Err(io::Error::other(format!(
+                "shutdown state cannot be flushed: {error}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Carried by the admitted replacement worker and its restart continuation.

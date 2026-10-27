@@ -326,33 +326,37 @@ async fn run(case: &str, seed: u64, arm: Arm) -> Receipt {
 }
 
 /// Fixed path: card-import stub clears, invite join seats, encrypted RT.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1161_card_import_invite() -> Result<()> {
-    let receipt = run(CASE, SEED, Arm::Plain).await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "{CASE}: expected GREEN, got {:?} (RED is the #1161 baseline on main)",
-        receipt.verdict()
-    );
-    Ok(())
+fn w3h_1161_card_import_invite() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run(CASE, SEED, Arm::Plain).await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "{CASE}: expected GREEN, got {:?} (RED is the #1161 baseline on main)",
+            receipt.verdict()
+        );
+        Ok(())
+    })
 }
 
 /// Negative control: withhold `SecureShareDelivered` to J → RED.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1161_control_share_withheld_is_red() -> Result<()> {
-    let receipt = run(CASE_WITHHOLD, SEED_WITHHOLD, Arm::WithholdShare).await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Red),
-        "{CASE_WITHHOLD}: expected RED, got {:?}",
-        receipt.verdict()
-    );
-    Ok(())
+fn w3h_1161_control_share_withheld_is_red() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run(CASE_WITHHOLD, SEED_WITHHOLD, Arm::WithholdShare).await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Red),
+            "{CASE_WITHHOLD}: expected RED, got {:?}",
+            receipt.verdict()
+        );
+        Ok(())
+    })
 }

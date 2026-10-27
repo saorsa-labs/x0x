@@ -430,6 +430,7 @@ fn member_added_with_owner_mandate_still_queues_on_revision_gap() {
         certificate_b64: Some("certificate".to_string()),
         owner_mandate,
         commit: Some(commit.clone()),
+        reseat_mandate: None,
     };
     let sender = f.member.agent_id();
     let mut queue_with = VecDeque::new();
@@ -510,6 +511,7 @@ fn refusing_capability_does_not_poison_queue_admission() {
         certificate_b64: Some("certificate".to_string()),
         owner_mandate: None,
         commit: Some(commit),
+        reseat_mandate: None,
     };
     let mut queue = VecDeque::new();
     let queued = admit_treekem_pending_event(

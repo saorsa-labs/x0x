@@ -2,8 +2,10 @@
 //!
 //! Owner trust runs before any body decode. Result and activity replies
 //! are one attempt, with no retry. The handler starts each reply send and
-//! returns, so one slow send does not hold the next message. A sender that
-//! is not owner-trusted gets at most one refusal per minute.
+//! returns, so one slow send does not hold the next message. A display
+//! runs on its own task. The opener wait stays off this loop, so a burst
+//! of displays does not delay an incoming result or activity reply. A
+//! sender that is not owner-trusted gets at most one refusal per minute.
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -128,29 +130,35 @@ async fn handle_show_request(state: &Arc<AppState>, typed: DmTypedPayload) {
             let envelope = typed.sender;
             let sender_machine = typed.machine_id;
             // Release the serial inbox before the opener. The display wait
-            // is up to 2 s and must not hold the next DM.
+            // is up to 2 s. The receive loop also awaits this handler, so
+            // the display itself has to leave the loop. The result send
+            // stays on the detached path and still waits for the outcome.
             finish(typed, DmTypedPayloadCompletion::Inserted);
-            let outcome = deliver_remote_show(
-                state,
-                sender,
-                envelope,
-                sender_machine,
-                &route,
-                via_rider,
-                &request_id_hex,
-            )
-            .await;
-            let result = GuiShowDmResult {
-                request_id,
-                outcome,
-            };
-            detach_reply(
-                state,
-                ReplyJob::Result {
-                    to: envelope,
-                    result,
-                },
-            );
+            let task_state = Arc::clone(state);
+            if !state.spawn_detached(async move {
+                let outcome = deliver_remote_show(
+                    &task_state,
+                    sender,
+                    envelope,
+                    sender_machine,
+                    &route,
+                    via_rider,
+                    &request_id_hex,
+                )
+                .await;
+                detach_reply(
+                    &task_state,
+                    ReplyJob::Result {
+                        to: envelope,
+                        result: GuiShowDmResult {
+                            request_id,
+                            outcome,
+                        },
+                    },
+                );
+            }) {
+                tracing::debug!("gui show display skipped: shutdown closed task admission");
+            }
         }
     }
 }
@@ -797,6 +805,148 @@ mod adr_remote {
         task.await.expect("handler");
     }
 
+    /// Three displays must not push an incoming reply toward the 10 s deadline.
+    ///
+    /// The production receive loop awaits one handler, then the next message.
+    /// Each display waits up to 2 seconds for the opener. This loop is that
+    /// same shape. The activity reply is queued behind three shows. It has to
+    /// arrive while those openers are still blocked.
+    #[tokio::test]
+    async fn display_burst_does_not_hold_the_incoming_activity_reply() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct Release(Arc<AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        struct HoldingOpener {
+            entered: Arc<AtomicUsize>,
+            release: Arc<AtomicBool>,
+        }
+
+        impl HoldingOpener {
+            fn park(&self, stop: &AtomicBool) -> bool {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                while !stop.load(Ordering::Acquire) && !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                true
+            }
+        }
+
+        impl crate::gui::ShowOpener for HoldingOpener {
+            fn open(&self, _url: &str) -> bool {
+                self.park(&AtomicBool::new(false))
+            }
+
+            fn open_until(&self, _url: &str, stop: &AtomicBool) -> bool {
+                self.park(stop)
+            }
+        }
+
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let _release_on_drop = Release(Arc::clone(&release));
+        state
+            .gui_show
+            .replace_opener_for_test(Arc::new(HoldingOpener {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }));
+        let sender = AgentId([0x61; 32]);
+        let machine = MachineId([0x62; 32]);
+        state.gui_show.trust_sender_for_test(&sender);
+        let activity_id = [0xA1; 16];
+        let activity_wait = state
+            .gui_show
+            .remote_hub()
+            .begin_activity(activity_id, sender, machine)
+            .expect("activity waiter");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        for index in 0..3u8 {
+            let mut request_id = [0x31; 16];
+            request_id[0] = index;
+            tx.send(show_typed(
+                sender,
+                machine,
+                request_id,
+                sender,
+                false,
+                state.agent.machine_id(),
+            ))
+            .await
+            .expect("queue show");
+        }
+        let now = unix_now_secs();
+        let reply = GuiActivityBody::Reply {
+            request_id: activity_id,
+            last_gui_visible_at: Some(now),
+            remote_enabled: true,
+        };
+        tx.send(DmTypedPayload {
+            sender,
+            machine_id: machine,
+            payload: reply.to_dm_payload().expect("encode activity reply"),
+            verified: true,
+            trust_decision: None,
+            received_at_unix_ms: now.saturating_mul(1000),
+            request_id: activity_id,
+            completion: None,
+        })
+        .await
+        .expect("queue activity reply");
+        let loop_state = Arc::clone(&state);
+        let loop_task = tokio::spawn(async move {
+            while let Some(typed) = rx.recv().await {
+                handle_gui_show_typed(&loop_state, typed).await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let body = tokio::time::timeout(std::time::Duration::from_secs(1), activity_wait.recv())
+            .await
+            .expect(
+                "an activity reply behind three displays must arrive within 1s, not near the 10s deadline",
+            )
+            .expect("activity waiter");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the reply waited {:?} ; three opener waits approach the 10s deadline",
+            started.elapsed()
+        );
+        match body {
+            GuiActivityBody::Reply {
+                request_id,
+                remote_enabled: true,
+                ..
+            } => assert_eq!(request_id, activity_id),
+            other => panic!("expected the queued activity reply, got {other:?}"),
+        }
+        let openers = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            openers.is_ok(),
+            "the three displays must still be running, entered={}",
+            entered.load(Ordering::SeqCst)
+        );
+        assert!(
+            !release.load(Ordering::Acquire),
+            "the reply arrived only after the openers were released"
+        );
+        drop(tx);
+        loop_task.await.expect("receive loop");
+    }
+
     #[tokio::test]
     async fn stop_on_one_remote_rider_does_not_block_the_other_or_the_daemon() {
         let (state, _dir) =
@@ -837,6 +987,21 @@ mod adr_remote {
         assert!(!state.gui_show.is_blocked(&owner));
         assert!(!state.gui_show.is_blocked(&state.agent.agent_id()));
         assert_ne!(rider_a_control, state.agent.agent_id());
+    }
+
+    /// The display task records the URL after the handler has returned.
+    async fn wait_until_opened(cap: &CapturingOpener, count: usize) {
+        let started = std::time::Instant::now();
+        loop {
+            if cap.urls.lock().expect("urls").len() >= count {
+                return;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(2) {
+                let got = cap.urls.lock().expect("urls").len();
+                panic!("opener recorded {got} urls, want {count}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     fn show_typed(
@@ -1072,6 +1237,7 @@ mod adr_remote {
             ),
         )
         .await;
+        wait_until_opened(&cap, 1).await;
         assert!(
             !cap.urls.lock().expect("urls").is_empty(),
             "another rider on the same daemon still displays"
@@ -1143,6 +1309,7 @@ mod adr_remote {
             )
             .await;
         }
+        wait_until_opened(&cap, 3).await;
         assert_eq!(
             cap.urls.lock().expect("urls").len(),
             3,
@@ -1160,6 +1327,7 @@ mod adr_remote {
             ),
         )
         .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(
             cap.urls.lock().expect("urls").len(),
             3,
@@ -1195,6 +1363,7 @@ mod adr_remote {
             ),
         )
         .await;
+        wait_until_opened(&cap, 1).await;
         let token = {
             let urls = cap.urls.lock().expect("urls");
             assert_eq!(urls.len(), 1, "the forged rider show displayed");
@@ -1241,6 +1410,7 @@ mod adr_remote {
             ),
         )
         .await;
+        wait_until_opened(&cap, 2).await;
         assert_eq!(
             cap.urls.lock().expect("urls").len(),
             2,
@@ -1307,6 +1477,7 @@ mod adr_remote {
             ),
         )
         .await;
+        wait_until_opened(&cap, 1).await;
         assert_eq!(
             cap.urls.lock().expect("urls").len(),
             1,

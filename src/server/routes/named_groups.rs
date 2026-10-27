@@ -9,6 +9,7 @@
 mod control_blob;
 mod direct_metadata_lanes;
 mod fair_admission;
+mod group_recovery;
 mod gss_share_hold;
 pub(in crate::server) use gss_share_hold::GssShareHolds;
 mod revocation_eviction;
@@ -19,6 +20,13 @@ pub(in crate::server) use control_blob::{
 };
 pub(in crate::server) use direct_metadata_lanes::run_direct_metadata_listener;
 pub(in crate::server) use fair_admission::FairAdmission;
+#[cfg(test)]
+pub(in crate::server) use group_recovery::open_staging_journal_for_test;
+pub(in crate::server) use group_recovery::{
+    get_group_recovery, reseat_group_member,
+    restore_containment as restore_group_recovery_containment, run_group_recovery_worker,
+    S3Runtime,
+};
 pub(in crate::server) use revocation_eviction::owner_recovery::sign_recovery_mandate;
 pub(in crate::server) use revocation_eviction::{
     run_revocation_eviction_worker, s4_no_eligible_admin_refusal, S4Runtime,
@@ -1395,6 +1403,14 @@ pub(in crate::server) enum JoinResultMessage {
         /// the key.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         intervening_events: Vec<NamedGroupMetadataEvent>,
+        /// ADR 0109 §2 (join carry): the authority's admin terminal
+        /// attestation for the first segment of `chain` plus the terminal,
+        /// naming this joiner. Sent only to a joiner whose current
+        /// verified advert sets `group_terminal_attest_v1`, and only when
+        /// no owner v2 attestation is served; omitted otherwise, so the
+        /// bytes a legacy joiner receives are unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admin_attestation: Option<Box<x0x::groups::recovery::AdminTerminalAttestation>>,
     },
     /// #477 W1: the authority's typed, attempt-bound refusal. Served ONLY
     /// to fetches that carried `accepts_refusal: true` AND a matching
@@ -1527,6 +1543,273 @@ pub(in crate::server) struct PendingJoinRefusal {
     /// Lazily materialized signature (base64 ML-DSA over the canonical
     /// receipt bytes) — `None` until first serve.
     pub cached_signature_b64: Option<String>,
+}
+
+/// ADR 0108 §8 (#1575): the cause names this tree stages pending notices
+/// for. A cause is a registered name of 1 to 64 bytes from `[a-z0-9_]`;
+/// these are the local halves of §8's registry rows whose staging rules
+/// need no wire change. The S4-registered `crypto_only_gap` row lands with
+/// the wire half below.
+const JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING: &str = "owner_certificate_pending";
+const JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN: &str = "no_eligible_admin";
+
+/// ADR 0108 §8: a cause name must be 1 to 64 bytes of `[a-z0-9_]`. A name
+/// a joiner does not know is shown as `unrecognized_cause`, never a decode
+/// failure, so the registry stays open — this gate only keeps a staged
+/// row's own name well-formed.
+fn valid_join_pending_cause(cause: &str) -> bool {
+    !cause.is_empty()
+        && cause.len() <= 64
+        && cause
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// ADR 0108 §8 — a notice detail: at most the three optional fields a
+/// registry row names (`count`, `revision`, `digests`). Detail may name
+/// counts, revisions and committed certificate digests; it never carries
+/// agent IDs, certificate bytes, roster entries or key material.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(in crate::server) struct JoinPendingNoticeDetail {
+    pub(in crate::server) count: Option<u32>,
+    pub(in crate::server) revision: Option<u64>,
+    pub(in crate::server) digests: Vec<String>,
+}
+
+/// ADR 0108 §8 (#1575) — a member-side STAGED notice for one held join
+/// attempt, keyed `(group_id, member_agent_id, attempt_id)` exactly like a
+/// staged refusal. Unsigned, in-memory local state only: the signed wire
+/// `JoinPendingNotice` (ML-DSA over canonical bytes, domain
+/// `x0x.named_group.join_pending.v1`) and the `JoinResultMessage::Pending`
+/// serving arm need David's ruling (#1575), so nothing here reaches a
+/// joiner yet. Like a staged refusal it is dropped when a Result or Refused
+/// is staged for the attempt, when its cause clears at the next poll-time
+/// evaluation, and at the 10-minute join staging lifetime.
+pub(in crate::server) struct PendingJoinNotice {
+    pub(in crate::server) cause: &'static str,
+    pub(in crate::server) detail: JoinPendingNoticeDetail,
+    /// The signer §8 names for the cause: the pinned authority, or — for
+    /// `no_eligible_admin` — any Active member (D154). Always this node.
+    pub(in crate::server) signer_agent_id: String,
+    pub(in crate::server) created_at: std::time::Instant,
+}
+
+/// ADR 0108 §8 staging: insert or refresh the notice for one attempt.
+/// TTL-swept at the join staging lifetime, like the staged refusals the
+/// staging sits beside.
+async fn stage_join_pending_notice(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    cause: &'static str,
+    detail: JoinPendingNoticeDetail,
+) {
+    debug_assert!(valid_join_pending_cause(cause), "registry cause shape");
+    let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
+    let signer_agent_id = hex::encode(state.agent.identity().agent_id().as_bytes());
+    let mut notices = state
+        .pending_join_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    notices.retain(|_, notice| notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    // §8 Q3 bound: the same 1024-entry cap as the staged refusals beside
+    // this map, evicting the oldest. The poll path stages under a
+    // joiner-chosen attempt id, so without this a single verified agent
+    // could grow the map without limit.
+    if notices.len() >= JOIN_REFUSAL_MAX_ENTRIES {
+        if let Some(oldest) = notices
+            .iter()
+            .min_by_key(|(_, notice)| notice.created_at)
+            .map(|(k, _)| k.clone())
+        {
+            notices.remove(&oldest);
+        }
+    }
+    notices.insert(
+        key,
+        PendingJoinNotice {
+            cause,
+            detail,
+            signer_agent_id,
+            created_at: Instant::now(),
+        },
+    );
+    tracing::debug!(
+        group_id = %LogHexId::group(group_id),
+        member = %LogHexId::agent(member_agent_id),
+        attempt_id = %attempt_id,
+        cause,
+        "ADR 0108 §8: staged join pending notice for a held join attempt"
+    );
+}
+
+/// ADR 0108 §8: a staged notice is dropped the moment a Result or Refused
+/// is staged for the same `(group, member, attempt)` — either terminal
+/// answer replaces it — or when its cause clears at the next poll-time
+/// evaluation.
+fn drop_staged_join_pending_notice(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+) {
+    let dropped = state
+        .pending_join_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ));
+    if let Some(notice) = dropped {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            attempt_id = %attempt_id,
+            cause = notice.cause,
+            signer = %LogHexId::agent(&notice.signer_agent_id),
+            detail = ?notice.detail,
+            "ADR 0108 §8: dropped the staged join pending notice"
+        );
+    }
+}
+
+/// ADR 0108 §8 signer rule (D154) at the join-result poll: with no staged
+/// Result or Refused, any Active member that receives a joiner's VERIFIED,
+/// attempt-bound fetch re-evaluates the notice conditions against its
+/// current committed roster. While verified revocations cover every admin
+/// seat (ADR 0110 §4, [`join_artifact_no_eligible_admin`]), it stages the
+/// single cause `no_eligible_admin`, with no detail; it never signs any
+/// other cause. When the conditions do not hold — an eligible admin
+/// returned (which clears only the D154 cause it ended), this node lost its
+/// Active seat, the joiner was removed, banned or revoked, or the group is
+/// withdrawn, quarantined or gone — the staged notice for the attempt is
+/// dropped (§8: a notice is dropped when its cause clears). A cause the
+/// poll cannot re-evaluate — S2's `owner_certificate_pending`, whose exit
+/// is the seal succeeding or the attempt ending — keeps its staged notice
+/// here; the Result and Refused staging hooks clear it. §8's selection
+/// order (Result, then Refused, then notice) is re-checked at entry: the
+/// caller holds the group's membership critical section when it still has
+/// it, and stays correct when it must re-acquire the section after the
+/// refusal probe consumed the guard — a terminal answer staged in that gap
+/// forbids staging and drops any staged notice. The wire half adds D154's
+/// full attempt binding (`attempt_evidence`); on today's wire any verified
+/// sender that names `member_agent_id` as itself reaches this evaluation,
+/// and the §8 Q3 cap bounds what it can stage. The notice grants nothing:
+/// it carries no key, Welcome, roster or certificate bytes.
+async fn evaluate_polled_join_pending_notice(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: Option<&str>,
+) {
+    // §8's pre-admission amendment (D145) binds every notice to the
+    // attempt: a poll without an attempt id stages nothing.
+    let Some(attempt_id) = attempt_id else {
+        return;
+    };
+    let drop_notice =
+        || drop_staged_join_pending_notice(state, group_id, member_agent_id, attempt_id);
+    // §8 selection order: a staged Result or Refused for this member's
+    // attempt replaces any notice, so neither may be staged over.
+    {
+        let results = state.pending_join_results.read().await;
+        if results
+            .get(&join_result_key(group_id, member_agent_id))
+            .is_some_and(|pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+        {
+            drop_notice();
+            return;
+        }
+    }
+    if state
+        .pending_join_refusals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+    {
+        drop_notice();
+        return;
+    }
+    // §8 extra conditions for a notice: the joiner holds no revoked agent.
+    // A revocation resync gap fails closed — nothing is staged over
+    // unverifiable revocation state.
+    let Some(joiner_agent) = parse_agent_id_hex(member_agent_id).ok() else {
+        drop_notice();
+        return;
+    };
+    let revoked_joiner = {
+        let revocation_set = state.agent.revocation_set();
+        let set = revocation_set.read().await;
+        if set.revocation_resync_required() {
+            drop_notice();
+            return;
+        }
+        set.is_agent_revoked(&joiner_agent)
+    };
+    // ... no Removed or Banned seat, and the group is not withdrawn,
+    // quarantined or deleted. D154's signer rule also needs THIS node to
+    // hold an Active seat: only a member may sign.
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (group_blocks, joiner_seat_blocks, this_node_active) = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            // §8: a deleted (or never-known) group blocks every notice
+            // condition, so any staged notice for it is dropped here.
+            drop_notice();
+            return;
+        };
+        (
+            info.withdrawn || info.is_fork_quarantined(),
+            info.members_v2
+                .get(member_agent_id)
+                .is_some_and(|seat| seat.is_removed() || seat.is_banned()),
+            info.has_active_member(&local_hex),
+        )
+    };
+    if group_blocks || joiner_seat_blocks || revoked_joiner || !this_node_active {
+        drop_notice();
+        return;
+    }
+    match join_artifact_no_eligible_admin(state, group_id).await {
+        Err(JoinArtifactRefusal::NoEligibleAdmin) => {
+            stage_join_pending_notice(
+                state,
+                group_id,
+                member_agent_id,
+                attempt_id,
+                JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+                JoinPendingNoticeDetail::default(),
+            )
+            .await;
+        }
+        // The D154 cover ended, so only the D154 cause clears at this
+        // poll. Another cause — S2's `owner_certificate_pending` — is
+        // owned by the seal path: it clears when that path stages the
+        // terminal answer (the Result and Refused hooks above), never
+        // here.
+        _ => {
+            let cause_is_d154 = state
+                .pending_join_notices
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&join_refusal_refusal_key(
+                    group_id,
+                    member_agent_id,
+                    attempt_id,
+                ))
+                .is_some_and(|notice| notice.cause == JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN);
+            if cause_is_d154 {
+                drop_notice();
+            }
+        }
+    }
 }
 
 /// #477 — a joiner-side pending-join attempt. Keyed `join_result_key`.
@@ -1754,6 +2037,12 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// present on receivers in this slice; enforcement is slice 3.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_mandate: Option<x0x::groups::OwnerMandate>,
+        /// ADR 0109 §3a: a promoted admin's `ReseatMandateV1`, carried in
+        /// place of `owner_mandate` on one re-seat add in an owner-axis
+        /// group. Absent on every other add; old binaries ignore the key
+        /// and judge the add by ADR 0064 §1b.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reseat_mandate: Option<x0x::groups::recovery::ReseatMandateV1>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
         /// #1023 (R19 Home blocker): base64 bincode `AgentCertificate`s for
@@ -6158,8 +6447,9 @@ pub(in crate::server) fn store_named_group_info_locked(
 pub(in crate::server) async fn store_named_group_info(
     state: &AppState,
     group_id: &str,
-    info: x0x::groups::GroupInfo,
+    mut info: x0x::groups::GroupInfo,
 ) -> bool {
+    state.group_recovery.hold_reseat_marker(&mut info);
     let mut groups = state.named_groups.write().await;
     // ADR0066-LOOKUP-WAIVER: `group_id` is the exact map key the caller is
     // about to replace below — not a quarantine lookup at all. The scoped
@@ -6331,9 +6621,60 @@ where
         state,
         &gss_publication_guard,
         None,
+        PublishNotDurable::Yes,
         mutate,
     )
     .await
+}
+
+/// ADR 0109 §4 "S3 publishes to the live map only when both writes are
+/// Durable": the S3 variant of
+/// [`persist_named_groups_quarantine_clear_gated`]. On `ReplacedNotDurable`
+/// the cleared candidate is NOT published. The live record stays
+/// contained, and memory is saved again so that the visible file holds the
+/// marker too. The caller retries later. The manual clear routes keep the
+/// #759 rule (publish on `ReplacedNotDurable`), so they use the other
+/// entry point. The S3 marker retirement and the re-seat swap (which
+/// lifts the staged record's marker) both use this one gate.
+pub(in crate::server) async fn persist_named_groups_quarantine_clear_durable_only<F>(
+    state: &AppState,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let gss_publication_guard = state.gss_publication_gate.write().await;
+    // An earlier `ReplacedNotDurable` left the visible file unconfirmed:
+    // save memory durably first, or change nothing.
+    if state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::Acquire)
+    {
+        match save_named_groups_checked_unlocked(state).await {
+            Ok(AtomicWriteOutcome::Durable) => state
+                .named_groups_requires_durability_confirmation
+                .store(false, Ordering::Release),
+            outcome => return outcome,
+        }
+    }
+    persist_named_groups_quarantine_clear_gated_unlocked(
+        state,
+        &gss_publication_guard,
+        None,
+        PublishNotDurable::No,
+        mutate,
+    )
+    .await
+}
+
+/// Whether a gated quarantine clear publishes its candidate on
+/// `ReplacedNotDurable` (#759, the manual clear) or only on `Durable`
+/// (ADR 0109 §4, S3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishNotDurable {
+    Yes,
+    No,
 }
 
 /// Caller holds P and G. Record replacements retain the existing TreeKEM
@@ -6342,6 +6683,7 @@ async fn persist_named_groups_quarantine_clear_gated_unlocked<F>(
     state: &AppState,
     _gss_publication_guard: &tokio::sync::RwLockWriteGuard<'_, ()>,
     rebind_group_id: Option<&str>,
+    publish_not_durable: PublishNotDurable,
     mutate: F,
 ) -> std::io::Result<AtomicWriteOutcome>
 where
@@ -6355,9 +6697,16 @@ where
     if !mutate(&mut candidate) {
         return Ok(AtomicWriteOutcome::NotReplaced);
     }
+    // ADR 0109 §3 step 2 (#1533 review): no clear lifts the marker a staged
+    // re-seat record holds; only the swap does. A clear that is then a no-op
+    // replaces nothing.
+    if state.group_recovery.hold_reseat_markers(&mut candidate) && candidate == before {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
     enforce_containment_invariant(&mut candidate, &before);
     let (legacy_json, home_suite_json) =
-        encode_named_groups_store_excluding_pending_stubs(state, &candidate, rebind_group_id)?;
+        encode_named_groups_store_excluding_pending_stubs(state, &candidate, rebind_group_id)
+            .await?;
     let prejournaled = if let Some(group_id) = rebind_group_id {
         match prepare_rebind_journal_for_groups(state, group_id, &candidate).await {
             RebindOutcome::Failed(error) => {
@@ -6375,6 +6724,23 @@ where
         if let Some(group_id) = rebind_group_id {
             discard_rebind_journal(state, group_id).await;
         }
+    }
+    if matches!(outcome, Ok(AtomicWriteOutcome::ReplacedNotDurable))
+        && publish_not_durable == PublishNotDurable::No
+    {
+        // ADR 0109 §4: nothing is published. The visible file holds the
+        // candidate, so memory (still contained) is saved again. Until
+        // that save is durable, the next persist must confirm memory
+        // first.
+        let resaved = save_named_groups_checked_unlocked(state).await;
+        if !matches!(resaved, Ok(AtomicWriteOutcome::Durable)) {
+            state
+                .named_groups_requires_durability_confirmation
+                .store(true, Ordering::Release);
+        } else if let Some(group_id) = rebind_group_id {
+            discard_rebind_journal(state, group_id).await;
+        }
+        return outcome;
     }
     if matches!(
         outcome,
@@ -6493,6 +6859,9 @@ where
         if !mutate(&mut groups) {
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
+        // ADR 0109 §3 step 2: a staged re-seat record holds the original's
+        // marker (`S3Runtime::hold_reseat_marker`).
+        state.group_recovery.hold_reseat_markers(&mut groups);
         // #732 r8 / #1103: ONE of the FIVE containment chokepoints. The others are
         // `persist_named_group_info`'s transaction, the TreeKEM atomic
         // writer's durable candidate, and the scoped entry in
@@ -7058,8 +7427,11 @@ pub(in crate::server) async fn persist_named_group_info(
 async fn persist_named_group_info_inner(
     state: &AppState,
     group_id: &str,
-    info: x0x::groups::GroupInfo,
+    mut info: x0x::groups::GroupInfo,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    // ADR 0109 §3 step 2: a staged re-seat record keeps the original's
+    // marker, so a replacement that dropped it is not a clear.
+    state.group_recovery.hold_reseat_marker(&mut info);
     // #457 r4: the named write and the TreeKEM snapshot rebind are ONE
     // crash-atomic transaction under the persistence lock — the journal
     // (post-mutation named json + rebound envelope) is written FIRST, the
@@ -7100,6 +7472,7 @@ async fn persist_named_group_info_inner(
             state,
             &_gss_publication_guard,
             Some(&key),
+            PublishNotDurable::Yes,
             |groups| store_named_group_info_locked(groups, &key, info),
         )
         .await;
@@ -7307,6 +7680,7 @@ async fn prepare_rebind_journal_for_groups(
         // persisted, so it survives the filter.
         let (legacy_json, home_suite_json) =
             encode_named_groups_store_excluding_pending_stubs(state, groups, Some(group_id))
+                .await
                 .map_err(|e| anyhow::anyhow!("named groups encode for journal: {e}"))?;
         // The LEGACY journal carries the legacy half (its postcard shape
         // is the downgrade-safe replay carrier — old binaries decode and
@@ -11690,6 +12064,23 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             return;
         }
     }
+    // ADR 0109 §2: an admin-armed ATA (held in the S3 sidecar) gates the
+    // pages the same way, inside its attested segment.
+    let admin_gated = match group_recovery::armed_admin_sequence(state, &response_info).await {
+        Some(sequence) => {
+            if !catchup_page_within_attested_sequence(&events, &response_info.state_hash, &sequence)
+            {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&response.group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    "ADR 0109 S3: TreeKEM catch-up page leaves the admin-attested sequence; adopting nothing"
+                );
+                return;
+            }
+            true
+        }
+        None => false,
+    };
     // #1113: a catch-up page is one batch. A truncated page from this peer
     // means that peer still owes a later page. Another peer's last page,
     // and a member-keyed KeyPackage reply, do not close this peer's stream.
@@ -11704,6 +12095,28 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     SELF_LEAVE_REKEY_BATCH
         .scope((), async {
             for event in events {
+                // ADR 0109 §2: the page gate above is checked once. Each
+                // commit of an admin-gated page is checked again on the
+                // record the earlier commits left, so a commit that removes
+                // or demotes the signer stops the rest of the page.
+                if admin_gated {
+                    if let Some(commit) = named_group_metadata_event_commit(&event) {
+                        if !group_recovery::armed_page_link_admitted(
+                            state,
+                            &response.group_id,
+                            commit,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&response.group_id),
+                                revision = commit.revision,
+                                "ADR 0109 S3: the signer has no Active admin seat after the applied commits; the rest of the catch-up page is refused"
+                            );
+                            break;
+                        }
+                    }
+                }
                 let recovery_event = member_joined_kp_cache_entry(&event)
                     .map(|(_, ev)| ev)
                     .filter(|ev| {
@@ -13628,6 +14041,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             return ApplyMetadataResult::REJECTED;
         }
     }
+    // ADR 0109 §2 "Conflict": every route (catch-up page, DM, gossip,
+    // replay) applies commits here, so the conflict bound is checked here
+    // once, on the record loaded under the membership lock.
+    if let Some(commit) = named_group_metadata_event_commit(&event) {
+        if !group_recovery::conflict_admits_commit(state, &info, commit).await {
+            tracing::warn!(
+                group_id = %LogHexId::group(&resolved_group_key),
+                revision = commit.revision,
+                "ADR 0109 S3: commit past the attestation conflict's common prefix refused"
+            );
+            return ApplyMetadataResult::REJECTED;
+        }
+    }
 
     let event_for_log = event.clone();
 
@@ -13653,6 +14079,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // #1023: hydrated by the apply wrappers after every guard has
             // dropped (`hydrate_from_member_added_sidecar`), never here.
             roster_certificates_b64: _,
+            reseat_mandate,
         } => {
             // ADR-0038 review B1 (+round-2): receivers enforce OwnerCertified
             // admission on inbound authority commits too. The event must
@@ -13921,6 +14348,23 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 roster_lock_already_held,
                             )
                             .await;
+                            // ADR 0109 §2: a capable pre-Welcome joiner
+                            // keeps its walk-valid served chain and refused
+                            // terminal in the S3 sidecar, so a later ATA
+                            // can apply them (rule (b)).
+                            if !anchored_gap
+                                && !adopt_chain.is_empty()
+                                && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+                            {
+                                group_recovery::keep_served_chain(
+                                    state,
+                                    &current,
+                                    &commit,
+                                    &adopt_chain,
+                                    &event_for_log,
+                                )
+                                .await;
+                            }
                             // Convergence only for the v2 owner-anchored
                             // stale-base gap: the frontier gate above missed
                             // it (the
@@ -13982,8 +14426,46 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // by construction (this whole block is behind the
             // owner-axis predicate), so those groups stay
             // byte-for-byte unchanged.
+            // ADR 0109 §3a: a re-seat add carries a promoted admin's
+            // `ReseatMandateV1` in place of the owner mandate. It is
+            // accepted only under the §3a rule; a failure refuses with the
+            // committed state unchanged, as `owner_mandate_missing` does.
+            let reseat_accepted = match (
+                info.policy.admission.owner_certified_user_id(),
+                owner_mandate.as_ref(),
+                reseat_mandate.as_ref(),
+            ) {
+                (Some(_), None, Some(mandate)) => {
+                    match group_recovery::verify_reseat_mandate_on_receive(
+                        state,
+                        &info,
+                        &next,
+                        &commit,
+                        mandate,
+                        &agent_id,
+                        treekem_key_package_hash.as_deref(),
+                        treekem_epoch,
+                        owner_certified_certificate.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(cause) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&agent_id),
+                                cause,
+                                "MemberAdded: reseat_mandate_invalid; rejecting with state byte-identical (ADR 0109 §3a)"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    }
+                }
+                _ => false,
+            };
             if let Some(owner) = info.policy.admission.owner_certified_user_id().copied() {
                 match owner_mandate.as_ref() {
+                    None if reseat_accepted => {}
                     Some(mandate) => {
                         // Trusted owner material: the event's committed
                         // certificate (verified against the owner above)
@@ -16351,6 +16833,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // ADR-0064 slice 2: minted in BOTH branches below at the
             // pre-mutation point (before `seal_commit_owner_certified`).
             let owner_mandate;
+            // ADR 0109 §3a: a promoted admin's re-seat mandate, in place of
+            // the owner mandate on one re-seat add.
+            let mut reseat_mandate: Option<x0x::groups::recovery::ReseatMandateV1> = None;
             next.roster_revision = next.roster_revision.saturating_add(1);
             next.add_member_with_kem(
                 member_agent_id.clone(),
@@ -16466,6 +16951,34 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     now_ms,
                 )
                 .await;
+                if owner_mandate.is_none() {
+                    match group_recovery::reseat_mandate_for_seat(
+                        state,
+                        &info,
+                        &next,
+                        &member_agent_id,
+                        &invite_secret,
+                        expected_epoch,
+                        owner_certified_admission.as_ref(),
+                        role,
+                    )
+                    .await
+                    {
+                        group_recovery::ReseatSeal::NotReseat => {}
+                        group_recovery::ReseatSeal::Mandate(mandate) => {
+                            reseat_mandate = Some(*mandate);
+                        }
+                        group_recovery::ReseatSeal::Refused(reason) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                reason,
+                                "ADR 0109 §3a: re-seat seal refused; nothing sealed"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    }
+                }
                 let commit =
                     match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                         Ok(commit) => commit,
@@ -16554,6 +17067,34 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     now_ms,
                 )
                 .await;
+                if owner_mandate.is_none() {
+                    match group_recovery::reseat_mandate_for_seat(
+                        state,
+                        &info,
+                        &next,
+                        &member_agent_id,
+                        &invite_secret,
+                        0,
+                        owner_certified_admission.as_ref(),
+                        role,
+                    )
+                    .await
+                    {
+                        group_recovery::ReseatSeal::NotReseat => {}
+                        group_recovery::ReseatSeal::Mandate(mandate) => {
+                            reseat_mandate = Some(*mandate);
+                        }
+                        group_recovery::ReseatSeal::Refused(reason) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                reason,
+                                "ADR 0109 §3a: re-seat seal refused; nothing sealed"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    }
+                }
                 match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                     Ok(commit) => commit,
                     Err(e) => {
@@ -16687,6 +17228,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 }),
                 owner_mandate,
                 commit: Some(commit),
+                reseat_mandate,
             };
             // #1023: every other owner-certified seat's certificate rides
             // the seat event, so the joiner holds them even when it is
@@ -17527,6 +18069,9 @@ pub(in crate::server) async fn get_named_group(
     let members = named_group_member_values(&info);
     // ADR 0110 (D64): the S4 obligations and their typed waits.
     let s4_status = revocation_eviction::group_status_json(&state, &info).await;
+    // ADR 0109 §8: the additive `recovery` object (absent when S3 holds no
+    // state for the group).
+    let s3_recovery = group_recovery::recovery_json(&state, &info).await;
 
     (
         StatusCode::OK,
@@ -17538,6 +18083,7 @@ pub(in crate::server) async fn get_named_group(
             "revocation_eviction_store": s4_status.store,
             "admin_availability": s4_status.admin_availability,
             "certificate_evidence_waits": s4_status.certificate_evidence_waits,
+            "recovery": s3_recovery,
             "certificate_rebind": s4_status.certificate_rebind,
             "name": info.name,
             "description": info.description,
@@ -21258,6 +21804,20 @@ pub(in crate::server) async fn join_group_via_invite(
     State(state): State<Arc<AppState>>,
     Json(req): Json<JoinGroupRequest>,
 ) -> impl IntoResponse {
+    join_group_via_invite_inner(state, req, false).await
+}
+
+/// `POST /groups/join`, and (with `reseat_staging`) ADR 0109 §3's staged
+/// join. A staged join may redeem §3a's promoted-admin re-seat invite,
+/// which has no owner countersignature: its caller has already run §3a's
+/// invite check (the paired authorisation, and the owner pin taken from
+/// the subject's own live record, passed as the Home-mode pin below).
+/// Every other ADR 0059 check runs unchanged.
+pub(super) async fn join_group_via_invite_inner(
+    state: Arc<AppState>,
+    req: JoinGroupRequest,
+    reseat_staging: bool,
+) -> impl IntoResponse {
     // r3 (Codex 10): the joiner-supplied display name is request-sized
     // input that rides the MemberJoined event onto every receiver's
     // roster — cap it at mint parity before anything else runs.
@@ -21446,7 +22006,11 @@ pub(in crate::server) async fn join_group_via_invite(
     // sigs, owner half (A2 step 8): the owner countersignature verifies
     // only after the base it commits to has re-derived.
     if let Err(refusal) = invite.verify_v4_owner_countersignature() {
-        return refuse_invite(&state, &invite, refusal.reason());
+        let reseat_invite = reseat_staging
+            && refusal == x0x::groups::invite::InviteRefusal::OwnerCountersignatureMissing;
+        if !reseat_invite {
+            return refuse_invite(&state, &invite, refusal.reason());
+        }
     }
 
     // ── owner (A2 step 9): #469 A3 Home-join mode matrix (fail closed
@@ -21863,6 +22427,10 @@ pub(in crate::server) async fn join_group_via_invite(
                 fork_evidence: None,
                 anchored_gap_refusal: None,
             });
+            // ADR 0109 §3 step 2 (#1533 review): a staged re-seat stub holds
+            // the journalled original's marker from its install (both
+            // install shapes below) until the swap.
+            state.group_recovery.hold_reseat_marker(&mut info);
 
             // ADR-0064 slice 2 (§1b capability predicate): an owner-axis
             // invite whose InviteV4 OWNER COUNTERSIGNATURE just verified
@@ -22731,6 +23299,7 @@ pub(in crate::server) async fn add_named_group_member(
             // (None on keyless-owner installs and non-owner-axis groups).
             owner_mandate,
             commit: Some(commit),
+            reseat_mandate: None,
         };
         // #1023: the sealed roster's other certificates ride the seat event.
         seat_cert_fetch::attach_roster_certificates_to_member_added(
@@ -23026,6 +23595,7 @@ async fn add_treekem_named_group_member(
         // on keyless-owner installs and non-owner-axis groups).
         owner_mandate,
         commit: Some(commit),
+        reseat_mandate: None,
     };
     // #1023: the sealed roster's other certificates ride the seat event.
     seat_cert_fetch::attach_roster_certificates_to_member_added(&state, &next, &mut event);
@@ -23767,7 +24337,8 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         if !has_withdrawn_same_stable_group_record(&groups, group_id, stable_group_id) {
             return Ok(false);
         }
-        encode_named_groups_store(&groups)
+        encode_named_groups_store_for_state(state, &groups)
+            .await
             .map_err(|e| anyhow::anyhow!("withdrawn named groups repair encode: {e}"))?
     };
 
@@ -27592,6 +28163,9 @@ async fn owner_certified_seal_with_eviction(
                             )))
                         }
                     };
+                if !group_recovery::local_seal_admitted(state, info, &commit).await {
+                    return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
+                }
                 // ADR-0064 r2: the explicit seal route is the ONLY local
                 // owner anchor that may clear the fork-quarantine marker —
                 // and only when the local install holds the owner USER key
@@ -27701,6 +28275,9 @@ async fn owner_certified_seal_with_eviction(
                         )))
                     }
                 };
+                if !group_recovery::local_seal_admitted(state, info, &commit).await {
+                    return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
+                }
                 // #1187: capture the pre-eviction snapshot so a failed seal
                 // can roll the in-memory group back to what a restart loads.
                 // Fail the request BEFORE the mutation if it cannot be taken.
@@ -27860,6 +28437,9 @@ async fn owner_certified_seal_with_eviction(
                     )))
                 }
             };
+            if !group_recovery::local_seal_admitted(state, info, &commit).await {
+                return Some(Err(api_error(StatusCode::CONFLICT, LOCAL_SEAL_CONTAINED)));
+            }
             let event = NamedGroupMetadataEvent::MemberRemoved {
                 group_id: next.stable_group_id().to_string(),
                 revision,
@@ -28890,6 +29470,34 @@ pub(in crate::server) async fn seal_commit_owner_certified(
             warranted_fetch_for_pending_seats(state, info, &still_pending);
         }
     }
+    // ADR 0109 §2 "Conflict" (#1533 r8): every ordinary local commit
+    // seals here, so the conflict bound is checked here for each of them.
+    // The check runs after the seal. A reply records a conflict under the
+    // roster lock (#1533 rc15), so a caller that holds that lock until the
+    // commit is saved cannot install past a prefix recorded meanwhile.
+    let before = info.clone();
+    let commit = seal_owner_certified_unbounded(state, info, signing_kp, now_ms).await?;
+    if group_recovery::local_seal_admitted(state, &before, &commit).await {
+        return Ok(commit);
+    }
+    *info = before;
+    Err(x0x::groups::state_commit::ApplyError::Invariant(
+        LOCAL_SEAL_CONTAINED.to_string(),
+    ))
+}
+
+/// The refusal text of a local seal past an attestation conflict's common
+/// prefix (ADR 0109 §2 "Conflict").
+pub(in crate::server) const LOCAL_SEAL_CONTAINED: &str =
+    "group_contained: an attestation conflict stops local commits at its common prefix (ADR 0109)";
+
+/// [`seal_commit_owner_certified`] without the ADR 0109 conflict bound.
+async fn seal_owner_certified_unbounded(
+    state: &AppState,
+    info: &mut x0x::groups::GroupInfo,
+    signing_kp: &crate::identity::AgentKeypair,
+    now_ms: u64,
+) -> Result<x0x::groups::GroupStateCommit, x0x::groups::state_commit::ApplyError> {
     let evidence = owner_cert_seal_evidence(state, info).await;
     // ADR 0108 §4 (#1143): `info` is the caller's working copy, which
     // already holds the seat write. Its Home scope is read from metadata,
@@ -29328,10 +29936,15 @@ pub(in crate::server) fn reject_fork_quarantined_marker(
     state
         .groups_diagnostics
         .record_fork_quarantine_refusal(group_id);
-    (
-        StatusCode::CONFLICT,
-        Json(fork_quarantine_refusal_body(group_id, marker)),
-    )
+    let mut body = fork_quarantine_refusal_body(group_id, marker);
+    // ADR 0109 §8: the additive `recovery` object.
+    if let (Some(recovery), Some(map)) = (
+        group_recovery::cached_recovery_json(state, group_id),
+        body.as_object_mut(),
+    ) {
+        map.insert("recovery".to_string(), recovery);
+    }
+    (StatusCode::CONFLICT, Json(body))
 }
 
 /// ADR-0066 §1 rows 1, 2, 4 and 6 + §4 (slice 9): the re-check the four
@@ -31354,7 +31967,11 @@ pub(in crate::server) async fn approve_join_request(
         if let Some(resp) = treekem_membership_unsupported(info) {
             return resp;
         }
-        let Some(req) = info.join_requests.get_mut(&request_id) else {
+        // #1533: approve on a private candidate. A refused seal (for
+        // example the ADR 0109 conflict bound) then leaves the live record
+        // without the Approved request and the new Active member.
+        let mut next = info.clone();
+        let Some(req) = next.join_requests.get_mut(&request_id) else {
             return not_found("request not found");
         };
         if !req.is_pending() {
@@ -31364,14 +31981,14 @@ pub(in crate::server) async fn approve_join_request(
         req.reviewed_by = Some(caller_hex.clone());
         req.reviewed_at = Some(now_ms);
         let requester_hex = req.requester_agent_id.clone();
-        info.add_member(
+        next.add_member(
             requester_hex.clone(),
             x0x::groups::GroupRole::Member,
             Some(caller_hex.clone()),
             None,
         );
-        info.roster_revision = info.roster_revision.saturating_add(1);
-        let commit = match seal_commit_owner_certified(&state, &mut *info, signing_kp, now_ms).await
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
         {
             Ok(c) => c,
             Err(e) => {
@@ -31381,6 +31998,7 @@ pub(in crate::server) async fn approve_join_request(
                 );
             }
         };
+        *info = next;
         let metadata_topic = info.metadata_topic.clone();
         let event_group_id = info.stable_group_id().to_string();
         let revision = info.roster_revision;
@@ -34235,9 +34853,13 @@ impl std::error::Error for EpochInstalledPersistError {}
 async fn persist_treekem_and_named_groups_atomic_with_info(
     state: &AppState,
     group_id_hex: &str,
-    info: x0x::groups::GroupInfo,
+    mut info: x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<()> {
+    // ADR 0109 §3 step 2: the staged re-seat record keeps the original's
+    // marker through its Welcome install (the marker check below then sees
+    // the same marker).
+    state.group_recovery.hold_reseat_marker(&mut info);
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let stable_group_id = info.stable_group_id().to_string();
     #[cfg(test)]
@@ -34360,7 +34982,8 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         // containment cannot have moved under it, so the results agree.
         enforce_containment_invariant(&mut next_groups, &groups);
         // #451 (merged main): the two-file split encoder.
-        encode_named_groups_store(&next_groups)
+        encode_named_groups_store_for_state(state, &next_groups)
+            .await
             .map_err(|e| anyhow::anyhow!("named groups encode: {e}"))?
     };
 
@@ -37667,6 +38290,11 @@ pub(in crate::server) async fn load_named_groups_merged(
                 );
             }
         }
+        // ADR 0109 §4: an S3 placeholder is replaced by its authoritative
+        // record from `<data_dir>/group-recovery/`.
+        if let Some(data_dir) = named_groups_path.parent() {
+            group_recovery::splice_authoritative_records(data_dir, &mut merged).await;
+        }
         Ok(merged)
     })
     .await
@@ -40072,22 +40700,40 @@ pub(in crate::server) async fn save_named_groups_checked(
 /// only, and no whole-map save may durably capture it before the member's
 /// own `MemberAdded` applies. THIS group's entry (when it is the confirmed
 /// state being persisted) survives the filter via `always_include`.
-fn encode_named_groups_store_excluding_pending_stubs(
+async fn encode_named_groups_store_excluding_pending_stubs(
     state: &AppState,
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     always_include: Option<&str>,
 ) -> std::io::Result<(String, String)> {
-    let pending = state
-        .pending_join_stubs
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if pending.is_empty() {
-        return encode_named_groups_store(groups);
+    let durable_view = {
+        let pending = state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!pending.is_empty()).then(|| {
+            let mut durable_view = groups.clone();
+            durable_view.retain(|key, _| {
+                Some(key.as_str()) == always_include || !pending.contains(key.as_str())
+            });
+            durable_view
+        })
+    };
+    encode_named_groups_store_for_state(state, durable_view.as_ref().unwrap_or(groups)).await
+}
+
+/// The production store encoder: ADR 0109 §4's S3 placeholder transaction
+/// (the authoritative record durable in the S3 sidecar first, then the
+/// placeholder in both legacy views), then the #451 split encode.
+async fn encode_named_groups_store_for_state(
+    state: &AppState,
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+) -> std::io::Result<(String, String)> {
+    // Stack budget (see `migrate_unsplit_home_suite_store_if_needed`): the
+    // S3 sidecar writer future lives on the heap, not in every save path.
+    match Box::pin(group_recovery::legacy_store_view(state, groups)).await? {
+        Some(view) => encode_named_groups_store(&view),
+        None => encode_named_groups_store(groups),
     }
-    let mut durable_view = groups.clone();
-    durable_view
-        .retain(|key, _| Some(key.as_str()) == always_include || !pending.contains(key.as_str()));
-    encode_named_groups_store(&durable_view)
 }
 
 pub(in crate::server) async fn save_named_groups_checked_unlocked(
@@ -40095,7 +40741,7 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
 ) -> std::io::Result<AtomicWriteOutcome> {
     let (legacy_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
-        encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
+        encode_named_groups_store_excluding_pending_stubs(state, &groups, None).await?
     };
     save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
 }
@@ -40536,6 +41182,9 @@ async fn stage_join_result(
             member_agent_id,
             attempt_id,
         ));
+        // ADR 0108 §8: the staged Result replaces a staged pending notice
+        // for the same attempt, exactly as it replaces a staged refusal.
+        drop_staged_join_pending_notice(state, group_id, member_agent_id, attempt_id);
     }
     let key = join_result_key(group_id, member_agent_id);
     let event_kind = named_group_metadata_event_kind(&event);
@@ -41068,6 +41717,10 @@ async fn remove_listener_if_token(state: &AppState, key: &str, token: u64) {
 /// CERT_EVIDENCE_DEADLINE_MS for the same join attempt. The seal publishes
 /// a group-scoped fetch each time, so until then the refusal stays
 /// retryable. In-grace members (evidence in flight) never stage a refusal.
+/// ADR 0108 §8 (#1575): every OwnerCertMemberPending seal refusal also
+/// stages the `owner_certificate_pending` notice immediately (see
+/// [`stage_join_pending_notice`]); the deadline gate below bounds only the
+/// terminal refusal.
 async fn stage_refusal_if_certificates_unobtainable(
     state: &AppState,
     group_key: &str,
@@ -41087,6 +41740,23 @@ async fn stage_refusal_if_certificates_unobtainable(
     let Some(attempt_id) = member_joined_event_attempt_id(event) else {
         return;
     };
+    // ADR 0108 §8 (#1575): every OwnerCertMemberPending seal refusal
+    // stages the pending-notice cause at once, with the pending-seat
+    // count — while the typed REFUSAL below stays deadline-gated and
+    // retryable. The notice drops when the seal later succeeds (the
+    // staged Result removes it) or when the refusal terminalizes.
+    stage_join_pending_notice(
+        state,
+        group_key,
+        member_agent_id,
+        &attempt_id,
+        JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING,
+        JoinPendingNoticeDetail {
+            count: Some(pending.len() as u32),
+            ..JoinPendingNoticeDetail::default()
+        },
+    )
+    .await;
     let (all_digest_only, stable_group_id) = {
         let groups = state.named_groups.read().await;
         let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_key) else {
@@ -41156,6 +41826,9 @@ async fn stage_join_refusal(
         signature_b64: String::new(),
     };
     let key = join_refusal_refusal_key(group_id, member_agent_id, &receipt.attempt_id);
+    // ADR 0108 §8: the staged Refused replaces a staged pending notice for
+    // the same attempt, exactly as a staged Result does.
+    drop_staged_join_pending_notice(state, group_id, member_agent_id, &receipt.attempt_id);
     let mut refusals = state
         .pending_join_refusals
         .lock()
@@ -42569,13 +43242,34 @@ async fn join_artifact_no_eligible_admin(
     state: &AppState,
     group_id: &str,
 ) -> std::result::Result<(), JoinArtifactRefusal> {
-    // With no ratchet guard, the only hold is `NoEligibleAdmin`.
     // A pending GSS removal (#1573) does not hold join artifacts: they
-    // carry key material to a member, not group ciphertext.
-    match group_ciphertext_withheld(state, group_id, None).await {
-        Some(GroupCiphertextHold::NoEligibleAdmin) => Err(JoinArtifactRefusal::NoEligibleAdmin),
-        Some(_) | None => Ok(()),
+    // carry key material to a member, not group ciphertext. Admin
+    // eligibility is checked on its own (#1533 rc16, Codex P2): the shared
+    // boundary returns its first hold, so a pending removal would mask it.
+    let info = {
+        let groups = state.named_groups.read().await;
+        match crate::server::resolve_group_entry_locked(&groups, group_id) {
+            Some((_, info)) => info.clone(),
+            None => return Ok(()),
+        }
+    };
+    if revocation_eviction::s4_withholds_ciphertext(state, &info).await {
+        Err(JoinArtifactRefusal::NoEligibleAdmin)
+    } else {
+        Ok(())
     }
+}
+
+/// Whether [`join_artifact_no_eligible_admin`] holds key material for
+/// `group_id` (test builds only).
+#[cfg(test)]
+pub(in crate::server) async fn join_artifacts_held_for_no_eligible_admin_for_test(
+    state: &AppState,
+    group_id: &str,
+) -> bool {
+    join_artifact_no_eligible_admin(state, group_id)
+        .await
+        .is_err()
 }
 
 /// The record-local guard, plus (OwnerCertified groups only) the
@@ -43916,7 +44610,7 @@ async fn handle_join_result_message_bound(
             group_id,
             member_agent_id,
             from_revision,
-            base_state_hash: _base_state_hash,
+            base_state_hash,
             accepts_refusal,
             accepts_control_blob_ref,
             attempt_id,
@@ -43961,7 +44655,7 @@ async fn handle_join_result_message_bound(
             // during the seat-to-result interval wakes and re-reads the
             // newly staged result (T4(b)).
             let membership_arc = group_membership_lock_for_known_group(state, &group_id).await;
-            let selection_guard = match &membership_arc {
+            let mut selection_guard = match &membership_arc {
                 Some(arc) => Some(arc.lock().await),
                 None => None,
             };
@@ -43990,7 +44684,7 @@ async fn handle_join_result_message_bound(
                     if let Some(attempt_id) = attempt_id.as_deref() {
                         // Results take precedence: a successful staging
                         // for this triple removed the refusal already.
-                        let refusal_response = match selection_guard {
+                        let refusal_response = match selection_guard.take() {
                             Some(guard) => {
                                 serve_staged_join_refusal(
                                     state,
@@ -44021,6 +44715,33 @@ async fn handle_join_result_message_bound(
                     member = %member_agent_id,
                     pending_count,
                 );
+                // ADR 0108 §8 (D154, #1575): no Result and no Refused is
+                // staged. A verified, attempt-bound poll from a held joiner
+                // re-evaluates the notice causes this member may sign and
+                // stages the typed local cause; the signed `Pending` serve
+                // itself waits on the wire ruling, so nothing is sent here.
+                // The refusal probe above may have consumed the caller's
+                // guard; re-acquire the critical section so §8's Result →
+                // Refused → notice selection stays linearized (the entry
+                // re-check inside covers a terminal answer staged in the
+                // gap).
+                if verified {
+                    let notice_section = match selection_guard.take() {
+                        Some(guard) => Some(guard),
+                        None => match &membership_arc {
+                            Some(arc) => Some(arc.lock().await),
+                            None => None,
+                        },
+                    };
+                    evaluate_polled_join_pending_notice(
+                        state,
+                        &group_id,
+                        &member_agent_id,
+                        attempt_id.as_deref(),
+                    )
+                    .await;
+                    drop(notice_section);
+                }
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
             };
@@ -44130,12 +44851,38 @@ async fn handle_join_result_message_bound(
                     }
                     _ => Vec::new(),
                 };
+            // ADR 0109 §2: the join-carry ATA for a capable stale joiner
+            // when no owner v2 attestation is served.
+            let admin_attestation = {
+                let owner_terminal_served = head_attestation
+                    .as_ref()
+                    .is_some_and(|attestation| attestation.terminal_signature_b64.is_some());
+                let terminal_epoch = match &event {
+                    NamedGroupMetadataEvent::MemberAdded { treekem_epoch, .. } => *treekem_epoch,
+                    _ => None,
+                };
+                group_recovery::join_carry_attestation(
+                    state,
+                    &group_id,
+                    &member_agent_id,
+                    from_revision,
+                    base_state_hash.as_deref(),
+                    &chain,
+                    named_group_metadata_event_commit(&event),
+                    terminal_epoch,
+                    attempt_id.as_deref(),
+                    owner_terminal_served,
+                )
+                .await
+                .map(Box::new)
+            };
             let response = JoinResultMessage::Result {
                 event: Box::new(event),
                 chain,
                 head_attestation: head_attestation.map(Box::new),
                 roster_certificates_b64: Vec::new(),
                 intervening_events,
+                admin_attestation,
             };
             let payload = match join_result_payload_with_roster_certificates(
                 state,
@@ -44398,6 +45145,7 @@ async fn handle_join_result_message_bound(
             head_attestation,
             roster_certificates_b64,
             intervening_events,
+            admin_attestation,
         } => {
             let event = *event;
             tracing::debug!(
@@ -44509,6 +45257,21 @@ async fn handle_join_result_message_bound(
                 intervening_events,
             ))
             .await;
+            // ADR 0109 §2: with a verified join-carry ATA, apply the
+            // attested served links state-only (rule (b)) so `event`
+            // chains from the new head.
+            let attested = match (
+                admin_attestation.as_deref(),
+                named_group_metadata_event_commit(&event),
+            ) {
+                (Some(ata), Some(terminal)) if verified && !chain.is_empty() => {
+                    Box::pin(group_recovery::apply_join_carry(
+                        state, &group_id, &chain, terminal, &event, ata,
+                    ))
+                    .await
+                }
+                _ => false,
+            };
             // #458 r3/r5: expose the carried chain AND head attestation
             // to the joiner's adoption path for exactly this apply.
             {
@@ -44516,7 +45279,10 @@ async fn handle_join_result_message_bound(
                     .pending_adoption_chains
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if !chain.is_empty() {
+                // ADR 0109 §2: after an attested join carry the terminal
+                // chains from the new head, so the served chain (anchored
+                // at the old base) is not offered to the adoption arm.
+                if !chain.is_empty() && !attested {
                     chains.insert(expected_key.clone(), chain);
                 }
             }
@@ -44559,6 +45325,9 @@ async fn handle_join_result_message_bound(
                 &roster_certificates_b64,
             )
             .await;
+            if attested {
+                group_recovery::retire_converged(state, &group_id).await;
+            }
             if applied {
                 // #477 (r6 item 2 → r7): the seat finalize ran INSIDE the
                 // MemberAdded apply while its membership guard was held
@@ -44975,6 +45744,33 @@ async fn poll_join_result_until_membership_confirmed(
         return;
     }
     if timed_out {
+        // ADR 0109 §2 (D64): an attempt S3 holds (an armed admin record,
+        // or a marker whose served chain S3 kept) keeps its stub and row,
+        // and reports the join state that mirrors its `recovery` object,
+        // never a bare TimedOut.
+        let held = {
+            let info = state.named_groups.read().await.get(&group_id).cloned();
+            match info {
+                Some(info) => group_recovery::held_join_state(state.as_ref(), &info).await,
+                None => None,
+            }
+        };
+        if let Some(join_state) = held {
+            tracing::info!(group_id = %LogHexId::group(&group_id), join_state, "ADR 0109 S3: join poll ended on an attempt S3 holds; the stub stays");
+            state
+                .last_join_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    group_id.clone(),
+                    LastJoinOutcome {
+                        outcome: join_state,
+                        reason: Some("adr0109_recovery_held"),
+                        finished_at_ms: now_millis_u64(),
+                    },
+                );
+            return;
+        }
         tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; finalizing the attempt as timed_out");
         // #477 C8: the poll task IS the deadline owner — the live expiry
         // path finalizes the joiner-side attempt state (stub cleanup) with
@@ -46142,6 +46938,32 @@ pub(in crate::server) type WelcomeFetchWaiter =
 pub(in crate::server) mod tests {
     use super::*;
 
+    /// ADR 0108 §8 (#1575): the notice currently staged for one
+    /// `(group, member, attempt)`, as `(cause, signer_agent_id, detail)`.
+    pub(in crate::server) fn staged_join_pending_notice(
+        state: &AppState,
+        group_id: &str,
+        member_agent_id: &str,
+        attempt_id: &str,
+    ) -> Option<(String, String, JoinPendingNoticeDetail)> {
+        state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&join_refusal_refusal_key(
+                group_id,
+                member_agent_id,
+                attempt_id,
+            ))
+            .map(|notice| {
+                (
+                    notice.cause.to_string(),
+                    notice.signer_agent_id.clone(),
+                    notice.detail.clone(),
+                )
+            })
+    }
+
     #[test]
     fn s2_welcome_decodes_from_reverified_cold_evidence() {
         use x0x::peer_evidence::{
@@ -46304,6 +47126,7 @@ pub(in crate::server) mod tests {
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
     mod issue877_error_body_session;
+    mod join_pending_notice_1575;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     #[path = "issue1105_public_revision_catchup.rs"]
@@ -47054,6 +47877,7 @@ pub(in crate::server) mod tests {
             mls_groups_path: data_dir.join("mls_groups.bin"),
             pending_join_results: RwLock::new(HashMap::new()),
             pending_join_refusals: StdMutex::new(HashMap::new()),
+            pending_join_notices: StdMutex::new(HashMap::new()),
             pending_join_attempts: StdMutex::new(HashMap::new()),
             last_join_outcomes: StdMutex::new(HashMap::new()),
             join_refusal_sign_limiter: StdMutex::new(Default::default()),
@@ -47116,6 +47940,7 @@ pub(in crate::server) mod tests {
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
             revocation_evictions: S4Runtime::default(),
+            group_recovery: S3Runtime::default(),
             ws_sessions: RwLock::new(HashMap::new()),
             ws_topics: RwLock::new(HashMap::new()),
             ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -48498,6 +49323,7 @@ pub(in crate::server) mod tests {
                     head_attestation: attestation.map(Box::new),
                     roster_certificates_b64: Vec::new(),
                     intervening_events: Vec::new(),
+                    admin_attestation: None,
                 },
             )
             .await;
@@ -52592,6 +53418,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit_add),
+            reseat_mandate: None,
         };
 
         let mut adminified = seated.clone();
@@ -52760,6 +53587,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit_add),
+            reseat_mandate: None,
         };
         let applied_add = apply_named_group_metadata_event(
             &state,
@@ -52827,6 +53655,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit_add2),
+            reseat_mandate: None,
         };
         let applied_add2 = apply_named_group_metadata_event(
             &state,
@@ -53161,6 +53990,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit_add),
+            reseat_mandate: None,
         };
         let applied_inner = apply_named_group_metadata_event_inner(
             &state,
@@ -55203,6 +56033,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(add_commit),
+            reseat_mandate: None,
         };
         let mut promoted = added.clone();
         promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
@@ -55248,34 +56079,53 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
-    /// #1508 rc17 (Codex P1): A removes a member with a GSS rotation,
-    /// changes the policy, promotes B and goes offline. A lagging survivor
-    /// must walk past the policy update, install the removal with B's
-    /// secret and reach A's last head. Before the fix the walk stopped at
-    /// the policy update, so the removal stayed parked although B was an
-    /// admin.
+    /// #1533 rc18 (Codex P1 at 7ca5841): A removes a member with a GSS
+    /// rotation, adds J, promotes J and goes offline. J's share reaches a
+    /// lagging survivor first; J is not on its roster. The survivor must
+    /// keep the share as a candidate, walk the add and the promotion,
+    /// install the removal with J's secret and reach A's last head. Before
+    /// the fix the share was dropped because J was not an Active member,
+    /// so the removal stayed parked.
     #[tokio::test]
-    async fn rc17_gss_removal_catchup_past_a_policy_update_reaches_its_head() -> Result<()> {
-        let f = f1_gss_rotation_fixture("policy-then-promotion").await?;
+    async fn rc18_gss_removal_catchup_with_a_new_admins_share_reaches_its_head() -> Result<()> {
+        let f = f1_gss_rotation_fixture("new-admin-share").await?;
         let admin = f.admin_kp.agent_id();
         let admin_hex = hex::encode(admin.as_bytes());
-        let promotee_hex = hex::encode(f.promotee.as_bytes());
-        let mut updated = f.committed.clone();
-        updated.policy.write_access = x0x::groups::GroupWriteAccess::AdminOnly;
-        updated.policy_revision = updated.policy_revision.saturating_add(1);
-        updated.updated_at = 2_000;
-        let policy_revision = updated.policy_revision;
-        let policy_commit =
-            seal_commit_owner_certified(&f.state, &mut updated, &f.admin_kp, 2_000).await?;
-        let policy_update = NamedGroupMetadataEvent::PolicyUpdated {
+        let joiner_kp = crate::identity::AgentKeypair::generate()?;
+        let joiner = joiner_kp.agent_id();
+        let joiner_hex = hex::encode(joiner.as_bytes());
+        let mut added = f.committed.clone();
+        added.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        added.roster_revision = added.roster_revision.saturating_add(1);
+        let add_revision = added.roster_revision;
+        let add_commit =
+            seal_commit_owner_certified(&f.state, &mut added, &f.admin_kp, 2_000).await?;
+        let addition = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
             group_id: f.committed.stable_group_id().to_string(),
-            revision: policy_revision,
+            revision: add_revision,
             actor: admin_hex.clone(),
-            policy: updated.policy.clone(),
-            commit: Some(policy_commit),
+            agent_id: joiner_hex.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(add_commit),
+            reseat_mandate: None,
         };
-        let mut promoted = updated.clone();
-        promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
+        let mut promoted = added.clone();
+        promoted.set_member_role(&joiner_hex, x0x::groups::GroupRole::Admin);
         promoted.roster_revision = promoted.roster_revision.saturating_add(1);
         let promotion_revision = promoted.roster_revision;
         let promotion_commit =
@@ -55284,40 +56134,66 @@ pub(in crate::server) mod tests {
             group_id: f.committed.stable_group_id().to_string(),
             revision: promotion_revision,
             actor: admin_hex,
-            agent_id: promotee_hex,
+            agent_id: joiner_hex.clone(),
             role: x0x::groups::GroupRole::Admin,
             commit: Some(promotion_commit),
         };
+        let mut share = f.envelope_event.clone();
+        if let NamedGroupMetadataEvent::SecureShareDelivered { actor, .. } = &mut share {
+            *actor = joiner_hex.clone();
+        }
 
         let held =
             apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
                 .await;
         assert!(!held.accepted);
-        let refused = apply_named_group_metadata_event(
-            &f.state,
-            rc14_promotee_share(&f),
-            f.promotee,
-            true,
-            None,
-        )
-        .await;
-        assert!(!refused.accepted, "B is a Member here");
-        let _ = apply_named_group_metadata_event(&f.state, policy_update, admin, true, None).await;
+        let refused = apply_named_group_metadata_event(&f.state, share, joiner, true, None).await;
+        assert!(!refused.accepted, "J is not on this roster");
+        let _ = apply_named_group_metadata_event(&f.state, addition, admin, true, None).await;
         let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
         {
             let groups = f.state.named_groups.read().await;
             let info = groups.get(&f.group_id).context("group")?;
             assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
             assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
-            assert_eq!(
-                info.policy.write_access,
-                x0x::groups::GroupWriteAccess::AdminOnly,
-                "the policy update is applied"
-            );
+            assert!(info.has_active_member(&joiner_hex), "J is seated");
         }
         assert_eq!(
             group_ciphertext_withheld(&f.state, &f.group_id, None).await,
             None
+        );
+        Ok(())
+    }
+
+    /// #1533 rc18: a share from a sender that no held commit makes an
+    /// admin installs nothing. The candidate is kept, but the walk finds no
+    /// roster on which its sender is an admin, so the removal keeps
+    /// waiting and sends stay held.
+    #[tokio::test]
+    async fn rc18_gss_candidate_share_from_an_unseated_sender_installs_nothing() -> Result<()> {
+        let f = f1_gss_rotation_fixture("unseated-candidate").await?;
+        let admin = f.admin_kp.agent_id();
+        let stranger = crate::identity::AgentKeypair::generate()?.agent_id();
+        let mut share = f.envelope_event.clone();
+        if let NamedGroupMetadataEvent::SecureShareDelivered { actor, .. } = &mut share {
+            *actor = hex::encode(stranger.as_bytes());
+        }
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(&f.state, share, stranger, true, None).await;
+        assert!(!refused.accepted);
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_ne!(info.state_hash, f.committed_state_hash, "still parked");
+        }
+        assert!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None)
+                .await
+                .is_some(),
+            "sends stay held"
         );
         Ok(())
     }
@@ -55576,6 +56452,80 @@ pub(in crate::server) mod tests {
             assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
             assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
             assert!(!info.has_active_member(&f.bystander_hex), "C has left");
+        }
+        assert_eq!(
+            group_ciphertext_withheld(&f.state, &f.group_id, None).await,
+            None
+        );
+        Ok(())
+    }
+
+    /// #1508 rc17 (Codex P1): A removes a member with a GSS rotation,
+    /// changes the policy, promotes B and goes offline. A lagging survivor
+    /// must walk past the policy update, install the removal with B's
+    /// secret and reach A's last head. Before the fix the walk stopped at
+    /// the policy update, so the removal stayed parked although B was an
+    /// admin.
+    #[tokio::test]
+    async fn rc17_gss_removal_catchup_past_a_policy_update_reaches_its_head() -> Result<()> {
+        let f = f1_gss_rotation_fixture("policy-then-promotion").await?;
+        let admin = f.admin_kp.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let promotee_hex = hex::encode(f.promotee.as_bytes());
+        let mut updated = f.committed.clone();
+        updated.policy.write_access = x0x::groups::GroupWriteAccess::AdminOnly;
+        updated.policy_revision = updated.policy_revision.saturating_add(1);
+        updated.updated_at = 2_000;
+        let policy_revision = updated.policy_revision;
+        let policy_commit =
+            seal_commit_owner_certified(&f.state, &mut updated, &f.admin_kp, 2_000).await?;
+        let policy_update = NamedGroupMetadataEvent::PolicyUpdated {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: policy_revision,
+            actor: admin_hex.clone(),
+            policy: updated.policy.clone(),
+            commit: Some(policy_commit),
+        };
+        let mut promoted = updated.clone();
+        promoted.set_member_role(&promotee_hex, x0x::groups::GroupRole::Admin);
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        let promotion_revision = promoted.roster_revision;
+        let promotion_commit =
+            seal_commit_owner_certified(&f.state, &mut promoted, &f.admin_kp, 3_000).await?;
+        let promotion = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: f.committed.stable_group_id().to_string(),
+            revision: promotion_revision,
+            actor: admin_hex,
+            agent_id: promotee_hex,
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(promotion_commit),
+        };
+
+        let held =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), admin, true, None)
+                .await;
+        assert!(!held.accepted);
+        let refused = apply_named_group_metadata_event(
+            &f.state,
+            rc14_promotee_share(&f),
+            f.promotee,
+            true,
+            None,
+        )
+        .await;
+        assert!(!refused.accepted, "B is a Member here");
+        let _ = apply_named_group_metadata_event(&f.state, policy_update, admin, true, None).await;
+        let _ = apply_named_group_metadata_event(&f.state, promotion, admin, true, None).await;
+        {
+            let groups = f.state.named_groups.read().await;
+            let info = groups.get(&f.group_id).context("group")?;
+            assert_eq!(info.state_hash, promoted.state_hash, "A's last head");
+            assert_eq!(info.shared_secret.as_deref(), Some(f.new_secret.as_slice()));
+            assert_eq!(
+                info.policy.write_access,
+                x0x::groups::GroupWriteAccess::AdminOnly,
+                "the policy update is applied"
+            );
         }
         assert_eq!(
             group_ciphertext_withheld(&f.state, &f.group_id, None).await,
@@ -59609,6 +60559,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(fake_group_state_commit(&group_id, 2, &admin_hex)),
+            reseat_mandate: None,
         };
         assert!(authorized_treekem_membership_event_for_queue(
             &info,
@@ -59738,6 +60689,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
+            reseat_mandate: None,
         };
 
         assert_eq!(
@@ -60135,6 +61087,7 @@ pub(in crate::server) mod tests {
             }),
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
+            reseat_mandate: None,
         };
 
         assert_eq!(
@@ -60184,11 +61137,13 @@ pub(in crate::server) mod tests {
                 certificate_b64: None,
                 owner_mandate: None,
                 commit: None,
+                reseat_mandate: None,
             }),
             chain: Vec::new(),
             head_attestation: None,
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         };
         let result_payload = serde_json::to_vec(&result);
         assert!(result_payload.is_ok(), "join-result response serializes");
@@ -61067,6 +62022,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: None,
+            reseat_mandate: None,
         };
         let json = serde_json::to_value(event);
         assert!(json.is_ok(), "welcome ref event serializes");
@@ -61260,6 +62216,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: None,
+            reseat_mandate: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&member_added));
 
@@ -61322,6 +62279,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(fake_commit(2, "state-1")),
+            reseat_mandate: None,
         };
         let ban_epoch_3 = NamedGroupMetadataEvent::MemberBanned {
             group_id: "aa".to_string(),
@@ -61392,6 +62350,7 @@ pub(in crate::server) mod tests {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(commit),
+            reseat_mandate: None,
         };
 
         assert_eq!(

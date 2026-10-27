@@ -76,8 +76,13 @@ impl AgentKemKeypair {
     /// existing file is present. Sets mode 0600 on Unix.
     pub async fn load_or_generate<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        if tokio::fs::try_exists(path).await.unwrap_or(false) {
-            let bytes = tokio::fs::read(path).await.map_err(IdentityError::from)?;
+        if crate::w3h_inline::fs::try_exists(path)
+            .await
+            .unwrap_or(false)
+        {
+            let bytes = crate::w3h_inline::fs::read(path)
+                .await
+                .map_err(IdentityError::from)?;
             let kp: AgentKemKeypair = bincode::deserialize(&bytes)
                 .map_err(|e| IdentityError::Serialization(format!("ML-KEM load: {e}")))?;
             // Basic sanity: public length matches ML-KEM-768.
@@ -91,25 +96,25 @@ impl AgentKemKeypair {
             return Ok(kp);
         }
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
+            crate::w3h_inline::fs::create_dir_all(parent)
                 .await
                 .map_err(IdentityError::from)?;
         }
         let kp = Self::generate()?;
         let bytes = bincode::serialize(&kp)
             .map_err(|e| IdentityError::Serialization(format!("ML-KEM save: {e}")))?;
-        tokio::fs::write(path, bytes)
+        crate::w3h_inline::fs::write(path, bytes)
             .await
             .map_err(IdentityError::from)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = tokio::fs::metadata(path)
+            let mut perms = crate::w3h_inline::fs::metadata(path)
                 .await
                 .map_err(IdentityError::from)?
                 .permissions();
             perms.set_mode(0o600);
-            tokio::fs::set_permissions(path, perms)
+            crate::w3h_inline::fs::set_permissions(path, perms)
                 .await
                 .map_err(IdentityError::from)?;
         }
@@ -393,7 +398,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kem.key");
 
-        tokio::fs::write(&path, b"not-a-valid-keypair")
+        crate::w3h_inline::fs::write(&path, b"not-a-valid-keypair")
             .await
             .unwrap();
         let result = AgentKemKeypair::load_or_generate(&path).await;

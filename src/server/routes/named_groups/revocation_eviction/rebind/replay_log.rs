@@ -468,7 +468,7 @@ async fn lock_file_writes(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 /// Write `log` durably at `path`. A file with a newer layout is never
 /// rewritten. Returns whether `log` is durable.
 async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
-    if let Ok(existing) = tokio::fs::read(path).await {
+    if let Ok(existing) = crate::w3h_inline::fs::read(path).await {
         if let Err(SidecarDecodeError::NewerFormat(version)) = decode(&existing) {
             tracing::warn!(version, path = %path.display(), "ADR 0110 S4: held frame log has a newer layout; the commit does not occur");
             return false;
@@ -494,7 +494,7 @@ async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
 /// commit replaces it, and its frames are lost as in the quarantine case.
 async fn read_all_in(dir: &Path, extension: &str, gate_open: bool) -> Vec<ReplayLogV1> {
     let mut logs = Vec::new();
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+    let Ok(mut entries) = crate::w3h_inline::fs::read_dir(dir).await else {
         return logs;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -502,7 +502,7 @@ async fn read_all_in(dir: &Path, extension: &str, gate_open: bool) -> Vec<Replay
         if path.extension().and_then(|ext| ext.to_str()) != Some(extension) {
             continue;
         }
-        let Ok(bytes) = tokio::fs::read(&path).await else {
+        let Ok(bytes) = crate::w3h_inline::fs::read(&path).await else {
             continue;
         };
         match decode(&bytes) {
@@ -776,7 +776,7 @@ pub(in super::super) mod tests {
         extension: &str,
         stable: &str,
     ) -> Vec<ReplayFrameV1> {
-        match tokio::fs::read(log_path(state, stable, extension)).await {
+        match crate::w3h_inline::fs::read(log_path(state, stable, extension)).await {
             Ok(bytes) => decode(&bytes).map(|log| log.frames).unwrap_or_default(),
             Err(_) => Vec::new(),
         }
@@ -1283,14 +1283,16 @@ pub(in super::super) mod tests {
     async fn a_corrupt_held_frame_log_is_quarantined_and_a_newer_one_is_kept() {
         let dir = tempfile::tempdir().expect("tempdir");
         let damaged = dir.path().join("aa.crblog");
-        tokio::fs::write(&damaged, b"X0XRPL1\0not a log")
+        crate::w3h_inline::fs::write(&damaged, b"X0XRPL1\0not a log")
             .await
             .expect("write");
         assert!(read_all_in(dir.path(), REBIND_EXTENSION, true)
             .await
             .is_empty());
         assert!(!damaged.exists(), "the damaged file is moved aside");
-        let mut entries = tokio::fs::read_dir(dir.path()).await.expect("read_dir");
+        let mut entries = crate::w3h_inline::fs::read_dir(dir.path())
+            .await
+            .expect("read_dir");
         let entry = entries.next_entry().await.expect("entry").expect("one");
         let name = entry.file_name().to_string_lossy().into_owned();
         assert!(
@@ -1305,7 +1307,9 @@ pub(in super::super) mod tests {
         };
         let mut bytes = encode(&log).expect("encode");
         bytes[PREFIX.len()] = b'2';
-        tokio::fs::write(&newer, &bytes).await.expect("write");
+        crate::w3h_inline::fs::write(&newer, &bytes)
+            .await
+            .expect("write");
         assert!(read_all_in(dir.path(), REBIND_EXTENSION, true)
             .await
             .is_empty());
@@ -1313,6 +1317,9 @@ pub(in super::super) mod tests {
             !write_at(&newer, &log).await,
             "a newer layout blocks the commit"
         );
-        assert_eq!(tokio::fs::read(&newer).await.expect("kept"), bytes);
+        assert_eq!(
+            crate::w3h_inline::fs::read(&newer).await.expect("kept"),
+            bytes
+        );
     }
 }

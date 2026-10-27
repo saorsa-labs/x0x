@@ -579,42 +579,46 @@ async fn run(case: &str, kind: OwnerAnnounce) -> Receipt {
     receipt
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1143_positive_control_consented_owner_announce_admits() -> Result<()> {
-    let receipt = run(
-        "w3h_1143_positive_control_consented_owner_announce_admits",
-        OwnerAnnounce::Consented,
-    )
-    .await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "the consented-announce control must admit J, got {:?}",
-        receipt.verdict()
-    );
-    Ok(())
+fn w3h_1143_positive_control_consented_owner_announce_admits() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run(
+            "w3h_1143_positive_control_consented_owner_announce_admits",
+            OwnerAnnounce::Consented,
+        )
+        .await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "the consented-announce control must admit J, got {:?}",
+            receipt.verdict()
+        );
+        Ok(())
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_red_1143_promoted_admin_admits_with_owner_offline() -> Result<()> {
-    let receipt = run(
-        "w3h_red_1143_promoted_admin_admits_with_owner_offline",
-        OwnerAnnounce::Anonymous,
-    )
-    .await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "ADR 0108 S2: A must admit J with O offline; receipt verdict {:?}",
-        receipt.verdict()
-    );
-    Ok(())
+fn w3h_red_1143_promoted_admin_admits_with_owner_offline() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run(
+            "w3h_red_1143_promoted_admin_admits_with_owner_offline",
+            OwnerAnnounce::Anonymous,
+        )
+        .await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "ADR 0108 S2: A must admit J with O offline; receipt verdict {:?}",
+            receipt.verdict()
+        );
+        Ok(())
+    })
 }
 
 /// Two direct frames can arrive before the watcher drains either request.
