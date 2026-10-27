@@ -3692,7 +3692,7 @@ mod daemon_tests {
         let admin = state.agent.agent_id();
         let admin_hex = hex::encode(admin.as_bytes());
         let survivor_hex = hex::encode(replica.agent.agent_id().as_bytes());
-        let survivor_kem = base64::engine::general_purpose::STANDARD
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
             .encode(&replica.agent_kem_keypair.public_bytes);
         let leaver_kp = x0x::identity::AgentKeypair::generate()?;
         let leaver = leaver_kp.agent_id();
@@ -3711,7 +3711,7 @@ mod daemon_tests {
             x0x::groups::GroupRole::Member,
             Some(admin_hex.clone()),
             None,
-            committer_seats_kem.then_some(survivor_kem),
+            committer_seats_kem.then(|| survivor_kem_b64.clone()),
         );
         if let Some(extra) = extra {
             info.add_member(
@@ -3727,10 +3727,12 @@ mod daemon_tests {
         // The survivor's own copy keeps the same sealed chain; only its
         // view of its own seat's KEM key differs.
         let mut replica_info = info.clone();
-        if !replica_seats_kem {
-            if let Some(member) = replica_info.members_v2.get_mut(&survivor_hex) {
-                member.kem_public_key_b64 = None;
-            }
+        // The survivor's own copy seats or drops its key per the flag,
+        // independent of the author's view — both divergent directions
+        // build (review: `true` must seat the key, not only "not drop"
+        // it, or a keyless author's copy stays keyless on the replica).
+        if let Some(member) = replica_info.members_v2.get_mut(&survivor_hex) {
+            member.kem_public_key_b64 = replica_seats_kem.then(|| survivor_kem_b64.clone());
         }
         state
             .named_groups
@@ -5125,8 +5127,8 @@ mod daemon_tests {
             "the author never sealed a share: its view of the seat has no KEM key"
         );
 
-        // The survivor's own view seats its key, so it installs the
-        // verified frame and holds for the share it expects.
+        // The survivor's own view seats its key, so the verified frame
+        // waits for its sealed share: nothing installs, the head stays.
         let applied = ng::apply_named_group_metadata_event(
             &fx.replica,
             fx.leave.clone(),
@@ -5136,20 +5138,18 @@ mod daemon_tests {
         )
         .await;
         assert!(applied.accepted, "{applied:?}");
+        let head_before = head_of(&fx.replica, &fx.group_id)
+            .await
+            .context("the head")?;
         assert_eq!(
             receive(&fx.replica, admin, &frame).await,
-            ReceiveOutcome::Applied,
-            "the keyed survivor installs the frame"
+            ReceiveOutcome::WaitingForShare,
+            "the keyed survivor takes the wait-for-share path"
         );
         assert_eq!(
             head_of(&fx.replica, &fx.group_id).await.as_deref(),
-            Some(result_head.as_str()),
-            "the head moves"
-        );
-        assert_eq!(
-            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
-            1,
-            "the survivor holds: no share of the new epoch reached it"
+            Some(head_before.as_str()),
+            "nothing installs before the share"
         );
 
         // The ruling's close: the send's ACK plus the author's own skip
@@ -5171,10 +5171,10 @@ mod daemon_tests {
                 "the obligation completes from the skip record"
             );
         }
-        assert_eq!(
-            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
-            1,
-            "the stranded survivor: its own view holds the key, the author's row is closed"
+        assert_ne!(
+            head_of(&fx.replica, &fx.group_id).await.as_deref(),
+            Some(result_head.as_str()),
+            "the stranded survivor: its view holds the key, the frame still waits for the share, and the author's row is closed"
         );
         Ok(())
     }
