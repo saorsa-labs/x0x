@@ -5,36 +5,45 @@
 //! this PR's seal-ordering fix the arms expect the ADR behaviour (GREEN);
 //! on `main` the base arm is RED, because `POST /groups/:id/state/seal`
 //! answered the caller's seat 403 before the §4 refusal. Each arm keeps
-//! the row's red cause: with the §4 cover test (`revoked_admin_cover`)
-//! neutralised, the assertions below observe replies that carry no typed
-//! state, so the arms fail with that cause and guard the behaviour they
-//! name (the neutralised run is the RED proof; see the PR body).
+//! the row's red causes: with the §4 cover test (`revoked_admin_cover`)
+//! neutralised, the member sends still succeed, so the arms fail with the
+//! leak cause, and the reads observe no typed state, so they fail with
+//! the no-state cause (the neutralised run is the RED proof; see the PR
+//! body).
 //!
 //! A is the sole admin and B, C are members of an ordinary
 //! `private_secure` (InviteOnly, TreeKEM) group created through the public
 //! API. Before t = 0 the group is settled (every node at A's state
-//! revision and TreeKEM epoch e0), a data-plane probe passes, and the case
-//! waits out `S4Timing::restart_sync_wait` (ADR 0110 §2), so no read below
-//! sits behind the boot head gate. The derived refusal needs the node's
-//! own current head round, so a first read can still show the §4 409 wait
-//! (`waiting_for_eligible_admin_revocation`, exit `group_admin_revoked`);
-//! the arms poll to the definitive 410 and record every earlier phase.
+//! revision and TreeKEM epoch e0), a data-plane probe passes and opens on
+//! B and C (a second ciphertext is held for the post-revocation read),
+//! and the case waits out `S4Timing::restart_sync_wait` (ADR 0110 §2), so
+//! no read below sits behind the boot head gate. The derived refusal
+//! needs the node's own current head round, so a first read can still
+//! show the §4 409 wait (`waiting_for_eligible_admin_revocation`, exit
+//! `group_admin_revoked`); the arms poll to the definitive 410 and record
+//! every earlier phase. Under the cover, a mutating reply that succeeds,
+//! or carries ciphertext, fails the arm at once (the leak cause). The
+//! row exists to prove that no new key material reaches anyone.
 //!
 //! Arms:
 //!
 //! - `w3h_1581_s4_ordinary_admin_revoked` (the row's base run and its
 //!   re-create variant). At t = 0 A revokes its own agent through
 //!   `POST /identity/revoke`; the record reaches B and then C (the ADR
-//!   names t = 100 ms and t = 1 s; delivery is the fabric default, and the
-//!   case awaits the holders in that order). At t = 2 s B and C call the
+//!   names t = 100 ms and t = 1 s; delivery is the fabric default, and
+//!   the case awaits the holders in that order and reports the measured
+//!   instants). At t = 2 s, measured from the revoke, B and C call the
 //!   send, invite and seal APIs: each answers 410 `group_admin_revoked`
 //!   naming A, with no key material in the body, and the status carries
-//!   the re-create offer (members B and C, the group name, the policy).
-//!   Local history stays readable, even A's own encrypt is refused, and
-//!   after the completion bound no node's epoch has moved and none is
+//!   the re-create offer (members B and C, the group's own name and
+//!   policy). Local history stays readable with the probe's record
+//!   present, the held key still opens that record (a local read; no new
+//!   key is made), and even A's own encrypt reaches the same refusal.
+//!   After the completion bound no node's epoch has moved and none is
 //!   quarantined, so no new key reached anyone. B then accepts the offer
-//!   through the public create API: the re-created group has a new ID, B
-//!   as its admin, C seated, and no history.
+//!   through the public create API with the offered name and policy
+//!   object: the re-created group has a new stable id, B as its admin, C
+//!   seated and active, and no history.
 //!
 //! Not covered by this case (named remainders of the row in #1581):
 //! the D late-evidence variant and the joiner-J variant. The J variant
@@ -80,6 +89,8 @@ const GROUP_NAME: &str = "w3h-1581 ordinary";
 const CAUSE_NO_STATE: &str = "no typed state: with A revoked, member sends, invites and seals \
                               still succeed (or answer another status), the status carries no \
                               re-create offer, and nothing clears a stale head";
+const CAUSE_LEAK: &str = "key material under the cover: with A revoked, a member send, invite \
+                          or seal still answered a success, or its body still carried ciphertext";
 const FINAL_BASE: &str = "sends_invite_seal_refuse_410_group_admin_revoked_with_recreate_offer";
 
 /// A desired-behaviour observation: the bool is the ADR behaviour; the
@@ -95,6 +106,23 @@ fn record(receipt: &mut Receipt, name: &str, seen: &Seen, passed: &mut bool, at:
     } else {
         receipt.cause(CAUSE_NO_STATE, Some(seen.1.clone()), true, at);
         *passed = false;
+    }
+}
+
+/// Record one observed §4 leak: after the cover, a mutating route still
+/// answered a success, or its body still carried key material. The arm
+/// fails at once; no later probe can clear it. Like a miss, the cause is
+/// recorded as observed, so the run with the §4 cover test neutralised
+/// stays the RED proof.
+fn leak(receipt: &mut Receipt, name: &str, reply: &str, passed: &mut bool, at: u128) {
+    receipt.cause(CAUSE_LEAK, Some(format!("{name}: {reply}")), true, at);
+    *passed = false;
+}
+
+/// Note a poll's earlier reply shapes (each shape once).
+fn note_phases(receipt: &mut Receipt, label: &str, phases: &[String]) {
+    if !phases.is_empty() {
+        receipt.note(format!("{label} earlier phases: {phases:?}"));
     }
 }
 
@@ -114,8 +142,61 @@ fn is_group_admin_revoked(status: StatusCode, body: &serde_json::Value, a_hex: &
         && body["kem_ciphertext_b64"].is_null()
 }
 
-/// One mutating request through a node's own barrier; the observation is
-/// whether it answers the definitive §4b(3) refusal.
+/// Whether the reply body carries group key material (ciphertext or a
+/// KEM envelope).
+fn carries_key_material(body: &serde_json::Value) -> bool {
+    body["ciphertext_b64"].is_string() || body["kem_ciphertext_b64"].is_string()
+}
+
+/// The classification of one post-revocation reply from a mutating route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// The definitive §4b(3) refusal: 410, the typed state, A named as
+    /// the revoked admin, no key material.
+    Definitive,
+    /// The §4 409 wait the production builder emits while the head round
+    /// is not yet definitive (exit `group_admin_revoked`).
+    Wait,
+    /// A success, or a body with key material: the §4 property (no new
+    /// key under the cover) is violated.
+    Violation,
+    /// Any other reply.
+    Other,
+}
+
+/// Whether the reply is the §4 409 wait: 409, the typed wait state, exit
+/// `group_admin_revoked`, A named among the revoked admins, and no key
+/// material.
+fn is_s4_wait(status: StatusCode, body: &serde_json::Value, a_hex: &str) -> bool {
+    status == StatusCode::CONFLICT
+        && body["state"] == "waiting_for_eligible_admin_revocation"
+        && body["exit"] == "group_admin_revoked"
+        && body["revoked_admins"].as_array().is_some_and(|ids| {
+            ids.iter().any(|id| {
+                id.as_str()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(a_hex))
+            })
+        })
+        && !carries_key_material(body)
+}
+
+/// Classify one post-revocation reply from a mutating route. The
+/// definitive refusal comes first; a success or key material is a leak,
+/// even on a non-2xx status; the wait is the only allowed earlier phase.
+fn classify_refusal(status: StatusCode, body: &serde_json::Value, a_hex: &str) -> Refusal {
+    if is_group_admin_revoked(status, body, a_hex) {
+        Refusal::Definitive
+    } else if status.is_success() || carries_key_material(body) {
+        Refusal::Violation
+    } else if is_s4_wait(status, body, a_hex) {
+        Refusal::Wait
+    } else {
+        Refusal::Other
+    }
+}
+
+/// One mutating request through a node's own barrier, classified; the
+/// string carries the observed reply for the receipt.
 async fn refused(
     sim: &Sim,
     label: &str,
@@ -123,16 +204,20 @@ async fn refused(
     path: &str,
     body: Option<serde_json::Value>,
     a_hex: &str,
-) -> Result<Seen> {
+) -> Result<(Refusal, String)> {
     let (status, reply) = sim.api(label, method, path, body).await?;
     Ok((
-        is_group_admin_revoked(status, &reply, a_hex),
+        classify_refusal(status, &reply, a_hex),
         format!("{label} {path}: {status} {reply}"),
     ))
 }
 
-/// Whether `label` can make group ciphertext (the member send path).
-async fn sends(sim: &Sim, label: &str, group: &str) -> Result<Seen> {
+/// `label` encrypts the probe; the ciphertext, or why it could not.
+async fn sends(
+    sim: &Sim,
+    label: &str,
+    group: &str,
+) -> Result<std::result::Result<String, String>> {
     let (status, body) = sim
         .api(
             label,
@@ -141,24 +226,62 @@ async fn sends(sim: &Sim, label: &str, group: &str) -> Result<Seen> {
             Some(json!({"payload_b64": BASE64.encode(PROBE)})),
         )
         .await?;
-    Ok((
-        status.is_success() && body["ciphertext_b64"].is_string(),
-        format!("{label} encrypt: {status} {body}"),
-    ))
+    Ok(match body["ciphertext_b64"].as_str() {
+        Some(ciphertext) if status.is_success() && body["ok"] != false => {
+            Ok(ciphertext.to_string())
+        }
+        _ => Err(format!("{label} encrypt: {status} {body}")),
+    })
+}
+
+/// Whether `label` recovers the probe from `ciphertext`, with the reply.
+/// The decrypt route is a local read of held key material; the §4
+/// refusal does not gate it, so it must keep working after the cover.
+async fn decrypts(sim: &Sim, label: &str, group: &str, ciphertext: &str) -> Result<Seen> {
+    let (status, body) = sim
+        .api(
+            label,
+            Method::POST,
+            &format!("/groups/{group}/secure/decrypt"),
+            Some(json!({"ciphertext_b64": ciphertext})),
+        )
+        .await?;
+    let ok = status.is_success()
+        && body["payload_b64"]
+            .as_str()
+            .and_then(|payload| BASE64.decode(payload).ok())
+            .is_some_and(|payload| payload == PROBE);
+    Ok((ok, format!("{label} decrypt: {status} {body}")))
+}
+
+/// The outcome of one label's post-revocation send poll.
+enum SendPoll {
+    /// The definitive §4b(3) 410 was reached; the earlier reply shapes
+    /// seen on the way (each recorded once).
+    Reached(Vec<String>),
+    /// The budget ended first; the earlier reply shapes seen are carried.
+    WaitedOut(Vec<String>),
+    /// A reply succeeded, or carried key material; the reply is carried,
+    /// and the arm fails at once.
+    Violation(String),
 }
 
 /// Poll `label`'s member send until it answers the definitive refusal
-/// (`budget` virtual time), recording each earlier reply shape once (the
-/// §4 409 wait names the same exit). Uses only barrier-free reads.
+/// (`budget` virtual time), recording each earlier reply shape once. The
+/// §4 409 wait (`waiting_for_eligible_admin_revocation`, exit
+/// `group_admin_revoked`) is an allowed earlier phase. A reply that
+/// succeeds, or carries key material, stops the poll at once: that is
+/// the leak the row's cover exists to prevent. Uses barrier-free reads.
 async fn until_refused(
     sim: &Sim,
     label: &str,
     group: &str,
     a_hex: &str,
     budget: Duration,
-) -> Result<(bool, Vec<String>)> {
+) -> Result<SendPoll> {
     let mut phases: Vec<String> = Vec::new();
-    let found = sim
+    let mut violation: Option<String> = None;
+    let refused = sim
         .until(
             &format!("{label} derives group_admin_revoked"),
             budget,
@@ -174,19 +297,76 @@ async fn until_refused(
                 else {
                     return false;
                 };
-                if is_group_admin_revoked(status, &body, a_hex) {
-                    return true;
+                match classify_refusal(status, &body, a_hex) {
+                    Refusal::Definitive => true,
+                    Refusal::Violation => {
+                        violation = Some(format!("{label} encrypt: {status} {body}"));
+                        true
+                    }
+                    _ => {
+                        let phase = format!("{status} {body}");
+                        if !phases.contains(&phase) {
+                            phases.push(phase);
+                        }
+                        false
+                    }
                 }
-                let phase = format!("{status} {body}");
-                if !phases.contains(&phase) {
-                    phases.push(phase);
-                }
-                false
             },
         )
         .await
         .is_ok();
-    Ok((found, phases))
+    Ok(match violation {
+        Some(reply) => SendPoll::Violation(reply),
+        None if refused => SendPoll::Reached(phases),
+        None => SendPoll::WaitedOut(phases),
+    })
+}
+
+/// Poll one label's member send to the definitive §4b(3) refusal and
+/// record it under `name`. `true`: the poll saw a leak (a success, or
+/// key material), so the caller stops probing; the arm already failed.
+async fn send_refusal(
+    sim: &Sim,
+    receipt: &mut Receipt,
+    label: &str,
+    name: &str,
+    group: &str,
+    a_hex: &str,
+    passed: &mut bool,
+) -> Result<bool> {
+    let poll = until_refused(sim, label, group, a_hex, REFUSAL).await?;
+    let at = sim.fabric().now().as_micros();
+    match poll {
+        SendPoll::Reached(phases) => {
+            note_phases(receipt, label, &phases);
+            record(
+                receipt,
+                name,
+                &(true, format!("{label} encrypt reached the definitive 410")),
+                passed,
+                at,
+            );
+            Ok(false)
+        }
+        SendPoll::WaitedOut(phases) => {
+            note_phases(receipt, label, &phases);
+            record(
+                receipt,
+                name,
+                &(
+                    false,
+                    format!("{label} encrypt never reached the definitive 410; phases {phases:?}"),
+                ),
+                passed,
+                at,
+            );
+            Ok(false)
+        }
+        SendPoll::Violation(reply) => {
+            leak(receipt, name, &reply, passed, at);
+            Ok(true)
+        }
+    }
 }
 
 /// The stable group id `label` resolves for `group` (the history scope).
@@ -198,15 +378,23 @@ async fn stable_id(sim: &Sim, label: &str, group: &str) -> Result<String> {
     Ok(info.stable_group_id().to_string())
 }
 
-/// Whether `label`'s local history for the group stays readable (2xx), and
-/// the page is empty when `expect_empty` (a re-created group carries no
-/// history).
+/// Whether `label`'s local history for the group stays readable (2xx)
+/// and holds at least one record (the setup probe's), or is exactly
+/// empty when `expect_empty` (a re-created group carries no history).
 async fn history(sim: &Sim, label: &str, group: &str, expect_empty: bool) -> Result<Seen> {
     let scope = format!("group:{}", stable_id(sim, label, group).await?);
     let (status, body) = sim
         .api(label, Method::GET, &format!("/history?scope={scope}"), None)
         .await?;
-    let ok = status.is_success() && body["ok"] == true && (!expect_empty || body["count"] == 0);
+    let ok = status.is_success()
+        && body["ok"] == true
+        && body["count"].as_u64().is_some_and(|count| {
+            if expect_empty {
+                count == 0
+            } else {
+                count >= 1
+            }
+        });
     Ok((
         ok,
         format!(
@@ -373,9 +561,42 @@ async fn create_named(sim: &Sim, owner: &str) -> Result<String> {
         .to_string())
 }
 
+/// Create a group through the public API from B's re-create offer: the
+/// offered name and the offered policy object, verbatim. The API accepts
+/// an explicit `policy` (it refuses `policy` together with `preset`, so
+/// no preset is passed).
+async fn create_offered(
+    sim: &Sim,
+    owner: &str,
+    name: &str,
+    policy: &serde_json::Value,
+) -> Result<String> {
+    let (status, created) = sim
+        .api(
+            owner,
+            Method::POST,
+            "/groups",
+            Some(json!({
+                "name": name,
+                "policy": policy,
+            })),
+        )
+        .await?;
+    ensure!(
+        status.is_success() && created["ok"] == true,
+        "{owner} create from the offer: {status} {created}"
+    );
+    Ok(created["group_id"]
+        .as_str()
+        .context("create response has no group_id")?
+        .to_string())
+}
+
 /// The §4b(3) base run: the typed refusal on every mutating route, the
-/// re-create offer on the status, history kept readable, no new key, then
-/// B's re-created group.
+/// re-create offer on the status, history kept readable and openable
+/// with the held key, no new key, then B's re-created group. After the
+/// cover, a mutating reply that succeeds, or carries key material,
+/// fails the arm at once (the leak cause).
 async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     let labels = ["A", "B", "C"];
@@ -392,9 +613,21 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let head0 = head_of(sim, "A", &group).await?;
 
     // Pre-trigger data plane: A's ciphertext opens on B and C, so a later
-    // refusal means the §4 state, not a broken path. History reads, too.
-    let (sent, why) = sends(sim, "A", &group).await?;
-    ensure!(sent, "setup: {why}");
+    // refusal means the §4 state, not a broken path. A second ciphertext
+    // is held unread, for the post-revocation open. History reads carry
+    // the probe's record.
+    let probe = match sends(sim, "A", &group).await? {
+        Ok(ciphertext) => ciphertext,
+        Err(why) => bail!("setup: {why}"),
+    };
+    let held_probe = match sends(sim, "A", &group).await? {
+        Ok(ciphertext) => ciphertext,
+        Err(why) => bail!("setup: {why}"),
+    };
+    for label in ["B", "C"] {
+        let (opened, why) = decrypts(sim, label, &group, &probe).await?;
+        ensure!(opened, "setup: {why}");
+    }
     let (readable, why) = history(sim, "B", &group, false).await?;
     ensure!(readable, "setup: {why}");
     past_boot_gate(sim).await?;
@@ -411,39 +644,53 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         )
         .await?;
     ensure!(status.is_success(), "A self-revokes: {status} {body}");
-    // The ADR's delivery order: B at t = 100 ms, C at t = 1 s.
+    let t0 = sim.fabric().now();
+    // The ADR's delivery order: B at t = 100 ms, C at t = 1 s. The waits
+    // are sequential, so B's measured instant cannot exceed C's; the
+    // delivery itself is the fabric default.
     sim.until("B holds A's revocation", EVIDENCE, async |s: &Sim| {
         holds_revocation(s, "B", &a_hex).await.unwrap_or(false)
     })
     .await?;
+    let b_held_at = sim.fabric().now();
     sim.until("C holds A's revocation", EVIDENCE, async |s: &Sim| {
         holds_revocation(s, "C", &a_hex).await.unwrap_or(false)
     })
     .await?;
+    let c_held_at = sim.fabric().now();
     receipt.request_delivered(
         "b_then_c_hold_a_revocation",
-        true,
-        "B first, then C (the ADR's t = 100 ms / t = 1 s order)".to_string(),
+        b_held_at <= c_held_at,
+        format!(
+            "B held at {} us, C held at {} us (the ADR names t = 100 ms and t = 1 s; delivery \
+             is the fabric default)",
+            b_held_at.as_micros(),
+            c_held_at.as_micros()
+        ),
         at(sim),
     );
 
-    // t = 2 s: B and C call send, invite and seal, and read the status.
-    sleep_to(sim, "wait to t=2s", sim.fabric().now() + secs(2)).await?;
+    // t = 2 s from t0: B and C call send, invite and seal, and read the
+    // status. Under the cover no mutating reply may succeed, or carry
+    // key material; the first such reply fails the arm at once, and no
+    // further mutating probe runs.
+    sleep_to(sim, "wait to t=2s", t0 + secs(2)).await?;
+    let mut leaked = false;
+    let mut b_offer: Option<(String, serde_json::Value)> = None;
     for label in ["B", "C"] {
-        let (found, phases) = until_refused(sim, label, &group, &a_hex, REFUSAL).await?;
-        if !phases.is_empty() {
-            receipt.note(format!("{label} earlier phases: {phases:?}"));
-        }
-        record(
+        leaked = send_refusal(
+            sim,
             receipt,
+            label,
             &format!("{label}_send_refused_group_admin_revoked"),
-            &(
-                found,
-                format!("{label} encrypt reached the definitive 410: {found}"),
-            ),
+            &group,
+            &a_hex,
             &mut passed,
-            at(sim),
-        );
+        )
+        .await?;
+        if leaked {
+            break;
+        }
         let requests: [(&str, Method, String, Option<serde_json::Value>); 2] = [
             (
                 "invite",
@@ -459,21 +706,32 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             ),
         ];
         for (name, method, path, body) in requests {
-            let seen = refused(sim, label, method, &path, body, &a_hex).await?;
+            let (class, reply) = refused(sim, label, method, &path, body, &a_hex).await?;
+            let name = format!("{label}_{name}_refused_group_admin_revoked");
+            if class == Refusal::Violation {
+                leak(receipt, &name, &reply, &mut passed, at(sim));
+                leaked = true;
+                break;
+            }
             record(
                 receipt,
-                &format!("{label}_{name}_refused_group_admin_revoked"),
-                &seen,
+                &name,
+                &(class == Refusal::Definitive, reply),
                 &mut passed,
                 at(sim),
             );
         }
+        if leaked {
+            break;
+        }
         // The status carries the re-create offer: B and C (the non-revoked
-        // members, sorted), the name, the policy.
+        // members, sorted), the group's own name and policy verbatim, and
+        // no key material on the read.
         let (status, offer) = sim
             .api(label, Method::GET, &format!("/groups/{group}"), None)
             .await?;
-        let mut offered: Vec<String> = offer["admin_availability"]["recreate_offer"]["members"]
+        let availability = &offer["admin_availability"];
+        let mut offered: Vec<String> = availability["recreate_offer"]["members"]
             .as_array()
             .map(|ids| {
                 ids.iter()
@@ -485,23 +743,36 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         offered.sort();
         let mut non_revoked = vec![b_hex.clone(), c_hex.clone()];
         non_revoked.sort();
+        let offered_name = availability["recreate_offer"]["name"].clone();
+        let offered_policy = availability["recreate_offer"]["policy"].clone();
         let ok = status.is_success()
-            && offer["admin_availability"]["state"] == "group_admin_revoked"
-            && offer["admin_availability"]["exit"] == "group_admin_revoked"
+            && availability["state"] == "group_admin_revoked"
+            && availability["exit"] == "group_admin_revoked"
             && offered == non_revoked
-            && offer["admin_availability"]["recreate_offer"]["name"] == GROUP_NAME
-            && offer["admin_availability"]["recreate_offer"]["policy"].is_object();
+            && offered_name.is_string()
+            && offered_name == offer["name"]
+            && offered_policy.is_object()
+            && offered_policy == offer["policy"]
+            && !carries_key_material(&offer);
         record(
             receipt,
             &format!("{label}_status_carries_recreate_offer"),
             &(
                 ok,
-                format!("{label} status: {status} {}", offer["admin_availability"]),
+                format!("{label} status: {status} {availability}"),
             ),
             &mut passed,
             at(sim),
         );
-        // Local history stays readable (nothing is deleted).
+        if ok && label == "B" {
+            // B re-creates with the offered name and the offered policy.
+            b_offer = Some((
+                offered_name.as_str().unwrap_or_default().to_string(),
+                offered_policy,
+            ));
+        }
+        // Local history stays readable with the probe's record present
+        // (nothing is deleted).
         let seen = history(sim, label, &group, false).await?;
         record(
             receipt,
@@ -510,16 +781,25 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             &mut passed,
             at(sim),
         );
+        // The held key still opens what it already holds: a local decrypt
+        // of A's held probe makes no new key, so the refusal gates
+        // writes, not the local read of held history.
+        let seen = decrypts(sim, label, &group, &held_probe).await?;
+        record(
+            receipt,
+            &format!("{label}_held_key_still_opens_the_probe"),
+            &seen,
+            &mut passed,
+            at(sim),
+        );
     }
-    // Even A's own key gets nothing new: A's own send is refused.
-    let seen = sends(sim, "A", &group).await?;
-    record(
-        receipt,
-        "a_own_send_refused",
-        &(!seen.0, seen.1),
-        &mut passed,
-        at(sim),
-    );
+    // Even A's own key gets nothing new: A holds its own revocation
+    // record, so A's own send must reach the same definitive refusal,
+    // through the same allowed 409 wait. A success, or any ciphertext,
+    // is the same leak. After a leak no further mutating probe runs.
+    if !leaked {
+        send_refusal(sim, receipt, "A", "a_own_send_refused", &group, &a_hex, &mut passed).await?;
+    }
 
     // No new key reached anyone: nothing may seal (no eligible admin
     // remains), so every node stays at the settled head, unquarantined.
@@ -539,9 +819,20 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     );
 
     // The re-create variant: B accepts the offer through the public
-    // create API. The re-created group has a new ID, B as its admin, C
-    // seated, and no history; the old group stays ended and readable.
-    let recreated = create_named(sim, "B").await?;
+    // create API with the offered name and policy object (a run that
+    // read no offer falls back to the preset and says so in a note).
+    // The re-created group has a new stable id, B as its admin, C seated
+    // and active, and no history; the old group stays ended and readable.
+    let recreated = match &b_offer {
+        Some((name, policy)) => create_offered(sim, "B", name, policy).await?,
+        None => {
+            receipt.note(
+                "no re-create offer was read; the re-create falls back to the private_secure \
+                 preset",
+            );
+            create_named(sim, "B").await?
+        }
+    };
     let link = invite(sim, "B", &recreated).await?;
     join(sim, "C", &link).await?;
     sim.until(
@@ -551,16 +842,31 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             members(s, "B", &recreated)
                 .await
                 .is_ok_and(|listed| listed.contains(&c_hex))
+                && membership_state(s, "C", &recreated)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("active")
         },
     )
     .await?;
     let b_admin = sees_admin(sim, "C", &recreated, "B").await?;
+    let c_active = membership_state(sim, "C", &recreated)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("active");
+    let old_stable = stable_id(sim, "B", &group).await?;
+    let new_stable = stable_id(sim, "B", &recreated).await?;
     let no_history = history(sim, "B", &recreated, true).await?;
     let (status, old) = sim
         .api("B", Method::GET, &format!("/groups/{group}"), None)
         .await?;
-    let ok = recreated != group
+    let ok = new_stable != old_stable
         && b_admin
+        && c_active
         && no_history.0
         && status.is_success()
         && old["admin_availability"]["state"] == "group_admin_revoked";
@@ -570,8 +876,9 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         &(
             ok,
             format!(
-                "new id differs: {}; C sees B admin: {b_admin}; {}; old status {status} {}",
-                recreated != group,
+                "stable ids differ (old {old_stable}, new {new_stable}): {}; C sees B admin: \
+                 {b_admin}; C reports itself active: {c_active}; {}; old status {status} {}",
+                new_stable != old_stable,
                 no_history.1,
                 old["admin_availability"]
             ),
@@ -595,10 +902,10 @@ async fn run(case: &str, seed: u64, labels: &[&str]) -> Receipt {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
             }
             if let Err(error) = sim.finish().await {
-                receipt.infra(format!("finish: {error:#}"), 0);
+                receipt.infra(format!("finish: {error}"), 0);
             }
         }
-        Err(error) => receipt.infra(format!("sim: {error:#}"), 0),
+        Err(error) => receipt.infra(format!("sim: {error}"), 0),
     }
     if receipt.verdict().is_none() || receipt.has_infra() {
         receipt.reclassify(FINAL_BASE);

@@ -28496,7 +28496,9 @@ async fn owner_certified_seal_with_eviction(
 /// chain and republish the signed public card (no-op payload change —
 /// used to refresh / repair / force-propagate the chain).
 ///
-/// Admin or higher only.
+/// Admin or higher only — except that the §4 refusal below runs first:
+/// while every admin seat is revoked, members get the typed
+/// `group_admin_revoked` state, not the seat 403 (ADR 0110 §4b(3)).
 ///
 /// ADR-0038: for OwnerCertified groups this endpoint is the full
 /// re-verification point — see `owner_certified_seal_with_eviction`.
