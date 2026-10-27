@@ -5630,8 +5630,9 @@ async fn move_live_record_aside(state: &Arc<AppState>, group_key: &str, info: &G
     state.mls_groups.write().await.remove(group_key);
     // The TreeKEM files stay (#1533 review): with the legacy overlay they
     // keep the original record and its tree paired on disk until the
-    // swap (#1567: the staged join's persists write the original's tree,
-    // `reseat_snapshot_cover`; `swap_staged_tree` writes the staged one).
+    // swap (#1567: the staged join's persists keep the original's tree,
+    // or no snapshot file when it had none, `reseat_snapshot_cover`;
+    // `swap_staged_tree` writes the staged one).
     // Startup loads them only at restore, and the rollback rewrites them
     // from the journal copy.
     state.treekem_groups.write().await.remove(group_key);
@@ -5910,9 +5911,10 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
 /// journal loads the original pair, which rolls back.
 ///
 /// A failed tree write that did not reach the commit point puts the
-/// journal back to `Staging` (the covers apply again), and the next tick
-/// retries. A group with no tree (GSS) needs only the mark. Returns
-/// whether the swap may go on to [`lift_staging_marker`].
+/// original's snapshot state back and the journal back to `Staging` (the
+/// covers apply again), and the next tick retries. A group with no tree
+/// (GSS) needs only the mark. Returns whether the swap may go on to
+/// [`lift_staging_marker`].
 async fn swap_staged_tree(
     state: &AppState,
     stable: &str,
@@ -5927,6 +5929,19 @@ async fn swap_staged_tree(
         None => None,
     };
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    // The original's snapshot state, which a failed tree write puts back.
+    // Read it before the `Swapping` mark below: that mark ends the cover.
+    let cover = if guard.is_some() && journal.phase != ReseatPhase::Swapping {
+        match super::reseat_snapshot_cover(state, key).await {
+            Ok(cover) => cover,
+            Err(error) => {
+                tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the swap is retried: {error}");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
     if journal.phase != ReseatPhase::Swapping {
         let mut marked = false;
         let marked_ref = &mut marked;
@@ -5954,6 +5969,13 @@ async fn swap_staged_tree(
         Err(error) if super::self_leave_persist_left_epoch_installed(&error) => true,
         Err(error) => {
             tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged tree is not durable yet; the original stays on disk and the swap is retried: {error}");
+            // The write can stop after the snapshot file and before its
+            // commit point: put the original's snapshot state back.
+            if let Some(cover) = cover {
+                if let Err(error) = super::restore_reseat_snapshot_cover(state, key, cover).await {
+                    tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot put the original's TreeKEM snapshot back after a failed swap: {error}");
+                }
+            }
             let _ = update_sidecar(state, stable, move |body| {
                 if let Some(open) = body.reseat_journal.as_mut() {
                     if open.record_digest == expected {
@@ -8871,6 +8893,338 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
         assert_eq!(legacy.state_hash, original.state_hash);
+        Ok(())
+    }
+
+    /// #1567 fixture: a contained TreeKEM original with no tree and no
+    /// snapshot file (the #871 gate-only, pre-Welcome joiner), durable, and
+    /// an open `Staging` journal with no `live_tree`. Then the move aside,
+    /// the staged join's stub install and its Welcome install under the
+    /// same key: a new record (one commit later) and its tree. Returns the
+    /// key, the original record, the staged record and the staged tree
+    /// bytes.
+    async fn treeless_staged_fixture(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<(String, GroupInfo, GroupInfo, Vec<u8>)> {
+        let key = "ea".repeat(16);
+        let group_id = hex::decode(&key)?;
+        let creator = state.agent.agent_id();
+        let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id);
+        let staged_tree = x0x::mls::TreeKemMlsGroup::create(group_id, creator, &seed)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut original =
+            GroupInfo::new("treekem".to_string(), String::new(), creator, key.clone());
+        original.migrate_from_v1();
+        original.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        original.shared_secret = None;
+        original.secret_epoch = staged_tree.epoch();
+        original.security_binding = Some(format!("treekem:epoch={}", staged_tree.epoch()));
+        original.recompute_state_hash();
+        let mut staged = original.clone();
+        staged.seal_commit(state.agent.identity().agent_keypair(), 2_000)?;
+        original.fork_quarantine = Some(original_marker(state, &original));
+        // The original, durable with no tree, as before the re-seat.
+        let (write_key, record) = (key.clone(), original.clone());
+        let outcome = super::super::persist_named_groups_mutation(state, move |groups| {
+            groups.insert(write_key, record);
+            true
+        })
+        .await?;
+        assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
+        assert!(!snapshot_exists(state, &key).await?);
+        assert!(open_staging_journal_for_test(state, &key, &original).await?);
+        // The move aside, then the staged join's stub and Welcome installs.
+        let aside = key.clone();
+        super::super::persist_named_groups_mutation(state, move |groups| {
+            groups.remove(&aside).is_some()
+        })
+        .await?;
+        let (write_key, record) = (key.clone(), staged.clone());
+        super::super::persist_named_groups_mutation(state, move |groups| {
+            groups.insert(write_key, record);
+            true
+        })
+        .await?;
+        super::super::persist_treekem_and_named_groups_atomic_with_info(
+            state,
+            &key,
+            staged.clone(),
+            &staged_tree,
+        )
+        .await?;
+        let staged_bytes = staged_tree.to_snapshot_bytes()?;
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(staged_tree)));
+        Ok((key, original, staged, staged_bytes))
+    }
+
+    /// Whether `<key>.snap` is on disk.
+    async fn snapshot_exists(state: &AppState, key: &str) -> anyhow::Result<bool> {
+        Ok(
+            tokio::fs::try_exists(super::super::treekem_snapshot_path(&state.treekem_dir, key))
+                .await?,
+        )
+    }
+
+    /// #1567 (ZCode on b9e87bb), ADR 0109 §3 and H-S3-c / H-S3-d8: a
+    /// re-seat whose original has no tree and no snapshot file completes,
+    /// and the node ends Active with keys. While the join is staged, its
+    /// Welcome install succeeds and `<key>.snap` stays absent, as the
+    /// original had none, so a restart (or a released binary) finds the
+    /// original record and no tree. The swap then writes the staged record
+    /// and its tree. With b9e87bb's cover the Welcome install failed (no
+    /// snapshot to keep), so this re-seat always rolled back. Inert: an
+    /// offline agent.
+    #[tokio::test]
+    async fn a_treeless_originals_reseat_completes_active_with_keys() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, staged, staged_tree) = treeless_staged_fixture(&state).await?;
+        let stable = original.stable_group_id().to_string();
+        assert!(
+            !snapshot_exists(&state, &key).await?,
+            "the snapshot file stays absent while the join is staged"
+        );
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert_eq!(legacy.state_hash, original.state_hash, "roster overlay");
+
+        assert!(swap_if_seated(&state, &stable).await);
+        assert!(open_journal(&state, &stable).await.is_none(), "swapped");
+        let envelope = snapshot_on_disk(&state, &key).await?;
+        assert_eq!(
+            (envelope.state_revision, &envelope.state_hash),
+            (staged.state_revision, &staged.state_hash)
+        );
+        assert!(
+            envelope.snapshot == staged_tree,
+            "the swap writes the staged tree"
+        );
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("the staged record is live"))?;
+        assert_eq!(live.state_hash, staged.state_hash);
+        assert!(live.fork_quarantine.is_none(), "the swap lifts the marker");
+        assert!(live.has_active_member(&local_hex(&state)), "Active");
+        assert!(
+            state.treekem_groups.read().await.contains_key(&key),
+            "with keys"
+        );
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert_eq!(legacy.state_hash, staged.state_hash);
+        Ok(())
+    }
+
+    /// #1567: a rolled-back re-seat of an original with no snapshot file
+    /// leaves no snapshot file behind. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_rolled_back_treeless_reseat_leaves_no_snapshot() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, _, _) = treeless_staged_fixture(&state).await?;
+        let stable = original.stable_group_id().to_string();
+        let journal = open_journal(&state, &stable)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("open journal"))?;
+        rollback_reseat(&state, &stable, journal.record_digest, "test").await;
+        assert!(open_journal(&state, &stable).await.is_none());
+        assert!(!snapshot_exists(&state, &key).await?);
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert_eq!(legacy.state_hash, original.state_hash);
+        Ok(())
+    }
+
+    /// A group whose admin A seats this node, then two more commits (an
+    /// add, then a promotion):
+    /// returns A, the group at A's seal (`base`), after one more commit
+    /// (`mid`) and after two (`ahead`), and the two links after `base`.
+    #[allow(clippy::type_complexity)]
+    fn segment_fixture(
+        state: &AppState,
+    ) -> anyhow::Result<(
+        x0x::identity::AgentKeypair,
+        GroupInfo,
+        GroupInfo,
+        GroupInfo,
+        Vec<RetainedCommit>,
+    )> {
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut base = GroupInfo::new(
+            "adr0109-segments".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "5109".repeat(16),
+        );
+        base.add_member(
+            local_hex(state),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        base.seal_commit(&admin, 1_000)?;
+        let mut mid = base.clone();
+        mid.add_member(
+            "44".repeat(32),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        mid.seal_commit(&admin, 2_000)?;
+        let mut ahead = mid.clone();
+        ahead.set_member_role(&"44".repeat(32), x0x::groups::GroupRole::Admin);
+        ahead.seal_commit(&admin, 3_000)?;
+        let links = links_after(&base, &ahead);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].commit.state_hash, mid.state_hash);
+        Ok((admin, base, mid, ahead, links))
+    }
+
+    /// The `awaiting_attestation` view with `reason`.
+    fn awaiting(reason: &str) -> Option<SubjectView> {
+        Some(SubjectView::Awaiting {
+            reason: reason.to_string(),
+        })
+    }
+
+    /// A fresh subject state for `info`'s group, with no progress since
+    /// `start`.
+    async fn fresh_subject(state: &AppState, info: &GroupInfo, start: Instant) {
+        state.group_recovery.inner.lock().await.subjects.insert(
+            info.stable_group_id().to_string(),
+            SubjectState::new(start, info.state_revision),
+        );
+    }
+
+    /// ADR 0109 §2 "Segments" (ZCode on 7726d92: the runtime loop had no
+    /// test): the admin-armed ATA covers one of the two links to the kept
+    /// terminal. At the segment's last hash the segment is exhausted: the
+    /// gate admits nothing, the node keeps a `Gap` ref to the kept
+    /// terminal and asks for the next segment at once, with no stall.
+    /// Control: one link before the segment end nothing is exhausted, and
+    /// the armed gate waits for its stall. This offline node has no capable
+    /// peer, so an ask shows as the round reaching target selection
+    /// (`no_capable_peer`, which replaces `segment_exhausted`); a held
+    /// round keeps the initial `no_reply`. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_segment_end_before_the_terminal_asks_for_the_next_segment() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (admin, base, mid, ahead, links) = segment_fixture(&state)?;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let ata = sign_ata(&admin, &local, &base, &links[..1])?;
+        let terminal = super::super::NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: ahead.stable_group_id().to_string(),
+            revision: links[1].commit.revision,
+            actor: admin_hex,
+            agent_id: "44".repeat(32),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(links[1].commit.clone()),
+        };
+        let terminal_json = serde_json::to_vec(&terminal)?;
+        let stable = base.stable_group_id().to_string();
+        assert!(
+            update_sidecar(&state, &stable, move |body| {
+                body.active_ata = Some(ata);
+                body.queued_terminal = Some(terminal_json);
+            })
+            .await
+        );
+        let expected = (links[1].commit.revision, links[1].commit.state_hash.clone());
+        let key = base.mls_group_id.clone();
+        let start = Instant::now();
+
+        // Control: at `base` the segment's link is still ahead, and the
+        // armed gate waits for its stall.
+        assert_eq!(exhausted_segment(&state, &base).await, None);
+        assert!(armed_admin_ata(&state, &base).await.is_some());
+        let base_refs = live_refs(&state, &base).await;
+        fresh_subject(&state, &base, start).await;
+        assert_eq!(
+            next_target(&state, &key, &base, &local, &base_refs, start).await,
+            None
+        );
+        assert_eq!(view_of(&state, &stable).await, awaiting("no_reply"), "held");
+
+        // At the segment's end: exhausted, the gate admits nothing, and
+        // the node asks at once.
+        assert_eq!(
+            exhausted_segment(&state, &mid).await,
+            Some(expected.clone())
+        );
+        assert!(armed_admin_ata(&state, &mid).await.is_none());
+        let refs = live_refs(&state, &mid).await;
+        assert!(
+            refs.iter().any(|r| matches!(
+                r,
+                RecoveryRef::Gap { reason, terminal_revision, terminal_state_hash, .. }
+                    if reason == s3::ADMIN_ATTESTED_GAP_REASON
+                        && (*terminal_revision, terminal_state_hash.clone()) == expected
+            )),
+            "{refs:?}"
+        );
+        fresh_subject(&state, &mid, start).await;
+        assert_eq!(
+            next_target(&state, &key, &mid, &local, &refs, start).await,
+            None
+        );
+        assert_eq!(
+            view_of(&state, &stable).await,
+            awaiting("no_capable_peer"),
+            "asked"
+        );
+        Ok(())
+    }
+
+    /// ADR 0109 §2 "Requests" (ZCode on 7726d92): an admin-armed ATA with
+    /// no progress asks for its renewal after `ATA_ARMED_LIFETIME`, not
+    /// after `GATE_STALL`. As in the segment test, an offline node's ask
+    /// shows as `no_capable_peer` and a held round keeps `no_reply`.
+    /// Inert: an offline agent.
+    #[tokio::test]
+    async fn an_armed_ata_without_progress_asks_for_renewal() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (admin, base, _, _, links) = segment_fixture(&state)?;
+        let ata = sign_ata(&admin, &local, &base, &links)?;
+        let stable = base.stable_group_id().to_string();
+        assert!(update_sidecar(&state, &stable, move |body| body.active_ata = Some(ata)).await);
+        let refs = live_refs(&state, &base).await;
+        assert_eq!(refs.len(), 1, "only the admin-armed gap: {refs:?}");
+        let key = base.mls_group_id.clone();
+        let start = Instant::now();
+        fresh_subject(&state, &base, start).await;
+        assert!(s3::GATE_STALL < s3::ATA_ARMED_LIFETIME);
+        for held in [
+            start + s3::GATE_STALL,
+            start + s3::ATA_ARMED_LIFETIME - Duration::from_secs(1),
+        ] {
+            assert_eq!(
+                next_target(&state, &key, &base, &local, &refs, held).await,
+                None
+            );
+            assert_eq!(view_of(&state, &stable).await, awaiting("no_reply"), "held");
+        }
+        let due = start + s3::ATA_ARMED_LIFETIME;
+        assert_eq!(
+            next_target(&state, &key, &base, &local, &refs, due).await,
+            None
+        );
+        assert_eq!(
+            view_of(&state, &stable).await,
+            awaiting("no_capable_peer"),
+            "asked"
+        );
         Ok(())
     }
 
