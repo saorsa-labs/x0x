@@ -113,10 +113,18 @@ async fn expired_post_dial_read_uses_contact_card() -> Result<(), Box<dyn std::e
     tokio::time::pause();
     let send = agent.send_direct_with_config(&recipient, vec![0x39], publish_config());
     tokio::pin!(send);
-    tokio::select! {
-        _ = entered.notified() => {},
-        result = &mut send => panic!("send ended before the dial/store stall: {result:?}"),
+    match futures::poll!(&mut send) {
+        Poll::Pending => {}
+        Poll::Ready(result) => panic!("send ended before the dial/store stall: {result:?}"),
     }
+    // Wait parked, not spinning: the store's background work needs the
+    // paused-clock auto-advance, and a spin freezes it. But nothing may
+    // re-poll `send` while we wait. The select! this replaces re-polled it
+    // on every wake, so auto-advance spent the 3 s dial cap and the
+    // fallback budget before the writer's hold was visible (the Coverage
+    // Gate flake). Un-polled, `send` cannot move; its completion path is
+    // blocked by the held store mutex until after this wait.
+    let _ = entered.notified().await;
     tokio::time::advance(Duration::from_secs(3) + Duration::from_millis(1)).await;
     assert!(futures::poll!(&mut send).is_pending());
     tokio::time::advance(publish_config().timeout_per_attempt + Duration::from_millis(1)).await;
