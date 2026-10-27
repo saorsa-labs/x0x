@@ -2669,11 +2669,59 @@ mod tests {
             assert_withheld(seal_once(&state, &topic).await);
         }
 
-        /// #1508 rc17 (Codex P1, ported from #1533 rc16): a GSS task record
-        /// sealed before a verified removal parks is not published after
-        /// it. The park leaves the epoch unchanged and the removed member
-        /// holds that secret. Before the fix `confirm_publication` checked
-        /// the plane and epoch only and answered `Current`.
+        /// #1573 (#1508 rc12): a GSS task delta is not sealed while a
+        /// verified removal waits for this survivor's share (the removed
+        /// member still holds the secret); the installed share ends the
+        /// hold. Before the fix the delta was sealed under the old secret.
+        #[tokio::test]
+        async fn gss_task_seal_is_withheld_while_a_removal_waits_for_its_share() {
+            let (state, _dir) = test_state().await;
+            let admin = AgentKeypair::generate().expect("admin key");
+            let group_key = "b4".repeat(16);
+            let mut info = group_with_foreign_admin(&state, &group_key, &admin);
+            let _ = info.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), info.clone());
+            let topic = format!("x0x.group.{group_key}.symphony.board");
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::Gss(_)))
+            ));
+
+            super::super::super::named_groups::park_pending_gss_removal_for_test(
+                &state, &group_key, &info,
+            );
+            let reason =
+                super::super::super::named_groups::GroupCiphertextHold::PendingGssRemoval.reason();
+            match seal_once(&state, &topic).await {
+                Err(x0x::crdt::CrdtError::Gossip(text)) => {
+                    assert!(text.contains(reason), "typed refusal, got {text}")
+                }
+                Err(other) => panic!("wrong refusal: {other}"),
+                Ok(_) => panic!("a task delta was sealed while a removal waits for its share"),
+            }
+
+            let mut keyed = info.clone();
+            let _ = keyed.rotate_shared_secret();
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(group_key.clone(), keyed);
+            assert!(matches!(
+                seal_once(&state, &topic).await,
+                Ok(Some(SealedTaskRecordBody::Gss(_)))
+            ));
+        }
+
+        /// #1533 rc16 (Codex P1): a GSS task record sealed before a
+        /// verified removal parks is not published after it. The park
+        /// leaves the epoch unchanged and the removed member holds that
+        /// secret. Before the fix `confirm_publication` checked the plane
+        /// and epoch only and answered `Current`.
         #[tokio::test]
         async fn gss_task_record_sealed_before_a_removal_parks_is_not_published() {
             let (state, _dir) = test_state().await;
@@ -2728,15 +2776,16 @@ mod tests {
             ));
         }
 
-        /// #1573 (#1508 rc12): a GSS task delta is not sealed while a
-        /// verified removal waits for this survivor's share (the removed
-        /// member still holds the secret); the installed share ends the
-        /// hold. Before the fix the delta was sealed under the old secret.
+        /// #1533 rc16 (Codex P2): a pending GSS removal does not mask the
+        /// no-eligible-admin hold on key material. With both holds, the
+        /// shared boundary reports the removal first; before the fix the
+        /// join-artifact guard read only that first hold and served shares,
+        /// Welcomes and join results.
         #[tokio::test]
-        async fn gss_task_seal_is_withheld_while_a_removal_waits_for_its_share() {
+        async fn join_artifacts_stay_held_when_a_removal_also_waits() {
             let (state, _dir) = test_state().await;
             let admin = AgentKeypair::generate().expect("admin key");
-            let group_key = "b4".repeat(16);
+            let group_key = "b6".repeat(16);
             let mut info = group_with_foreign_admin(&state, &group_key, &admin);
             let _ = info.rotate_shared_secret();
             state
@@ -2744,36 +2793,31 @@ mod tests {
                 .write()
                 .await
                 .insert(group_key.clone(), info.clone());
-            let topic = format!("x0x.group.{group_key}.symphony.board");
-            assert!(matches!(
-                seal_once(&state, &topic).await,
-                Ok(Some(SealedTaskRecordBody::Gss(_)))
-            ));
-
             super::super::super::named_groups::park_pending_gss_removal_for_test(
                 &state, &group_key, &info,
             );
-            let reason =
-                super::super::super::named_groups::GroupCiphertextHold::PendingGssRemoval.reason();
-            match seal_once(&state, &topic).await {
-                Err(x0x::crdt::CrdtError::Gossip(text)) => {
-                    assert!(text.contains(reason), "typed refusal, got {text}")
-                }
-                Err(other) => panic!("wrong refusal: {other}"),
-                Ok(_) => panic!("a task delta was sealed while a removal waits for its share"),
-            }
-
-            let mut keyed = info.clone();
-            let _ = keyed.rotate_shared_secret();
-            state
-                .named_groups
-                .write()
+            // A pending removal alone does not hold key material.
+            assert!(
+                !super::super::super::named_groups::join_artifacts_held_for_no_eligible_admin_for_test(
+                    &state, &group_key,
+                )
                 .await
-                .insert(group_key.clone(), keyed);
-            assert!(matches!(
-                seal_once(&state, &topic).await,
-                Ok(Some(SealedTaskRecordBody::Gss(_)))
-            ));
+            );
+            revoke_agent(&state, &admin).await;
+            assert_eq!(
+                super::super::super::named_groups::group_ciphertext_withheld(
+                    &state, &group_key, None,
+                )
+                .await,
+                Some(super::super::super::named_groups::GroupCiphertextHold::PendingGssRemoval),
+                "both holds apply; the boundary reports the removal first"
+            );
+            assert!(
+                super::super::super::named_groups::join_artifacts_held_for_no_eligible_admin_for_test(
+                    &state, &group_key,
+                )
+                .await
+            );
         }
 
         /// Codex P2 (#1508 r6), ADR 0110 §4b(3): a `SignedPublic` group's

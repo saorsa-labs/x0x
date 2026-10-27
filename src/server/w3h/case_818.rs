@@ -18,15 +18,23 @@
 //! chain to J's base, and a TreeKEM joiner never adopts across a gap. The
 //! refused served chain then goes to `classify_refused_joiner_fork_chain`.
 //!
-//! GREEN (ADR 0109 S3): within 130 s J is active at A's state revision and
-//! TreeKEM epoch, with no fork-quarantine marker. RED (`main`, the #818
-//! design decision of 2026-09-24): an ownerless group cannot tell a gap
-//! from a fork, so J installs a `signer_only` marker with `no_anchor: true`
-//! on A's legitimate add and records no anchored-gap exemption. About 120 s
-//! after the join, J's join-result poll times out
-//! (`JOIN_RESULT_POLL_TIMEOUT`) and J drops its stub, marker included. So
-//! the case records the cause the first time it sees it. A dropped record
-//! is an observed outcome only after the cause was seen; else it is INFRA.
+//! GREEN (ADR 0109 S3, the H-S3-a candidate): within 130 s J is active at
+//! A's state revision and TreeKEM epoch, and J is never marked in the
+//! window. RED (`main`, the #818 design decision of 2026-09-24): an
+//! ownerless group cannot tell a gap from a fork, so J installs a
+//! `signer_only` marker with `no_anchor: true` on A's legitimate add and
+//! records no anchored-gap exemption. About 120 s after the join, J's
+//! join-result poll times out (`JOIN_RESULT_POLL_TIMEOUT`) and J drops its
+//! stub, marker included. So the case records the cause the first time it
+//! sees it. A dropped record is an observed outcome only after the cause
+//! was seen; else it is INFRA.
+//!
+//! The red baseline was RED on `main`. This branch has the S3 code, so the
+//! red baseline now expects GREEN and keeps its `_red_` name, as #1256 and
+//! #1357 did (#1356, "the W3-H case for #818 is green"). A failure whose
+//! observation matches `main` (`CAUSE`) is RED; any other failure is
+//! INFRA. The H-S3-a row's "sends no catch-up request" is not judged: the
+//! receipt notes J's frames to A instead.
 //!
 //! Control, expected GREEN on `main`: the same group and skew, but A mints
 //! I after the removal, so there is no gap (the just-in-time invite that
@@ -116,7 +124,8 @@ impl View {
 }
 
 /// The desired end state: J is active at A's state revision and TreeKEM
-/// epoch, with no fork-quarantine marker.
+/// epoch, with no fork-quarantine marker. The window also requires that J
+/// was never marked.
 fn caught_up(j: Option<&View>, a: &View, membership: Option<&str>) -> bool {
     j.is_some_and(|j| {
         membership == Some("active")
@@ -355,6 +364,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // (`JOIN_RESULT_POLL_TIMEOUT`, 120 s). So the cause is recorded the
     // first time it is observed, and the wait runs the full budget.
     let mut cause: Option<String> = None;
+    let mut j_marked: Option<String> = None;
     let mut seen = Observations::default();
     let waited = sim
         .until("J catches up to A", CATCHUP, async |s: &Sim| {
@@ -367,6 +377,11 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
             let Some(state) = seen.observe(membership_state(s, "J", &group)).await else {
                 return true;
             };
+            if let Some(j) = j.as_ref().filter(|j| j.marker.is_some()) {
+                j_marked.get_or_insert_with(|| {
+                    format!("at {} us: J {}", s.fabric().now().as_micros(), j.describe())
+                });
+            }
             if let Some(j) = j.as_ref().filter(|j| is_cause(j, &a_hex, base)) {
                 cause.get_or_insert_with(|| {
                     format!(
@@ -376,7 +391,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
                     )
                 });
             }
-            caught_up(j.as_ref(), &a, state.as_deref())
+            j_marked.is_none() && caught_up(j.as_ref(), &a, state.as_deref())
         })
         .await;
     if let Err(error) = waited {
@@ -392,7 +407,7 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     let j_state = sim
         .at_instant("read J's membership", membership_state(sim, "J", &group))
         .await??;
-    let passed = caught_up(j.as_ref(), &a, j_state.as_deref());
+    let passed = j_marked.is_none() && caught_up(j.as_ref(), &a, j_state.as_deref());
     let j_text = j.as_ref().map_or_else(
         || "has no record (stub dropped)".to_string(),
         View::describe,
@@ -402,8 +417,10 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         "INFRA: J dropped its record of the group and the #818 cause was never observed"
     );
     receipt.note(format!(
-        "arm={arm:?} at the end: J membership={j_state:?}; J {j_text}; A {}",
-        a.describe()
+        "arm={arm:?} at the end: J membership={j_state:?}; J {j_text}; A {}; \
+         J first marked: {j_marked:?}; J frames to A since the join: {}",
+        a.describe(),
+        delivered_after(sim, "J", "A", joined_at)?
     ));
 
     let to_a = delivered_after(sim, "J", "A", joined_at)?;
@@ -463,7 +480,8 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
     Ok(())
 }
 
-/// The #818 part 2 red baseline: RED on `main` until ADR 0109 S3 lands.
+/// The #818 part 2 red baseline: RED on `main`; GREEN with ADR 0109 S3
+/// (H-S3-a).
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -475,7 +493,7 @@ fn w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined() -> Result<()> {
             "w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined",
             0x0818_0001,
             Arm::StaleInvite,
-            Verdict::Red,
+            Verdict::Green,
         )
         .await
     })

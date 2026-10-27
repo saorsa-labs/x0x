@@ -3897,7 +3897,7 @@ fn finish_persist(inner: &mut S4Inner, covered_seq: u64, written: bool) -> bool 
 /// The temp file is created owner-only (`0600`) before any byte goes in,
 /// whatever the umask: S3/S4 sidecars can hold private key material
 /// (ADR 0012). The rename keeps that mode.
-async fn write_bytes_durably(
+pub(super) async fn write_bytes_durably(
     path: &FsPath,
     bytes: &[u8],
     temp_txid: Option<&[u8; 16]>,
@@ -3975,7 +3975,10 @@ async fn remove_file_durably(path: &FsPath) {
 /// ADR 0108 §5a steps 1 to 3: move a damaged file aside under its pending
 /// name, fsync the directory and verify the copy. Returns the `txid` and
 /// the pending path, or the failed step.
-async fn quarantine_file(path: &FsPath, bytes: &[u8]) -> Result<([u8; 16], PathBuf), &'static str> {
+pub(super) async fn quarantine_file(
+    path: &FsPath,
+    bytes: &[u8],
+) -> Result<([u8; 16], PathBuf), &'static str> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -3995,7 +3998,7 @@ async fn quarantine_file(path: &FsPath, bytes: &[u8]) -> Result<([u8; 16], PathB
 }
 
 /// ADR 0108 §5a step 5: mark a pending copy as history.
-async fn finalize_quarantine(pending: &FsPath) -> bool {
+pub(super) async fn finalize_quarantine(pending: &FsPath) -> bool {
     let Some(name) = pending.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -4442,7 +4445,7 @@ fn now_unix_ms() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     // ─── Codex round 1, item 2: persistence generation ─────────────────
@@ -5664,7 +5667,10 @@ mod tests {
     /// An ADR 0094 upgrade journal record in `phase`, in the fixed record
     /// name of `data_dir`. Raw JSON on purpose, so a test can also write a
     /// phase the reader does not know.
-    fn write_upgrade_journal(data_dir: &FsPath, phase: &str) -> anyhow::Result<()> {
+    pub(in crate::server) fn write_upgrade_journal(
+        data_dir: &FsPath,
+        phase: &str,
+    ) -> anyhow::Result<()> {
         let artifact = |name: &str| {
             serde_json::json!({
                 "target_path": data_dir.join(name),

@@ -2873,6 +2873,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+            reseat_mandate: None,
         };
         let result =
             apply_named_group_metadata_event(&state, event, authority_id, true, None).await;

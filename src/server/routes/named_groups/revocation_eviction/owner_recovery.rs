@@ -56,6 +56,9 @@ const ORC_RESEND_INTERVAL: Duration = Duration::from_secs(5);
 const ORC_RETAIN_TTL: Duration = Duration::from_secs(600);
 /// Frames held for a later retry.
 const ORC_STASH_CAP: usize = 32;
+/// #1533 rc18: parked shares per group from senders that are not Active
+/// members on this node's roster ([`park_early_share`]).
+const ORC_CANDIDATE_SHARES_PER_GROUP: usize = 4;
 /// A commit attempt that met a transient wait retries no sooner than this.
 const ORC_COMMIT_RETRY: Duration = Duration::from_secs(5);
 /// The per-exchange bound of one mandate, commit or catch-up frame write.
@@ -116,6 +119,10 @@ struct ParkedShare {
     event: super::super::NamedGroupMetadataEvent,
     sender: AgentId,
     at: Instant,
+    /// The sender was not an Active member on this node's roster when the
+    /// share was parked (#1533 rc18): a candidate that only a verified
+    /// successor chain can make an admin.
+    candidate: bool,
 }
 
 /// A verified catch-up commit of a GSS `OwnerCertified` group that does
@@ -1641,10 +1648,22 @@ pub(in crate::server) fn spawn_receipt(
 /// that has not installed here yet (#1508 rc13: the sender can be an admin
 /// that a later commit promotes). The share and the frame use different
 /// carriers, so the share can arrive first, and the sender seals it only
-/// once. The group is a GSS group, the sender is the actor and an Active
-/// member, and the share is for a later epoch. Nothing is opened or
-/// installed here: [`replay_early_shares`] runs the full share apply again
-/// after the frame installs. Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`].
+/// once. The group is a GSS group, the sender is the actor, and the share
+/// is for a later epoch. Nothing is opened or installed here:
+/// [`replay_early_shares`] runs the full share apply again after the frame
+/// installs. Bounded by [`ORC_STASH_CAP`] and [`ORC_RETAIN_TTL`].
+///
+/// #1533 rc18 (Codex P1): the sender can also be absent from this node's
+/// roster. A later admin can add B, promote B and go offline; B is not on
+/// a stale survivor's roster. Such a share is a candidate: it is kept
+/// only in a bound of [`ORC_CANDIDATE_SHARES_PER_GROUP`] per group and one
+/// per sender, and it is evicted before a member's share. Its sender is
+/// validated when it is used: [`promoted_admin_secret`] uses a share only
+/// from an admin of a roster that the verified held chain reaches. When
+/// the group's candidate bound is full, a new candidate is kept only when
+/// a held, signed commit of the group adds its sender
+/// ([`held_add_names`]), and it replaces a candidate that no held commit
+/// adds.
 pub(in crate::server) async fn park_early_share(
     state: &AppState,
     info: &GroupInfo,
@@ -1665,28 +1684,76 @@ pub(in crate::server) async fn park_early_share(
         || info.withdrawn
         || orc::crypto_kind(info) != orc::RecoveryCryptoKind::Gss
         || *actor != sender_hex
-        || !info.has_active_member(&sender_hex)
         || *secret_epoch < info.secret_epoch
         || (*secret_epoch == info.secret_epoch && info.shared_secret.is_some())
     {
         return;
     }
-    let now = Instant::now();
-    let mut inner = state.revocation_evictions.inner.lock().await;
-    let parked = &mut inner.orc.early_shares;
-    parked.retain(|share| now.saturating_duration_since(share.at) <= ORC_RETAIN_TTL);
-    if parked.len() >= ORC_STASH_CAP {
-        parked.remove(0);
-    }
-    parked.push(ParkedShare {
+    let share = ParkedShare {
         stable_group_id: info.stable_group_id().to_string(),
         event: event.clone(),
         sender,
-        at: now,
-    });
+        at: Instant::now(),
+        candidate: !info.has_active_member(&sender_hex),
+    };
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    let orc = &mut inner.orc;
+    if !park_share(&mut orc.early_shares, &orc.held_events, share) {
+        return;
+    }
     drop(inner);
     // A stashed GSS recovery waits for this share (#1508 rc12).
     state.agent.s4_revocation_intake().request_reconcile();
+}
+
+/// Add `share` to `parked` under the [`park_early_share`] bounds. Returns
+/// whether it was kept.
+fn park_share(parked: &mut Vec<ParkedShare>, held: &[HeldEvent], share: ParkedShare) -> bool {
+    let now = share.at;
+    parked.retain(|kept| now.saturating_duration_since(kept.at) <= ORC_RETAIN_TTL);
+    if share.candidate {
+        // One candidate per sender and group: the newer share replaces it.
+        parked.retain(|kept| {
+            !(kept.candidate
+                && kept.stable_group_id == share.stable_group_id
+                && kept.sender == share.sender)
+        });
+        let in_group =
+            |kept: &ParkedShare| kept.candidate && kept.stable_group_id == share.stable_group_id;
+        if parked.iter().filter(|kept| in_group(kept)).count() >= ORC_CANDIDATE_SHARES_PER_GROUP {
+            if !held_add_names(held, &share.stable_group_id, &share.sender) {
+                return false;
+            }
+            let Some(at) = parked.iter().position(|kept| {
+                in_group(kept) && !held_add_names(held, &kept.stable_group_id, &kept.sender)
+            }) else {
+                return false;
+            };
+            parked.remove(at);
+        }
+    }
+    if parked.len() >= ORC_STASH_CAP {
+        // A candidate goes before a member's share.
+        let at = parked.iter().position(|kept| kept.candidate).unwrap_or(0);
+        parked.remove(at);
+    }
+    parked.push(share);
+    true
+}
+
+/// A held, signed commit of `stable_group_id` adds `sender`
+/// ([`hold_unchained_event`]). This only orders the candidate bound: the
+/// share is still used only from an admin of a verified walked roster.
+fn held_add_names(held: &[HeldEvent], stable_group_id: &str, sender: &AgentId) -> bool {
+    let sender_hex = hex::encode(sender.as_bytes());
+    held.iter().any(|held| {
+        held.stable_group_id == stable_group_id
+            && matches!(
+                &held.event,
+                super::super::NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                    if *agent_id == sender_hex
+            )
+    })
 }
 
 /// What the parked early shares of `body`'s group hold for this node, for
@@ -2726,6 +2793,17 @@ async fn receive_commit(
             ReceiveOutcome::Refused(refusal)
         };
     }
+    let commit = body.commit.to_commit();
+    // ADR 0109 §2 "Conflict" (#1533 r6): the one conflict gate bounds
+    // this commit as it bounds every metadata route.
+    if !ng::group_recovery::conflict_admits_commit(state, &info, &commit).await {
+        tracing::warn!(
+            group_id = %ng::LogHexId::group(&group_key),
+            revision = commit.revision,
+            "ADR 0109 S3: owner recovery past the attestation conflict's common prefix refused"
+        );
+        return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryGroupQuarantined);
+    }
     // #1508 review F2: the received frame is durable before the roster it
     // carries is installed, in the held log that the author uses. A
     // restarted receiver then serves it to a survivor that missed it while
@@ -2827,7 +2905,6 @@ async fn receive_commit(
         }
         _ => None,
     };
-    let commit = body.commit.to_commit();
     let signed_binding = commit.security_binding.clone();
     let roster_revision = body.roster_revision;
     let crypto = body.crypto.clone();
@@ -3180,6 +3257,80 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "recovery_head_mismatch");
         assert_eq!(body["group_id"], "g");
+    }
+
+    /// #1533 rc18: candidate shares (senders not on this roster) are
+    /// bounded per group and per sender, evicted before a member's share,
+    /// and a full bound admits a new candidate only when a held commit
+    /// adds its sender. A flood of candidates never evicts a member share.
+    #[test]
+    fn candidate_shares_are_bounded_and_go_first() {
+        let event =
+            |group: &str| super::super::super::NamedGroupMetadataEvent::SecureShareDelivered {
+                group_id: group.to_string(),
+                recipient: String::new(),
+                secret_epoch: 1,
+                kem_ciphertext_b64: String::new(),
+                aead_nonce_b64: String::new(),
+                aead_ciphertext_b64: String::new(),
+                actor: String::new(),
+            };
+        let share = |group: &str, sender: u8, candidate: bool| ParkedShare {
+            stable_group_id: group.to_string(),
+            event: event(group),
+            sender: AgentId([sender; 32]),
+            at: Instant::now(),
+            candidate,
+        };
+        let mut parked = Vec::new();
+        assert!(park_share(&mut parked, &[], share("g", 1, false)));
+        for sender in 10..10 + ORC_CANDIDATE_SHARES_PER_GROUP as u8 {
+            assert!(park_share(&mut parked, &[], share("g", sender, true)));
+        }
+        // The same sender replaces its candidate.
+        assert!(park_share(&mut parked, &[], share("g", 10, true)));
+        assert_eq!(parked.len(), 1 + ORC_CANDIDATE_SHARES_PER_GROUP);
+        // The bound is full: an unnamed candidate is dropped.
+        assert!(!park_share(&mut parked, &[], share("g", 99, true)));
+        // A candidate that a held commit adds replaces an unnamed one.
+        let named = AgentId([98; 32]);
+        let add = HeldEvent {
+            stable_group_id: "g".to_string(),
+            event: super::super::super::NamedGroupMetadataEvent::MemberAdded {
+                roster_certificates_b64: Vec::new(),
+                group_id: "g".to_string(),
+                revision: 2,
+                actor: String::new(),
+                agent_id: hex::encode(named.as_bytes()),
+                display_name: None,
+                treekem_commit_b64: None,
+                treekem_welcome_b64: None,
+                welcome_ref: None,
+                treekem_epoch: None,
+                treekem_key_package_hash: None,
+                member_joined_recovery: None,
+                member_recovery_history: Vec::new(),
+                certificate_b64: None,
+                owner_mandate: None,
+                commit: None,
+                reseat_mandate: None,
+            },
+            author: AgentId([0; 32]),
+            prev_state_hash: None,
+            at: Instant::now(),
+        };
+        assert!(park_share(&mut parked, &[add], share("g", 98, true)));
+        assert!(parked.iter().any(|kept| kept.sender == named));
+        assert_eq!(parked.len(), 1 + ORC_CANDIDATE_SHARES_PER_GROUP);
+        // Candidates of many groups fill the global cap: they go first,
+        // and the member share stays.
+        for group in 0..ORC_STASH_CAP {
+            let _ = park_share(&mut parked, &[], share(&format!("h{group}"), 50, true));
+        }
+        assert!(parked.len() <= ORC_STASH_CAP);
+        assert!(parked
+            .iter()
+            .any(|kept| !kept.candidate && kept.sender == AgentId([1; 32])));
     }
 
     /// #1508 review (Codex P1 #3): the promoted member writes the recovery
@@ -4294,6 +4445,35 @@ mod restart_tests {
             .into_iter()
             .map(|(_, head, bytes)| (head, bytes.to_vec()))
             .collect()
+    }
+
+    /// #1533 r6 (Codex P1 1), ADR 0109 §2 "Conflict": "Nothing past the
+    /// common prefix applies" holds for an S4 owner recovery too. The
+    /// receiver records an attestation conflict on the parent (no fork
+    /// marker), then the valid recovery commit on that parent arrives: it
+    /// is refused and the head does not move. Before the fix the recovery
+    /// receiver applied the commit without the conflict gate. Inert.
+    #[tokio::test]
+    async fn a_recorded_attestation_conflict_refuses_a_valid_recovery() -> Result<()> {
+        let (author_dir, receiver_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (receiver, info, bytes, _result_head, _admin) =
+            received_recovery(author_dir.path(), receiver_dir.path()).await?;
+        let stable = info.stable_group_id().to_string();
+        anyhow::ensure!(
+            super::super::super::group_recovery::record_conflict_at_head_for_test(&receiver, &info)
+                .await?,
+            "the conflict is durable"
+        );
+        assert_eq!(
+            receive_bytes(&receiver, &bytes).await?,
+            ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryGroupQuarantined)
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "nothing past the common prefix applies (owner recovery)"
+        );
+        Ok(())
     }
 
     /// F2 (a): a survivor installs a recovery, then restarts while the
