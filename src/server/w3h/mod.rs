@@ -15,7 +15,8 @@
 //! entropy/wall-clock shim (`scripts/w3h/w3h_shim.c`) is preloaded, the
 //! wall clock is a fixed base plus virtual time: each `clock_gettime`
 //! pulls the current virtual offset (no 1 ms ticker race; #1245), and
-//! all OS entropy is seeded.
+//! OS entropy is seeded per spawned task so one task's draws do not move
+//! another's stream.
 //!
 //! Determinism (plan §3a): [`Sim::finish`] renders the fabric's canonical
 //! trace up to the `teardown begins` mark and prints
@@ -94,6 +95,7 @@ const GATED_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20
 struct Shim {
     set_wall_offset_ns: unsafe extern "C" fn(u64),
     set_virt_time_ns_fn: unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
+    set_entropy_key_fn: unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
     thread_stats: unsafe extern "C" fn(*mut libc::c_char, usize) -> libc::c_int,
 }
 
@@ -132,6 +134,17 @@ unsafe extern "C" fn virt_offset_ns() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+/// C ABI: the current spawned task's id, or 0 when this draw is on the
+/// test body (`block_on`) or a thread with no task. 0 selects the shim's
+/// OS-thread stream. Must not draw entropy itself.
+unsafe extern "C" fn entropy_task_key() -> u64 {
+    let Some(id) = tokio::task::try_id() else {
+        return 0;
+    };
+    // `Id` prints as its integer. A parse failure selects the thread stream.
+    id.to_string().parse().unwrap_or(0)
+}
+
 /// Test helper: install the pull origin on the current runtime.
 #[cfg(test)]
 pub(super) fn install_virt_clock_for_test(origin: tokio::time::Instant) {
@@ -161,10 +174,11 @@ impl Shim {
         use rand::RngCore as _;
         // SAFETY: `dlsym` with RTLD_DEFAULT and NUL-terminated names has no
         // preconditions; null means "not found".
-        let (set_wall, set_virt, active, calls, stats) = unsafe {
+        let (set_wall, set_virt, set_entropy, active, calls, stats) = unsafe {
             (
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_wall_offset_ns".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_virt_time_ns_fn".as_ptr()),
+                libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_entropy_key_fn".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_active".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_entropy_calls".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_thread_stats".as_ptr()),
@@ -172,6 +186,7 @@ impl Shim {
         };
         if set_wall.is_null()
             || set_virt.is_null()
+            || set_entropy.is_null()
             || active.is_null()
             || calls.is_null()
             || stats.is_null()
@@ -180,13 +195,17 @@ impl Shim {
         }
         // SAFETY: these are the shim's exported functions with exactly these
         // C ABI signatures (`scripts/w3h/w3h_shim.c`).
-        let (set_wall_offset_ns, set_virt_time_ns_fn, active, calls) = unsafe {
+        let (set_wall_offset_ns, set_virt_time_ns_fn, set_entropy_key_fn, active, calls) = unsafe {
             (
                 std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(u64)>(set_wall),
                 std::mem::transmute::<
                     *mut libc::c_void,
                     unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
                 >(set_virt),
+                std::mem::transmute::<
+                    *mut libc::c_void,
+                    unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
+                >(set_entropy),
                 std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn() -> libc::c_int>(
                     active,
                 ),
@@ -222,6 +241,7 @@ impl Shim {
         Ok(Self {
             set_wall_offset_ns,
             set_virt_time_ns_fn,
+            set_entropy_key_fn,
             thread_stats,
         })
     }
@@ -266,6 +286,20 @@ impl Shim {
         // SAFETY: `virt_offset_ns` matches the shim's C ABI; it only locks
         // `VIRT_CLOCK`, enters the owning handle, and reads the paused clock.
         unsafe { (self.set_virt_time_ns_fn)(Some(virt_offset_ns)) }
+        self.install_entropy_key();
+    }
+
+    /// Per-task entropy. A spawned task's `getrandom` uses its task id as
+    /// the stream key, so another task's draws do not move it (#1245).
+    fn install_entropy_key(self) {
+        // SAFETY: `entropy_task_key` matches the shim's C ABI. It reads the
+        // current task id and does not draw entropy.
+        unsafe { (self.set_entropy_key_fn)(Some(entropy_task_key)) }
+    }
+
+    fn clear_entropy_key(self) {
+        // SAFETY: clearing the key fn is a plain atomic store in the shim.
+        unsafe { (self.set_entropy_key_fn)(None) }
     }
 
     fn clear_virt_time(self) {
@@ -274,6 +308,7 @@ impl Shim {
         *VIRT_CLOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.clear_entropy_key();
     }
 }
 
@@ -683,10 +718,10 @@ impl Sim {
 
     /// A fabric, clock gate and WARN-log capture with no daemons yet.
     /// `labels` names every node the case will start: their machine and
-    /// agent keys are generated here, on the test thread, before any daemon
-    /// runs. Daemons draw entropy on the test thread too (one current-thread
-    /// runtime), so a key generated after a daemon starts would depend on
-    /// how many draws that daemon's tasks happened to make first.
+    /// agent keys are generated here, on the test body, before any daemon
+    /// runs. The test body has no spawned-task id, so keygen stays on the
+    /// main-thread entropy stream. A daemon task's later `getrandom` uses
+    /// that task's own stream and does not move these keys (#1245).
     pub(crate) fn empty(case: &str, seed: u64, labels: &[&str]) -> Result<Self> {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::Layer as _;
