@@ -1545,6 +1545,273 @@ pub(in crate::server) struct PendingJoinRefusal {
     pub cached_signature_b64: Option<String>,
 }
 
+/// ADR 0108 §8 (#1575): the cause names this tree stages pending notices
+/// for. A cause is a registered name of 1 to 64 bytes from `[a-z0-9_]`;
+/// these are the local halves of §8's registry rows whose staging rules
+/// need no wire change. The S4-registered `crypto_only_gap` row lands with
+/// the wire half below.
+const JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING: &str = "owner_certificate_pending";
+const JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN: &str = "no_eligible_admin";
+
+/// ADR 0108 §8: a cause name must be 1 to 64 bytes of `[a-z0-9_]`. A name
+/// a joiner does not know is shown as `unrecognized_cause`, never a decode
+/// failure, so the registry stays open — this gate only keeps a staged
+/// row's own name well-formed.
+fn valid_join_pending_cause(cause: &str) -> bool {
+    !cause.is_empty()
+        && cause.len() <= 64
+        && cause
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// ADR 0108 §8 — a notice detail: at most the three optional fields a
+/// registry row names (`count`, `revision`, `digests`). Detail may name
+/// counts, revisions and committed certificate digests; it never carries
+/// agent IDs, certificate bytes, roster entries or key material.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(in crate::server) struct JoinPendingNoticeDetail {
+    pub(in crate::server) count: Option<u32>,
+    pub(in crate::server) revision: Option<u64>,
+    pub(in crate::server) digests: Vec<String>,
+}
+
+/// ADR 0108 §8 (#1575) — a member-side STAGED notice for one held join
+/// attempt, keyed `(group_id, member_agent_id, attempt_id)` exactly like a
+/// staged refusal. Unsigned, in-memory local state only: the signed wire
+/// `JoinPendingNotice` (ML-DSA over canonical bytes, domain
+/// `x0x.named_group.join_pending.v1`) and the `JoinResultMessage::Pending`
+/// serving arm need David's ruling (#1575), so nothing here reaches a
+/// joiner yet. Like a staged refusal it is dropped when a Result or Refused
+/// is staged for the attempt, when its cause clears at the next poll-time
+/// evaluation, and at the 10-minute join staging lifetime.
+pub(in crate::server) struct PendingJoinNotice {
+    pub(in crate::server) cause: &'static str,
+    pub(in crate::server) detail: JoinPendingNoticeDetail,
+    /// The signer §8 names for the cause: the pinned authority, or — for
+    /// `no_eligible_admin` — any Active member (D154). Always this node.
+    pub(in crate::server) signer_agent_id: String,
+    pub(in crate::server) created_at: std::time::Instant,
+}
+
+/// ADR 0108 §8 staging: insert or refresh the notice for one attempt.
+/// TTL-swept at the join staging lifetime, like the staged refusals the
+/// staging sits beside.
+async fn stage_join_pending_notice(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    cause: &'static str,
+    detail: JoinPendingNoticeDetail,
+) {
+    debug_assert!(valid_join_pending_cause(cause), "registry cause shape");
+    let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
+    let signer_agent_id = hex::encode(state.agent.identity().agent_id().as_bytes());
+    let mut notices = state
+        .pending_join_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    notices.retain(|_, notice| notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    // §8 Q3 bound: the same 1024-entry cap as the staged refusals beside
+    // this map, evicting the oldest. The poll path stages under a
+    // joiner-chosen attempt id, so without this a single verified agent
+    // could grow the map without limit.
+    if notices.len() >= JOIN_REFUSAL_MAX_ENTRIES {
+        if let Some(oldest) = notices
+            .iter()
+            .min_by_key(|(_, notice)| notice.created_at)
+            .map(|(k, _)| k.clone())
+        {
+            notices.remove(&oldest);
+        }
+    }
+    notices.insert(
+        key,
+        PendingJoinNotice {
+            cause,
+            detail,
+            signer_agent_id,
+            created_at: Instant::now(),
+        },
+    );
+    tracing::debug!(
+        group_id = %LogHexId::group(group_id),
+        member = %LogHexId::agent(member_agent_id),
+        attempt_id = %attempt_id,
+        cause,
+        "ADR 0108 §8: staged join pending notice for a held join attempt"
+    );
+}
+
+/// ADR 0108 §8: a staged notice is dropped the moment a Result or Refused
+/// is staged for the same `(group, member, attempt)` — either terminal
+/// answer replaces it — or when its cause clears at the next poll-time
+/// evaluation.
+fn drop_staged_join_pending_notice(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+) {
+    let dropped = state
+        .pending_join_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ));
+    if let Some(notice) = dropped {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            attempt_id = %attempt_id,
+            cause = notice.cause,
+            signer = %LogHexId::agent(&notice.signer_agent_id),
+            detail = ?notice.detail,
+            "ADR 0108 §8: dropped the staged join pending notice"
+        );
+    }
+}
+
+/// ADR 0108 §8 signer rule (D154) at the join-result poll: with no staged
+/// Result or Refused, any Active member that receives a joiner's VERIFIED,
+/// attempt-bound fetch re-evaluates the notice conditions against its
+/// current committed roster. While verified revocations cover every admin
+/// seat (ADR 0110 §4, [`join_artifact_no_eligible_admin`]), it stages the
+/// single cause `no_eligible_admin`, with no detail; it never signs any
+/// other cause. When the conditions do not hold — an eligible admin
+/// returned (which clears only the D154 cause it ended), this node lost its
+/// Active seat, the joiner was removed, banned or revoked, or the group is
+/// withdrawn, quarantined or gone — the staged notice for the attempt is
+/// dropped (§8: a notice is dropped when its cause clears). A cause the
+/// poll cannot re-evaluate — S2's `owner_certificate_pending`, whose exit
+/// is the seal succeeding or the attempt ending — keeps its staged notice
+/// here; the Result and Refused staging hooks clear it. §8's selection
+/// order (Result, then Refused, then notice) is re-checked at entry: the
+/// caller holds the group's membership critical section when it still has
+/// it, and stays correct when it must re-acquire the section after the
+/// refusal probe consumed the guard — a terminal answer staged in that gap
+/// forbids staging and drops any staged notice. The wire half adds D154's
+/// full attempt binding (`attempt_evidence`); on today's wire any verified
+/// sender that names `member_agent_id` as itself reaches this evaluation,
+/// and the §8 Q3 cap bounds what it can stage. The notice grants nothing:
+/// it carries no key, Welcome, roster or certificate bytes.
+async fn evaluate_polled_join_pending_notice(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: Option<&str>,
+) {
+    // §8's pre-admission amendment (D145) binds every notice to the
+    // attempt: a poll without an attempt id stages nothing.
+    let Some(attempt_id) = attempt_id else {
+        return;
+    };
+    let drop_notice =
+        || drop_staged_join_pending_notice(state, group_id, member_agent_id, attempt_id);
+    // §8 selection order: a staged Result or Refused for this member's
+    // attempt replaces any notice, so neither may be staged over.
+    {
+        let results = state.pending_join_results.read().await;
+        if results
+            .get(&join_result_key(group_id, member_agent_id))
+            .is_some_and(|pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+        {
+            drop_notice();
+            return;
+        }
+    }
+    if state
+        .pending_join_refusals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+    {
+        drop_notice();
+        return;
+    }
+    // §8 extra conditions for a notice: the joiner holds no revoked agent.
+    // A revocation resync gap fails closed — nothing is staged over
+    // unverifiable revocation state.
+    let Some(joiner_agent) = parse_agent_id_hex(member_agent_id).ok() else {
+        drop_notice();
+        return;
+    };
+    let revoked_joiner = {
+        let revocation_set = state.agent.revocation_set();
+        let set = revocation_set.read().await;
+        if set.revocation_resync_required() {
+            drop_notice();
+            return;
+        }
+        set.is_agent_revoked(&joiner_agent)
+    };
+    // ... no Removed or Banned seat, and the group is not withdrawn,
+    // quarantined or deleted. D154's signer rule also needs THIS node to
+    // hold an Active seat: only a member may sign.
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (group_blocks, joiner_seat_blocks, this_node_active) = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            // §8: a deleted (or never-known) group blocks every notice
+            // condition, so any staged notice for it is dropped here.
+            drop_notice();
+            return;
+        };
+        (
+            info.withdrawn || info.is_fork_quarantined(),
+            info.members_v2
+                .get(member_agent_id)
+                .is_some_and(|seat| seat.is_removed() || seat.is_banned()),
+            info.has_active_member(&local_hex),
+        )
+    };
+    if group_blocks || joiner_seat_blocks || revoked_joiner || !this_node_active {
+        drop_notice();
+        return;
+    }
+    match join_artifact_no_eligible_admin(state, group_id).await {
+        Err(JoinArtifactRefusal::NoEligibleAdmin) => {
+            stage_join_pending_notice(
+                state,
+                group_id,
+                member_agent_id,
+                attempt_id,
+                JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+                JoinPendingNoticeDetail::default(),
+            )
+            .await;
+        }
+        // The D154 cover ended, so only the D154 cause clears at this
+        // poll. Another cause — S2's `owner_certificate_pending` — is
+        // owned by the seal path: it clears when that path stages the
+        // terminal answer (the Result and Refused hooks above), never
+        // here.
+        _ => {
+            let cause_is_d154 = state
+                .pending_join_notices
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&join_refusal_refusal_key(
+                    group_id,
+                    member_agent_id,
+                    attempt_id,
+                ))
+                .is_some_and(|notice| notice.cause == JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN);
+            if cause_is_d154 {
+                drop_notice();
+            }
+        }
+    }
+}
+
 /// #477 — a joiner-side pending-join attempt. Keyed `join_result_key`.
 pub(in crate::server) struct PendingJoinAttempt {
     pub attempt_id: String,
@@ -40915,6 +41182,9 @@ async fn stage_join_result(
             member_agent_id,
             attempt_id,
         ));
+        // ADR 0108 §8: the staged Result replaces a staged pending notice
+        // for the same attempt, exactly as it replaces a staged refusal.
+        drop_staged_join_pending_notice(state, group_id, member_agent_id, attempt_id);
     }
     let key = join_result_key(group_id, member_agent_id);
     let event_kind = named_group_metadata_event_kind(&event);
@@ -41447,6 +41717,10 @@ async fn remove_listener_if_token(state: &AppState, key: &str, token: u64) {
 /// CERT_EVIDENCE_DEADLINE_MS for the same join attempt. The seal publishes
 /// a group-scoped fetch each time, so until then the refusal stays
 /// retryable. In-grace members (evidence in flight) never stage a refusal.
+/// ADR 0108 §8 (#1575): every OwnerCertMemberPending seal refusal also
+/// stages the `owner_certificate_pending` notice immediately (see
+/// [`stage_join_pending_notice`]); the deadline gate below bounds only the
+/// terminal refusal.
 async fn stage_refusal_if_certificates_unobtainable(
     state: &AppState,
     group_key: &str,
@@ -41466,6 +41740,23 @@ async fn stage_refusal_if_certificates_unobtainable(
     let Some(attempt_id) = member_joined_event_attempt_id(event) else {
         return;
     };
+    // ADR 0108 §8 (#1575): every OwnerCertMemberPending seal refusal
+    // stages the pending-notice cause at once, with the pending-seat
+    // count — while the typed REFUSAL below stays deadline-gated and
+    // retryable. The notice drops when the seal later succeeds (the
+    // staged Result removes it) or when the refusal terminalizes.
+    stage_join_pending_notice(
+        state,
+        group_key,
+        member_agent_id,
+        &attempt_id,
+        JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING,
+        JoinPendingNoticeDetail {
+            count: Some(pending.len() as u32),
+            ..JoinPendingNoticeDetail::default()
+        },
+    )
+    .await;
     let (all_digest_only, stable_group_id) = {
         let groups = state.named_groups.read().await;
         let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_key) else {
@@ -41535,6 +41826,9 @@ async fn stage_join_refusal(
         signature_b64: String::new(),
     };
     let key = join_refusal_refusal_key(group_id, member_agent_id, &receipt.attempt_id);
+    // ADR 0108 §8: the staged Refused replaces a staged pending notice for
+    // the same attempt, exactly as a staged Result does.
+    drop_staged_join_pending_notice(state, group_id, member_agent_id, &receipt.attempt_id);
     let mut refusals = state
         .pending_join_refusals
         .lock()
@@ -44361,7 +44655,7 @@ async fn handle_join_result_message_bound(
             // during the seat-to-result interval wakes and re-reads the
             // newly staged result (T4(b)).
             let membership_arc = group_membership_lock_for_known_group(state, &group_id).await;
-            let selection_guard = match &membership_arc {
+            let mut selection_guard = match &membership_arc {
                 Some(arc) => Some(arc.lock().await),
                 None => None,
             };
@@ -44390,7 +44684,7 @@ async fn handle_join_result_message_bound(
                     if let Some(attempt_id) = attempt_id.as_deref() {
                         // Results take precedence: a successful staging
                         // for this triple removed the refusal already.
-                        let refusal_response = match selection_guard {
+                        let refusal_response = match selection_guard.take() {
                             Some(guard) => {
                                 serve_staged_join_refusal(
                                     state,
@@ -44421,6 +44715,33 @@ async fn handle_join_result_message_bound(
                     member = %member_agent_id,
                     pending_count,
                 );
+                // ADR 0108 §8 (D154, #1575): no Result and no Refused is
+                // staged. A verified, attempt-bound poll from a held joiner
+                // re-evaluates the notice causes this member may sign and
+                // stages the typed local cause; the signed `Pending` serve
+                // itself waits on the wire ruling, so nothing is sent here.
+                // The refusal probe above may have consumed the caller's
+                // guard; re-acquire the critical section so §8's Result →
+                // Refused → notice selection stays linearized (the entry
+                // re-check inside covers a terminal answer staged in the
+                // gap).
+                if verified {
+                    let notice_section = match selection_guard.take() {
+                        Some(guard) => Some(guard),
+                        None => match &membership_arc {
+                            Some(arc) => Some(arc.lock().await),
+                            None => None,
+                        },
+                    };
+                    evaluate_polled_join_pending_notice(
+                        state,
+                        &group_id,
+                        &member_agent_id,
+                        attempt_id.as_deref(),
+                    )
+                    .await;
+                    drop(notice_section);
+                }
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
             };
@@ -46617,6 +46938,32 @@ pub(in crate::server) type WelcomeFetchWaiter =
 pub(in crate::server) mod tests {
     use super::*;
 
+    /// ADR 0108 §8 (#1575): the notice currently staged for one
+    /// `(group, member, attempt)`, as `(cause, signer_agent_id, detail)`.
+    pub(in crate::server) fn staged_join_pending_notice(
+        state: &AppState,
+        group_id: &str,
+        member_agent_id: &str,
+        attempt_id: &str,
+    ) -> Option<(String, String, JoinPendingNoticeDetail)> {
+        state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&join_refusal_refusal_key(
+                group_id,
+                member_agent_id,
+                attempt_id,
+            ))
+            .map(|notice| {
+                (
+                    notice.cause.to_string(),
+                    notice.signer_agent_id.clone(),
+                    notice.detail.clone(),
+                )
+            })
+    }
+
     #[test]
     fn s2_welcome_decodes_from_reverified_cold_evidence() {
         use x0x::peer_evidence::{
@@ -46779,6 +47126,7 @@ pub(in crate::server) mod tests {
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
     mod issue877_error_body_session;
+    mod join_pending_notice_1575;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     #[path = "issue1105_public_revision_catchup.rs"]
@@ -47529,6 +47877,7 @@ pub(in crate::server) mod tests {
             mls_groups_path: data_dir.join("mls_groups.bin"),
             pending_join_results: RwLock::new(HashMap::new()),
             pending_join_refusals: StdMutex::new(HashMap::new()),
+            pending_join_notices: StdMutex::new(HashMap::new()),
             pending_join_attempts: StdMutex::new(HashMap::new()),
             last_join_outcomes: StdMutex::new(HashMap::new()),
             join_refusal_sign_limiter: StdMutex::new(Default::default()),
