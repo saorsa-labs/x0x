@@ -19,7 +19,8 @@
 //! another's stream. With `--cfg tokio_unstable` the seed is the spawn
 //! lineage (parent, spawn site, and child index), not the process-wide
 //! task id, so an earlier spawn at another site cannot move a signature
-//! (#1245). Release binaries are not built with that cfg.
+//! (#1245). A lookup miss is counted and fails the case. Release binaries
+//! are not built with that cfg.
 //!
 //! Determinism (plan §3a): [`Sim::finish`] renders the fabric's canonical
 //! trace up to the `teardown begins` mark and prints
@@ -145,9 +146,12 @@ unsafe extern "C" fn entropy_task_key() -> u64 {
 }
 
 /// Stream key for the current task. A runtime built by [`block_on_paused`]
-/// under `tokio_unstable` returns the lineage key recorded at spawn. Any
-/// other runtime returns the task id, which still isolates siblings and
-/// still moves when an earlier spawn shifts the process-wide counter.
+/// under `tokio_unstable` returns the lineage key recorded at spawn. A miss
+/// is counted. [`block_on_paused`] and [`receipt::Receipt::emit`] fail the
+/// case when that count is not zero, so a runtime with no spawn hooks
+/// cannot fall back to the process-wide task id without a failure. Without
+/// `tokio_unstable` the key is the task id. That still isolates siblings
+/// and still moves when an earlier spawn shifts the process-wide counter.
 fn current_task_entropy_key() -> u64 {
     let Some(id) = tokio::task::try_id() else {
         return 0;
@@ -156,7 +160,25 @@ fn current_task_entropy_key() -> u64 {
     if bits == 0 {
         return 0;
     }
-    lineage::lookup(bits).unwrap_or(bits)
+    if let Some(key) = lineage::lookup(bits) {
+        return key;
+    }
+    // The shim calls this through a C function. A panic here would unwind
+    // into that shim. Count the miss and keep the task-id fallback for this
+    // draw. The case fails at the Rust boundary.
+    lineage::note_miss();
+    bits
+}
+
+/// Fail the test when a `tokio_unstable` build drew a key for a task that
+/// had no recorded spawn. The count stays zero on any other build.
+fn ensure_lineage_recorded() {
+    let misses = lineage::misses();
+    assert_eq!(
+        misses, 0,
+        "W3-H lineage lookup missed {misses} times under tokio_unstable; \
+         the runtime has no spawn hooks and fell back to the process-wide task id"
+    );
 }
 
 /// `Id` prints as its integer. A parse failure selects the thread stream.
@@ -165,7 +187,8 @@ fn task_id_bits(id: tokio::task::Id) -> u64 {
 }
 
 /// Paused current-thread runtime for one W3-H test. Under `tokio_unstable`
-/// every spawn records a lineage key before the task runs.
+/// every spawn records a lineage key before the task runs. A lookup miss
+/// fails the test after the future finishes.
 pub(crate) fn block_on_paused<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T>,
@@ -174,7 +197,9 @@ where
     let mut builder = tokio::runtime::Builder::new_current_thread();
     builder.enable_all().start_paused(true);
     lineage::install(&mut builder);
-    builder.build().expect("w3h runtime").block_on(future)
+    let result = builder.build().expect("w3h runtime").block_on(future);
+    ensure_lineage_recorded();
+    result
 }
 
 #[cfg(tokio_unstable)]
@@ -200,7 +225,13 @@ mod lineage {
         }
     }
 
+    /// Process-global. Two tests in one process share these counters and
+    /// can move each other's keys. W3-H requires nextest, which runs one
+    /// test per process. [`super::block_on_paused`] clears the table first.
     static TABLE: Mutex<Table> = Mutex::new(Table::empty());
+
+    /// Lookup misses for this process. Same process-global limit as [`TABLE`].
+    static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn lock() -> std::sync::MutexGuard<'static, Table> {
         TABLE
@@ -210,6 +241,15 @@ mod lineage {
 
     pub(super) fn reset() {
         *lock() = Table::empty();
+        MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn note_miss() {
+        MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn misses() -> u64 {
+        MISSES.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(super) fn lookup(task_id: u64) -> Option<u64> {
@@ -222,9 +262,11 @@ mod lineage {
     }
 
     /// The hook runs on the spawner, before the child is scheduled, so
-    /// `try_id` is the parent. `block_on` has no task id; those children
-    /// hang off parent key 0. A child index counts spawns of one parent at
-    /// one source location, so a spawn at another location does not move it.
+    /// `try_id` is the parent. `block_on` and any other thread with no task
+    /// id have no parent key. Their children share parent key 0, and they
+    /// share one child counter per spawn site. A child index counts spawns
+    /// of one parent at one source location, so a spawn at another location
+    /// does not move it.
     fn note_spawn(meta: &tokio::runtime::TaskMeta<'_>) {
         let child = super::task_id_bits(meta.id());
         if child == 0 {
@@ -252,6 +294,10 @@ mod lineage {
         lock().by_task.remove(&child);
     }
 
+    /// FNV-1a of [`std::panic::Location::file`], line, and column.
+    /// `file()` for a registry crate is an absolute path under `CARGO_HOME`,
+    /// so the key is stable on one machine and differs across hosts. A
+    /// workspace path is relative to the crate and is stable across machines.
     fn site_key(loc: &'static std::panic::Location<'static>) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
         for byte in loc.file().as_bytes() {
@@ -288,6 +334,13 @@ mod lineage {
 
     pub(super) fn lookup(_task_id: u64) -> Option<u64> {
         None
+    }
+
+    /// The task-id fallback is the only key on this build. It is not a miss.
+    pub(super) fn note_miss() {}
+
+    pub(super) fn misses() -> u64 {
+        0
     }
 
     pub(super) fn install(_builder: &mut tokio::runtime::Builder) {}

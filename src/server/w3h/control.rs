@@ -410,6 +410,42 @@ fn w3h_lineage_key_ignores_an_unrelated_root_spawn() {
     );
 }
 
+/// #1245: a runtime with no spawn hooks does not record lineage. The miss
+/// must fail the case. A silent fallback to the process-wide task id is
+/// the instability this key removes.
+#[cfg(tokio_unstable)]
+#[test]
+fn w3h_lineage_miss_fails_the_case() {
+    super::lineage::reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        tokio::spawn(async {
+            let _ = super::current_task_entropy_key();
+        })
+        .await
+        .expect("worker");
+    });
+    assert!(
+        super::lineage::misses() > 0,
+        "an unhooked runtime must count a lineage miss"
+    );
+    let panicked = std::panic::catch_unwind(super::ensure_lineage_recorded);
+    super::lineage::reset();
+    let payload = panicked.expect_err("a lineage miss must fail the case");
+    let text = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        text.contains("lineage lookup missed"),
+        "panic text was {text}"
+    );
+}
+
 #[cfg(target_os = "linux")]
 type ShimTestFill = unsafe extern "C" fn(u64, *mut libc::c_void, usize);
 #[cfg(target_os = "linux")]
