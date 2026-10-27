@@ -9,6 +9,8 @@
 //! when the format releases: a change to the field order or to a field's
 //! type then fails [`v1_sidecar_fixture_decodes_and_re_encodes_exactly`].
 
+#![cfg(test)]
+
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
