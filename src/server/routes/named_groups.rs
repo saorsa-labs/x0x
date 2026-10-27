@@ -7605,6 +7605,11 @@ async fn rebind_envelope_for(
     if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
         return Ok(None);
     }
+    // #1567: a staged re-seat's metadata seal keeps the original's tree on
+    // disk, as the roster view keeps the original record.
+    if let Some(cover) = reseat_snapshot_cover(state, group_id).await? {
+        return Ok(Some(cover));
+    }
     // Arm 1: live group — encode the current snapshot under the new
     // binding. Contention retried briefly, then failed.
     let live = {
@@ -34314,6 +34319,14 @@ fn encode_treekem_snapshot_envelope(
     let snapshot = group
         .to_snapshot_bytes()
         .map_err(|e| anyhow::anyhow!("treekem snapshot encode: {e}"))?;
+    encode_treekem_snapshot_envelope_bytes(info, snapshot)
+}
+
+/// [`encode_treekem_snapshot_envelope`] for snapshot bytes already taken.
+fn encode_treekem_snapshot_envelope_bytes(
+    info: &x0x::groups::GroupInfo,
+    snapshot: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
     let mut bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
     let envelope = TreeKemSnapshotEnvelope {
         version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
@@ -34353,6 +34366,46 @@ fn treekem_snapshot_envelope_matches_info(
     envelope.state_revision == info.state_revision
         && envelope.state_hash == info.state_hash
         && envelope.security_binding == info.security_binding
+}
+
+/// ADR 0109 §3 step 2 (#1567): the snapshot envelope that `<group_id_hex>.snap`
+/// must hold while a re-seat of that key is staged, or `None` when no
+/// re-seat is staged there.
+///
+/// The staged join installs its tree under the original's key. The legacy
+/// overlay keeps the original record in the roster files until the swap,
+/// so the snapshot file must keep the original's tree too. Otherwise a
+/// restart, or a released binary, finds the original record beside the
+/// staged tree. When the epochs match, the startup re-bind (#457) then
+/// pairs them. The cover is the journalled tree bound to the journalled
+/// record, or else the snapshot file as it is (the original's). The staged
+/// tree reaches disk only in the swap ([`group_recovery`]'s
+/// `swap_staged_tree`).
+///
+/// Callers hold `named_groups_persistence_lock`, which the swap also
+/// holds when it ends the cover.
+///
+/// # Errors
+///
+/// The original has no snapshot to keep: the caller writes nothing, so the
+/// staged join fails and the re-seat rolls back.
+async fn reseat_snapshot_cover(state: &AppState, group_id_hex: &str) -> Result<Option<Vec<u8>>> {
+    let Some(journal) = group_recovery::staging_journal_for_key(state, group_id_hex).await else {
+        return Ok(None);
+    };
+    if let Some(tree) = journal.live_tree {
+        let original: x0x::groups::GroupInfo = serde_json::from_slice(&journal.live_record)
+            .map_err(|e| anyhow::anyhow!("re-seat journal record decode: {e}"))?;
+        return encode_treekem_snapshot_envelope_bytes(&original, tree).map(Some);
+    }
+    tokio::fs::read(treekem_snapshot_path(&state.treekem_dir, group_id_hex))
+        .await
+        .map(Some)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "ADR 0109 S3: a re-seat is staged and the original has no TreeKEM snapshot to keep: {e}"
+            )
+        })
 }
 
 async fn persist_treekem_snapshot_bytes(
@@ -34436,6 +34489,12 @@ pub(super) async fn persist_treekem_snapshot_bound(
         "withdrawn_snapshot_persist",
     )
     .await?;
+    // #1567: while a re-seat is staged here, the file keeps the original's
+    // tree. A retained journal then needs no refresh: its envelope is the
+    // same cover.
+    if let Some(cover) = reseat_snapshot_cover(state, group_id_hex).await? {
+        return persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, cover).await;
+    }
     let bytes = encode_treekem_snapshot_envelope(&info, group)?;
     persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, bytes).await?;
     ensure_treekem_persistence_allowed_locked(
@@ -34594,6 +34653,18 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     // the same marker).
     state.group_recovery.hold_reseat_marker(&mut info);
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    persist_treekem_and_named_groups_atomic_locked(state, group_id_hex, info, group).await
+}
+
+/// [`persist_treekem_and_named_groups_atomic_with_info`] for a caller that
+/// already holds `named_groups_persistence_lock` (the ADR 0109 re-seat
+/// swap, #1567).
+async fn persist_treekem_and_named_groups_atomic_locked(
+    state: &AppState,
+    group_id_hex: &str,
+    info: x0x::groups::GroupInfo,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<()> {
     let stable_group_id = info.stable_group_id().to_string();
     #[cfg(test)]
     maybe_force_post_crypto_withdrawn_group_for_test(state, group_id_hex, Some(&stable_group_id))
@@ -34728,7 +34799,13 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     )
     .await;
 
-    let snapshot_envelope = encode_treekem_snapshot_envelope(&info, group)?;
+    // #1567: a staged re-seat keeps the original's tree in the snapshot and
+    // in the journal (which a released binary replays), as the roster view
+    // above keeps the original record.
+    let snapshot_envelope = match reseat_snapshot_cover(state, group_id_hex).await? {
+        Some(cover) => cover,
+        None => encode_treekem_snapshot_envelope(&info, group)?,
+    };
     // 1) Repair payloads first: the legacy journal (old binaries replay it
     //    into snapshot + named_groups.json), then the sidecar journal.
     let journal = TreeKemNamedPersistJournal {

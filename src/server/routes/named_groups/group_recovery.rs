@@ -1258,6 +1258,20 @@ async fn open_reseat_journals(state: &AppState) -> Vec<ReseatJournalV1> {
         .collect()
 }
 
+/// #1567: the open, not yet `Swapping` re-seat journal whose original
+/// record sits under `key`. While it exists, `<key>.snap` (and the
+/// TreeKEM journal envelope written with it) keeps the original's tree:
+/// the TreeKEM half of [`reseat_overlay`].
+pub(super) async fn staging_journal_for_key(
+    state: &AppState,
+    key: &str,
+) -> Option<ReseatJournalV1> {
+    open_reseat_journals(state)
+        .await
+        .into_iter()
+        .find(|journal| journal.live_key == key)
+}
+
 /// §3 step 2 (#1533 review): the staged join runs apart from the
 /// original's containment. While a journal is open and not yet
 /// `Swapping`, every legacy file keeps the journalled original record (its
@@ -5616,9 +5630,10 @@ async fn move_live_record_aside(state: &Arc<AppState>, group_key: &str, info: &G
     state.mls_groups.write().await.remove(group_key);
     // The TreeKEM files stay (#1533 review): with the legacy overlay they
     // keep the original record and its tree paired on disk until the
-    // staged join's own atomic persist replaces the tree. Startup loads
-    // them only at restore, and the rollback rewrites them from the
-    // journal copy.
+    // swap (#1567: the staged join's persists write the original's tree,
+    // `reseat_snapshot_cover`; `swap_staged_tree` writes the staged one).
+    // Startup loads them only at restore, and the rollback rewrites them
+    // from the journal copy.
     state.treekem_groups.write().await.remove(group_key);
     super::save_mls_groups(state).await;
     let mut cache_aliases = aliases;
@@ -5824,37 +5839,26 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
     let journal = &journal;
     let live = live_record_for(state, stable).await;
     let local = local_hex(state);
-    let seated = match live.as_ref() {
+    let seated_key = match live.as_ref() {
         Some((key, info)) if !is_journalled_original(info, journal) => {
             let has_tree = state.treekem_groups.read().await.contains_key(key);
-            journal.staged_result_ready(info, &local, has_tree)
+            journal
+                .staged_result_ready(info, &local, has_tree)
+                .then(|| key.clone())
         }
-        _ => false,
+        _ => None,
     };
-    if !seated {
+    let Some(key) = seated_key else {
         return false;
-    }
+    };
     let expected = journal.record_digest;
     // §3 step 3 (#1533 review): `Swapping` lifts the legacy overlay and the
     // marker hold, then one durable roster write puts the staged record in
     // the legacy files without the original's marker before the journal
     // closes. A crash before that write loads the original, which rolls
     // back.
-    if journal.phase != ReseatPhase::Swapping {
-        let mut marked = false;
-        let marked_ref = &mut marked;
-        let durable = update_sidecar(state, stable, move |body| {
-            if let Some(open) = body.reseat_journal.as_mut() {
-                if open.record_digest == expected {
-                    open.phase = ReseatPhase::Swapping;
-                    *marked_ref = true;
-                }
-            }
-        })
-        .await;
-        if !(durable && marked) {
-            return true;
-        }
+    if !swap_staged_tree(state, stable, journal, &key).await {
+        return true;
     }
     if !lift_staging_marker(state, stable, journal).await {
         tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the swapped-in record is not durable yet; it keeps the original's marker and the swap is retried");
@@ -5893,6 +5897,74 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
         }
     }
     true
+}
+
+/// §3 step 3 (#1567): mark the journal `Swapping` and, in the same hold of
+/// `named_groups_persistence_lock`, put the staged record and its tree on
+/// disk in one TreeKEM persist transaction. Until then the snapshot file
+/// keeps the original's tree (`reseat_snapshot_cover`), as the roster
+/// files keep the original record. `Swapping` ends both covers, so no
+/// other roster write may come between it and the tree write: the lock
+/// keeps the original record and tree, or the staged record and tree,
+/// paired on disk at every point. A crash before the transaction's
+/// journal loads the original pair, which rolls back.
+///
+/// A failed tree write that did not reach the commit point puts the
+/// journal back to `Staging` (the covers apply again), and the next tick
+/// retries. A group with no tree (GSS) needs only the mark. Returns
+/// whether the swap may go on to [`lift_staging_marker`].
+async fn swap_staged_tree(
+    state: &AppState,
+    stable: &str,
+    journal: &ReseatJournalV1,
+    key: &str,
+) -> bool {
+    let expected = journal.record_digest;
+    let tree = state.treekem_groups.read().await.get(key).cloned();
+    // Lock order as every TreeKEM persist: the group, then the store.
+    let guard = match tree.as_ref() {
+        Some(tree) => Some(tree.lock().await),
+        None => None,
+    };
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    if journal.phase != ReseatPhase::Swapping {
+        let mut marked = false;
+        let marked_ref = &mut marked;
+        let durable = update_sidecar(state, stable, move |body| {
+            if let Some(open) = body.reseat_journal.as_mut() {
+                if open.record_digest == expected {
+                    open.phase = ReseatPhase::Swapping;
+                    *marked_ref = true;
+                }
+            }
+        })
+        .await;
+        if !(durable && marked) {
+            return false;
+        }
+    }
+    let Some(guard) = guard else {
+        return true;
+    };
+    let Some(info) = state.named_groups.read().await.get(key).cloned() else {
+        return false;
+    };
+    match super::persist_treekem_and_named_groups_atomic_locked(state, key, info, &guard).await {
+        Ok(()) => true,
+        Err(error) if super::self_leave_persist_left_epoch_installed(&error) => true,
+        Err(error) => {
+            tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged tree is not durable yet; the original stays on disk and the swap is retried: {error}");
+            let _ = update_sidecar(state, stable, move |body| {
+                if let Some(open) = body.reseat_journal.as_mut() {
+                    if open.record_digest == expected {
+                        open.phase = ReseatPhase::Staging;
+                    }
+                }
+            })
+            .await;
+            false
+        }
+    }
 }
 
 /// §3 step 3: the swap's roster write. The staged record (every record of
@@ -8595,6 +8667,17 @@ mod tests {
         let marker = original_marker(&state, &original);
         original.fork_quarantine = Some(marker.clone());
         assert!(open_staging_journal_for_test(&state, &key, &original).await?);
+        // #1567: the journal carries the original's tree, which the snapshot
+        // file keeps while the join is staged.
+        let original_tree = tree.to_snapshot_bytes()?;
+        assert!(
+            update_sidecar(&state, original.stable_group_id(), move |body| {
+                if let Some(journal) = body.reseat_journal.as_mut() {
+                    journal.live_tree = Some(original_tree);
+                }
+            })
+            .await
+        );
         // The stub install, then the Welcome install of a `next` with no
         // marker.
         let (write_key, record) = (key.clone(), staged.clone());
@@ -8617,6 +8700,177 @@ mod tests {
             .expect("the staged record is live");
         assert_eq!(live.fork_quarantine, Some(marker));
         assert!(held_join_state(&state, &live).await.is_none());
+        Ok(())
+    }
+
+    /// #1567 fixture: a contained TreeKEM original, durable with its tree
+    /// (epoch 0), and an open `Staging` journal that holds both. Then the
+    /// staged join's Welcome install under the same key: a new record (one
+    /// commit later) and a different tree at the same epoch, so the startup
+    /// re-bind (#457) would pair it with the original record. Returns the
+    /// key, the original record, the original tree bytes, the staged
+    /// record and the staged tree bytes.
+    async fn staged_tree_fixture(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<(String, GroupInfo, Vec<u8>, GroupInfo, Vec<u8>)> {
+        let key = "e9".repeat(16);
+        let group_id = hex::decode(&key)?;
+        let creator = state.agent.agent_id();
+        let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id);
+        let original_tree = x0x::mls::TreeKemMlsGroup::create(group_id.clone(), creator, &seed)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let staged_tree = x0x::mls::TreeKemMlsGroup::create(group_id, creator, &[0x67; 32])
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let mut original =
+            GroupInfo::new("treekem".to_string(), String::new(), creator, key.clone());
+        original.migrate_from_v1();
+        original.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        original.shared_secret = None;
+        original.secret_epoch = original_tree.epoch();
+        original.security_binding = Some(format!("treekem:epoch={}", original_tree.epoch()));
+        original.recompute_state_hash();
+        let mut staged = original.clone();
+        staged.seal_commit(state.agent.identity().agent_keypair(), 2_000)?;
+        assert_eq!(staged.security_binding, original.security_binding);
+        original.fork_quarantine = Some(original_marker(state, &original));
+        // The original, durable with its tree, as before the re-seat.
+        super::super::persist_treekem_and_named_groups_atomic_with_info(
+            state,
+            &key,
+            original.clone(),
+            &original_tree,
+        )
+        .await?;
+        let original_bytes = original_tree.to_snapshot_bytes()?;
+        assert!(open_staging_journal_for_test(state, &key, &original).await?);
+        let journal_tree = original_bytes.clone();
+        assert!(
+            update_sidecar(state, original.stable_group_id(), move |body| {
+                if let Some(journal) = body.reseat_journal.as_mut() {
+                    journal.live_tree = Some(journal_tree);
+                }
+            })
+            .await
+        );
+        // The move aside, then the staged join's Welcome install.
+        state.treekem_groups.write().await.remove(&key);
+        let aside = key.clone();
+        super::super::persist_named_groups_mutation(state, move |groups| {
+            groups.remove(&aside).is_some()
+        })
+        .await?;
+        super::super::persist_treekem_and_named_groups_atomic_with_info(
+            state,
+            &key,
+            staged.clone(),
+            &staged_tree,
+        )
+        .await?;
+        let staged_bytes = staged_tree.to_snapshot_bytes()?;
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(staged_tree)));
+        Ok((key, original, original_bytes, staged, staged_bytes))
+    }
+
+    /// The envelope in `<key>.snap` on disk.
+    async fn snapshot_on_disk(
+        state: &AppState,
+        key: &str,
+    ) -> anyhow::Result<super::super::TreeKemSnapshotEnvelope> {
+        let bytes =
+            tokio::fs::read(super::super::treekem_snapshot_path(&state.treekem_dir, key)).await?;
+        super::super::decode_treekem_snapshot_envelope(&bytes)?
+            .ok_or_else(|| anyhow::anyhow!("unbound snapshot"))
+    }
+
+    /// #1567, ADR 0109 §3 steps 2 and 3: while a re-seat join is staged,
+    /// the snapshot file keeps the original's tree, bound to the original
+    /// record, as the roster files keep the original record. A restart (or
+    /// a released binary) loads that pair. Before the fix the staged
+    /// join's Welcome install wrote its own tree to `<key>.snap` beside the
+    /// original record; at the same epoch the startup re-bind paired them.
+    /// The swap then puts the staged tree on disk with the staged record.
+    /// Inert: an offline agent.
+    #[tokio::test]
+    async fn a_staged_reseat_keeps_the_originals_tree_on_disk_until_the_swap() -> anyhow::Result<()>
+    {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, original_tree, staged, staged_tree) =
+            staged_tree_fixture(&state).await?;
+        let stable = original.stable_group_id().to_string();
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert_eq!(legacy.state_hash, original.state_hash, "roster overlay");
+        let envelope = snapshot_on_disk(&state, &key).await?;
+        assert_eq!(
+            (envelope.state_revision, &envelope.state_hash),
+            (original.state_revision, &original.state_hash),
+            "the snapshot stays bound to the original record"
+        );
+        assert!(
+            envelope.snapshot == original_tree,
+            "the snapshot file keeps the original's tree while staged"
+        );
+        // A restart (or a released binary) on these files pairs the
+        // original record with the original's tree.
+        let roster = HashMap::from([(key.clone(), legacy)]);
+        let restored =
+            super::super::restore_treekem_groups(&roster, state.agent.as_ref(), &state.treekem_dir)
+                .await;
+        let tree = restored
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("the original tree restores"))?;
+        assert!(tree.lock().await.to_snapshot_bytes()? == original_tree);
+
+        // The swap: the staged record and its tree reach disk together.
+        let journal = sidecar_snapshot(&state, &stable)
+            .await
+            .and_then(|body| body.reseat_journal)
+            .ok_or_else(|| anyhow::anyhow!("open journal"))?;
+        assert!(swap_staged_tree(&state, &stable, &journal, &key).await);
+        let envelope = snapshot_on_disk(&state, &key).await?;
+        assert_eq!(
+            (envelope.state_revision, &envelope.state_hash),
+            (staged.state_revision, &staged.state_hash)
+        );
+        assert!(
+            envelope.snapshot == staged_tree,
+            "the swap writes the staged tree"
+        );
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert_eq!(legacy.state_hash, staged.state_hash);
+        Ok(())
+    }
+
+    /// #1567: a rolled-back staged re-seat leaves the original record and
+    /// the original's tree paired on disk. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_rolled_back_reseat_keeps_the_originals_tree_on_disk() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, original_tree, _, _) = staged_tree_fixture(&state).await?;
+        let stable = original.stable_group_id().to_string();
+        let journal = sidecar_snapshot(&state, &stable)
+            .await
+            .and_then(|body| body.reseat_journal)
+            .ok_or_else(|| anyhow::anyhow!("open journal"))?;
+        rollback_reseat(&state, &stable, journal.record_digest, "test").await;
+        assert!(sidecar_snapshot(&state, &stable)
+            .await
+            .and_then(|body| body.reseat_journal)
+            .is_none());
+        let envelope = snapshot_on_disk(&state, &key).await?;
+        assert_eq!(envelope.state_hash, original.state_hash);
+        assert!(envelope.snapshot == original_tree);
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert_eq!(legacy.state_hash, original.state_hash);
         Ok(())
     }
 
