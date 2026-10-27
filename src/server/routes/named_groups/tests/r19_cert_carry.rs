@@ -1167,6 +1167,7 @@ fn staged_member_added(
         certificate_b64: Some(cert_b64(member_cert)),
         owner_mandate: None,
         commit: None,
+        reseat_mandate: None,
     }
 }
 
@@ -1277,6 +1278,7 @@ async fn admin_seals_after_owner_device_goes_offline() -> Result<()> {
             head_attestation: None,
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         },
     )
     .await?;
@@ -1549,6 +1551,7 @@ async fn sidecar_never_pushes_an_inline_join_result_over_the_dm_limit() -> Resul
         head_attestation: None,
         roster_certificates_b64: Vec::new(),
         intervening_events: Vec::new(),
+        admin_attestation: None,
     };
     assert!(serde_json::to_vec(&bare)?.len() <= x0x::dm::MAX_PAYLOAD_BYTES);
     let served =
@@ -1816,6 +1819,7 @@ async fn creator_offline_scenario_on_plane(
             head_attestation: None,
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         },
     )
     .await?;

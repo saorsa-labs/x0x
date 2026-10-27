@@ -1710,6 +1710,25 @@ enum GroupSub {
         /// Role to assign: admin | member.
         role: String,
     },
+    /// Re-seat a forked or removed node by hand (admin+, ADR 0109 §3).
+    Reseat {
+        /// Group ID.
+        group_id: String,
+        /// Agent hex of the node to re-seat.
+        agent_id: String,
+        /// The operator's reason (required, non-empty).
+        #[arg(long)]
+        reason: String,
+        /// The basis as JSON, e.g.
+        /// '{"kind":"removal","revision":7,"state_hash":"..."}'.
+        #[arg(long)]
+        basis: String,
+    },
+    /// Show this node's ADR 0109 recovery state for a group.
+    Recovery {
+        /// Group ID.
+        group_id: String,
+    },
     /// Self-rebind this agent's renewed certificate into its seat before
     /// the cutoff `not_after − τ` (ADR 0110 §4a).
     RebindCertificate {
@@ -3025,6 +3044,15 @@ async fn run(
                 agent_id,
                 role,
             }) => commands::group::set_role(&client, &group_id, &agent_id, &role).await,
+            Some(GroupSub::Reseat {
+                group_id,
+                agent_id,
+                reason,
+                basis,
+            }) => commands::group::reseat(&client, &group_id, &agent_id, &reason, &basis).await,
+            Some(GroupSub::Recovery { group_id }) => {
+                commands::group::recovery(&client, &group_id).await
+            }
             Some(GroupSub::RebindCertificate {
                 group_id,
                 agent_id,
