@@ -59,6 +59,7 @@ mod case_1427;
 mod case_1471;
 mod case_811;
 mod case_818;
+mod case_969;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
