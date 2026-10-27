@@ -1806,138 +1806,154 @@ async fn expect(
 
 /// The red baseline: N commits H's seat, then learns H's mapping; no Hello
 /// follows and H never fetches the Welcome. RED on main.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1207_red_baseline_roster_then_discovery_hello_never_sent() -> Result<()> {
-    expect(
-        "w3h_1207_red_baseline_roster_then_discovery_hello_never_sent",
-        0x1207_0001,
-        Variant::Race(Order::RosterThenDiscovery),
-        false,
-        Verdict::Red,
-    )
-    .await
+fn w3h_1207_red_baseline_roster_then_discovery_hello_never_sent() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1207_red_baseline_roster_then_discovery_hello_never_sent",
+            0x1207_0001,
+            Variant::Race(Order::RosterThenDiscovery),
+            false,
+            Verdict::Red,
+        )
+        .await
+    })
 }
 
 /// Discovery first: N's commit-time push reaches H, which looks N up
 /// through the own-host hint. Predicted GREEN on main (see the module doc).
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1207_discovery_then_roster_recovers_through_the_commit_push() -> Result<()> {
-    expect(
-        "w3h_1207_discovery_then_roster_recovers_through_the_commit_push",
-        0x1207_0002,
-        Variant::Race(Order::DiscoveryThenRoster),
-        false,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1207_discovery_then_roster_recovers_through_the_commit_push() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1207_discovery_then_roster_recovers_through_the_commit_push",
+            0x1207_0002,
+            Variant::Race(Order::DiscoveryThenRoster),
+            false,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// Neither side ever learns the other's mapping. RED on main, and it must
 /// stay RED with S1.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1207_red_baseline_no_mapping_on_either_side() -> Result<()> {
-    expect(
-        "w3h_1207_red_baseline_no_mapping_on_either_side",
-        0x1207_0003,
-        Variant::NoMapping,
-        false,
-        Verdict::Red,
-    )
-    .await
+fn w3h_1207_red_baseline_no_mapping_on_either_side() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1207_red_baseline_no_mapping_on_either_side",
+            0x1207_0003,
+            Variant::NoMapping,
+            false,
+            Verdict::Red,
+        )
+        .await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1207_control_admin_knows_joiner() -> Result<()> {
-    expect(
-        "w3h_1207_control_admin_knows_joiner",
-        0x1207_0004,
-        Variant::AdminKnowsJoiner,
-        false,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1207_control_admin_knows_joiner() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1207_control_admin_knows_joiner",
+            0x1207_0004,
+            Variant::AdminKnowsJoiner,
+            false,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1207_control_intact_persisted_evidence() -> Result<()> {
-    expect(
-        "w3h_1207_control_intact_persisted_evidence",
-        0x1207_0005,
-        Variant::PersistedEvidence,
-        false,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1207_control_intact_persisted_evidence() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1207_control_intact_persisted_evidence",
+            0x1207_0005,
+            Variant::PersistedEvidence,
+            false,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1207_control_authorized_third_holder() -> Result<()> {
-    expect(
-        "w3h_1207_control_authorized_third_holder",
-        0x1207_0006,
-        Variant::ThirdHolder,
-        false,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1207_control_authorized_third_holder() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1207_control_authorized_third_holder",
+            0x1207_0006,
+            Variant::ThirdHolder,
+            false,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// S1 on (#1251, merged in 0abd524): the red baseline must turn GREEN
 /// through N's deferred N->H Hello after the release.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_red_1207_ready_hello_roster_then_discovery() -> Result<()> {
-    expect(
-        "w3h_red_1207_ready_hello_roster_then_discovery",
-        0x1207_0001,
-        Variant::Race(Order::RosterThenDiscovery),
-        true,
-        Verdict::Green,
-    )
-    .await
+fn w3h_red_1207_ready_hello_roster_then_discovery() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_red_1207_ready_hello_roster_then_discovery",
+            0x1207_0001,
+            Variant::Race(Order::RosterThenDiscovery),
+            true,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// S1 on: with no mapping on either side, the deferred Hello has nothing
 /// to fire on; the case must stay RED.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_red_1207_ready_hello_no_mapping_stays_red() -> Result<()> {
-    expect(
-        "w3h_red_1207_ready_hello_no_mapping_stays_red",
-        0x1207_0003,
-        Variant::NoMapping,
-        true,
-        Verdict::Red,
-    )
-    .await
+fn w3h_red_1207_ready_hello_no_mapping_stays_red() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_red_1207_ready_hello_no_mapping_stays_red",
+            0x1207_0003,
+            Variant::NoMapping,
+            true,
+            Verdict::Red,
+        )
+        .await
+    })
 }

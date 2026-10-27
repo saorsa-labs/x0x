@@ -209,7 +209,7 @@ fn row_key(info: &GroupInfo, target_hex: &str) -> Option<EvictionKey> {
 
 /// Read the prepared journal of `key`, when the file holds one for it.
 async fn read_prepared_journal(path: &std::path::Path, key: &EvictionKey) -> Option<EvJournalV1> {
-    let bytes = tokio::fs::read(path).await.ok()?;
+    let bytes = crate::w3h_inline::fs::read(path).await.ok()?;
     let journal = s4::decode_evjournal(&bytes).ok()?;
     (journal.stable_group_id == key.stable_group_id && journal.target == key.target)
         .then_some(journal)

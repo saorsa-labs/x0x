@@ -393,6 +393,19 @@ jobs:
           mkdir -m 700 "${artifact}"
           test ! -e "${artifact}/proof.json"
 
+      # The x0x lib test unit at opt-level 3 peaked at 15.7 of 16 GB RAM
+      # and 2.9 of 3 GB swap (run 40002832571). A larger lib went past
+      # that, and the runner stopped with exit 143 before a test ran
+      # (#1533 runs 40003771420, 39995270646).
+      - name: Add build swap
+        shell: bash
+        run: |
+          sudo fallocate -l 12G /x0x-build.swap
+          sudo chmod 600 /x0x-build.swap
+          sudo mkswap /x0x-build.swap
+          sudo swapon /x0x-build.swap
+          free -m
+
       - name: Sample signing-path build resources
         shell: bash
         run: |
@@ -644,7 +657,15 @@ jobs:
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
         # The profile default-filter still intersects this expression, so
         # only `w3h_` tests run. Repeat count stays 20.
+        # `--cfg tokio_unstable` is this job only. Release binaries and the
+        # other CI jobs do not set it (#1245). `CARGO_ENCODED_RUSTFLAGS`
+        # replaces `RUSTFLAGS` when it is set, so append to whichever is live.
         run: |
+          if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+            export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}"$'\x1f'"--cfg"$'\x1f'"tokio_unstable"
+          else
+            export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable"
+          fi
           filter="$(python3 -B scripts/ci/w3h-shards.py --filter "${{ matrix.group }}")"
           echo "W3H-SHARD-START group=${{ matrix.group }} filter=${filter}"
           python3 -B scripts/ci/w3h-shards.py --list "${{ matrix.group }}"
@@ -760,10 +781,12 @@ jobs:
           --expect w3h_1161_card_import_invite=GREEN
           --require w3h_1161_control_share_withheld_is_red
           --expect w3h_1161_control_share_withheld_is_red=RED
+          --require w3h_969_leave_rekey_restart_seals_under_the_current_epoch
+          --expect w3h_969_leave_rekey_restart_seals_under_the_current_epoch=GREEN
           --require w3h_1471_forged_card_import_invite
           --expect w3h_1471_forged_card_import_invite=GREEN
           --require w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined
-          --expect w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined=RED
+          --expect w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined=GREEN
           --require w3h_818_control_ownerless_invite_after_the_removal_joins
           --expect w3h_818_control_ownerless_invite_after_the_removal_joins=GREEN
           --require w3h_1357_red_s4_idle_revocation_one_admin
@@ -800,6 +823,24 @@ jobs:
           --expect w3h_1023_control_holders_never_return_fail_closed=GREEN
           --require w3h_1023_control_holder_returns_recovers
           --expect w3h_1023_control_holder_returns_recovers=GREEN
+          --require w3h_1356_red_s3_aligned_stale_joiner_catches_up
+          --expect w3h_1356_red_s3_aligned_stale_joiner_catches_up=GREEN
+          --require w3h_1356_control_s3_attestation_touches_only_the_subject
+          --expect w3h_1356_control_s3_attestation_touches_only_the_subject=GREEN
+          --require w3h_1356_red_s3_forked_node_shows_reseat_required
+          --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
+          --require w3h_1356_control_s3_forked_node_not_auto_recovered
+          --expect w3h_1356_control_s3_forked_node_not_auto_recovered=GREEN
+          --require w3h_1356_red_s3_manual_reseat_recovers_forked_node
+          --expect w3h_1356_red_s3_manual_reseat_recovers_forked_node=GREEN
+          --require w3h_1356_red_s3_b_provisional_admin_ata_promotes
+          --expect w3h_1356_red_s3_b_provisional_admin_ata_promotes=GREEN
+          --require w3h_1356_red_s3_t_typed_waits_name_their_cause
+          --expect w3h_1356_red_s3_t_typed_waits_name_their_cause=GREEN
+          --require w3h_1356_red_s3_t_deferred_until_host_commit
+          --expect w3h_1356_red_s3_t_deferred_until_host_commit=GREEN
+          --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
+          --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable

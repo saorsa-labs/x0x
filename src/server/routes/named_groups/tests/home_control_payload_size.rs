@@ -111,6 +111,7 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
         certificate_b64: Some(BASE64.encode(bincode::serialize(&cert)?)),
         owner_mandate: Some(mandate),
         commit: Some(commit.clone()),
+        reseat_mandate: None,
     };
     let event_bytes = serde_json::to_vec(&event)?;
     let event_len = event_bytes.len();
@@ -139,6 +140,7 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
         head_attestation: Some(Box::new(head)),
         roster_certificates_b64: Vec::new(),
         intervening_events: Vec::new(),
+        admin_attestation: None,
     };
     let result_len = serde_json::to_vec(&result)?.len();
     let result_bytes = serde_json::to_vec(&result)?;
@@ -282,6 +284,7 @@ async fn real_home_seat_control_envelopes_exceed_direct_message_limit() -> Resul
         certificate_b64: Some(BASE64.encode(bincode::serialize(&second_cert)?)),
         owner_mandate: Some(second_mandate),
         commit: Some(second_commit),
+        reseat_mandate: None,
     };
     let second_bytes = serde_json::to_vec(&second_event)?;
     let pulled_second = super::super::control_blob::socket_free_roundtrip(
@@ -340,6 +343,7 @@ impl BoundJoinerScenario {
             head_attestation: Some(Box::new(self.head_attestation.clone())),
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         }
     }
 }
@@ -465,6 +469,7 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
         certificate_b64: Some(BASE64.encode(bincode::serialize(&cert)?)),
         owner_mandate: Some(mandate),
         commit: Some(commit.clone()),
+        reseat_mandate: None,
     };
     assert!(serde_json::to_vec(&event)?.len() > crate::dm::MAX_PAYLOAD_BYTES);
     let first_retained = next.commit_log.first().expect("Home retained commit");
@@ -487,6 +492,7 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
         head_attestation: Some(Box::new(head.clone())),
         roster_certificates_b64: Vec::new(),
         intervening_events: Vec::new(),
+        admin_attestation: None,
     })?;
     assert!(
         result_wire.len() > crate::dm::MAX_PAYLOAD_BYTES,
@@ -537,6 +543,7 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
             head_attestation: Some(Box::new(head.clone())),
             roster_certificates_b64: Vec::new(),
             intervening_events: Vec::new(),
+            admin_attestation: None,
         })?
         .len()
             > crate::dm::MAX_PAYLOAD_BYTES

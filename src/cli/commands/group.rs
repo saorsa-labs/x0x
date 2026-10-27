@@ -355,6 +355,37 @@ pub async fn ban(client: &DaemonClient, group_id: &str, agent_id: &str) -> Resul
     Ok(())
 }
 
+/// `x0x group reseat` — POST /groups/:id/members/:agent_id/reseat
+/// (ADR 0109 §3). `basis` is the JSON basis object.
+pub async fn reseat(
+    client: &DaemonClient,
+    group_id: &str,
+    agent_id: &str,
+    reason: &str,
+    basis: &str,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let basis: serde_json::Value = serde_json::from_str(basis)
+        .map_err(|e| anyhow::anyhow!("--basis must be a JSON object: {e}"))?;
+    let body = serde_json::json!({ "reason": reason, "basis": basis });
+    let resp = client
+        .post(
+            &format!("/groups/{group_id}/members/{agent_id}/reseat"),
+            &body,
+        )
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x group recovery` — GET /groups/:id/recovery (ADR 0109 §8).
+pub async fn recovery(client: &DaemonClient, group_id: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get(&format!("/groups/{group_id}/recovery")).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x group unban` — DELETE /groups/:id/ban/:agent_id.
 pub async fn unban(client: &DaemonClient, group_id: &str, agent_id: &str) -> Result<()> {
     client.ensure_running().await?;

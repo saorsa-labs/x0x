@@ -95,6 +95,14 @@ impl CapabilityRegistry {
     /// ADR 0110 §4b(1): understands `OwnerRecoveryMandateV1` and
     /// `OwnerRecoveryV1` (`X0XORC1`). Bit 7.
     pub const OWNER_RECOVERY_V1: u64 = 1 << 7;
+    /// ADR 0109 §5: issues and verifies admin terminal attestations,
+    /// answers `group_attest_request` (`X0XGRC1`) and consumes re-seat
+    /// authorisations. Bit 8. Advertised: the S3 receivers are in place.
+    pub const GROUP_TERMINAL_ATTEST_V1: u64 = 1 << 8;
+    /// ADR 0109 §3a: verifies and applies promoted-admin
+    /// `ReseatMandateV1` commits. Bit 9. Advertised: the receiver rule is
+    /// in place.
+    pub const GROUP_RESEAT_MANDATE_V1: u64 = 1 << 9;
     /// Understands remote GUI show typed DMs (ADR 0083 slice 3).
     ///
     /// Bit 10. The canonical registry in `docs/adr/README.md` already
@@ -116,6 +124,8 @@ impl CapabilityRegistry {
                 | Self::FILE_CONTROL_ACK_V1
                 | Self::EVICTION_HANDOFF_V1
                 | Self::CRYPTO_EXCLUSION_V1
+                | Self::GROUP_TERMINAL_ATTEST_V1
+                | Self::GROUP_RESEAT_MANDATE_V1
                 | Self::CERTIFICATE_REBIND_V1
                 | Self::OWNER_RECOVERY_V1
                 | Self::GUI_SHOW_V1
@@ -142,6 +152,8 @@ impl CapabilityRegistry {
             Some((Self::EVICTION_HANDOFF_V1, "eviction_handoff_v1"))
         } else if payload.starts_with(crate::groups::crypto_exclusion::CRYPTO_EXCLUSION_PREFIX) {
             Some((Self::CRYPTO_EXCLUSION_V1, "crypto_exclusion_v1"))
+        } else if payload.starts_with(crate::groups::recovery::GROUP_RECOVERY_PREFIX) {
+            Some((Self::GROUP_TERMINAL_ATTEST_V1, "group_terminal_attest_v1"))
         } else if payload.starts_with(crate::groups::cert_rebind::CERTIFICATE_REBIND_PREFIX) {
             Some((Self::CERTIFICATE_REBIND_V1, "certificate_rebind_v1"))
         } else if payload.starts_with(crate::groups::owner_recovery::OWNER_RECOVERY_PREFIX) {

@@ -68,6 +68,8 @@ pub mod identity;
 /// persistent storage of MachineKeypair and AgentKeypair.
 pub mod storage;
 
+mod w3h_inline;
+
 /// Cross-process advisory file locks (instance lock, revocations-v3 writer).
 pub(crate) mod file_lock;
 
@@ -15876,6 +15878,16 @@ impl Agent {
             .send_replace(dm::DmCapabilities::pending());
     }
 
+    /// W3-H only: advertise `registry` in place of this release's
+    /// application registry, to model a node on an older release. The
+    /// advert service republishes on the change. A later DM-inbox start
+    /// replaces it, so call it once the inbox runs.
+    #[cfg(test)]
+    pub(crate) fn set_application_registry_for_test(&self, registry: dm::CapabilityRegistry) {
+        self.dm_capabilities_tx
+            .send_modify(|caps| caps.application_registry = registry);
+    }
+
     /// This agent's currently advertised DM capabilities.
     ///
     /// Mirrors what the advert service publishes and what `runtime_agent_card`
@@ -23142,11 +23154,18 @@ impl AgentBuilder {
                 // started here, after the `await`, where the service has an
                 // owner.
                 let start_cfg = cfg.clone();
-                let opened = tokio::task::spawn_blocking(move || {
+                // W3-H (#1245): `Store::open` on the blocking pool leaves the
+                // paused runtime idle, so virtual time auto-advances by
+                // however long SQLite takes. Open on the caller instead.
+                let opened = if w3h_inline::shim_active() {
                     history::HistoryService::open(&start_cfg, &data_dir)
-                })
-                .await
-                .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?
+                } else {
+                    tokio::task::spawn_blocking(move || {
+                        history::HistoryService::open(&start_cfg, &data_dir)
+                    })
+                    .await
+                    .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?
+                }
                 .map_err(|e| error::IdentityError::HistoryInit(e.to_string()))?;
                 let service = history::HistoryService::start_tasks(opened);
                 let handle = service.handle();

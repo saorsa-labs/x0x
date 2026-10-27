@@ -263,17 +263,19 @@ async fn run() -> Receipt {
 }
 
 /// Fixed path: forged card-import stub clears, invite join seats, encrypted RT.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1471_forged_card_import_invite() -> Result<()> {
-    let receipt = run().await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "{CASE}: expected GREEN, got {:?} (RED is the #1471 baseline on unfixed main)",
-        receipt.verdict()
-    );
-    Ok(())
+fn w3h_1471_forged_card_import_invite() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run().await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "{CASE}: expected GREEN, got {:?} (RED is the #1471 baseline on unfixed main)",
+            receipt.verdict()
+        );
+        Ok(())
+    })
 }

@@ -515,6 +515,79 @@ async fn b1_real_admission_obligation_satisfies_b8_gate() {
     );
 }
 
+// --- #1533 r9: a refused approval seal leaves the live record unchanged ----
+//
+// ADR 0109 §2 "Conflict": a recorded attestation conflict on the head
+// refuses every local seal. The approve route set the request Approved and
+// seated the requester on the LIVE record before the seal, and the seal
+// rolled back only its own changes. So the refused approval left an Active
+// member with no valid commit. The route now approves on a private
+// candidate.
+#[tokio::test]
+async fn a_refused_approval_seal_leaves_the_request_pending() {
+    let (state, _dir) = d_state().await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let witness_kp = fresh_kp();
+    let witness_hex = hex::encode(witness_kp.agent_id().as_bytes());
+    let group_key = "ac".repeat(16);
+    let request_id =
+        install_group_with_witness(&state, &group_key, &requester_hex, &witness_hex).await;
+    offer_predecessor_obligation_via_real_path(&state, &group_key, &request_id, &requester_kp)
+        .await;
+    let before = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_key)
+        .cloned()
+        .expect("group");
+    assert!(
+        group_recovery::record_conflict_at_head_for_test(&state, &before)
+            .await
+            .expect("conflict"),
+        "the conflict is durable"
+    );
+
+    let (status, body) = response_json(
+        approve_join_request(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((group_key.clone(), request_id.clone())),
+        )
+        .await
+        .into_response(),
+    )
+    .await
+    .expect("response");
+    assert_ne!(status, StatusCode::OK);
+    assert!(
+        body.to_string().contains("group_contained"),
+        "the conflict bound refuses the seal: {body}"
+    );
+    let live = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_key)
+        .cloned()
+        .expect("group");
+    assert_eq!(live.state_hash, before.state_hash, "the head did not move");
+    assert!(
+        !live.has_active_member(&requester_hex),
+        "no Active member without a valid commit"
+    );
+    assert_eq!(live.roster_revision, before.roster_revision);
+    assert!(
+        live.join_requests
+            .get(&request_id)
+            .is_some_and(x0x::groups::JoinRequest::is_pending),
+        "the request stays pending"
+    );
+}
+
 // ===========================================================================
 // B2 — replay / admission lock-cycle (two-task reproduction)
 // ===========================================================================
