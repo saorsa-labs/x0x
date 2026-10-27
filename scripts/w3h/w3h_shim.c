@@ -13,15 +13,18 @@
  *
  *  1. Entropy. getrandom(), getentropy() and syscall(SYS_getrandom, ...)
  *     return SplitMix64 output (not a CSPRNG: test processes only). Each
- *     THREAD has its own stream, seeded by (W3H_ENTROPY_SEED, the thread's
- *     name, its ordinal among threads with that name), so one thread's
- *     draws never move another thread's position: the harness's test
- *     thread (named after the test by libtest, and running every daemon
- *     task on its current-thread runtime) sees the same values whatever
- *     the blocking pool does. Rust consumers in the lockfile reach one of
- *     these: getrandom 0.2 via syscall(SYS_getrandom), getrandom 0.3/0.4
- *     and std (HashMap RandomState, which also seeds tokio's select! RNG)
- *     via getrandom().
+ *     stream is keyed so one draw sequence cannot move another:
+ *       - a spawned tokio task uses the key the harness registers
+ *         (spawn lineage: parent, spawn site, and child index). Sibling
+ *         tasks do not share that stream, and a spawn at another site
+ *         does not move this task's key (#1245).
+ *       - a thread that is not inside a task (the test body, a blocking
+ *         worker) uses a key from its name and a first-draw ordinal.
+ *         Spawned tasks do not read that stream, so a worker's ordinal
+ *         cannot move a task's signature (#1245).
+ *     Rust consumers in the lockfile reach one of these: getrandom 0.2 via
+ *     syscall(SYS_getrandom), getrandom 0.3/0.4 and std (HashMap
+ *     RandomState, which also seeds tokio's select! RNG) via getrandom().
  *
  *  2. Wall clock. clock_gettime(CLOCK_REALTIME*) returns 2026-01-01T00:00:00Z
  *     plus the harness's virtual time. Prefer w3h_shim_set_virt_time_ns_fn():
@@ -158,23 +161,34 @@ static atomic_int shim_active;
 static atomic_ulong entropy_calls;
 
 static uint64_t entropy_seed;
+static pthread_t main_pthread;
+static atomic_uint fallback_ordinal;
 
-/* Per-thread streams and their accounting. */
-#define W3H_MAX_THREADS 512
+/* One stream per entropy key. Task ids use the low half; thread keys set
+ * the high bit so the two spaces do not meet. */
+/* One slot per task that draws. Long cases spawn well under this; past it
+ * every extra key shares one overflow stream (see unregistered_draws). */
+#define W3H_MAX_STREAMS 16384
 #define W3H_NAME_LEN 16
-struct thread_entry {
+struct stream_entry {
+    uint64_t key;
+    uint64_t state;
+    atomic_ulong draws;
     char name[W3H_NAME_LEN];
     unsigned int ordinal;
-    atomic_ulong draws;
 };
 static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct thread_entry registry[W3H_MAX_THREADS];
-static atomic_int registry_len;
+static struct stream_entry registry[W3H_MAX_STREAMS];
+static int registry_len;
 static atomic_ulong unregistered_draws;
 
-static __thread int tl_seeded;
-static __thread int tl_index = -1;
-static __thread uint64_t tl_state;
+static __thread int tl_key_ready;
+static __thread uint64_t tl_thread_key;
+static __thread unsigned int tl_ordinal;
+static __thread int tl_in_key_fn;
+
+typedef uint64_t (*w3h_entropy_key_fn)(void);
+static atomic_uintptr_t entropy_key_fn;
 
 typedef int (*clock_gettime_fn)(clockid_t, struct timespec *);
 static _Atomic(clock_gettime_fn) real_clock_gettime;
@@ -185,6 +199,7 @@ __attribute__((constructor)) static void w3h_shim_init(void) {
      * before this point sees `shim_active == 0` / a NULL resolver and takes
      * the raw-syscall pass-through, so dlsym is never re-entered from an
      * interposed call. */
+    main_pthread = pthread_self();
     void *resolved = dlsym(RTLD_NEXT, "clock_gettime");
     if (resolved != NULL) {
         clock_gettime_fn fn;
@@ -227,53 +242,116 @@ static uint64_t fnv1a(const char *text) {
     return hash;
 }
 
-/* First draw on this thread: find its name and its ordinal among threads
- * with the same name (registration order), and derive its stream. */
-static void seed_this_thread(void) {
-    char name[W3H_NAME_LEN];
-    memset(name, 0, sizeof name);
-    if (pthread_getname_np(pthread_self(), name, sizeof name) != 0) {
-        strcpy(name, "?");
-    }
-    unsigned int ordinal = 0;
-    pthread_mutex_lock(&registry_lock);
-    int len = atomic_load(&registry_len);
-    for (int i = 0; i < len; ++i) {
-        if (strncmp(registry[i].name, name, W3H_NAME_LEN) == 0) {
-            ordinal++;
+/* OS-thread key for draws that are not inside a spawned task. The main
+ * thread is a constant. Any other thread takes a first-draw ordinal so
+ * two workers do not share one stream; that ordinal follows who draws
+ * first, and task streams do not use it. */
+static uint64_t ensure_thread_key(void) {
+    if (!tl_key_ready) {
+        if (pthread_equal(pthread_self(), main_pthread)) {
+            tl_thread_key = mix64(entropy_seed ^ 0x4d41494eULL);
+            tl_ordinal = 0;
+        } else {
+            char name[W3H_NAME_LEN];
+            memset(name, 0, sizeof name);
+            if (pthread_getname_np(pthread_self(), name, sizeof name) != 0 || name[0] == '\0') {
+                memcpy(name, "unnamed", 8);
+            }
+            tl_ordinal = atomic_fetch_add(&fallback_ordinal, 1);
+            tl_thread_key =
+                mix64(entropy_seed ^ mix64(fnv1a(name)) ^ mix64(0x5157ULL + tl_ordinal));
         }
+        tl_thread_key |= (1ULL << 63);
+        tl_key_ready = 1;
     }
-    if (len < W3H_MAX_THREADS) {
-        memcpy(registry[len].name, name, W3H_NAME_LEN);
-        registry[len].ordinal = ordinal;
-        atomic_store(&registry[len].draws, 0);
-        tl_index = len;
-        atomic_store(&registry_len, len + 1);
-    }
-    pthread_mutex_unlock(&registry_lock);
-    tl_state = mix64(entropy_seed ^ mix64(fnv1a(name)) ^ mix64(0x5157ULL + ordinal));
-    tl_seeded = 1;
+    return tl_thread_key;
 }
 
-static void fill(void *buf, size_t len) {
+static uint64_t key_initial_state(uint64_t key) {
+    return mix64(entropy_seed ^ mix64(key));
+}
+
+static void label_stream(struct stream_entry *slot, uint64_t key) {
+    memset(slot->name, 0, sizeof slot->name);
+    if ((key & (1ULL << 63)) == 0) {
+        memcpy(slot->name, "task", 4);
+        slot->ordinal = key > 0xffffffffULL ? 0xffffffffU : (unsigned int)key;
+        return;
+    }
+    if (pthread_getname_np(pthread_self(), slot->name, sizeof slot->name) != 0 ||
+        slot->name[0] == '\0') {
+        memcpy(slot->name, "thread", 6);
+    }
+    slot->ordinal = tl_ordinal;
+}
+
+/* Find or create `key`. Caller holds registry_lock. */
+static int stream_slot(uint64_t key) {
+    for (int i = 0; i < registry_len; ++i) {
+        if (registry[i].key == key) {
+            return i;
+        }
+    }
+    if (registry_len >= W3H_MAX_STREAMS) {
+        return -1;
+    }
+    struct stream_entry *slot = &registry[registry_len];
+    slot->key = key;
+    slot->state = key_initial_state(key);
+    atomic_store(&slot->draws, 0);
+    label_stream(slot, key);
+    return registry_len++;
+}
+
+static void fill_key(uint64_t key, void *buf, size_t len) {
     unsigned char *out = (unsigned char *)buf;
-    if (!tl_seeded) {
-        seed_this_thread();
+    static uint64_t overflow_state;
+    static int overflow_ready;
+    pthread_mutex_lock(&registry_lock);
+    int index = stream_slot(key);
+    uint64_t state;
+    if (index >= 0) {
+        state = registry[index].state;
+    } else if (!overflow_ready) {
+        overflow_state = key_initial_state(0xffffffffffffffffULL);
+        overflow_ready = 1;
+        state = overflow_state;
+    } else {
+        state = overflow_state;
     }
     while (len > 0) {
-        uint64_t word = splitmix64(&tl_state);
+        uint64_t word = splitmix64(&state);
         size_t n = len < sizeof word ? len : sizeof word;
         memcpy(out, &word, n);
         out += n;
         len -= n;
     }
-    atomic_fetch_add(&entropy_calls, 1);
-    if (tl_index >= 0) {
-        atomic_fetch_add(&registry[tl_index].draws, 1);
+    if (index >= 0) {
+        registry[index].state = state;
+        atomic_fetch_add(&registry[index].draws, 1);
     } else {
+        overflow_state = state;
         atomic_fetch_add(&unregistered_draws, 1);
     }
+    pthread_mutex_unlock(&registry_lock);
+    atomic_fetch_add(&entropy_calls, 1);
 }
+
+static uint64_t current_entropy_key(void) {
+    w3h_entropy_key_fn fn = (w3h_entropy_key_fn)atomic_load(&entropy_key_fn);
+    uint64_t key = 0;
+    if (fn != NULL && !tl_in_key_fn) {
+        tl_in_key_fn = 1;
+        key = fn();
+        tl_in_key_fn = 0;
+    }
+    if (key == 0 || (key & (1ULL << 63)) != 0) {
+        return ensure_thread_key();
+    }
+    return key;
+}
+
+static void fill(void *buf, size_t len) { fill_key(current_entropy_key(), buf, len); }
 
 /* EFAULT for a non-NULL buffer the caller cannot write: let the kernel
  * write the WHOLE range first. getrandom(2) returns a short count when it
@@ -375,22 +453,63 @@ typedef uint64_t (*w3h_virt_ns_fn)(void);
 static atomic_uintptr_t virt_ns_fn;
 
 /* Exported for the harness (found with dlsym(RTLD_DEFAULT, ...)). */
-unsigned int w3h_shim_version(void) { return 3; }
+unsigned int w3h_shim_version(void) { return 5; }
 
 int w3h_shim_active(void) { return atomic_load(&shim_active); }
 
 unsigned long w3h_shim_entropy_calls(void) { return atomic_load(&entropy_calls); }
 
+/* Register the per-task key. NULL clears it. A 0 return, or any value with
+ * the high bit set, selects the calling thread's stream instead. */
+void w3h_shim_set_entropy_key_fn(w3h_entropy_key_fn fn) {
+    if (!atomic_load(&shim_active)) {
+        return;
+    }
+    atomic_store(&entropy_key_fn, (uintptr_t)fn);
+}
+
+/* Test aid: forget one key so the next fill starts from its seed again. */
+void w3h_shim_test_reset_key(uint64_t key) {
+    pthread_mutex_lock(&registry_lock);
+    for (int i = 0; i < registry_len; ++i) {
+        if (registry[i].key != key) {
+            continue;
+        }
+        int last = registry_len - 1;
+        if (i != last) {
+            registry[i].key = registry[last].key;
+            registry[i].state = registry[last].state;
+            atomic_store(&registry[i].draws, atomic_load(&registry[last].draws));
+            memcpy(registry[i].name, registry[last].name, W3H_NAME_LEN);
+            registry[i].ordinal = registry[last].ordinal;
+        }
+        registry[last].key = 0;
+        registry_len--;
+        break;
+    }
+    pthread_mutex_unlock(&registry_lock);
+}
+
+/* Test aid: draw `len` bytes from `key` (not via the task callback). */
+void w3h_shim_test_fill(uint64_t key, void *buf, size_t len) {
+    if (!atomic_load(&shim_active) || key == 0 || buf == NULL || len == 0) {
+        return;
+    }
+    fill_key(key, buf, len);
+}
+
 /* Writes "name#ordinal=draws" entries separated by '\n' into `out` (NUL
- * terminated, truncated to `cap`). Returns the number of threads that drew
- * entropy. Diagnostics only: never part of the canonical trace. */
+ * terminated, truncated to `cap`). Returns the number of streams that drew
+ * entropy. A task stream is `task#<id>`. Diagnostics only: never part of
+ * the canonical trace. */
 int w3h_shim_thread_stats(char *out, size_t cap) {
     if (out == NULL || cap == 0) {
         return -1;
     }
     out[0] = '\0';
     size_t used = 0;
-    int len = atomic_load(&registry_len);
+    pthread_mutex_lock(&registry_lock);
+    int len = registry_len;
     for (int i = 0; i < len && used + 1 < cap; ++i) {
         int wrote = snprintf(out + used, cap - used, "%.*s#%u=%lu\n", W3H_NAME_LEN,
                              registry[i].name, registry[i].ordinal,
@@ -404,6 +523,7 @@ int w3h_shim_thread_stats(char *out, size_t cap) {
             break;
         }
     }
+    pthread_mutex_unlock(&registry_lock);
     unsigned long extra = atomic_load(&unregistered_draws);
     if (extra > 0 && used + 1 < cap) {
         snprintf(out + used, cap - used, "(unregistered)=%lu\n", extra);

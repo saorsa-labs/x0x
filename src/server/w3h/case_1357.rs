@@ -2007,177 +2007,197 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
 }
 
 /// ADR 0110 `s4_idle_revocation_one_admin`: RED on `main`, GREEN with S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_red_s4_idle_revocation_one_admin() -> Result<()> {
-    expect(
-        "w3h_1357_red_s4_idle_revocation_one_admin",
-        0x1357_0001,
-        IDLE,
-        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_red_s4_idle_revocation_one_admin() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_red_s4_idle_revocation_one_admin",
+            0x1357_0001,
+            IDLE,
+            // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_idle_revocation_one_admin`, Home (`OwnerCertified`)
 /// variant: the owner issuer-revokes B. RED on `main`, GREEN with S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_red_s4_idle_revocation_one_admin_home() -> Result<()> {
-    expect(
-        "w3h_1357_red_s4_idle_revocation_one_admin_home",
-        0x1357_0005,
-        HOME_IDLE,
-        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_red_s4_idle_revocation_one_admin_home() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_red_s4_idle_revocation_one_admin_home",
+            0x1357_0005,
+            HOME_IDLE,
+            // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_self_leave_crypto_only`: GREEN on `main` (#1113 / #1337)
 /// and after S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_control_s4_self_leave_crypto_only() -> Result<()> {
-    expect(
-        "w3h_1357_control_s4_self_leave_crypto_only",
-        0x1357_0002,
-        SELF_LEAVE,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_control_s4_self_leave_crypto_only() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_control_s4_self_leave_crypto_only",
+            0x1357_0002,
+            SELF_LEAVE,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_fallback_rank_manual`: RED on `main`, GREEN with S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_red_s4_fallback_rank_manual() -> Result<()> {
-    expect(
-        "w3h_1357_red_s4_fallback_rank_manual",
-        0x1357_0003,
-        MANUAL_DURING_WINDOW,
-        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_red_s4_fallback_rank_manual() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_red_s4_fallback_rank_manual",
+            0x1357_0003,
+            MANUAL_DURING_WINDOW,
+            // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// `s4_fallback_rank_manual`'s baseline: with no S4 obligation, D's manual
 /// remove rekeys at once, before and after S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_control_s4_manual_remove_without_obligation() -> Result<()> {
-    expect(
-        "w3h_1357_control_s4_manual_remove_without_obligation",
-        0x1357_0004,
-        MANUAL_WITHOUT_OBLIGATION,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_control_s4_manual_remove_without_obligation() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_control_s4_manual_remove_without_obligation",
+            0x1357_0004,
+            MANUAL_WITHOUT_OBLIGATION,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_self_leave_crypto_only`, repeated with B's revocation
 /// arriving after the leave: one exclusion, B stays Removed. GREEN on
 /// `main` (#1337 rekeys at the leave; the revocation adds nothing) and
 /// after S4 (the revocation must not rekey again).
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_control_s4_self_leave_then_revocation() -> Result<()> {
-    expect(
-        "w3h_1357_control_s4_self_leave_then_revocation",
-        0x1357_0006,
-        LEAVE_THEN_REVOKE,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_control_s4_self_leave_then_revocation() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_control_s4_self_leave_then_revocation",
+            0x1357_0006,
+            LEAVE_THEN_REVOKE,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_restart_intake_prepare` (crash after durable intake, with
 /// a duplicate trigger): RED on `main`, GREEN with S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_red_s4_restart_intake_prepare() -> Result<()> {
-    expect(
-        "w3h_1357_red_s4_restart_intake_prepare",
-        0x1357_0007,
-        RESTART_INTAKE,
-        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_red_s4_restart_intake_prepare() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_red_s4_restart_intake_prepare",
+            0x1357_0007,
+            RESTART_INTAKE,
+            // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_designated_late_observation`: A observes late; automatic
 /// healthy exclusion. RED on `main`, GREEN with S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_red_s4_designated_late_observation() -> Result<()> {
-    expect(
-        "w3h_1357_red_s4_designated_late_observation",
-        0x1357_0008,
-        LATE_OBSERVATION,
-        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_red_s4_designated_late_observation() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_red_s4_designated_late_observation",
+            0x1357_0008,
+            LATE_OBSERVATION,
+            // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_designated_late_observation`, A stalled past W + Δ:
 /// D's ranked fallback reaches H. RED on `main`, GREEN with S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_red_s4_designated_stalled_a_fallback() -> Result<()> {
-    expect(
-        "w3h_1357_red_s4_designated_stalled_a_fallback",
-        0x1357_0009,
-        STALLED_A_FALLBACK,
-        // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_red_s4_designated_stalled_a_fallback() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_red_s4_designated_stalled_a_fallback",
+            0x1357_0009,
+            STALLED_A_FALLBACK,
+            // #1357 fixed: RED on main (DIAG PR #1496), GREEN with S4.
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_designated_late_observation` safety control: with A held,
 /// no D/E sibling before W/2. GREEN on `main` and after S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_control_s4_designated_no_early_sibling() -> Result<()> {
-    expect(
-        "w3h_1357_control_s4_designated_no_early_sibling",
-        0x1357_000a,
-        NO_EARLY_SIBLING,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_control_s4_designated_no_early_sibling() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_control_s4_designated_no_early_sibling",
+            0x1357_000a,
+            NO_EARLY_SIBLING,
+            Verdict::Green,
+        )
+        .await
+    })
 }

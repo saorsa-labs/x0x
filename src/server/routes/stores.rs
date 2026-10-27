@@ -6224,6 +6224,73 @@ mod tests {
         )
     }
 
+    /// #1533 review (Codex P1, staged re-seat containment): while a re-seat
+    /// journal is open, the staged record in the live map (written here by
+    /// an ordinary roster write, as the staged join writes its record) must
+    /// hold the original's marker. Then the background gates refuse as for
+    /// the original: the KV seal (`current_info`), task ingestion and the
+    /// delegation gate. Before the fix the staged record had no marker, and
+    /// only the REST refusals read the journal. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_staged_reseat_keeps_kv_task_and_delegation_containment() -> anyhow::Result<()> {
+        use crate::server::routes::named_groups as ng;
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let group_key = "e7".repeat(16);
+        seed_treekem_group(&state, &group_key).await;
+        let staged = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .cloned()
+            .expect("seeded group");
+        let stable = staged.stable_group_id().to_string();
+        let mut original = staged.clone();
+        original.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: original.state_revision,
+            state_hash: "sibling".to_string(),
+            committed_by: hex::encode(state.agent.agent_id().as_bytes()),
+            observed_at_ms: 1,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: original.terminal_commit_header(),
+                conflicting_commit: original.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        assert!(ng::open_staging_journal_for_test(&state, &group_key, &original).await?);
+        // The staged join's roster write of its own record (no marker).
+        let (key, record) = (group_key.clone(), staged.clone());
+        let outcome = ng::persist_named_groups_mutation(&state, move |groups| {
+            groups.insert(key, record);
+            true
+        })
+        .await?;
+        assert_eq!(outcome, ng::AtomicWriteOutcome::Durable);
+
+        let protector = treekem_store_protector(&state, &group_key, &staged);
+        assert!(
+            protector.current_info().await.is_err(),
+            "the KV seal gate refuses the staged record"
+        );
+        for id in [group_key.as_str(), stable.as_str()] {
+            assert_eq!(
+                crate::server::delegations::fork_quarantine_marker(&state, id).await,
+                original.fork_quarantine,
+                "delegation gate, {id}"
+            );
+        }
+        let list = format!("x0x.group.{group_key}.symphony.inbox");
+        assert_eq!(
+            crate::server::routes::tasks::task_list_fork_quarantine(&state, &list)
+                .await
+                .map(|(_, marker)| marker),
+            original.fork_quarantine,
+            "task ingestion gate"
+        );
+        Ok(())
+    }
+
     /// Cancel while the seal is still waiting for the group lock. The
     /// ratchet must not move.
     #[tokio::test]

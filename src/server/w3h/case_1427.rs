@@ -600,32 +600,36 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1427_offline_member_reaches_the_epoch_it_missed() -> Result<()> {
-    expect(
-        "w3h_1427_offline_member_reaches_the_epoch_it_missed",
-        0x1427_0001,
-        Arm::Plain,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1427_offline_member_reaches_the_epoch_it_missed() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1427_offline_member_reaches_the_epoch_it_missed",
+            0x1427_0001,
+            Arm::Plain,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer() -> Result<()> {
-    expect(
-        "w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer",
-        0x1427_0002,
-        Arm::SignerAfterThreeOfflineAdmins,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer",
+            0x1427_0002,
+            Arm::SignerAfterThreeOfflineAdmins,
+            Verdict::Green,
+        )
+        .await
+    })
 }

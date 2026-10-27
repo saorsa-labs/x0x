@@ -20,6 +20,8 @@ mod crdt_subscriptions;
 mod delegations;
 mod delivery_gate;
 mod group_access;
+#[cfg(test)]
+mod gui_show_pair;
 mod gui_show_remote;
 /// M1 structured `/health` verdict (#1380). `pub` because the `x0xd`
 /// binary installs [`health_verdict::ErrorCountLayer`] in its tracing
@@ -1324,6 +1326,7 @@ pub async fn serve_with_options(
         pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
         home_provisioning_deferred: std::sync::atomic::AtomicBool::new(false),
         pending_join_refusals: StdMutex::new(HashMap::new()),
+        pending_join_notices: StdMutex::new(HashMap::new()),
         pending_join_attempts: StdMutex::new(HashMap::new()),
         last_join_outcomes: StdMutex::new(HashMap::new()),
         join_refusal_sign_limiter: StdMutex::new(Default::default()),
@@ -1351,6 +1354,7 @@ pub async fn serve_with_options(
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
         revocation_evictions: routes::named_groups::S4Runtime::default(),
+        group_recovery: routes::named_groups::S3Runtime::awaiting_restore(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -1453,6 +1457,12 @@ pub async fn serve_with_options(
         )
         .await);
     }
+
+    // ADR 0109 §2 "Conflict" and §4 (#1533 r8): restore the S3
+    // containment from disk before any listener, worker or route can apply
+    // or seal a commit. A recorded attestation conflict then bounds the
+    // first commit after a restart.
+    routes::named_groups::restore_group_recovery_containment(&state).await;
 
     // Startup recovery (engineer ruling 23 Oct 2026): a receipt-less
     // upgrade-flush.json or an upgrade-flush-rollback.json whose owning
@@ -2515,6 +2525,11 @@ pub async fn serve_with_options(
         routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),
     ));
 
+    // ADR 0109 S3: ownerless attestation and manual re-seat.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_group_recovery_worker(Arc::clone(&state)),
+    ));
+
     // Background signed public-message listener for typed gossip-DM fallback
     // delivery. Per-group pubsub is still the primary fan-out path; this route
     // handles the same signed message when the sender additionally direct-
@@ -2737,8 +2752,8 @@ pub async fn serve_with_options(
     }
 
     // ADR 0083 slice 3: remote GUI show. Trust runs in the handler, before
-    // the body is decoded. Reply sends are detached there, so one slow
-    // refusal does not hold the next result or activity message.
+    // the body is decoded. Displays and reply sends run on detached tasks,
+    // so one opener wait does not hold the next result or activity message.
     {
         let gui_show_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
@@ -2943,6 +2958,14 @@ pub async fn serve_with_options(
         .route(
             "/groups/:id/members/:agent_id/role",
             patch(update_member_role),
+        )
+        .route(
+            "/groups/:id/members/:agent_id/reseat",
+            post(routes::named_groups::reseat_group_member),
+        )
+        .route(
+            "/groups/:id/recovery",
+            get(routes::named_groups::get_group_recovery),
         )
         .route(
             "/groups/:id/members/:agent_id/certificate/rebind",
