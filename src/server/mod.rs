@@ -1353,6 +1353,7 @@ pub async fn serve_with_options(
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
         revocation_evictions: routes::named_groups::S4Runtime::default(),
+        group_recovery: routes::named_groups::S3Runtime::awaiting_restore(),
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
@@ -1455,6 +1456,12 @@ pub async fn serve_with_options(
         )
         .await);
     }
+
+    // ADR 0109 §2 "Conflict" and §4 (#1533 r8): restore the S3
+    // containment from disk before any listener, worker or route can apply
+    // or seal a commit. A recorded attestation conflict then bounds the
+    // first commit after a restart.
+    routes::named_groups::restore_group_recovery_containment(&state).await;
 
     // Startup recovery (engineer ruling 23 Oct 2026): a receipt-less
     // upgrade-flush.json or an upgrade-flush-rollback.json whose owning
@@ -2517,6 +2524,11 @@ pub async fn serve_with_options(
         routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),
     ));
 
+    // ADR 0109 S3: ownerless attestation and manual re-seat.
+    bg_tasks.push(tokio::spawn(
+        routes::named_groups::run_group_recovery_worker(Arc::clone(&state)),
+    ));
+
     // Background signed public-message listener for typed gossip-DM fallback
     // delivery. Per-group pubsub is still the primary fan-out path; this route
     // handles the same signed message when the sender additionally direct-
@@ -2945,6 +2957,14 @@ pub async fn serve_with_options(
         .route(
             "/groups/:id/members/:agent_id/role",
             patch(update_member_role),
+        )
+        .route(
+            "/groups/:id/members/:agent_id/reseat",
+            post(routes::named_groups::reseat_group_member),
+        )
+        .route(
+            "/groups/:id/recovery",
+            get(routes::named_groups::get_group_recovery),
         )
         .route(
             "/groups/:id/members/:agent_id/certificate/rebind",

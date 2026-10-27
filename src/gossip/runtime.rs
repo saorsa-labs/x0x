@@ -1889,4 +1889,209 @@ mod tests {
     fn window_rate_handles_no_previous() {
         assert_eq!(window_rate(50u64, 50u64, 10.0), 0.0);
     }
+
+    // ── #1395 / #288: the membership lane under a stalled remote ────────
+    //
+    // WHY (fleet evidence, #288): `Timed out handling gossip message
+    // stream_type="Membership" elapsed_ms=5001` on bytes=2 frames —
+    // "the remote peer is accepting the QUIC stream but not reading".
+    // Every membership handler answers an inbound frame with egress
+    // (SWIM Ping → Ack, Join → ForwardJoin fan-out, Neighbor →
+    // NeighborReply). That egress awaits `open_uni()`/`write_all()`,
+    // which park once the remote's transport stops returning
+    // uni-stream credit: the remote's QUIC stack still ACKs (so the
+    // connection stays "healthy") while its app no longer drains the
+    // recv queue, so ant-quic's reader task parks its accept budget —
+    // the ingest back-pressure valve. The send then parks for the
+    // connection's lifetime and the 5 s watchdog cancels the handler
+    // mid-protocol.
+    //
+    // This harness reproduces that remote WITHOUT CPU contention: a
+    // raw ant-quic node whose recv queue is small, which SWIM-pings
+    // the SUT and never reads its inbound streams. Issue #1395's ratio
+    // (`timed_out / received`) is measured over a fixed stall window.
+    //
+    // Inert by construction, same shape as `test_network_config`:
+    // loopback bind, no seeds, mDNS and port mapping off on both nodes.
+    //
+    // Set X0X_1395_MEASURE_ONLY=1 to print the measurements without the
+    // post-fix assertions (used to record the before/after evidence).
+
+    /// Recv-queue depth the synthetic stalled peer tolerates before its
+    /// ant-quic reader parks (queue 64 + accept budget + advertised uni
+    /// stream credit 8 ⇒ the stall engages after roughly a hundred
+    /// unread Acks). Production nodes use 50_000/256; the small values
+    /// only shrink how long the burst phase takes to reach the same
+    /// steady state.
+    const STALL_PEER_DATA_CHANNEL_CAPACITY: usize = 64;
+    const STALL_PEER_UNI_CREDIT: u32 = 8;
+    /// Pings sent before the window: comfortably above the ~100 the
+    /// stalled peer absorbs before its credit stops returning.
+    const STALL_BURST_PINGS: usize = 400;
+    /// Measurement window: the ratio #1395 asks for is taken over this
+    /// many seconds of sustained stall.
+    const STALL_WINDOW: Duration = Duration::from_secs(12);
+
+    fn membership_swim_ping_frame() -> Vec<u8> {
+        let wrapped = saorsa_gossip_membership::MembershipProtocolMessage::Swim(
+            saorsa_gossip_membership::SwimMessage::Ping,
+        );
+        let mut frame = vec![GossipStreamType::Membership.to_byte()];
+        frame.extend_from_slice(&postcard::to_allocvec(&wrapped).expect("serialize SWIM Ping"));
+        frame
+    }
+
+    async fn spawn_stalled_peer() -> (ant_quic::Node, std::net::SocketAddr) {
+        let config = ant_quic::NodeConfig::builder()
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("loopback addr literal"),
+            )
+            .mdns_enabled(false)
+            .port_mapping_enabled(false)
+            .data_channel_capacity(STALL_PEER_DATA_CHANNEL_CAPACITY)
+            .max_concurrent_uni_streams(STALL_PEER_UNI_CREDIT)
+            .build();
+        let node = ant_quic::Node::with_config(config)
+            .await
+            .expect("stalled peer node");
+        let addr = node.local_addr().expect("stalled peer bound addr");
+        // A raw ant-quic node registers inbound connections only when the
+        // application drives `accept()`. Drive it, and nothing else: the
+        // connection (and its reader task) comes up, but the app-facing
+        // recv queue is never drained — the stalled-remote condition.
+        let accept_driver = node.clone();
+        tokio::spawn(async move { while accept_driver.accept().await.is_some() {} });
+        (node, addr)
+    }
+
+    async fn stalled_peer_view_of_sut(stalled: &ant_quic::Node) -> ant_quic::PeerId {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(conn) = stalled.connected_peers().await.into_iter().next() {
+                return conn.peer_id;
+            }
+            assert!(Instant::now() < deadline, "stalled peer never saw the SUT");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_remote_peer_cannot_pin_membership_dispatch() {
+        let measure_only = std::env::var("X0X_1395_MEASURE_ONLY").is_ok();
+
+        let network = Arc::new(
+            NetworkNode::new(test_network_config(), None, None)
+                .await
+                .expect("SUT network node"),
+        );
+        let runtime = GossipRuntime::new(
+            GossipConfig::default(),
+            Arc::clone(&network),
+            crate::gossip::pubsub::test_support::signing_context(),
+        )
+        .await
+        .expect("SUT runtime");
+        runtime.start().await.expect("SUT runtime started");
+
+        let (stalled, stalled_addr) = spawn_stalled_peer().await;
+        network
+            .connect_addr(stalled_addr)
+            .await
+            .expect("dial the stalled peer");
+        let sut_peer_on_stalled = stalled_peer_view_of_sut(&stalled).await;
+        let ping = membership_swim_ping_frame();
+
+        // Warm-up: the healthy path. The stalled peer reads nothing yet,
+        // but its queue is empty, so Acks complete and the lane is clean.
+        for _ in 0..10 {
+            let _ = stalled.send(&sut_peer_on_stalled, &ping).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let m = &runtime.dispatch_stats().membership;
+            if m.received >= 10 && m.completed + m.timed_out >= 10 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "warm-up pings never dispatched");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let warm = runtime.dispatch_stats().membership;
+        assert_eq!(warm.timed_out, 0, "warm-up must be timeout-free");
+        println!(
+            "[1395] warmup received={} completed={} timed_out={} max_elapsed_ms={}",
+            warm.received, warm.completed, warm.timed_out, warm.max_elapsed_ms
+        );
+
+        // Burst: fill the stalled peer's recv queue, accept budget and
+        // uni-stream credit so every subsequent Ack send parks.
+        for _ in 0..STALL_BURST_PINGS {
+            let _ = stalled.send(&sut_peer_on_stalled, &ping).await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let window_start = runtime.dispatch_stats().membership;
+        println!(
+            "[1395] window_start received={} completed={} timed_out={} max_elapsed_ms={}",
+            window_start.received,
+            window_start.completed,
+            window_start.timed_out,
+            window_start.max_elapsed_ms
+        );
+
+        // Stall window: keep pinging while the remote stays unread, and
+        // sample the lane once per second.
+        let started = Instant::now();
+        let mut next_sample = started;
+        let mut next_ping = started;
+        while started.elapsed() < STALL_WINDOW {
+            let now = Instant::now();
+            if now >= next_ping {
+                let _ = stalled.send(&sut_peer_on_stalled, &ping).await;
+                next_ping += Duration::from_millis(100);
+            }
+            if now >= next_sample {
+                let m = runtime.dispatch_stats().membership;
+                println!("[1395] t={:>2}s received={} completed={} timed_out={} over_1s={} max_elapsed_ms={}",
+                    started.elapsed().as_secs(), m.received, m.completed, m.timed_out, m.over_1s_count, m.max_elapsed_ms);
+                next_sample += Duration::from_secs(1);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let the last pings reach the dispatcher before the final read.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let window_end = runtime.dispatch_stats().membership;
+        let d_received = window_end.received.saturating_sub(window_start.received);
+        let d_timed_out = window_end.timed_out.saturating_sub(window_start.timed_out);
+        let d_over_100ms = window_end
+            .over_100ms_count
+            .saturating_sub(window_start.over_100ms_count);
+        let ratio = if d_received > 0 {
+            d_timed_out as f64 / d_received as f64
+        } else {
+            f64::INFINITY
+        };
+        println!("[1395] SUMMARY d_received={} d_timed_out={} d_over_100ms={} ratio={:.4} max_elapsed_ms={}",
+            d_received, d_timed_out, d_over_100ms, ratio, window_end.max_elapsed_ms);
+
+        if !measure_only {
+            assert!(
+                d_received >= 8,
+                "stall window dispatched only {d_received} messages; the harness did not exercise the lane"
+            );
+            assert!(
+                d_over_100ms * 2 >= d_received,
+                "stall never engaged: {d_received} dispatched but only {d_over_100ms} took the slow egress path"
+            );
+            assert!(
+                ratio < 0.005,
+                "membership-lane timeout ratio {ratio:.4} exceeds the 0.5% #1395 bar ({d_timed_out}/{d_received})"
+            );
+        }
+
+        runtime.shutdown().await.expect("SUT runtime shutdown");
+        stalled.shutdown().await;
+    }
 }

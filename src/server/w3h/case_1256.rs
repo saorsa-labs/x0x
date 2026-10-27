@@ -948,52 +948,58 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
 
 /// The red case: after a gossip-applied `MemberAdded`, a metadata event
 /// sent to M only by gossip is never applied. RED on main.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_red_1256_gossip_only_event_after_a_gossip_member_added() -> Result<()> {
-    expect(
-        "w3h_red_1256_gossip_only_event_after_a_gossip_member_added",
-        0x1256_0001,
-        Arm::GossipOnly,
-        // #1256 fixed: RED on main (CI 20/20 on 8244ce7), GREEN with the fix.
-        Verdict::Green,
-    )
-    .await
+fn w3h_red_1256_gossip_only_event_after_a_gossip_member_added() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_red_1256_gossip_only_event_after_a_gossip_member_added",
+            0x1256_0001,
+            Arm::GossipOnly,
+            // #1256 fixed: RED on main (CI 20/20 on 8244ce7), GREEN with the fix.
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// Control: the second event also reaches M by DM, which the never-exiting
 /// direct-channel listener applies. GREEN on main.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1256_control_second_event_also_by_dm() -> Result<()> {
-    expect(
-        "w3h_1256_control_second_event_also_by_dm",
-        0x1256_0002,
-        Arm::AlsoByDm,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1256_control_second_event_also_by_dm() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1256_control_second_event_also_by_dm",
+            0x1256_0002,
+            Arm::AlsoByDm,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// Control: M restarts after the first event, which re-arms its topic
 /// listener, so the gossip-only second event is applied. GREEN on main.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1256_control_member_restarted_after_the_first_event() -> Result<()> {
-    expect(
-        "w3h_1256_control_member_restarted_after_the_first_event",
-        0x1256_0003,
-        Arm::RestartedMember,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1256_control_member_restarted_after_the_first_event() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1256_control_member_restarted_after_the_first_event",
+            0x1256_0003,
+            Arm::RestartedMember,
+            Verdict::Green,
+        )
+        .await
+    })
 }

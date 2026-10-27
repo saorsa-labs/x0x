@@ -559,47 +559,53 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1105_red_baseline_restarted_replica_stays_at_n() -> Result<()> {
-    expect(
-        "w3h_1105_red_baseline_restarted_replica_stays_at_n",
-        0x1105_0001,
-        Arm::SnapshotDropped,
-        Verdict::Red,
-    )
-    .await
+fn w3h_1105_red_baseline_restarted_replica_stays_at_n() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1105_red_baseline_restarted_replica_stays_at_n",
+            0x1105_0001,
+            Arm::SnapshotDropped,
+            Verdict::Red,
+        )
+        .await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1105_restarted_replica_obtains_n_plus_one_snapshot() -> Result<()> {
-    expect(
-        "w3h_1105_restarted_replica_obtains_n_plus_one_snapshot",
-        0x1105_0002,
-        Arm::ProductionPath,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1105_restarted_replica_obtains_n_plus_one_snapshot() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1105_restarted_replica_obtains_n_plus_one_snapshot",
+            0x1105_0002,
+            Arm::ProductionPath,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin() -> Result<()> {
-    expect(
-        "w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin",
-        0x1105_0003,
-        Arm::InviteOnly,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1105_invite_only_restart_obtains_n_plus_one_from_local_admin",
+            0x1105_0003,
+            Arm::InviteOnly,
+            Verdict::Green,
+        )
+        .await
+    })
 }

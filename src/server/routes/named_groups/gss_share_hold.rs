@@ -8,7 +8,8 @@
 //!
 //! The hold has no time limit, and it survives a restart. Each waiting
 //! transition is written to `gss-share-holds/<blake3(group key)>.json`
-//! (0600, parent directory synced) when it parks. A restarted node loads
+//! through the shared S3/S4 durable writer (0600 from creation, content
+//! and directory synced) when it parks. A restarted node loads
 //! the files before its first ciphertext check, so it does not seal under
 //! the old secret again. The hold ends only when the node holds a secret
 //! of the transition's epoch or later (a verified key transition
@@ -422,10 +423,10 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    crate::storage::save_private_bytes_to(&path, bytes)
-        .await
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    super::sync_parent_dir_for_path(&path)
+    // #1533 rc22: the shared S3/S4 writer (ADR 0110 §5 write barrier):
+    // the temporary file is created 0600 before any byte, its content is
+    // synced before the rename, and the directory is synced after it.
+    super::revocation_eviction::write_bytes_durably(&path, &bytes, None).await
 }
 
 /// Write the group's holds, and log a failed write. Memory still holds the

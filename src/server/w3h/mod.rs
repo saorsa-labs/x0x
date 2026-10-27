@@ -15,7 +15,12 @@
 //! entropy/wall-clock shim (`scripts/w3h/w3h_shim.c`) is preloaded, the
 //! wall clock is a fixed base plus virtual time: each `clock_gettime`
 //! pulls the current virtual offset (no 1 ms ticker race; #1245), and
-//! all OS entropy is seeded.
+//! OS entropy is seeded per spawned task so one task's draws do not move
+//! another's stream. With `--cfg tokio_unstable` the seed is the spawn
+//! lineage (parent, spawn site, and child index), not the process-wide
+//! task id, so an earlier spawn at another site cannot move a signature
+//! (#1245). A lookup miss is counted and fails the case. Release binaries
+//! are not built with that cfg.
 //!
 //! Determinism (plan §3a): [`Sim::finish`] renders the fabric's canonical
 //! trace up to the `teardown begins` mark and prints
@@ -45,6 +50,7 @@ mod case_1105;
 mod case_1161;
 mod case_1191;
 mod case_1256;
+mod case_1356;
 mod case_1357;
 mod case_1427;
 mod case_1471;
@@ -94,6 +100,7 @@ const GATED_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20
 struct Shim {
     set_wall_offset_ns: unsafe extern "C" fn(u64),
     set_virt_time_ns_fn: unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
+    set_entropy_key_fn: unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
     thread_stats: unsafe extern "C" fn(*mut libc::c_char, usize) -> libc::c_int,
 }
 
@@ -132,6 +139,261 @@ unsafe extern "C" fn virt_offset_ns() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+/// C ABI: the current task's entropy key, or 0 when this draw is on the
+/// test body (`block_on`) or a thread with no task. 0 selects the shim's
+/// OS-thread stream. Must not draw entropy itself.
+unsafe extern "C" fn entropy_task_key() -> u64 {
+    current_task_entropy_key()
+}
+
+/// Stream key for the current task. A runtime built by [`block_on_paused`]
+/// under `tokio_unstable` returns the lineage key recorded at spawn. A miss
+/// is counted. [`block_on_paused`] and [`receipt::Receipt::emit`] fail the
+/// case when that count is not zero, so a runtime with no spawn hooks
+/// cannot fall back to the process-wide task id without a failure. Without
+/// `tokio_unstable` the key is the task id. That still isolates siblings
+/// and still moves when an earlier spawn shifts the process-wide counter.
+fn current_task_entropy_key() -> u64 {
+    let Some(id) = tokio::task::try_id() else {
+        return 0;
+    };
+    let bits = task_id_bits(id);
+    if bits == 0 {
+        return 0;
+    }
+    if let Some(key) = lineage::lookup(bits) {
+        return key;
+    }
+    // Tokio blocking tasks are unowned. `on_task_spawn` does not run for
+    // them, so the table has no row yet. A runtime that installed hooks
+    // records the row here. The key is the next index at one fixed site
+    // under parent 0, not this task id. A runtime with no hooks counts a
+    // miss. The shim calls this through a C function, so the miss must not
+    // panic here. The case fails at the Rust boundary.
+    if lineage::hooks_installed() {
+        return lineage::record_unseen(bits);
+    }
+    lineage::note_miss();
+    bits
+}
+
+/// Fail the test when a `tokio_unstable` build drew a key for a task that
+/// had no recorded spawn. The count stays zero on any other build.
+fn ensure_lineage_recorded() {
+    let misses = lineage::misses();
+    assert_eq!(
+        misses, 0,
+        "W3-H lineage lookup missed {misses} times under tokio_unstable; \
+         the runtime has no spawn hooks and fell back to the process-wide task id"
+    );
+}
+
+/// `Id` prints as its integer. A parse failure selects the thread stream.
+fn task_id_bits(id: tokio::task::Id) -> u64 {
+    id.to_string().parse().unwrap_or(0)
+}
+
+/// Paused current-thread runtime for one W3-H test. Under `tokio_unstable`
+/// every spawn records a lineage key before the task runs. A lookup miss
+/// fails the test after the future finishes.
+pub(crate) fn block_on_paused<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    lineage::reset();
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder.enable_all().start_paused(true);
+    lineage::install(&mut builder);
+    let result = builder.build().expect("w3h runtime").block_on(future);
+    ensure_lineage_recorded();
+    result
+}
+
+#[cfg(tokio_unstable)]
+mod lineage {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    struct Table {
+        /// Next child index for one parent key and one spawn site.
+        next_child: BTreeMap<(u64, u64), u32>,
+        /// Tokio task id → lineage stream key. Removed when the task ends
+        /// so a reused id does not keep the previous key. The child counter
+        /// is not reused: a later spawn at the same site takes the next index.
+        by_task: BTreeMap<u64, u64>,
+    }
+
+    impl Table {
+        const fn empty() -> Self {
+            Self {
+                next_child: BTreeMap::new(),
+                by_task: BTreeMap::new(),
+            }
+        }
+    }
+
+    /// Process-global. Two tests in one process share these counters and
+    /// can move each other's keys. W3-H requires nextest, which runs one
+    /// test per process. [`super::block_on_paused`] clears the table first.
+    static TABLE: Mutex<Table> = Mutex::new(Table::empty());
+
+    /// Lookup misses for this process. Same process-global limit as [`TABLE`].
+    static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn lock() -> std::sync::MutexGuard<'static, Table> {
+        TABLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Set while this process's runtime installed spawn hooks.
+    static HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub(super) fn reset() {
+        *lock() = Table::empty();
+        MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
+        HOOKS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn hooks_installed() -> bool {
+        HOOKS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn note_miss() {
+        MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn misses() -> u64 {
+        MISSES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn lookup(task_id: u64) -> Option<u64> {
+        lock().by_task.get(&task_id).copied()
+    }
+
+    pub(super) fn install(builder: &mut tokio::runtime::Builder) {
+        HOOKS.store(true, std::sync::atomic::Ordering::Relaxed);
+        builder.on_task_spawn(note_spawn);
+        builder.on_task_terminate(note_terminate);
+    }
+
+    /// First entropy draw for a task the spawn hook did not see. Tokio
+    /// blocking tasks take this path. Parent key 0 is the same shared
+    /// parent as a spawn from a thread with no task id. The site is fixed,
+    /// so these tasks do not share a child counter with a real spawn site.
+    /// The index is the order of first draws in this process, not the task id.
+    pub(super) fn record_unseen(task_id: u64) -> u64 {
+        const UNSEEN_SITE: u64 = 0xB10C_71D0_0000_0001;
+        let mut table = lock();
+        if let Some(key) = table.by_task.get(&task_id).copied() {
+            return key;
+        }
+        let counter = table.next_child.entry((0, UNSEEN_SITE)).or_insert(0);
+        *counter = counter.saturating_add(1);
+        let key = stream_key(0, UNSEEN_SITE, *counter);
+        table.by_task.insert(task_id, key);
+        key
+    }
+
+    /// The hook runs on the spawner, before the child is scheduled, so
+    /// `try_id` is the parent. `block_on` and any other thread with no task
+    /// id have no parent key. Their children share parent key 0, and they
+    /// share one child counter per spawn site. A child index counts spawns
+    /// of one parent at one source location, so a spawn at another location
+    /// does not move it.
+    fn note_spawn(meta: &tokio::runtime::TaskMeta<'_>) {
+        let child = super::task_id_bits(meta.id());
+        if child == 0 {
+            return;
+        }
+        let site = site_key(meta.spawned_at());
+        let seen = super::task_id_bits_of_current();
+        let mut table = lock();
+        let parent_key = if seen != 0 && seen != child {
+            table.by_task.get(&seen).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let counter = table.next_child.entry((parent_key, site)).or_insert(0);
+        *counter = counter.saturating_add(1);
+        let key = stream_key(parent_key, site, *counter);
+        table.by_task.insert(child, key);
+    }
+
+    fn note_terminate(meta: &tokio::runtime::TaskMeta<'_>) {
+        let child = super::task_id_bits(meta.id());
+        if child == 0 {
+            return;
+        }
+        lock().by_task.remove(&child);
+    }
+
+    /// FNV-1a of [`std::panic::Location::file`], line, and column.
+    /// `file()` for a registry crate is an absolute path under `CARGO_HOME`,
+    /// so the key is stable on one machine and differs across hosts. A
+    /// workspace path is relative to the crate and is stable across machines.
+    fn site_key(loc: &'static std::panic::Location<'static>) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in loc.file().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash ^= u64::from(loc.line());
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+        hash ^= u64::from(loc.column());
+        hash.wrapping_mul(0x100_0000_01b3)
+    }
+
+    fn stream_key(parent: u64, site: u64, index: u32) -> u64 {
+        let mut mixed = parent
+            ^ site.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from(index).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        // The shim reserves the high bit for OS-thread streams, and 0 means
+        // "use the thread stream".
+        let key = mixed & !(1_u64 << 63);
+        if key == 0 {
+            1
+        } else {
+            key
+        }
+    }
+}
+
+#[cfg(not(tokio_unstable))]
+mod lineage {
+    pub(super) fn reset() {}
+
+    pub(super) fn lookup(_task_id: u64) -> Option<u64> {
+        None
+    }
+
+    /// The task-id fallback is the only key on this build. It is not a miss.
+    pub(super) fn note_miss() {}
+
+    pub(super) fn misses() -> u64 {
+        0
+    }
+
+    pub(super) fn hooks_installed() -> bool {
+        false
+    }
+
+    pub(super) fn record_unseen(_task_id: u64) -> u64 {
+        0
+    }
+
+    pub(super) fn install(_builder: &mut tokio::runtime::Builder) {}
+}
+
+/// Task id of the spawner, or 0 when this thread is inside `block_on`.
+#[cfg(tokio_unstable)]
+fn task_id_bits_of_current() -> u64 {
+    tokio::task::try_id().map(task_id_bits).unwrap_or(0)
+}
+
 /// Test helper: install the pull origin on the current runtime.
 #[cfg(test)]
 pub(super) fn install_virt_clock_for_test(origin: tokio::time::Instant) {
@@ -161,10 +423,11 @@ impl Shim {
         use rand::RngCore as _;
         // SAFETY: `dlsym` with RTLD_DEFAULT and NUL-terminated names has no
         // preconditions; null means "not found".
-        let (set_wall, set_virt, active, calls, stats) = unsafe {
+        let (set_wall, set_virt, set_entropy, active, calls, stats) = unsafe {
             (
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_wall_offset_ns".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_virt_time_ns_fn".as_ptr()),
+                libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_set_entropy_key_fn".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_active".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_entropy_calls".as_ptr()),
                 libc::dlsym(libc::RTLD_DEFAULT, c"w3h_shim_thread_stats".as_ptr()),
@@ -172,6 +435,7 @@ impl Shim {
         };
         if set_wall.is_null()
             || set_virt.is_null()
+            || set_entropy.is_null()
             || active.is_null()
             || calls.is_null()
             || stats.is_null()
@@ -180,13 +444,17 @@ impl Shim {
         }
         // SAFETY: these are the shim's exported functions with exactly these
         // C ABI signatures (`scripts/w3h/w3h_shim.c`).
-        let (set_wall_offset_ns, set_virt_time_ns_fn, active, calls) = unsafe {
+        let (set_wall_offset_ns, set_virt_time_ns_fn, set_entropy_key_fn, active, calls) = unsafe {
             (
                 std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn(u64)>(set_wall),
                 std::mem::transmute::<
                     *mut libc::c_void,
                     unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
                 >(set_virt),
+                std::mem::transmute::<
+                    *mut libc::c_void,
+                    unsafe extern "C" fn(Option<unsafe extern "C" fn() -> u64>),
+                >(set_entropy),
                 std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn() -> libc::c_int>(
                     active,
                 ),
@@ -222,6 +490,7 @@ impl Shim {
         Ok(Self {
             set_wall_offset_ns,
             set_virt_time_ns_fn,
+            set_entropy_key_fn,
             thread_stats,
         })
     }
@@ -266,6 +535,21 @@ impl Shim {
         // SAFETY: `virt_offset_ns` matches the shim's C ABI; it only locks
         // `VIRT_CLOCK`, enters the owning handle, and reads the paused clock.
         unsafe { (self.set_virt_time_ns_fn)(Some(virt_offset_ns)) }
+        self.install_entropy_key();
+    }
+
+    /// Per-task entropy. A spawned task's `getrandom` uses the lineage key
+    /// recorded for that task, so another task's draws do not move it and
+    /// an earlier spawn at another site does not move the key (#1245).
+    fn install_entropy_key(self) {
+        // SAFETY: `entropy_task_key` matches the shim's C ABI. It reads the
+        // current task id and the lineage table. It does not draw entropy.
+        unsafe { (self.set_entropy_key_fn)(Some(entropy_task_key)) }
+    }
+
+    fn clear_entropy_key(self) {
+        // SAFETY: clearing the key fn is a plain atomic store in the shim.
+        unsafe { (self.set_entropy_key_fn)(None) }
     }
 
     fn clear_virt_time(self) {
@@ -274,6 +558,7 @@ impl Shim {
         *VIRT_CLOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.clear_entropy_key();
     }
 }
 
@@ -683,10 +968,10 @@ impl Sim {
 
     /// A fabric, clock gate and WARN-log capture with no daemons yet.
     /// `labels` names every node the case will start: their machine and
-    /// agent keys are generated here, on the test thread, before any daemon
-    /// runs. Daemons draw entropy on the test thread too (one current-thread
-    /// runtime), so a key generated after a daemon starts would depend on
-    /// how many draws that daemon's tasks happened to make first.
+    /// agent keys are generated here, on the test body, before any daemon
+    /// runs. The test body has no spawned-task id, so keygen stays on the
+    /// main-thread entropy stream. A daemon task's later `getrandom` uses
+    /// that task's own stream and does not move these keys (#1245).
     pub(crate) fn empty(case: &str, seed: u64, labels: &[&str]) -> Result<Self> {
         use tracing_subscriber::layer::SubscriberExt as _;
         use tracing_subscriber::Layer as _;

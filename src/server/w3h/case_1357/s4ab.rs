@@ -1650,49 +1650,55 @@ async fn expect2(case: &str, seed: u64, arm: Arm2, want: Verdict) -> Result<()> 
 }
 
 /// ADR 0110 `s4_certificate_rebind` runs (1) and (4): GREEN with S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_s4_certificate_rebind_pre_cutoff() -> Result<()> {
-    expect2(
-        "w3h_1357_s4_certificate_rebind_pre_cutoff",
-        0x1357_000b,
-        Arm2::Rebind(RebindRun::PreCutoff),
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_s4_certificate_rebind_pre_cutoff() -> Result<()> {
+    super::super::block_on_paused(async move {
+        expect2(
+            "w3h_1357_s4_certificate_rebind_pre_cutoff",
+            0x1357_000b,
+            Arm2::Rebind(RebindRun::PreCutoff),
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_certificate_rebind` run (6), designated admin reachable:
 /// GREEN with S4. Needs the shim (wall clock = base + virtual time), so
 /// it runs in the W3-H gate only.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[ignore = "needs the W3-H LD_PRELOAD shim: the W3-H gate runs it with --run-ignored all"]
-async fn w3h_1357_s4_certificate_rebind_post_cutoff() -> Result<()> {
-    expect2(
-        "w3h_1357_s4_certificate_rebind_post_cutoff",
-        0x1357_000c,
-        Arm2::Rebind(RebindRun::PostCutoff),
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_s4_certificate_rebind_post_cutoff() -> Result<()> {
+    super::super::block_on_paused(async move {
+        expect2(
+            "w3h_1357_s4_certificate_rebind_post_cutoff",
+            0x1357_000c,
+            Arm2::Rebind(RebindRun::PostCutoff),
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0110 `s4_owner_recovery`, Home with its sole admin revoked: GREEN
 /// with S4.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1357_s4_owner_recovery() -> Result<()> {
-    expect2(
-        "w3h_1357_s4_owner_recovery",
-        0x1357_000d,
-        Arm2::Recovery(RecoveryArm::SoleAdminRevoked),
-        Verdict::Green,
-    )
-    .await
+fn w3h_1357_s4_owner_recovery() -> Result<()> {
+    super::super::block_on_paused(async move {
+        expect2(
+            "w3h_1357_s4_owner_recovery",
+            0x1357_000d,
+            Arm2::Recovery(RecoveryArm::SoleAdminRevoked),
+            Verdict::Green,
+        )
+        .await
+    })
 }
