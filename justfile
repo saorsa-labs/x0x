@@ -35,13 +35,13 @@ w3h-shim:
 # `--run-ignored all` includes LD_PRELOAD-only unit tests declared `#[ignore]`
 # (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
 test-w3h: w3h-shim
-    python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h --run-ignored all
+    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable" python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h --run-ignored all
 
 # W3-H gate (D196): each case 20 times; the same verdict and complete receipts
 # every time. Distinct traces are reported; add --strict-traces to require one.
 test-w3h-gate: w3h-shim
     rm -rf target/w3h/traces
-    python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h --run-ignored all --stress-count 20
+    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable" python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h --run-ignored all --stress-count 20
     python3 scripts/ci/w3h-trace-check.py target/w3h/traces --runs 20 --require w3h_s1_control_group_invite_join_over_public_api --require w3h_s1_negative_control_offline_joiner_is_not_admitted --require w3h_1143_positive_control_consented_owner_announce_admits --require w3h_red_1143_promoted_admin_admits_with_owner_offline --require w3h_s4_control_evidence_hello_over_sim_streams --require w3h_s4_control_owner_sync_over_sim_streams --expect w3h_1143_positive_control_consented_owner_announce_admits=GREEN --expect w3h_red_1143_promoted_admin_admits_with_owner_offline=GREEN
 
 # Full-coverage suite run. nextest is fail-fast by default: the first failure
@@ -266,7 +266,7 @@ deny:
 # when the #1143 cases change (ADR 0108 S2).
 test-w3h-permuted: w3h-shim
     rm -rf target/w3h/traces-creator-low target/w3h/traces-admin-low
-    python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h-permuted-creator-low --stress-count 5
-    python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h-permuted-admin-low --stress-count 5
+    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable" python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h-permuted-creator-low --stress-count 5
+    RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable" python3 scripts/dev/test-isolated.py nextest --all-features --lib -- --profile w3h-permuted-admin-low --stress-count 5
     python3 scripts/ci/w3h-trace-check.py target/w3h/traces-creator-low --runs 5 --require w3h_1143_red_baseline_reproduces_owner_cert_member_pending --expect w3h_1143_red_baseline_reproduces_owner_cert_member_pending=RED
     python3 scripts/ci/w3h-trace-check.py target/w3h/traces-admin-low --runs 5 --require w3h_1143_red_baseline_reproduces_owner_cert_member_pending --expect w3h_1143_red_baseline_reproduces_owner_cert_member_pending=RED
