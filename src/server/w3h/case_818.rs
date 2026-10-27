@@ -482,34 +482,38 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
 
 /// The #818 part 2 red baseline: RED on `main`; GREEN with ADR 0109 S3
 /// (H-S3-a).
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined() -> Result<()> {
-    expect(
-        "w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined",
-        0x0818_0001,
-        Arm::StaleInvite,
-        Verdict::Green,
-    )
-    .await
+fn w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined",
+            0x0818_0001,
+            Arm::StaleInvite,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// The ownerless group with the same skew, but the invite is minted after
 /// the removal, so there is no gap.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_818_control_ownerless_invite_after_the_removal_joins() -> Result<()> {
-    expect(
-        "w3h_818_control_ownerless_invite_after_the_removal_joins",
-        0x0818_0002,
-        Arm::JustInTimeInvite,
-        Verdict::Green,
-    )
-    .await
+fn w3h_818_control_ownerless_invite_after_the_removal_joins() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_818_control_ownerless_invite_after_the_removal_joins",
+            0x0818_0002,
+            Arm::JustInTimeInvite,
+            Verdict::Green,
+        )
+        .await
+    })
 }

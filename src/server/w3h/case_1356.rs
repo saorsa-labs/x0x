@@ -1205,83 +1205,93 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
 }
 
 /// H-S3-a2 (#818, aligned clocks): RED on the base; GREEN with ADR 0109 S3.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1356_red_s3_aligned_stale_joiner_catches_up() -> Result<()> {
-    expect(
-        "w3h_1356_red_s3_aligned_stale_joiner_catches_up",
-        0x1356_0001,
-        Arm::AlignedJoin,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1356_red_s3_aligned_stale_joiner_catches_up() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1356_red_s3_aligned_stale_joiner_catches_up",
+            0x1356_0001,
+            Arm::AlignedJoin,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// H-S3-d1 in part (D41): J's recovery never marks, clears or moves A or M1.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1356_control_s3_attestation_touches_only_the_subject() -> Result<()> {
-    expect(
-        "w3h_1356_control_s3_attestation_touches_only_the_subject",
-        0x1356_0002,
-        Arm::SkewBystanders,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1356_control_s3_attestation_touches_only_the_subject() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1356_control_s3_attestation_touches_only_the_subject",
+            0x1356_0002,
+            Arm::SkewBystanders,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0109 §3 and §8: a forked node shows `reseat_required {not_on_chain}`
 /// (RED on the base; GREEN with S3).
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1356_red_s3_forked_node_shows_reseat_required() -> Result<()> {
-    expect(
-        "w3h_1356_red_s3_forked_node_shows_reseat_required",
-        0x1356_0003,
-        Arm::ForkTyped,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1356_red_s3_forked_node_shows_reseat_required() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1356_red_s3_forked_node_shows_reseat_required",
+            0x1356_0003,
+            Arm::ForkTyped,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0109 §3: a forked node is never recovered automatically.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1356_control_s3_forked_node_not_auto_recovered() -> Result<()> {
-    expect(
-        "w3h_1356_control_s3_forked_node_not_auto_recovered",
-        0x1356_0004,
-        Arm::ForkNotAuto,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1356_control_s3_forked_node_not_auto_recovered() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1356_control_s3_forked_node_not_auto_recovered",
+            0x1356_0004,
+            Arm::ForkNotAuto,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// ADR 0109 §3: an admin's manual re-seat recovers a forked node (RED on
 /// the base; GREEN with S3).
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1356_red_s3_manual_reseat_recovers_forked_node() -> Result<()> {
-    expect(
-        "w3h_1356_red_s3_manual_reseat_recovers_forked_node",
-        0x1356_0005,
-        Arm::ForkReseat,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1356_red_s3_manual_reseat_recovers_forked_node() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1356_red_s3_manual_reseat_recovers_forked_node",
+            0x1356_0005,
+            Arm::ForkReseat,
+            Verdict::Green,
+        )
+        .await
+    })
 }
