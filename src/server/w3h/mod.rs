@@ -163,9 +163,15 @@ fn current_task_entropy_key() -> u64 {
     if let Some(key) = lineage::lookup(bits) {
         return key;
     }
-    // The shim calls this through a C function. A panic here would unwind
-    // into that shim. Count the miss and keep the task-id fallback for this
-    // draw. The case fails at the Rust boundary.
+    // Tokio blocking tasks are unowned. `on_task_spawn` does not run for
+    // them, so the table has no row yet. A runtime that installed hooks
+    // records the row here. The key is the next index at one fixed site
+    // under parent 0, not this task id. A runtime with no hooks counts a
+    // miss. The shim calls this through a C function, so the miss must not
+    // panic here. The case fails at the Rust boundary.
+    if lineage::hooks_installed() {
+        return lineage::record_unseen(bits);
+    }
     lineage::note_miss();
     bits
 }
@@ -239,9 +245,17 @@ mod lineage {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Set while this process's runtime installed spawn hooks.
+    static HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     pub(super) fn reset() {
         *lock() = Table::empty();
         MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
+        HOOKS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(super) fn hooks_installed() -> bool {
+        HOOKS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(super) fn note_miss() {
@@ -257,8 +271,27 @@ mod lineage {
     }
 
     pub(super) fn install(builder: &mut tokio::runtime::Builder) {
+        HOOKS.store(true, std::sync::atomic::Ordering::Relaxed);
         builder.on_task_spawn(note_spawn);
         builder.on_task_terminate(note_terminate);
+    }
+
+    /// First entropy draw for a task the spawn hook did not see. Tokio
+    /// blocking tasks take this path. Parent key 0 is the same shared
+    /// parent as a spawn from a thread with no task id. The site is fixed,
+    /// so these tasks do not share a child counter with a real spawn site.
+    /// The index is the order of first draws in this process, not the task id.
+    pub(super) fn record_unseen(task_id: u64) -> u64 {
+        const UNSEEN_SITE: u64 = 0xB10C_71D0_0000_0001;
+        let mut table = lock();
+        if let Some(key) = table.by_task.get(&task_id).copied() {
+            return key;
+        }
+        let counter = table.next_child.entry((0, UNSEEN_SITE)).or_insert(0);
+        *counter = counter.saturating_add(1);
+        let key = stream_key(0, UNSEEN_SITE, *counter);
+        table.by_task.insert(task_id, key);
+        key
     }
 
     /// The hook runs on the spawner, before the child is scheduled, so
@@ -340,6 +373,14 @@ mod lineage {
     pub(super) fn note_miss() {}
 
     pub(super) fn misses() -> u64 {
+        0
+    }
+
+    pub(super) fn hooks_installed() -> bool {
+        false
+    }
+
+    pub(super) fn record_unseen(_task_id: u64) -> u64 {
         0
     }
 

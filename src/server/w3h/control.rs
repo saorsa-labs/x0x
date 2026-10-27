@@ -446,6 +446,36 @@ fn w3h_lineage_miss_fails_the_case() {
     );
 }
 
+/// #1245: a Tokio blocking task does not run `on_task_spawn`. Its key is
+/// still lineage, not the task id, and a second run keeps that key.
+#[cfg(tokio_unstable)]
+#[test]
+fn w3h_lineage_key_of_a_blocking_task_ignores_the_task_id() {
+    fn once() -> (u64, u64) {
+        super::block_on_paused(async {
+            tokio::task::spawn_blocking(|| {
+                let id = tokio::task::try_id().expect("blocking task has a task id");
+                let bits = super::task_id_bits(id);
+                (bits, super::current_task_entropy_key())
+            })
+            .await
+            .expect("blocking task")
+        })
+    }
+
+    let (id_first, key_first) = once();
+    let (id_second, key_second) = once();
+    assert_ne!(id_first, id_second, "the task id must move across runtimes");
+    assert_ne!(key_first, 0);
+    assert_ne!(key_first, id_first);
+    assert_ne!(key_second, id_second);
+    assert_eq!(
+        key_first, key_second,
+        "blocking-task lineage key must not follow the task id"
+    );
+    assert_eq!(super::lineage::misses(), 0);
+}
+
 #[cfg(target_os = "linux")]
 type ShimTestFill = unsafe extern "C" fn(u64, *mut libc::c_void, usize);
 #[cfg(target_os = "linux")]
