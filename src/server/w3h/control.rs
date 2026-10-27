@@ -17,7 +17,7 @@
 #![cfg(test)]
 
 use super::*;
-use anyhow::{bail, ensure};
+use anyhow::{anyhow, bail, ensure};
 use base64::Engine as _;
 use serde_json::json;
 
@@ -289,6 +289,108 @@ async fn w3h_system_time_follows_pull_callback_via_shim() -> Result<()> {
         "SystemTime::now() after 600s virtual jump should advance ~600s, got {elapsed:?} \
          (registration/interposition failure would leave real wall time)"
     );
+    Ok(())
+}
+
+/// #1245: one spawned task's `getrandom` stream does not move when a sibling
+/// draws. The shim keys the stream by tokio task id.
+///
+/// Declared `#[ignore]`: it needs `LD_PRELOAD=libw3h_shim.so` (ADR 0025
+/// §3–4). The W3-H harness runs it via `nextest --profile w3h-gate
+/// --run-ignored all`. A missing shim there is a hard failure.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[ignore = "requires W3-H LD_PRELOAD shim (nextest profile w3h / w3h-gate --run-ignored all)"]
+async fn w3h_task_entropy_stream_ignores_sibling_draws() -> Result<()> {
+    let shim = super::Shim::detect()
+        .map_err(|reason| anyhow!("W3-H shim required for per-task entropy: {reason}"))?;
+    shim.install_entropy_key();
+    struct ClearEntropy(super::Shim);
+    impl Drop for ClearEntropy {
+        fn drop(&mut self) {
+            self.0.clear_entropy_key();
+        }
+    }
+    let _clear = ClearEntropy(shim);
+
+    let sibling = tokio::spawn(async {
+        let mut noise = [0u8; 256];
+        draw_exact(&mut noise)?;
+        Ok::<(), anyhow::Error>(())
+    });
+    sibling
+        .await
+        .map_err(|error| anyhow!("sibling task join: {error}"))??;
+
+    tokio::spawn(async {
+        let id = tokio::task::try_id().ok_or_else(|| anyhow!("spawned task has no id"))?;
+        let key: u64 = id
+            .to_string()
+            .parse()
+            .map_err(|error| anyhow!("task id {id} is not an integer: {error}"))?;
+        ensure!(key != 0, "task id 0 is the thread-stream sentinel");
+
+        let fill = shim_test_fill()?;
+        let reset = shim_test_reset_key()?;
+        let mut expected = [0u8; 16];
+        // Drop draws made while resolving this task id. `fill` then samples
+        // the fresh stream, and the second reset makes `getrandom` repeat it.
+        // SAFETY: `expected` is writable for 16 bytes. `reset` drops only the
+        // shim table entry for `key`. The shim does not keep the pointer.
+        unsafe { reset(key) };
+        unsafe { fill(key, expected.as_mut_ptr().cast(), expected.len()) };
+        unsafe { reset(key) };
+
+        let mut got = [0u8; 16];
+        draw_exact(&mut got)?;
+        ensure!(
+            got.as_slice() == expected.as_slice(),
+            "task stream diverged from its own seed after a sibling drew \
+             (got {got:?} expected {expected:?})"
+        );
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|error| anyhow!("entropy task join: {error}"))??;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+type ShimTestFill = unsafe extern "C" fn(u64, *mut libc::c_void, usize);
+#[cfg(target_os = "linux")]
+type ShimTestReset = unsafe extern "C" fn(u64);
+
+#[cfg(target_os = "linux")]
+fn shim_test_fill() -> Result<ShimTestFill> {
+    shim_fn(c"w3h_shim_test_fill")
+}
+
+#[cfg(target_os = "linux")]
+fn shim_test_reset_key() -> Result<ShimTestReset> {
+    shim_fn(c"w3h_shim_test_reset_key")
+}
+
+#[cfg(target_os = "linux")]
+fn shim_fn<T>(name: &std::ffi::CStr) -> Result<T> {
+    // SAFETY: `dlsym` with RTLD_DEFAULT and a NUL-terminated name has no
+    // preconditions. Null means the shim did not export `name`.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    ensure!(
+        !symbol.is_null(),
+        "shim symbol {} is missing",
+        name.to_string_lossy()
+    );
+    // SAFETY: `symbol` is the shim export the caller named as `T`.
+    Ok(unsafe { std::mem::transmute_copy(&symbol) })
+}
+
+#[cfg(target_os = "linux")]
+fn draw_exact(buf: &mut [u8]) -> Result<()> {
+    // SAFETY: `buf` is writable for its length. Flag 0 is a blocking
+    // getrandom, which the shim serves in full when it is active.
+    let got = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+    let len = isize::try_from(buf.len()).map_err(|error| anyhow!("draw length: {error}"))?;
+    ensure!(got == len, "getrandom returned {got}, expected {len}");
     Ok(())
 }
 
