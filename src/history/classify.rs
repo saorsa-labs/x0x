@@ -105,6 +105,8 @@ pub fn classify_dm_payload(payload: &[u8]) -> DmPayloadClass {
         // user message that starts with the prefix stays history.
         || crate::groups::eviction::decode_handoff(payload).is_ok()
         || crate::groups::crypto_exclusion::decode_frame(payload).is_ok()
+        // ADR 0109 §5: S3 attestation requests and responses, likewise.
+        || crate::groups::recovery::decode_message(payload).is_ok()
         || crate::groups::cert_rebind::decode_frame(payload).is_ok()
         || crate::groups::owner_recovery::decode_frame(payload).is_ok()
     {
@@ -247,6 +249,25 @@ mod tests {
         );
         assert_eq!(
             classify_dm_payload(b"X0XCRB1 hello"),
+            DmPayloadClass::Durable("text/plain")
+        );
+    }
+
+    #[test]
+    fn s3_recovery_frames_are_ephemeral_and_prefix_text_is_durable() {
+        let message = crate::groups::recovery::GroupRecoveryMessageV1::Request(
+            crate::groups::recovery::GroupAttestRequestV1 {
+                group: "g".to_string(),
+                requester: [1; 32],
+                head_revision: 3,
+                head_state_hash: "h".to_string(),
+                refs: Vec::new(),
+            },
+        );
+        let bytes = crate::groups::recovery::encode_message(&message).expect("encode");
+        assert_eq!(classify_dm_payload(&bytes), DmPayloadClass::Ephemeral);
+        assert_eq!(
+            classify_dm_payload(b"X0XGRC1 hello"),
             DmPayloadClass::Durable("text/plain")
         );
     }

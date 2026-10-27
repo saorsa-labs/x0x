@@ -1547,6 +1547,7 @@ async fn issue458r2_adoption_refuses_commit_signed_by_non_actor() -> Result<()> 
             certificate_b64,
             owner_mandate: None,
             commit: Some(forged_commit),
+            reseat_mandate: None,
         }
     };
 
@@ -3873,6 +3874,7 @@ async fn issue458r4_removed_admin_fork_rejected() -> Result<()> {
         certificate_b64: joiner_cert_b64,
         owner_mandate: None,
         commit: Some(terminal_commit),
+        reseat_mandate: None,
     };
 
     // Serve the fork with the join result: chain + terminal, actor = A,
@@ -4052,6 +4054,7 @@ async fn issue458r5_stale_joiner_removed_admin_fork_rejected() -> Result<()> {
         certificate_b64: joiner_cert_b64,
         owner_mandate: None,
         commit: Some(terminal_commit.clone()),
+        reseat_mandate: None,
     };
     let attacker_id = attacker.agent_id();
 
@@ -4235,6 +4238,7 @@ async fn issue458r5_withdrawn_link_refused() -> Result<()> {
         certificate_b64: joiner_cert_b64,
         owner_mandate: None,
         commit: Some(terminal.clone()),
+        reseat_mandate: None,
     };
     // Fresh owner attestation for the MUTATED head (the withdrawn link's
     // hash) so the anchor CAS passes.
@@ -4404,6 +4408,7 @@ async fn r6c_targeted_refusal(
         certificate_b64: joiner_cert_b64,
         owner_mandate: None,
         commit: Some(terminal.clone()),
+        reseat_mandate: None,
     };
     let attestation = x0x::server::routes::named_groups::HeadAttestation::sign_for_terminal(
         &stage.group_id,
@@ -5607,6 +5612,7 @@ async fn adr0064_s4_removed_admin_fork_to_joiner_quarantines() -> Result<()> {
         ),
         owner_mandate: None,
         commit: Some(terminal.clone()),
+        reseat_mandate: None,
     };
 
     // Serve the fork chain with the join result — NO head attestation
@@ -5706,6 +5712,7 @@ async fn adr0064_s4_removed_admin_fork_to_joiner_quarantines() -> Result<()> {
         ),
         owner_mandate: None,
         commit: Some(stranger_terminal),
+        reseat_mandate: None,
     };
     let chain_key2 = join_result_key(&stage.group_id, &stage.joiner_hex);
     joiner2_state
@@ -6089,6 +6096,7 @@ async fn stale_base_treekem_fork_with_replayed_owner_attestation_still_quarantin
         ),
         owner_mandate: None,
         commit: Some(terminal.clone()),
+        reseat_mandate: None,
     };
 
     // Served WITH the owner's genuine (canonical-head) attestation.
@@ -6313,6 +6321,7 @@ async fn stale_base_treekem_sibling_terminal_with_genuine_owner_attestation_quar
         ),
         owner_mandate: None,
         commit: Some(sibling.clone()),
+        reseat_mandate: None,
     };
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
     joiner_state
@@ -7132,6 +7141,7 @@ async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result
         ),
         owner_mandate: None,
         commit: Some(genuine.clone()),
+        reseat_mandate: None,
     };
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
     joiner_state
@@ -7280,6 +7290,7 @@ async fn forking_catchup_policy_page_leaves_group_state_untouched() -> Result<()
         ),
         owner_mandate: None,
         commit: Some(genuine.clone()),
+        reseat_mandate: None,
     };
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
     joiner_state
@@ -7822,6 +7833,7 @@ async fn stale_record_in_one_group_does_not_block_another() -> Result<()> {
             certificate_b64: None,
             owner_mandate: None,
             commit: Some(genuine.clone()),
+            reseat_mandate: None,
         }),
         sender: stage.authority.agent.agent_id(),
         queued_at: std::time::Instant::now(),
@@ -8054,6 +8066,7 @@ async fn real_invite_stale_base_gap_is_classified_anchored_and_queued() -> Resul
         ),
         owner_mandate: None,
         commit: Some(genuine.clone()),
+        reseat_mandate: None,
     };
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
     joiner_state
@@ -8203,6 +8216,7 @@ async fn real_invite_removed_admin_sibling_is_classified_and_quarantined() -> Re
         ),
         owner_mandate: None,
         commit: Some(sibling.clone()),
+        reseat_mandate: None,
     };
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
     joiner_state
@@ -8545,6 +8559,7 @@ async fn adr0064_s4_removed_admin_fork_replay_under_held_lock_no_deadlock() -> R
         ),
         owner_mandate: None,
         commit: Some(terminal.clone()),
+        reseat_mandate: None,
     };
     let chain_key = join_result_key(&stage.group_id, &stage.joiner_hex);
     joiner_state

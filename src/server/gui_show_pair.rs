@@ -141,16 +141,32 @@ async fn remote_show_opens_on_the_other_owner_daemon() {
     // Heartbeats omit the owner certificate until the human discloses it.
     // Owner trust reads that certificate. Both daemons announce it the same
     // way `POST /announce` does.
-    state_a
-        .agent
-        .announce_identity(true, true)
-        .await
-        .expect("A discloses its owner certificate");
-    state_b
-        .agent
-        .announce_identity(true, true)
-        .await
-        .expect("B discloses its owner certificate");
+    //
+    // `announced_at` has one-second precision and a merge accepts an equal
+    // value. A startup announcement built before consent has no certificate.
+    // If it arrives after the disclosure of the same second, it removes the
+    // cached certificate and the show is refused. Consent is recorded when
+    // the first disclosure returns, so every later announcement carries the
+    // certificate. The second disclosure is in a later second, so every
+    // announcement without the certificate is older and is ignored.
+    for state in [&state_a, &state_b] {
+        state
+            .agent
+            .announce_identity(true, true)
+            .await
+            .expect("disclose the owner certificate");
+    }
+    let consented_at = unix_ms() / 1000;
+    while unix_ms() / 1000 <= consented_at {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for state in [&state_a, &state_b] {
+        state
+            .agent
+            .announce_identity(true, true)
+            .await
+            .expect("disclose the owner certificate in a later second");
+    }
 
     let ready = Instant::now();
     let mut last = String::new();

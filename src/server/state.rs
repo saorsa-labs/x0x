@@ -1115,6 +1115,14 @@ pub(super) struct AppState {
     /// lazy ML-DSA signature materialized on first capable serve. Bounded
     /// (1024) and TTL-swept alongside `pending_join_results`.
     pub(super) pending_join_refusals: StdMutex<HashMap<String, PendingJoinRefusal>>,
+    /// ADR 0108 §8 (#1575): member-side staged join pending notices, keyed
+    /// `(group_id, member_agent_id, attempt_id)` like the staged refusals.
+    /// Unsigned typed local state for held join attempts: the signed wire
+    /// `JoinPendingNotice` and its `Pending` serving arm wait on David's
+    /// ruling (#1575), so nothing here is served to a joiner. Memory-only,
+    /// TTL-swept at the join staging lifetime.
+    pub(super) pending_join_notices:
+        StdMutex<HashMap<String, crate::server::routes::named_groups::PendingJoinNotice>>,
     /// #477: joiner-side pending-join attempt registry, keyed
     /// `join_result_key` — the attempt id, the pinned inviter, and the
     /// poll task handle, so a typed refusal / timeout / seat can
@@ -1271,6 +1279,8 @@ pub(super) struct AppState {
     pub(super) treekem_dir: PathBuf,
     /// ADR 0110 S4: revocation-eviction obligations and budgets.
     pub(super) revocation_evictions: super::routes::named_groups::S4Runtime,
+    /// ADR 0109 S3: ownerless attestation and manual re-seat runtime.
+    pub(super) group_recovery: super::routes::named_groups::S3Runtime,
     /// Active WebSocket sessions.
     pub(super) ws_sessions: RwLock<HashMap<String, WsSession>>,
     /// Shared WS topic state (single lock for channel + subscribers + forwarder per topic).
