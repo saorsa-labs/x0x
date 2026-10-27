@@ -1474,51 +1474,57 @@ async fn expect_row(case: &str, seed: u64, row: Row, want: Verdict) -> Result<()
 }
 
 /// H-S3-b (L1, D82): RED on the base; GREEN with ADR 0109 S3.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1356_red_s3_b_provisional_admin_ata_promotes() -> Result<()> {
-    expect_row(
-        "w3h_1356_red_s3_b_provisional_admin_ata_promotes",
-        0x1356_0101,
-        Row::Provisional,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1356_red_s3_b_provisional_admin_ata_promotes() -> Result<()> {
+    super::super::block_on_paused(async move {
+        expect_row(
+            "w3h_1356_red_s3_b_provisional_admin_ata_promotes",
+            0x1356_0101,
+            Row::Provisional,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// H-S3-t (1) to (3) (D64): RED on the base; GREEN with ADR 0109 S3.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1356_red_s3_t_typed_waits_name_their_cause() -> Result<()> {
-    expect_row(
-        "w3h_1356_red_s3_t_typed_waits_name_their_cause",
-        0x1356_0102,
-        Row::TypedWaits,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1356_red_s3_t_typed_waits_name_their_cause() -> Result<()> {
+    super::super::block_on_paused(async move {
+        expect_row(
+            "w3h_1356_red_s3_t_typed_waits_name_their_cause",
+            0x1356_0102,
+            Row::TypedWaits,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// H-S3-t (4) (D64, ADR 0094): RED on the base; GREEN with ADR 0109 S3.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1356_red_s3_t_deferred_until_host_commit() -> Result<()> {
-    expect_row(
-        "w3h_1356_red_s3_t_deferred_until_host_commit",
-        0x1356_0103,
-        Row::HostCommit,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1356_red_s3_t_deferred_until_host_commit() -> Result<()> {
+    super::super::block_on_paused(async move {
+        expect_row(
+            "w3h_1356_red_s3_t_deferred_until_host_commit",
+            0x1356_0103,
+            Row::HostCommit,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 /// H-S3-r (D97, D119) as ADR 0109 writes it. Not a gate case: it cannot
@@ -1527,31 +1533,35 @@ async fn w3h_1356_red_s3_t_deferred_until_host_commit() -> Result<()> {
 /// record and no exhausted segment; §2 sends a request only for one of
 /// those, so J never asks A and never sees `base_beyond_retention`. Run it
 /// by hand (`--run-ignored all`): this test.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[ignore = "ADR 0109 H-S3-r cannot reach its candidate state under §2's request triggers (#1572); a probe, not a gate case"]
-async fn probe_w3h_1356_s3_r_beyond_retention() -> Result<()> {
-    let receipt = run_row(
-        "probe_w3h_1356_s3_r_beyond_retention",
-        0x1356_0104,
-        Row::Retention,
-    )
-    .await;
-    ensure!(receipt.verdict().is_some(), "no verdict");
-    Ok(())
+fn probe_w3h_1356_s3_r_beyond_retention() -> Result<()> {
+    super::super::block_on_paused(async move {
+        let receipt = run_row(
+            "probe_w3h_1356_s3_r_beyond_retention",
+            0x1356_0104,
+            Row::Retention,
+        )
+        .await;
+        ensure!(receipt.verdict().is_some(), "no verdict");
+        Ok(())
+    })
 }
 
 /// H-S3-d5 (D80): RED on the base; GREEN with ADR 0109 S3.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear() -> Result<()> {
-    expect_row(
-        "w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear",
-        0x1356_0105,
-        Row::Sibling,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear() -> Result<()> {
+    super::super::block_on_paused(async move {
+        expect_row(
+            "w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear",
+            0x1356_0105,
+            Row::Sibling,
+            Verdict::Green,
+        )
+        .await
+    })
 }

@@ -657,7 +657,15 @@ jobs:
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
         # The profile default-filter still intersects this expression, so
         # only `w3h_` tests run. Repeat count stays 20.
+        # `--cfg tokio_unstable` is this job only. Release binaries and the
+        # other CI jobs do not set it (#1245). `CARGO_ENCODED_RUSTFLAGS`
+        # replaces `RUSTFLAGS` when it is set, so append to whichever is live.
         run: |
+          if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
+            export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}"$'\x1f'"--cfg"$'\x1f'"tokio_unstable"
+          else
+            export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable"
+          fi
           filter="$(python3 -B scripts/ci/w3h-shards.py --filter "${{ matrix.group }}")"
           echo "W3H-SHARD-START group=${{ matrix.group }} filter=${filter}"
           python3 -B scripts/ci/w3h-shards.py --list "${{ matrix.group }}"

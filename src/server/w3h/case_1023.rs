@@ -3075,7 +3075,7 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
@@ -3086,17 +3086,19 @@ async fn expect(case: &str, seed: u64, arm: Arm, want: Verdict) -> Result<()> {
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-async fn w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes() -> Result<()> {
-    expect(
-        "w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes",
-        0x1023_0001,
-        Arm::HolderReturns,
-        Verdict::Red,
-    )
-    .await
+fn w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes",
+            0x1023_0001,
+            Arm::HolderReturns,
+            Verdict::Red,
+        )
+        .await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
@@ -3107,17 +3109,19 @@ async fn w3h_1023_red_baseline_all_holders_offline_wait_is_typed_then_resumes() 
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-async fn w3h_1023_restart_one_holder_online_admits() -> Result<()> {
-    expect(
-        "w3h_1023_restart_one_holder_online_admits",
-        0x1023_0002,
-        Arm::OneHolderOnline,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1023_restart_one_holder_online_admits() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1023_restart_one_holder_online_admits",
+            0x1023_0002,
+            Arm::OneHolderOnline,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
@@ -3128,17 +3132,19 @@ async fn w3h_1023_restart_one_holder_online_admits() -> Result<()> {
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-async fn w3h_1023_control_holders_never_return_fail_closed() -> Result<()> {
-    expect(
-        "w3h_1023_control_holders_never_return_fail_closed",
-        0x1023_0003,
-        Arm::HoldersNeverReturn,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1023_control_holders_never_return_fail_closed() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1023_control_holders_never_return_fail_closed",
+            0x1023_0003,
+            Arm::HoldersNeverReturn,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
@@ -3149,14 +3155,16 @@ async fn w3h_1023_control_holders_never_return_fail_closed() -> Result<()> {
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-async fn w3h_1023_control_holder_returns_recovers() -> Result<()> {
-    expect(
-        "w3h_1023_control_holder_returns_recovers",
-        0x1023_0004,
-        Arm::HolderReturnsRecovers,
-        Verdict::Green,
-    )
-    .await
+fn w3h_1023_control_holder_returns_recovers() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1023_control_holder_returns_recovers",
+            0x1023_0004,
+            Arm::HolderReturnsRecovers,
+            Verdict::Green,
+        )
+        .await
+    })
 }
 
 #[test]

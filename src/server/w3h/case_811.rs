@@ -826,43 +826,49 @@ fn assert_control(receipt: &Receipt, expected: Verdict, web_request_delivered: b
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_811_late_joiner_reads_history_from_plain_member() -> Result<()> {
-    let receipt = run(CASE, SEED, WebFault::None).await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "{CASE} verdict {:?}, expected GREEN",
-        receipt.verdict()
-    );
-    Ok(())
+fn w3h_811_late_joiner_reads_history_from_plain_member() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run(CASE, SEED, WebFault::None).await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "{CASE} verdict {:?}, expected GREEN",
+            receipt.verdict()
+        );
+        Ok(())
+    })
 }
 
 /// Wiki syncs. Web's state-sync requests are dropped before they reach P.
 /// J lacks web keys P holds, but the missing store's request was not
 /// delivered, so the receipt stays INFRA.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_811_control_web_request_dropped_is_infra() -> Result<()> {
-    let receipt = run(CASE_DROP, 0x0811_0002, WebFault::DropRequests).await;
-    assert_control(&receipt, Verdict::Infra, false)
+fn w3h_811_control_web_request_dropped_is_infra() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run(CASE_DROP, 0x0811_0002, WebFault::DropRequests).await;
+        assert_control(&receipt, Verdict::Infra, false)
+    })
 }
 
 /// The web request reaches P (`requests_received` moves). P's web history
 /// frames toward J are dropped, so J still lacks web keys P holds. That is
 /// RED. Wiki is not faulted and must arrive.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_811_control_web_history_withheld_is_red() -> Result<()> {
-    let receipt = run(CASE_WITHHOLD, 0x0811_0003, WebFault::WithholdHistory).await;
-    assert_control(&receipt, Verdict::Red, true)
+fn w3h_811_control_web_history_withheld_is_red() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run(CASE_WITHHOLD, 0x0811_0003, WebFault::WithholdHistory).await;
+        assert_control(&receipt, Verdict::Red, true)
+    })
 }
