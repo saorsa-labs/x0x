@@ -1001,12 +1001,7 @@ pub(super) fn new_delivery(
         Arc::clone(&bytes),
         true,
     );
-    let gss_epoch = ce::decode_frame(&bytes)
-        .ok()
-        .and_then(|frame| match frame.body.crypto {
-            ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } => Some(next_secret_epoch),
-            ce::CryptoExclusionCryptoV1::TreeKem { .. } => None,
-        });
+    let gss_epoch = frame_gss_epoch(&bytes);
     let gss_shares_pending = resumed && gss_epoch.is_some();
     ce_state.deliveries.insert(
         key.clone(),
@@ -1090,6 +1085,34 @@ pub(super) fn saved_frame_heads(bytes: &[u8]) -> Option<(String, String, u64)> {
         frame.body.commit.state_hash,
         frame.body.next_revision,
     ))
+}
+
+/// The rotated secret epoch a saved GSS frame commits to (`None` for a
+/// TreeKEM frame, which carries its own key material).
+pub(super) fn frame_gss_epoch(bytes: &[u8]) -> Option<u64> {
+    ce::decode_frame(bytes)
+        .ok()
+        .and_then(|frame| match frame.body.crypto {
+            ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } => Some(next_secret_epoch),
+            ce::CryptoExclusionCryptoV1::TreeKem { .. } => None,
+        })
+}
+
+/// #1574 item 3: whether a saved GSS frame the chain superseded still
+/// needs its delivery at restart. The live round rule in
+/// `drive_deliveries` keeps a delivery while the rotated secret is still
+/// the current committed one, because a GSS survivor installs the frame
+/// only with its sealed share, and the crash may have lost the shares
+/// before any survivor converged (#1508 review P1). The restart
+/// classification must not end that delivery earlier than the live rule
+/// would: without a delivery the row would complete on the chain proof
+/// alone, with no round ever re-sealing the share. `gss_epoch` is the
+/// frame's rotated epoch ([`frame_gss_epoch`]).
+pub(super) fn superseded_gss_delivery_kept(info: &GroupInfo, gss_epoch: Option<u64>) -> bool {
+    let Some(epoch) = gss_epoch else {
+        return false;
+    };
+    info.secret_epoch == epoch && ce::committed_secret_epoch(info) == epoch
 }
 
 // ─── Delivery ──────────────────────────────────────────────────────────────
@@ -2533,6 +2556,43 @@ mod tests {
             classify_saved_frame(&info, "p", "r"),
             SavedFrameState::Superseded
         );
+    }
+
+    /// #1574 item 3: the restart rule for a superseded GSS frame mirrors
+    /// the live round rule — the delivery survives while the rotated
+    /// secret is still the current committed one, and a later rekey (or a
+    /// TreeKEM frame with no rotated secret) ends it.
+    #[test]
+    fn a_superseded_gss_frame_keeps_its_delivery_while_its_secret_is_current() {
+        let mut info = info_with_log("c", &[("p", "r"), ("r", "c")]);
+        for retained in info.commit_log.iter_mut() {
+            retained.commit.security_binding = Some(ce::gss_binding(2));
+        }
+        info.security_binding = Some(ce::gss_binding(2));
+        info.secret_epoch = 2;
+        assert!(superseded_gss_delivery_kept(&info, Some(2)));
+        // A rekey moved the committed epoch past the frame's rotation.
+        info.commit_log
+            .last_mut()
+            .expect("head commit")
+            .commit
+            .security_binding = Some(ce::gss_binding(3));
+        info.security_binding = Some(ce::gss_binding(3));
+        info.secret_epoch = 3;
+        assert!(!superseded_gss_delivery_kept(&info, Some(2)));
+        // A TreeKEM frame carries no rotated secret epoch.
+        assert!(!superseded_gss_delivery_kept(&info, None));
+        // The committed epoch is the frame's again, but a sealed share of
+        // a newer epoch already raised the local one: the live rule needs
+        // both to agree, so the delivery is not current.
+        info.commit_log
+            .last_mut()
+            .expect("head commit")
+            .commit
+            .security_binding = Some(ce::gss_binding(2));
+        info.security_binding = Some(ce::gss_binding(2));
+        info.secret_epoch = 5;
+        assert!(!superseded_gss_delivery_kept(&info, Some(2)));
     }
 
     #[test]
