@@ -270,9 +270,18 @@ struct Placeheld {
     /// whose REAL record the legacy view holds. `None` once an
     /// authoritative record is durable.
     first_before: Option<s3::AuthoritativeHead>,
+    /// The REAL record that `first_before` names. While no authoritative
+    /// record is durable and the authoritative write fails, the legacy
+    /// views keep this record for the group (#1570).
+    first_before_record: Option<Arc<GroupInfo>>,
     /// BLAKE3 of the JSON of the authoritative record that is durable in
     /// the sidecar.
     durable_digest: Option<[u8; 32]>,
+    /// The last roster save could not make this group's authoritative
+    /// record durable, so the legacy views kept the group's last durable
+    /// form (#1570). The group's transition is not published, and the
+    /// worker writes again.
+    authoritative_failed: bool,
     /// Load reconciliation kept a placeholder that matches neither end of
     /// its binding: the live record is that placeholder, inert, and no
     /// authoritative write runs for it.
@@ -1204,10 +1213,17 @@ fn placeheld_key<'a>(
 /// that stops being placeheld meanwhile is written either wholly before or
 /// wholly after that change.
 ///
+/// #1570: when one group's authoritative record cannot be made durable,
+/// only that group is held back. Its legacy entry stays in its last durable
+/// form ([`unsynced_legacy_entry`]), it is marked `authoritative_failed`
+/// (its transition is not published, [`confirm_placeheld_write`]), and the
+/// other groups are saved.
+///
 /// # Errors
 ///
-/// A sidecar write that is not durable: the caller's save then writes no
-/// legacy file, so nothing is published.
+/// A sidecar write that is not durable for a group with no known durable
+/// legacy form: the caller's save then writes no legacy file, so nothing
+/// is published.
 pub(super) async fn legacy_store_view(
     state: &AppState,
     groups: &HashMap<String, GroupInfo>,
@@ -1226,13 +1242,35 @@ pub(super) async fn legacy_store_view(
         let Some(canonical) = placeheld_key(groups, &stable, &entry).cloned() else {
             continue;
         };
-        if !entry.lost && !frozen.contains(&stable) {
-            sync_authoritative(state, &stable, &entry, &canonical, groups).await?;
-        }
+        let held_back = if !entry.lost && !frozen.contains(&stable) {
+            let held_back =
+                match sync_authoritative(state, &stable, &entry, &canonical, groups).await {
+                    Ok(()) => None,
+                    Err(error) => Some(
+                        unsynced_legacy_entry(state, &stable, &entry)
+                            .await
+                            .ok_or(error)?,
+                    ),
+                };
+            let failed = held_back.is_some();
+            with_placeheld(state, |placeheld| {
+                if let Some(entry) = placeheld.get_mut(&stable) {
+                    entry.authoritative_failed = failed;
+                    entry.legacy_pending |= failed;
+                }
+            });
+            held_back
+        } else {
+            None
+        };
         for (key, info) in groups {
             if info.stable_group_id() == stable.as_str() {
+                let legacy = match &held_back {
+                    Some(held) if *key == canonical => held.clone(),
+                    _ => s3_placeholder(info),
+                };
                 view.get_or_insert_with(|| groups.clone())
-                    .insert(key.clone(), s3_placeholder(info));
+                    .insert(key.clone(), legacy);
             }
         }
     }
@@ -1358,9 +1396,65 @@ async fn sync_authoritative(
             entry.key = key.to_string();
             entry.durable_digest = Some(digest);
             entry.first_before = None;
+            entry.first_before_record = None;
         }
     });
     Ok(())
+}
+
+/// #1570: the legacy entry of a placeheld group whose authoritative write
+/// failed in this save: its last durable form, so the failure does not
+/// spread to the other groups and no containment is lost.
+/// - With a durable authoritative record: that record's S3 placeholder.
+///   Load reconciliation matches it to the binding's `after`
+///   ([`s3::AuthoritativeChoice::After`]).
+/// - Before any authoritative record is durable: the real record that the
+///   legacy views held when the group was placeheld (`first_before`). The
+///   arming is then dropped ([`confirm_placeheld_write`]).
+///
+/// `None` when neither is known; the save then fails as a whole.
+async fn unsynced_legacy_entry(
+    state: &AppState,
+    stable: &str,
+    entry: &Placeheld,
+) -> Option<GroupInfo> {
+    let Some(digest) = entry.durable_digest else {
+        return entry.first_before_record.as_deref().cloned();
+    };
+    let inner = state.group_recovery.inner.lock().await;
+    let bytes = inner
+        .sidecars
+        .get(stable)?
+        .authoritative_record
+        .as_deref()?;
+    if *blake3::hash(bytes).as_bytes() != digest {
+        return None;
+    }
+    let record = serde_json::from_slice::<GroupInfo>(bytes).ok()?;
+    Some(s3_placeholder(&record))
+}
+
+/// #1570: a roster save can be Durable while a placeheld group's own
+/// authoritative write failed (its legacy entry kept its last durable
+/// form). For that group's transition the write is then not Durable:
+/// `ReplacedNotDurable` when a durable authoritative record backs the
+/// placeholder on disk (the record stays contained and the worker writes
+/// again), `Dropped` when none does (the legacy views hold the real
+/// record, so the arming is rolled back).
+fn confirm_placeheld_write(state: &AppState, stable: &str, write: LegacyWrite) -> LegacyWrite {
+    if write != LegacyWrite::Durable {
+        return write;
+    }
+    with_placeheld(state, |placeheld| match placeheld.get(stable) {
+        Some(entry) if entry.authoritative_failed => {
+            if entry.durable_digest.is_some() {
+                LegacyWrite::ReplacedNotDurable
+            } else {
+                LegacyWrite::Dropped
+            }
+        }
+        _ => write,
+    })
 }
 
 fn is_placeheld(state: &AppState, stable: &str) -> bool {
@@ -1461,7 +1555,9 @@ fn begin_placehold(state: &AppState, key: &str, info: &GroupInfo) {
         placeheld.entry(stable).or_insert_with(|| Placeheld {
             key: key.to_string(),
             first_before: Some(s3::AuthoritativeHead::of(info)),
+            first_before_record: Some(Arc::new(info.clone())),
             durable_digest: None,
+            authoritative_failed: false,
             lost: false,
             legacy_pending: true,
         });
@@ -1663,7 +1759,8 @@ async fn arm_in_place(
     }
     begin_placehold(state, group_key, captured);
     let outcome = super::save_named_groups_checked(state).await;
-    finish_arm(state, &stable, LegacyWrite::of(&outcome), &ata).await
+    let write = confirm_placeheld_write(state, &stable, LegacyWrite::of(&outcome));
+    finish_arm(state, &stable, write, &ata).await
 }
 
 /// Write the legacy views again (the placeholder, or the real record once
@@ -1743,6 +1840,8 @@ async fn ensure_placeholders(state: &AppState) {
                     let first_before = durable_digest
                         .is_none()
                         .then(|| s3::AuthoritativeHead::of(info));
+                    let first_before_record =
+                        durable_digest.is_none().then(|| Arc::new(info.clone()));
                     let key = key.clone();
                     with_placeheld(state, |placeheld| {
                         placeheld.insert(
@@ -1750,7 +1849,9 @@ async fn ensure_placeholders(state: &AppState) {
                             Placeheld {
                                 key,
                                 first_before,
+                                first_before_record,
                                 durable_digest,
+                                authoritative_failed: false,
                                 lost,
                                 legacy_pending: true,
                             },
@@ -1799,7 +1900,9 @@ async fn ensure_placeholders(state: &AppState) {
     if write == LegacyWrite::Durable {
         with_placeheld(state, |placeheld| {
             for entry in placeheld.values_mut() {
-                entry.legacy_pending = false;
+                if !entry.authoritative_failed {
+                    entry.legacy_pending = false;
+                }
             }
         });
         for stable in unplacehold {
@@ -2776,11 +2879,15 @@ pub(super) async fn apply_join_carry(
     // placeholder, bound to the epoch token captured under this lock.
     let write = if epoch_unchanged(state, &group_key, &captured_epoch).await {
         begin_placehold(state, &group_key, &current);
-        LegacyWrite::of(&super::persist_named_group_info(state, &group_key, next.clone()).await)
+        let outcome = super::persist_named_group_info(state, &group_key, next.clone()).await;
+        confirm_placeheld_write(state, &stable, LegacyWrite::of(&outcome))
     } else {
         LegacyWrite::Dropped
     };
-    if write == LegacyWrite::ReplacedNotDurable {
+    // #1570: a `Dropped` from `confirm_placeheld_write` follows a Durable
+    // save, which published `next`; `unpublish_not_durable` takes it back
+    // (it changes nothing when the live record is no longer `next`).
+    if write != LegacyWrite::Durable {
         unpublish_not_durable(state, &group_key, &current, &next).await;
     }
     if !finish_arm(state, &stable, write, ata).await {
@@ -10214,8 +10321,10 @@ mod tests {
     }
 
     /// ADR 0109 §4 "sidecar, then legacy view": when the authoritative
-    /// record cannot be made durable, the roster save writes no legacy
-    /// file, so a placeholder is never on disk without its backing.
+    /// record cannot be made durable, a placeholder is never on disk
+    /// without its backing. #1570: the group keeps its real record in the
+    /// legacy views and its arming is dropped; the save itself is not
+    /// blocked.
     #[tokio::test]
     async fn placeholder_is_never_written_without_a_durable_authoritative_record(
     ) -> anyhow::Result<()> {
@@ -10227,17 +10336,113 @@ mod tests {
         tokio::fs::write(sidecar_dir(&state), b"not a directory").await?;
         begin_placehold(&state, &key, &info);
         let outcome = super::super::save_named_groups_checked(&state).await;
-        assert!(!matches!(
-            outcome,
-            Ok(super::super::AtomicWriteOutcome::Durable
-                | super::super::AtomicWriteOutcome::ReplacedNotDurable)
-        ));
+        assert_eq!(
+            confirm_placeheld_write(&state, &stable, LegacyWrite::of(&outcome)),
+            LegacyWrite::Dropped,
+            "the arming is not published"
+        );
         let legacy = legacy_entry(&state.named_groups_path, &key)
             .await?
             .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
-        assert!(!s3::is_s3_placeholder(&legacy), "no legacy write happened");
+        assert!(
+            !s3::is_s3_placeholder(&legacy),
+            "no placeholder without backing"
+        );
         assert!(legacy.has_active_member(&local));
-        let _ = stable;
+        Ok(())
+    }
+
+    /// #1570: while one placeheld group's sidecar cannot be written, the
+    /// roster saves of every other group still land. The blocked group
+    /// keeps the placeholder of its durable authoritative record (its
+    /// containment), its change is held back, and the worker writes it
+    /// once the sidecar is writable again. Before the fix every roster
+    /// save failed while the sidecar was unwritable.
+    #[tokio::test]
+    async fn an_unwritable_sidecar_holds_back_only_its_own_group() -> anyhow::Result<()> {
+        use super::super::AtomicWriteOutcome;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+        let durable = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("armed legacy entry"))?;
+        assert!(s3::is_s3_placeholder(&durable));
+
+        // The armed group's sidecar cannot be written: a non-empty
+        // directory holds its name.
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::remove_file(&path).await?;
+        tokio::fs::create_dir_all(path.join("blocked")).await?;
+
+        // The armed group's live record changes, so the next save must
+        // write its authoritative record again; another group is added.
+        let other_admin = x0x::identity::AgentKeypair::generate()?;
+        let mut other = GroupInfo::new(
+            "adr0109-other".to_string(),
+            String::new(),
+            other_admin.agent_id(),
+            "4570".repeat(16),
+        );
+        other.seal_commit(&other_admin, 1_000)?;
+        let other_key = other.mls_group_id.clone();
+        {
+            let mut groups = state.named_groups.write().await;
+            if let Some(live) = groups.get_mut(&key) {
+                live.description = "changed while blocked".to_string();
+            }
+            groups.insert(other_key.clone(), other);
+        }
+        let outcome = super::super::save_named_groups_checked(&state).await;
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "another group's save is not blocked: {outcome:?}"
+        );
+        assert!(
+            legacy_entry(&state.named_groups_path, &other_key)
+                .await?
+                .is_some(),
+            "the other group is saved"
+        );
+        let held = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("held legacy entry"))?;
+        assert_eq!(
+            serde_json::to_value(&held)?,
+            serde_json::to_value(&durable)?,
+            "the blocked group keeps its durable placeholder"
+        );
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(
+                |entry| entry.authoritative_failed && entry.legacy_pending
+            )));
+        assert_eq!(
+            confirm_placeheld_write(&state, &stable, LegacyWrite::of(&outcome)),
+            LegacyWrite::ReplacedNotDurable,
+            "the blocked group's change is not published as durable"
+        );
+
+        // The sidecar is writable again: the worker writes the change.
+        tokio::fs::remove_dir_all(&path).await?;
+        ensure_placeholders(&state).await;
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("rewritten legacy entry"))?;
+        assert!(s3::is_s3_placeholder(&legacy));
+        assert_eq!(legacy.description, "changed while blocked");
+        let record = sidecar_on_disk(&state, &stable)
+            .await?
+            .authoritative_record
+            .ok_or_else(|| anyhow::anyhow!("authoritative record"))?;
+        let record: GroupInfo = serde_json::from_slice(&record)?;
+        assert_eq!(record.description, "changed while blocked");
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(
+                |entry| !entry.authoritative_failed && !entry.legacy_pending
+            )));
         Ok(())
     }
 
