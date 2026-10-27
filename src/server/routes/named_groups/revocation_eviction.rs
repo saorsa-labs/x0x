@@ -660,6 +660,14 @@ async fn group_head_synced_at(state: &AppState, group_key: &str, tree_epoch: Opt
     let unresolved = unresolved_head_evidence(state, &key, &info, local_epoch).await;
     let local = *state.agent.agent_id().as_bytes();
     let inner = runtime.inner.lock().await;
+    // The same excluded set the worker pass builds for its round: the open
+    // rows' and queued bans' targets, and the owner-recovery exclusions
+    // (the revoked admins of a held mandate, the removed seats of a
+    // restored delivery). The rebind plane excludes no holder. Without the
+    // owner-recovery part the gate and the pass disagree on the holders
+    // exactly when no holders are left: the pass asks nobody, while the
+    // gate still counts a revoked admin and waits the full restart sync
+    // wait for an answer that cannot come (#1576).
     let excluded: BTreeSet<[u8; 32]> = inner
         .store
         .open_rows_for_group(info.stable_group_id())
@@ -670,6 +678,15 @@ async fn group_head_synced_at(state: &AppState, group_key: &str, tree_epoch: Opt
                 .keys()
                 .filter(|key| key.stable_group_id == info.stable_group_id())
                 .map(|key| key.target),
+        )
+        .chain(
+            inner
+                .orc
+                .head_round_groups()
+                .get(info.stable_group_id())
+                .into_iter()
+                .flatten()
+                .copied(),
         )
         .collect();
     let holders = head_holders(&info, &local, &excluded).len();
@@ -5689,6 +5706,147 @@ pub(super) mod tests {
         assert!(
             !crate::w3h_inline::fs::try_exists(&path).await?,
             "retired after the write"
+        );
+        Ok(())
+    }
+
+    /// #1576: a restored removal delivery keeps a head round through its
+    /// open row. The restart adopts the saved `MemberRemoved` whose
+    /// commit is the group's head; the `reconcile_and_retain` delivering
+    /// set holds the row open on the next pass (the roster alone would
+    /// complete it in a `SignedPublic` group), and the open row keeps the
+    /// group's §2 head round, which the restored event's resends wait
+    /// for. No dedicated restart test proved this before.
+    #[tokio::test]
+    async fn a_restored_removal_delivery_keeps_the_head_round_through_its_open_row(
+    ) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let target_hex = hex::encode(target.agent_id().as_bytes());
+        let survivor = x0x::identity::AgentKeypair::generate()?;
+        let admin_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let group_id = "cd".repeat(16);
+        // A SignedPublic group: no crypto proof holds a removed target's
+        // row open, so only the delivering set can.
+        let mut info = GroupInfo::new(
+            "s4-c".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::SignedPublic;
+        info.add_member(
+            target_hex.clone(),
+            GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.add_member(
+            hex::encode(survivor.agent_id().as_bytes()),
+            GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.recompute_state_hash();
+        // The removal head: the target's removal, committed by the admin.
+        let mut removed = info.clone();
+        removed.roster_revision = removed.roster_revision.saturating_add(1);
+        let revision = removed.roster_revision;
+        removed.remove_member(&target_hex, Some(admin_hex.clone()));
+        let commit = removed.seal_commit(state.agent.identity().agent_keypair(), now_unix_ms())?;
+        let saved = super::super::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: group_id.clone(),
+            revision,
+            actor: admin_hex,
+            agent_id: target_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: None,
+            commit: Some(commit),
+        };
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), removed.clone());
+        let stable = removed.stable_group_id().to_string();
+        let key = EvictionKey::new(stable.clone(), *target.agent_id().as_bytes());
+
+        // A committed removal row, durable in the `.evs`, as a crash after
+        // the commit leaves it.
+        revoke_agent(&state, &target).await?;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store.intake(
+                &key,
+                EvictionTrigger::AgentRevocation {
+                    record_hash: [1; 32],
+                    record_bytes: Vec::new(),
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            let row = inner.store.get_mut(&key).context("row")?;
+            row.phase = Phase::CommittedDeliveryPending;
+            row.outgoing_event = Some(serde_json::to_vec(&saved)?);
+            inner.mark_not_durable(&key);
+        }
+        assert!(
+            persist_obligations(&state).await,
+            "the committed removal row is durable"
+        );
+
+        // The restart: the `.evs` loads and the saved removal resumes as
+        // a delivery.
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        load_persisted_obligations(&state).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.store.get(&key).map(|row| row.phase),
+                Some(Phase::CommittedDeliveryPending)
+            );
+            assert!(inner.removals.contains_key(&key), "the delivery resumes");
+        }
+
+        // The pass after the restart: the delivering set keeps the row
+        // open, and the open row keeps the group's head round.
+        revocation_eviction_pass(&state).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.store.get(&key).map(|row| row.phase),
+                Some(Phase::CommittedDeliveryPending),
+                "the delivering set holds the row open"
+            );
+            assert!(
+                inner.head_rounds.contains_key(&stable),
+                "the open row keeps the group's head round"
+            );
+        }
+
+        // The negative control: without the delivery the same pass
+        // completes the row from the roster, and the group's round goes.
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .removals
+            .remove(&key);
+        revocation_eviction_pass(&state).await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).map(|row| row.phase),
+            Some(Phase::Complete),
+            "no delivering set: the roster completes the row"
+        );
+        assert!(
+            !inner.head_rounds.contains_key(&stable),
+            "no open row: no head round"
         );
         Ok(())
     }
