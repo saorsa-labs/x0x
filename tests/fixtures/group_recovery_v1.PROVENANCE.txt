@@ -1,0 +1,21 @@
+ADR 0109 S3 sidecar: initial V1 encoder fixture (#1568)
+
+File: group_recovery_v1.bin
+SHA-256: 3a472f2a9fd53afd0a18a9c129bda9036533962cd3066b83f287ebe13f1951b7
+Size: 116231 bytes
+Base: 258cd184 (PR #1533, branch claude/issue-1356-s3, ADR 0109 Accepted).
+Generated: 2026-10-27, macOS arm64, using this branch's encode_sidecar.
+Command:
+  cargo test --lib --all-features groups::recovery::format_fixture -- \
+    --ignored --exact groups::recovery::format_fixture::generate_initial_v1_sidecar_fixture
+
+The generator uses a freshly generated, test-only ML-DSA agent key. It sets
+every GroupRecoveryV1 field, including attestation_conflict and
+authoritative_binding, which ADR 0109 §4 does not list. Every signature is
+made at 2000000000000 ms; no secret key is stored. The generator uses
+create_new and refuses to overwrite this fixture.
+
+This is the INITIAL, UNRELEASED encoder fixture. No released binary writes
+X0GRCV1 yet. Keep this file unchanged when the format releases, and add the
+release-artifact provenance at that gate, as ADR 0085 rule 6 requires.
+Accepted ADR files have not been edited.

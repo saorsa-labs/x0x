@@ -1665,6 +1665,13 @@ pub struct RetiredRecordV1 {
 
 /// The S3 sidecar body (§4). Embedded `GroupInfo` records and events are
 /// JSON documents carried as bytes.
+///
+/// The fields up to `retired` are the ADR 0109 §4 list. The last two,
+/// `attestation_conflict` and `authoritative_binding`, are not in that list:
+/// they carry §2 "Conflict" and §4 "Transactions" state (#1568). postcard is
+/// positional, so the field order is the format: a new field needs a new
+/// header version. `tests/fixtures/group_recovery_v1.bin` pins the layout
+/// (ADR 0085 rule 6).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupRecoveryV1 {
     /// Incremented by every transition.
@@ -2137,6 +2144,9 @@ pub fn promotion_prefix(
     }
     None
 }
+
+#[cfg(test)]
+mod format_fixture;
 
 #[cfg(test)]
 mod tests {
