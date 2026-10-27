@@ -574,11 +574,22 @@ swapped, logs the cause, and exits `EX_TEMPFAIL` (75). Every backup is
 verified before the first rename, and a missing backup restores nothing; a
 rename that fails after an earlier rename succeeded can still leave the
 daemon and the `x0x` CLI on mixed versions — that state is logged for
-manual recovery, not silently accepted. After a complete restore, the service
-manager restarts the daemon on the old version. A partial restore needs
-manual recovery. An error after the flush completed (for example a receipt
-that fails authorization) also ends in `EX_TEMPFAIL`;
-nothing is restored because the new bytes are already durable.
+manual recovery, not silently accepted. After the renames, every directory
+that received a restored binary is synced, so the old version is back on
+disk even after a power loss immediately following the exit. After a
+complete restore, the service manager restarts the daemon on the old
+version. A partial restore needs manual recovery. An error after the flush
+completed (for example a receipt that fails authorization) also ends in
+`EX_TEMPFAIL`; nothing is restored because the new bytes are already
+durable.
+
+Both started-failure exits are immediate. The supervised-exit path calls
+the exit directly after its recovery. On the local arm-and-flush path, the
+control listener writes the error reply to the launcher first, then exits
+`EX_TEMPFAIL` from its own loop (issue #1595, Claude #1566 finding 1): it
+no longer waits for the server shutdown tail to reach the flush finish, so
+a shutdown that hangs behind an already-stopped daemon cannot park the
+process with the supervisor waiting forever.
 
 For a started failure on the local arm-and-flush path, the host journal
 first records `rolling_back` with a flush-failure cause. Only then does the
@@ -622,10 +633,17 @@ stop later or publish a late receipt-less intent record.
 
 The flush walk refuses any symlink under the data root or the identity
 root (`~/.x0x` by default): a symlink is not a verified store root, and its
-target is not walked or fsynced. A symlink an operator put there makes
-every flush fail the same way, so supervised update stays blocked on that
-host until the symlink is removed; the failed-upgrade hold keeps the
-restart loop from re-applying the release while it is investigated.
+target is not walked or fsynced. The refusal names the offending path, in
+the flush error and in the logs, so the operator can find and remove it
+(issue #1595). The same refusal surfaces **before** an upgrade is
+attempted: flush admission runs the same walk — metadata only, no fsync —
+over the exact roots the flush will walk, and a supervised apply is
+refused with the offending path before any byte changes. A symlink an
+operator put there therefore stops the next upgrade attempt up front,
+loudly, instead of failing the flush after the daemon already stopped; the
+failed-upgrade hold keeps the restart loop from re-applying a release
+whose flush did fail that way. `x0xd --doctor` does not yet run this
+check; the admission refusal is the diagnostic surface today.
 
 The local control listener is a Unix socket, `upgrade-flush.sock` in the
 data directory, mode `0600`. It accepts one JSON request line carrying the

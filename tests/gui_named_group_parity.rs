@@ -153,6 +153,18 @@ const DEFERRED: &[(Method, &str, &str)] = &[
         "/groups/:id/quarantine/clear",
         "operator/ops endpoint; exposed via CLI + REST, GUI ops panel deferred (ADR-0064)",
     ),
+    // ADR 0109 §3/§8: the admin's manual re-seat and the recovery view are
+    // operator/ops endpoints, like the quarantine clear: CLI + REST first.
+    (
+        Method::Post,
+        "/groups/:id/members/:agent_id/reseat",
+        "operator/ops endpoint; exposed via CLI + REST, GUI ops panel deferred (ADR 0109)",
+    ),
+    (
+        Method::Get,
+        "/groups/:id/recovery",
+        "operator/ops endpoint; exposed via CLI + REST, GUI ops panel deferred (ADR 0109)",
+    ),
 ];
 
 /// One observed daemon call: the path expression text (including

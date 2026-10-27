@@ -124,6 +124,7 @@ async fn member_added_keeps_registration_and_queued_followup() -> Result<()> {
         certificate_b64: None,
         owner_mandate: None,
         commit: Some(commit),
+        reseat_mandate: None,
     };
     // Park apply so both events are queued before the first one can exit.
     let lock = group_membership_lock(&state, GROUP).await;

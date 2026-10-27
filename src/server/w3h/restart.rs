@@ -201,36 +201,40 @@ async fn restart_scenario(sim: &mut Sim, mode: RestartMode) -> Result<()> {
     restart_member(sim, "A", "B", &group, mode).await
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
-async fn w3h_s3_control_graceful_restart_reseats_member() -> Result<()> {
-    let mut sim = Sim::start(
-        "w3h_s3_control_graceful_restart_reseats_member",
-        0x5300_0001,
-        &["A", "B", "C"],
-    )
-    .await?;
-    let outcome = restart_scenario(&mut sim, RestartMode::Graceful).await;
-    sim.conclude(outcome).await
+fn w3h_s3_control_graceful_restart_reseats_member() -> Result<()> {
+    super::block_on_paused(async move {
+        let mut sim = Sim::start(
+            "w3h_s3_control_graceful_restart_reseats_member",
+            0x5300_0001,
+            &["A", "B", "C"],
+        )
+        .await?;
+        let outcome = restart_scenario(&mut sim, RestartMode::Graceful).await;
+        sim.conclude(outcome).await
+    })
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
-async fn w3h_s3_control_crash_restart_reseats_member() -> Result<()> {
-    let mut sim = Sim::start(
-        "w3h_s3_control_crash_restart_reseats_member",
-        0x5300_0002,
-        &["A", "B", "C"],
-    )
-    .await?;
-    let outcome = restart_scenario(&mut sim, RestartMode::Crash).await;
-    sim.conclude(outcome).await
+fn w3h_s3_control_crash_restart_reseats_member() -> Result<()> {
+    super::block_on_paused(async move {
+        let mut sim = Sim::start(
+            "w3h_s3_control_crash_restart_reseats_member",
+            0x5300_0002,
+            &["A", "B", "C"],
+        )
+        .await?;
+        let outcome = restart_scenario(&mut sim, RestartMode::Crash).await;
+        sim.conclude(outcome).await
+    })
 }
 
 /// Owner-backed restart (Codex S3 review, finding 1): O starts with the
@@ -273,19 +277,21 @@ async fn owner_backed_scenario(sim: &mut Sim) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
-async fn w3h_s3_control_owner_backed_restart_reseats_member() -> Result<()> {
-    let mut sim = Sim::empty(
-        "w3h_s3_control_owner_backed_restart_reseats_member",
-        0x5300_0005,
-        &["A", "O"],
-    )?;
-    let outcome = owner_backed_scenario(&mut sim).await;
-    sim.conclude(outcome).await
+fn w3h_s3_control_owner_backed_restart_reseats_member() -> Result<()> {
+    super::block_on_paused(async move {
+        let mut sim = Sim::empty(
+            "w3h_s3_control_owner_backed_restart_reseats_member",
+            0x5300_0005,
+            &["A", "O"],
+        )?;
+        let outcome = owner_backed_scenario(&mut sim).await;
+        sim.conclude(outcome).await
+    })
 }
 
 /// Negative control for the hint rule: right after a restart, C knows only
@@ -349,51 +355,55 @@ async fn hint_scenario(sim: &mut Sim) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
-async fn w3h_s3_negative_control_restarted_node_needs_an_address_to_dial() -> Result<()> {
-    let mut sim = Sim::start(
-        "w3h_s3_negative_control_restarted_node_needs_an_address_to_dial",
-        0x5300_0003,
-        &["A", "B", "C"],
-    )
-    .await?;
-    let outcome = hint_scenario(&mut sim).await;
-    sim.conclude(outcome).await
+fn w3h_s3_negative_control_restarted_node_needs_an_address_to_dial() -> Result<()> {
+    super::block_on_paused(async move {
+        let mut sim = Sim::start(
+            "w3h_s3_negative_control_restarted_node_needs_an_address_to_dial",
+            0x5300_0003,
+            &["A", "B", "C"],
+        )
+        .await?;
+        let outcome = hint_scenario(&mut sim).await;
+        sim.conclude(outcome).await
+    })
 }
 
 /// Harness guard: a stopped daemon whose state is still held (here by the
 /// test itself) must make [`Sim::stop`] report INFRA, never a silent
 /// restart next to a possibly live old daemon.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
-async fn w3h_s3_restart_reports_a_leaked_daemon_state_as_infra() -> Result<()> {
-    let mut sim = Sim::start(
-        "w3h_s3_restart_reports_a_leaked_daemon_state_as_infra",
-        0x5300_0004,
-        &["A", "B"],
-    )
-    .await?;
-    let leaked = sim.state("B")?;
-    let stopped = sim.stop("B", RestartMode::Graceful).await;
-    let error = stopped
-        .err()
-        .context("a stop with a leaked daemon state succeeded")?;
-    ensure!(
-        format!("{error:#}").contains("INFRA") && format!("{error:#}").contains("still held"),
-        "unexpected stop error: {error:#}"
-    );
-    drop(leaked);
-    sim.fabric()
-        .mark("checkpoint: a leaked daemon state makes the stop INFRA");
-    sim.finish().await?;
-    Ok(())
+fn w3h_s3_restart_reports_a_leaked_daemon_state_as_infra() -> Result<()> {
+    super::block_on_paused(async move {
+        let mut sim = Sim::start(
+            "w3h_s3_restart_reports_a_leaked_daemon_state_as_infra",
+            0x5300_0004,
+            &["A", "B"],
+        )
+        .await?;
+        let leaked = sim.state("B")?;
+        let stopped = sim.stop("B", RestartMode::Graceful).await;
+        let error = stopped
+            .err()
+            .context("a stop with a leaked daemon state succeeded")?;
+        ensure!(
+            format!("{error:#}").contains("INFRA") && format!("{error:#}").contains("still held"),
+            "unexpected stop error: {error:#}"
+        );
+        drop(leaked);
+        sim.fabric()
+            .mark("checkpoint: a leaked daemon state makes the stop INFRA");
+        sim.finish().await?;
+        Ok(())
+    })
 }
 
 /// Harness guard: the drain proves release, not only that the daemon state
@@ -402,41 +412,43 @@ async fn w3h_s3_restart_reports_a_leaked_daemon_state_as_infra() -> Result<()> {
 /// EXCLUSIVE lock and the next incarnation could not open it
 /// (`HistoryInit`). [`Sim::stop`] must report INFRA naming the history
 /// lock, and nothing else.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon controls run in the Linux isolated namespace only"
 )]
-async fn w3h_s3_restart_reports_a_held_history_lock_as_infra() -> Result<()> {
-    let mut sim = Sim::start(
-        "w3h_s3_restart_reports_a_held_history_lock_as_infra",
-        0x5300_0006,
-        &["A", "B"],
-    )
-    .await?;
-    let held = sim
-        .state("B")?
-        .agent
-        .history()
-        .cloned()
-        .context("B runs no history store")?;
-    let stopped = sim.stop("B", RestartMode::Graceful).await;
-    let error = stopped
-        .err()
-        .context("a stop with B's history database still open succeeded")?;
-    let text = format!("{error:#}");
-    ensure!(
-        text.contains("INFRA")
-            && text.contains("history db")
-            && !text.contains("daemon state by")
-            && !text.contains("agent by"),
-        "unexpected stop error: {text}"
-    );
-    drop(held);
-    sim.fabric()
-        .mark("checkpoint: a held history lock makes the stop INFRA");
-    sim.finish().await?;
-    Ok(())
+fn w3h_s3_restart_reports_a_held_history_lock_as_infra() -> Result<()> {
+    super::block_on_paused(async move {
+        let mut sim = Sim::start(
+            "w3h_s3_restart_reports_a_held_history_lock_as_infra",
+            0x5300_0006,
+            &["A", "B"],
+        )
+        .await?;
+        let held = sim
+            .state("B")?
+            .agent
+            .history()
+            .cloned()
+            .context("B runs no history store")?;
+        let stopped = sim.stop("B", RestartMode::Graceful).await;
+        let error = stopped
+            .err()
+            .context("a stop with B's history database still open succeeded")?;
+        let text = format!("{error:#}");
+        ensure!(
+            text.contains("INFRA")
+                && text.contains("history db")
+                && !text.contains("daemon state by")
+                && !text.contains("agent by"),
+            "unexpected stop error: {text}"
+        );
+        drop(held);
+        sim.fabric()
+            .mark("checkpoint: a held history lock makes the stop INFRA");
+        sim.finish().await?;
+        Ok(())
+    })
 }
 
 /// One file as the release check must leave it: name, size, bytes and

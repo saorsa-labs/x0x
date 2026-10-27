@@ -58,7 +58,7 @@ impl OwnerProfile {
     /// Returns the underlying IO error if the record cannot be written.
     pub async fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
+            crate::w3h_inline::fs::create_dir_all(dir).await?;
         }
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::other(format!("serialize owner profile: {e}")))?;
@@ -72,7 +72,7 @@ impl OwnerProfile {
     /// a corrupt file is surfaced loudly rather than treated as absent —
     /// an install must never silently "forget" who owns it.
     pub async fn load_from(path: &Path) -> std::io::Result<Option<Self>> {
-        match tokio::fs::read(path).await {
+        match crate::w3h_inline::fs::read(path).await {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
                 .map_err(|e| std::io::Error::other(format!("parse owner profile: {e}"))),
@@ -124,7 +124,7 @@ impl SelfProfile {
     /// Returns the underlying IO error. A corrupt file is surfaced loudly:
     /// round-tripping names across restart must never silently reset.
     pub async fn load_from(path: &Path) -> std::io::Result<Option<Self>> {
-        match tokio::fs::read(path).await {
+        match crate::w3h_inline::fs::read(path).await {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
                 .map_err(|e| std::io::Error::other(format!("parse self profile: {e}"))),
@@ -200,6 +200,11 @@ impl SelfProfile {
 /// it lands (`journal_faults::pause_next_rename`).
 pub(crate) async fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
     let (from, to) = (from.to_path_buf(), to.to_path_buf());
+    if crate::w3h_inline::shim_active() {
+        #[cfg(test)]
+        journal_faults::before_rename(&to);
+        return std::fs::rename(&from, &to);
+    }
     tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         journal_faults::before_rename(&to);
@@ -219,14 +224,17 @@ pub(crate) async fn rename_file(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Returns the IO error of an fsync, or of an open other than a missing
 /// file.
 pub(crate) async fn make_durable(path: &Path) -> std::io::Result<()> {
-    match tokio::fs::File::open(path).await {
+    match crate::w3h_inline::fs::File::open(path).await {
         Ok(file) => file.sync_all().await?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
     #[cfg(unix)]
     if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        tokio::fs::File::open(dir).await?.sync_all().await?;
+        crate::w3h_inline::fs::File::open(dir)
+            .await?
+            .sync_all()
+            .await?;
     }
     #[cfg(test)]
     if path.exists() {
@@ -262,19 +270,23 @@ pub(crate) async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Resu
     // a host crash must not bring back the old profile after that. fsync
     // the temp file before the rename, and the directory after it.
     let written = async {
+        #[cfg(not(test))]
         use tokio::io::AsyncWriteExt as _;
-        let mut file = tokio::fs::File::create(&tmp).await?;
+        let mut file = crate::w3h_inline::fs::File::create(&tmp).await?;
         file.write_all(bytes).await?;
         file.sync_all().await?;
         rename_file(&tmp, path).await
     }
     .await;
     if let Err(e) = written {
-        let _ = tokio::fs::remove_file(&tmp).await;
+        let _ = crate::w3h_inline::fs::remove_file(&tmp).await;
         return Err(e);
     }
     #[cfg(unix)]
-    tokio::fs::File::open(dir).await?.sync_all().await?;
+    crate::w3h_inline::fs::File::open(dir)
+        .await?
+        .sync_all()
+        .await?;
     #[cfg(test)]
     crash_sim::note_durable(path);
     Ok(())
@@ -442,7 +454,7 @@ impl IssuedCertRecord {
         // through File::open(append) are single-write atomic in practice,
         // but the temp+rename shape keeps the file NEVER partially written
         // even on weird filesystems.
-        let mut content = tokio::fs::read(path).await.unwrap_or_default();
+        let mut content = crate::w3h_inline::fs::read(path).await.unwrap_or_default();
         content.extend_from_slice(line.as_bytes());
         content.push(b'\n');
         Self::replace_locked(path, content, writer, held)
@@ -491,7 +503,7 @@ impl IssuedCertRecord {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir).await?;
+            crate::w3h_inline::fs::create_dir_all(dir).await?;
         }
         let tmp = path.with_file_name(format!(
             ".{}.{}.journal.tmp",
@@ -505,11 +517,11 @@ impl IssuedCertRecord {
         // the rename leaves new bytes that are not durable (#1542).
         durable.remove(path);
         if let Err(e) = Self::write_synced(&tmp, content).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = crate::w3h_inline::fs::remove_file(&tmp).await;
             return Err(e);
         }
         if let Err(e) = rename_file(&tmp, path).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = crate::w3h_inline::fs::remove_file(&tmp).await;
             return Err(e);
         }
         #[cfg(test)]
@@ -519,7 +531,10 @@ impl IssuedCertRecord {
         // parent directory to make the rename durable.
         #[cfg(unix)]
         if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            tokio::fs::File::open(dir).await?.sync_all().await?;
+            crate::w3h_inline::fs::File::open(dir)
+                .await?
+                .sync_all()
+                .await?;
         }
         durable.insert(path.to_path_buf());
         #[cfg(test)]
@@ -539,7 +554,7 @@ impl IssuedCertRecord {
         if writer.contains(path) {
             return Ok((writer, held));
         }
-        match tokio::fs::read(path).await {
+        match crate::w3h_inline::fs::read(path).await {
             Ok(content) => Self::replace_locked(path, content, writer, held).await,
             // No journal: no line to publish.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((writer, held)),
@@ -549,8 +564,9 @@ impl IssuedCertRecord {
 
     /// Write `bytes` to a new file at `path` and fsync it.
     async fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(not(test))]
         use tokio::io::AsyncWriteExt as _;
-        let mut file = tokio::fs::File::create(path).await?;
+        let mut file = crate::w3h_inline::fs::File::create(path).await?;
         file.write_all(bytes).await?;
         file.sync_all().await
     }
@@ -616,7 +632,7 @@ impl IssuedCertRecord {
     /// (a missing file is an empty journal).
     #[must_use]
     pub async fn load(path: &Path) -> Vec<Self> {
-        match tokio::fs::read_to_string(path).await {
+        match crate::w3h_inline::fs::read_to_string(path).await {
             Ok(text) => text
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
@@ -927,7 +943,9 @@ mod tests {
             .unwrap()
             .is_none());
         let corrupt = dir.path().join("owner.json");
-        tokio::fs::write(&corrupt, b"{ not json").await.unwrap();
+        crate::w3h_inline::fs::write(&corrupt, b"{ not json")
+            .await
+            .unwrap();
         assert!(OwnerProfile::load_from(&corrupt).await.is_err());
     }
 
@@ -1015,9 +1033,9 @@ mod tests {
         assert_eq!(IssuedCertRecord::load(&path).await, vec![r1, r2]);
 
         // Malformed line is skipped, the rest survive.
-        let mut text = tokio::fs::read_to_string(&path).await.unwrap();
+        let mut text = crate::w3h_inline::fs::read_to_string(&path).await.unwrap();
         text.insert_str(0, "{not json}\n");
-        tokio::fs::write(&path, text).await.unwrap();
+        crate::w3h_inline::fs::write(&path, text).await.unwrap();
         let loaded = IssuedCertRecord::load(&path).await;
         assert_eq!(loaded.len(), 2, "corrupt line skipped, records kept");
         assert_eq!(
