@@ -978,19 +978,21 @@ async fn run(case: &str, seed: u64) -> Receipt {
 /// The #969 case: after leave, rekey and restart, every relevant frame is
 /// sealed under the current epoch (expected GREEN on main; the in-process
 /// oracle passes).
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_969_leave_rekey_restart_seals_under_the_current_epoch() -> Result<()> {
-    let receipt = run(CASE, SEED).await;
-    ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "{CASE}: expected GREEN, got {:?}",
-        receipt.verdict()
-    );
-    Ok(())
+fn w3h_969_leave_rekey_restart_seals_under_the_current_epoch() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run(CASE, SEED).await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "{CASE}: expected GREEN, got {:?}",
+            receipt.verdict()
+        );
+        Ok(())
+    })
 }
 
 /// The frame oracle's decode chain, proved on a locally built frame (it runs
