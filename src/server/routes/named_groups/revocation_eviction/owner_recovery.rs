@@ -1778,7 +1778,10 @@ pub(in crate::server) async fn serve_catchup(
     }
     // The frames all come from one group (`catchup_frames` serves the
     // first of `group_ids` that has a log).
-    let Some((_, info)) = group_by_stable(state, &frames[0].0).await else {
+    let Some(first_group) = frames.first().map(|(group, _, _)| group.clone()) else {
+        return;
+    };
+    let Some((_, info)) = group_by_stable(state, &first_group).await else {
         return;
     };
     let mut gss_groups = BTreeSet::new();

@@ -21,17 +21,22 @@
 //! - **Write.** Temp write, fsync, atomic rename and directory fsync, as
 //!   for the `.evjournal`. If the write fails, the commit does not occur.
 //!   A file with a newer layout is never rewritten, so the commit does not
-//!   occur either (fail closed). Writes of one group's log serialize (one
-//!   writer at a time per file, #1579 fix round). In the rebind and
-//!   owner-recovery logs each write starts from the frames the file
-//!   already holds, then memory's, then the new frame: a restart may have
-//!   left frames in the file that memory has not installed, and no write
-//!   displaces what the last write made durable. A frame at a revision
-//!   the file already holds, with a different result head, is a competing
-//!   commit: both are kept, and the held frame is never replaced — the
+//!   occur either (fail closed). A file that cannot be read at all fails
+//!   the write the same way: only a missing file plans as empty (review).
+//!   Writes of one group's log serialize (one writer at a time per file,
+//!   #1579 fix round). In the rebind and owner-recovery logs each write
+//!   starts from the frames the file already holds, then memory's, then
+//!   the new frame: a restart may have left frames in the file that
+//!   memory has not installed, and the only frames a write drops are the
+//!   ones the bound below drops. A frame at a revision the file already
+//!   holds, with a different result head, is a competing commit: the
 //!   pair is the fork evidence that two commits claimed one revision
-//!   (#1579). A refused commit or install removes its own frame and no
-//!   other ([`rewrite_without`]). The crypto-only exclusion log keeps the
+//!   (#1579), and a revision holds at most two file-only frames plus the
+//!   newest write's — a third file-only frame leaves with the next
+//!   write, so a signer cannot fill the per-group cap at one revision
+//!   and evict the catch-up window below the head. A refused commit or
+//!   install removes its own frame first and no other
+//!   ([`rewrite_without`]). The crypto-only exclusion log keeps the
 //!   #1508 rule — a received frame never replaces a held one, so one
 //!   frame per revision — and its writes plan from memory plus the new
 //!   frame only, as before #1579: a stale frame only the file holds, at
@@ -338,8 +343,18 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
         // The same competing-pair bound as [`Self::planned`]: this
         // rewrite is a write of the merged view, so it must not keep a
         // per-revision pile the cap would evict the held frames for.
+        // The refused frame leaves before the bound counts, so it takes
+        // no place: with the file holding [A, B, C] at one revision and
+        // A refused, B and C keep the two places and A is gone — not the
+        // shape where A and B consume the bound and the valid C leaves
+        // (review). Memory never holds the refused commit (a frame is
+        // remembered only after its commit or install succeeds), so
+        // skipping the file frames removes it everywhere.
         let mut competing: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
         for frame in file_frames {
+            if frame.next_revision == refused_revision && frame.result_head == refused_head {
+                continue;
+            }
             let held = self.log.get(stable).is_some_and(|log| {
                 log.iter().any(|e| {
                     e.next_revision == frame.next_revision && e.result_head == frame.result_head
@@ -370,9 +385,6 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
                     e.authored,
                 );
             }
-        }
-        if let Some(log) = scratch.log.get_mut(stable) {
-            log.retain(|e| !(e.next_revision == refused_revision && e.result_head == refused_head));
         }
         scratch.file(stable)
     }
@@ -1270,6 +1282,94 @@ pub(in super::super) mod tests {
                 (5, "h5b", b"second".as_slice())
             ],
             "the refused frame leaves; the competing pair stays as evidence"
+        );
+    }
+
+    /// #1579 review: a log path that cannot be read — here a directory
+    /// sits where the file belongs — fails the write closed.
+    /// `write_received` answers `false` (the caller installs nothing),
+    /// and `rewrite_without` leaves the path as it is; neither plans
+    /// from memory alone, which would drop the frames the file holds.
+    #[tokio::test]
+    async fn an_unreadable_log_fails_the_write_closed() {
+        use crate::server::routes::named_groups as ng;
+        fn rebind_held(inner: &mut S4Inner) -> &mut HeldLog<16, true> {
+            &mut inner.rebind.log
+        }
+        let (state, _dir) = ng::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .log
+            .remember("g", 4, "h4", Arc::new(b"held".to_vec()), true);
+        let path = log_path(&state, "g", REBIND_EXTENSION);
+        std::fs::create_dir_all(&path).expect("a directory where the log belongs");
+        assert!(
+            !write_received(
+                &state,
+                REBIND_EXTENSION,
+                rebind_held,
+                "g",
+                (5, "h5x"),
+                &Arc::new(b"x".to_vec())
+            )
+            .await,
+            "a read error other than NotFound fails the write"
+        );
+        rewrite_without(&state, REBIND_EXTENSION, rebind_held, "g", (4, "h4")).await;
+        assert!(
+            path.is_dir(),
+            "the rewrite skipped: the path is untouched, never planned from memory"
+        );
+    }
+
+    /// #1579 review: the refused frame leaves before the per-revision
+    /// bound counts, so it takes no place. The file holds three frames at
+    /// revision 5 and the first is refused: the other two keep the two
+    /// places and the refused one is gone — not the shape where the
+    /// refused frame and the second consumed the bound and the valid
+    /// third left.
+    #[tokio::test]
+    async fn the_refused_frame_takes_no_place_in_the_bound() {
+        use crate::server::routes::named_groups as ng;
+        fn rebind_held(inner: &mut S4Inner) -> &mut HeldLog<16, true> {
+            &mut inner.rebind.log
+        }
+        let (state, _dir) = ng::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        for (head, bytes) in [
+            ("h5a", b"a".to_vec()),
+            ("h5b", b"b".to_vec()),
+            ("h5c", b"c".to_vec()),
+        ] {
+            assert!(
+                write_received(
+                    &state,
+                    REBIND_EXTENSION,
+                    rebind_held,
+                    "g",
+                    (5, head),
+                    &Arc::new(bytes)
+                )
+                .await
+            );
+        }
+        rewrite_without(&state, REBIND_EXTENSION, rebind_held, "g", (5, "h5a")).await;
+        let on_disk = frames_on_disk(&state, REBIND_EXTENSION, "g").await;
+        let held: Vec<(u64, &str)> = on_disk
+            .iter()
+            .map(|frame| (frame.next_revision, frame.result_head.as_str()))
+            .collect();
+        assert_eq!(
+            held,
+            vec![(5, "h5b"), (5, "h5c")],
+            "the refused frame took no place: the two valid frames stay"
         );
     }
 

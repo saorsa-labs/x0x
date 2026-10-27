@@ -3194,14 +3194,14 @@ pub(super) mod restart_tests {
         Ok(())
     }
 
-    /// #1579 review: a revision keeps the competing pair and no more. A
-    /// signer can seal many distinct valid frames at one revision;
-    /// without the bound they fill the per-group cap and the oldest
-    /// frames leave — the catch-up window below the head. Four distinct
-    /// frames are written at one revision: the pair and the newest stay,
-    /// the third leaves.
+    /// #1579 review: a revision holds two file-only frames plus the
+    /// newest write's, and no more. A signer can seal many distinct
+    /// valid frames at one revision; without the bound they fill the
+    /// per-group cap and the oldest frames leave — the catch-up window
+    /// below the head. Four distinct frames are written at one revision:
+    /// the first two and the newest stay, the third leaves.
     #[tokio::test]
-    async fn a_revision_keeps_the_competing_pair_and_no_more() -> Result<()> {
+    async fn a_revision_keeps_two_file_only_frames_and_the_newest() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let receiver = offline_daemon(dir.path(), None).await?;
         let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
@@ -3232,7 +3232,7 @@ pub(super) mod restart_tests {
         let [h1, h2, h3, h4] = heads.as_slice() else {
             anyhow::bail!("four frames");
         };
-        debug_assert!(h1 != h2 && h1 != h3 && h1 != h4 && h2 != h3 && h2 != h4 && h3 != h4);
+        assert!(h1 != h2 && h1 != h3 && h1 != h4 && h2 != h3 && h2 != h4 && h3 != h4);
 
         let _blocked = block_install(&receiver).await?;
         for bytes in &frames_in {
@@ -3248,7 +3248,7 @@ pub(super) mod restart_tests {
         assert_eq!(
             on_disk.len(),
             3,
-            "the pair and the newest frame: the third leaves, not the catch-up window"
+            "two file-only frames and the newest: the third leaves, not the catch-up window"
         );
         assert_eq!(
             (
@@ -3257,7 +3257,7 @@ pub(super) mod restart_tests {
                 on_disk[2].result_head.as_str()
             ),
             (h1.as_str(), h2.as_str(), h4.as_str()),
-            "the pair and the newest stay"
+            "the first two and the newest stay"
         );
         receiver.agent.shutdown().await;
         Ok(())
