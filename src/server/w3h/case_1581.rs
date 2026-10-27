@@ -172,10 +172,8 @@ fn is_s4_wait(status: StatusCode, body: &serde_json::Value, a_hex: &str) -> bool
         && body["state"] == "waiting_for_eligible_admin_revocation"
         && body["exit"] == "group_admin_revoked"
         && body["revoked_admins"].as_array().is_some_and(|ids| {
-            ids.iter().any(|id| {
-                id.as_str()
-                    .is_some_and(|id| id.eq_ignore_ascii_case(a_hex))
-            })
+            ids.iter()
+                .any(|id| id.as_str().is_some_and(|id| id.eq_ignore_ascii_case(a_hex)))
         })
         && !carries_key_material(body)
 }
@@ -213,11 +211,7 @@ async fn refused(
 }
 
 /// `label` encrypts the probe; the ciphertext, or why it could not.
-async fn sends(
-    sim: &Sim,
-    label: &str,
-    group: &str,
-) -> Result<std::result::Result<String, String>> {
+async fn sends(sim: &Sim, label: &str, group: &str) -> Result<std::result::Result<String, String>> {
     let (status, body) = sim
         .api(
             label,
@@ -386,15 +380,16 @@ async fn history(sim: &Sim, label: &str, group: &str, expect_empty: bool) -> Res
     let (status, body) = sim
         .api(label, Method::GET, &format!("/history?scope={scope}"), None)
         .await?;
-    let ok = status.is_success()
-        && body["ok"] == true
-        && body["count"].as_u64().is_some_and(|count| {
-            if expect_empty {
-                count == 0
-            } else {
-                count >= 1
-            }
-        });
+    let ok =
+        status.is_success()
+            && body["ok"] == true
+            && body["count"].as_u64().is_some_and(|count| {
+                if expect_empty {
+                    count == 0
+                } else {
+                    count >= 1
+                }
+            });
     Ok((
         ok,
         format!(
@@ -757,10 +752,7 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         record(
             receipt,
             &format!("{label}_status_carries_recreate_offer"),
-            &(
-                ok,
-                format!("{label} status: {status} {availability}"),
-            ),
+            &(ok, format!("{label} status: {status} {availability}")),
             &mut passed,
             at(sim),
         );
@@ -798,7 +790,16 @@ async fn base_scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     // through the same allowed 409 wait. A success, or any ciphertext,
     // is the same leak. After a leak no further mutating probe runs.
     if !leaked {
-        send_refusal(sim, receipt, "A", "a_own_send_refused", &group, &a_hex, &mut passed).await?;
+        send_refusal(
+            sim,
+            receipt,
+            "A",
+            "a_own_send_refused",
+            &group,
+            &a_hex,
+            &mut passed,
+        )
+        .await?;
     }
 
     // No new key reached anyone: nothing may seal (no eligible admin
