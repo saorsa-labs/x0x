@@ -36,14 +36,16 @@
 //! A second cut at B's restart opens the restart recovery window: GREEN
 //! also requires, strictly after that cut, sealed recovery traffic from
 //! B's restarted incarnation — its `StateRequest` on the `/state-sync`
-//! side topic, or its restart write when the local replica already
-//! converged (the unshimmed coverage job's shape) — and A carrying that
-//! traffic back on the main topic. A Control frame B sent before it went
-//! down can no longer satisfy anything. (A's side is its retained image
-//! when the responder cooldown allows one, else its sealed
-//! re-propagation of B's restarted write; the case spans about 6 virtual
-//! seconds, so the 15-second cooldown usually holds from the bootstrap
-//! serve.)
+//! side topic, or its restart write on the main topic when the local
+//! replica already converged (the unshimmed coverage job's shape). A
+//! Control frame B sent before it went down can no longer satisfy
+//! anything. Delivery to A is proven by the scenario itself (A reads
+//! B's post-restart key or the case errors). A's own post-cut send is
+//! recorded but not required: its re-propagation of B's write needs an
+//! eager pubsub peer (the removed member may already have left the
+//! mesh), and its retained answer is suppressed by the responder's
+//! 15-second cooldown — the case spans about 6 virtual seconds and A's
+//! last full serve was the bootstrap about 2.6 seconds earlier.
 
 #![cfg(test)]
 
@@ -395,9 +397,14 @@ fn run_oracle(
 /// The restart recovery exchange after `restart_cut`: when B's restarted
 /// incarnation sent sealed recovery traffic — its `StateRequest` on the
 /// side topic, or its restart write when the local replica already
-/// converged (the unshimmed coverage job's shape) — and when A carried
-/// that traffic back (fabric virtual time), so a GREEN proves the
+/// converged (the unshimmed coverage job's shape) — so a GREEN proves the
 /// exchange happened, not merely that both nodes stayed quiet-sealed.
+/// Delivery to A is proven by the scenario itself (A reads B's
+/// post-restart key or the case errors). A's own post-cut send is
+/// recorded but not required: its re-propagation of B's write depends on
+/// A still having an eager pubsub peer for the store at that moment (the
+/// removed member C may already have left the mesh), and its retained
+/// answer is cooldown-suppressed in this harness's timeline.
 #[derive(Default)]
 struct RestartExchange {
     b_request_at: Option<Duration>,
@@ -407,8 +414,7 @@ struct RestartExchange {
 
 impl RestartExchange {
     fn happened(&self) -> bool {
-        (self.b_request_at.is_some() || self.b_restart_write_at.is_some())
-            && self.a_answer_at.is_some()
+        self.b_request_at.is_some() || self.b_restart_write_at.is_some()
     }
 
     fn describe(&self) -> String {
@@ -432,19 +438,19 @@ impl RestartExchange {
 /// naming B's own peer and whose sealed author is B's agent — or, when
 /// B's local replica already converged at re-open (the unshimmed
 /// coverage job's shape), its restart write on the main topic. A's side
-/// is a current-epoch frame on the main topic that is a retained image
-/// (`RetainedState`, the answer shape when the responder's cooldown
-/// allows one — in the shimmed runs A's full-state answer to the
-/// post-restart request is usually suppressed by
-/// `STATE_RESPONSE_COOLDOWN_SECS`: A's last full serve was the bootstrap
-/// about 2.6 virtual seconds earlier, and the whole case spans about 6
-/// virtual seconds) or names the restart key (A's sealed re-propagation
-/// of B's restarted-incarnation write). Either side's shapes prove the
-/// restarted incarnation and the holder exchanged sealed traffic; the
-/// trace artifact records which. Every frame in this window is also
-/// judged by [`run_oracle`], so a frame that fails its authenticated open
-/// fails the case there; here an open failure only means the frame is
-/// not one of the exchange shapes being classified.
+/// is recorded for the receipt but not required: a current-epoch frame
+/// on the main topic that is a retained image (`RetainedState`, the
+/// answer shape when the responder's cooldown allows one — in the
+/// shimmed runs A's full-state answer to the post-restart request is
+/// usually suppressed by `STATE_RESPONSE_COOLDOWN_SECS`: A's last full
+/// serve was the bootstrap about 2.6 virtual seconds earlier, and the
+/// whole case spans about 6 virtual seconds) or names the restart key
+/// (A's sealed re-propagation of B's restarted-incarnation write, which
+/// needs A to still have an eager pubsub peer — one shimmed rerun in 20
+/// had none: the removed member had left the mesh by then). Every frame
+/// in this window is also judged by [`run_oracle`], so a frame that
+/// fails its authenticated open fails the case there; here an open
+/// failure only means the frame is not one of the recorded shapes.
 fn run_restart_exchange(
     sim: &Sim,
     restart_cut: usize,
@@ -909,17 +915,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         ),
         at(sim),
     );
-    receipt.evidence(
-        "A carried B's restarted-incarnation traffic: a sealed retained image or its sealed \
-         re-propagation of B's restart write, after the cut",
-        exchange.a_answer_at.is_some(),
-        exchange.describe(),
-        at(sim),
-    );
     let coverage = oracle.a_post_write && exchange.happened();
     receipt.evidence(
         "the oracle saw post-rekey sealed traffic from both members and the restart recovery \
-         exchange",
+         exchange (A's own post-cut send is recorded in the times, not required: its \
+         re-propagation needs an eager peer, and its retained answer is cooldown-suppressed)",
         coverage,
         format!(
             "a_post_write={} {}",
