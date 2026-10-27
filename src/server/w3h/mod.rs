@@ -645,9 +645,11 @@ struct IdleWait {
 }
 
 thread_local! {
-    static IDLE_WAIT: IdleWait = IdleWait {
-        waker: Mutex::new(None),
-        ready: AtomicBool::new(false),
+    static IDLE_WAIT: IdleWait = const {
+        IdleWait {
+            waker: Mutex::new(None),
+            ready: AtomicBool::new(false),
+        }
     };
 }
 
