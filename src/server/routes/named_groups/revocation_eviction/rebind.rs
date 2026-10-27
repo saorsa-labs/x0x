@@ -2866,13 +2866,15 @@ pub(super) mod restart_tests {
         info
     }
 
-    /// An `OwnerCertified` group: `admin` is its admin, and `seat` and the
-    /// receiver are certified Members. Each certificate expires in ten
-    /// minutes. The frame rebinds `seat`'s certificate.
+    /// An `OwnerCertified` group: `admin` is its admin, and `seat`,
+    /// `peer` and the receiver are certified Members. Each certificate
+    /// expires in ten minutes. The frame rebinds `seat`'s certificate;
+    /// the competing frame renews `peer`'s.
     struct RebindFixture {
         owner: UserKeypair,
         admin: AgentKeypair,
         seat: AgentKeypair,
+        peer: AgentKeypair,
         info: GroupInfo,
     }
 
@@ -2881,6 +2883,7 @@ pub(super) mod restart_tests {
             let owner = UserKeypair::generate()?;
             let admin = AgentKeypair::generate()?;
             let seat = AgentKeypair::generate()?;
+            let peer = AgentKeypair::generate()?;
             let now = now_unix_ms() / 1000;
             let mut info = GroupInfo::new(
                 "crb".to_string(),
@@ -2891,7 +2894,7 @@ pub(super) mod restart_tests {
             info.policy.admission =
                 x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
             let admin_hex = hex::encode(admin.agent_id().as_bytes());
-            for member in [&seat, receiver] {
+            for member in [&seat, receiver, &peer] {
                 info.add_member(
                     hex::encode(member.agent_id().as_bytes()),
                     GroupRole::Member,
@@ -2899,7 +2902,7 @@ pub(super) mod restart_tests {
                     None,
                 );
             }
-            for member in [&admin, &seat, receiver] {
+            for member in [&admin, &seat, receiver, &peer] {
                 let cert = AgentCertificate::issue_with_expiry(&owner, member, Some(now + 600))?;
                 cr::install_certificate(
                     &mut info,
@@ -2926,6 +2929,7 @@ pub(super) mod restart_tests {
                 owner,
                 admin,
                 seat,
+                peer,
                 info: parent,
             })
         }
@@ -2945,17 +2949,23 @@ pub(super) mod restart_tests {
             Ok((bytes, next.state_hash))
         }
 
-        /// A second, different rebind of the seat on the same parent: a
-        /// competing commit at the same revision (#1579) — a different
-        /// renewal, so a different roster root and result head.
+        /// A second, different rebind on the same parent: a competing
+        /// commit at the same revision (#1579) — the admin renews the
+        /// `peer` member, so a different roster root and result head. It
+        /// does not rebind the same seat again: after one of the pair
+        /// installs, that seat's committed certificate is the renewal,
+        /// and #1533 r11's sibling rule leaves a same-seat sibling
+        /// unvalidated (`CertificateEvidenceMissing` — the parent's
+        /// certificate bytes are gone). A sibling of another seat keeps
+        /// every certificate the rule reads, whichever frame installs.
         fn competing_frame(&self) -> Result<(Vec<u8>, String)> {
             let now_ms = now_unix_ms();
             let renewal = AgentCertificate::issue_with_expiry(
                 &self.owner,
-                &self.seat,
+                &self.peer,
                 Some(now_ms / 1000 + 7000),
             )?;
-            let seat = *self.seat.agent_id().as_bytes();
+            let seat = *self.peer.agent_id().as_bytes();
             let (next, frame) = cr::seal(&self.info, seat, &renewal, &self.admin, now_ms)
                 .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
             let bytes = cr::encode_frame(&frame)?;
@@ -3110,7 +3120,10 @@ pub(super) mod restart_tests {
     /// — the crash window left it there, memory has not installed it — is
     /// written beside the held frame, never in its place, and both stay
     /// durable. After the restart one installs and the other, a valid
-    /// sibling, contains the group as fork evidence.
+    /// sibling, contains the group as fork evidence. The competing frame
+    /// renews another member's seat: #1533 r11's sibling rule reads the
+    /// parent's certificate bytes for the signer and the rebound seat, so
+    /// a same-seat sibling is unprovable once one of the pair installs.
     #[tokio::test]
     async fn a_competing_rebind_frame_is_kept_as_fork_evidence() -> Result<()> {
         let dir = tempfile::tempdir()?;
