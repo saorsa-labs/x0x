@@ -242,4 +242,83 @@ mod systemd_lists_tests {
             }
         }
     }
+
+    #[test]
+    fn loaded_list_accepts_4096_rows_and_refuses_4097() {
+        let mut rows: Vec<_> = (0..4096)
+            .map(|n| {
+                json!([
+                    format!("unit{n}.service"),
+                    "description",
+                    "loaded",
+                    "inactive",
+                    "dead",
+                    "",
+                    format!("/unit/u{n}"),
+                    0,
+                    "",
+                    "/"
+                ])
+            })
+            .collect();
+        let raw = serde_json::to_vec(&json!({"type":"a(ssssssouso)","data":[rows]})).unwrap();
+        assert!(raw.len() < MAX_BYTES);
+        let units = loaded(&raw).unwrap();
+        assert_eq!(units.len(), 4096);
+        assert_eq!(units.last().unwrap().name, "unit4095.service");
+        rows.push(json!([
+            "extra.service",
+            "",
+            "loaded",
+            "inactive",
+            "dead",
+            "",
+            "/unit/extra",
+            0,
+            "",
+            "/"
+        ]));
+        let raw = serde_json::to_vec(&json!({"type":"a(ssssssouso)","data":[rows]})).unwrap();
+        assert!(raw.len() < MAX_BYTES);
+        assert!(loaded(&raw).is_err());
+    }
+
+    #[test]
+    fn loaded_debug_redacts_fields_in_leaf_and_nested_formats() {
+        let raw = json!({"type":"a(ssssssouso)","data":[[[
+            "private.service", "private description", "private-load", "private-active",
+            "private-sub", "private-alias.service", "/private/unit", 324567,
+            "private-job", "/private/job"
+        ]]]});
+        let units = loaded(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(units[0].description, "private description");
+        assert_eq!(units[0].job_id, 324567);
+        for rendered in [
+            format!("{:?}", units[0]),
+            format!("{:#?}", units[0]),
+            format!("{units:?}"),
+            format!("{units:#?}"),
+        ] {
+            assert!(!rendered.contains("private"));
+            assert!(!rendered.contains("324567"));
+            assert!(rendered.contains("<redacted>"));
+        }
+    }
+
+    #[test]
+    fn configured_debug_redacts_fields_in_leaf_and_nested_formats() {
+        let raw = json!({"type":"a(ss)","data":[[["/private/unit.service", "private-state"]]]});
+        let files = configured(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert_eq!(files[0].path, PathBuf::from("/private/unit.service"));
+        assert_eq!(files[0].state, "private-state");
+        for rendered in [
+            format!("{:?}", files[0]),
+            format!("{:#?}", files[0]),
+            format!("{files:?}"),
+            format!("{files:#?}"),
+        ] {
+            assert!(!rendered.contains("private"));
+            assert!(rendered.contains("<redacted>"));
+        }
+    }
 }

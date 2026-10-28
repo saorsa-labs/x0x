@@ -12,6 +12,7 @@
 
 use serde::{de::DeserializeOwned, Deserialize};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
@@ -27,7 +28,7 @@ struct Reply<T> {
 }
 
 /// All ten fields of ListUnits, including aliases and queued-job information.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(super) struct LoadedUnit {
     pub name: String,
     pub description: String,
@@ -41,11 +42,24 @@ pub(super) struct LoadedUnit {
     pub job_object: String,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(super) struct UnitFile {
     /// Supplied absolute spelling only; never canonicalized or opened here.
     pub path: PathBuf,
     pub state: String,
+}
+
+// Candidate names, descriptions and source paths are host-private inventory.
+impl fmt::Debug for LoadedUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LoadedUnit(<redacted>)")
+    }
+}
+
+impl fmt::Debug for UnitFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UnitFile(<redacted>)")
+    }
 }
 
 pub(super) fn loaded(bytes: &[u8]) -> io::Result<Vec<LoadedUnit>> {
