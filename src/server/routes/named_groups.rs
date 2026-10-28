@@ -42175,12 +42175,15 @@ fn wire_body_for_staged_notice(
 /// already holds these bytes), `notice_only` narrowing the answer to the
 /// member-signed D154 cause, and — for the signature itself — the §8 lazy
 /// materialization: sign at the first capable serve, cache until the cause
-/// or detail changes, rate-limited per `(group, member)` and globally (the
-/// #477 limiter shape; §8 Q3 values stay with David). The staged body must
-/// still be inside its 10-minute lifetime. `signer_public_key_b64` rides
-/// only when this node is not the attempt's expected authority and the
-/// cause is `no_eligible_admin` (§8 wire shape; never part of the canonical
-/// bytes).
+/// or detail changes, rate-limited per `(group, member)` and globally
+/// (the #477 limiter shape and values, settled by reviewer consensus in
+/// PR #1639 round 4: 1 per joiner per 30 s, 20 per minute overall). The
+/// token is reserved BEFORE the ML-DSA run and refunded on a failed
+/// signature, so an exhausted budget signs nothing and a cached re-serve
+/// spends no token. The staged body must still be inside its 10-minute
+/// lifetime. `signer_public_key_b64` rides only when this node is not the
+/// attempt's expected authority and the cause is `no_eligible_admin` (§8
+/// wire shape; never part of the canonical bytes).
 ///
 /// Returns the serialized `Pending` arm, or `None` when nothing may be
 /// served (the joiner retries at the next poll).
@@ -42242,24 +42245,23 @@ async fn serve_staged_join_pending_notice(
     let signature_b64 = match cached_signature {
         Some(cached) => cached,
         None => {
-            // §8 Q3 (values pending): the same bounded limiter shape as the
-            // refusal signatures — 1 per (group, member) / 30 s and 20/min
-            // globally. ML-DSA runs OUTSIDE the global notices mutex, and
-            // the token is reserved only after signing succeeds, so a
-            // failed signature spends nothing (PR #1639 review round 3).
-            use base64::Engine as _;
-            let signing_kp = state.agent.identity().agent_keypair();
-            let canonical = canonical_join_pending_notice_bytes(&notice);
-            let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-                signing_kp.secret_key(),
-                &canonical,
-            )
-            .ok()?;
-            let mut limiter = state
-                .join_pending_notice_sign_limiter
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !limiter.reserve(group_id, member_agent_id) {
+            // §8 Q3 (settled by reviewer consensus, PR #1639 review round
+            // 4): the same bounded limiter shape as the refusal signatures
+            // — 1 per (group, member) / 30 s and 20/min globally. The
+            // token is RESERVED BEFORE ML-DSA runs and refunded when
+            // signing fails: an exhausted budget signs nothing (round 3
+            // signed first and discarded the signature, leaving the
+            // signing cost uncapped) and a failed signature spends
+            // nothing. ML-DSA runs OUTSIDE the global notices mutex and
+            // outside the limiter lock; a cached re-serve spends no token.
+            let reserved = {
+                let mut limiter = state
+                    .join_pending_notice_sign_limiter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                limiter.reserve(group_id, member_agent_id)
+            };
+            if !reserved {
                 tracing::debug!(
                     group_id = %LogHexId::group(group_id),
                     member = %LogHexId::agent(member_agent_id),
@@ -42267,6 +42269,31 @@ async fn serve_staged_join_pending_notice(
                 );
                 return None;
             }
+            use base64::Engine as _;
+            let signing_kp = state.agent.identity().agent_keypair();
+            let canonical = canonical_join_pending_notice_bytes(&notice);
+            let sig = match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                signing_kp.secret_key(),
+                &canonical,
+            ) {
+                Ok(sig) => sig,
+                Err(error) => {
+                    state
+                        .join_pending_notice_sign_limiter
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .refund(group_id, member_agent_id);
+                    tracing::warn!(
+                        group_id = %LogHexId::group(group_id),
+                        member = %LogHexId::agent(member_agent_id),
+                        error = %error,
+                        "#1575: notice signature failed — the limiter token is refunded"
+                    );
+                    return None;
+                }
+            };
+            #[cfg(test)]
+            join_egress_test_barrier::park(member_agent_id, "join_pending_notice_sign").await;
             let signature_b64 = BASE64.encode(sig.as_bytes());
             // Cache the signature for the next serve of the same bytes. The
             // write-back re-checks the row under a fresh lock: a restage
@@ -42307,6 +42334,178 @@ async fn serve_staged_join_pending_notice(
         notice: Box::new(notice),
     };
     serde_json::to_vec(&response).ok()
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4, Codex P2): the serving-eligibility
+/// half of the `Pending` reply's admission — the same facts the poll-time
+/// evaluation drops a notice for, re-taken under the group's membership
+/// lock immediately before the reply is written: the joiner was removed,
+/// banned or revoked (or a revocation resync gap makes revocation state
+/// unverifiable), the group is withdrawn, quarantined or gone, this node
+/// lost its Active seat (only a member may sign), or a terminal answer —
+/// a Result or a Refused — was staged for the attempt during delivery. A
+/// notice grants nothing, so the ADR 0110 §4 key-material hold does not
+/// apply: `no_eligible_admin` is itself a §8 notice cause.
+async fn join_pending_notice_serving_blocked(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+) -> bool {
+    let Ok(joiner_agent) = parse_agent_id_hex(member_agent_id) else {
+        return true;
+    };
+    let revoked_joiner = {
+        let revocation_set = state.agent.revocation_set();
+        let set = revocation_set.read().await;
+        if set.revocation_resync_required() {
+            return true;
+        }
+        set.is_agent_revoked(&joiner_agent)
+    };
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (group_blocks, joiner_seat_blocks, this_node_active) = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return true;
+        };
+        (
+            info.withdrawn || info.is_fork_quarantined(),
+            info.members_v2
+                .get(member_agent_id)
+                .is_some_and(|seat| seat.is_removed() || seat.is_banned()),
+            info.has_active_member(&local_hex),
+        )
+    };
+    if group_blocks || joiner_seat_blocks || revoked_joiner || !this_node_active {
+        return true;
+    }
+    // §8 selection order at the write: a terminal answer staged during
+    // delivery supersedes the notice, so the reply is withheld.
+    if state
+        .pending_join_results
+        .read()
+        .await
+        .get(&join_result_key(group_id, member_agent_id))
+        .is_some_and(|pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+    {
+        return true;
+    }
+    state
+        .pending_join_refusals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4): the staged-row half of the
+/// `Pending` reply's admission, synchronous so it can also run at the
+/// transport seam immediately before the write: the notice for the exact
+/// attempt is still staged, inside BOTH of its 10-minute clocks, and still
+/// resolves to exactly the canonical bytes that were signed — a restage
+/// that changed the cause or detail (or dropped the row for a terminal
+/// answer) withholds the reply.
+fn join_pending_notice_row_current(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    served_canonical_hash: &str,
+) -> bool {
+    let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
+    let notices = state
+        .pending_join_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    notices.get(&key).is_some_and(|staged| {
+        staged_join_pending_notice_is_current(staged)
+            && join_pending_notice_hash(&wire_body_for_staged_notice(
+                group_id,
+                member_agent_id,
+                attempt_id,
+                staged,
+            )) == served_canonical_hash
+    })
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4, Codex P2): the admission of one
+/// `Pending` notice reply. Like every join artifact it leaves in ONE
+/// admitted direct exchange — never the generic DM sender, whose retries
+/// and gossip/relay fallback would write again with no §8 check at the
+/// seam, so a ban or a withdrawal during delivery could not stop the
+/// reply. The pre-phase re-takes the group's membership lock and re-runs
+/// §8's serving conditions ([`join_pending_notice_serving_blocked`]) plus
+/// the staged-row check; the seam re-checks the row synchronously at the
+/// write. The served bytes themselves name what may still be written: the
+/// reply's canonical notice hash must still be the staged row's.
+fn join_pending_notice_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    response: &[u8],
+) -> x0x::dm::ArtifactAdmission {
+    let state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    let member_agent_id = member_agent_id.to_string();
+    let attempt_id = attempt_id.to_string();
+    let served = response.to_vec();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let group_id = group_id.clone();
+        let member_agent_id = member_agent_id.clone();
+        let attempt_id = attempt_id.clone();
+        let served = served.clone();
+        async move {
+            let Ok(JoinResultMessage::Pending { notice }) =
+                serde_json::from_slice::<JoinResultMessage>(&served)
+            else {
+                return None;
+            };
+            let served_hash = join_pending_notice_hash(&notice);
+            let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
+            {
+                let _membership_guard = lock.lock().await;
+                if join_pending_notice_serving_blocked(
+                    &state,
+                    &group_id,
+                    &member_agent_id,
+                    &attempt_id,
+                )
+                .await
+                {
+                    return None;
+                }
+                if !join_pending_notice_row_current(
+                    &state,
+                    &group_id,
+                    &member_agent_id,
+                    &attempt_id,
+                    &served_hash,
+                ) {
+                    return None;
+                }
+            }
+            let seam_state = Arc::clone(&state);
+            let seam_group = group_id.clone();
+            let seam_member = member_agent_id.clone();
+            let seam_attempt = attempt_id.clone();
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_pending_notice_row_current(
+                    &seam_state,
+                    &seam_group,
+                    &seam_member,
+                    &seam_attempt,
+                    &served_hash,
+                )
+            });
+            Some(seam)
+        }
+    })
 }
 
 /// §8 (PR #1639 review round 3, finding 1): the joiner's advert is unknown
@@ -42683,6 +42882,20 @@ impl JoinRefusalSignLimiter {
         } else {
             false
         }
+    }
+
+    /// PR #1639 review round 4 (Codex P2): give back the token `reserve`
+    /// took when the work it admitted does not happen — a notice signature
+    /// that failed after the reservation. Bounded: the global bucket
+    /// returns to the cap at most, and the per-member entry is dropped so
+    /// the next reserve for the pair starts clean.
+    fn refund(&mut self, group_id: &str, member_agent_id: &str) {
+        self.per_member
+            .remove(&(group_id.to_string(), member_agent_id.to_string()));
+        self.global_tokens = self
+            .global_tokens
+            .saturating_add(1)
+            .min(JOIN_REFUSAL_GLOBAL_BUDGET);
     }
 }
 
@@ -45389,8 +45602,13 @@ pub(in crate::server) async fn handle_join_result_message(
 /// conditions (capability-gated, `held_notice_hash`-deduped; one direct
 /// exchange, no hidden resend, D145 pre-admission). Runs inside the group's
 /// membership critical section (`notice_section` is `None` only for an
-/// unknown group); the send happens after the section is released (PR
-/// #1639 review round 2). Returns `true` when a response was sent.
+/// unknown group); the payload is built under the section and the WRITE
+/// happens after the section is released (PR #1639 review round 2), in one
+/// admitted pinned exchange whose admission re-runs §8's serving
+/// conditions under the section again and whose seam re-checks the staged
+/// row at the write (PR #1639 review round 4). Returns `true` when a
+/// `Pending` reply was built and handed to that exchange (admission may
+/// still withhold it; the joiner retries at its next poll).
 #[allow(clippy::too_many_arguments)]
 async fn answer_join_pending_notice_fetch(
     state: &Arc<AppState>,
@@ -45438,15 +45656,46 @@ async fn answer_join_pending_notice_fetch(
                 if let Some(response) = response {
                     // The payload is built under the critical section (local
                     // work + one lazy signature, like the refusal path); the
-                    // SEND happens after the section is released — a direct
-                    // send waits out its full ack timeout and must never
-                    // hold the group's membership lock (PR #1639 review
-                    // round 2). One direct exchange, no hidden resend
-                    // (D145).
+                    // WRITE happens after the section is released, in ONE
+                    // admitted direct exchange — the same pinned
+                    // single-exchange path every join artifact takes (no
+                    // retry, no gossip/relay fallback). The generic DM
+                    // sender is never used: it retries and falls back with
+                    // no §8 check at the write, so a ban or a withdrawal
+                    // during delivery could not stop the reply. The
+                    // admission re-runs §8's serving conditions under the
+                    // membership lock and the seam re-checks the staged row
+                    // immediately before the write (PR #1639 review round
+                    // 4). A withheld or lost reply means the joiner retries
+                    // at its next poll (D145: one direct exchange, no
+                    // hidden resend).
                     drop(notice_section);
-                    #[cfg(test)]
-                    join_egress_test_barrier::park(member_agent_id, "join_pending_notice").await;
-                    send_join_result_response(state, sender, &response).await;
+                    let admission = join_pending_notice_admission(
+                        state,
+                        group_id,
+                        member_agent_id,
+                        attempt_id.unwrap_or_default(),
+                        &response,
+                    );
+                    let deadline = Instant::now() + PENDING_JOIN_RESULT_TTL;
+                    if let Err(reason) = send_join_artifact(
+                        state,
+                        sender,
+                        &response,
+                        group_id,
+                        "join_pending_notice",
+                        admission,
+                        deadline,
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(group_id),
+                            member = %LogHexId::agent(member_agent_id),
+                            reason = %reason,
+                            "ADR 0108 §8: the Pending notice reply was withheld or lost — the joiner retries at the next poll"
+                        );
+                    }
                     return true;
                 }
             }
@@ -48080,6 +48329,7 @@ pub(in crate::server) mod tests {
     mod issue821_read_auth;
     mod issue877_error_body_session;
     mod join_pending_notice_1575;
+    mod join_pending_notice_limiter_1575;
     mod join_pending_notice_wire_1575;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
