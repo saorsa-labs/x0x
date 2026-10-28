@@ -424,6 +424,54 @@ macro_rules! shutdown_flush_regression_tests {
             }
 
             #[test]
+            fn supervised_producers_only_flush_failure_retries_before_the_hold() {
+                // Issue #1595 (Claude #1565 finding 4): one slow request at
+                // upgrade time must not hold a release forever. A started
+                // failure caused only by unfinished producers at the drain
+                // bound draws the fixed bounded retry budget: the first
+                // failures still exit EX_TEMPFAIL (the restart retries the
+                // release on the old binary) without a hold; only a spent
+                // budget writes the per-release hold. The retry record is
+                // carried across the fixtures like a real data root carries
+                // it across restarts.
+                let mut carried: Option<Vec<u8>> = None;
+                for attempt in 1..=(flush::PRODUCER_DRAIN_RETRIES + 1) {
+                    let (_dir, plan) = fixture();
+                    if let Some(prior) = &carried {
+                        std::fs::write(plan.data_root.join(flush::RETRY_RECORD), prior).unwrap();
+                    }
+                    let owner = flush::register(
+                        plan.data_root.clone(),
+                        Arc::new(|_, stopped| {
+                            stopped.store(true, Ordering::SeqCst);
+                            Err(io::Error::other(flush::PRODUCERS_UNFINISHED))
+                        }),
+                    )
+                    .unwrap();
+                    let mut exit_code = None;
+                    let result = AutoApplyUpgrader::new("x0xd").trigger_restart_with_exit(
+                        &plan,
+                        "2.0.0",
+                        |code| exit_code = Some(code),
+                    );
+                    owner.join_workers();
+                    assert!(result.is_err());
+                    assert_eq!(
+                        exit_code,
+                        Some(restart::flush_failure_exit_code()),
+                        "every producer-drain failure is still a started failure"
+                    );
+                    assert_eq!(
+                        plan.data_root.join(flush::HOLD_RECORD).exists(),
+                        attempt > flush::PRODUCER_DRAIN_RETRIES,
+                        "attempt {attempt}"
+                    );
+                    carried =
+                        Some(std::fs::read(plan.data_root.join(flush::RETRY_RECORD)).unwrap());
+                }
+            }
+
+            #[test]
             fn receipt_authorization_failure_after_the_stop_exits_tempfail() {
                 // Engineer ruling 23 Oct 2026: any error after the flush
                 // started ends in exit 75; a parked daemon with no API and

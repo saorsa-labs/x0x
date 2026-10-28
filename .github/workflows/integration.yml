@@ -69,10 +69,21 @@ jobs:
         # tests. `test(/^proptest_/) | test(/proptest/)` is kept to pull in
         # those presence lib tests; the eight `binary(...)` clauses cover the
         # rest. (60 tests total vs the prior 2.)
-        # --build-jobs 2: belt-and-braces cap on parallel linking, since each
-        # proptest binary links the (large) x0x crate.
+        # --build-jobs 1: one rustc/linker at a time. Each proptest binary
+        # links the (large) x0x crate, and with two running at once the
+        # build is this job's peak-memory high-water mark. Run 40530790509
+        # (27 Oct 2026, head e89d8124) was killed by an external SIGTERM
+        # (exit 143) 9m50s into the `cargo nextest list` build — before any
+        # test ran — on runner image 20261025.353.1, the first wave of the
+        # kernel 6.17→7.0-azure bump, while every Property Tests run that
+        # passed the same afternoon (including this branch on 25 Oct and
+        # sibling jobs of the same run) drew the older 20261012.334.1
+        # image. A tree-identical earlier head passed with a 14-minute
+        # build, so the kill is environmental, under build load.
+        # Serialising the build halves the peak; the job's default
+        # 360-minute ceiling absorbs the few extra minutes.
         run: |
-          bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 2 --lib \
+          bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 1 --lib \
             --test proptest_connectivity --test proptest_crdt --test proptest_files \
             --test proptest_groups --test proptest_kv --test proptest_mls \
             --test proptest_presence --test proptest_trust \

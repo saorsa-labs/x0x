@@ -42,8 +42,8 @@ use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 
 use super::crypto_exclusion::{
-    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, next_attempt,
-    note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
+    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
+    next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
 use super::mandate_store::{self, PendingOrcV1};
@@ -160,7 +160,7 @@ pub(super) struct OrcState {
     mandates_restored: bool,
     /// Authored and installed recovery commits, for catch-up serving; the
     /// authored and the received frames are durable ([`replay_log`]).
-    log: replay_log::HeldLog<ORC_LOG_PER_GROUP>,
+    log: replay_log::HeldLog<ORC_LOG_PER_GROUP, true>,
 }
 
 impl OrcState {
@@ -297,7 +297,7 @@ impl OrcState {
     }
 }
 
-fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP> {
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP, true> {
     &mut inner.orc.log
 }
 
@@ -1467,7 +1467,7 @@ async fn finish_commit(
         ),
     };
     if !persisted {
-        replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+        replay_log::rewrite_without(state, ext, held, &stable, at).await;
         rollback(&mut tree, &next, "owner_recovery_persist_failed");
         tracing::error!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: persist failed");
         set_wait(state, &stable, None).await;
@@ -1746,8 +1746,13 @@ fn spawn_commit_send(
 /// Serve the recovery commit frames this node holds for the group (any of
 /// `group_ids`) above `from_revision` to a catch-up requester, oldest
 /// first, on the distinct gated carrier only, never inside a legacy
-/// catch-up page (§4b(1) "Mixed versions"). Each write uses the guarded
-/// admission with [`HeadRule::OnChain`] and the `owner_recovery_v1` gate.
+/// catch-up page (§4b(1) "Mixed versions"). A competing frame kept as
+/// fork evidence (#1579) is not on this node's verified chain, so it is
+/// skipped, not served, and it does not stop the round. A
+/// fork-quarantined group serves nothing on purpose: `head_rule_admits`
+/// refuses every frame of it, so the skip leaves the round empty. Each
+/// write uses the guarded admission with [`HeadRule::OnChain`] and the
+/// `owner_recovery_v1` gate.
 ///
 /// The author's frames survive a restart ([`replay_log`]). A GSS frame
 /// moves the requester's epoch without the secret, so an admin also seals
@@ -1768,8 +1773,25 @@ pub(in crate::server) async fn serve_catchup(
         .orc
         .log
         .catchup_frames(group_ids, from_revision);
+    if frames.is_empty() {
+        return;
+    }
+    // The frames all come from one group (`catchup_frames` serves the
+    // first of `group_ids` that has a log).
+    let Some(first_group) = frames.first().map(|(group, _, _)| group.clone()) else {
+        return;
+    };
+    let Some((_, info)) = group_by_stable(state, &first_group).await else {
+        return;
+    };
     let mut gss_groups = BTreeSet::new();
     for (group_id, result_head, bytes) in frames {
+        // #1579: a competing frame kept as fork evidence is not on this
+        // node's verified chain. It is never served, and it does not stop
+        // the round for the frames that are.
+        if !head_rule_admits(&info, &HeadRule::OnChain(result_head.clone())) {
+            continue;
+        }
         if matches!(
             orc::decode_frame(&bytes),
             Ok(orc::OwnerRecoveryFrameV1::Commit(frame))
@@ -3163,7 +3185,7 @@ async fn receive_commit(
     {
         Ok(next) => next,
         Err(error) => {
-            replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+            replay_log::rewrite_without(state, ext, held, &stable, at).await;
             tracing::info!(group_id = %ng::LogHexId::group(&group_key), "ADR 0110 S4: owner recovery commit refused by the chained apply: {error}");
             return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
         }
@@ -3237,7 +3259,7 @@ async fn receive_commit(
                     guard,
                     "owner_recovery_proof_failed",
                 );
-                replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+                replay_log::rewrite_without(state, ext, held, &stable, at).await;
                 return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
             }
             match ng::persist_treekem_and_named_groups_atomic_with_info(
@@ -3829,6 +3851,9 @@ mod tests {
 
     /// #1357: recovery commit frames are held for catch-up serving, oldest
     /// first, above the requested revision, deduplicated and bounded.
+    /// #1579: a frame at a held revision with a different result head is a
+    /// competing commit: it is kept beside the held one, as fork evidence,
+    /// and it never replaces it.
     #[test]
     fn catchup_frames_are_bounded_ordered_and_above_the_revision() {
         let mut orc = OrcState::default();
@@ -3847,12 +3872,15 @@ mod tests {
         let all = orc.log.catchup_frames(&["x".into(), "g".into()], 0);
         assert_eq!(all.len(), ORC_LOG_PER_GROUP);
         let heads: Vec<&str> = all.iter().map(|(_, head, _)| head.as_str()).collect();
-        let expected: Vec<String> = (3..=total).map(|revision| format!("h{revision}")).collect();
+        let mut expected: Vec<String> =
+            (4..=total).map(|revision| format!("h{revision}")).collect();
+        expected.push("dup".to_string());
         assert_eq!(heads, expected);
         assert!(all.iter().all(|(id, _, _)| id == "g"));
         let tail = orc.log.catchup_frames(&["g".into()], total - 1);
-        assert_eq!(tail.len(), 1);
+        assert_eq!(tail.len(), 2, "the competing frame is held too");
         assert_eq!(tail[0].1, format!("h{total}"));
+        assert_eq!(tail[1].1, "dup");
         assert!(orc.log.catchup_frames(&["other".into()], 0).is_empty());
     }
 
@@ -4266,6 +4294,75 @@ mod tests {
         assert_eq!(served[0].2.as_slice(), bytes.as_slice());
         assert!(inner.orc.deliveries.contains_key(&stable));
         drop(inner);
+        state.agent.shutdown().await;
+    }
+
+    /// #1576: a held mandate's group where the mandate's named (revoked)
+    /// admin is the only other active member has no head holders left.
+    /// The worker pass's round excludes that admin, so nobody is asked;
+    /// the §2 head gate (`group_head_synced`, which gates the mandate's
+    /// seal) must agree and open once the restart minimum elapsed, with
+    /// no confirmed round. Before the fix the gate still counted the
+    /// revoked admin as a holder, so the seal waited the full restart
+    /// sync wait for an answer that cannot come.
+    #[tokio::test]
+    async fn a_held_mandate_with_no_head_holders_opens_the_head_gate() {
+        let (_dir, mut state, info, _admin_hex) = recovery_fixture().await;
+        // A restart sync wait no paused-clock auto-advance can cover, so
+        // only the holder count can open the round.
+        Arc::get_mut(&mut state)
+            .expect("the fresh state is not shared yet")
+            .revocation_evictions = super::super::S4Runtime::new(x0x::groups::eviction::S4Timing {
+            restart_sync_wait: Duration::from_secs(3600),
+            ..x0x::groups::eviction::S4Timing::default()
+        });
+        let stable = info.stable_group_id().to_string();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        // The restart minimum elapses. The mandate is the group's only S4
+        // work — no row and no queued ban — so the worker keeps the
+        // group's head round through the owner-recovery plane alone, and
+        // only the owner-recovery exclusions can drop the revoked admin
+        // from the holders. The round for the current head just started
+        // and has no answer yet, as a seal attempt right after a new head
+        // meets.
+        tokio::time::pause();
+        tokio::time::advance(state.revocation_evictions.timing.restart_sync_wait).await;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.store.rows().next().is_none(),
+                "no row: the mandate is the only work"
+            );
+            assert!(
+                inner.orc.head_round_groups().contains_key(&stable),
+                "the mandate's group keeps a head round with its named admin excluded"
+            );
+            inner.head_rounds.insert(
+                stable.clone(),
+                super::super::HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        }
+        assert!(
+            super::super::group_head_synced(&state, &stable).await,
+            "no holders left: the gate opens without a confirmed round"
+        );
+        // The held mandate seals on that gate.
+        try_commit(&state, &stable).await;
+        let committed = state.named_groups.read().await[&stable].clone();
+        assert_eq!(
+            committed.state_revision,
+            info.state_revision + 1,
+            "the recovery commits without waiting the restart sync wait"
+        );
         state.agent.shutdown().await;
     }
 
@@ -6044,6 +6141,143 @@ mod restart_tests {
             .map(|(_, share)| share)
             .next_back()
             .context("Q seals its current secret to the survivor")
+    }
+
+    /// #1579: a competing recovery frame kept below the head never stops
+    /// the catch-up round — proven at the real `serve_catchup` loop. Two
+    /// promoted members hold the owner key and seal competing recoveries
+    /// from one parent; this node commits its own and holds the other as
+    /// evidence, first in the log. The round skips the competitor, sends
+    /// the on-chain frame (the test-build in-process stand-in admits it)
+    /// and then seals the current secret to the requester: the scheduled
+    /// share is the evidence the round ran past the competitor to its
+    /// end. A `return` at the skip ends the round on the competitor, and
+    /// no share is sealed.
+    #[tokio::test]
+    async fn the_catchup_round_skips_a_competing_recovery_frame_and_seals_the_share() -> Result<()>
+    {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let owner_seed = [0x73; 32];
+        let author = offline_author(author_dir.path(), owner_seed).await?;
+        let survivor = zero_restart_wait(
+            offline_daemon(
+                survivor_dir.path(),
+                Some(x0x::identity::UserKeypair::from_seed(&owner_seed)?),
+            )
+            .await?,
+        )?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let survivor_id = survivor.agent.agent_id();
+        let survivor_hex = hex::encode(survivor_id.as_bytes());
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let mut info = recovery_parent(
+            owner,
+            &admin,
+            [
+                author.agent.identity().agent_keypair(),
+                survivor.agent.identity().agent_keypair(),
+            ],
+        )?;
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        {
+            use base64::Engine as _;
+            for (state, seat) in [
+                (&author, author_hex.clone()),
+                (&survivor, survivor_hex.clone()),
+            ] {
+                info.members_v2
+                    .get_mut(&seat)
+                    .context("seat")?
+                    .kem_public_key_b64 = Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(&state.agent_kem_keypair.public_bytes),
+                );
+            }
+        }
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        for state in [&author, &survivor] {
+            hold_persisted(state, &info).await?;
+            revoke(state, &admin).await?;
+        }
+        // Each daemon holds the other's current verified advert, so the
+        // capability gate never withholds and no commit waits on D76.
+        let bits = x0x::dm::CapabilityRegistry::current().bits;
+        let now = x0x::dm_capability::now_unix_ms();
+        super::tests::advertise(&author, survivor_id, bits, now);
+        super::tests::advertise(&survivor, author.agent.agent_id(), bits, now);
+        // The survivor seals a competing recovery from the same parent.
+        let (competed, competitor_bytes) = commit_own_recovery(&survivor, &stable, &info).await?;
+        // The competitor enters this node's log first: the evidence the
+        // round must serve past, before this node commits its own branch.
+        {
+            let mut inner = author.revocation_evictions.inner.lock().await;
+            inner.orc.log.remember(
+                &stable,
+                competed.state_revision,
+                competed.state_hash.as_str(),
+                Arc::new(competitor_bytes),
+                false,
+            );
+        }
+        let (committed, _bytes) = commit_own_recovery(&author, &stable, &info).await?;
+        anyhow::ensure!(
+            committed.state_revision == competed.state_revision
+                && committed.state_hash != competed.state_hash,
+            "the two recoveries compete at one revision"
+        );
+        let order: Vec<String> = author
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .log
+            .catchup_frames(std::slice::from_ref(&stable), info.state_revision)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert_eq!(
+            order,
+            vec![competed.state_hash.clone(), committed.state_hash.clone()],
+            "the round meets the competitor first, then the on-chain frame"
+        );
+        // The real round: skip the competitor, serve the on-chain frame,
+        // seal the current secret to the requester.
+        let before = scheduled_shares(&author).len();
+        serve_catchup(
+            &author,
+            &survivor_id,
+            std::slice::from_ref(&stable),
+            info.state_revision,
+        )
+        .await;
+        let share = scheduled_shares(&author)
+            .into_iter()
+            .skip(before)
+            .filter(|(to, _)| *to == survivor_hex)
+            .map(|(_, share)| share)
+            .next_back()
+            .context("the round served past the competitor and sealed the share")?;
+        let expected = <[u8; 32]>::try_from(
+            committed
+                .shared_secret
+                .as_deref()
+                .context("the committed secret")?,
+        )?;
+        assert_eq!(
+            open_share(&share, &survivor.agent_kem_keypair)?,
+            (committed.secret_epoch, expected),
+            "the share opens to the current secret"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
     }
 
     /// Codex P1 (#1508 rc12 r3): the recovery promotes P, P promotes Q,

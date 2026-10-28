@@ -22,8 +22,8 @@ pub(super) struct FlushOwner {
     complete: mpsc::SyncSender<io::Result<()>>,
     control: tokio::task::JoinHandle<()>,
     socket: PathBuf,
-    /// Process exit used after a started flush failed. A seam so tests can
-    /// observe the EX_TEMPFAIL code instead of ending the test process.
+    /// Process exit after a completed socket flush or a started failure.
+    /// Tests capture the carried status instead of ending the test process.
     exit: Arc<dyn Fn(i32) + Send + Sync>,
     /// Set (with a stored permit) by the control loop after a started flush
     /// failed and its recovery finished; `finish` exits EX_TEMPFAIL on it.
@@ -150,14 +150,24 @@ impl FlushOwner {
                     )))
                 };
                 let started_flush_failed = matches!(response, Err(ArmFailure::FlushFailed(_)));
+                let success_exit = response.as_ref().ok().map(|armed| armed.exit_code);
                 let value = match response {
-                    Ok(receipt) => serde_json::json!({"receipt": receipt}),
+                    Ok(armed) => serde_json::json!({"receipt": armed.receipt}),
                     Err(error) => serde_json::json!({"error": error.to_string()}),
                 };
                 if let Ok(mut bytes) = serde_json::to_vec(&value) {
                     bytes.push(b'\n');
                     let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&bytes))
                         .await;
+                }
+                if let Some(code) = success_exit {
+                    // The live receipt proves the barriers completed. End the
+                    // old participant after the existing bounded reply attempt,
+                    // even if the requester disconnected or `finish` is parked.
+                    // Do not log or wait for another shutdown notification after
+                    // the acknowledged log barrier. The frozen owner retains
+                    // restart/reap/start authority; this only ends this process.
+                    (control_exit)(code);
                 }
                 // Only after the reply is written does the failed flush end
                 // this process. `arm` completed its recovery (the hold, the
@@ -207,7 +217,10 @@ impl FlushOwner {
                 if producers_finished {
                     Ok(())
                 } else {
-                    Err(io::Error::other("shutdown producers remain unfinished"))
+                    // The shared marker names the one transient started-flush
+                    // cause that draws the bounded retry budget instead of an
+                    // immediate hold (issue #1595).
+                    Err(io::Error::other(shutdown_flush::PRODUCERS_UNFINISHED))
                 }
             });
             let _ = self.complete.try_send(result);
@@ -262,6 +275,16 @@ struct AdmittedArm {
     /// Recovery verifies every backup before starting the restore.
     restore_set: Vec<(PathBuf, PathBuf)>,
     journal: Box<journal::JournalRecord>,
+    /// Completion status from this participant's frozen restart owner.
+    exit_code: i32,
+}
+
+/// Only the live acknowledgement creates successful completion authority.
+/// The socket still serializes the receipt alone; this status stays local.
+#[derive(Debug)]
+struct ArmedFlush {
+    receipt: shutdown_flush::Receipt,
+    exit_code: i32,
 }
 
 fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<AdmittedArm> {
@@ -308,12 +331,21 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
             "arm request names a different old participant",
         ));
     }
-    if participant.restart.mode == journal::RestartOwner::LauncherChild {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "launcher-child handoff ownership is not implemented",
-        ));
-    }
+    let exit_code = match participant.restart.mode {
+        journal::RestartOwner::SupervisedExit => participant
+            .restart
+            .supervised_exit_code
+            .unwrap_or_else(crate::upgrade::restart::supervised_exit_code),
+        // Stop cleanly for the existing external handoff owner. This path
+        // neither requests a supervisor restart nor starts a helper/candidate.
+        journal::RestartOwner::TransactionalHandoff => 0,
+        journal::RestartOwner::LauncherChild => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "launcher-child handoff ownership is not implemented",
+            ));
+        }
+    };
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs())
@@ -354,6 +386,7 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
         handoff,
         restore_set,
         journal: record,
+        exit_code,
     })
 }
 
@@ -363,11 +396,7 @@ struct ArmPreparation {
     wrote_handoff: bool,
 }
 
-fn arm(
-    state: &ControlContext,
-    root: &Path,
-    bytes: &[u8],
-) -> Result<shutdown_flush::Receipt, ArmFailure> {
+fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> Result<ArmedFlush, ArmFailure> {
     let admitted = match admit(state, root, bytes) {
         Ok(admitted) => admitted,
         Err(error) => return Err(ArmFailure::Refused(error)),
@@ -395,6 +424,7 @@ fn arm(
         handoff,
         restore_set,
         journal,
+        exit_code,
     } = current;
     let handoff_path = root.join(journal::HANDOFF_FILE_NAME);
     // Serialize a late prepare with refusal cleanup, including a timed-out
@@ -424,25 +454,17 @@ fn arm(
         &reservation,
     );
     match flush {
-        Ok(receipt) => Ok(receipt),
+        Ok(receipt) => Ok(ArmedFlush { receipt, exit_code }),
         Err(shutdown_flush::FlushFailure::NotOwned(error)) => Err(ArmFailure::Refused(error)),
         Err(failure @ shutdown_flush::FlushFailure::Started(_)) => {
             // The flush started and the daemon stopped behind the hook. Hold
-            // the failed release first (engineer ruling, 23 Oct 2026) so the
-            // restart this exit creates cannot re-apply it, then restore
+            // the failed release first — or spend one of the bounded
+            // producer-drain retries (engineer ruling, 23 Oct 2026;
+            // issue #1595) — so the restart this exit creates cannot
+            // re-apply a release that fails deterministically, then restore
             // every binary the transaction swapped and leave the EX_TEMPFAIL
-            // exit to `finish`.
-            if let Err(error) = shutdown_flush::hold_failed_release(
-                root,
-                &plan.candidate_version,
-                &failure.to_string(),
-            ) {
-                tracing::error!(
-                    %error,
-                    "cannot persist the failed-upgrade hold; the next automatic \
-                     check may retry this release once more"
-                );
-            }
+            // exit to the control loop after its reply.
+            shutdown_flush::hold_or_retry_started_failure(root, &plan.candidate_version, &failure);
             let recovery_complete = match restore_arm(
                 root,
                 *journal,
