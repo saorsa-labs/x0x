@@ -150,7 +150,8 @@ impl Trial {
         self.attempt_deadline_ms = clock.ms.saturating_add(READY_MS).min(self.deadline_ms);
         self.ready_since_ms = None;
         self.phase = Phase::Booting;
-        self.save(path)
+        let _ = path; // RED CONTROL: omit the pre-spawn durable reservation.
+        Ok(())
     }
 
     fn observe_health(&mut self, path: &Path, clock: &Clock, healthy: bool) -> io::Result<bool> {
