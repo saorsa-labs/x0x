@@ -277,6 +277,7 @@ struct AdmittedArm {
     journal: Box<journal::JournalRecord>,
     /// Completion status from this participant's frozen restart owner.
     exit_code: i32,
+    launcher_owned: bool,
 }
 
 /// Only the live acknowledgement creates successful completion authority.
@@ -285,6 +286,62 @@ struct AdmittedArm {
 struct ArmedFlush {
     receipt: shutdown_flush::Receipt,
     exit_code: i32,
+}
+
+// The 20 Oct enable hold is independent of the approved S3b authoring scope.
+// A future activation must also supply the complete carried inventory issuer.
+fn admit_launcher_parent(participant: &journal::Participant) -> io::Result<()> {
+    const ENABLED: bool = false;
+    if !ENABLED {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "M2 launcher activation is held",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let launcher = participant
+            .restart
+            .launcher
+            .as_ref()
+            .ok_or_else(|| io::Error::other("launcher binding missing"))?;
+        // SAFETY: getppid takes no pointers and has no failure mode.
+        let parent = unsafe { libc::getppid() } as u32;
+        let stat = std::fs::read_to_string(format!("/proc/{parent}/stat"))?;
+        let start: u64 = stat
+            .rsplit_once(')')
+            .ok_or_else(|| io::Error::other("bad parent stat"))?
+            .1
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| io::Error::other("missing parent start"))?
+            .parse()
+            .map_err(io::Error::other)?;
+        let argv: Vec<_> = launcher
+            .argv
+            .iter()
+            .flat_map(|arg| arg.as_bytes().iter().copied().chain(std::iter::once(0)))
+            .collect();
+        if launcher.pid != Some(parent)
+            || launcher.process_start != Some(start)
+            || launcher.boot_id != crate::upgrade::probe::ProbeClock::now()?.boot_id
+            || std::fs::read_link(format!("/proc/{parent}/exe"))? != launcher.executable
+            || std::fs::read(format!("/proc/{parent}/cmdline"))? != argv
+        {
+            return Err(io::Error::other(
+                "frozen launcher is not this child's live parent",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = participant;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "launcher process custody requires Linux",
+        ))
+    }
 }
 
 fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<AdmittedArm> {
@@ -340,12 +397,11 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
         // neither requests a supervisor restart nor starts a helper/candidate.
         journal::RestartOwner::TransactionalHandoff => 0,
         journal::RestartOwner::LauncherChild => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "launcher-child handoff ownership is not implemented",
-            ));
+            admit_launcher_parent(participant)?;
+            0
         }
     };
+    let launcher_owned = participant.restart.mode == journal::RestartOwner::LauncherChild;
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs())
@@ -381,6 +437,7 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
     .map(|(_, artifact)| (artifact.target_path.clone(), artifact.backup_path.clone()))
     .collect();
     Ok(AdmittedArm {
+        launcher_owned,
         plan,
         binding,
         handoff,
@@ -425,6 +482,7 @@ fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> Result<ArmedFlush, 
         restore_set,
         journal,
         exit_code,
+        launcher_owned,
     } = current;
     let handoff_path = root.join(journal::HANDOFF_FILE_NAME);
     // Serialize a late prepare with refusal cleanup, including a timed-out
@@ -455,6 +513,15 @@ fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> Result<ArmedFlush, 
     );
     match flush {
         Ok(receipt) => Ok(ArmedFlush { receipt, exit_code }),
+        Err(failure) if launcher_owned => {
+            // The protected parent owns restoration after every OLD child is
+            // reaped. Never rename the shared pair from a stopping child.
+            if failure.started() {
+                Err(ArmFailure::FlushFailed(failure))
+            } else {
+                Err(ArmFailure::Refused(io::Error::other(failure.to_string())))
+            }
+        }
         Err(shutdown_flush::FlushFailure::NotOwned(error)) => Err(ArmFailure::Refused(error)),
         Err(failure @ shutdown_flush::FlushFailure::Started(_)) => {
             // The flush started and the daemon stopped behind the hook. Hold

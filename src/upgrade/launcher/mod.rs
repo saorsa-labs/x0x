@@ -30,6 +30,7 @@ mod recovery;
 pub(crate) fn fixture_receipt(request: &[u8]) -> io::Result<serde_json::Value> {
     control::fixture_receipt(request)
 }
+mod run;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
