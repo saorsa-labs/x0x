@@ -329,6 +329,11 @@ struct S3Inner {
     /// §1 step 2: signed ATAs keyed by `(group, subject, from_state_hash)`,
     /// reused until [`s3::ATA_ARM_WINDOW`] expires.
     ata_cache: HashMap<(String, String, String), AdminTerminalAttestation>,
+    /// #1645: per key, a failed re-seat swap whose files may be mixed (the
+    /// tree write failed after its commit point and the files from before
+    /// it are not all back). Every other whole-roster write waits
+    /// ([`refuse_roster_write_during_failed_swap`]).
+    failed_swaps: HashMap<String, FailedSwap>,
     /// Test only: where a failed swap's rollback stops (#1645).
     #[cfg(test)]
     swap_rollback_stop: Option<SwapRollbackStop>,
@@ -347,6 +352,8 @@ enum SwapRollbackStop {
     SidecarRestoreFails,
     /// The files are back, and the durable `Staging` write fails.
     PhaseWriteFails,
+    /// The snapshot restore fails (an unwritable `treekem/`).
+    SnapshotRestoreFails,
 }
 
 /// A sidecar fault (§4, ADR 0108 §5a): S3 makes no transition for the
@@ -5890,6 +5897,11 @@ async fn live_record_for(state: &AppState, stable: &str) -> Option<(String, Grou
 async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
     let lock = super::group_membership_lock(state, stable).await;
     let _membership_guard = lock.lock().await;
+    // #1645: a failed swap's files go back first. Until then nothing else
+    // of the re-seat runs (its rollback writes the roster too).
+    if !resolve_failed_swap(state, stable).await {
+        return true;
+    }
     let Some(journal) = sidecar_snapshot(state, stable)
         .await
         .and_then(|body| body.reseat_journal)
@@ -5959,6 +5971,172 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
     true
 }
 
+/// #1645: the original pair's files from before the swap's tree write,
+/// which a failed write puts back. Only the swap that made the `Swapping`
+/// mark reads them: memory never advances the original's tree, so they
+/// cannot rewind a ratchet.
+struct SwapBefore {
+    cover: super::ReseatSnapshotCover,
+    rosters: super::RosterStoresBefore,
+}
+
+/// #1645: a failed swap whose files may be mixed
+/// ([`S3Inner::failed_swaps`]). No other roster write runs meanwhile.
+/// At most one key is pinned: a pin is set only in [`swap_staged_tree`],
+/// under `named_groups_persistence_lock` and after its check that no
+/// other key is pinned, so two pins can never wait on each other.
+enum FailedSwap {
+    /// The swap made the `Swapping` mark. Each tick puts `before` (the
+    /// original pair) back, then ends the swap.
+    Rollback {
+        stable: String,
+        expected: [u8; 32],
+        before: SwapBefore,
+    },
+    /// A retry of a `Swapping` journal (round 4 review). Its transaction
+    /// journals replay the staged pair that `Swapping` names, with the
+    /// tree that memory holds now, so nothing is put back: files read
+    /// before the retry can be a mixed set or an older ratchet. Each tick
+    /// retries the tree write forward, and only a write past its commit
+    /// point that leaves the staged pair durable ends the refusal.
+    Forward,
+}
+
+/// #1645 (round 4 audit): refuse a whole-roster write while a failed
+/// re-seat swap's files may be mixed, except the tree write of that swap
+/// (`allow`, its key), which retries forward. After a tree write that
+/// failed past its commit point, only the transaction journals make the
+/// files a matching pair again (a restart replays them). A later roster
+/// write would put the staged record beside the original's tree, and its
+/// newer revision makes the startup replay drop the journals as stale.
+/// The refusal ends when the staged pair is durable or the original files
+/// are all back.
+pub(super) async fn refuse_roster_write_during_failed_swap(
+    state: &AppState,
+    allow: Option<&str>,
+) -> std::io::Result<()> {
+    let inner = state.group_recovery.inner.lock().await;
+    match inner
+        .failed_swaps
+        .keys()
+        .find(|key| Some(key.as_str()) != allow)
+    {
+        Some(key) => Err(std::io::Error::other(format!(
+            "ADR 0109 S3: the failed re-seat swap of {} is not resolved yet; the roster write waits for it",
+            LogHexId::group(key)
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Record the failed swap of `key`, or (`None`) end its refusal.
+async fn set_failed_swap(state: &AppState, key: &str, failed: Option<FailedSwap>) {
+    let mut inner = state.group_recovery.inner.lock().await;
+    match failed {
+        Some(failed) => {
+            inner.failed_swaps.insert(key.to_string(), failed);
+        }
+        None => {
+            inner.failed_swaps.remove(key);
+        }
+    }
+}
+
+/// #1645: put back the files of a rolled-back swap of `stable` that a
+/// tick before could not put back, before anything else of the re-seat
+/// runs. Returns whether the re-seat may go on: no failed swap of
+/// `stable` is left, or it is [`FailedSwap::Forward`] (the swap's own
+/// tree write retries it). Caller holds the group membership lock.
+async fn resolve_failed_swap(state: &AppState, stable: &str) -> bool {
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    let failed = {
+        let mut inner = state.group_recovery.inner.lock().await;
+        let key = inner
+            .failed_swaps
+            .iter()
+            .find(|(_, failed)| matches!(failed, FailedSwap::Rollback { stable: s, .. } if s == stable))
+            .map(|(key, _)| key.clone());
+        key.and_then(|key| inner.failed_swaps.remove(&key).map(|failed| (key, failed)))
+    };
+    let Some((key, failed)) = failed else {
+        return true;
+    };
+    if let FailedSwap::Rollback {
+        expected, before, ..
+    } = &failed
+    {
+        if finish_failed_swap(state, stable, &key, *expected, before).await {
+            tracing::info!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the failed swap's files are back; roster writes resume");
+            return true;
+        }
+    }
+    set_failed_swap(state, &key, Some(failed)).await;
+    false
+}
+
+/// #1645: put `before` (the original pair) back after a failed swap that
+/// made the `Swapping` mark and, when all of it is durable, end the swap
+/// ([`end_swap_after_rollback`]). Returns whether that is all durable.
+/// A group that memory holds as withdrawn gets the withdrawn repair
+/// instead: it removes the tree and the journals, so no pair is left to
+/// mix, and a restore would undo the withdrawal on disk. Caller holds
+/// `named_groups_persistence_lock`.
+async fn finish_failed_swap(
+    state: &AppState,
+    stable: &str,
+    key: &str,
+    expected: [u8; 32],
+    before: &SwapBefore,
+) -> bool {
+    match super::repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
+        state,
+        key,
+        Some(stable),
+        "reseat_failed_swap",
+    )
+    .await
+    {
+        Ok(true) => return end_swap_after_rollback(state, stable, key, expected).await,
+        Ok(false) => {}
+        Err(error) => {
+            tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the withdrawn repair after a failed swap did not complete; the swap stays recoverable and is retried: {error}");
+            return false;
+        }
+    }
+    rollback_swap_files(state, stable, key, before).await
+        && end_swap_after_rollback(state, stable, key, expected).await
+}
+
+/// #1645: the swap that made the mark changed no file (or the files are
+/// already the original pair): end it, or, when that fails, refuse other
+/// roster writes until a tick ends it.
+async fn end_or_pin_rollback(
+    state: &AppState,
+    stable: &str,
+    key: &str,
+    expected: [u8; 32],
+    before: SwapBefore,
+) {
+    if !end_swap_after_rollback(state, stable, key, expected).await {
+        pin_rollback(state, stable, key, expected, before).await;
+    }
+}
+
+async fn pin_rollback(
+    state: &AppState,
+    stable: &str,
+    key: &str,
+    expected: [u8; 32],
+    before: SwapBefore,
+) {
+    let failed = FailedSwap::Rollback {
+        stable: stable.to_string(),
+        expected,
+        before,
+    };
+    set_failed_swap(state, key, Some(failed)).await;
+}
+
 /// §3 step 3 (#1567): mark the journal `Swapping` and, in the same hold of
 /// `named_groups_persistence_lock`, put the staged record and its tree on
 /// disk in one TreeKEM persist transaction. Until then the snapshot file
@@ -5981,6 +6159,26 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
 /// journals and `Swapping`. Either way the next tick retries. A group with
 /// no tree (GSS) needs only the mark. Returns whether the swap may go on
 /// to [`lift_staging_marker`].
+///
+/// A write that stops before its commit point (#1645, Codex P1 round 4),
+/// or that does not run, changed no file: the original pair is still on
+/// disk and no journal replays the staged pair. When this call made the
+/// mark, the swap ends at once ([`end_swap_after_rollback`]), with no
+/// file restore that can fail. Before the fix the restore ran, and when
+/// it failed (an unwritable `treekem/`) memory kept `Swapping` with the
+/// covers off and no journal: a later whole-roster save wrote the staged
+/// record beside the original's tree, and a restart paired them.
+///
+/// A write that fails after its commit point can leave mixed files, which
+/// only its journals repair. From that failure until the staged pair is
+/// durable or the original files are all back, every other whole-roster
+/// write is refused ([`refuse_roster_write_during_failed_swap`]), so no
+/// write can make the journals stale. The swap that made the mark puts
+/// the original pair back ([`FailedSwap::Rollback`]). A retry of a
+/// `Swapping` journal puts nothing back and retries forward
+/// ([`FailedSwap::Forward`]): the files it could read are not known to be
+/// a matching pair, and its tree can be older than the tree in memory.
+/// A withdrawn group's repair leaves no pair to mix; the swap ends.
 async fn swap_staged_tree(
     state: &AppState,
     stable: &str,
@@ -5995,18 +6193,32 @@ async fn swap_staged_tree(
         None => None,
     };
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    // The original's snapshot state and both roster stores, which a failed
-    // tree write puts back. Read them before the `Swapping` mark below:
-    // that mark ends the covers.
-    let before = if guard.is_some() && journal.phase != ReseatPhase::Swapping {
+    // F5: another group's failed swap refuses every roster write, so this
+    // one would only mark `Swapping` and end it again. Wait for it.
+    if refuse_roster_write_during_failed_swap(state, Some(key))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let marked_here = journal.phase != ReseatPhase::Swapping;
+    // The original pair's snapshot state and both roster stores, which a
+    // failed tree write puts back. Read them before the `Swapping` mark
+    // below: that mark ends the covers. A retry of a `Swapping` journal
+    // reads nothing: it never puts files back ([`FailedSwap::Forward`]).
+    let before = if guard.is_some() && marked_here {
         let read = async {
-            let Some(cover) = super::reseat_snapshot_cover(state, key).await? else {
-                return anyhow::Ok(None);
+            let cover = match super::reseat_snapshot_cover(state, key).await? {
+                Some(cover) => cover,
+                None => super::snapshot_file_cover(state, key).await?,
             };
-            Ok(Some((cover, super::read_roster_stores(state).await?)))
+            anyhow::Ok(SwapBefore {
+                cover,
+                rosters: super::read_roster_stores(state).await?,
+            })
         };
         match read.await {
-            Ok(before) => before,
+            Ok(before) => Some(before),
             Err(error) => {
                 tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the swap is retried: {error}");
                 return false;
@@ -6015,7 +6227,7 @@ async fn swap_staged_tree(
     } else {
         None
     };
-    if journal.phase != ReseatPhase::Swapping {
+    if marked_here {
         let mut marked = false;
         let marked_ref = &mut marked;
         let durable = update_sidecar(state, stable, move |body| {
@@ -6035,53 +6247,101 @@ async fn swap_staged_tree(
         return true;
     };
     let Some(info) = state.named_groups.read().await.get(key).cloned() else {
+        // No write ran: the files are as they were.
+        if let Some(before) = before {
+            end_or_pin_rollback(state, stable, key, expected, before).await;
+        }
         return false;
     };
-    match super::persist_treekem_and_named_groups_atomic_locked(state, key, info, &guard, true)
-        .await
-    {
-        Ok(()) => true,
-        Err(error) if super::self_leave_persist_left_epoch_installed(&error) => true,
-        Err(error) => {
-            tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged tree is not durable yet; the original is put back and the swap is retried: {error}");
-            // The write can stop after the sidecar and the snapshot file and
-            // before its commit point. Its journals stay, so a crash before
-            // the original's files are back replays the staged pair.
-            let Some((cover, rosters)) = before else {
-                return false;
-            };
-            if rollback_swap_files(state, stable, key, cover, &rosters).await {
-                end_swap_after_rollback(state, stable, key, expected).await;
+    let result =
+        super::persist_treekem_and_named_groups_atomic_locked(state, key, info, &guard, true).await;
+    let error = match result {
+        // Past the commit point; the staged pair is durable, or the
+        // journals replay it.
+        Err(error) if !super::self_leave_persist_left_epoch_installed(&error) => error,
+        _ => {
+            set_failed_swap(state, key, None).await;
+            return true;
+        }
+    };
+    if super::persist_withdrew_group(&error) {
+        // The withdrawn repair wrote the rosters and removed the tree and
+        // the journals: no pair is left to mix, and putting `before` back
+        // would undo the withdrawal on disk.
+        tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the group is withdrawn; the swap ends: {error}");
+        set_failed_swap(state, key, None).await;
+        if marked_here {
+            // A failure is logged; the journal stays `Swapping` and a restart
+            // loads the withdrawn record.
+            let _ = end_swap_after_rollback(state, stable, key, expected).await;
+        }
+        return false;
+    }
+    if super::persist_stopped_before_commit(&error) {
+        // No live file changed. The swap that made the mark ends at once,
+        // with no file restore that can fail. A retry of a `Swapping`
+        // journal stays as it is: a pin from an earlier attempt stays, and
+        // its journals still replay the staged pair.
+        tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged tree write stopped before its commit point; the files are unchanged and the swap is retried: {error}");
+        if let Some(before) = before {
+            end_or_pin_rollback(state, stable, key, expected, before).await;
+        }
+        return false;
+    }
+    // Past the commit point: the files can be mixed, and the journals
+    // replay the staged pair. Until the files are a matching pair again no
+    // other roster write runs.
+    match before {
+        Some(before) => {
+            tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged tree is not durable yet; the original pair is put back and the swap is retried: {error}");
+            if !finish_failed_swap(state, stable, key, expected, &before).await {
+                pin_rollback(state, stable, key, expected, before).await;
             }
-            false
+        }
+        None => {
+            tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged tree is not durable yet; its journals replay the staged pair and the write is retried: {error}");
+            set_failed_swap(state, key, Some(FailedSwap::Forward)).await;
         }
     }
+    false
 }
 
 /// #1645 (Codex P1 on #1645 and #1683): the original's files are all back
-/// after a failed swap; end the swap. The order makes every point recover
-/// to the original pair, whichever write fails:
+/// after a failed swap (restored, or never changed); end the swap. The
+/// caller holds `named_groups_persistence_lock` throughout, so no other
+/// roster or tree write runs between the steps. The order makes every
+/// point recover to the original pair, whichever write fails:
 ///
-/// 1. The journal goes back to `Staging` in memory, while this caller
-///    still holds `named_groups_persistence_lock`. The covers apply again
-///    before any other roster or tree write can run, so every later write
-///    (of any group) keeps the original record and the original's tree on
-///    disk. With `Swapping` left in memory, a later whole-roster save wrote
-///    the staged record beside the restored original tree.
-/// 2. The swap's transaction journals are discarded. They hold the staged
+/// 1. The swap's transaction journals are discarded, durably (the
+///    removal and its directory sync are checked). They hold the staged
 ///    pair, and the files no longer need them: a restart replays nothing
-///    and loads the original pair.
+///    and loads the original pair. When the discard fails, the swap stays
+///    `Swapping`, the journals can still replay the staged pair, and every
+///    other roster write is refused until the next tick retries.
+/// 2. The journal goes back to `Staging` in memory and the refusal ends.
+///    The covers apply again before the lock is released, so every later
+///    write (of any group) keeps the original record and the original's
+///    tree on disk. With `Swapping` left in memory, a later whole-roster
+///    save wrote the staged record beside the restored original tree.
 /// 3. The durable `Staging` write, checked. When it fails, the sidecar on
 ///    disk still says `Swapping`; a restart loads the original record
 ///    under it, and `staged_join_lost` rolls back to the original pair.
 ///    The next sidecar write of the group, or the next swap attempt,
 ///    makes the memory phase durable.
-async fn end_swap_after_rollback(state: &AppState, stable: &str, key: &str, expected: [u8; 32]) {
+async fn end_swap_after_rollback(
+    state: &AppState,
+    stable: &str,
+    key: &str,
+    expected: [u8; 32],
+) -> bool {
+    if let Err(error) = super::discard_seal_journal_pair_durable(state, key).await {
+        tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot discard the failed swap's journals; the swap stays recoverable and is retried: {error}");
+        return false;
+    }
     state
         .group_recovery
         .reset_phase_in_memory(stable, expected)
         .await;
-    super::discard_seal_journal_pair(state, key).await;
     #[cfg(test)]
     let fault = state.group_recovery.inner.lock().await.swap_rollback_stop
         == Some(SwapRollbackStop::PhaseWriteFails);
@@ -6096,6 +6356,7 @@ async fn end_swap_after_rollback(state: &AppState, stable: &str, key: &str, expe
     if !durable {
         tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the rolled-back swap's `Staging` phase is not durable yet; the original pair is on disk and a restart rolls back to it");
     }
+    true
 }
 
 /// Put `body`'s re-seat journal `expected` back to `Staging`. Returns
@@ -6117,12 +6378,19 @@ async fn rollback_swap_files(
     state: &AppState,
     stable: &str,
     key: &str,
-    cover: super::ReseatSnapshotCover,
-    rosters: &super::RosterStoresBefore,
+    before: &SwapBefore,
 ) -> bool {
+    let rosters = &before.rosters;
     #[cfg(test)]
     let stop = state.group_recovery.inner.lock().await.swap_rollback_stop;
-    if let Err(error) = super::restore_reseat_snapshot_cover(state, key, cover).await {
+    let snapshot = match () {
+        #[cfg(test)]
+        () if stop == Some(SwapRollbackStop::SnapshotRestoreFails) => {
+            Err(anyhow::anyhow!("test fault"))
+        }
+        () => super::restore_reseat_snapshot_cover(state, key, before.cover.clone()).await,
+    };
+    if let Err(error) = snapshot {
         tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot put the original's TreeKEM snapshot back after a failed swap; the staged pair stays recoverable: {error}");
         return false;
     }
@@ -9316,6 +9584,94 @@ mod tests {
         Ok(())
     }
 
+    /// #1645 (Codex P1, round 4), ADR 0109 §3: the swap's TreeKEM write
+    /// stops before its commit point (the legacy journal write fails), and
+    /// the snapshot restore would fail too. No live file changed, so the
+    /// swap ends at once: memory goes back to `Staging` and no journal is
+    /// left. A later whole-roster save keeps the original record, and a
+    /// restart loads the original pair; in process the next tick swaps.
+    /// Before the fix the swap tried the file restore, which failed, so
+    /// memory kept `Swapping` (covers off) with no transaction journal: the
+    /// roster save wrote the staged record beside the original's tree, and
+    /// the restart paired them. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_swap_stopped_before_its_commit_point_ends_on_the_original_pair() -> anyhow::Result<()>
+    {
+        use super::super::{set_save_fault, SaveFault};
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?.user_id();
+        for (byte, retry) in [("e7", false), ("e6", true)] {
+            let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+            let (key, original, original_tree, staged, staged_tree) =
+                staged_tree_fixture_with(&state, byte, Some(owner)).await?;
+            let stable = original.stable_group_id().to_string();
+            state.group_recovery.inner.lock().await.swap_rollback_stop =
+                Some(SwapRollbackStop::SnapshotRestoreFails);
+            let fault = set_save_fault(&state, SaveFault::JournalWriteFails);
+            assert!(swap_if_seated(&state, &stable).await, "retried next tick");
+            drop(fault);
+            state.group_recovery.inner.lock().await.swap_rollback_stop = None;
+            assert_eq!(
+                open_journal(&state, &stable)
+                    .await
+                    .map(|journal| journal.phase),
+                Some(ReseatPhase::Staging),
+                "retry {retry}: memory is back to `Staging`: the covers apply"
+            );
+            let journal = super::super::treekem_journal_path(&state.treekem_dir, &key);
+            let hsjournal = super::super::treekem_home_suite_journal_path(&state.treekem_dir, &key);
+            assert!(
+                !tokio::fs::try_exists(&journal).await?,
+                "retry {retry}: no TreeKEM journal"
+            );
+            assert!(
+                !tokio::fs::try_exists(&hsjournal).await?,
+                "retry {retry}: no orphan Home-Suite journal"
+            );
+
+            if retry {
+                assert!(swap_if_seated(&state, &stable).await, "the retry swaps");
+                assert!(
+                    holds_a_matching_pair(
+                        &state,
+                        &key,
+                        &original,
+                        &original_tree,
+                        &staged,
+                        &staged_tree
+                    )
+                    .await?,
+                    "the retry holds the staged pair"
+                );
+                assert!(open_journal(&state, &stable).await.is_none(), "swapped");
+                continue;
+            }
+
+            // Another whole-roster save, as for any other group.
+            let outcome = super::super::persist_named_groups_mutation(&state, |_| true).await?;
+            assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
+            let legacy = legacy_entry(&state.named_groups_path, &key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+            assert_eq!(
+                legacy.state_hash, original.state_hash,
+                "the original record stays"
+            );
+
+            let restarted = restart_at(state, dir.path()).await?;
+            let staged_pair = holds_a_matching_pair(
+                &restarted,
+                &key,
+                &original,
+                &original_tree,
+                &staged,
+                &staged_tree,
+            )
+            .await?;
+            assert!(!staged_pair, "the restart loads the original pair");
+        }
+        Ok(())
+    }
+
     /// #1645 (Codex P1): a Home-Suite restore that fails is not ignored.
     /// The swap keeps its transaction journals and `Swapping`, so a crash
     /// restarts on the staged pair, and in process the next tick retries
@@ -9366,6 +9722,205 @@ mod tests {
                 assert!(open_journal(&state, &stable).await.is_none(), "swapped");
             }
         }
+        Ok(())
+    }
+
+    /// #1645 (round 4 audit), ADR 0109 §3: the swap's tree write fails
+    /// past its commit point and the snapshot restore fails too. Until the
+    /// files are back, every other whole-roster write is refused, so the
+    /// transaction journals stay valid. A crash then replays the staged
+    /// pair. In process, the next tick puts the files back, lifts the
+    /// refusal and swaps. Before the fix a later roster save wrote the
+    /// staged record (a newer revision) beside the original's tree; the
+    /// startup replay dropped the journals as stale, and the restart
+    /// paired the staged record with the original's tree. Inert: an
+    /// offline agent.
+    #[tokio::test]
+    async fn a_failed_swap_restore_refuses_roster_writes_until_the_files_are_back(
+    ) -> anyhow::Result<()> {
+        use super::super::{set_save_fault, SaveFault};
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?.user_id();
+        for (byte, crash) in [("e5", true), ("e4", false)] {
+            let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+            let (key, original, original_tree, staged, staged_tree) =
+                staged_tree_fixture_with(&state, byte, Some(owner)).await?;
+            let stable = original.stable_group_id().to_string();
+            state.group_recovery.inner.lock().await.swap_rollback_stop =
+                Some(SwapRollbackStop::SnapshotRestoreFails);
+            let fault = set_save_fault(&state, SaveFault::NamedNotReplacedAfterSnapshot);
+            assert!(swap_if_seated(&state, &stable).await, "crash {crash}");
+            drop(fault);
+            assert_eq!(
+                open_journal(&state, &stable).await.map(|j| j.phase),
+                Some(ReseatPhase::Swapping),
+                "crash {crash}: the swap stays recoverable"
+            );
+            let journal = super::super::treekem_journal_path(&state.treekem_dir, &key);
+            assert!(
+                tokio::fs::try_exists(&journal).await?,
+                "crash {crash}: the transaction journal stays"
+            );
+
+            // Another whole-roster save, as for any other group: refused.
+            let named_before = tokio::fs::read(&state.named_groups_path).await?;
+            assert!(
+                super::super::persist_named_groups_mutation(&state, |_| true)
+                    .await
+                    .is_err(),
+                "crash {crash}: the roster write is refused"
+            );
+            assert!(
+                tokio::fs::read(&state.named_groups_path).await? == named_before,
+                "crash {crash}: named_groups.json is unchanged"
+            );
+
+            if crash {
+                let restarted = restart_at(state, dir.path()).await?;
+                assert!(
+                    holds_a_matching_pair(
+                        &restarted,
+                        &key,
+                        &original,
+                        &original_tree,
+                        &staged,
+                        &staged_tree,
+                    )
+                    .await?,
+                    "the restart replays the staged pair"
+                );
+                assert_eq!(
+                    open_journal(&restarted, &stable).await.map(|j| j.phase),
+                    Some(ReseatPhase::Swapping),
+                    "the swap resumes from its phase"
+                );
+                continue;
+            }
+
+            // The next tick puts the files back, lifts the refusal and
+            // swaps in the same call.
+            state.group_recovery.inner.lock().await.swap_rollback_stop = None;
+            assert!(swap_if_seated(&state, &stable).await, "the retry swaps");
+            assert!(open_journal(&state, &stable).await.is_none(), "swapped");
+            let outcome = super::super::persist_named_groups_mutation(&state, |_| true).await?;
+            assert_eq!(
+                outcome,
+                super::super::AtomicWriteOutcome::Durable,
+                "the refusal is lifted"
+            );
+            assert!(
+                holds_a_matching_pair(
+                    &state,
+                    &key,
+                    &original,
+                    &original_tree,
+                    &staged,
+                    &staged_tree
+                )
+                .await?,
+                "the staged pair"
+            );
+            let restarted = restart_at(state, dir.path()).await?;
+            assert!(
+                holds_a_matching_pair(
+                    &restarted,
+                    &key,
+                    &original,
+                    &original_tree,
+                    &staged,
+                    &staged_tree,
+                )
+                .await?,
+                "the restart keeps the staged pair"
+            );
+            assert!(open_journal(&restarted, &stable).await.is_none());
+        }
+        Ok(())
+    }
+
+    /// #1645 (round 4 review), ADR 0109 §3: a retry of a `Swapping`
+    /// journal (here after a restart) fails past its commit point. It puts
+    /// no file back: the files it could read are not known to be a matching
+    /// pair, and their tree can be older than the tree in memory (a rewound
+    /// ratchet). Its journals stay and replay the staged pair, every other
+    /// roster write is refused, and the next tick retries forward. Before
+    /// the fix the retry wrote back the files it read before the write and
+    /// discarded the journals. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_failed_swapping_retry_keeps_its_journals_and_retries_forward() -> anyhow::Result<()>
+    {
+        use super::super::{set_save_fault, SaveFault};
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?.user_id();
+        let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, original_tree, staged, staged_tree) =
+            staged_tree_fixture_with(&state, "e3", Some(owner)).await?;
+        let stable = original.stable_group_id().to_string();
+        // Reach a `Swapping` journal on the staged pair: a failed swap, then
+        // a restart that replays its journals.
+        state.group_recovery.inner.lock().await.swap_rollback_stop =
+            Some(SwapRollbackStop::SnapshotRestoreFails);
+        let fault = set_save_fault(&state, SaveFault::NamedNotReplacedAfterSnapshot);
+        assert!(swap_if_seated(&state, &stable).await);
+        drop(fault);
+        let state = restart_at(state, dir.path()).await?;
+        assert_eq!(
+            open_journal(&state, &stable).await.map(|j| j.phase),
+            Some(ReseatPhase::Swapping)
+        );
+
+        // The fixture's staged tree has its own seed, which the startup
+        // restore does not know: load it as the staged join holds it.
+        let tree =
+            x0x::mls::TreeKemMlsGroup::restore(&staged_tree, state.agent.agent_id(), &[0x67; 32])
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(tree)));
+
+        // The retry fails past its commit point.
+        let fault = set_save_fault(&state, SaveFault::NamedNotReplacedAfterSnapshot);
+        assert!(swap_if_seated(&state, &stable).await, "retried next tick");
+        drop(fault);
+        assert_eq!(
+            open_journal(&state, &stable).await.map(|j| j.phase),
+            Some(ReseatPhase::Swapping),
+            "the swap stays recoverable"
+        );
+        let journal = super::super::treekem_journal_path(&state.treekem_dir, &key);
+        assert!(
+            tokio::fs::try_exists(&journal).await?,
+            "the retry's journals stay"
+        );
+        assert!(
+            super::super::persist_named_groups_mutation(&state, |_| true)
+                .await
+                .is_err(),
+            "another roster write is refused"
+        );
+
+        // The next tick retries forward and swaps.
+        assert!(swap_if_seated(&state, &stable).await, "the retry swaps");
+        assert!(open_journal(&state, &stable).await.is_none(), "swapped");
+        assert_eq!(
+            super::super::persist_named_groups_mutation(&state, |_| true).await?,
+            super::super::AtomicWriteOutcome::Durable,
+            "the refusal is lifted"
+        );
+        let restarted = restart_at(state, dir.path()).await?;
+        assert!(
+            holds_a_matching_pair(
+                &restarted,
+                &key,
+                &original,
+                &original_tree,
+                &staged,
+                &staged_tree,
+            )
+            .await?,
+            "the restart keeps the staged pair"
+        );
+        assert!(open_journal(&restarted, &stable).await.is_none());
         Ok(())
     }
 
