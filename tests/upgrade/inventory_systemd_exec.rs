@@ -265,3 +265,49 @@ fn enforces_input_command_argument_and_flag_capacity_at_boundaries() {
     value["data"].as_array_mut().unwrap().push(row);
     assert!(parse(&value.to_string(), "ExecStart").is_err());
 }
+
+fn assert_private_debug(value: &dyn std::fmt::Debug, kind: &str) {
+    for rendered in [format!("{value:?}"), format!("{value:#?}")] {
+        assert_eq!(rendered, format!("{kind}(<redacted>)"));
+    }
+}
+
+#[test]
+fn debug_execution_property_does_not_print_supplied_arguments() {
+    let raw = changed(
+        1,
+        json!(["helper", "--token=private-token", "private\nargument"]),
+    );
+    let property = parse(&raw, "ExecStartEx").unwrap();
+    assert_private_debug(&property, "ExecutionProperty");
+    assert_eq!(property.commands[0].argv[1], "--token=private-token");
+    // A containing receipt must not disclose values through nested Debug.
+    assert!(!format!("{:#?}", Some(&property)).contains("private"));
+}
+
+#[test]
+fn debug_execution_command_does_not_print_paths_arguments_or_results() {
+    for (raw, name) in [(LEGACY, "ExecStart"), (EXTENDED, "ExecStartEx")] {
+        let property = parse(raw, name).unwrap();
+        for command in &property.commands {
+            assert_private_debug(command, "ExecutionCommand");
+        }
+    }
+}
+
+#[test]
+fn debug_execution_flags_does_not_print_unknown_supplied_values() {
+    let raw = changed(2, json!(["private-flag", "future\nflag"]));
+    let property = parse(&raw, "ExecStartEx").unwrap();
+    assert_private_debug(&property.commands[0].flags, "ExecutionFlags");
+    assert_eq!(
+        property.commands[0].flags,
+        ExecutionFlags::Extended(vec!["private-flag".into(), "future\nflag".into()])
+    );
+    for value in [true, false] {
+        assert_private_debug(
+            &ExecutionFlags::LegacyIgnoreFailure(value),
+            "ExecutionFlags",
+        );
+    }
+}

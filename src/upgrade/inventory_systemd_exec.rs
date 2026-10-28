@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use serde::{de::DeserializeOwned, Deserialize};
-use std::io;
+use std::{fmt, io};
 
 const MAX_BYTES: usize = 1_048_576;
 const MAX_COMMANDS: usize = 4096;
@@ -26,7 +26,7 @@ const PROPERTIES: [&str; 7] = [
     "ExecStopPost",
 ];
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(crate) enum ExecutionFlags {
     /// The legacy property omits all flags other than ignore-failure. It must
     /// never be interpreted as evidence that other launch flags are absent.
@@ -36,7 +36,7 @@ pub(crate) enum ExecutionFlags {
     Extended(Vec<String>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(crate) struct ExecutionCommand {
     pub(crate) executable: String,
     pub(crate) argv: Vec<String>,
@@ -50,10 +50,30 @@ pub(crate) struct ExecutionCommand {
     pub(crate) status: i32,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(crate) struct ExecutionProperty {
     pub(crate) property: String,
     pub(crate) commands: Vec<ExecutionCommand>,
+}
+
+// Supplied arguments, environment values, paths and future flags can contain
+// secrets. Redact both leaf values and containers so nested Debug is safe.
+impl fmt::Debug for ExecutionFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExecutionFlags(<redacted>)")
+    }
+}
+
+impl fmt::Debug for ExecutionCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExecutionCommand(<redacted>)")
+    }
+}
+
+impl fmt::Debug for ExecutionProperty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExecutionProperty(<redacted>)")
+    }
 }
 
 #[derive(Deserialize)]

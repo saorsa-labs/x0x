@@ -9,12 +9,12 @@
 #![allow(dead_code)] // Dormant until the complete inventory producer is integrated.
 
 use serde::{de::DeserializeOwned, Deserialize};
-use std::io;
+use std::{fmt, io};
 
 const MAX_BYTES: usize = 1_048_576;
 const MAX_ENTRIES: usize = 4096;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct EnvironmentFile {
     /// Literal manager-side path or glob; not resolved against the unit root.
     pub(crate) path: String,
@@ -22,12 +22,26 @@ pub(crate) struct EnvironmentFile {
     pub(crate) ignore_missing: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) enum EnvironmentProperty {
     Environment(Vec<String>),
     Files(Vec<EnvironmentFile>),
     Pass(Vec<String>),
     Unset(Vec<String>),
+}
+
+// Supplied arguments, environment values, paths and future flags can contain
+// secrets. Redact both leaf values and containers so nested Debug is safe.
+impl fmt::Debug for EnvironmentFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EnvironmentFile(<redacted>)")
+    }
+}
+
+impl fmt::Debug for EnvironmentProperty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EnvironmentProperty(<redacted>)")
+    }
 }
 
 #[derive(Deserialize)]

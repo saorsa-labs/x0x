@@ -233,3 +233,42 @@ fn exact_input_and_entry_limits_are_enforced() {
         assert!(parse_property(property, &padded).is_err());
     }
 }
+
+#[test]
+fn debug_environment_properties_do_not_disclose_assignments_names_or_paths() {
+    for (name, signature, data) in [
+        (
+            "Environment",
+            "as",
+            json!(["SECRET=private-token", "MULTILINE=private\nvalue"]),
+        ),
+        ("PassEnvironment", "as", json!(["PRIVATE_VARIABLE"])),
+        ("UnsetEnvironment", "as", json!(["SECRET=private-token"])),
+        (
+            "EnvironmentFiles",
+            "a(sb)",
+            json!([["/private/account/secret.env", true]]),
+        ),
+    ] {
+        let property = parse_property(name, &reply(signature, data)).unwrap();
+        assert_eq!(format!("{property:?}"), "EnvironmentProperty(<redacted>)");
+        assert_eq!(format!("{property:#?}"), "EnvironmentProperty(<redacted>)");
+        assert!(!format!("{:#?}", Some(&property)).contains("private"));
+    }
+}
+
+#[test]
+fn debug_environment_file_does_not_disclose_its_supplied_path() {
+    let property = parse_property(
+        "EnvironmentFiles",
+        &reply("a(sb)", json!([["/private/account/secret.env", true]])),
+    )
+    .unwrap();
+    let EnvironmentProperty::Files(files) = property else {
+        panic!("expected files")
+    };
+    assert_eq!(format!("{:?}", files[0]), "EnvironmentFile(<redacted>)");
+    assert_eq!(format!("{:#?}", files[0]), "EnvironmentFile(<redacted>)");
+    assert_eq!(files[0].path, "/private/account/secret.env");
+    assert!(files[0].ignore_missing);
+}
