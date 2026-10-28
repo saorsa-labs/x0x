@@ -84,7 +84,7 @@ macro_rules! arm_flush_regression_tests {
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 assert!(!root.join(shutdown_flush::RECORD).exists());
                 assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
-                let receipt = arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap();
+                let receipt = arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap().receipt;
                 owner.join_workers();
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
                 let plan: journal::FrozenPlan = serde_json::from_value(journal["plan"].clone()).unwrap();
