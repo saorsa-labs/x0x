@@ -21,12 +21,14 @@
 //!   the frame keyless — the head moves, the old secret is dropped, the
 //!   share hold stays — and a share that arrives once the seat publishes
 //!   a KEM key ends the hold. That keyless install is local fact only
-//!   (Engineer ruling, 27 Oct 22:10 GMT): it never proves delivery, and
-//!   while it lasts the survivor claims no head in its catch-up answers
-//!   ([`super::super::gss_share_hold::reported_head`]), so it converges no
-//!   author's delivery row. The author's row for such a seat stays open
-//!   until it can seal (the seat publishes a KEM key) or a survivor's
-//!   head claim proves delivery.
+//!   (Engineer ruling, 27 Oct 22:10 GMT: it never proves delivery, and a
+//!   transport ACK closes no seat): while it lasts the survivor claims
+//!   no head in its catch-up answers
+//!   ([`super::super::gss_share_hold::reported_head`]) — an interim,
+//!   fail-closed absence, since the omit-vs-parent-head wire question is
+//!   open with David — so it converges no author's delivery row. The
+//!   author's row for such a seat stays open until it can seal (the seat
+//!   publishes a KEM key) or a survivor's head claim proves delivery.
 //! - **Hold (D76).** While an Active survivor's current verified advert
 //!   lacks `crypto_exclusion_v1`, the commit does not run. The obligation
 //!   shows `waiting_for_receiver_upgrade`, naming each holding survivor.
@@ -1005,10 +1007,12 @@ fn spawn_gss_share_to(state: &Arc<AppState>, info: &GroupInfo, recipient_hex: &s
 /// waiting for one would hold the verified frame for ever. The seat's
 /// KEM key is local data — not in the roster root or the state hash — so
 /// another member's view of the seat can differ; that is why the keyless
-/// install is local fact only: it never proves delivery, and while it
-/// lasts this node claims no head in its catch-up answers
-/// ([`super::super::gss_share_hold::reported_head`]), so it converges no
-/// author's delivery row (Engineer ruling, 27 Oct 22:10 GMT).
+/// install is local fact only: it never proves delivery (Engineer
+/// ruling, 27 Oct 22:10 GMT), and while it lasts this node claims no
+/// head in its catch-up answers
+/// ([`super::super::gss_share_hold::reported_head`]) — an interim,
+/// fail-closed absence pending David's omit-vs-parent-head ruling — so
+/// it converges no author's delivery row.
 fn own_seat_cannot_take_a_share(state: &AppState, info: &GroupInfo) -> bool {
     let own_hex = hex::encode(state.agent.agent_id().as_bytes());
     info.active_members()
@@ -2186,10 +2190,12 @@ async fn install_gss(
     // holds) is dropped, and the share hold stays until a share of this
     // epoch installs — through the existing share path once the seat
     // publishes a KEM key (a re-join) or a later rotation seals to it.
-    // The install is local fact only (Engineer ruling, 27 Oct 22:10
-    // GMT): while the hold lasts this node claims no head in its
-    // catch-up answers, and the install converges no author's delivery
-    // row.
+    // The install is local fact only (Engineer ruling, 27 Oct 22:10 GMT:
+    // it never proves delivery, and an ACK closes no seat): while the
+    // hold lasts this node claims no head in its catch-up answers (an
+    // interim, fail-closed absence; the omit-vs-parent-head wire
+    // question is open with David), and the install converges no
+    // author's delivery row.
     let awaiting_share = waiting && promoted.is_none() && own_seat_cannot_take_a_share(state, info);
     if waiting && promoted.is_none() && !awaiting_share {
         tracing::info!(
@@ -4547,6 +4553,51 @@ mod daemon_tests {
             .collect()
     }
 
+    /// The `responder_state_hash` this node really serves in a catch-up
+    /// answer for `group_id` (#1578 review: the tests feed the served
+    /// answer, never a hand-built value).
+    async fn served_responder_head(
+        state: &Arc<AppState>,
+        requester: AgentId,
+        group_id: &str,
+    ) -> Result<Option<String>> {
+        use anyhow::Context as _;
+        let info = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .cloned()
+            .context("group")?;
+        ng::handle_treekem_catchup_request(
+            state,
+            &requester,
+            true,
+            ng::TreeKemCatchupRequest {
+                message_type: "treekem_catchup_request".to_string(),
+                group_id: group_id.to_string(),
+                requester_agent_id: hex::encode(requester.as_bytes()),
+                from_revision: info.state_revision,
+                from_treekem_epoch: 0,
+                current_state_hash: info.state_hash.clone(),
+                missing_prev_state_hash: None,
+                target_member_id: None,
+                limit: 64,
+            },
+        )
+        .await;
+        let served = state
+            .named_group_test_recorders
+            .catchup_responses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+            .context("the catch-up answer was served")?;
+        let page: ng::TreeKemCatchupResponse =
+            serde_json::from_slice(&served).map_err(|error| anyhow::anyhow!("page: {error}"))?;
+        Ok(page.responder_state_hash.clone())
+    }
+
     /// #1508 review P1 (ADR 0110 §3): the survivor's head is the
     /// committer's delivery evidence, so a GSS survivor must never hold the
     /// exclusion's result head without the new secret. Here the frame
@@ -4868,14 +4919,6 @@ mod daemon_tests {
         let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = decoded.body.crypto else {
             anyhow::bail!("the fixture commits the GSS form");
         };
-        let new_secret = fx
-            .state
-            .named_groups
-            .read()
-            .await
-            .get(&fx.group_id)
-            .and_then(|info| info.shared_secret.clone())
-            .context("the rotated secret")?;
         let survivor = fx.replica.agent.agent_id();
         let survivor_hex = hex::encode(survivor.as_bytes());
         let admin = fx.state.agent.agent_id();
@@ -4951,12 +4994,10 @@ mod daemon_tests {
         );
 
         // Engineer ruling, 27 Oct 22:10 GMT: the keyless install never
-        // proves delivery. The survivor claims no head while the hold
-        // lasts, so its catch-up answer converges nothing on the author,
-        // and the send's transport ACK never closes the seat (ADR 0110
-        // §3 L228): the row stays open until the author can seal — the
-        // seat publishes a KEM key — or a survivor's head claim proves
-        // delivery.
+        // proves delivery, and the send's transport ACK never closes the
+        // seat (ADR 0110 §3 L228). The row stays open until the author
+        // can seal — the seat publishes a KEM key — or a survivor's head
+        // claim proves delivery.
         let survivor_info = fx
             .replica
             .named_groups
@@ -4966,7 +5007,14 @@ mod daemon_tests {
             .cloned()
             .context("group")?;
         assert_eq!(
-            ng::gss_share_hold::reported_head(&fx.replica, &fx.group_id, &survivor_info).await,
+            ng::gss_share_hold::reported_head(
+                &fx.replica,
+                &fx.group_id,
+                &survivor_info.state_hash,
+                survivor_info.secret_epoch,
+                survivor_info.shared_secret.is_some(),
+            )
+            .await,
             None,
             "a keyless install claims no head: the local fact converges no author's row"
         );
@@ -4974,11 +5022,28 @@ mod daemon_tests {
             ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
             "the durable hold is written to disk while the share is awaited"
         );
+        // The real served catch-up answer, not a hand-built value: the
+        // keyless survivor's page claims no head at all.
+        let served = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
+        assert_eq!(
+            served, None,
+            "the served answer omits the field while the responder is keyless"
+        );
         super::super::note_catchup_head(
             &fx.state,
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
-            None,
+            served.as_deref(),
+        )
+        .await;
+        // The other answer David's open question could pick — the live
+        // hold's parent head — must not converge the row either: a head
+        // behind the result proves the survivor holds no key of it.
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            parent.as_deref(),
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -5004,20 +5069,29 @@ mod daemon_tests {
             );
         }
 
-        // The recovery path: the seat publishes a KEM key (a re-join) and a
-        // holder seals the current secret to it through the existing share
-        // primitive (`/secure/reseal` and the S4 delivery both use it).
-        let secret: [u8; 32] = new_secret.as_slice().try_into().context("secret bytes")?;
-        let share = ng::build_secure_share_event(
-            &fx.stable,
-            &survivor_hex,
-            &base64::engine::general_purpose::STANDARD
-                .encode(&fx.replica.agent_kem_keypair.public_bytes),
-            &hex::encode(admin.as_bytes()),
-            &secret,
-            next_secret_epoch,
-        )
-        .map_err(|error| anyhow::anyhow!("seal the share: {error:?}"))?;
+        // The recovery path, ADR 0024 item 7: the keyless install never
+        // completes the removal for the author. Only when the seat
+        // publishes a KEM key (a re-join; no wire event seats a key on
+        // an Active seat, so the test sets it as the /secure/reseal
+        // endpoint test does) can the author's own S4 delivery spawn
+        // seal the current secret, and only the installed share — whose
+        // report is then the result head — converges the row.
+        fx.state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&fx.group_id)
+            .context("the author's group")?
+            .set_member_kem_public_key(
+                &survivor_hex,
+                base64::engine::general_purpose::STANDARD
+                    .encode(&fx.replica.agent_kem_keypair.public_bytes),
+            );
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        let share = shares_for(&fx.state, &survivor_hex)
+            .pop()
+            .context("the author's own spawn sealed the share once the seat had a key")?;
         let took =
             ng::apply_named_group_metadata_event(&fx.replica, share, admin, true, None).await;
         assert!(took.accepted, "the awaited share installs: {took:?}");
@@ -5033,6 +5107,179 @@ mod daemon_tests {
         assert!(
             !ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
             "the prune that ended the hold wrote the file: no hold residue survives it"
+        );
+        // The share is the proof: only now does the survivor report a
+        // head, and only that report completes the author's row.
+        let sealed_info = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        let reported = ng::gss_share_hold::reported_head(
+            &fx.replica,
+            &fx.group_id,
+            &sealed_info.state_hash,
+            sealed_info.secret_epoch,
+            sealed_info.shared_secret.is_some(),
+        )
+        .await;
+        assert_eq!(
+            reported.as_deref(),
+            Some(result_head.as_str()),
+            "with the share held the report is the result head: a share-proof"
+        );
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            reported.as_deref(),
+        )
+        .await;
+        assert_eq!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Converged),
+            "the share-proof report converges the seat"
+        );
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        super::super::revocation_eviction_pass(&fx.state).await;
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner.ce.delivering().contains(&key),
+                "the confirmed share ends the delivery"
+            );
+            assert_eq!(
+                inner.store.get(&key).map(|row| row.phase),
+                Some(Phase::Complete),
+                "the obligation completes only after the key is published and the share is sealed"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1578 review (Claude, 28 Oct): the keyless install writes its
+    /// durable hold BEFORE the apply. If the apply is then refused — the
+    /// snapshot the install seals by no longer chains, as a sibling
+    /// commit under the same frame would leave it — the refusal must
+    /// leave the durable hold in place: this node holds no secret of the
+    /// new epoch, and the old one (which the excluded member still
+    /// holds) must keep withholding new ciphertext, with no time limit,
+    /// exactly as the wait path's hold (#1508/#1533 rc13). The hold is
+    /// no dead end: a retry that chains installs, and the fixture test
+    /// above ends its hold with the awaited share. `receive` refuses a
+    /// stale frame before `install_gss` runs, so the test drives the
+    /// install directly with a snapshot that does not chain.
+    #[tokio::test]
+    async fn a_refused_apply_after_the_hold_written_keeps_the_durable_hold() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let decoded = ce::decode_frame(&frame).context("frame")?;
+        let result_head = decoded.body.commit.state_hash.clone();
+        let commit = decoded.body.commit.to_commit();
+        let body = decoded.body.clone();
+        let next_secret_epoch = match body.crypto {
+            ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } => next_secret_epoch,
+            _ => anyhow::bail!("the fixture commits the GSS form"),
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let parent = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+
+        // The install runs with a snapshot the commit no longer applies
+        // to (a sibling commit moved the revision past it): the hold is
+        // written first, then the apply refuses.
+        let mut stale = parent.clone();
+        stale.state_revision = commit.revision + 1;
+        assert_eq!(
+            install_gss(
+                &fx.replica,
+                &fx.group_id,
+                &stale,
+                &body,
+                &commit,
+                next_secret_epoch,
+                Arc::new(frame.clone()),
+            )
+            .await,
+            ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::BadSignature),
+            "the apply refuses: the commit is stale against the snapshot"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            Some(parent.state_hash.clone()),
+            "nothing installed on the refusal"
+        );
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            1,
+            "the durable hold stays: no secret of the new epoch exists here"
+        );
+        assert!(
+            ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
+            "the hold outlives the refused apply on disk"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "the old secret keeps withholding new ciphertext after the refusal"
+        );
+
+        // The hold is no dead end: a retry that chains installs keyless
+        // and keeps the hold until a share of the epoch arrives.
+        assert_eq!(
+            install_gss(
+                &fx.replica,
+                &fx.group_id,
+                &parent,
+                &body,
+                &commit,
+                next_secret_epoch,
+                Arc::new(frame.clone()),
+            )
+            .await,
+            ReceiveOutcome::Applied,
+            "the retry that chains installs"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            Some(result_head),
+            "the keyless install moves the head"
+        );
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            1,
+            "the keyless install keeps the hold until a share arrives"
         );
         Ok(())
     }
@@ -5117,6 +5364,30 @@ mod daemon_tests {
             1,
             "the waiting survivor holds: no new ciphertext until the share installs"
         );
+
+        // The waiting survivor still holds the old secret, so its served
+        // answer keeps the field's existing meaning: its saved head, the
+        // parent. Fed to the author, that real head converges nothing —
+        // the row needs the result head, which only an installed share
+        // proves.
+        let served = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
+        assert_eq!(
+            served.as_deref(),
+            Some(head_before.as_str()),
+            "a waiting node with a secret reports its saved head"
+        );
+        assert_ne!(
+            served.as_deref(),
+            Some(result_head.as_str()),
+            "the stranded survivor does not hold the result head"
+        );
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
 
         // ADR 0110 §3 L228 (Engineer ruling, 27 Oct 22:10 GMT): the
         // carrier's acceptance of the frame is Sent, not delivery. The
@@ -5232,42 +5503,7 @@ mod daemon_tests {
         // The survivor's real catch-up answer claims no head at all
         // while it holds no secret of the epoch: the local keyless fact
         // never reaches the author as convergence evidence.
-        let replica_info = fx
-            .replica
-            .named_groups
-            .read()
-            .await
-            .get(&fx.group_id)
-            .cloned()
-            .context("group")?;
-        ng::handle_treekem_catchup_request(
-            &fx.replica,
-            &admin,
-            true,
-            ng::TreeKemCatchupRequest {
-                message_type: "treekem_catchup_request".to_string(),
-                group_id: fx.group_id.clone(),
-                requester_agent_id: hex::encode(admin.as_bytes()),
-                from_revision: replica_info.state_revision,
-                from_treekem_epoch: 0,
-                current_state_hash: replica_info.state_hash.clone(),
-                missing_prev_state_hash: None,
-                target_member_id: None,
-                limit: 64,
-            },
-        )
-        .await;
-        let served = fx
-            .replica
-            .named_group_test_recorders
-            .catchup_responses
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pop()
-            .context("the catch-up answer was served")?;
-        let page: ng::TreeKemCatchupResponse =
-            serde_json::from_slice(&served).map_err(|error| anyhow::anyhow!("page: {error}"))?;
-        let reported = page.responder_state_hash.clone();
+        let reported = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
         assert_ne!(
             reported.as_deref(),
             Some(result_head.as_str()),
@@ -5314,6 +5550,15 @@ mod daemon_tests {
         let took =
             ng::apply_named_group_metadata_event(&fx.replica, share, admin, true, None).await;
         assert!(took.accepted, "the owed share installs: {took:?}");
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            0,
+            "the share's prune dropped the keyless hold from memory"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
+            "the share's prune wrote the hold file: no residue survives it"
+        );
         let sealed_info = fx
             .replica
             .named_groups
@@ -5327,8 +5572,14 @@ mod daemon_tests {
             sealed_info.shared_secret.is_some(),
             "the survivor holds the rotated secret"
         );
-        let reported =
-            ng::gss_share_hold::reported_head(&fx.replica, &fx.group_id, &sealed_info).await;
+        let reported = ng::gss_share_hold::reported_head(
+            &fx.replica,
+            &fx.group_id,
+            &sealed_info.state_hash,
+            sealed_info.secret_epoch,
+            sealed_info.shared_secret.is_some(),
+        )
+        .await;
         assert_eq!(
             reported.as_deref(),
             Some(result_head.as_str()),
@@ -5486,6 +5737,15 @@ mod daemon_tests {
             None,
             "the installed share ends the hold"
         );
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&restarted, &fx.group_id),
+            0,
+            "the share's prune dropped the hold from memory after the restart"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::hold_file_exists(&restarted, &fx.group_id),
+            "the share's prune wrote the hold file after the restart"
+        );
         let installed = restarted
             .named_groups
             .read()
@@ -5498,6 +5758,19 @@ mod daemon_tests {
             installed.shared_secret.as_deref(),
             Some(new_secret.as_slice()),
             "the restarted survivor holds the rotated secret"
+        );
+        let reported = ng::gss_share_hold::reported_head(
+            &restarted,
+            &fx.group_id,
+            &installed.state_hash,
+            installed.secret_epoch,
+            installed.shared_secret.is_some(),
+        )
+        .await;
+        assert_eq!(
+            reported.as_deref(),
+            Some(result_head.as_str()),
+            "after the share installs the restarted survivor reports the result head"
         );
         Ok(())
     }
@@ -5563,21 +5836,30 @@ mod daemon_tests {
             "the persisted roster still seats the survivor with no KEM key"
         );
 
-        // The restarted author runs its rounds. The keyless survivor's
-        // answer claims no head (a None answer converges nothing), the
-        // head round still syncs on the restart wait, and the resumed
-        // send's acceptance leaves the seat Sent — never Converged.
+        // The restarted author runs its rounds. The survivor still holds
+        // the old secret at a head behind the result, so its real served
+        // answer is that saved head — a head the author's row cannot
+        // converge on (only the result head, which an installed share
+        // proves, does that). The head round still syncs on the restart
+        // wait, and the resumed send's acceptance leaves the seat Sent —
+        // never Converged.
         advertise_crypto_exclusion(&restarted, survivor);
         restarted
             .named_group_test_recorders
             .catchup_page_force_ok
             .store(true, std::sync::atomic::Ordering::SeqCst);
         super::super::revocation_eviction_pass(&restarted).await;
+        let served =
+            served_responder_head(&fx.replica, fx.state.agent.agent_id(), &fx.group_id).await?;
+        assert_ne!(
+            served, None,
+            "the survivor holds a secret, so its answer keeps the field's saved-head meaning"
+        );
         super::super::note_catchup_head(
             &restarted,
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
-            None,
+            served.as_deref(),
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;

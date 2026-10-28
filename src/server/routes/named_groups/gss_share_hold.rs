@@ -176,39 +176,43 @@ pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
     })
 }
 
-/// #1578 (Engineer ruling, 27 Oct 22:10 GMT): the head this node claims
-/// for `group_key` in a catch-up answer. `None` while a held exclusion's
-/// share has not arrived — this node installed that exclusion's result
-/// keyless. The install is local fact only: it must never converge an
-/// author's delivery row, so the node claims no head until a secret of
-/// that epoch installs. A chain of keyless installs still claims no head.
-/// Every other node — one with a secret (a superseded install that keeps
-/// its hold included), one held only for a later epoch, one with no hold —
-/// claims its saved head.
+/// #1578: the head this node claims for `group_key` in a catch-up
+/// answer, from the narrow inputs its caller copied under the groups
+/// read lock. `None` while a held exclusion's share has not arrived —
+/// this node installed that exclusion's result keyless, so it holds no
+/// secret of its saved head's epoch. That interim absence is fail-closed:
+/// the install is local fact only and must never converge an author's
+/// delivery row, so the node claims no head until a secret of that epoch
+/// installs. Whether a keyless node should instead report the live
+/// hold's parent head is an open wire question with David; until he
+/// rules, no peer ever sees convergence evidence from a keyless node.
+/// A chain of keyless installs still claims no head. Every other node —
+/// one with a secret (a superseded install that keeps its hold
+/// included), one held only for a later epoch, one with no hold —
+/// claims its saved head, exactly as before #1578.
 pub(super) async fn reported_head(
     state: &AppState,
     group_key: &str,
-    info: &x0x::groups::GroupInfo,
+    saved_head: &str,
+    secret_epoch: u64,
+    has_secret: bool,
 ) -> Option<String> {
     ensure_loaded(state).await;
-    // The #1578 keyless install: the head is a held exclusion's result and
-    // no secret of its epoch is held. The node makes no head claim at all;
-    // every other node reports its current head.
-    let keyless = info.shared_secret.is_none()
+    // The #1578 keyless install: the saved head is a held exclusion's
+    // result and no secret of its epoch is held. The node makes no head
+    // claim at all; every other node reports its saved head.
+    let keyless = !has_secret
         && state
             .gss_share_holds
             .exclusions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group_key)
-            .is_some_and(|held| {
-                held.iter()
-                    .any(|hold| hold.secret_epoch == info.secret_epoch)
-            });
+            .is_some_and(|held| held.iter().any(|hold| hold.secret_epoch == secret_epoch));
     if keyless {
         None
     } else {
-        Some(info.state_hash.clone())
+        Some(saved_head.to_string())
     }
 }
 
@@ -822,7 +826,15 @@ mod tests {
         let (state, _dir) = test_state().await;
         hold(&state, "g", "parent-head", 2);
         let info = gss_group(2, None, "keyless-result-head");
-        assert_eq!(reported_head(&state, "g", &info).await, None);
+        let claimed = reported_head(
+            &state,
+            "g",
+            &info.state_hash,
+            info.secret_epoch,
+            info.shared_secret.is_some(),
+        )
+        .await;
+        assert_eq!(claimed, None);
     }
 
     /// #1578: a chain of keyless installs claims no head: the newest
@@ -833,7 +845,15 @@ mod tests {
         hold(&state, "g", "parent-e1", 1);
         hold(&state, "g", "parent-e2", 2);
         let info = gss_group(2, None, "keyless-result-head");
-        assert_eq!(reported_head(&state, "g", &info).await, None);
+        let claimed = reported_head(
+            &state,
+            "g",
+            &info.state_hash,
+            info.secret_epoch,
+            info.shared_secret.is_some(),
+        )
+        .await;
+        assert_eq!(claimed, None);
     }
 
     /// #1578: a superseded install keeps its hold, but it holds a secret
@@ -843,23 +863,36 @@ mod tests {
         let (state, _dir) = test_state().await;
         hold(&state, "g", "parent-head", 1);
         let info = gss_group(2, Some(vec![7; 32]), "saved-head");
-        assert_eq!(
-            reported_head(&state, "g", &info).await,
-            Some("saved-head".to_string())
-        );
+        let claimed = reported_head(
+            &state,
+            "g",
+            &info.state_hash,
+            info.secret_epoch,
+            info.shared_secret.is_some(),
+        )
+        .await;
+        assert_eq!(claimed, Some("saved-head".to_string()));
     }
 
-    /// #1578: a node held only for a later epoch claims its saved head:
-    /// that head is not the held exclusion's result.
+    /// #1578: a node with no secret held only for a LATER epoch claims
+    /// its saved head. The epoch match is what the keyless check needs:
+    /// no hold names the saved head's own epoch, so that head is not a
+    /// keyless-installed result — the branch a keyless chain skips when
+    /// its older holds stop matching the epoch.
     #[tokio::test]
     async fn later_epoch_hold_claims_saved_head() {
         let (state, _dir) = test_state().await;
         hold(&state, "g", "parent-head", 2);
-        let info = gss_group(1, Some(vec![7; 32]), "saved-head");
-        assert_eq!(
-            reported_head(&state, "g", &info).await,
-            Some("saved-head".to_string())
-        );
+        let info = gss_group(1, None, "saved-head");
+        let claimed = reported_head(
+            &state,
+            "g",
+            &info.state_hash,
+            info.secret_epoch,
+            info.shared_secret.is_some(),
+        )
+        .await;
+        assert_eq!(claimed, Some("saved-head".to_string()));
     }
 
     /// With no holds the node claims its saved head.
@@ -867,9 +900,14 @@ mod tests {
     async fn no_holds_claims_saved_head() {
         let (state, _dir) = test_state().await;
         let info = gss_group(1, Some(vec![7; 32]), "saved-head");
-        assert_eq!(
-            reported_head(&state, "g", &info).await,
-            Some("saved-head".to_string())
-        );
+        let claimed = reported_head(
+            &state,
+            "g",
+            &info.state_hash,
+            info.secret_epoch,
+            info.shared_secret.is_some(),
+        )
+        .await;
+        assert_eq!(claimed, Some("saved-head".to_string()));
     }
 }

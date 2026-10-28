@@ -1314,11 +1314,11 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     truncated: bool,
     /// Saved membership head of the responder. Absent on a KeyPackage
     /// reply, on an old peer, and on a responder whose held exclusion's
-    /// share has not arrived (#1578: it installed the result keyless and
-    /// claims no head until a secret of that epoch installs). A present
-    /// value is always the responder's saved head. A startup self-leave
-    /// seal trusts this only when it equals the local head after the page
-    /// is applied.
+    /// share has not arrived (#1578: it installed the result keyless,
+    /// holds no secret of that epoch, and claims no head until a secret
+    /// of it installs). A present value is always the responder's saved
+    /// head. A startup self-leave seal trusts this only when it equals
+    /// the local head after the page is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
 }
@@ -11802,23 +11802,33 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             ];
             keys.sort();
             keys.dedup();
-            (
-                info.has_active_member(&sender_hex),
-                keys,
-                Some((key.clone(), info.clone())),
-            )
+            // #1578 review: the head claim needs only these values;
+            // cloning the whole GroupInfo per catch-up request is waste.
+            let claim = (
+                key.clone(),
+                info.state_hash.clone(),
+                info.secret_epoch,
+                info.shared_secret.is_some(),
+            );
+            (info.has_active_member(&sender_hex), keys, Some(claim))
         } else {
             (false, vec![request.group_id.clone()], None)
         }
     };
-    // #1578 (Engineer ruling, 27 Oct 22:10 GMT): the responder's saved
-    // head is its survivor-convergence evidence for this group's S4
-    // deliveries. A node that installed a GSS exclusion keyless claims no
-    // head (None) — that local fact never converges an author's delivery
-    // row.
+    // #1578: the responder's saved head is its survivor-convergence
+    // evidence for this group's S4 deliveries. A node that installed a
+    // GSS exclusion keyless claims no head (None) — that local fact
+    // never converges an author's delivery row. The absence is interim
+    // and fail-closed: whether a keyless node should instead report the
+    // live hold's parent head is an open wire question with David. Every
+    // other responder, an unknown group included, keeps main's answer.
     let saved_head = match &held_group {
-        Some((key, info)) => gss_share_hold::reported_head(state, key, info).await,
-        None => None,
+        Some((key, saved_head, secret_epoch, has_secret)) => {
+            gss_share_hold::reported_head(state, key, saved_head, *secret_epoch, *has_secret).await
+        }
+        // Exactly main's answer for a group this responder does not
+        // know: a present, empty saved head.
+        None => Some(String::new()),
     };
     let target_of_cached_add = {
         let logs = state.treekem_event_log.read().await;
