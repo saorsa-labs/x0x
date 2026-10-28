@@ -1807,7 +1807,16 @@ every wait. A wait always names its cause; it does not stop silently.
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
-| `POST /groups/:id/secure/encrypt`, the group-scoped KV-store and task-list seal hooks (both planes), the startup self-leave rekey | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold has no time limit. A secret of the held epoch, or a later one, ends it. (These are the routes that make group ciphertext; the 202 queue paths above, invites and member adds make none, so they do not return it.) |
+| `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold has no time limit. A secret of the held epoch, or a later one, ends it. |
+
+The same hold refuses group ciphertext on the paths that make no HTTP
+response of their own, and each refusal carries the same reason text: a
+group-scoped task-list seal fails the delta with
+`CrdtError::Gossip("task seal: …")`; a group-scoped KV-store write
+refuses with `KvError::SecureRecord` before any record is made; the
+startup self-leave rekey defers its pass and logs the hold's reason.
+The 202 queue paths above, invites and member adds make no group
+ciphertext, so they refuse nothing here.
 
 **The keyless survivor state (#1578).** A keyless GSS survivor is a member
 of an encrypted group (`policy.confidentiality` `mls_encrypted`) whose own

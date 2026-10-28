@@ -1320,9 +1320,11 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     /// of its saved head's epoch, and its own roster seat carries no KEM
     /// key, it claims no head). Every other responder — a SignedPublic
     /// member, an encrypted-group joiner still waiting for its welcome
-    /// share, and a superseded intermediate install included — serves
-    /// exactly main's value. A present value is always the responder's
-    /// saved head. A startup self-leave seal trusts this only when it
+    /// share, and a superseded intermediate install whose seat still
+    /// carries the KEM key — serves exactly main's value. A present
+    /// value is the responder's saved head, except that a responder
+    /// that does not know the group serves an empty string (main's
+    /// answer). A startup self-leave seal trusts this only when it
     /// equals the local head after the page is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
@@ -27418,19 +27420,19 @@ async fn rekey_treekem_self_leaves(state: &Arc<AppState>, group_id: &str) {
     }
     let membership_lock = group_membership_lock(state, &group_key).await;
     let _membership_guard = membership_lock.lock().await;
-    // ADR 0110 §4 (D75): this daemon is the committing admin, and every
-    // admin seat is revoked, so it stops sealing. A new rekey epoch would
-    // reach the revoked admins' leaves. A commit already on the local chain
+    // ADR 0110 §4 (D75) and #1578: group ciphertext is withheld here
+    // either because this committing admin's every admin seat is revoked
+    // (a new rekey epoch would reach the revoked admins' leaves) or
+    // because this node installed a verified exclusion keyless and still
+    // waits for its sealed share. A commit already on the local chain
     // is still published by the resume path: survivors need that link to
     // follow the chain the owner-recovery commit extends (§4b(1)).
-    if group_ciphertext_withheld(state, &group_key, None)
-        .await
-        .is_some()
-    {
+    if let Some(hold) = group_ciphertext_withheld(state, &group_key, None).await {
         if self_leave_rekey_log_once(&format!("s4:{group_key}")) {
             tracing::info!(
                 group_id = %LogHexId::group(&group_key),
-                "self-leave TreeKEM rekey deferred: no eligible admin remains (ADR 0110 §4)"
+                reason = %hold.reason(),
+                "self-leave TreeKEM rekey deferred: group ciphertext is withheld (ADR 0110 §4, #1578)"
             );
         }
         return;
