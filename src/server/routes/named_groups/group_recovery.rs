@@ -3874,7 +3874,9 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
                     advance_round(subject, now, from_pending);
                 }
                 AttestRefusalReason::BaseBeyondRetention => {
-                    if every_reached_admin_beyond_retention(&subject.asked) {
+                    if every_reached_admin_beyond_retention(&subject.asked, |agent| {
+                        roster_admin(&info, agent)
+                    }) {
                         subject.view = SubjectView::Readmission {
                             cause: "base_beyond_retention",
                         };
@@ -3897,16 +3899,33 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
 
 /// §3 "Beyond retention" (D97): the node enters `readmission_required`
 /// when every admin it has *reached* refuses with `base_beyond_retention`
-/// and none attests. A target that never answered (`pending`) was not
-/// reached, and a `not_an_admin` answer is not an admin's; neither blocks
-/// the state. An unreachable admin may still attest later, which leaves
-/// the state (§8).
-fn every_reached_admin_beyond_retention(asked: &BTreeMap<String, String>) -> bool {
+/// and none attests. Only targets that are admins on this node's roster
+/// (`is_admin`) count, so a member's answer never decides the state. An
+/// admin that never answered (`pending`) was not reached, and one that
+/// answers `not_an_admin` is no longer an admin; neither blocks the state.
+/// An unreachable admin may still attest later, which leaves the state
+/// (§8).
+fn every_reached_admin_beyond_retention(
+    asked: &BTreeMap<String, String>,
+    is_admin: impl Fn(&str) -> bool,
+) -> bool {
     let mut reached = asked
-        .values()
-        .filter(|answer| !matches!(answer.as_str(), "pending" | "not_an_admin"))
+        .iter()
+        .filter(|(agent, answer)| {
+            is_admin(agent) && !matches!(answer.as_str(), "pending" | "not_an_admin")
+        })
         .peekable();
-    reached.peek().is_some() && reached.all(|answer| answer == "base_beyond_retention")
+    reached.peek().is_some() && reached.all(|(_, answer)| answer == "base_beyond_retention")
+}
+
+/// `agent_hex` is an Active admin on `info`'s roster.
+fn roster_admin(info: &GroupInfo, agent_hex: &str) -> bool {
+    info.members_v2
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(agent_hex))
+        .is_some_and(|(_, member)| {
+            member.is_active() && member.role.at_least(x0x::groups::GroupRole::Admin)
+        })
 }
 
 /// §2 "Conflict": this node holds a recorded attestation conflict.
@@ -9091,6 +9110,45 @@ mod tests {
         Ok(())
     }
 
+    /// #1567 (ZCode on c076826: the hook had no test): the ratchet
+    /// persist after an encrypt or decrypt on the staged tree
+    /// (`persist_treekem_snapshot_bound`) keeps the original's snapshot
+    /// state while the join is staged: the original's tree bound to the
+    /// original record (Keep), or no snapshot file (Absent). Without the
+    /// cover it writes the staged tree. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_staged_ratchet_persist_keeps_the_originals_snapshot_state() -> anyhow::Result<()> {
+        let staged_tree = |state: Arc<AppState>, key: String| async move {
+            state
+                .treekem_groups
+                .read()
+                .await
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("staged tree"))
+        };
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, original_tree, _, _) = staged_tree_fixture(&state).await?;
+        let tree = staged_tree(Arc::clone(&state), key.clone()).await?;
+        super::super::persist_treekem_snapshot_bound(&state, &key, &*tree.lock().await).await?;
+        let envelope = snapshot_on_disk(&state, &key).await?;
+        assert_eq!(envelope.state_hash, original.state_hash);
+        assert!(
+            envelope.snapshot == original_tree,
+            "Keep: the original's tree"
+        );
+
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, _, _, _) = treeless_staged_fixture(&state).await?;
+        let tree = staged_tree(Arc::clone(&state), key.clone()).await?;
+        super::super::persist_treekem_snapshot_bound(&state, &key, &*tree.lock().await).await?;
+        assert!(
+            !snapshot_exists(&state, &key).await?,
+            "Absent: no snapshot file"
+        );
+        Ok(())
+    }
+
     /// #1567: the tree-less staged persist (`Absent`, roster half only)
     /// keeps the atomic persist's outcomes. `NotReplaced` fails and keeps
     /// the live record; `ReplacedNotDurable` fails as "epoch installed"
@@ -11600,9 +11658,10 @@ mod tests {
         Ok(())
     }
 
-    /// §3 "Beyond retention" (H-S3-r): an admin that never answered, or a
-    /// member's `not_an_admin`, does not block `readmission_required`; any
-    /// other answer from a reached admin does.
+    /// §3 "Beyond retention" (H-S3-r): an admin that never answered, or
+    /// an admin's `not_an_admin`, does not block `readmission_required`;
+    /// any other answer from a reached admin does. A member's answer
+    /// (ZCode on c076826), even `base_beyond_retention`, never counts.
     #[test]
     fn readmission_counts_only_reached_admins() {
         let asked = |rows: &[(&str, &str)]| -> BTreeMap<String, String> {
@@ -11610,20 +11669,24 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect()
         };
+        let admins = |agent: &str| matches!(agent, "a" | "b" | "c");
+        let check =
+            |rows: &[(&str, &str)]| every_reached_admin_beyond_retention(&asked(rows), admins);
         let bbr = "base_beyond_retention";
-        assert!(every_reached_admin_beyond_retention(&asked(&[("a", bbr)])));
-        assert!(every_reached_admin_beyond_retention(&asked(&[
+        assert!(check(&[("a", bbr)]));
+        assert!(check(&[
             ("a", bbr),
             ("b", "pending"),
-            ("m", "not_an_admin"),
-        ])));
-        assert!(!every_reached_admin_beyond_retention(&asked(&[])));
-        assert!(!every_reached_admin_beyond_retention(&asked(&[(
-            "b", "pending"
-        )])));
-        assert!(!every_reached_admin_beyond_retention(&asked(&[
-            ("a", bbr),
-            ("c", "attester_behind"),
-        ])));
+            ("c", "not_an_admin")
+        ]));
+        assert!(
+            check(&[("a", bbr), ("m", "attester_behind")]),
+            "a member's answer never blocks"
+        );
+        assert!(!check(&[]));
+        assert!(!check(&[("b", "pending")]));
+        assert!(!check(&[("a", bbr), ("c", "attester_behind")]));
+        assert!(!check(&[("m", bbr)]), "a member's refusal never decides");
+        assert!(!check(&[("m", bbr), ("b", "pending")]));
     }
 }
