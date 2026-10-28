@@ -6074,6 +6074,143 @@ mod restart_tests {
             .context("Q seals its current secret to the survivor")
     }
 
+    /// #1579: a competing recovery frame kept below the head never stops
+    /// the catch-up round — proven at the real `serve_catchup` loop. Two
+    /// promoted members hold the owner key and seal competing recoveries
+    /// from one parent; this node commits its own and holds the other as
+    /// evidence, first in the log. The round skips the competitor, sends
+    /// the on-chain frame (the test-build in-process stand-in admits it)
+    /// and then seals the current secret to the requester: the scheduled
+    /// share is the evidence the round ran past the competitor to its
+    /// end. A `return` at the skip ends the round on the competitor, and
+    /// no share is sealed.
+    #[tokio::test]
+    async fn the_catchup_round_skips_a_competing_recovery_frame_and_seals_the_share() -> Result<()>
+    {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let owner_seed = [0x73; 32];
+        let author = offline_author(author_dir.path(), owner_seed).await?;
+        let survivor = zero_restart_wait(
+            offline_daemon(
+                survivor_dir.path(),
+                Some(x0x::identity::UserKeypair::from_seed(&owner_seed)?),
+            )
+            .await?,
+        )?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let survivor_id = survivor.agent.agent_id();
+        let survivor_hex = hex::encode(survivor_id.as_bytes());
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let mut info = recovery_parent(
+            owner,
+            &admin,
+            [
+                author.agent.identity().agent_keypair(),
+                survivor.agent.identity().agent_keypair(),
+            ],
+        )?;
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        {
+            use base64::Engine as _;
+            for (state, seat) in [
+                (&author, author_hex.clone()),
+                (&survivor, survivor_hex.clone()),
+            ] {
+                info.members_v2
+                    .get_mut(&seat)
+                    .context("seat")?
+                    .kem_public_key_b64 = Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(&state.agent_kem_keypair.public_bytes),
+                );
+            }
+        }
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        for state in [&author, &survivor] {
+            hold_persisted(state, &info).await?;
+            revoke(state, &admin).await?;
+        }
+        // Each daemon holds the other's current verified advert, so the
+        // capability gate never withholds and no commit waits on D76.
+        let bits = x0x::dm::CapabilityRegistry::current().bits;
+        let now = x0x::dm_capability::now_unix_ms();
+        super::tests::advertise(&author, survivor_id, bits, now);
+        super::tests::advertise(&survivor, author.agent.agent_id(), bits, now);
+        // The survivor seals a competing recovery from the same parent.
+        let (competed, competitor_bytes) = commit_own_recovery(&survivor, &stable, &info).await?;
+        // The competitor enters this node's log first: the evidence the
+        // round must serve past, before this node commits its own branch.
+        {
+            let mut inner = author.revocation_evictions.inner.lock().await;
+            inner.orc.log.remember(
+                &stable,
+                competed.state_revision,
+                competed.state_hash.as_str(),
+                Arc::new(competitor_bytes),
+                false,
+            );
+        }
+        let (committed, _bytes) = commit_own_recovery(&author, &stable, &info).await?;
+        anyhow::ensure!(
+            committed.state_revision == competed.state_revision
+                && committed.state_hash != competed.state_hash,
+            "the two recoveries compete at one revision"
+        );
+        let order: Vec<String> = author
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .log
+            .catchup_frames(std::slice::from_ref(&stable), info.state_revision)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert_eq!(
+            order,
+            vec![competed.state_hash.clone(), committed.state_hash.clone()],
+            "the round meets the competitor first, then the on-chain frame"
+        );
+        // The real round: skip the competitor, serve the on-chain frame,
+        // seal the current secret to the requester.
+        let before = scheduled_shares(&author).len();
+        serve_catchup(
+            &author,
+            &survivor_id,
+            std::slice::from_ref(&stable),
+            info.state_revision,
+        )
+        .await;
+        let share = scheduled_shares(&author)
+            .into_iter()
+            .skip(before)
+            .filter(|(to, _)| *to == survivor_hex)
+            .map(|(_, share)| share)
+            .next_back()
+            .context("the round served past the competitor and sealed the share")?;
+        let expected = <[u8; 32]>::try_from(
+            committed
+                .shared_secret
+                .as_deref()
+                .context("the committed secret")?,
+        )?;
+        assert_eq!(
+            open_share(&share, &survivor.agent_kem_keypair)?,
+            (committed.secret_epoch, expected),
+            "the share opens to the current secret"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
+    }
+
     /// Codex P1 (#1508 rc12 r3): the recovery promotes P, P promotes Q,
     /// then P goes offline. A lagging survivor catches up from Q only: Q
     /// serves the recovery frame and its current secret (still E+1, the

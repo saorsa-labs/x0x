@@ -23,6 +23,8 @@
 //!   A file with a newer layout is never rewritten, so the commit does not
 //!   occur either (fail closed). A file that cannot be read at all fails
 //!   the write the same way: only a missing file plans as empty (review).
+//!   A file that cannot be decoded also plans as empty, and the write
+//!   replaces it, as the first write after the quarantine does.
 //!   Writes of one group's log serialize (one writer at a time per file,
 //!   #1579 fix round). In the rebind and owner-recovery logs each write
 //!   starts from the frames the file already holds, then memory's, then
@@ -286,8 +288,10 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
             // serves — and eventually the held frame. Two file-only
             // frames per revision are the pair this log exists to keep
             // (before the winner installs, both are file-only); a frame
-            // memory also holds is the installed chain and is never
-            // dropped here.
+            // memory also holds is the installed chain, kept by the
+            // bound. The per-group cap still trims what the merge built,
+            // and the trim drops the lowest revision, memory-held or not:
+            // every fork kept shrinks the window below the head.
             let mut competing: std::collections::BTreeMap<u64, u32> =
                 std::collections::BTreeMap::new();
             for frame in file_frames {
@@ -554,8 +558,16 @@ async fn read_all_in(dir: &Path, extension: &str, gate_open: bool) -> Vec<Replay
         if path.extension().and_then(|ext| ext.to_str()) != Some(extension) {
             continue;
         }
-        let Ok(bytes) = crate::w3h_inline::fs::read(&path).await else {
-            continue;
+        let bytes = match crate::w3h_inline::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "ADR 0110 S4: held frame log could not be read at startup; not loaded"
+                );
+                continue;
+            }
         };
         match decode(&bytes) {
             Ok(log) => logs.push(log),
@@ -1216,7 +1228,10 @@ pub(in super::super) mod tests {
     /// #1579 fix round 2: a refused commit or install removes its own
     /// frame and no other. After a restart with a competing pair on disk
     /// (memory holds neither), a later refused frame leaves the pair in
-    /// the file — the evidence this log exists for.
+    /// the file — the evidence this log exists for. Memory holds the
+    /// installed frame below the pair and never the refused commit: a
+    /// frame is remembered only after its commit or install succeeds, and
+    /// the rewrite does not bring the refused one back.
     #[tokio::test]
     async fn a_refused_frame_leaves_the_log_and_the_file_evidence_stays() {
         use crate::server::routes::named_groups as ng;
@@ -1226,6 +1241,16 @@ pub(in super::super) mod tests {
         let (state, _dir) = ng::tests::secure_endpoint_test_state()
             .await
             .expect("test state");
+        // The installed frame below the pair: memory holds it, as after a
+        // real install.
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .log
+            .remember("g", 4, "h4", Arc::new(b"held".to_vec()), false);
         let pair = (Arc::new(b"first".to_vec()), Arc::new(b"second".to_vec()));
         assert!(
             write_received(
@@ -1278,21 +1303,41 @@ pub(in super::super) mod tests {
         assert_eq!(
             held,
             vec![
+                (4, "h4", b"held".as_slice()),
                 (5, "h5a", b"first".as_slice()),
                 (5, "h5b", b"second".as_slice())
             ],
             "the refused frame leaves; the competing pair stays as evidence"
         );
+        let in_memory: Vec<String> = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .log
+            .catchup_frames(&["g".to_string()], 0)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert_eq!(
+            in_memory,
+            vec!["h4".to_string()],
+            "memory never holds the refused commit"
+        );
     }
 
-    /// #1579 review: a log path that cannot be read — here a directory
-    /// sits where the file belongs — fails the write closed.
-    /// `write_received` answers `false` (the caller installs nothing),
-    /// and `rewrite_without` leaves the path as it is; neither plans
-    /// from memory alone, which would drop the frames the file holds.
+    /// #1579 review: a log file the process cannot read — here a valid log
+    /// with mode `0o000` — fails the write closed. A rename needs no read
+    /// permission on the target, so a plan from memory alone would replace
+    /// the file and drop the frames it holds; instead
+    /// `write_received` answers `false` (the caller installs nothing) and
+    /// `rewrite_without` leaves the file as it is. The file's bytes are
+    /// the same after both calls.
     #[tokio::test]
     async fn an_unreadable_log_fails_the_write_closed() {
         use crate::server::routes::named_groups as ng;
+        use std::os::unix::fs::PermissionsExt as _;
         fn rebind_held(inner: &mut S4Inner) -> &mut HeldLog<16, true> {
             &mut inner.rebind.log
         }
@@ -1307,24 +1352,48 @@ pub(in super::super) mod tests {
             .rebind
             .log
             .remember("g", 4, "h4", Arc::new(b"held".to_vec()), true);
+        // A valid log that holds a competing pair, made unreadable.
         let path = log_path(&state, "g", REBIND_EXTENSION);
-        std::fs::create_dir_all(&path).expect("a directory where the log belongs");
+        let held_file = ReplayLogV1 {
+            stable_group_id: "g".to_string(),
+            frames: vec![
+                ReplayFrameV1 {
+                    next_revision: 5,
+                    result_head: "h5a".to_string(),
+                    authored: false,
+                    frame: b"first".to_vec(),
+                },
+                ReplayFrameV1 {
+                    next_revision: 5,
+                    result_head: "h5b".to_string(),
+                    authored: false,
+                    frame: b"second".to_vec(),
+                },
+            ],
+        };
+        let bytes = encode(&held_file).expect("encode");
+        std::fs::write(&path, &bytes).expect("write the log");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("the log is unreadable");
         assert!(
             !write_received(
                 &state,
                 REBIND_EXTENSION,
                 rebind_held,
                 "g",
-                (5, "h5x"),
+                (6, "h6x"),
                 &Arc::new(b"x".to_vec())
             )
             .await,
             "a read error other than NotFound fails the write"
         );
         rewrite_without(&state, REBIND_EXTENSION, rebind_held, "g", (4, "h4")).await;
-        assert!(
-            path.is_dir(),
-            "the rewrite skipped: the path is untouched, never planned from memory"
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("the log is readable again");
+        assert_eq!(
+            std::fs::read(&path).expect("read the log"),
+            bytes,
+            "neither call renamed over the unreadable log: the pair it holds is unchanged"
         );
     }
 
@@ -1370,6 +1439,53 @@ pub(in super::super) mod tests {
             held,
             vec![(5, "h5b"), (5, "h5c")],
             "the refused frame took no place: the two valid frames stay"
+        );
+    }
+
+    /// #1579 review: `rewrite_without` keeps the same two-file-only-frames
+    /// bound as a write. The file holds four frames only it has at one
+    /// revision and the first is refused: the refused frame leaves before
+    /// the bound counts, so the second and the third keep the two places
+    /// and the fourth leaves.
+    #[tokio::test]
+    async fn a_refusal_keeps_two_file_only_frames_at_the_refused_revision() {
+        use crate::server::routes::named_groups as ng;
+        fn rebind_held(inner: &mut S4Inner) -> &mut HeldLog<16, true> {
+            &mut inner.rebind.log
+        }
+        let (state, _dir) = ng::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        // Four frames at one revision that only the file holds: the crash
+        // window after four competing writes, before any install.
+        let path = log_path(&state, "g", REBIND_EXTENSION);
+        let frames_of = |heads: [&str; 4]| ReplayLogV1 {
+            stable_group_id: "g".to_string(),
+            frames: heads
+                .into_iter()
+                .enumerate()
+                .map(|(at, head)| ReplayFrameV1 {
+                    next_revision: 5,
+                    result_head: head.to_string(),
+                    authored: false,
+                    frame: vec![at as u8 + 1],
+                })
+                .collect(),
+        };
+        assert!(
+            write_at(&path, &frames_of(["h5a", "h5b", "h5c", "h5d"])).await,
+            "the file holds four frames"
+        );
+        rewrite_without(&state, REBIND_EXTENSION, rebind_held, "g", (5, "h5a")).await;
+        let on_disk = frames_on_disk(&state, REBIND_EXTENSION, "g").await;
+        let held: Vec<(u64, &str)> = on_disk
+            .iter()
+            .map(|frame| (frame.next_revision, frame.result_head.as_str()))
+            .collect();
+        assert_eq!(
+            held,
+            vec![(5, "h5b"), (5, "h5c")],
+            "the refusal keeps the next two file-only frames; the fourth leaves"
         );
     }
 

@@ -3263,17 +3263,73 @@ pub(super) mod restart_tests {
         Ok(())
     }
 
+    /// Install a verified advert for `peer`, as the daemon-tests helper
+    /// does: the catch-up gate reads the requester's current verified
+    /// advert.
+    fn advertise(state: &AppState, peer: AgentId, bits: u64, created_at_unix_ms: u64) {
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+        assert!(
+            state.agent.capability_store().insert(
+                peer,
+                x0x::identity::MachineId([4; 32]),
+                capabilities,
+                created_at_unix_ms,
+            ),
+            "verified capability advert"
+        );
+    }
+
+    /// The tracing text `f` produces. These tests run on the current-thread
+    /// runtime, so the thread-local default subscriber sees every event of
+    /// the awaited future.
+    async fn captured_tracing(f: impl std::future::Future<Output = ()>) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f.await;
+        drop(_guard);
+        let bytes = std::mem::take(&mut *sink.0.lock().expect("sink"));
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
     /// #1579: a competing frame kept below the head never stops the
-    /// catch-up round. The log holds the installed sibling, the
-    /// competitor and a later on-chain frame; the serving loop's head
-    /// rule serves the first and the third and skips the competitor.
-    /// Without the skip the competitor's send would refuse (it is not on
-    /// this node's chain) and end the round, stranding every frame after
-    /// it — the claim proven here at the loop's own surface: the real
-    /// `catchup_frames` output, filtered by the real `head_rule_admits`
-    /// per frame, in file order.
+    /// catch-up round — proven at the real `serve_catchup` loop, offline.
+    /// The log holds the competitor first, then the on-chain frame (the
+    /// installed sibling's branch is this node's head). The loop's head
+    /// rule skips the competitor and still attempts the on-chain frame's
+    /// send, which goes through the real guarded admission and the
+    /// test-build in-process pinned stand-in: the stand-in's admitted
+    /// marker in the captured log is the evidence that the send ran and
+    /// passed the gate. A `return` at the skip (or serving the competitor,
+    /// whose send the seam refuses) ends the round on the competitor, and
+    /// the capture then holds no marker — the frame after the competitor
+    /// never leaves.
     #[tokio::test]
-    async fn the_catchup_round_skips_a_competing_frame_below_the_head() -> Result<()> {
+    async fn the_catchup_round_serves_past_a_competing_frame_below_the_head() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let receiver = offline_daemon(dir.path(), None).await?;
         let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
@@ -3281,77 +3337,59 @@ pub(super) mod restart_tests {
         let (bytes1, head1, head1_state) = fixture.frame_with_state()?;
         let (bytes2, head2) = fixture.competing_frame()?;
         assert_ne!(head1, head2, "the fixture frames compete at one revision");
-        // A later commit on the installed sibling's branch: the pair sits
-        // below the head, and the group is not quarantined (the competitor
-        // was never received, only kept in the log).
-        let now_ms = now_unix_ms();
-        let renewal = AgentCertificate::issue_with_expiry(
-            &fixture.owner,
-            &fixture.seat,
-            Some(now_ms / 1000 + 8000),
-        )?;
-        let (head3_info, frame3) = cr::seal(
-            &head1_state,
-            *fixture.seat.agent_id().as_bytes(),
-            &renewal,
-            &fixture.admin,
-            now_ms,
-        )
-        .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
-        let bytes3 = cr::encode_frame(&frame3)?;
-        let head3 = head3_info.state_hash.clone();
-        hold_persisted(&receiver, &head3_info).await?;
+        // This node installed the sibling's branch: head1 is the head, and
+        // the competitor at the same revision is evidence only.
+        hold_persisted(&receiver, &head1_state).await?;
+        let revision = head1_state.state_revision;
         {
             let mut inner = receiver.revocation_evictions.inner.lock().await;
-            inner.rebind.log.remember(
-                &stable,
-                head3_info.state_revision.saturating_sub(1),
-                head1.as_str(),
-                Arc::new(bytes1),
-                false,
-            );
-            inner.rebind.log.remember(
-                &stable,
-                head3_info.state_revision.saturating_sub(1),
-                head2.as_str(),
-                Arc::new(bytes2),
-                false,
-            );
-            inner.rebind.log.remember(
-                &stable,
-                head3_info.state_revision,
-                head3.as_str(),
-                Arc::new(bytes3),
-                false,
-            );
+            inner
+                .rebind
+                .log
+                .remember(&stable, revision, head2.as_str(), Arc::new(bytes2), false);
+            inner
+                .rebind
+                .log
+                .remember(&stable, revision, head1.as_str(), Arc::new(bytes1), false);
         }
-        let info = receiver
-            .named_groups
-            .read()
-            .await
-            .get(&stable)
-            .cloned()
-            .context("the group")?;
-        let from = fixture.info.state_revision;
-        let frames = receiver
+        let order: Vec<String> = receiver
             .revocation_evictions
             .inner
             .lock()
             .await
             .rebind
             .log
-            .catchup_frames(std::slice::from_ref(&stable), from);
-        assert_eq!(frames.len(), 3, "the round sees every held frame");
-        let mut served: Vec<String> = Vec::new();
-        for (_, result_head, _) in &frames {
-            if head_rule_admits(&info, &HeadRule::OnChain(result_head.clone())) {
-                served.push(result_head.clone());
-            }
-        }
+            .catchup_frames(std::slice::from_ref(&stable), fixture.info.state_revision)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
         assert_eq!(
-            served,
-            vec![head1, head3],
-            "the competitor is skipped and the frames after it are still served"
+            order,
+            vec![head2.clone(), head1.clone()],
+            "the round meets the competitor first, then the on-chain frame"
+        );
+        // A capable member asks this node for catch-up.
+        let requester = fixture.peer.agent_id();
+        advertise(
+            &receiver,
+            requester,
+            x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+            now_unix_ms(),
+        );
+        let captured = captured_tracing(async {
+            serve_catchup(
+                &receiver,
+                &requester,
+                std::slice::from_ref(&stable),
+                fixture.info.state_revision,
+            )
+            .await;
+        })
+        .await;
+        assert!(
+            captured.contains("certificate rebind catch-up send refused or failed")
+                && captured.contains(x0x::dm::PINNED_STANDIN_ADMITTED),
+            "the round skipped the competitor and attempted the on-chain frame's send:\n{captured}"
         );
         receiver.agent.shutdown().await;
         Ok(())
