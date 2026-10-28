@@ -176,52 +176,36 @@ pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
     })
 }
 
-/// #1578 (Engineer ruling, 25 Oct 00:26): the head this node reports for
-/// `group_key` in a catch-up answer. While this node holds no secret of a
-/// held exclusion's epoch — it installed that exclusion's result keyless —
-/// the report is the live hold's parent, the newest head of the chain this
-/// node's secrets vouch for, never the installed result: a keyless install
-/// is local fact only, it does not prove delivery of the share, and the
-/// author's delivery row must stay open until the share installs (then the
-/// report is the current head again, and it is share-proof). The parent of
-/// the lowest *live* hold is reported. In a chain of keyless installs
-/// only the newest hold stays live, so the report is the chain's first
-/// result — itself keyless-installed, though still the newest head this
-/// node's secrets vouch for. A superseded install keeps its hold until
-/// the later secret lands (#1633): until then it reports the hold's
-/// parent, and the head is reported again only once that later key
-/// installs, which alone proves it. A node that holds
-/// a secret, or is held by no exclusion, reports its current head.
-pub(super) async fn reported_head(
-    state: &AppState,
-    group_key: &str,
-    info: &x0x::groups::GroupInfo,
-) -> String {
-    ensure_loaded(state).await;
-    let lot = state
-        .gss_share_holds
-        .exclusions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(held) = lot.get(group_key) else {
-        return info.state_hash.clone();
-    };
-    // The #1578 keyless install: the head is a held exclusion's result and
-    // no secret of its epoch is held. A node with a secret, or held only
-    // for a later epoch (its head is not that exclusion's result), reports
-    // its current head.
-    let keyless = info.shared_secret.is_none()
-        && held
-            .iter()
-            .any(|hold| hold.secret_epoch == info.secret_epoch);
-    if !keyless {
-        return info.state_hash.clone();
+/// #1578 (David's ruling, 28 Oct 02:09 GMT): the head this node claims
+/// for a group in a catch-up answer, from the narrow inputs its caller
+/// copied under the groups read lock. `None` exactly while the node is
+/// keyless on the GSS plane: the group's secrets are GSS-delivered, the
+/// node holds no secret of its saved head's epoch, and its own roster
+/// seat carries no KEM public key — the #1578 keyless install. Such a
+/// node can never identify a share sealed to its seat, so its install
+/// is local fact only and must never converge an author's delivery row:
+/// no peer sees convergence evidence from it until a secret of that
+/// epoch installs, and a chain of keyless installs claims no head at
+/// all. The claim is derived from the group state itself, never from
+/// the hold file: a hold write that fails, and the restart after it,
+/// cannot turn a keyless install into a head claim (the installed GSS
+/// head keeps implying its key). Every other responder — one with a
+/// secret (a superseded intermediate install included), one whose
+/// waiting keeps the old secret, a member of any other plane (a TreeKEM
+/// joiner holds heads with no GSS secret and no seat KEM key by design,
+/// so the keyless marker is meaningless there), and a responder that
+/// does not know the group — claims its saved head, exactly as on main.
+pub(super) fn reported_head(
+    gss_plane: bool,
+    saved_head: &str,
+    has_secret: bool,
+    own_seat_keyless: bool,
+) -> Option<String> {
+    if gss_plane && !has_secret && own_seat_keyless {
+        None
+    } else {
+        Some(saved_head.to_string())
     }
-    held.iter()
-        .filter(|hold| holds(info, Some(hold.secret_epoch)))
-        .min_by_key(|hold| hold.secret_epoch)
-        .map(|hold| hold.parent_state_hash.clone())
-        .unwrap_or_else(|| info.state_hash.clone())
 }
 
 /// Whether a parked removal or ban, or a held crypto-only exclusion, still
@@ -785,5 +769,70 @@ pub(in crate::server) mod test_seam {
 
     pub(in crate::server) fn hold_file_exists(state: &AppState, group_key: &str) -> bool {
         hold_path(state, group_key).exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1578 rc3 (review finding 1): the keyless claim is derived from
+    /// the group state, not from the hold file. A hold write that fails
+    /// and the restart after it leave the keyless install with no hold
+    /// anywhere — the claim stays absent. Before the fix the saved head
+    /// was served as soon as no hold named the epoch, and the node
+    /// claimed a head it holds no key for.
+    #[test]
+    fn a_keyless_install_claims_no_head_with_no_hold_anywhere() {
+        assert_eq!(
+            reported_head(true, "keyless-result-head", false, true),
+            None
+        );
+    }
+
+    /// #1578 rc3 (rc3 review, plane gate): a member of any other plane
+    /// — a TreeKEM joiner, which holds heads with no GSS secret and no
+    /// seat KEM key by design — keeps main's answer. Without the plane
+    /// gate every such joiner would disclaim its head for ever.
+    #[test]
+    fn a_non_gss_member_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(false, "saved-head", false, true),
+            Some("saved-head".to_string())
+        );
+    }
+
+    /// #1578 rc3 (David's ruling, 28 Oct 02:09 GMT): a superseded
+    /// intermediate install keeps its hold at the epoch and holds no
+    /// secret, but its own seat carries a KEM key, so it is not keyless:
+    /// it claims its saved head, exactly as on main. Before the fix the
+    /// hold at the epoch made the claim absent.
+    #[test]
+    fn a_superseded_intermediate_install_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(true, "saved-head", false, false),
+            Some("saved-head".to_string())
+        );
+    }
+
+    /// #1578: a node whose own seat is keyless but that holds the
+    /// secret (the exclusion's author on a snapshot-derived roster,
+    /// which strips every KEM key) vouches for the head it sealed: it
+    /// claims its saved head.
+    #[test]
+    fn a_keyless_seat_that_holds_the_secret_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(true, "saved-head", true, true),
+            Some("saved-head".to_string())
+        );
+    }
+
+    /// With a secret and a keyed seat the node claims its saved head.
+    #[test]
+    fn a_keyed_node_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(true, "saved-head", true, false),
+            Some("saved-head".to_string())
+        );
     }
 }

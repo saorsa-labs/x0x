@@ -1572,7 +1572,7 @@ token. A session token is refused before the body is read.
 | POST | `/groups/cards/import` | `x0x group card-import` | Import a group card into local cache |
 | POST | `/groups/:id/secure/encrypt` | `x0x group secure-encrypt <group_id>` | Encrypt content with the group's shared secret (member-only) |
 | POST | `/groups/:id/secure/decrypt` | `x0x group secure-decrypt <group_id>` | Decrypt content with the group's shared secret (member-only, epoch must match) |
-| POST | `/groups/:id/secure/reseal` | `x0x group secure-reseal <group_id>` | Re-seal the current group shared secret to a named recipient (`SecureShareDelivered`-format envelope) |
+| POST | `/groups/:id/secure/reseal` | `x0x group secure-reseal <group_id>` | Re-seal the current group shared secret to a named recipient (`SecureShareDelivered`-format envelope). Once a #1578 keyless survivor's seat is keyed again (a verified leave and re-join), this seal ends its ciphertext hold |
 | POST | `/groups/secure/open-envelope` | `x0x group secure-open-envelope` | Open a `SecureShareDelivered` envelope with this daemon's KEM key. Requires the durable owner API token; session and rider credentials receive typed `403` before JSON parsing |
 | DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. A sole-member leave deletes the group (`{"ok":true,"deleted":...}`); otherwise the last admin is blocked — promote another admin first or use `x0x group delete` |
 
@@ -1807,6 +1807,21 @@ every wait. A wait always names its cause; it does not stop silently.
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
+| Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold has no time limit. A secret of the held epoch, or a later one, ends it. |
+
+**The keyless survivor state (#1578).** A GSS survivor whose roster seat
+carries no ML-KEM-768 public key cannot receive the re-sealed share of a
+rotated secret, so it installs a verified exclusion frame without the new
+secret. While that state lasts: the node withholds new group ciphertext with
+the 409 above; its catch-up answers omit `responder_state_hash` (a node that
+holds no secret of an epoch cannot vouch for a head of that epoch; every
+other responder, a superseded intermediate head included, serves the field
+exactly as before); and the author's removal obligation stays open — a
+keyless install never proves delivery. The state ends when the seat leaves
+and re-joins with a verified KEM binding — no wire event seats a KEM key on
+an already-Active seat — and a holder then seals the current secret to it:
+`POST /groups/:id/secure/reseal`, the S4 delivery's own re-seal, or the next
+rotation all do this, and the installed share ends the hold.
 
 **Wire and capabilities.** The daemon advertises three more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
