@@ -5847,19 +5847,34 @@ mod restart_tests {
             "the carrier's acceptance of the frame closes no keyless seat"
         );
         // The carrier really took the frame in those rounds: the seat's
-        // status is Sent — the acceptance that must close nothing.
-        {
-            let inner = author.revocation_evictions.inner.lock().await;
-            assert_eq!(
-                inner.orc.deliveries.get(&stable).and_then(|delivery| {
+        // status is Sent — the acceptance that must close nothing. The
+        // last round's send completes asynchronously, so poll for it.
+        let mut accepted = false;
+        for _ in 0..250 {
+            let seat = author
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .deliveries
+                .get(&stable)
+                .and_then(|delivery| {
                     delivery
                         .recipients
                         .get(survivor.agent.agent_id().as_bytes())
-                }),
-                Some(&RecipientDelivery::Sent),
-                "the carrier took the frame: its acceptance is Sent, and it closes nothing"
-            );
+                        .copied()
+                });
+            if seat == Some(RecipientDelivery::Sent) {
+                accepted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert!(
+            accepted,
+            "the carrier took the frame: its acceptance is Sent, and it closes nothing"
+        );
         assert_eq!(
             shares_to_survivor(&author),
             sealed,

@@ -1784,8 +1784,9 @@ mod daemon_tests {
         // Force another round: the obligation stays open while the
         // survivor is keyless. The round's head ask returns the keyless
         // disclaimer — the survivor claims no head while keyless (#1627,
-        // David's ruling, 28 Oct 02:09 GMT) — and that answer converges
-        // nothing.
+        // David's ruling, 28 Oct 02:09 GMT) — fed here at the catch-up
+        // entry point (the served shape is pinned by the
+        // crypto-exclusion tests), and that answer converges nothing.
         {
             let mut inner = state.revocation_evictions.inner.lock().await;
             if let Some(delivery) = inner.removals.get_mut(&key) {

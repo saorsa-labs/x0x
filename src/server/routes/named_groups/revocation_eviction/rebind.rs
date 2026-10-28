@@ -2687,8 +2687,10 @@ mod daemon_tests {
             Some(RecipientDelivery::Sent),
             "the seat stays Sent after the carrier's acceptance"
         );
-        // The answer a keyless survivor really serves (#1627, David's
-        // ruling, 28 Oct 02:09 GMT): no `responder_state_hash` at all.
+        // The keyless survivor's answer while keyless (#1627, David's
+        // ruling, 28 Oct 02:09 GMT): no `responder_state_hash` at all,
+        // fed here at the catch-up entry point. The served shape itself
+        // is pinned by the crypto-exclusion tests on the real serve path.
         super::super::note_catchup_head(
             &state,
             std::slice::from_ref(&group_id),
@@ -2707,12 +2709,12 @@ mod daemon_tests {
         );
         // The rebind frame carries no key material: a survivor can hold
         // and report the result head only once it can take the group's
-        // secret. This row keeps no state-machine view of that, so the
-        // recovery is modelled here: the author's roster copy seats a KEM
-        // key (the re-join of the named recovery), and the report below
-        // is the share-proof such a keyed survivor then serves. The real
-        // install path is proven by the owner-recovery and
-        // crypto-exclusion two-node tests.
+        // secret. This row's convergence never reads a seat's KEM key, so
+        // the recovery is modelled, not observed: seating the key on the
+        // author's roster copy stands for the re-join of the named
+        // recovery, and the report below is the share-proof such a keyed
+        // survivor then serves. The real install path is proven by the
+        // owner-recovery and crypto-exclusion two-node tests.
         let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
         {
             let mut groups = state.named_groups.write().await;
