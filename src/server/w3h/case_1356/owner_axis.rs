@@ -49,6 +49,32 @@ async fn announce_all(sim: &Sim, labels: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// `admin` seals a rename. A seal checks every member's certificate and the
+/// first try may start the fetches it needs; the creator's seat carries no
+/// certificate, so each retry refreshes O's certificate announce.
+async fn seal_rename(sim: &Sim, admin: &str, group: &str, name: &str) -> Result<()> {
+    let path = format!("/groups/{group}");
+    let mut last = String::new();
+    sim.until(
+        &format!("{admin} seals a rename"),
+        SETUP,
+        async |s: &Sim| {
+            let body = Some(json!({"name": name}));
+            match s.request(admin, Method::PATCH, &path, body).await {
+                Ok((code, _)) if code.is_success() => true,
+                answer => {
+                    last = format!("{answer:?}");
+                    let body = json!({"include_user_identity": true, "human_consent": true});
+                    let _ = s.request("O", Method::POST, "/announce", Some(body)).await;
+                    false
+                }
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("{admin}'s last seal answer: {last}"))
+}
+
 async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let owner = crate::identity::UserKeypair::from_seed(&[0x13; 32])?;
     start_certified(sim, "O", &owner, true).await?;
@@ -113,15 +139,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         at(sim),
     );
     let since = sim.fabric().mark_indexed("case: A renames");
-    // A seal checks every member's certificate; the first try may start
-    // the fetches it needs.
-    let path = format!("/groups/{group}");
-    sim.until("A seals a rename", SETUP, async |s: &Sim| {
-        let body = Some(json!({"name": "w3h owner axis A"}));
-        let sealed = s.request("A", Method::PATCH, &path, body).await;
-        sealed.is_ok_and(|(code, _)| code.is_success())
-    })
-    .await?;
+    seal_rename(sim, "A", &group, "w3h owner axis A").await?;
     let head = view(sim, "A", &group).await?;
     let applied = sim
         .until("O applies A's seal", SETUP, async |s: &Sim| {
