@@ -216,6 +216,12 @@ where
     // `u32::MAX` keeps the local queue first until it is empty. The seed
     // fixes `select!` and `watch` poll order on this runtime.
     builder.global_queue_interval(u32::MAX);
+    // The clock hold occupies one pool thread for the whole scenario.
+    // Every other `spawn_blocking` task shares the remaining thread, in
+    // spawn order. A wider pool lets the OS choose which completion wakes
+    // first, and that order moves `offline@` and same-instant stream
+    // direction between reruns (#1245).
+    builder.max_blocking_threads(2);
     // Fires only when a barrier has asked to be woken at idle. Otherwise
     // the callback returns without touching the clock, so a closed gate
     // still parks and auto-advance outside `Sim` is unchanged.
@@ -755,8 +761,8 @@ async fn drive_paused<F: std::future::Future>(fut: F) -> F::Output {
 /// Holding one blocking task inhibits paused tokio's auto-advance
 /// (tokio `runtime/blocking/schedule.rs`); releasing it allows it again.
 struct ClockGate {
-    release: std::sync::mpsc::Sender<()>,
-    task: tokio::task::JoinHandle<()>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ClockGate {
@@ -765,12 +771,29 @@ impl ClockGate {
         let task = tokio::task::spawn_blocking(move || {
             let _ = wait.recv();
         });
-        Self { release, task }
+        Self {
+            release: Some(release),
+            task: Some(task),
+        }
+    }
+
+    /// Nested-barrier token for [`Sim`]. It does not take a pool thread.
+    /// [`AutoAdvanceHold`] already inhibits auto-advance, and the second
+    /// pool thread must stay free for scenario work (#1245).
+    fn marker() -> Self {
+        Self {
+            release: None,
+            task: None,
+        }
     }
 
     async fn open(self) {
-        let _ = self.release.send(());
-        let _ = self.task.await;
+        if let Some(release) = self.release {
+            let _ = release.send(());
+        }
+        if let Some(task) = self.task {
+            let _ = task.await;
+        }
     }
 }
 
@@ -1236,7 +1259,7 @@ impl Sim {
             plane,
             fabric,
             nodes: BTreeMap::new(),
-            gate: Mutex::new(Some(ClockGate::close())),
+            gate: Mutex::new(Some(ClockGate::marker())),
             _clock_hold: AutoAdvanceHold::acquire(),
             shim,
             logs,
@@ -1579,7 +1602,7 @@ impl Sim {
         *self
             .gate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ClockGate::close());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ClockGate::marker());
         if let Some(shim) = self.shim {
             shim.set_wall(self.fabric.now());
         }
