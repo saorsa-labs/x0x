@@ -13,6 +13,8 @@ mod inventory_accounts;
 #[cfg(unix)]
 mod inventory_procfs;
 #[cfg(unix)]
+mod inventory_systemd_environment;
+#[cfg(unix)]
 mod inventory_systemd_exec;
 #[cfg(unix)]
 mod inventory_systemd_lists;
