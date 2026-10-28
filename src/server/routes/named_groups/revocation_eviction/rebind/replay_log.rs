@@ -152,10 +152,10 @@ struct HeldFrame {
 impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> {
     /// Keep a frame. With `KEEP_COMPETING` (the rebind and owner-recovery
     /// logs, #1579) a frame of the same commit (the revision and the
-    /// result head) replaces the held copy, so one commit is held once —
-    /// an authored copy replaces a received one — while a frame at a held
-    /// revision with a different result head is a competing commit: both
-    /// are kept and neither replaces the other. The bytes are the fork
+    /// result head) replaces the held copy — whichever copy arrived first,
+    /// authored or received — so one commit is held once, while a frame at
+    /// a held revision with a different result head is a competing commit:
+    /// both are kept and neither replaces the other. The bytes are the fork
     /// evidence that two commits claimed one revision.
     ///
     /// Without it (the crypto-only exclusion log, #1508) the frame held
@@ -1334,6 +1334,7 @@ pub(in super::super) mod tests {
     /// `write_received` answers `false` (the caller installs nothing) and
     /// `rewrite_without` leaves the file as it is. The file's bytes are
     /// the same after both calls.
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_unreadable_log_fails_the_write_closed() {
         use crate::server::routes::named_groups as ng;
