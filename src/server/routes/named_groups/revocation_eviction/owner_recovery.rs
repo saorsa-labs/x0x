@@ -1711,15 +1711,13 @@ fn spawn_commit_send(
     let _spawned = state.spawn_detached(async move {
         let rule = HeadRule::Current(result_head.clone());
         let status = send_guarded(&task_state, &stable, &agent, rule, bytes.as_slice()).await;
-        let mut inner = task_state.revocation_evictions.inner.lock().await;
-        let recorded = inner.orc.finish_commit_attempt(
-            &stable,
-            &result_head,
-            agent.as_bytes(),
-            attempt,
-            status,
-        );
-        drop(inner);
+        let recorded = task_state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .finish_commit_attempt(&stable, &result_head, agent.as_bytes(), attempt, status);
         // #1508 r5: a GSS survivor's share follows its frame write, so the
         // obligation stays with the frame until that write lands, and a
         // restored delivery (all recipients `Due`) seals it again. The
@@ -5843,13 +5841,11 @@ mod restart_tests {
             worker_tick(&author).await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            still_delivering(&author, &stable, &survivor).await,
-            "the carrier's acceptance of the frame closes no keyless seat"
-        );
         // The carrier really took the frame in those rounds: the seat's
         // status is Sent — the acceptance that must close nothing. The
-        // last round's send completes asynchronously, so poll for it.
+        // last round's send completes asynchronously, so poll for it,
+        // and only then check the row: a close made when the send
+        // completes must not slip through between the two checks.
         let mut accepted = false;
         for _ in 0..250 {
             let seat = author
@@ -5875,6 +5871,10 @@ mod restart_tests {
         assert!(
             accepted,
             "the carrier took the frame: its acceptance is Sent, and it closes nothing"
+        );
+        assert!(
+            still_delivering(&author, &stable, &survivor).await,
+            "the carrier's acceptance of the frame closes no keyless seat"
         );
         assert_eq!(
             shares_to_survivor(&author),

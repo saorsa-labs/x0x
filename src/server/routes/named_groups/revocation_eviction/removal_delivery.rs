@@ -1745,7 +1745,7 @@ mod daemon_tests {
     /// installed share's report — the share-proof — converges the seat
     /// and ends the row.
     #[tokio::test]
-    async fn a_keyless_seat_stays_pending_until_its_share_installs() -> Result<()> {
+    async fn a_keyless_seat_stays_pending_until_the_share_proof_converges_it() -> Result<()> {
         use base64::Engine as _;
         let (state, _dir) = state_past_restart_wait().await?;
         let survivor = AgentId([0x85; 32]);
@@ -1758,9 +1758,6 @@ mod daemon_tests {
         let key = EvictionKey::new(stable.clone(), target);
         {
             let mut inner = state.revocation_evictions.inner.lock().await;
-            inner
-                .head_rounds
-                .insert(stable, HeadRound::new(&info.state_hash, Instant::now()));
             inner.removals.insert(
                 key.clone(),
                 new_delivery(
@@ -1778,11 +1775,11 @@ mod daemon_tests {
             "the carrier's acceptance is Sent, not delivery: an ACK closes no seat (ADR 0110 §3)"
         );
         // Force another round: the obligation stays open while the
-        // survivor is keyless. The round's head ask returns the keyless
-        // disclaimer — the survivor claims no head while keyless (#1627,
-        // David's ruling, 28 Oct 02:09 GMT) — fed here at the catch-up
-        // entry point (the served shape is pinned by the
-        // crypto-exclusion tests), and that answer converges nothing.
+        // survivor is keyless. The keyless disclaimer — the survivor
+        // claims no head while keyless (#1627, David's ruling, 28 Oct
+        // 02:09 GMT) — fed here at the catch-up entry point (the served
+        // shape is pinned by the crypto-exclusion tests): with no round
+        // open it creates no obligation, and it converges no seat.
         {
             let mut inner = state.revocation_evictions.inner.lock().await;
             if let Some(delivery) = inner.removals.get_mut(&key) {
