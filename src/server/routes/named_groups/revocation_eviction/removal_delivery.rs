@@ -1782,8 +1782,10 @@ mod daemon_tests {
             "no share can be sealed to a seat with no KEM key"
         );
         // Force another round: the obligation stays open while the
-        // survivor is keyless. Its answer omits a head, so nothing
-        // converges the seat.
+        // survivor is keyless. The round's head ask returns the keyless
+        // disclaimer — the survivor claims no head while keyless (#1627,
+        // David's ruling, 28 Oct 02:09 GMT) — and that answer converges
+        // nothing.
         {
             let mut inner = state.revocation_evictions.inner.lock().await;
             if let Some(delivery) = inner.removals.get_mut(&key) {
@@ -1791,9 +1793,16 @@ mod daemon_tests {
             }
         }
         drive(&state).await;
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            None,
+        )
+        .await;
         assert!(
             seat_becomes(&state, &key, survivor.as_bytes(), RecipientDelivery::Sent).await,
-            "the next round sends again: no head claim arrived"
+            "the keyless disclaimer converges nothing: the seat stays Sent"
         );
         assert_eq!(
             shares_to(&state, &survivor_hex),
@@ -1856,9 +1865,12 @@ mod daemon_tests {
             "no report arrived: the row stays open after the seal"
         );
 
-        // The share installs at the survivor; its catch-up answer is then
-        // the result head. This report — the one the installed share makes
-        // possible — is the share-proof, and only it converges the seat.
+        // This row's state machine has no survivor node, so the report is
+        // fed at the entry point the catch-up answer reaches: it is the
+        // answer a survivor serves once the sealed share installs — the
+        // share-proof — and only it converges the seat. The real install
+        // path is proven by the owner-recovery and crypto-exclusion
+        // two-node tests.
         super::super::note_catchup_head(
             &state,
             std::slice::from_ref(&group_id),
@@ -1982,6 +1994,15 @@ mod daemon_tests {
             0,
             "no share can be sealed to a seat with no KEM key"
         );
+        // The resumed round's head ask returns the keyless disclaimer; it
+        // converges nothing on the restarted author either.
+        super::super::note_catchup_head(
+            &restarted,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            None,
+        )
+        .await;
         {
             let inner = restarted.revocation_evictions.inner.lock().await;
             assert!(
@@ -2024,9 +2045,9 @@ mod daemon_tests {
             "the restarted author's round sealed the share once the seat had a key"
         );
 
-        // The share installs at the survivor; its report — the share-proof
-        // the installed share makes possible — is the only thing that
-        // converges the seat and ends the row.
+        // The report a survivor serves once the sealed share installs —
+        // the share-proof, fed at the catch-up entry point as above — is
+        // the only thing that converges the seat and ends the row.
         super::super::note_catchup_head(
             &restarted,
             std::slice::from_ref(&group_id),

@@ -5846,6 +5846,20 @@ mod restart_tests {
             still_delivering(&author, &stable, &survivor).await,
             "the carrier's acceptance of the frame closes no keyless seat"
         );
+        // The carrier really took the frame in those rounds: the seat's
+        // status is Sent — the acceptance that must close nothing.
+        {
+            let inner = author.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.orc.deliveries.get(&stable).and_then(|delivery| {
+                    delivery
+                        .recipients
+                        .get(survivor.agent.agent_id().as_bytes())
+                }),
+                Some(&RecipientDelivery::Sent),
+                "the carrier took the frame: its acceptance is Sent, and it closes nothing"
+            );
+        }
         assert_eq!(
             shares_to_survivor(&author),
             sealed,

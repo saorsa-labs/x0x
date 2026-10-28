@@ -2705,9 +2705,14 @@ mod daemon_tests {
             Some(RecipientDelivery::Sent),
             "a keyless disclaimer converges nothing — the survivor claims no head while keyless"
         );
-        // The rebind frame carries no key material: the survivor can hold
+        // The rebind frame carries no key material: a survivor can hold
         // and report the result head only once it can take the group's
-        // secret. Seat a KEM key for it on the author's roster copy.
+        // secret. This row keeps no state-machine view of that, so the
+        // recovery is modelled here: the author's roster copy seats a KEM
+        // key (the re-join of the named recovery), and the report below
+        // is the share-proof such a keyed survivor then serves. The real
+        // install path is proven by the owner-recovery and
+        // crypto-exclusion two-node tests.
         let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
         {
             let mut groups = state.named_groups.write().await;
@@ -2718,7 +2723,7 @@ mod daemon_tests {
                 .expect("the survivor's seat")
                 .kem_public_key_b64 = Some(BASE64.encode(&kem.public_bytes));
         }
-        // The share-proof report: the survivor now holds the result head.
+        // The report a keyed survivor then serves — the share-proof.
         super::super::note_catchup_head(
             &state,
             std::slice::from_ref(&group_id),
