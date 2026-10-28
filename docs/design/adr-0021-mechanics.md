@@ -83,11 +83,16 @@ The inbox attributes these machines to the sender:
   the sender. That includes the retained binding, a machine a later
   binding replaced, and a verified machine that lost timestamp selection.
   LRU eviction drops the retained entry and does not drop this set. The
-  set is capped at 8 machines per agent and 65,536 pairs per cache. An
-  agent whose next machine does not fit fails closed for unattested DMs.
-  If the cache cannot name another such agent, every unattested DM fails
-  closed. A valid attestation is still accepted. The set is process
-  memory. A restart drops it with the cache.
+  set is capped at 8 machines per agent, 65,536 pairs per cache, and
+  4,096 named overflowed agents. An agent whose next machine does not
+  fit is overflowed. That agent fails closed for an unattested DM or
+  ACK only when the inbox already holds a machine revocation for that
+  agent. A sender with no machine revocation stays accepted. Filling
+  the name list does not refuse every sender. A valid attestation is
+  still accepted. The set is process memory. Overflow lasts until
+  process restart. The daemon does not persist the set. Rebuilding a
+  replaced machine from disk would need a new stored format, which this
+  rule does not add.
 - a machine on the sender's contact
 - a machine named by a binding tombstone for that agent (indexed by agent)
 - the machine the envelope claims
@@ -98,12 +103,26 @@ resolved machine is revoked. A machine-revocation record still expires
 under the existing revocation TTL, and this refusal ends with that record.
 
 A sender with none of those machines revoked keeps the absent-attestation
-path above, unless attribution overflow has already failed that sender
-closed. A machine revocation for some other device does not change that
-sender's path. A cold receiver that cannot attribute the revoked machine
-to the sender still follows the ADR 0021 claim fallback. That fallback is
-the remaining strip residual: an unattested envelope whose origin
-attestation was removed, claiming a machine this receiver cannot attribute.
+path above. Attribution overflow does not change that. A machine
+revocation for some other device does not change that sender's path. A
+cold receiver that cannot attribute the revoked machine to the sender
+still follows the ADR 0021 claim fallback. That fallback is the remaining
+strip residual: an unattested envelope whose origin attestation was
+removed, claiming a machine this receiver cannot attribute.
+
+Restart residual. A machine known only through the in-memory accepted
+set is not attributed after a restart. The revocation record for that
+machine can still be stored. An unattested DM that claims a different,
+clean machine is accepted again, because the inbox can no longer
+attribute the revoked machine to the sender. Contacts, binding
+tombstones, the claimed machine, and a retained binding that has been
+rebuilt in this process still count. Those records already persist.
+The accepted-machine history does not.
+
+An attacker who holds the agent key can mint a fresh machine and a
+valid attestation. This check does not stop that DM. The remedy is an
+agent revocation or a binding tombstone.
+
 The relay `DeliverLocally` path (`RelayDisposition::DeliverLocally` in
 `src/lib.rs`) takes the envelope's claimed machine and does not apply this
 refusal. Relay delivery is off unless `[peer_relay] enabled = true`.

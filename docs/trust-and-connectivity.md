@@ -309,13 +309,7 @@ store confirms that agent on that machine:
   (`POST /agent/card/import`, token-authenticated, `Agent::pin_card_binding`).
   A card import is a local-user pin for its (agent, machine). It is
   newest-wins, so a stale card never rolls back a fresher binding. No network
-  input reaches it. Once an agent has any machine revocation, an unattested
-  DM or ACK on the inbox topic or the compatibility bus requires an origin
-  attestation (#1659; David, 28 Oct 2026). That is a deliberate partial
-  override of ADR 0021's accept-with-binding-fallback policy for those
-  agents only. The relay `DeliverLocally` path does not apply it. The
-  attribution cap, the tombstone index and that residual are in
-  [ADR-0021 mechanics](design/adr-0021-mechanics.md).
+  input reaches it.
 - the announced binding (class A or B announcements only);
 - a usable ADR 0089 evidence record for exactly that (agent, machine).
 
@@ -323,6 +317,18 @@ Otherwise they use the authority stores' machine, or treat the agent as
 unverified. The connector records a dialed machine only when an authority
 store confirms it. An unconfirmed connection can carry the current send as an
 unverified hint, but never creates a binding.
+
+Once an agent has any machine revocation, an unattested DM or ACK on the
+inbox topic or the compatibility bus requires an origin attestation
+(#1659; David, 28 Oct 2026). That is a deliberate partial override of ADR
+0021's accept-with-binding-fallback policy for those agents only. The
+relay `DeliverLocally` path does not apply it. The caps (8 machines per
+agent, 65,536 pairs, 4,096 named overflowed agents), the rule that
+overflow lasts until restart, the tombstone index, and the restart
+residual are in [ADR-0021 mechanics](design/adr-0021-mechanics.md). An
+agent-key compromise is not stopped by this check: the holder can mint a
+fresh machine and a valid attestation. The remedy is an agent revocation
+or a binding tombstone.
 
 Behaviour to know:
 
