@@ -323,12 +323,15 @@ inbox topic or the compatibility bus requires an origin attestation
 (#1659; David, 28 Oct 2026). That is a deliberate partial override of ADR
 0021's accept-with-binding-fallback policy for those agents only. The
 relay `DeliverLocally` path does not apply it. The caps (8 machines per
-agent, 65,536 pairs, 4,096 named overflowed agents), the rule that
-overflow lasts until restart, the tombstone index, and the restart
-residual are in [ADR-0021 mechanics](design/adr-0021-mechanics.md). An
-agent-key compromise is not stopped by this check: the holder can mint a
-fresh machine and a valid attestation. The remedy is an agent revocation
-or a binding tombstone.
+agent, 65,536 pairs, of which agents that are not Trusted or Known
+contacts share 4,096, and 4,096 named overflowed agents), the rule that
+a machine past the cap is not recorded, and the restart residual are in
+[ADR-0021 mechanics](design/adr-0021-mechanics.md). Overflow does not
+refuse an unattested DM by itself. An unattested DM for an unrecorded
+machine can still be accepted. An agent-key compromise is not stopped by
+this check: the holder can mint a fresh machine and a valid attestation.
+A binding tombstone blocks only the named pair. Containing the
+compromised agent key requires an agent revocation.
 
 Behaviour to know:
 

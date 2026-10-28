@@ -14914,6 +14914,21 @@ impl Agent {
                         announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
                     );
                 }
+                let relationship = {
+                    let store = contact_store.read().await;
+                    matches!(
+                        store
+                            .get(&announcement.agent_id)
+                            .map(|contact| contact.trust_level),
+                        Some(contacts::TrustLevel::Trusted | contacts::TrustLevel::Known)
+                    )
+                };
+                if relationship {
+                    authenticated_machine_bindings
+                        .write()
+                        .await
+                        .note_relationship_peer(announcement.agent_id);
+                }
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,

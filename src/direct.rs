@@ -558,14 +558,19 @@ pub struct DmDiagnosticsStats {
     pub incoming_trust_rejected: u64,
     /// DMs dropped because the sender's agent identity has been revoked.
     /// Non-zero means a revoked peer is still attempting to communicate.
-    /// An attribution-overflow refusal is not included. That uses
-    /// `incoming_dropped_attribution_overflow`.
+    /// An overflow-labelled refusal is not included. That uses
+    /// `incoming_dropped_attribution_overflow`, and only when an attributed
+    /// machine is already revoked.
     #[serde(default)]
     pub incoming_dropped_revoked: u64,
-    /// Unattested DMs and ACKs dropped because this sender's attribution
-    /// overflowed and the sender already holds a machine revocation.
-    /// A sender with no machine revocation does not move this counter.
-    /// Overflow lasts until process restart.
+    /// Unattested DMs and ACKs dropped because an attributed machine is
+    /// revoked and this sender's attribution set has also overflowed.
+    /// Overflow does not itself refuse the DM. A machine past the per-agent
+    /// cap is not recorded, so a revocation of that machine is not
+    /// attributed and an unattested DM that claims a clean machine can
+    /// still be accepted. That loss of attribution is a residual. A sender
+    /// with no attributed machine revocation does not move this counter.
+    /// The set is process memory and is empty after a restart.
     #[serde(default)]
     pub incoming_dropped_attribution_overflow: u64,
     /// DMs dropped because the sender's cached agent certificate has expired

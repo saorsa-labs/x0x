@@ -136,16 +136,16 @@ const ACCEPTED_MACHINES_PER_AGENT: usize = 8;
 /// #1659: (agent, machine) pairs in one cache. A further pair marks that
 /// agent overflowed and does not evict another agent's pairs.
 const ACCEPTED_MACHINE_PAIR_CAPACITY: usize = 65_536;
+/// Pairs that agents who are not Trusted or Known contacts may record.
+/// Throwaway peers share this budget and cannot fill
+/// [`ACCEPTED_MACHINE_PAIR_CAPACITY`].
+const ACCEPTED_MACHINE_STRANGER_PAIRS: usize = 4_096;
 /// #1659: agents that can be named as overflowed. A further agent is
 /// counted and is not a reason to refuse any other sender.
 const ACCEPTED_MACHINE_OVERFLOW_AGENTS: usize = 4_096;
-/// Minimum gap between unattested-drop warnings. A flood must not emit one
-/// `warn!` per DM.
+/// Minimum gap between unattested-drop and attribution-cap warnings.
+/// A flood must not emit one `warn!` per DM.
 const UNATTESTED_DROP_WARN_INTERVAL_MS: u64 = 60_000;
-static UNATTESTED_REVOCATION_WARN_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static UNATTESTED_OVERFLOW_WARN_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AuthenticatedMachineBinding {
@@ -171,16 +171,18 @@ pub(crate) struct AuthenticatedMachineBinding {
 /// eviction) wakes ADR-0074 §4 stream reauth — including the DM attestation
 /// writer `record_authenticated_machine_binding`.
 ///
-/// `accepted_machines` is the #1659 attribution memory. It records every
-/// verified machine for an agent, including one that lost timestamp
-/// selection and one that a later binding replaced. LRU eviction drops the
-/// retained entry and does not drop the set. The set is capped per agent
-/// and overall. An agent whose next machine does not fit is overflowed.
-/// That agent fails closed for an unattested DM only when a machine
-/// revocation for that agent is already held. Overflow never refuses a
-/// sender that has no machine revocation, and it never refuses a different
-/// sender. The set is process memory. A restart drops it. Overflow lasts
-/// until that restart.
+/// `accepted_machines` is the #1659 attribution memory. It records a
+/// verified machine after that DM's attestation and trust checks admit it.
+/// The set includes the retained binding, a machine a later binding
+/// replaced, and a verified machine that lost timestamp selection. LRU
+/// eviction drops the retained entry and does not drop the set. One agent
+/// can record 8 machines. The cache holds 65,536 pairs. Agents that are
+/// not Trusted or Known contacts share 4,096 of those pairs, so throwaway
+/// peers cannot fill the cache. A machine past either cap is not recorded.
+/// Overflow does not refuse an unattested DM by itself. A revocation of an
+/// unrecorded machine is not attributed, and an unattested DM that claims
+/// a clean machine can still be accepted. That loss of attribution is a
+/// residual. The set is process memory. A restart drops it.
 #[derive(Debug)]
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
@@ -188,21 +190,23 @@ pub struct AuthenticatedMachineBindingCache {
     /// Machines accepted for each agent, including machines a later binding
     /// replaced (#1659). Not removed by LRU eviction. Bounded.
     accepted_machines: std::collections::HashMap<AgentId, std::collections::HashSet<MachineId>>,
-    /// Agents whose verified history did not fit. An unattested DM from one
-    /// of these agents fails closed only when that agent holds a machine
-    /// revocation.
+    /// Agents whose verified history did not fit in the per-agent or pair cap.
+    /// A machine past the cap is not in `accepted_machines`.
     overflowed_agents: std::collections::HashSet<AgentId>,
+    /// Trusted or Known contacts. Their pairs do not use the stranger budget.
+    relationship_peers: std::collections::HashSet<AgentId>,
     attribution_pairs_len: usize,
+    attribution_stranger_pairs_len: usize,
     attribution_per_agent: usize,
     attribution_pairs: usize,
+    attribution_stranger_pairs: usize,
     attribution_overflow_agents: usize,
-    /// Agents that overflowed after the name list was full. They are not
-    /// failed closed as a group.
+    /// Agents that overflowed after the name list was full.
     attribution_unnamed_overflows: u64,
-    /// One warning has been emitted for the full name list.
-    attribution_names_full_logged: bool,
-    /// One warning has been emitted for the first named overflow.
-    attribution_overflow_logged: bool,
+    /// Stranger pairs refused because the stranger budget was full.
+    attribution_stranger_overflows: u64,
+    /// Last attribution-cap warning, unix milliseconds. One cache, not one process.
+    attribution_overflow_warn_ms: u64,
     capacity: usize,
     recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
@@ -217,13 +221,16 @@ impl Default for AuthenticatedMachineBindingCache {
             by_machine: Default::default(),
             accepted_machines: std::collections::HashMap::new(),
             overflowed_agents: std::collections::HashSet::new(),
+            relationship_peers: std::collections::HashSet::new(),
             attribution_pairs_len: 0,
+            attribution_stranger_pairs_len: 0,
             attribution_per_agent: ACCEPTED_MACHINES_PER_AGENT,
             attribution_pairs: ACCEPTED_MACHINE_PAIR_CAPACITY,
+            attribution_stranger_pairs: ACCEPTED_MACHINE_STRANGER_PAIRS,
             attribution_overflow_agents: ACCEPTED_MACHINE_OVERFLOW_AGENTS,
             attribution_unnamed_overflows: 0,
-            attribution_names_full_logged: false,
-            attribution_overflow_logged: false,
+            attribution_stranger_overflows: 0,
+            attribution_overflow_warn_ms: 0,
             recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
@@ -249,13 +256,16 @@ impl AuthenticatedMachineBindingCache {
             by_machine: Default::default(),
             accepted_machines: std::collections::HashMap::new(),
             overflowed_agents: std::collections::HashSet::new(),
+            relationship_peers: std::collections::HashSet::new(),
             attribution_pairs_len: 0,
+            attribution_stranger_pairs_len: 0,
             attribution_per_agent: ACCEPTED_MACHINES_PER_AGENT,
             attribution_pairs: ACCEPTED_MACHINE_PAIR_CAPACITY,
+            attribution_stranger_pairs: ACCEPTED_MACHINE_STRANGER_PAIRS,
             attribution_overflow_agents: ACCEPTED_MACHINE_OVERFLOW_AGENTS,
             attribution_unnamed_overflows: 0,
-            attribution_names_full_logged: false,
-            attribution_overflow_logged: false,
+            attribution_stranger_overflows: 0,
+            attribution_overflow_warn_ms: 0,
             recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
@@ -300,19 +310,41 @@ impl AuthenticatedMachineBindingCache {
             .unwrap_or_default()
     }
 
-    /// Whether this agent's verified machine history did not fit.
+    /// Whether this agent's per-agent or pair cap refused another machine.
     ///
-    /// A `true` result refuses an unattested DM only together with a machine
-    /// revocation already held for this agent. It is never true for a
-    /// different agent, including after the name list is full.
+    /// A `true` result does not by itself refuse an unattested DM. Machines
+    /// past the cap are absent from [`Self::machines_accepted_for`].
     pub(crate) fn attribution_requires_attestation(&self, agent_id: &AgentId) -> bool {
         self.overflowed_agents.contains(agent_id)
+    }
+
+    /// Mark `agent_id` as a Trusted or Known contact before the next record.
+    pub(crate) fn note_relationship_peer(&mut self, agent_id: AgentId) {
+        self.relationship_peers.insert(agent_id);
+    }
+
+    /// Lower the stranger-pair budget. Call this before any stranger `record`.
+    #[cfg(test)]
+    pub(crate) fn set_stranger_pair_limit_for_test(&mut self, pairs: usize) {
+        self.attribution_stranger_pairs = pairs.max(1);
     }
 
     /// Overflowed agents that could not be named because the name list was full.
     #[cfg(test)]
     pub(crate) fn attribution_unnamed_overflows(&self) -> u64 {
         self.attribution_unnamed_overflows
+    }
+
+    /// Stranger pairs refused after the stranger budget filled.
+    #[cfg(test)]
+    pub(crate) fn attribution_stranger_overflows(&self) -> u64 {
+        self.attribution_stranger_overflows
+    }
+
+    /// Stranger pairs currently stored.
+    #[cfg(test)]
+    pub(crate) fn attribution_stranger_pairs_len(&self) -> usize {
+        self.attribution_stranger_pairs_len
     }
 
     fn remember_accepted_machine(&mut self, agent_id: AgentId, machine_id: MachineId) {
@@ -326,11 +358,24 @@ impl AuthenticatedMachineBindingCache {
         {
             return;
         }
+        let relationship = self.relationship_peers.contains(&agent_id);
         let agent_len = self
             .accepted_machines
             .get(&agent_id)
             .map(|machines| machines.len())
             .unwrap_or(0);
+        let stranger_full =
+            !relationship && self.attribution_stranger_pairs_len >= self.attribution_stranger_pairs;
+        if stranger_full
+            && agent_len < self.attribution_per_agent
+            && self.attribution_pairs_len < self.attribution_pairs
+        {
+            // The shared pair cap still has room for Trusted and Known contacts.
+            self.attribution_stranger_overflows =
+                self.attribution_stranger_overflows.saturating_add(1);
+            self.warn_attribution_pressure(agent_id);
+            return;
+        }
         if agent_len >= self.attribution_per_agent
             || self.attribution_pairs_len >= self.attribution_pairs
         {
@@ -342,6 +387,26 @@ impl AuthenticatedMachineBindingCache {
             .or_default()
             .insert(machine_id);
         self.attribution_pairs_len += 1;
+        if !relationship {
+            self.attribution_stranger_pairs_len += 1;
+        }
+    }
+
+    fn warn_attribution_pressure(&mut self, agent_id: AgentId) {
+        let now = now_unix_ms();
+        if now.saturating_sub(self.attribution_overflow_warn_ms) < UNATTESTED_DROP_WARN_INTERVAL_MS
+        {
+            return;
+        }
+        self.attribution_overflow_warn_ms = now;
+        tracing::warn!(
+            agent = %hex::encode(agent_id.as_bytes()),
+            unnamed = self.attribution_unnamed_overflows,
+            stranger_overflows = self.attribution_stranger_overflows,
+            stranger_pairs = self.attribution_stranger_pairs_len,
+            pairs = self.attribution_pairs_len,
+            "attribution cap reached; a machine past the cap is not recorded, and an unattested DM for that machine can still be accepted"
+        );
     }
 
     fn mark_attribution_overflow(&mut self, agent_id: AgentId) {
@@ -349,29 +414,14 @@ impl AuthenticatedMachineBindingCache {
             return;
         }
         if self.overflowed_agents.len() >= self.attribution_overflow_agents {
-            // The new agent cannot be named. Do not refuse other senders.
+            // The new agent cannot be named. Other senders keep their pairs.
             self.attribution_unnamed_overflows =
                 self.attribution_unnamed_overflows.saturating_add(1);
-            if !self.attribution_names_full_logged {
-                self.attribution_names_full_logged = true;
-                tracing::warn!(
-                    named = self.overflowed_agents.len(),
-                    "attribution overflow name list is full; further agents are not refused as a group"
-                );
-            }
+            self.warn_attribution_pressure(agent_id);
             return;
         }
         self.overflowed_agents.insert(agent_id);
-        if !self.attribution_overflow_logged {
-            self.attribution_overflow_logged = true;
-            tracing::warn!(
-                agent = %hex::encode(agent_id.as_bytes()),
-                named = self.overflowed_agents.len(),
-                per_agent = self.attribution_per_agent,
-                pairs = self.attribution_pairs,
-                "attribution overflow started; an overflowed agent fails closed only while that agent holds a machine revocation"
-            );
-        }
+        self.warn_attribution_pressure(agent_id);
     }
 
     /// Wake `notify` on every future retained-machine / expiry / clear /
@@ -571,10 +621,12 @@ impl AuthenticatedMachineBindingCache {
         self.by_machine.clear();
         self.accepted_machines.clear();
         self.overflowed_agents.clear();
+        self.relationship_peers.clear();
         self.attribution_pairs_len = 0;
+        self.attribution_stranger_pairs_len = 0;
         self.attribution_unnamed_overflows = 0;
-        self.attribution_names_full_logged = false;
-        self.attribution_overflow_logged = false;
+        self.attribution_stranger_overflows = 0;
+        self.attribution_overflow_warn_ms = 0;
         self.recency.clear();
         if had_state {
             self.notify_changed();
@@ -1020,6 +1072,10 @@ impl DmInboxService {
             authenticated_machine_bindings,
             history,
             ack_publisher,
+            unattested_revocation_warn_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
+            unattested_overflow_warn_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let mut handles = vec![spawn_subscription_loop(
@@ -1462,6 +1518,10 @@ pub(crate) struct InboxPipeline {
     history: Option<crate::history::HistoryHandle>,
     /// Bounded background publisher for durable (v2) ACK envelopes.
     ack_publisher: AckPublisherHandle,
+    /// Per-inbox rate limit for unattested revocation warnings.
+    unattested_revocation_warn_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Per-inbox rate limit for unattested overflow warnings.
+    unattested_overflow_warn_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl InboxPipeline {
@@ -1661,6 +1721,30 @@ async fn durable_history_logical_request(
 }
 
 impl InboxPipeline {
+    /// Record attribution for an attested DM that the revocation, pairing,
+    /// and trust checks have admitted. A refused DM does not take a slot.
+    /// Trusted and Known contacts use the shared pair cap. Every other
+    /// agent uses the stranger budget.
+    async fn attribute_admitted_origin(
+        &self,
+        agent: AgentId,
+        machine: MachineId,
+        announced_at: u64,
+    ) {
+        let relationship = {
+            let store = self.contacts.read().await;
+            matches!(
+                store.get(&agent).map(|contact| contact.trust_level),
+                Some(crate::contacts::TrustLevel::Trusted | crate::contacts::TrustLevel::Known)
+            )
+        };
+        let mut cache = self.authenticated_machine_bindings.write().await;
+        if relationship {
+            cache.note_relationship_peer(agent);
+        }
+        cache.record(agent, machine, announced_at);
+    }
+
     /// #1659: how an unattested DM from `agent` is treated.
     ///
     /// Attribution is every machine the authenticated-binding cache has
@@ -1853,24 +1937,26 @@ impl InboxPipeline {
         //
         // Issue #213: prefer the fresh per-DM origin-machine attestation —
         // a machine-key signature covering this envelope, verifiable with
-        // ZERO prior cache state. When present and valid it supersedes (and
-        // refreshes) the retained binding; when present but invalid the DM
-        // is a hard drop (never fall back — a bad attestation is an attack
-        // signal, not a legacy peer). Only when the attestation is ABSENT
+        // ZERO prior cache state. When present and valid, and the later
+        // checks admit the DM, it supersedes (and refreshes) the retained
+        // binding. When present but invalid the DM is a hard drop (never
+        // fall back — a bad attestation is an attack signal, not a legacy
+        // peer). Only when the attestation is ABSENT
         // (pre-#213 peer) do we degrade to the #184 retained-binding check,
         // where the envelope machine claim is sender-controlled: prefer the
         // retained machine from an accepted, verified identity announcement;
         // the claim is only a best-effort fallback for agents with no
         // authenticated binding. See docs/design/adr-0021-mechanics.md.
         //
-        // #1659 (David, 28 Oct 2026): once any machine the inbox attributes
-        // to this sender is revoked, an absent attestation is a refusal.
-        // The cache records every verified machine that fits, including one
-        // that lost timestamp selection. An overflowed agent fails closed
-        // only when that agent already holds a machine revocation. A valid
-        // attestation still takes the Ok(Some) arm.
+        // #1659 (David, 28 Oct 2026, 02:08 GMT): once any machine the inbox
+        // attributes to this sender is revoked, an absent attestation is a
+        // refusal. Attribution is recorded only after this DM is admitted.
+        // A machine past the per-agent cap is not recorded. Revoking that
+        // machine does not attribute it, so an unattested DM that claims a
+        // clean machine can still be accepted.
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let claimed_machine_id = MachineId(envelope.sender_machine_id);
+        let mut fresh_attestation = false;
         //
         // #927: `origin_authenticated` records whether the resolved machine
         // came from an attestation or an authenticated binding. A bare
@@ -1885,18 +1971,10 @@ impl InboxPipeline {
                     machine = %hex::encode(attested_machine.as_bytes()),
                     "DM origin machine authenticated by fresh machine-key attestation"
                 );
-                // Refresh the retained binding so later UNATTESTED DMs from
-                // this agent are checked against the freshest authenticated
-                // machine — this is what lets a portable move A→B displace a
-                // stale binding. Convert ms→s: announcement-sourced bindings
-                // are seconds-granularity and the cache orders by timestamp.
-                record_authenticated_machine_binding(
-                    &self.authenticated_machine_bindings,
-                    sender_agent_id,
-                    attested_machine,
-                    envelope.created_at_unix_ms / 1000,
-                )
-                .await;
+                // The retained binding and the attribution set are updated
+                // only after revocation, pairing, and trust checks admit
+                // this DM. A refused attestation does not take a slot.
+                fresh_attestation = true;
                 (attested_machine, true)
             }
             Err(rejection) => {
@@ -1938,7 +2016,7 @@ impl InboxPipeline {
                         UnattestedAttribution::Revoked => {
                             self.dm.record_incoming_dropped_revoked();
                             warn_unattested_drop(
-                                &UNATTESTED_REVOCATION_WARN_MS,
+                                &self.unattested_revocation_warn_ms,
                                 "inbound_unattested_after_machine_revocation",
                                 &envelope.sender_agent_id,
                                 claimed_machine_id.as_bytes(),
@@ -1949,11 +2027,11 @@ impl InboxPipeline {
                         UnattestedAttribution::Overflow => {
                             self.dm.record_incoming_dropped_attribution_overflow();
                             warn_unattested_drop(
-                                &UNATTESTED_OVERFLOW_WARN_MS,
+                                &self.unattested_overflow_warn_ms,
                                 "inbound_unattested_attribution_overflow",
                                 &envelope.sender_agent_id,
                                 claimed_machine_id.as_bytes(),
-                                "DM dropped: unattested sender overflowed attribution and holds a machine revocation",
+                                "DM dropped: unattested sender has an attributed machine revocation and an overflowed attribution set",
                             );
                             return;
                         }
@@ -2035,8 +2113,13 @@ impl InboxPipeline {
             }
         }
 
+        let admitted_at = envelope.created_at_unix_ms / 1000;
         match envelope.body.clone() {
             DmBody::Ack(ack) => {
+                if fresh_attestation {
+                    self.attribute_admitted_origin(sender_agent_id, sender_machine_id, admitted_at)
+                        .await;
+                }
                 // The ACK's own `protocol_version` names the receipt semantics
                 // the recipient is claiming; the waiter accepts it only if
                 // that matches what the send negotiated (ADR 0030 §2).
@@ -2058,11 +2141,18 @@ impl InboxPipeline {
                 );
             }
             DmBody::Payload(payload) => {
+                let origin = if fresh_attestation {
+                    PayloadOrigin::FreshAttestation
+                } else if origin_authenticated {
+                    PayloadOrigin::Retained
+                } else {
+                    PayloadOrigin::Claim
+                };
                 self.handle_payload(
                     envelope,
                     payload,
                     sender_machine_id,
-                    origin_authenticated,
+                    origin,
                     sender_pubkey,
                     ack_legacy_bus,
                 )
@@ -2076,11 +2166,13 @@ impl InboxPipeline {
         envelope: DmEnvelope,
         payload: DmPayload,
         sender_machine_id: MachineId,
-        origin_authenticated: bool,
+        origin: PayloadOrigin,
         sender_pubkey: Vec<u8>,
         ack_legacy_bus: bool,
     ) {
+        let origin_authenticated = origin.authenticated();
         let sender_agent_id = AgentId(envelope.sender_agent_id);
+        let admitted_at = envelope.created_at_unix_ms / 1000;
         let decision = {
             let store = self.contacts.read().await;
             TrustEvaluator::new(&store).evaluate(&TrustContext {
@@ -2145,6 +2237,11 @@ impl InboxPipeline {
                 return;
             }
             _ => {}
+        }
+
+        if matches!(origin, PayloadOrigin::FreshAttestation) {
+            self.attribute_admitted_origin(sender_agent_id, sender_machine_id, admitted_at)
+                .await;
         }
 
         let aad = envelope.aead_aad();
@@ -3054,6 +3151,23 @@ fn drop_if_sender_revoked(
     }
 }
 
+/// How `handle_payload` should treat the machine it was given.
+#[derive(Clone, Copy)]
+enum PayloadOrigin {
+    /// Sender claim only. Do not record attribution.
+    Claim,
+    /// Already authenticated by the retained binding. Do not record again.
+    Retained,
+    /// Fresh attestation that the trust check admitted. Record attribution.
+    FreshAttestation,
+}
+
+impl PayloadOrigin {
+    fn authenticated(self) -> bool {
+        !matches!(self, Self::Claim)
+    }
+}
+
 /// Why an unattested DM or ACK is dropped, or that it may continue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnattestedAttribution {
@@ -3071,8 +3185,12 @@ enum UnattestedAttribution {
 /// the sender. Attribution is the claimed machine, the retained binding,
 /// every machine the authenticated-binding cache has accepted for the
 /// sender, a contact machine, or a binding tombstone. An unrelated machine
-/// revocation does not count. Overflow refuses only that sender, and only
-/// when one of those machines is revoked.
+/// revocation does not count. A machine past the attribution cap is not in
+/// the accepted set. Revoking that machine does not refuse an unattested
+/// DM that claims a different clean machine. When an attributed machine is
+/// revoked and the sender's set has also overflowed, the result is
+/// [`UnattestedAttribution::Overflow`]. That counter does not add a refusal
+/// the revocation check would not already make.
 fn sender_unattested_attribution(
     revoked: &RevocationSet,
     agent: &AgentId,
@@ -3090,10 +3208,7 @@ fn sender_unattested_attribution(
         || contact_machines
             .iter()
             .any(|machine| revoked.is_machine_revoked(machine))
-        || revoked
-            .binding_tombstone_machines(agent)
-            .into_iter()
-            .any(|machine| revoked.is_machine_revoked(&machine));
+        || revoked.any_tombstone_machine_revoked(agent);
     if !holds {
         return UnattestedAttribution::Allow;
     }
@@ -3360,6 +3475,10 @@ mod tests {
             authenticated_machine_bindings,
             history: None,
             ack_publisher,
+            unattested_revocation_warn_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                0,
+            )),
+            unattested_overflow_warn_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         InboxHarness {
@@ -5929,15 +6048,15 @@ mod tests {
         assert_eq!(stats.incoming_dropped_revoked, 0);
     }
 
-    /// #1659: the per-agent cap is full, and no machine is revoked. An
-    /// unattested DM is still accepted. After a machine revocation is held
-    /// for this overflowed sender, an unattested DM is refused on the
-    /// overflow counter, not `incoming_dropped_revoked`.
+    /// #1659: a machine past the per-agent cap is not recorded. Revoking that
+    /// machine does not refuse an unattested DM that claims a later clean
+    /// machine. Overflow does not add a refusal.
     #[tokio::test]
-    async fn issue1659_attribution_overflow_refuses_only_when_revocation_held() {
+    async fn issue1659_past_cap_machine_revocation_does_not_block_clean_claim() {
         let sender = test_keypair();
         let machine_a = MachineKeypair::generate().expect("machine A keygen");
         let machine_b = MachineKeypair::generate().expect("machine B keygen");
+        let machine_c = MachineKeypair::generate().expect("machine C keygen");
         let mut harness = make_inbox_harness(&sender, None, None).await;
         harness
             .pipeline
@@ -5945,71 +6064,52 @@ mod tests {
             .write()
             .await
             .set_attribution_limits_for_test(1, 64, 8);
+        let now = now_unix_ms();
 
-        let attested_a = attested_payload_message(&harness, &sender, &machine_a, 0x94);
-        harness
-            .pipeline
-            .handle_incoming(attested_a, false, crate::dm::DmAckIngress::Subscription)
-            .await;
-        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
-            .await
-            .expect("the first attested DM must be delivered")
-            .expect("delivery stream closed");
-        assert_eq!(delivered.machine_id, machine_a.machine_id());
-
-        let attested_b = attested_payload_message_at(
-            &harness,
-            &sender,
-            &machine_b,
-            0x95,
-            now_unix_ms().saturating_add(1_000),
-        );
-        harness
-            .pipeline
-            .handle_incoming(attested_b, false, crate::dm::DmAckIngress::Subscription)
-            .await;
-        let delivered_b = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
-            .await
-            .expect("a valid attestation still delivers after the cap")
-            .expect("delivery stream closed");
-        assert_eq!(delivered_b.machine_id, machine_b.machine_id());
-        assert!(
+        for (machine, byte, at) in [
+            (&machine_a, 0x94_u8, now),
+            (&machine_b, 0x95, now.saturating_add(5_000)),
+            (&machine_c, 0x96, now.saturating_add(10_000)),
+        ] {
+            let message = attested_payload_message_at(&harness, &sender, machine, byte, at);
             harness
                 .pipeline
-                .authenticated_machine_bindings
-                .read()
+                .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+                .await;
+            let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
                 .await
-                .attribution_requires_attestation(&sender.agent_id()),
-            "the second machine must mark this sender overflowed"
-        );
+                .expect("a valid attestation is delivered even past the cap")
+                .expect("delivery stream closed");
+            assert_eq!(delivered.machine_id, machine.machine_id());
+        }
 
-        let unattested = payload_message(&harness, &sender, machine_b.machine_id(), 0x96);
+        let accepted = harness
+            .pipeline
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .machines_accepted_for(&sender.agent_id());
+        assert!(accepted.contains(&machine_a.machine_id()));
+        assert!(
+            !accepted.contains(&machine_b.machine_id()),
+            "the machine past the per-agent cap must stay unrecorded"
+        );
+        assert!(!accepted.contains(&machine_c.machine_id()));
+
+        insert_machine_revocation(&harness, &machine_b).await;
+        let unattested = payload_message(&harness, &sender, machine_c.machine_id(), 0x97);
         harness
             .pipeline
             .handle_incoming(unattested, false, crate::dm::DmAckIngress::Subscription)
             .await;
-        let delivered_clean = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
             .await
-            .expect("overflow without a machine revocation must still accept the DM")
+            .expect("an unrecorded machine revocation must not block the clean claim")
             .expect("delivery stream closed");
-        assert_eq!(delivered_clean.machine_id, machine_b.machine_id());
+        assert_eq!(delivered.machine_id, machine_c.machine_id());
         let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
         assert_eq!(stats.incoming_dropped_revoked, 0);
         assert_eq!(stats.incoming_dropped_attribution_overflow, 0);
-
-        insert_machine_revocation(&harness, &machine_a).await;
-        let refused = payload_message(&harness, &sender, machine_b.machine_id(), 0x97);
-        harness
-            .pipeline
-            .handle_incoming(refused, false, crate::dm::DmAckIngress::Subscription)
-            .await;
-        let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
-        assert_eq!(stats.incoming_dropped_revoked, 0);
-        assert_eq!(
-            stats.incoming_dropped_attribution_overflow, 1,
-            "an overflowed sender who holds a machine revocation uses the overflow counter"
-        );
-        assert_no_delivery(&mut harness.receiver).await;
     }
 
     /// #1659: attacker overflow must not refuse an unrelated sender who holds
@@ -6108,27 +6208,18 @@ mod tests {
         assert_eq!(stats.incoming_dropped_attribution_overflow, 1);
     }
 
-    /// #1659: a machine revocation that arrives before any binding is still
-    /// attributed when the attested path records the machine and EP3 then
-    /// drops that DM. A later valid attestation from clean machine B moves
-    /// the retained binding. An unattested claim of B stays refused.
+    /// A DM that the revocation check refuses does not take an attribution
+    /// slot. Machine A is revoked before any admitted attestation, so the
+    /// dropped attestation does not link A to the sender. A later admitted
+    /// attestation from clean machine B is recorded. An unattested claim of
+    /// B is accepted: A was never attributed.
     #[tokio::test]
-    async fn issue1659_revocation_before_binding_still_attributes() {
+    async fn issue1659_refused_attestation_does_not_take_an_attribution_slot() {
         let sender = test_keypair();
         let machine_a = MachineKeypair::generate().expect("machine A keygen");
         let machine_b = MachineKeypair::generate().expect("machine B keygen");
         let mut harness = make_inbox_harness(&sender, None, None).await;
         insert_machine_revocation(&harness, &machine_a).await;
-        assert!(
-            harness
-                .pipeline
-                .authenticated_machine_bindings
-                .read()
-                .await
-                .peek(&sender.agent_id())
-                .is_none(),
-            "the revocation arrives before any binding"
-        );
 
         let attested = attested_payload_message(&harness, &sender, &machine_a, 0xB1);
         harness
@@ -6136,16 +6227,6 @@ mod tests {
             .handle_incoming(attested, false, crate::dm::DmAckIngress::Subscription)
             .await;
         assert_no_delivery(&mut harness.receiver).await;
-        assert_eq!(
-            harness
-                .pipeline
-                .dm
-                .diagnostics_snapshot()
-                .stats
-                .incoming_dropped_revoked,
-            1,
-            "EP3 drops the attested DM from revoked machine A"
-        );
         assert!(
             harness
                 .pipeline
@@ -6153,8 +6234,8 @@ mod tests {
                 .read()
                 .await
                 .machines_accepted_for(&sender.agent_id())
-                .contains(&machine_a.machine_id()),
-            "the attested path records A before EP3 drops the DM"
+                .is_empty(),
+            "a refused attestation must not enter the attribution set"
         );
 
         let attested_b = attested_payload_message_at(
@@ -6162,7 +6243,7 @@ mod tests {
             &sender,
             &machine_b,
             0xB2,
-            now_unix_ms().saturating_add(1_000),
+            now_unix_ms().saturating_add(5_000),
         );
         harness
             .pipeline
@@ -6179,7 +6260,11 @@ mod tests {
             .pipeline
             .handle_incoming(unattested, false, crate::dm::DmAckIngress::Subscription)
             .await;
-        assert_no_delivery(&mut harness.receiver).await;
+        let delivered_b = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("B was admitted and A was never attributed")
+            .expect("delivery stream closed");
+        assert_eq!(delivered_b.machine_id, machine_b.machine_id());
         assert_eq!(
             harness
                 .pipeline
@@ -6187,9 +6272,179 @@ mod tests {
                 .diagnostics_snapshot()
                 .stats
                 .incoming_dropped_revoked,
-            2,
-            "A stays attributed, so an unattested claim of B is refused"
+            1,
+            "only the refused attestation of revoked machine A is counted"
         );
+    }
+
+    /// Strangers share a small pair budget. A Trusted contact still records
+    /// after that budget is full. A blocked sender does not take a slot.
+    #[tokio::test]
+    async fn issue1659_strangers_cannot_exhaust_relationship_attribution() {
+        let contact = test_keypair();
+        let mut harness = make_inbox_harness(&contact, None, None).await;
+        {
+            let mut cache = harness
+                .pipeline
+                .authenticated_machine_bindings
+                .write()
+                .await;
+            cache.set_attribution_limits_for_test(8, 64, 8);
+            cache.set_stranger_pair_limit_for_test(1);
+        }
+
+        let blocked = test_keypair();
+        harness
+            .pipeline
+            .contacts
+            .write()
+            .await
+            .set_trust(&blocked.agent_id(), TrustLevel::Blocked);
+        let blocked_machine = MachineKeypair::generate().expect("blocked machine");
+        let blocked_dm = attested_payload_message(&harness, &blocked, &blocked_machine, 0xC1);
+        harness
+            .pipeline
+            .handle_incoming(blocked_dm, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        {
+            let cache = harness.pipeline.authenticated_machine_bindings.read().await;
+            assert!(cache.machines_accepted_for(&blocked.agent_id()).is_empty());
+            assert_eq!(cache.attribution_stranger_pairs_len(), 0);
+        }
+
+        let stranger_a = test_keypair();
+        let stranger_b = test_keypair();
+        let machine_a = MachineKeypair::generate().expect("stranger A machine");
+        let machine_b = MachineKeypair::generate().expect("stranger B machine");
+        for (sender, machine, byte) in [
+            (&stranger_a, &machine_a, 0xC2_u8),
+            (&stranger_b, &machine_b, 0xC3),
+        ] {
+            let message = attested_payload_message(&harness, sender, machine, byte);
+            harness
+                .pipeline
+                .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+                .await;
+            let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+                .await
+                .expect("an attested stranger DM is still delivered")
+                .expect("delivery stream closed");
+            assert_eq!(delivered.sender, sender.agent_id());
+        }
+        {
+            let cache = harness.pipeline.authenticated_machine_bindings.read().await;
+            assert!(cache
+                .machines_accepted_for(&stranger_a.agent_id())
+                .contains(&machine_a.machine_id()));
+            assert!(
+                cache
+                    .machines_accepted_for(&stranger_b.agent_id())
+                    .is_empty(),
+                "the second stranger must not take a pair once the stranger budget is full"
+            );
+            assert!(cache.attribution_stranger_overflows() >= 1);
+        }
+
+        let contact_a = MachineKeypair::generate().expect("contact machine A");
+        let contact_b = MachineKeypair::generate().expect("contact machine B");
+        for (machine, byte, at) in [
+            (&contact_a, 0xC4_u8, now_unix_ms()),
+            (&contact_b, 0xC5, now_unix_ms().saturating_add(5_000)),
+        ] {
+            let message = attested_payload_message_at(&harness, &contact, machine, byte, at);
+            harness
+                .pipeline
+                .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+                .await;
+            let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+                .await
+                .expect("a Trusted contact still records after the stranger budget fills")
+                .expect("delivery stream closed");
+            assert_eq!(delivered.machine_id, machine.machine_id());
+        }
+        let accepted = harness
+            .pipeline
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .machines_accepted_for(&contact.agent_id());
+        assert!(accepted.contains(&contact_a.machine_id()));
+        assert!(accepted.contains(&contact_b.machine_id()));
+    }
+
+    /// An unattested ACK from a sender with a revoked machine must not
+    /// resolve a waiter. A counter staying at zero is not that proof.
+    #[tokio::test]
+    async fn issue1659_unattested_ack_stays_pending_when_machine_is_revoked() {
+        let sender = test_keypair();
+        let clean = MachineId([0xC6; 32]);
+        let revoked = MachineKeypair::generate().expect("revoked machine");
+        let harness = make_inbox_harness(&sender, Some(clean), None).await;
+        record_contact_machine(&harness, &sender.agent_id(), revoked.machine_id()).await;
+        insert_machine_revocation(&harness, &revoked).await;
+        let request_id = [0xA7; 16];
+        let mut waiter =
+            harness
+                .pipeline
+                .inflight
+                .register(request_id, sender.agent_id(), Some(clean));
+        let ack = unattested_ack_message(&harness, &sender, clean, 0xA7);
+        harness
+            .pipeline
+            .handle_incoming(ack, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert!(
+            matches!(
+                waiter.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the unattested ACK must leave the waiter pending"
+        );
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            1
+        );
+    }
+
+    /// #1659: a present but invalid attestation is a hard drop. It must not
+    /// fall through to the absent-attestation path, even when a machine
+    /// revocation is held for the sender.
+    #[tokio::test]
+    async fn issue1659_invalid_attestation_is_a_hard_drop() {
+        let sender = test_keypair();
+        let clean = MachineKeypair::generate().expect("clean machine");
+        let revoked = MachineKeypair::generate().expect("revoked machine");
+        let mut harness = make_inbox_harness(&sender, Some(clean.machine_id()), None).await;
+        record_contact_machine(&harness, &sender.agent_id(), revoked.machine_id()).await;
+        insert_machine_revocation(&harness, &revoked).await;
+
+        let first = attested_payload_message(&harness, &sender, &clean, 0xD1);
+        let first_envelope = DmEnvelope::from_wire_bytes(&first.payload).expect("decode");
+        let captured = first_envelope
+            .origin_attestation
+            .clone()
+            .expect("attestation");
+        let mut envelope =
+            craft_unsigned_payload_envelope(&harness, &sender, clean.machine_id(), 0xD2);
+        sign_envelope_with_agent(&mut envelope, &sender);
+        envelope.origin_attestation = Some(captured);
+        assert!(envelope.verify_origin_attestation().is_err());
+        let message = wrap_in_pubsub(&harness, &sender, &envelope);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
+        assert_eq!(stats.incoming_trust_rejected, 1);
+        assert_eq!(stats.incoming_dropped_revoked, 0);
+        assert_eq!(stats.incoming_dropped_attribution_overflow, 0);
     }
 
     /// #213 REPLAY: an attestation captured from DM-1 (request R1) is
@@ -6498,7 +6753,7 @@ mod tests {
 
     /// The pair cap refuses one more agent and does not drop a stored pair.
     #[test]
-    fn accepted_machine_pair_cap_fails_closed_without_dropping_others() {
+    fn accepted_machine_pair_cap_keeps_stored_pairs() {
         let mut bindings =
             AuthenticatedMachineBindingCache::with_capacity(8).with_attribution_limits(8, 2, 4);
         let agent_a = AgentId([0xA1; 32]);
@@ -6522,9 +6777,10 @@ mod tests {
         assert!(!bindings.attribution_requires_attestation(&AgentId([0xD4; 32])));
     }
 
-    /// One agent cannot grow its set past the per-agent cap.
+    /// One agent cannot grow its set past the per-agent cap. The extra
+    /// machine is not recorded. That is not a refusal of a later DM.
     #[test]
-    fn accepted_machine_per_agent_cap_fails_closed() {
+    fn accepted_machine_per_agent_cap_stops_recording() {
         let mut bindings =
             AuthenticatedMachineBindingCache::default().with_attribution_limits(2, 100, 10);
         let agent = AgentId([0x11; 32]);
@@ -6536,10 +6792,10 @@ mod tests {
         assert!(!bindings.attribution_requires_attestation(&AgentId([0x22; 32])));
     }
 
-    /// A full overflow-name list does not fail closed every agent. The
-    /// stored pair stays. The unnamed agent is counted, not refused as a group.
+    /// A full overflow-name list does not mark every agent. The stored pair
+    /// stays. The unnamed agent is counted.
     #[test]
-    fn accepted_machine_overflow_does_not_fail_close_other_agents() {
+    fn accepted_machine_overflow_name_list_does_not_mark_every_agent() {
         let mut bindings =
             AuthenticatedMachineBindingCache::with_capacity(8).with_attribution_limits(1, 1, 1);
         let agent_a = AgentId([0xA1; 32]);
@@ -6560,17 +6816,20 @@ mod tests {
             .contains(&machine_a));
     }
 
-    /// A restart drops machines known only through this cache. Contacts and
-    /// tombstones are separate persisted records and are not this set.
+    /// A process restart is a new empty cache. The live cache still attributes
+    /// the revoked machine. The restarted cache does not, so the same
+    /// unattested claim is accepted. Contacts and tombstones are separate
+    /// persisted records and are not this set.
     #[test]
     fn issue1659_restart_drops_cache_only_machine_attribution() {
         let agent = AgentId([0xA1; 32]);
         let machine_b = MachineId([0x22; 32]);
         let machine_kp = MachineKeypair::generate().expect("machine keygen");
         let machine_a = machine_kp.machine_id();
-        let mut bindings = AuthenticatedMachineBindingCache::default();
-        bindings.record(agent, machine_a, 1);
-        bindings.record(agent, machine_b, 2);
+        let mut live = AuthenticatedMachineBindingCache::default();
+        live.note_relationship_peer(agent);
+        live.record(agent, machine_a, 1);
+        live.record(agent, machine_b, 2);
         let now = now_unix_ms() / 1000;
         let record = crate::revocation::RevocationRecord::sign(
             crate::revocation::RevokedSubject::Machine(machine_a),
@@ -6584,7 +6843,7 @@ mod tests {
         revoked
             .verify_and_insert(record, None)
             .expect("machine self-revocation verifies and inserts");
-        let accepted = bindings.machines_accepted_for(&agent);
+        let accepted = live.machines_accepted_for(&agent);
         assert_eq!(
             sender_unattested_attribution(
                 &revoked,
@@ -6595,13 +6854,16 @@ mod tests {
                 &accepted,
                 false,
             ),
-            UnattestedAttribution::Revoked
+            UnattestedAttribution::Revoked,
+            "before restart the live cache attributes revoked machine A"
         );
-        bindings.clear_for_test();
+        let restarted = AuthenticatedMachineBindingCache::default();
+        assert!(restarted.machines_accepted_for(&agent).is_empty());
+        assert!(restarted.peek(&agent).is_none());
         assert_eq!(
-            sender_unattested_attribution(&revoked, &agent, None, machine_b, &[], &[], false,),
+            sender_unattested_attribution(&revoked, &agent, None, machine_b, &[], &[], false),
             UnattestedAttribution::Allow,
-            "after restart, a machine known only from the cache is not attributed"
+            "after restart a machine known only from the previous cache is not attributed"
         );
     }
 
@@ -6828,7 +7090,7 @@ mod tests {
                     _ => panic!("payload"),
                 },
                 machine,
-                true,
+                PayloadOrigin::Retained,
                 sender.public_key().as_bytes().to_vec(),
                 false,
             )
@@ -6853,7 +7115,7 @@ mod tests {
                     _ => panic!("payload"),
                 },
                 machine,
-                true,
+                PayloadOrigin::Retained,
                 sender.public_key().as_bytes().to_vec(),
                 false,
             )

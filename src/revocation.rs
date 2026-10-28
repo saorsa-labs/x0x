@@ -1083,20 +1083,41 @@ impl RevocationSet {
     /// pairings, read from the per-agent index. Callers use it to attribute
     /// a machine revocation to an agent (#1659). It does not itself mean
     /// the machine is revoked.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn binding_tombstone_machines(&self, agent: &AgentId) -> Vec<MachineId> {
-        let mut machines = Vec::new();
+        let mut machines = HashSet::new();
         if let Some(set) = self.binding_machines_by_agent.get(agent) {
             machines.extend(set.iter().copied());
         }
         if let Some(set) = self.bundle_machines_by_agent.get(agent) {
-            for machine in set {
-                if !machines.contains(machine) {
-                    machines.push(*machine);
-                }
-            }
+            machines.extend(set.iter().copied());
         }
-        machines
+        machines.into_iter().collect()
+    }
+
+    /// Whether any tombstone for `agent` names a revoked machine.
+    ///
+    /// Walks the two per-agent sets directly and returns on the first hit.
+    /// Callers that already hold the revocation lock use this instead of
+    /// building a deduplicated list.
+    #[must_use]
+    pub(crate) fn any_tombstone_machine_revoked(&self, agent: &AgentId) -> bool {
+        self.binding_machines_by_agent
+            .get(agent)
+            .is_some_and(|machines| {
+                machines
+                    .iter()
+                    .any(|machine| self.revoked_machines.contains(machine))
+            })
+            || self
+                .bundle_machines_by_agent
+                .get(agent)
+                .is_some_and(|machines| {
+                    machines
+                        .iter()
+                        .any(|machine| self.revoked_machines.contains(machine))
+                })
     }
 
     /// Whether an `(agent, machine)` binding is retired (ADR-0043 check
@@ -3941,6 +3962,53 @@ mod tests {
             set2.binding_tombstone_machines(&binding.agent),
             vec![crate::identity::MachineId([9u8; 32])],
             "resetting bundle tombstones must drop machines the index still named"
+        );
+    }
+
+    /// Many tombstones stay a linear short-circuit. One revoked machine among
+    /// hundreds is enough. Duplicate names across the two indexes count once.
+    #[test]
+    fn many_tombstones_short_circuit_when_one_machine_is_revoked() {
+        let agent = AgentId([0x71; 32]);
+        let machine_kp = MachineKeypair::generate().unwrap();
+        let revoked = machine_kp.machine_id();
+        let mut bindings = Vec::with_capacity(512);
+        for i in 0..511u32 {
+            let mut id = [0xABu8; 32];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            bindings.push(AgentMachineBinding {
+                agent,
+                machine: MachineId(id),
+                move_epoch: 1,
+            });
+        }
+        bindings.push(AgentMachineBinding {
+            agent,
+            machine: revoked,
+            move_epoch: 2,
+        });
+        let mut set = RevocationSet::new();
+        assert!(set.union_bundle_retired(&bindings));
+        // The same machine in both indexes must not change the answer.
+        let record = RevocationRecord::sign(
+            RevokedSubject::Machine(revoked),
+            machine_kp.public_key(),
+            machine_kp.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        assert!(set.verify_and_insert(record, None).unwrap());
+        assert!(set.any_tombstone_machine_revoked(&agent));
+        assert!(!set.any_tombstone_machine_revoked(&AgentId([0x72; 32])));
+        assert_eq!(set.binding_tombstone_machines(&agent).len(), 512);
+        let mut listed = set.binding_tombstone_machines(&agent);
+        listed.sort_by_key(|id| id.0);
+        listed.dedup();
+        assert_eq!(
+            listed.len(),
+            512,
+            "the two indexes must not duplicate a machine"
         );
     }
 

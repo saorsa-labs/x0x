@@ -80,19 +80,29 @@ and the compatibility gossip bus both use that function.
 The inbox attributes these machines to the sender:
 
 - every verified machine the authenticated-binding cache has accepted for
-  the sender. That includes the retained binding, a machine a later
-  binding replaced, and a verified machine that lost timestamp selection.
-  LRU eviction drops the retained entry and does not drop this set. The
-  set is capped at 8 machines per agent, 65,536 pairs per cache, and
-  4,096 named overflowed agents. An agent whose next machine does not
-  fit is overflowed. That agent fails closed for an unattested DM or
-  ACK only when the inbox already holds a machine revocation for that
-  agent. A sender with no machine revocation stays accepted. Filling
-  the name list does not refuse every sender. A valid attestation is
-  still accepted. The set is process memory. Overflow lasts until
-  process restart. The daemon does not persist the set. Rebuilding a
-  replaced machine from disk would need a new stored format, which this
-  rule does not add.
+  the sender. The cache records a machine only after that DM's attestation
+  verifies and the revocation, pairing, and trust checks admit the DM. A
+  refused DM does not take a slot. The set includes the retained binding,
+  a machine a later binding replaced, and a verified machine that lost
+  timestamp selection. LRU eviction drops the retained entry and does not
+  drop this set. One agent can record 8 machines. The cache holds 65,536
+  pairs. Agents that are not Trusted or Known contacts share 4,096 of
+  those pairs, so one sender's throwaway peers cannot fill the cache.
+  Trusted and Known contacts still record until the 65,536 pair cap.
+  4,096 overflowed agents can be named. A machine that does not fit is
+  not recorded. Overflow does not refuse an unattested DM or ACK by
+  itself. A revocation of an unrecorded machine is not attributed, and
+  an unattested DM that claims a clean machine can still be accepted.
+  That loss of attribution is a residual. A valid attestation is still
+  accepted. The set is process memory. It lasts until process restart.
+  The daemon does not persist the set. Rebuilding a replaced machine
+  from disk would need a new stored format, which this rule does not add.
+  When the stranger budget or the name list fills, the cache emits a
+  rate-limited warning that includes the overflow counts. Operators read
+  that warning. `incoming_dropped_attribution_overflow` on
+  `GET /diagnostics/dm` counts a different event: an unattested DM refused
+  because an already-attributed machine is revoked and the sender's set
+  has also overflowed. It does not mean a machine past the cap was refused.
 - a machine on the sender's contact
 - a machine named by a binding tombstone for that agent (indexed by agent)
 - the machine the envelope claims
@@ -119,9 +129,16 @@ tombstones, the claimed machine, and a retained binding that has been
 rebuilt in this process still count. Those records already persist.
 The accepted-machine history does not.
 
+Cap residual. A machine past the per-agent cap of 8, or past the stranger
+budget, is not in the accepted set. Revoking that machine does not make
+an unattested DM fail. An unattested DM that claims a clean machine this
+receiver still attributes can be accepted.
+
 An attacker who holds the agent key can mint a fresh machine and a
-valid attestation. This check does not stop that DM. The remedy is an
-agent revocation or a binding tombstone.
+valid attestation. This check does not stop that DM. A binding tombstone
+blocks only the named agent-and-machine pair. The attacker can still
+attest from another machine. Containing an agent-key compromise requires
+an agent revocation.
 
 The relay `DeliverLocally` path (`RelayDisposition::DeliverLocally` in
 `src/lib.rs`) takes the envelope's claimed machine and does not apply this
