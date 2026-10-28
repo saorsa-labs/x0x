@@ -88,16 +88,19 @@ async fn expired_post_dial_read_uses_contact_card() -> Result<(), Box<dyn std::e
         machines: Vec::new(),
         dm_capabilities: Some(dm::DmCapabilities::v1_gossip_ready(kem.public_bytes)),
     });
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let signal = Arc::clone(&entered);
+    let hold_taken = Arc::new(AtomicBool::new(false));
+    let hold_flag = Arc::clone(&hold_taken);
     let dial_started = Arc::new(AtomicBool::new(false));
     let dial_flag = Arc::clone(&dial_started);
     let (hold, hold_rx) = std::sync::mpsc::channel();
     let (release, release_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         if hold_rx.recv().is_ok() {
+            // The delayed writer is part of the test: the handshake below
+            // must not depend on this thread winning any race.
+            std::thread::sleep(Duration::from_millis(50));
             let _held = store.hold_state_for_testing();
-            signal.notify_one();
+            hold_flag.store(true, Ordering::SeqCst);
             let _ = release_rx.recv();
         }
     });
@@ -133,12 +136,17 @@ async fn expired_post_dial_read_uses_contact_card() -> Result<(), Box<dyn std::e
     }
     // The dial now stalls inside the hook; only the writer thread's hold
     // handshake remains, and nothing may re-poll `send` while it happens.
-    // The select! this replaces re-polled `send` on every wake, and
-    // paused-time auto-advance then spent the 3 s dial cap and the 500 ms
-    // fallback budget before the hold was visible (the Coverage Gate
-    // flake). Un-polled, `send` cannot move; its only completion path is
-    // blocked by the held store mutex.
-    let _ = entered.notified().await;
+    // The handshake must also keep the runtime out of park: a parked
+    // current-thread runtime auto-advances paused time through every
+    // registered timer (the 3 s dial cap, then the whole-send deadline)
+    // while the delayed writer makes progress, and the first poll below
+    // then finds the send already expired. A task that yields in a loop is
+    // always runnable, so the runtime never parks: virtual time freezes
+    // for the whole handshake while real time lets the writer take the
+    // hold.
+    while !hold_taken.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
     tokio::time::advance(Duration::from_secs(3) + Duration::from_millis(1)).await;
     assert!(futures::poll!(&mut send).is_pending());
     tokio::time::advance(publish_config().timeout_per_attempt + Duration::from_millis(1)).await;
