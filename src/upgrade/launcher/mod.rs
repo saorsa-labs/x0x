@@ -25,6 +25,11 @@ pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
 pub(crate) fn candidate_boot_for_fixture(version: &str) -> io::Result<()> {
     child::candidate_boot_owned(version)
 }
+mod control;
+mod recovery;
+pub(crate) fn fixture_receipt(request: &[u8]) -> io::Result<serde_json::Value> {
+    control::fixture_receipt(request)
+}
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
