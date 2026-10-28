@@ -3583,9 +3583,10 @@ reaper counters:
 ### `GET /diagnostics/dm`
 
 `stats.incoming_dropped_revoked` counts DMs and ACKs dropped because the
-sender's agent or an attributed machine is revoked. An unattested refusal
-where the attribution set has also overflowed is not a field of this
-object. The daemon counts it internally and emits a rate-limited warning.
+sender's agent is revoked, or because a machine this cache still
+attributes to that sender is revoked. An unattested message refused only
+because the attribution set overflowed is not part of this counter. The
+daemon counts that refusal internally and emits a rate-limited warning.
 Stranger-budget eviction is the same kind of warning. A machine past the
 per-agent cap is not recorded, and a revocation of that machine does not
 move `incoming_dropped_revoked` for an unattested DM or ACK that claims

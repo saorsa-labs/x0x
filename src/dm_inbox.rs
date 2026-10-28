@@ -133,14 +133,21 @@ const AUTHENTICATED_MACHINE_BINDING_CAPACITY: usize = 65_536;
 /// #1659: verified machines remembered for one agent. One more marks that
 /// agent overflowed and does not grow the set.
 const ACCEPTED_MACHINES_PER_AGENT: usize = 8;
-/// #1659: (agent, machine) pairs in one cache. A further pair marks that
-/// agent overflowed and does not evict another agent's pairs.
+/// #1659: (agent, machine) pairs in one cache. The cap is three shares:
+/// Trusted or Known contacts, protected non-contacts, and strangers.
 const ACCEPTED_MACHINE_PAIR_CAPACITY: usize = 65_536;
-/// Pairs that agents who are not Trusted or Known contacts may record.
-/// The pool is a bounded LRU. A new stranger pair evicts the least-recently
-/// used stranger pair. It does not evict a contact pair, and it does not
-/// fill [`ACCEPTED_MACHINE_PAIR_CAPACITY`].
+/// Stranger share of [`ACCEPTED_MACHINE_PAIR_CAPACITY`]. A new stranger
+/// pair evicts the least-recently used stranger pair. It does not evict a
+/// contact pair or a protected non-contact pair. This share stays available
+/// when the other shares are full. A stranger flood that evicts a stranger
+/// pair drops attribution for that machine. That loss is a residual.
 const ACCEPTED_MACHINE_STRANGER_PAIRS: usize = 4_096;
+/// Protected non-contact share of [`ACCEPTED_MACHINE_PAIR_CAPACITY`].
+/// A member of a group whose admission needs an invite or approval, or a
+/// grant party, uses this share when that peer is not a Trusted or Known
+/// contact. OpenJoin membership does not. A new pair past this share evicts
+/// the least-recently used pair in this share. It does not take a contact pair.
+const ACCEPTED_MACHINE_PROTECTED_PAIRS: usize = 16_384;
 /// #1659: agents that can be named as overflowed. A further agent is
 /// counted and is not a reason to refuse any other sender.
 const ACCEPTED_MACHINE_OVERFLOW_AGENTS: usize = 4_096;
@@ -160,22 +167,14 @@ pub(crate) struct AuthenticatedMachineBinding {
     last_used: (std::time::Instant, u64),
 }
 
-/// Bounded LRU cache of authenticated agent→machine bindings.
+/// Group, grant, or contact check for attribution.
 ///
-/// Bindings survive reachability-cache eviction and are refreshed by accepted
-/// identity announcements and inbound DMs. At the generous capacity ceiling,
-/// the least-recently-used binding is evicted and every eviction is logged;
-/// subsequent DMs from that agent degrade to the observable claim fallback.
-///
-/// When `set_change_notify` is installed, every mutation that changes
-/// a retained machine, its expiry metadata, or drops a binding (clear /
-/// eviction) wakes ADR-0074 §4 stream reauth — including the DM attestation
-/// writer `record_authenticated_machine_binding`.
-///
-/// Group-member and grant-party check for attribution. `Some(true)` keeps
-/// that agent's pairs out of the stranger LRU, the same way a Trusted or
-/// Known contact does. `None` means the check could not run; callers keep
-/// the flag already stored. The closure must not lock this cache.
+/// `Some(true)` means the peer is a protected non-contact: a member of a
+/// group whose admission needs an invite or approval, or a grant party.
+/// OpenJoin membership is not protection. `Some(false)` means the peer is
+/// a stranger unless the caller also has a Trusted or Known contact.
+/// `None` means the check could not run; callers keep the standing already
+/// stored. The closure must not lock this cache.
 #[derive(Clone)]
 pub(crate) struct AttributionRelationshipProbe {
     inner: std::sync::Arc<dyn Fn(AgentId) -> Option<bool> + Send + Sync>,
@@ -188,6 +187,8 @@ impl std::fmt::Debug for AttributionRelationshipProbe {
 }
 
 impl AttributionRelationshipProbe {
+    /// Test probe that always answers. Production installs [`Self::from_answer`].
+    #[cfg(test)]
     pub(crate) fn from_fn(probe: impl Fn(AgentId) -> bool + Send + Sync + 'static) -> Self {
         Self::from_answer(move |agent_id| Some(probe(agent_id)))
     }
@@ -205,25 +206,100 @@ impl AttributionRelationshipProbe {
     }
 }
 
+/// Who pays for an attributed pair inside the 65,536 cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttributionStanding {
+    /// Trusted or Known contact. Pairs use the contact share.
+    Contact,
+    /// Invite-or-approval group member, or a grant party, who is not a contact.
+    /// Pairs use the protected share.
+    Protected,
+    /// Everyone else, including an OpenJoin co-member. Pairs use the stranger share.
+    Stranger,
+}
+
+/// What the relationship probe returned before a standing is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttributionProbeView {
+    /// No probe is installed. A library embedder without `x0xd` is this case.
+    /// Only a Trusted or Known contact is protected.
+    Absent,
+    /// The probe could not answer. Keep the standing already stored.
+    Unknown,
+    /// Group admission needs an invite or approval, or a grant is live.
+    Related,
+    /// The probe ran and the peer is not a protected non-contact.
+    Unrelated,
+}
+
+/// Contact trust wins. A definite probe answer is next. An unknown answer
+/// keeps `current`, including contact protection that a busy lock must not clear.
+pub(crate) fn standing_from_probe(
+    contact: bool,
+    probe: AttributionProbeView,
+    current: AttributionStanding,
+) -> AttributionStanding {
+    if contact {
+        return AttributionStanding::Contact;
+    }
+    match probe {
+        AttributionProbeView::Related => AttributionStanding::Protected,
+        AttributionProbeView::Unrelated | AttributionProbeView::Absent => {
+            AttributionStanding::Stranger
+        }
+        AttributionProbeView::Unknown => current,
+    }
+}
+
+pub(crate) fn probe_view(
+    probe: Option<&AttributionRelationshipProbe>,
+    agent_id: AgentId,
+) -> AttributionProbeView {
+    match probe {
+        None => AttributionProbeView::Absent,
+        Some(probe) => match probe.answer(agent_id) {
+            Some(true) => AttributionProbeView::Related,
+            Some(false) => AttributionProbeView::Unrelated,
+            None => AttributionProbeView::Unknown,
+        },
+    }
+}
+
+/// Bounded LRU cache of authenticated agent→machine bindings.
+///
+/// Bindings survive reachability-cache eviction and are refreshed by accepted
+/// identity announcements and inbound DMs. At the generous capacity ceiling,
+/// the least-recently-used binding is evicted and every eviction is logged;
+/// subsequent DMs from that agent degrade to the observable claim fallback.
+///
+/// When `set_change_notify` is installed, every mutation that changes
+/// a retained machine, its expiry metadata, or drops a binding (clear /
+/// eviction) wakes ADR-0074 §4 stream reauth — including the DM attestation
+/// writer `record_authenticated_machine_binding`.
+///
 /// `accepted_machines` is the #1659 attribution memory. An identity
 /// announcement records its machine when the announcement is accepted. A
 /// DM records its machine only after decryption succeeds. An ACK records
 /// its machine only after the trust check admits it and a waiter matches.
 /// The set includes the retained binding, a machine a later binding
 /// replaced, and a verified machine that lost timestamp selection. Evicting
-/// a retained binding does not drop the set. Stranger pairs are a bounded
-/// LRU of 4,096: a new stranger pair evicts the least-recently used
-/// stranger pair, and that evicted machine is no longer attributed. A
-/// Trusted or Known contact, a group member, or a grant party is not in
-/// that pool, and a stranger insert does not evict one of them.
-/// Downgrading or removing that privilege moves those pairs into the
-/// stranger pool. One agent can record 8 machines. A further machine is
-/// not recorded while the agent is at that cap. After a stranger eviction
-/// frees a slot, a later admitted machine is recorded again. The cache
-/// holds 65,536 pairs. A machine past the per-agent cap is not recorded.
-/// That loss of attribution is a residual. The set is process memory. A
-/// restart, including a self-update restart, drops it. An undecryptable
-/// DM can move the retained binding and does not admit that machine.
+/// a retained binding does not drop the set. The 65,536 pairs are three
+/// shares. Trusted or Known contacts use the remainder after the other two
+/// shares. Protected non-contacts (a group whose admission needs an invite
+/// or approval, or a grant party) use 16,384 pairs. Strangers, including
+/// OpenJoin co-members, use 4,096 pairs. A new pair past a non-contact
+/// share evicts the least-recently used pair in that share. It does not
+/// evict a contact pair. The stranger share stays available when the other
+/// shares are full. A stranger flood that evicts a stranger pair is a
+/// residual. Standing is chosen again on every record and on every contact
+/// change. Dropping or downgrading a contact keeps protection that still
+/// comes from a qualifying group or a grant. One agent can record 8
+/// machines. A further machine is not recorded while the agent is at that
+/// cap. After an eviction frees a slot, a later admitted machine is
+/// recorded again. A machine past the per-agent cap is not recorded. That
+/// loss of attribution is a residual. The set is process memory. A restart,
+/// including a self-update restart, drops it. An undecryptable DM can move
+/// the retained binding and does not admit that machine.
 #[derive(Debug)]
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
@@ -234,18 +310,21 @@ pub struct AuthenticatedMachineBindingCache {
     /// Agents whose verified history did not fit in the per-agent or pair cap.
     /// A machine past the cap is not in `accepted_machines`.
     overflowed_agents: std::collections::HashSet<AgentId>,
-    /// Trusted or Known contacts, and peers the relationship probe names
-    /// (group members and grant parties). Their pairs do not use the
-    /// stranger budget.
-    relationship_peers: std::collections::HashSet<AgentId>,
-    /// Group members and grant parties. Checked when a pair is recorded.
-    /// Absent means only the contact flag above protects a peer.
+    /// Trusted or Known contacts. Their pairs use the contact share.
+    contact_peers: std::collections::HashSet<AgentId>,
+    /// Protected non-contacts. Their pairs use the protected share.
+    protected_peers: std::collections::HashSet<AgentId>,
+    /// Bumped on every standing write. A stale resolve does not overwrite it.
+    relationship_epochs: std::collections::HashMap<AgentId, u64>,
+    /// Group and grant check. Absent means only a contact is protected.
     relationship_probe: Option<AttributionRelationshipProbe>,
     attribution_pairs_len: usize,
     attribution_stranger_pairs_len: usize,
+    attribution_protected_pairs_len: usize,
     attribution_per_agent: usize,
     attribution_pairs: usize,
     attribution_stranger_pairs: usize,
+    attribution_protected_pairs: usize,
     attribution_overflow_agents: usize,
     /// Agents that overflowed after the name list was full.
     attribution_unnamed_overflows: u64,
@@ -254,10 +333,14 @@ pub struct AuthenticatedMachineBindingCache {
     attribution_stranger_overflows: u64,
     /// Last attribution-cap warning, monotonic milliseconds. One cache.
     attribution_overflow_warn_ms: u64,
-    /// Least-recently used stranger pairs. Contacts are not in this order.
+    /// Least-recently used stranger pairs. Contacts and protected peers are not in this order.
     stranger_order: std::collections::BTreeSet<(u64, [u8; 32], [u8; 32])>,
     stranger_index: std::collections::HashMap<([u8; 32], [u8; 32]), u64>,
     stranger_clock: u64,
+    /// Least-recently used protected non-contact pairs.
+    protected_order: std::collections::BTreeSet<(u64, [u8; 32], [u8; 32])>,
+    protected_index: std::collections::HashMap<([u8; 32], [u8; 32]), u64>,
+    protected_clock: u64,
     capacity: usize,
     recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
@@ -272,13 +355,17 @@ impl Default for AuthenticatedMachineBindingCache {
             by_machine: Default::default(),
             accepted_machines: std::collections::HashMap::new(),
             overflowed_agents: std::collections::HashSet::new(),
-            relationship_peers: std::collections::HashSet::new(),
+            contact_peers: std::collections::HashSet::new(),
+            protected_peers: std::collections::HashSet::new(),
+            relationship_epochs: std::collections::HashMap::new(),
             relationship_probe: None,
             attribution_pairs_len: 0,
             attribution_stranger_pairs_len: 0,
+            attribution_protected_pairs_len: 0,
             attribution_per_agent: ACCEPTED_MACHINES_PER_AGENT,
             attribution_pairs: ACCEPTED_MACHINE_PAIR_CAPACITY,
             attribution_stranger_pairs: ACCEPTED_MACHINE_STRANGER_PAIRS,
+            attribution_protected_pairs: ACCEPTED_MACHINE_PROTECTED_PAIRS,
             attribution_overflow_agents: ACCEPTED_MACHINE_OVERFLOW_AGENTS,
             attribution_unnamed_overflows: 0,
             attribution_stranger_overflows: 0,
@@ -286,6 +373,9 @@ impl Default for AuthenticatedMachineBindingCache {
             stranger_order: std::collections::BTreeSet::new(),
             stranger_index: std::collections::HashMap::new(),
             stranger_clock: 0,
+            protected_order: std::collections::BTreeSet::new(),
+            protected_index: std::collections::HashMap::new(),
+            protected_clock: 0,
             recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
@@ -311,13 +401,17 @@ impl AuthenticatedMachineBindingCache {
             by_machine: Default::default(),
             accepted_machines: std::collections::HashMap::new(),
             overflowed_agents: std::collections::HashSet::new(),
-            relationship_peers: std::collections::HashSet::new(),
+            contact_peers: std::collections::HashSet::new(),
+            protected_peers: std::collections::HashSet::new(),
+            relationship_epochs: std::collections::HashMap::new(),
             relationship_probe: None,
             attribution_pairs_len: 0,
             attribution_stranger_pairs_len: 0,
+            attribution_protected_pairs_len: 0,
             attribution_per_agent: ACCEPTED_MACHINES_PER_AGENT,
             attribution_pairs: ACCEPTED_MACHINE_PAIR_CAPACITY,
             attribution_stranger_pairs: ACCEPTED_MACHINE_STRANGER_PAIRS,
+            attribution_protected_pairs: ACCEPTED_MACHINE_PROTECTED_PAIRS,
             attribution_overflow_agents: ACCEPTED_MACHINE_OVERFLOW_AGENTS,
             attribution_unnamed_overflows: 0,
             attribution_stranger_overflows: 0,
@@ -325,6 +419,9 @@ impl AuthenticatedMachineBindingCache {
             stranger_order: std::collections::BTreeSet::new(),
             stranger_index: std::collections::HashMap::new(),
             stranger_clock: 0,
+            protected_order: std::collections::BTreeSet::new(),
+            protected_index: std::collections::HashMap::new(),
+            protected_clock: 0,
             recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
@@ -355,6 +452,10 @@ impl AuthenticatedMachineBindingCache {
         self.attribution_per_agent = per_agent.max(1);
         self.attribution_pairs = pairs.max(1);
         self.attribution_overflow_agents = overflow_agents.max(1);
+        // A lowered pair cap in tests is a contact-and-stranger budget.
+        // The protected share is set with its own helper so it does not
+        // consume the contact remainder.
+        self.attribution_protected_pairs = 0;
     }
 
     /// Machines this cache has accepted for `agent_id`.
@@ -377,27 +478,190 @@ impl AuthenticatedMachineBindingCache {
         self.overflowed_agents.contains(agent_id)
     }
 
-    /// Mark or clear eviction protection for `agent_id`.
+    /// Mark or clear contact protection for `agent_id`.
     ///
-    /// A downgrade or removal moves that agent's pairs into the stranger
-    /// pool, which may evict the least-recently used stranger pair. A
-    /// promotion takes those pairs out of the pool. Stranger inserts never
-    /// evict a pair while this flag is set. Callers set the flag for a
-    /// Trusted or Known contact, a group member, or a grant party.
+    /// `true` is the contact share. `false` moves that agent's pairs into
+    /// the stranger share, which may evict the least-recently used stranger
+    /// pair. A group or grant that should survive a contact downgrade uses
+    /// [`Self::set_standing`] through [`set_resolved_attribution_standing`].
     pub(crate) fn set_relationship_peer(&mut self, agent_id: AgentId, relationship: bool) {
-        if relationship {
-            if self.relationship_peers.insert(agent_id) {
-                self.reclassify_as_contact(agent_id);
-            }
-        } else if self.relationship_peers.remove(&agent_id) {
-            self.reclassify_as_stranger(agent_id);
+        self.set_standing(
+            agent_id,
+            if relationship {
+                AttributionStanding::Contact
+            } else {
+                AttributionStanding::Stranger
+            },
+        );
+    }
+
+    pub(crate) fn standing_of(&self, agent_id: AgentId) -> AttributionStanding {
+        if self.contact_peers.contains(&agent_id) {
+            AttributionStanding::Contact
+        } else if self.protected_peers.contains(&agent_id) {
+            AttributionStanding::Protected
+        } else {
+            AttributionStanding::Stranger
         }
+    }
+
+    pub(crate) fn relationship_epoch(&self, agent_id: AgentId) -> u64 {
+        self.relationship_epochs
+            .get(&agent_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Apply `standing` and bump the epoch so an older resolve cannot overwrite it.
+    pub(crate) fn set_standing(&mut self, agent_id: AgentId, standing: AttributionStanding) {
+        let epoch = self.relationship_epoch(agent_id).saturating_add(1);
+        self.relationship_epochs.insert(agent_id, epoch);
+        self.apply_standing(agent_id, standing);
+    }
+
+    /// Apply `standing` only when no later write has bumped the epoch.
+    pub(crate) fn set_standing_if_epoch(
+        &mut self,
+        agent_id: AgentId,
+        standing: AttributionStanding,
+        epoch: u64,
+    ) -> bool {
+        if self.relationship_epoch(agent_id) != epoch {
+            return false;
+        }
+        self.set_standing(agent_id, standing);
+        true
+    }
+
+    fn apply_standing(&mut self, agent_id: AgentId, standing: AttributionStanding) {
+        let current = self.standing_of(agent_id);
+        if current == standing {
+            return;
+        }
+        self.detach_pairs(agent_id, current);
+        match standing {
+            AttributionStanding::Contact => {
+                self.contact_peers.insert(agent_id);
+            }
+            AttributionStanding::Protected => {
+                self.protected_peers.insert(agent_id);
+                self.attach_pairs(agent_id, standing);
+            }
+            AttributionStanding::Stranger => self.attach_pairs(agent_id, standing),
+        }
+    }
+
+    fn detach_pairs(&mut self, agent_id: AgentId, current: AttributionStanding) {
+        match current {
+            AttributionStanding::Contact => {
+                self.contact_peers.remove(&agent_id);
+            }
+            AttributionStanding::Protected => {
+                self.protected_peers.remove(&agent_id);
+                self.forget_protected(agent_id);
+            }
+            AttributionStanding::Stranger => self.forget_stranger(agent_id),
+        }
+    }
+
+    fn attach_pairs(&mut self, agent_id: AgentId, standing: AttributionStanding) {
+        let (_contact_cap, protected_cap, stranger_cap) = self.share_caps();
+        for machine in self.machines_accepted_for(&agent_id) {
+            match standing {
+                AttributionStanding::Protected => {
+                    self.touch_protected(agent_id, machine);
+                    self.attribution_protected_pairs_len += 1;
+                }
+                AttributionStanding::Stranger => {
+                    self.touch_stranger(agent_id, machine);
+                    self.attribution_stranger_pairs_len += 1;
+                }
+                AttributionStanding::Contact => {}
+            }
+        }
+        match standing {
+            AttributionStanding::Protected => {
+                while self.attribution_protected_pairs_len > protected_cap {
+                    if !self.evict_lru_protected() {
+                        break;
+                    }
+                    self.warn_attribution_pressure(agent_id);
+                }
+            }
+            AttributionStanding::Stranger => {
+                while self.attribution_stranger_pairs_len > stranger_cap {
+                    if !self.evict_lru_stranger() {
+                        break;
+                    }
+                    self.warn_attribution_pressure(agent_id);
+                }
+            }
+            AttributionStanding::Contact => {}
+        }
+    }
+
+    fn forget_stranger(&mut self, agent_id: AgentId) {
+        for machine in self.machines_accepted_for(&agent_id) {
+            let key = (agent_id.0, machine.0);
+            if let Some(seq) = self.stranger_index.remove(&key) {
+                self.stranger_order.remove(&(seq, key.0, key.1));
+                self.attribution_stranger_pairs_len =
+                    self.attribution_stranger_pairs_len.saturating_sub(1);
+            }
+        }
+    }
+
+    fn forget_protected(&mut self, agent_id: AgentId) {
+        for machine in self.machines_accepted_for(&agent_id) {
+            let key = (agent_id.0, machine.0);
+            if let Some(seq) = self.protected_index.remove(&key) {
+                self.protected_order.remove(&(seq, key.0, key.1));
+                self.attribution_protected_pairs_len =
+                    self.attribution_protected_pairs_len.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Contact remainder, protected limit, and stranger limit.
+    ///
+    /// The protected and stranger numbers are the class limits. A full class
+    /// evicts inside itself. The contact number is what remains of the pair
+    /// cap after those two shares are reserved, so a full contact share still
+    /// leaves the stranger share available.
+    ///
+    /// A class limit larger than the pair cap is a test budget. It does not
+    /// reserve the whole cap, so contacts still fit. The global pair cap
+    /// refuses the extra pairs, and that class does not evict until it
+    /// reaches its own limit.
+    fn share_caps(&self) -> (usize, usize, usize) {
+        let total = self.attribution_pairs.max(1);
+        let stranger_limit = self.attribution_stranger_pairs.max(1);
+        let protected_limit = self.attribution_protected_pairs;
+        let shares_fit = stranger_limit.saturating_add(protected_limit) <= total;
+        let stranger_reserved = if shares_fit { stranger_limit } else { 0 };
+        let protected_reserved = if shares_fit { protected_limit } else { 0 };
+        let contact = total
+            .saturating_sub(stranger_reserved)
+            .saturating_sub(protected_reserved);
+        (contact, protected_limit, stranger_limit)
+    }
+
+    fn contact_pairs_len(&self) -> usize {
+        self.attribution_pairs_len
+            .saturating_sub(self.attribution_stranger_pairs_len)
+            .saturating_sub(self.attribution_protected_pairs_len)
     }
 
     /// Lower the stranger-pair budget. Call this before any stranger `record`.
     #[cfg(test)]
     pub(crate) fn set_stranger_pair_limit_for_test(&mut self, pairs: usize) {
         self.attribution_stranger_pairs = pairs.max(1);
+    }
+
+    /// Lower the protected non-contact budget. Call this before any protected `record`.
+    #[cfg(test)]
+    pub(crate) fn set_protected_pair_limit_for_test(&mut self, pairs: usize) {
+        self.attribution_protected_pairs = pairs;
     }
 
     /// Overflowed agents that could not be named because the name list was full.
@@ -419,69 +683,67 @@ impl AuthenticatedMachineBindingCache {
     }
 
     /// Install the group-member and grant-party check. Replaces any
-    /// previous probe. The probe does not by itself move stored pairs;
-    /// the next record applies it through [`Self::set_relationship_peer`].
+    /// previous probe. The probe does not by itself move stored pairs.
+    /// The next record, and every contact change, applies it.
     pub(crate) fn install_relationship_probe(&mut self, probe: AttributionRelationshipProbe) {
         self.relationship_probe = Some(probe);
     }
 
-    /// Whether `agent_id` is a group member or a grant party.
-    ///
-    /// `None` means the probe could not answer. No probe means the agent
-    /// is not protected by this check.
-    pub(crate) fn protected_relationship(&self, agent_id: AgentId) -> Option<bool> {
-        self.relationship_probe
-            .as_ref()
-            .map(|probe| probe.answer(agent_id))
-            .unwrap_or(Some(false))
+    /// Contact trust, or the probe, or the standing already stored when the
+    /// probe cannot answer. A busy lock must not clear protection.
+    #[cfg(test)]
+    pub(crate) fn resolve_relationship(&self, agent_id: AgentId, contact: bool) -> bool {
+        !matches!(
+            self.resolve_standing(agent_id, contact),
+            AttributionStanding::Stranger
+        )
     }
 
-    /// Contact trust, or the probe, or the flag already stored when the
-    /// probe cannot answer. A busy lock must not clear protection.
-    pub(crate) fn resolve_relationship(&self, agent_id: AgentId, contact: bool) -> bool {
-        if contact {
-            return true;
-        }
-        match self.protected_relationship(agent_id) {
-            Some(answer) => answer,
-            None => self.relationship_peers.contains(&agent_id),
-        }
+    #[cfg(test)]
+    pub(crate) fn resolve_standing(&self, agent_id: AgentId, contact: bool) -> AttributionStanding {
+        standing_from_probe(
+            contact,
+            probe_view(self.relationship_probe.as_ref(), agent_id),
+            self.standing_of(agent_id),
+        )
     }
 
     fn remember_accepted_machine(&mut self, agent_id: AgentId, machine_id: MachineId) {
-        let relationship = self.relationship_peers.contains(&agent_id);
+        let standing = self.standing_of(agent_id);
         if self
             .accepted_machines
             .get(&agent_id)
             .is_some_and(|machines| machines.contains(&machine_id))
         {
-            if !relationship {
-                self.touch_stranger(agent_id, machine_id);
-            }
+            self.touch_class(agent_id, machine_id, standing);
             return;
         }
         if self.agent_accepted_len(&agent_id) >= self.attribution_per_agent {
             self.mark_attribution_overflow(agent_id);
             return;
         }
-        if self.attribution_pairs_len >= self.attribution_pairs {
-            // A contact can take a stranger slot. A stranger cannot take a
-            // contact slot, and one contact cannot evict another.
-            let freed = relationship && self.evict_lru_stranger();
+        let (contact_cap, protected_cap, stranger_cap) = self.share_caps();
+        let class_full = match standing {
+            AttributionStanding::Contact => self.contact_pairs_len() >= contact_cap,
+            AttributionStanding::Protected => self.attribution_protected_pairs_len >= protected_cap,
+            AttributionStanding::Stranger => self.attribution_stranger_pairs_len >= stranger_cap,
+        };
+        if class_full {
+            let freed = match standing {
+                AttributionStanding::Stranger => self.evict_lru_stranger(),
+                AttributionStanding::Protected => self.evict_lru_protected(),
+                AttributionStanding::Contact => false,
+            };
             if !freed {
+                if standing == AttributionStanding::Stranger {
+                    self.attribution_stranger_overflows =
+                        self.attribution_stranger_overflows.saturating_add(1);
+                }
+                self.warn_attribution_pressure(agent_id);
                 self.mark_attribution_overflow(agent_id);
                 return;
             }
-        }
-        if !relationship && self.attribution_stranger_pairs_len >= self.attribution_stranger_pairs {
-            if self.evict_lru_stranger() {
-                self.warn_attribution_pressure(agent_id);
-            } else {
-                self.attribution_stranger_overflows =
-                    self.attribution_stranger_overflows.saturating_add(1);
-                self.warn_attribution_pressure(agent_id);
-                return;
-            }
+            self.warn_attribution_pressure(agent_id);
         }
         if self.agent_accepted_len(&agent_id) >= self.attribution_per_agent
             || self.attribution_pairs_len >= self.attribution_pairs
@@ -494,13 +756,28 @@ impl AuthenticatedMachineBindingCache {
             .or_default()
             .insert(machine_id);
         self.attribution_pairs_len += 1;
-        if !relationship {
-            self.touch_stranger(agent_id, machine_id);
-            self.attribution_stranger_pairs_len += 1;
+        self.touch_class(agent_id, machine_id, standing);
+        match standing {
+            AttributionStanding::Stranger => self.attribution_stranger_pairs_len += 1,
+            AttributionStanding::Protected => self.attribution_protected_pairs_len += 1,
+            AttributionStanding::Contact => {}
         }
         // A slot was free, so this agent can record again. The next
         // machine past the cap sets the overflow flag once more.
         self.overflowed_agents.remove(&agent_id);
+    }
+
+    fn touch_class(
+        &mut self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        standing: AttributionStanding,
+    ) {
+        match standing {
+            AttributionStanding::Stranger => self.touch_stranger(agent_id, machine_id),
+            AttributionStanding::Protected => self.touch_protected(agent_id, machine_id),
+            AttributionStanding::Contact => {}
+        }
     }
 
     fn agent_accepted_len(&self, agent_id: &AgentId) -> usize {
@@ -550,32 +827,43 @@ impl AuthenticatedMachineBindingCache {
         true
     }
 
-    fn reclassify_as_contact(&mut self, agent_id: AgentId) {
-        for machine in self.machines_accepted_for(&agent_id) {
-            let key = (agent_id.0, machine.0);
-            if let Some(seq) = self.stranger_index.remove(&key) {
-                self.stranger_order.remove(&(seq, key.0, key.1));
-                self.attribution_stranger_pairs_len =
-                    self.attribution_stranger_pairs_len.saturating_sub(1);
-            }
+    fn touch_protected(&mut self, agent_id: AgentId, machine_id: MachineId) {
+        let key = (agent_id.0, machine_id.0);
+        if let Some(seq) = self.protected_index.get(&key).copied() {
+            self.protected_order.remove(&(seq, key.0, key.1));
         }
+        self.protected_clock = self.protected_clock.saturating_add(1);
+        let seq = self.protected_clock;
+        self.protected_order.insert((seq, key.0, key.1));
+        self.protected_index.insert(key, seq);
     }
 
-    fn reclassify_as_stranger(&mut self, agent_id: AgentId) {
-        for machine in self.machines_accepted_for(&agent_id) {
-            let key = (agent_id.0, machine.0);
-            if self.stranger_index.contains_key(&key) {
-                continue;
-            }
-            self.touch_stranger(agent_id, machine);
-            self.attribution_stranger_pairs_len += 1;
+    /// Drop the least-recently used protected non-contact pair. Contact pairs stay.
+    fn evict_lru_protected(&mut self) -> bool {
+        let Some((seq, agent, machine)) = self.protected_order.iter().next().copied() else {
+            return false;
+        };
+        self.protected_order.remove(&(seq, agent, machine));
+        self.protected_index.remove(&(agent, machine));
+        let agent_id = AgentId(agent);
+        let machine_id = MachineId(machine);
+        let removed = self
+            .accepted_machines
+            .get_mut(&agent_id)
+            .is_some_and(|machines| machines.remove(&machine_id));
+        if self
+            .accepted_machines
+            .get(&agent_id)
+            .is_some_and(|machines| machines.is_empty())
+        {
+            self.accepted_machines.remove(&agent_id);
         }
-        while self.attribution_stranger_pairs_len > self.attribution_stranger_pairs {
-            if !self.evict_lru_stranger() {
-                break;
-            }
-            self.warn_attribution_pressure(agent_id);
+        if removed {
+            self.attribution_pairs_len = self.attribution_pairs_len.saturating_sub(1);
+            self.attribution_protected_pairs_len =
+                self.attribution_protected_pairs_len.saturating_sub(1);
         }
+        true
     }
 
     fn warn_attribution_pressure(&mut self, agent_id: AgentId) {
@@ -849,15 +1137,21 @@ impl AuthenticatedMachineBindingCache {
         self.by_machine.clear();
         self.accepted_machines.clear();
         self.overflowed_agents.clear();
-        self.relationship_peers.clear();
+        self.contact_peers.clear();
+        self.protected_peers.clear();
+        self.relationship_epochs.clear();
         self.attribution_pairs_len = 0;
         self.attribution_stranger_pairs_len = 0;
+        self.attribution_protected_pairs_len = 0;
         self.attribution_unnamed_overflows = 0;
         self.attribution_stranger_overflows = 0;
         self.attribution_overflow_warn_ms = 0;
         self.stranger_order.clear();
         self.stranger_index.clear();
         self.stranger_clock = 0;
+        self.protected_order.clear();
+        self.protected_index.clear();
+        self.protected_clock = 0;
         self.recency.clear();
         if had_state {
             self.notify_changed();
@@ -880,6 +1174,10 @@ impl AuthenticatedMachineBindingCache {
 pub type AuthenticatedMachineBindings = Arc<RwLock<AuthenticatedMachineBindingCache>>;
 
 /// Move `agent_id` into or out of the contact attribution pool.
+///
+/// `false` clears protection, including group and grant protection. Revocation
+/// and quarantine reblock use that. A contact downgrade that must keep a
+/// group or grant uses [`set_resolved_attribution_standing`].
 pub(crate) async fn set_attribution_relationship(
     bindings: &AuthenticatedMachineBindings,
     agent_id: AgentId,
@@ -889,6 +1187,40 @@ pub(crate) async fn set_attribution_relationship(
         .write()
         .await
         .set_relationship_peer(agent_id, relationship);
+}
+
+/// Re-evaluate contact trust and the relationship probe, then store the standing.
+///
+/// The probe runs before the bindings write lock. `contact` is the Trusted or
+/// Known bit the caller already read. Hold that contacts lock until this
+/// returns so a concurrent trust change cannot be overwritten by a stale bit.
+pub(crate) async fn set_resolved_attribution_standing(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: AgentId,
+    contact: bool,
+) {
+    with_resolved_standing(bindings, agent_id, contact, |_| ()).await;
+}
+
+/// [`set_resolved_attribution_standing`], then `body` under the same write lock.
+pub(crate) async fn with_resolved_standing<T>(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: AgentId,
+    contact: bool,
+    body: impl FnOnce(&mut AuthenticatedMachineBindingCache) -> T,
+) -> T {
+    let (probe, current, epoch) = {
+        let cache = bindings.read().await;
+        (
+            cache.relationship_probe.clone(),
+            cache.standing_of(agent_id),
+            cache.relationship_epoch(agent_id),
+        )
+    };
+    let standing = standing_from_probe(contact, probe_view(probe.as_ref(), agent_id), current);
+    let mut cache = bindings.write().await;
+    cache.set_standing_if_epoch(agent_id, standing, epoch);
+    body(&mut cache)
 }
 
 /// Install the group-member and grant-party check on the authenticated
@@ -1973,38 +2305,38 @@ async fn durable_history_logical_request(
 }
 
 impl InboxPipeline {
-    async fn sender_is_relationship(&self, agent: AgentId) -> bool {
-        let contact = {
-            let store = self.contacts.read().await;
-            store.get(&agent).is_some_and(|contact| {
-                matches!(
-                    contact.trust_level,
-                    crate::contacts::TrustLevel::Trusted | crate::contacts::TrustLevel::Known
-                )
-            })
-        };
-        self.authenticated_machine_bindings
-            .read()
-            .await
-            .resolve_relationship(agent, contact)
+    /// Hold the contacts lock across the probe and the standing write.
+    async fn with_sender_standing<T>(
+        &self,
+        agent: AgentId,
+        body: impl FnOnce(&mut AuthenticatedMachineBindingCache) -> T,
+    ) -> T {
+        let contacts = self.contacts.read().await;
+        let contact = contacts.get(&agent).is_some_and(|contact| {
+            matches!(
+                contact.trust_level,
+                crate::contacts::TrustLevel::Trusted | crate::contacts::TrustLevel::Known
+            )
+        });
+        with_resolved_standing(&self.authenticated_machine_bindings, agent, contact, body).await
     }
 
     /// Move the retained binding so a share-grant check sees this origin.
     /// Does not take an attribution slot.
     async fn refresh_admitted_origin(&self, agent: AgentId, machine: MachineId, announced_at: u64) {
-        let relationship = self.sender_is_relationship(agent).await;
-        let mut cache = self.authenticated_machine_bindings.write().await;
-        cache.set_relationship_peer(agent, relationship);
-        cache.refresh_retained_origin(agent, machine, announced_at);
+        self.with_sender_standing(agent, |cache| {
+            cache.refresh_retained_origin(agent, machine, announced_at);
+        })
+        .await;
     }
 
     /// Record attribution after decryption succeeded, or after an admitted
     /// ACK matched a waiter. A refused or undecryptable DM does not take a slot.
     async fn remember_admitted_origin(&self, agent: AgentId, machine: MachineId) {
-        let relationship = self.sender_is_relationship(agent).await;
-        let mut cache = self.authenticated_machine_bindings.write().await;
-        cache.set_relationship_peer(agent, relationship);
-        cache.remember_accepted_machine(agent, machine);
+        self.with_sender_standing(agent, |cache| {
+            cache.remember_accepted_machine(agent, machine);
+        })
+        .await;
     }
 
     /// Record the retained binding and attribution together. Used for an
@@ -2015,10 +2347,10 @@ impl InboxPipeline {
         machine: MachineId,
         announced_at: u64,
     ) {
-        let relationship = self.sender_is_relationship(agent).await;
-        let mut cache = self.authenticated_machine_bindings.write().await;
-        cache.set_relationship_peer(agent, relationship);
-        cache.record(agent, machine, announced_at);
+        self.with_sender_standing(agent, |cache| {
+            cache.record(agent, machine, announced_at);
+        })
+        .await;
     }
 
     /// #1659: how an unattested DM from `agent` is treated.
@@ -7860,6 +8192,105 @@ mod tests {
             !cache.resolve_relationship(agent, false),
             "a definite negative answer clears protection"
         );
+    }
+
+    /// Dropping contact trust keeps a probe that still says the peer is protected.
+    /// A later stranger flood does not evict that pair.
+    #[tokio::test]
+    async fn issue1659_contact_downgrade_keeps_probe_protection_through_stranger_flood() {
+        let member = AgentId([0x51; 32]);
+        let machine = MachineId([0x52; 32]);
+        let bindings = Arc::new(tokio::sync::RwLock::new(
+            AuthenticatedMachineBindingCache::default(),
+        ));
+        {
+            let mut cache = bindings.write().await;
+            cache.set_stranger_pair_limit_for_test(1);
+            cache.install_relationship_probe(AttributionRelationshipProbe::from_fn(move |agent| {
+                agent == member
+            }));
+        }
+        set_resolved_attribution_standing(&bindings, member, true).await;
+        record_authenticated_machine_binding(&bindings, member, machine, 1).await;
+        set_resolved_attribution_standing(&bindings, member, false).await;
+        record_authenticated_machine_binding(
+            &bindings,
+            AgentId([0x53; 32]),
+            MachineId([0x53; 32]),
+            2,
+        )
+        .await;
+        record_authenticated_machine_binding(
+            &bindings,
+            AgentId([0x54; 32]),
+            MachineId([0x54; 32]),
+            3,
+        )
+        .await;
+        let cache = bindings.read().await;
+        assert_eq!(cache.standing_of(member), AttributionStanding::Protected);
+        assert!(
+            cache.machines_accepted_for(&member).contains(&machine),
+            "group or grant protection survives a contact downgrade and a stranger flood"
+        );
+    }
+
+    /// Protected non-contacts have their own share. Filling it does not drop a contact.
+    /// The stranger share still accepts a pair after the contact share is full.
+    #[test]
+    fn issue1659_protected_share_cannot_take_contact_slots() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        cache.set_attribution_limits_for_test(8, 4, 4);
+        cache.set_stranger_pair_limit_for_test(1);
+        cache.set_protected_pair_limit_for_test(1);
+        let contact = AgentId([0x11; 32]);
+        cache.set_relationship_peer(contact, true);
+        cache.record(contact, MachineId([0x11; 32]), 1);
+        cache.record(contact, MachineId([0x12; 32]), 2);
+        let protected = AgentId([0x21; 32]);
+        cache.set_standing(protected, AttributionStanding::Protected);
+        cache.record(protected, MachineId([0x21; 32]), 3);
+        let sybil = AgentId([0x31; 32]);
+        cache.set_standing(sybil, AttributionStanding::Protected);
+        cache.record(sybil, MachineId([0x31; 32]), 4);
+        assert!(cache
+            .machines_accepted_for(&contact)
+            .contains(&MachineId([0x11; 32])));
+        assert!(cache
+            .machines_accepted_for(&contact)
+            .contains(&MachineId([0x12; 32])));
+        assert_eq!(cache.machines_accepted_for(&contact).len(), 2);
+        let stranger = AgentId([0x41; 32]);
+        cache.record(stranger, MachineId([0x41; 32]), 5);
+        assert!(
+            cache
+                .machines_accepted_for(&stranger)
+                .contains(&MachineId([0x41; 32])),
+            "the stranger share stays available when the contact share is full"
+        );
+        assert_eq!(cache.machines_accepted_for(&contact).len(), 2);
+    }
+
+    #[test]
+    fn issue1659_stranger_share_stays_when_the_contact_share_is_full() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        cache.set_attribution_limits_for_test(8, 3, 4);
+        cache.set_stranger_pair_limit_for_test(1);
+        let contact = AgentId([0x61; 32]);
+        cache.set_relationship_peer(contact, true);
+        cache.record(contact, MachineId([1; 32]), 1);
+        cache.record(contact, MachineId([2; 32]), 2);
+        cache.record(contact, MachineId([3; 32]), 3);
+        assert_eq!(cache.machines_accepted_for(&contact).len(), 2);
+        let stranger = AgentId([0x62; 32]);
+        cache.record(stranger, MachineId([4; 32]), 4);
+        assert!(cache
+            .machines_accepted_for(&stranger)
+            .contains(&MachineId([4; 32])));
+        assert_eq!(cache.attribution_stranger_pairs_len(), 1);
+        assert!(cache
+            .machines_accepted_for(&contact)
+            .contains(&MachineId([1; 32])));
     }
 
     /// A DM whose originating MACHINE is revoked (but whose agent-id is clean)

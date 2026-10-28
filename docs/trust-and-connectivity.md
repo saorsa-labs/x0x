@@ -326,9 +326,9 @@ machine revocation. An ACK is not accepted from a device this receiver
 would refuse a DM from. That is a deliberate partial override of ADR
 0021's accept-with-binding-fallback policy for those linked agents only.
 The relay `DeliverLocally` path does not apply it. The caps (8 machines
-per agent, 65,536 pairs, a stranger LRU of 4,096 that does not evict
-Trusted or Known contacts, group members, or grant parties, and 4,096
-named overflowed agents), the rule that a machine past the per-agent cap
+per agent, 65,536 pairs split into a contact remainder of 45,056, a
+protected non-contact share of 16,384, and a stranger LRU of 4,096, and
+4,096 named overflowed agents), the rule that a machine past the per-agent cap
 is not recorded, and the restart residual are in
 [ADR-0021 mechanics](design/adr-0021-mechanics.md). Overflow does not
 refuse an unattested DM or ACK by itself. An unattested DM or ACK that

@@ -13,6 +13,7 @@ mod acl_admin;
 pub use acl_admin::AclReloadTrigger;
 mod api_watchdog;
 pub(crate) use api_watchdog::ApiWatchdogConfig;
+pub(crate) mod attribution_probe;
 mod auth;
 pub(crate) use auth::SESSION_TOKEN_TTL;
 pub mod config;
@@ -1679,40 +1680,20 @@ pub async fn serve_with_options(
     let grants = agent.owner_trust.share_grant_store();
     let revoked_for_probe = std::sync::Arc::clone(&agent.revocation_set);
     let discovery_for_probe = std::sync::Arc::clone(&agent.identity_discovery_cache);
+    let evidence_for_probe = std::sync::Arc::clone(agent.peer_evidence());
     let groups_for_probe = std::sync::Arc::downgrade(&state);
     crate::dm_inbox::install_attribution_relationship_probe(
         &agent.authenticated_machine_bindings(),
         crate::dm_inbox::AttributionRelationshipProbe::from_answer(move |peer| {
-            let group_member = groups_for_probe.upgrade().and_then(|state| {
-                let groups = state.named_groups.try_read().ok()?;
-                let local = hex::encode(state.agent.agent_id().as_bytes());
-                let peer_hex = hex::encode(peer.as_bytes());
-                Some(groups.values().any(|group| {
-                    !group.withdrawn
-                        && group
-                            .members_v2
-                            .get(&local)
-                            .is_some_and(|member| member.is_active())
-                        && group
-                            .members_v2
-                            .get(&peer_hex)
-                            .is_some_and(|member| member.is_active())
-                }))
-            });
-            if group_member == Some(true) {
-                return Some(true);
-            }
-            let Some(grants) = grants.as_ref() else {
-                return group_member;
-            };
-            let Ok(revoked) = revoked_for_probe.try_read() else {
-                return None;
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or(0);
-            let cert = match discovery_for_probe.try_read() {
+            let upgraded = groups_for_probe.upgrade();
+            let groups = upgraded
+                .as_ref()
+                .and_then(|state| state.named_groups.try_read().ok());
+            let local = upgraded
+                .as_ref()
+                .map(|state| state.agent.agent_id())
+                .unwrap_or(x0x::identity::AgentId([0; 32]));
+            let discovery = match discovery_for_probe.try_read() {
                 Ok(cache) => Some(
                     cache
                         .get(&peer)
@@ -1720,17 +1701,21 @@ pub async fn serve_with_options(
                 ),
                 Err(_) => None,
             };
-            let Some(cert) = cert else {
-                return match grants.try_evidence_related(peer, None, &revoked, now) {
-                    Some(true) => Some(true),
-                    Some(false) | None => None,
-                };
-            };
-            match grants.try_evidence_related(peer, cert.as_ref(), &revoked, now) {
-                Some(true) => Some(true),
-                Some(false) => group_member,
-                None => None,
-            }
+            let revoked = revoked_for_probe.try_read().ok();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            attribution_probe::answer(attribution_probe::AttributionProbeInput {
+                groups: groups.as_deref(),
+                local,
+                peer,
+                grants: grants.as_deref(),
+                revoked: revoked.as_deref(),
+                discovery_cert: discovery.as_ref().map(|cert| cert.as_ref()),
+                evidence: Some(evidence_for_probe.as_ref()),
+                now_secs: now,
+            })
         }),
     )
     .await;

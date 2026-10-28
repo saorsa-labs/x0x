@@ -17,19 +17,23 @@ use crate as x0x;
 use super::super::state::AppState;
 use super::super::{not_found, parse_agent_id_hex};
 use crate::contacts::{IdentityType, TrustLevel};
-use crate::dm_inbox::set_attribution_relationship;
 
-async fn sync_contact_relationship(state: &Arc<AppState>, agent_id: x0x::identity::AgentId) {
-    let relationship = {
-        let store = state.contacts.read().await;
-        store.get(&agent_id).is_some_and(|contact| {
-            matches!(contact.trust_level, TrustLevel::Trusted | TrustLevel::Known)
-        })
-    };
-    set_attribution_relationship(
+/// Re-evaluate attribution after a contact add, change, or delete.
+///
+/// The contacts lock is held until the standing is stored. Group membership
+/// and a live grant still protect the peer when the contact itself does not.
+pub(in crate::server) async fn sync_contact_relationship(
+    state: &Arc<AppState>,
+    agent_id: x0x::identity::AgentId,
+) {
+    let store = state.contacts.read().await;
+    let contact = store.get(&agent_id).is_some_and(|contact| {
+        matches!(contact.trust_level, TrustLevel::Trusted | TrustLevel::Known)
+    });
+    crate::dm_inbox::set_resolved_attribution_standing(
         &state.agent.authenticated_machine_bindings(),
         agent_id,
-        relationship,
+        contact,
     )
     .await;
 }

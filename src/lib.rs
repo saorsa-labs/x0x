@@ -14920,21 +14920,23 @@ impl Agent {
                         announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
                     );
                 }
-                let contact = {
-                    let store = contact_store.read().await;
-                    matches!(
-                        store
-                            .get(&announcement.agent_id)
-                            .map(|contact| contact.trust_level),
-                        Some(contacts::TrustLevel::Trusted | contacts::TrustLevel::Known)
-                    )
-                };
-                {
-                    let mut cache = authenticated_machine_bindings.write().await;
-                    let relationship =
-                        cache.resolve_relationship(announcement.agent_id, contact);
-                    cache.set_relationship_peer(announcement.agent_id, relationship);
-                }
+                let contacts = contact_store.read().await;
+                let contact = matches!(
+                    contacts
+                        .get(&announcement.agent_id)
+                        .map(|contact| contact.trust_level),
+                    Some(contacts::TrustLevel::Trusted | contacts::TrustLevel::Known)
+                );
+                // Probe before the bindings write lock. Hold the contacts
+                // read until the standing is stored so a trust change cannot
+                // be overwritten by this snapshot.
+                dm_inbox::set_resolved_attribution_standing(
+                    &authenticated_machine_bindings,
+                    announcement.agent_id,
+                    contact,
+                )
+                .await;
+                drop(contacts);
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,

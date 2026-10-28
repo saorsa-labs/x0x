@@ -91,15 +91,24 @@ The inbox attributes these machines to the sender:
   binding, a machine a later binding replaced, and a verified machine that
   lost timestamp selection. Evicting a retained binding does not drop this
   set. One agent can record 8 machines. A ninth machine for that agent is
-  not recorded. The cache holds 65,536 pairs. Agents that are not
-  Trusted or Known contacts, group members, or grant parties share a
-  bounded LRU of 4,096 pairs. A new stranger pair evicts the
-  least-recently used stranger pair. That evicted machine is no longer
-  attributed. A stranger insert does not evict a Trusted or Known
-  contact, a group member, or a grant party. Downgrading or removing
-  that privilege moves its pairs into the stranger pool. After a
-  stranger eviction frees one of an agent's slots, a later admitted
-  machine is recorded again. 4,096 overflowed agents can be named.
+  not recorded. The cache holds 65,536 pairs in three shares. Trusted
+  or Known contacts use the remainder, 45,056 pairs. Protected
+  non-contacts use 16,384 pairs. A protected non-contact is a member of
+  a group whose admission needs an invite or approval (invite-only,
+  request-access, or owner-certified), or a grant party, and is not a
+  Trusted or Known contact. OpenJoin membership does not protect a
+  peer. Strangers, including OpenJoin co-members, share a bounded LRU
+  of 4,096 pairs. That share stays available when the other shares are
+  full. A new pair past a non-contact share evicts the least-recently
+  used pair in that share. That evicted machine is no longer attributed.
+  A stranger insert does not evict a contact pair or a protected
+  non-contact pair. A stranger flood that evicts a stranger pair is a
+  residual. Standing is chosen again on every record and on every
+  contact change. Deleting or downgrading a contact keeps protection
+  that still comes from a qualifying group or a grant. A library
+  embedder that does not run the `x0xd` probe gets contact-only
+  protection. After an eviction frees one of an agent's slots, a later
+  admitted machine is recorded again. 4,096 overflowed agents can be named.
   Overflow does not refuse an unattested DM or ACK by itself. A
   revocation of an unrecorded machine is not attributed, and an
   unattested DM or ACK that claims a different, clean machine can still
