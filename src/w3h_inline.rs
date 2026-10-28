@@ -18,14 +18,6 @@ pub(crate) fn shim_active() -> bool {
     }
 }
 
-/// Count one blocking-pool admission on a W3-H runtime. A build without
-/// `tokio_unstable`, or a process with no paused W3-H runtime, does nothing.
-#[cfg(test)]
-pub(crate) fn note_blocking_admission() {
-    #[cfg(tokio_unstable)]
-    crate::server::note_blocking_admission();
-}
-
 #[cfg(not(test))]
 pub(crate) mod fs {
     pub use tokio::fs::{
@@ -42,15 +34,10 @@ pub(crate) mod fs {
 
     use super::shim_active;
 
-    fn note_pool_admission() {
-        super::note_blocking_admission();
-    }
-
     pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
         if shim_active() {
             std::fs::read(path)
         } else {
-            note_pool_admission();
             tokio::fs::read(path).await
         }
     }
@@ -59,7 +46,6 @@ pub(crate) mod fs {
         if shim_active() {
             std::fs::read_to_string(path)
         } else {
-            note_pool_admission();
             tokio::fs::read_to_string(path).await
         }
     }
@@ -68,7 +54,6 @@ pub(crate) mod fs {
         if shim_active() {
             std::fs::write(path, contents)
         } else {
-            note_pool_admission();
             tokio::fs::write(path, contents).await
         }
     }
@@ -77,7 +62,6 @@ pub(crate) mod fs {
         if shim_active() {
             std::fs::rename(from, to)
         } else {
-            note_pool_admission();
             tokio::fs::rename(from, to).await
         }
     }
@@ -86,7 +70,6 @@ pub(crate) mod fs {
         if shim_active() {
             std::fs::remove_file(path)
         } else {
-            note_pool_admission();
             tokio::fs::remove_file(path).await
         }
     }
@@ -95,7 +78,6 @@ pub(crate) mod fs {
         if shim_active() {
             std::fs::create_dir_all(path)
         } else {
-            note_pool_admission();
             tokio::fs::create_dir_all(path).await
         }
     }
@@ -108,7 +90,6 @@ pub(crate) mod fs {
                 Err(error) => Err(error),
             }
         } else {
-            note_pool_admission();
             tokio::fs::try_exists(path).await
         }
     }
@@ -117,7 +98,6 @@ pub(crate) mod fs {
         if shim_active() {
             std::fs::metadata(path)
         } else {
-            note_pool_admission();
             tokio::fs::metadata(path).await
         }
     }
@@ -129,7 +109,6 @@ pub(crate) mod fs {
         if shim_active() {
             std::fs::set_permissions(path, perms)
         } else {
-            note_pool_admission();
             tokio::fs::set_permissions(path, perms).await
         }
     }
@@ -179,7 +158,6 @@ pub(crate) mod fs {
                 inner: ReadDirInner::Std(sorted_entries(path.as_ref())?.into_iter()),
             });
         }
-        note_pool_admission();
         Ok(ReadDir {
             inner: ReadDirInner::Tokio(tokio::fs::read_dir(path).await?),
         })
@@ -189,16 +167,13 @@ pub(crate) mod fs {
         pub async fn next_entry(&mut self) -> io::Result<Option<DirEntry>> {
             match &mut self.inner {
                 ReadDirInner::Std(entries) => Ok(entries.next()),
-                ReadDirInner::Tokio(entries) => {
-                    note_pool_admission();
-                    match entries.next_entry().await? {
-                        Some(entry) => Ok(Some(DirEntry {
-                            path: entry.path(),
-                            file_name: entry.file_name(),
-                        })),
-                        None => Ok(None),
-                    }
-                }
+                ReadDirInner::Tokio(entries) => match entries.next_entry().await? {
+                    Some(entry) => Ok(Some(DirEntry {
+                        path: entry.path(),
+                        file_name: entry.file_name(),
+                    })),
+                    None => Ok(None),
+                },
             }
         }
     }
@@ -219,7 +194,6 @@ pub(crate) mod fs {
                     inner: FileInner::Std(std::fs::File::open(path)?),
                 });
             }
-            note_pool_admission();
             Ok(Self {
                 inner: FileInner::Tokio(tokio::fs::File::open(path).await?),
             })
@@ -231,7 +205,6 @@ pub(crate) mod fs {
                     inner: FileInner::Std(std::fs::File::create(path)?),
                 });
             }
-            note_pool_admission();
             Ok(Self {
                 inner: FileInner::Tokio(tokio::fs::File::create(path).await?),
             })
@@ -245,7 +218,6 @@ pub(crate) mod fs {
                 }
                 FileInner::Tokio(file) => {
                     use tokio::io::AsyncWriteExt;
-                    note_pool_admission();
                     file.write_all(buf).await
                 }
             }
@@ -254,10 +226,7 @@ pub(crate) mod fs {
         pub async fn sync_all(&self) -> io::Result<()> {
             match &self.inner {
                 FileInner::Std(file) => file.sync_all(),
-                FileInner::Tokio(file) => {
-                    note_pool_admission();
-                    file.sync_all().await
-                }
+                FileInner::Tokio(file) => file.sync_all().await,
             }
         }
     }
@@ -309,7 +278,6 @@ pub(crate) mod fs {
                     inner: FileInner::Std(options.open(path)?),
                 });
             }
-            note_pool_admission();
             let mut options = tokio::fs::OpenOptions::new();
             options.write(self.write).create_new(self.create_new);
             #[cfg(unix)]

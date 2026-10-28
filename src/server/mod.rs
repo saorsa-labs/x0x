@@ -41,7 +41,7 @@ pub use update_check::run_update_check_and_report;
 // `#![cfg(test)]` inside the module).
 mod w3h;
 #[cfg(all(test, tokio_unstable))]
-pub(crate) use w3h::note_blocking_admission;
+pub(crate) use w3h::counted_spawn_blocking;
 mod ws;
 
 #[cfg(test)]
