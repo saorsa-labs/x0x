@@ -3587,10 +3587,11 @@ sender's agent is revoked, or because a machine this cache still
 attributes to that sender is revoked. An overflowed attribution set
 does not by itself refuse an unattested message. The daemon refuses
 for overflow only when a revoked machine is also attributed to that
-sender. That refusal is an internal counter, not
-`incoming_dropped_revoked`. The daemon emits a rate-limited warning
-for it, one sender at a time. One sender cannot suppress the warning
-for a different sender.
+sender. That refusal increments `incoming_dropped_revoked`. An internal
+counter for the same drop stays off this response. The daemon emits a
+rate-limited warning for it, one remembered sender at a time, for 256
+senders. A further sender shares one interval. One remembered sender
+cannot suppress the warning for a different remembered sender.
 Stranger-budget eviction is the same kind of warning. A machine past the
 per-agent cap is not recorded, and a revocation of that machine does not
 move `incoming_dropped_revoked` for an unattested DM or ACK that claims

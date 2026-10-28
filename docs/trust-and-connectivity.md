@@ -331,9 +331,12 @@ protected non-contact share of 16,384, and a stranger LRU of 4,096, and
 4,096 named overflowed agents), the rule that a machine past the per-agent cap
 is not recorded, and the restart residual are in
 [ADR-0021 mechanics](design/adr-0021-mechanics.md). An unknown revocation
-answer does not evict a protected pair and does not count as a confirmed
-revocation. Overflow does not
-refuse an unattested DM or ACK by itself. An unattested DM or ACK that
+answer does not evict a protected pair or a stranger pair and does not
+count as a confirmed revocation. A revoked pair in either share stays
+pinned, up to 2 machines for that agent. Overflow does not
+refuse an unattested DM or ACK by itself. When it does refuse, because
+a revoked machine is also attributed, the drop increments
+`incoming_dropped_revoked`. An unattested DM or ACK that
 claims a different, clean machine can still be accepted. An agent-key
 compromise is not stopped by this check: the holder can mint a fresh
 machine and a valid attestation.

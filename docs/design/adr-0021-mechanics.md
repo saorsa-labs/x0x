@@ -106,10 +106,11 @@ The inbox attributes these machines to the sender:
   co-members, share a bounded LRU of 4,096 pairs. That share stays
   available when the other shares are full. A new pair past a
   non-contact share evicts the least-recently used pair in that share
-  that is not pinned. A revoked machine of a protected agent is pinned.
-  One protected agent can pin 2 revoked machines. A further revoked
-  machine for that agent can be evicted. Eviction takes a non-revoked
-  pair first and does not drop a pinned pair. The pin uses the
+  that is not pinned. A revoked machine is pinned in the protected
+  share and in the stranger share. One agent can pin 2 revoked
+  machines in a share. A further revoked machine for that agent can
+  be evicted. Eviction takes a non-revoked pair first and does not
+  drop a pinned pair. The pin uses the
   revocation probe `x0xd` installs. A confirmed revocation counts toward
   that pin. An unknown answer, including a busy revocation lock, does not
   evict that pair and does not count as a confirmed newer revocation. A
@@ -121,18 +122,21 @@ The inbox attributes these machines to the sender:
   requirement, so that eviction is not a residual. That evicted machine
   is no longer attributed. A stranger insert does not evict a contact
   pair or a protected non-contact pair. A stranger flood that evicts a
-  stranger pair is a residual. Relationship epochs remember 8,192
-  agents. A further agent evicts the oldest stranger epoch, then the
-  oldest protected epoch, and a contact epoch only when no other epoch
-  remains. Evicting an epoch does not drop a machine attribution.
-  Promoting an agent into the contact share drops that agent's pairs
-  which do not fit the contact remainder, so the stranger share stays
-  available. Standing is chosen again on every record and on every
+  clean stranger pair is a residual. A revoked stranger pair stays
+  pinned. Relationship epochs remember 8,192 agents. Each standing
+  write takes the next value from a process-wide clock. Eviction does
+  not reuse a generation. A further agent evicts the oldest stranger
+  epoch, then the oldest protected epoch, and a contact epoch only
+  when no other epoch remains. Evicting an epoch does not drop a
+  machine attribution. Promoting an agent into the contact share drops
+  that agent's clean pairs which do not fit the contact remainder. A
+  revoked machine stays pinned, up to 2 for that agent. An unknown
+  revocation answer stays. The stranger share stays available. Standing is chosen again on every record and on every
   contact change. Deleting or downgrading a contact keeps protection
   that still comes from a qualifying group or a grant. A quarantine
   reblock clears that protection too and moves the agent's pairs into
-  the stranger share. That move can evict a stranger pair. It is a
-  residual until the next record. A library embedder that does not run
+  the stranger share. That move can evict a clean stranger pair. It is a
+  residual until the next record. A revoked stranger pair stays pinned. A library embedder that does not run
   the `x0xd` probe gets contact-only protection. Records already in the
   cache when the probe is installed are classified again. A group
   membership change does not reclassify pairs by itself. The next
@@ -151,9 +155,11 @@ The inbox attributes these machines to the sender:
   the stranger pool evicts or the name list fills, the cache emits a
   rate-limited warning on a monotonic clock, one sender at a time, for
   256 senders. One sender cannot suppress the warning for a different
-  sender. An unattested refusal that
-  also finds an overflowed set is an internal counter and the same kind of
-  warning. It is not a field of `GET /diagnostics/dm`.
+  sender. A sender past those 256 shares one interval and does not take
+  a remembered sender's slot. An unattested refusal that also finds an
+  overflowed set increments `incoming_dropped_revoked` and an internal
+  counter, and emits the same kind of warning. The internal counter is
+  not a field of `GET /diagnostics/dm`.
 - a machine on the sender's contact
 - a machine named by a binding tombstone for that agent (indexed by agent)
 - the machine the envelope claims

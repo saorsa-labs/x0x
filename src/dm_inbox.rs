@@ -137,10 +137,12 @@ const ACCEPTED_MACHINES_PER_AGENT: usize = 8;
 /// Trusted or Known contacts, protected non-contacts, and strangers.
 const ACCEPTED_MACHINE_PAIR_CAPACITY: usize = 65_536;
 /// Stranger share of [`ACCEPTED_MACHINE_PAIR_CAPACITY`]. A new stranger
-/// pair evicts the least-recently used stranger pair. It does not evict a
-/// contact pair or a protected non-contact pair. This share stays available
-/// when the other shares are full. A stranger flood that evicts a stranger
-/// pair drops attribution for that machine. That loss is a residual.
+/// pair evicts the least-recently used stranger pair that is not pinned.
+/// A revoked machine is pinned, up to 2 per agent, the same way as the
+/// protected share. A clean stranger pair can still be evicted. That loss
+/// is a residual. An unknown revocation answer is not evicted. It does not
+/// evict a contact pair or a protected non-contact pair. This share stays
+/// available when the other shares are full.
 const ACCEPTED_MACHINE_STRANGER_PAIRS: usize = 4_096;
 /// Protected non-contact share of [`ACCEPTED_MACHINE_PAIR_CAPACITY`].
 /// A member of a group whose admission needs an invite or approval, or a
@@ -156,21 +158,23 @@ const ACCEPTED_MACHINE_PROTECTED_PAIRS: usize = 16_384;
 const ACCEPTED_MACHINE_OVERFLOW_AGENTS: usize = 4_096;
 /// Minimum gap between unattested-drop and attribution-cap warnings.
 /// A flood must not emit one `warn!` per DM. The gap is per sender, so
-/// one sender cannot mask the warning for another.
+/// one sender cannot mask the warning for another. A sender past
+/// [`UNATTESTED_WARN_SENDERS`] shares one interval.
 const UNATTESTED_DROP_WARN_INTERVAL_MS: u64 = 60_000;
-/// Senders remembered for that per-sender gap. A further sender evicts
-/// the least-recently warned sender.
+/// Senders remembered for that per-sender gap. A further sender shares
+/// one interval and does not evict a remembered sender.
 const UNATTESTED_WARN_SENDERS: usize = 256;
-/// Agents whose standing epoch is remembered. A further agent evicts the
-/// oldest stranger epoch, then the oldest protected epoch. A contact
-/// epoch is evicted only when no other epoch remains. Evicting an epoch
-/// does not drop machine attribution.
+/// Agents whose standing epoch is remembered. Each standing write takes
+/// the next value from a process-wide clock. Eviction does not reuse that
+/// generation. A further agent evicts the oldest stranger epoch, then the
+/// oldest protected epoch. A contact epoch is evicted only when no other
+/// epoch remains. Evicting an epoch does not drop machine attribution.
 const RELATIONSHIP_EPOCH_CAPACITY: usize = 8_192;
-/// Revoked machines one protected agent can pin in the protected share.
-/// Eviction takes a non-revoked pair first and does not drop a pinned
-/// pair. A further revoked machine for that agent can be evicted. Two
-/// covers the machine just revoked and one earlier revocation. The pin
-/// needs the revocation probe `x0xd` installs.
+/// Revoked machines one agent can pin in the protected share, the stranger
+/// share, or a contact promotion. Eviction takes a non-revoked pair first
+/// and does not drop a pinned pair. A further revoked machine for that
+/// agent can be evicted. Two covers the machine just revoked and one
+/// earlier revocation. The pin needs the revocation probe `x0xd` installs.
 const PINNED_REVOKED_MACHINES_PER_AGENT: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
@@ -243,7 +247,7 @@ impl std::fmt::Debug for RevokedMachineProbe {
     }
 }
 
-/// Pin decision for one protected-share pair.
+/// Pin decision for one accepted pair.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RevocationPin {
     /// Confirmed revoked. Counts toward the two newer pins for this agent.
@@ -351,8 +355,9 @@ pub(crate) fn probe_view(
 /// OpenJoin co-members, use 4,096 pairs. A new pair past a non-contact
 /// share evicts the least-recently used pair in that share. It does not
 /// evict a contact pair. The stranger share stays available when the other
-/// shares are full. A stranger flood that evicts a stranger pair is a
-/// residual. Standing is chosen again on every record and on every contact
+/// shares are full. A stranger flood that evicts a clean stranger pair is a
+/// residual. A revoked stranger pair stays pinned, up to 2 per agent.
+/// Standing is chosen again on every record and on every contact
 /// change. Dropping or downgrading a contact keeps protection that still
 /// comes from a qualifying group or a grant. One agent can record 8
 /// machines. A further machine is not recorded while the agent is at that
@@ -362,10 +367,12 @@ pub(crate) fn probe_view(
 /// including a self-update restart, drops it. An undecryptable DM can move
 /// the retained binding and does not admit that machine. A later DM or
 /// ACK that is admitted through that retained binding records it.
-/// Relationship epochs are capped at 8,192 agents. A protected peer is
-/// removed when its last accepted machine is gone and its relationship
-/// epoch is gone. A protected agent's revoked machines are pinned, up to
-/// 2 per agent, when the revocation probe confirms the revocation. An
+/// Relationship epochs are capped at 8,192 agents. Each standing write
+/// takes the next process-wide generation. Eviction does not reuse it.
+/// A protected peer is removed when its last accepted machine is gone and
+/// its relationship epoch is gone. A protected or stranger agent's revoked
+/// machines are pinned, up to 2 per agent, when the revocation probe
+/// confirms the revocation. Contact promotion keeps the same pin. An
 /// unknown answer does not evict that pair and does not count as a
 /// confirmed revocation. A move into this share that cannot fit those
 /// pairs is refused, and the pairs stay in the share they already use.
@@ -383,8 +390,8 @@ pub struct AuthenticatedMachineBindingCache {
     contact_peers: std::collections::HashSet<AgentId>,
     /// Protected non-contacts. Their pairs use the protected share.
     protected_peers: std::collections::HashSet<AgentId>,
-    /// Bumped on every standing write. A stale resolve does not overwrite it.
-    /// Bounded at 8,192 agents.
+    /// Process-wide standing generation. A stale resolve does not overwrite it.
+    /// A forgotten agent reads as 0. Bounded at 8,192 agents.
     relationship_epochs: std::collections::HashMap<AgentId, u64>,
     relationship_epoch_order: std::collections::BTreeSet<(u64, [u8; 32])>,
     relationship_epoch_index: std::collections::HashMap<AgentId, u64>,
@@ -592,6 +599,11 @@ impl AuthenticatedMachineBindingCache {
         }
     }
 
+    /// Standing generation for `agent_id`.
+    ///
+    /// `0` means this agent has no stored generation. A minted generation
+    /// starts at 1. Eviction removes the entry and does not reset the clock,
+    /// so the next standing write cannot reuse the generation a resolve holds.
     pub(crate) fn relationship_epoch(&self, agent_id: AgentId) -> u64 {
         self.relationship_epochs
             .get(&agent_id)
@@ -599,11 +611,10 @@ impl AuthenticatedMachineBindingCache {
             .unwrap_or(0)
     }
 
-    /// Apply `standing` and bump the epoch so an older resolve cannot overwrite it.
+    /// Apply `standing` and mint a generation so an older resolve cannot overwrite it.
     pub(crate) fn set_standing(&mut self, agent_id: AgentId, standing: AttributionStanding) {
         self.apply_standing(agent_id, standing);
-        let epoch = self.relationship_epoch(agent_id).saturating_add(1);
-        self.store_relationship_epoch(agent_id, epoch);
+        self.mint_relationship_epoch(agent_id);
     }
 
     /// Apply `standing` only when no later write has bumped the epoch.
@@ -620,15 +631,16 @@ impl AuthenticatedMachineBindingCache {
         true
     }
 
-    fn store_relationship_epoch(&mut self, agent_id: AgentId, epoch: u64) {
+    fn mint_relationship_epoch(&mut self, agent_id: AgentId) {
         if let Some(seq) = self.relationship_epoch_index.remove(&agent_id) {
             self.relationship_epoch_order.remove(&(seq, agent_id.0));
         }
         self.relationship_epoch_clock = self.relationship_epoch_clock.saturating_add(1);
-        let seq = self.relationship_epoch_clock;
-        self.relationship_epochs.insert(agent_id, epoch);
-        self.relationship_epoch_order.insert((seq, agent_id.0));
-        self.relationship_epoch_index.insert(agent_id, seq);
+        let generation = self.relationship_epoch_clock;
+        self.relationship_epochs.insert(agent_id, generation);
+        self.relationship_epoch_order
+            .insert((generation, agent_id.0));
+        self.relationship_epoch_index.insert(agent_id, generation);
         while self.relationship_epochs.len() > self.relationship_epoch_cap {
             if !self.evict_relationship_epoch(agent_id) {
                 break;
@@ -776,18 +788,40 @@ impl AuthenticatedMachineBindingCache {
         }
     }
 
-    /// Drop this agent's pairs until the contact remainder can hold them.
+    /// Drop this agent's clean pairs until the contact remainder can hold them.
     ///
-    /// A promotion otherwise keeps every pair and can fill the reserved
+    /// A confirmed revoked machine stays, up to 2 for this agent. An unknown
+    /// revocation answer stays. Those pairs can sit above the remainder. A
+    /// promotion otherwise keeps every clean pair and can fill the reserved
     /// stranger share. The global pair cap would then refuse a new stranger.
     fn trim_contact_share(&mut self, agent_id: AgentId) {
         let (contact_cap, _, _) = self.share_caps();
         let machines = self.machines_accepted_for(&agent_id);
+        let mut clean = Vec::new();
+        let mut revoked = Vec::new();
         for machine in machines {
+            match self.revocation_pin(&machine) {
+                RevocationPin::Clean => clean.push(machine),
+                RevocationPin::Revoked => revoked.push(machine),
+                RevocationPin::Unknown => {}
+            }
+        }
+        for machine in clean {
             if self.contact_pairs_len() <= contact_cap {
-                break;
+                return;
             }
             self.drop_accepted_pair(agent_id, machine);
+        }
+        let mut pinned = 0usize;
+        for machine in revoked {
+            if self.contact_pairs_len() <= contact_cap {
+                return;
+            }
+            if pinned < PINNED_REVOKED_MACHINES_PER_AGENT {
+                pinned += 1;
+            } else {
+                self.drop_accepted_pair(agent_id, machine);
+            }
         }
     }
 
@@ -1057,9 +1091,18 @@ impl AuthenticatedMachineBindingCache {
         self.stranger_index.insert(key, seq);
     }
 
-    /// Drop the least-recently used stranger pair. Contact pairs stay.
+    /// Drop the least-recently used stranger pair that is not pinned.
+    ///
+    /// A confirmed revoked machine is pinned, up to 2 of the most recently
+    /// touched revoked pairs for that agent. An unknown answer is not
+    /// evicted. When every remaining pair is pinned, this returns false.
     fn evict_lru_stranger(&mut self) -> bool {
-        let Some((seq, agent, machine)) = self.stranger_order.iter().next().copied() else {
+        let Some((seq, agent, machine)) = self
+            .stranger_order
+            .iter()
+            .copied()
+            .find(|(seq, agent, machine)| self.stranger_pair_evictable(*seq, *agent, *machine))
+        else {
             return false;
         };
         self.stranger_order.remove(&(seq, agent, machine));
@@ -1142,6 +1185,27 @@ impl AuthenticatedMachineBindingCache {
     /// confirmed revocations. The count uses this agent's accepted machines
     /// (at most 8), not the whole protected share.
     fn protected_pair_evictable(&self, seq: u64, agent: [u8; 32], machine: [u8; 32]) -> bool {
+        self.pinned_pair_evictable(seq, agent, machine, |other| {
+            self.protected_index.get(&(agent, other)).copied()
+        })
+    }
+
+    fn stranger_pair_evictable(&self, seq: u64, agent: [u8; 32], machine: [u8; 32]) -> bool {
+        self.pinned_pair_evictable(seq, agent, machine, |other| {
+            self.stranger_index.get(&(agent, other)).copied()
+        })
+    }
+
+    /// A clean pair can be evicted. An unknown pair cannot. A confirmed
+    /// revoked pair can be evicted only when this agent already has 2 newer
+    /// confirmed revocations in `index_of`.
+    fn pinned_pair_evictable(
+        &self,
+        seq: u64,
+        agent: [u8; 32],
+        machine: [u8; 32],
+        index_of: impl Fn([u8; 32]) -> Option<u64>,
+    ) -> bool {
         match self.revocation_pin(&MachineId(machine)) {
             RevocationPin::Clean => return true,
             RevocationPin::Unknown => return false,
@@ -1157,8 +1221,7 @@ impl AuthenticatedMachineBindingCache {
                         if other.0 == machine {
                             return false;
                         }
-                        let Some(other_seq) = self.protected_index.get(&(agent, other.0)).copied()
-                        else {
+                        let Some(other_seq) = index_of(other.0) else {
                             return false;
                         };
                         other_seq > seq && self.revocation_pin(other) == RevocationPin::Revoked
@@ -3073,6 +3136,7 @@ impl InboxPipeline {
                             return;
                         }
                         UnattestedAttribution::Overflow => {
+                            self.dm.record_incoming_dropped_revoked();
                             self.dm.record_incoming_dropped_attribution_overflow();
                             warn_unattested_drop(
                                 &self.unattested_overflow_warn,
@@ -4273,8 +4337,8 @@ enum UnattestedAttribution {
 /// the accepted set. Revoking that machine does not refuse an unattested
 /// DM that claims a different clean machine. When an attributed machine is
 /// revoked and the sender's set has also overflowed, the result is
-/// [`UnattestedAttribution::Overflow`]. That counter does not add a refusal
-/// the revocation check would not already make.
+/// [`UnattestedAttribution::Overflow`]. The caller counts that refusal in
+/// `incoming_dropped_revoked` and in the internal overflow counter.
 fn sender_unattested_attribution(
     revoked: &RevocationSet,
     agent: &AgentId,
@@ -4324,7 +4388,8 @@ fn warn_interval_open(last_ms: u64, now: u64) -> bool {
 #[derive(Debug, Default)]
 struct UnattestedWarnLog {
     last_ms: std::collections::HashMap<[u8; 32], u64>,
-    order: std::collections::VecDeque<[u8; 32]>,
+    /// Shared interval for senders that do not fit in `last_ms`.
+    overflow_warn_ms: u64,
 }
 
 impl UnattestedWarnLog {
@@ -4337,21 +4402,24 @@ impl UnattestedWarnLog {
             if !warn_interval_open(prev, now) {
                 return false;
             }
-            self.order.retain(|id| id != &key);
         } else if self.last_ms.len() >= UNATTESTED_WARN_SENDERS {
-            if let Some(old) = self.order.pop_front() {
-                self.last_ms.remove(&old);
+            // Do not evict a remembered sender. A new identity past the cap
+            // would otherwise warn on every DM.
+            if !warn_interval_open(self.overflow_warn_ms, now) {
+                return false;
             }
+            self.overflow_warn_ms = now.max(1);
+            return true;
         }
         self.last_ms.insert(key, now.max(1));
-        self.order.push_back(key);
         true
     }
 }
 
-/// Emit one unattested-drop warning per sender per interval. Later DMs
-/// from that sender still increment their counter. A different sender is
-/// not masked.
+/// Emit one unattested-drop warning per remembered sender per interval.
+/// A sender past the remembered cap shares one interval. Later DMs from
+/// that sender still increment their counter. A remembered sender is not
+/// masked by another.
 fn warn_unattested_drop(
     log: &std::sync::Mutex<UnattestedWarnLog>,
     stage: &'static str,
@@ -7352,7 +7420,10 @@ mod tests {
             .await;
         assert_no_delivery(&mut harness.receiver).await;
         let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
-        assert_eq!(stats.incoming_dropped_revoked, 0);
+        assert_eq!(
+            stats.incoming_dropped_revoked, 1,
+            "an overflow refusal with a revoked machine counts as incoming_dropped_revoked"
+        );
         assert_eq!(
             harness
                 .pipeline
@@ -7377,7 +7448,7 @@ mod tests {
         assert_no_delivery(&mut harness.receiver).await;
         let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
         assert_eq!(
-            stats.incoming_dropped_revoked, 1,
+            stats.incoming_dropped_revoked, 2,
             "a sender with a revoked machine stays refused after attacker overflow"
         );
         assert_eq!(
@@ -9074,6 +9145,70 @@ mod tests {
         assert_eq!(cache.machines_accepted_for(&contact).len(), 2);
     }
 
+    /// A full contact share must not drop a revoked machine while the clean
+    /// machine stays the retained binding.
+    #[test]
+    fn issue1659_contact_promotion_keeps_revoked_machine_when_share_is_full() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        cache.set_attribution_limits_for_test(8, 4, 4);
+        cache.set_stranger_pair_limit_for_test(2);
+        cache.install_revoked_machine_probe(|machine| Some(machine.0[0] == 0xA1));
+        let filler = AgentId([0x01; 32]);
+        cache.set_relationship_peer(filler, true);
+        cache.record(filler, MachineId([0x01; 32]), 1);
+        cache.record(filler, MachineId([0x02; 32]), 2);
+        assert_eq!(cache.contact_pairs_len(), 2);
+        let peer = AgentId([0x10; 32]);
+        let revoked = MachineId([0xA1; 32]);
+        let clean = MachineId([0xB1; 32]);
+        cache.record(peer, revoked, 3);
+        cache.record(peer, clean, 4);
+        cache.set_relationship_peer(peer, true);
+        assert_eq!(
+            cache.entries.get(&peer).map(|binding| binding.machine_id),
+            Some(clean),
+            "the clean machine stays the retained binding"
+        );
+        assert!(
+            cache.machines_accepted_for(&peer).contains(&revoked),
+            "promotion must keep the revoked machine when the contact share is full"
+        );
+        assert!(
+            !cache.machines_accepted_for(&peer).contains(&clean),
+            "a clean pair is the one promotion drops"
+        );
+        assert_eq!(cache.machines_accepted_for(&filler).len(), 2);
+    }
+
+    /// Sybil identity churn must not evict a stranger's revoked pair.
+    #[test]
+    fn issue1659_stranger_revocation_pin_survives_identity_churn() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        cache.set_stranger_pair_limit_for_test(2);
+        cache.install_revoked_machine_probe(|machine| Some(machine.0[0] == 0x11));
+        let victim = AgentId([0x21; 32]);
+        let revoked = MachineId([0x11; 32]);
+        let clean = MachineId([0x12; 32]);
+        cache.record(victim, revoked, 1);
+        cache.record(victim, clean, 2);
+        for offset in 1..8u8 {
+            let agent = AgentId([0x30 + offset; 32]);
+            cache.record(
+                agent,
+                MachineId([0x40 + offset; 32]),
+                u64::from(offset) + 10,
+            );
+        }
+        assert!(
+            cache.machines_accepted_for(&victim).contains(&revoked),
+            "a revoked stranger pair stays attributed through identity churn"
+        );
+        assert!(
+            !cache.machines_accepted_for(&victim).contains(&clean),
+            "a clean stranger pair is evicted before a pinned revocation"
+        );
+    }
+
     #[test]
     fn issue1659_stale_epoch_does_not_overwrite_standing() {
         let mut cache = AuthenticatedMachineBindingCache::default();
@@ -9373,10 +9508,24 @@ mod tests {
             .write()
             .await
             .set_trust(&agent, TrustLevel::Trusted);
-        bindings
-            .write()
-            .await
-            .set_standing(agent, AttributionStanding::Contact);
+        {
+            let mut cache = bindings.write().await;
+            let held = cache.relationship_epoch(agent);
+            cache.set_relationship_epoch_limit_for_test(1);
+            cache.set_standing(AgentId([0xB1; 32]), AttributionStanding::Stranger);
+            assert_eq!(
+                cache.relationship_epoch(agent),
+                0,
+                "epoch eviction forgets the generation the paused resolve holds"
+            );
+            cache.set_standing(agent, AttributionStanding::Contact);
+            let promoted = cache.relationship_epoch(agent);
+            assert_ne!(
+                promoted, held,
+                "a promotion after eviction must not reuse the generation the resolve holds"
+            );
+            assert_ne!(promoted, 0);
+        }
         gate.release.notify_one();
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
@@ -9420,6 +9569,41 @@ mod tests {
             log.lock().expect("warn log").allow(&[2; 32], now),
             "one sender must not mask another sender's warning"
         );
+    }
+
+    /// Senders past the remembered cap share one interval. A new identity
+    /// must not take a slot and warn on every DM.
+    #[test]
+    fn issue1659_warn_limiter_shares_one_interval_past_the_cap() {
+        let mut log = UnattestedWarnLog::default();
+        let now = monotonic_ms();
+        for index in 0..UNATTESTED_WARN_SENDERS {
+            assert!(
+                log.allow(&warn_sender(index), now),
+                "each remembered sender may warn once"
+            );
+        }
+        let first = warn_sender(0);
+        assert!(
+            log.allow(&warn_sender(UNATTESTED_WARN_SENDERS), now),
+            "the first sender past the cap may warn once in the interval"
+        );
+        assert!(
+            !log.allow(&warn_sender(UNATTESTED_WARN_SENDERS + 1), now),
+            "a further sender in the same interval must not warn"
+        );
+        assert!(
+            !log.allow(&first, now),
+            "a remembered sender keeps its interval when new senders arrive"
+        );
+    }
+
+    fn warn_sender(index: usize) -> [u8; 32] {
+        let mut sender = [0u8; 32];
+        let value = u16::try_from(index).expect("sender index");
+        sender[30] = u8::try_from(value >> 8).expect("high byte");
+        sender[31] = u8::try_from(value & 0xff).expect("low byte");
+        sender
     }
 
     #[test]

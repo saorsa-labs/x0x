@@ -560,8 +560,7 @@ pub struct DmDiagnosticsStats {
     /// machine has been revoked.
     /// Non-zero means a revoked peer is still attempting to communicate.
     /// An unattested refusal that also has an overflowed attribution set
-    /// is counted only on an internal counter and a rate-limited warning.
-    /// It is not a field of this object.
+    /// is included here. A separate internal counter stays off this object.
     #[serde(default)]
     pub incoming_dropped_revoked: u64,
     /// DMs dropped because the sender's cached agent certificate has expired
@@ -1061,8 +1060,9 @@ impl DirectMessaging {
     /// Record an unattested DM dropped because attribution overflowed for a
     /// sender that already holds a machine revocation.
     ///
-    /// The count stays off `GET /diagnostics/dm`. The inbox emits a
-    /// rate-limited warning for the same drop.
+    /// The caller also increments `incoming_dropped_revoked`. This count
+    /// stays off `GET /diagnostics/dm`. The inbox emits a rate-limited
+    /// warning for the same drop.
     pub(crate) fn record_incoming_dropped_attribution_overflow(&self) {
         self.diagnostics
             .incoming_dropped_attribution_overflow
