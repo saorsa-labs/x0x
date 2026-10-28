@@ -3,8 +3,9 @@
 //! - `w3h_clock_gate_*`: virtual time does not move outside a barrier.
 //! - `w3h_auto_advance_freezes_*`: without `tokio_unstable`, auto-advance
 //!   stays put while `spawn_blocking` runs.
-//! - `w3h_recheck_*`: the unstable recheck thread re-arms after a lost park
-//!   and does not publish `ready` into the next barrier.
+//! - `w3h_recheck_*`: the unstable recheck thread re-arms after a lost park,
+//!   including when the pool stays busy across disarm, and does not publish
+//!   `ready` into the next barrier.
 //! - `w3h_s1_control_*`: three real daemons, public API only, over the
 //!   fabric. The positive control must converge AND deliver group data; the
 //!   negative control (joiner offline) must fail for exactly the intended
@@ -324,7 +325,7 @@ fn w3h_recheck_rearms_when_the_runtime_reparks_before_disarm() -> Result<()> {
         let _hold = super::AutoAdvanceHold::acquire();
         let slot = super::idle_slot();
         let slot_for_coord = std::sync::Arc::clone(&slot);
-        super::set_force_pool_busy(true);
+        super::set_force_pool_busy(&slot, true);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         super::install_disarm_gate(entered_tx, release_rx);
@@ -383,7 +384,7 @@ fn w3h_recheck_rearms_when_the_runtime_reparks_before_disarm() -> Result<()> {
             );
             // The pool is idle, and nothing wakes the runtime. The broken
             // thread now exits. The fixed one publishes `ready`.
-            super::set_force_pool_busy(false);
+            super::set_force_pool_busy(&slot_for_coord, false);
             let disarm = release.disarm.take().expect("disarm sender");
             let _ = disarm.send(());
         });
@@ -427,6 +428,127 @@ fn w3h_recheck_rearms_when_the_runtime_reparks_before_disarm() -> Result<()> {
     })
 }
 
+/// #1245: the recheck thread is a plain OS thread. If the runtime parks
+/// again before disarm and the pool is still busy, that thread must re-arm
+/// with the handle captured on the runtime. `Handle::current` panics there,
+/// after the epoch claim, and a later park starts no thread. This case
+/// keeps the pool marked busy until the first recheck thread has exited.
+#[test]
+#[cfg(tokio_unstable)]
+fn w3h_recheck_rearms_when_the_pool_stays_busy_across_disarm() -> Result<()> {
+    super::block_on_paused(async move {
+        let _hold = super::AutoAdvanceHold::acquire();
+        let slot = super::idle_slot();
+        let slot_for_coord = std::sync::Arc::clone(&slot);
+        super::set_force_pool_busy(&slot, true);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        super::install_disarm_gate(entered_tx, release_rx);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        super::install_recheck_finished(finished_tx);
+        let (wake_tx, wake_rx) = tokio::sync::oneshot::channel::<()>();
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let sleeper = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        tokio::task::yield_now().await;
+
+        let coord = std::thread::spawn(move || {
+            struct Release {
+                resume: Option<std::sync::mpsc::Sender<()>>,
+                disarm: Option<std::sync::mpsc::Sender<()>>,
+            }
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    if let Some(resume) = self.resume.take() {
+                        let _ = resume.send(());
+                    }
+                    if let Some(disarm) = self.disarm.take() {
+                        let _ = disarm.send(());
+                    }
+                }
+            }
+            let mut release = Release {
+                resume: Some(resume_tx),
+                disarm: Some(release_tx),
+            };
+            let order = std::sync::atomic::Ordering::Acquire;
+            wait_until_idle(
+                &slot_for_coord,
+                |slot| {
+                    let epoch = slot.epoch.load(order);
+                    slot.parked.load(order) && slot.recheck_epoch.load(order) == epoch
+                },
+                "recheck was not armed while the runtime was parked",
+            );
+            let _ = wake_tx.send(());
+            holding_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("runtime thread did not block outside the park hook");
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("recheck thread did not stop before disarm");
+            let resume = release.resume.take().expect("resume sender");
+            let _ = resume.send(());
+            wait_until_idle(
+                &slot_for_coord,
+                |slot| {
+                    let epoch = slot.epoch.load(order);
+                    slot.parked.load(order) && slot.recheck_epoch.load(order) == epoch
+                },
+                "runtime did not park again before the recheck disarmed",
+            );
+            // Busy stays set across disarm. The broken thread panics in
+            // `Handle::current` and leaves the claim. The fixed thread has
+            // already started its replacement when this signal arrives.
+            let disarm = release.disarm.take().expect("disarm sender");
+            let _ = disarm.send(());
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("recheck thread did not exit after disarm");
+            super::set_force_pool_busy(&slot_for_coord, false);
+        });
+
+        let (wall_tx, wall_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = wall_tx.send(());
+        });
+        let start = tokio::time::Instant::now();
+        let stepped = tokio::select! {
+            biased;
+            stepped = super::drive_paused(async {
+                wake_rx.await.ok();
+                let _ = holding_tx.send(());
+                let _ = resume_rx.recv();
+                let origin = tokio::time::Instant::now();
+                std::future::poll_fn(|_cx| {
+                    if tokio::time::Instant::now() > origin {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                Ok::<(), anyhow::Error>(())
+            }) => stepped,
+            _ = wall_rx => bail!("idle step stalled while the pool stayed busy across disarm"),
+        };
+        coord.join().expect("recheck coordinator");
+        stepped?;
+        ensure!(
+            tokio::time::Instant::now() > start,
+            "re-arm did not step virtual time"
+        );
+        ensure!(
+            !sleeper.is_finished(),
+            "the 30 s timer fired inside the wall bound"
+        );
+        Ok(())
+    })
+}
+
 /// #1245: a recheck that has already decided the pool is idle can still be
 /// running when the barrier ends. Its `ready` store must not complete the
 /// next barrier's idle pulse.
@@ -437,7 +559,7 @@ fn w3h_recheck_ready_stays_on_its_barrier_epoch() -> Result<()> {
         let _hold = super::AutoAdvanceHold::acquire();
         let slot = super::idle_slot();
         let slot_for_coord = std::sync::Arc::clone(&slot);
-        super::set_force_pool_busy(true);
+        super::set_force_pool_busy(&slot, true);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         super::install_before_publish_gate(entered_tx, release_rx);
@@ -475,7 +597,7 @@ fn w3h_recheck_ready_stays_on_its_barrier_epoch() -> Result<()> {
                 "recheck was not armed while the pool was forced busy",
             );
             let epoch = slot_for_coord.epoch.load(order);
-            super::set_force_pool_busy(false);
+            super::set_force_pool_busy(&slot_for_coord, false);
             entered_rx
                 .recv_timeout(std::time::Duration::from_secs(3))
                 .expect("recheck thread did not stop before publish");
