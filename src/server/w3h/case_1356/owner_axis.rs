@@ -502,9 +502,6 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             .map(|log| log.text.chars().take(300).collect())
             .collect();
         receipt.note(format!("WARN logs since J's join: {}", logs.join(" | ")));
-        // On `main` (28 Oct 2026) O's seal carries the owner mandate, so
-        // `classify_refused_joiner_fork_chain` returns at the owner-mandate
-        // check before it records the gap (#1689 rc1 evidence).
         receipt.note("J's gate did not arm before the window: the row's prerequisite is missing");
         receipt.finish(FINAL_C, false, at(sim));
         return Ok(());
@@ -528,6 +525,27 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     }
     let j_status = status(sim, "J", &group).await?;
     let j1 = view(sim, "J", &group).await?;
+    if both {
+        // H-S3-c2 prerequisite: canonical r+1 reached J, so J holds both
+        // the marker and the gap record before the re-seat. A missing one
+        // is INFRA, never RED.
+        let held = j1.marker.is_some() && j1.gap_refusal.is_some();
+        receipt.evidence(
+            "j_holds_marker_and_gap_before_the_reseat",
+            held,
+            format!(
+                "J {}; O's r+1 gossip frames to J after r+1′: {}",
+                j1.describe(),
+                held_to_j.load(std::sync::atomic::Ordering::SeqCst)
+            ),
+            at(sim),
+        );
+        if !held {
+            receipt.note("J lacks the marker or the gap record: the row's prerequisite is missing");
+            receipt.finish(FINAL_C, false, at(sim));
+            return Ok(());
+        }
+    }
     let typed = j_status.as_ref().is_some_and(|st| {
         st.recovery_state() == Some("reseat_required")
             && st.recovery_cause() == Some("not_on_chain")
