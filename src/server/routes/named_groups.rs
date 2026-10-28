@@ -11780,6 +11780,10 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // the portable agent keeps its Active seat, so the same roster check
     // cannot refuse the device either — the DM's QUIC-authenticated
     // sender machine refuses it, under its own operator sentence.
+    // #1622 (ADR 0110 D70): a binding revocation retires the pairing
+    // only — the agent keeps its seat and the device stays clean — so
+    // neither gate above can refuse it; the pairing itself does, under
+    // its own operator sentence.
     // A pending revocation resync also refuses (fail-closed, as the
     // response handler does), under its own operator sentence.
     {
@@ -11798,6 +11802,14 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 group_id = %LogHexId::group(&request.group_id),
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request from a machine-revoked requester"
+            );
+            return;
+        }
+        if revoked.is_binding_revoked(sender, machine_id) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %LogHexId::agent(&sender_hex),
+                "rejecting TreeKEM catch-up request from a requester with a revoked agent-machine binding"
             );
             return;
         }
@@ -12067,8 +12079,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         // #1616 (ADR 0110 D70): a machine-revoked device is dropped with
         // its agent. Its portable agent keeps the Active seat the roster
         // check below sees, so the machine gate must fire first.
+        // #1622 (ADR 0110 D70): a revoked agent-machine binding retires
+        // the pairing only — agent and device each stay clean — so the
+        // pairing itself is dropped here, before the roster check.
         if revoked.is_agent_revoked(sender)
             || revoked.is_machine_revoked(machine_id)
+            || revoked.is_binding_revoked(sender, machine_id)
             || revoked.revocation_resync_required()
         {
             return;
@@ -47190,6 +47206,7 @@ pub(in crate::server) mod tests {
     mod issue1347_join_request_token_class;
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
+    mod issue1622_binding_revoked_catchup;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
