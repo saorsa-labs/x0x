@@ -841,6 +841,8 @@ jobs:
           --expect w3h_1356_red_s3_t_deferred_until_host_commit=GREEN
           --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
           --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
+          --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
+          --expect w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable
