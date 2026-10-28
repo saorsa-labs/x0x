@@ -290,7 +290,10 @@ fn clear_idle_wait() {
         *waker = None;
         drop(waker);
         slot.force_pool_busy.store(false, Ordering::Release);
-        slot.blocking_unsettled.store(false, Ordering::Release);
+        slot.blocking_unsettled_task.store(0, Ordering::Release);
+        slot.blocking_unsettled_gen.store(0, Ordering::Release);
+        slot.blocking_run_gen.store(0, Ordering::Release);
+        slot.drop_gate_on_publish.store(false, Ordering::Release);
         *slot
             .hooks
             .lock()
@@ -790,12 +793,23 @@ struct IdleWait {
     /// Task id of [`AutoAdvanceHold`] on this runtime, or 0. The terminate
     /// hook runs on a pool thread, so this is not a thread-local cell.
     clock_hold_task: AtomicU64,
-    /// A blocking closure has returned and the pool has not marked that
-    /// thread idle yet. That lag is not scenario work (#1662).
-    blocking_unsettled: AtomicBool,
+    /// Task id of a blocking closure that has returned and whose pool
+    /// thread has not gone idle or started another task, or 0 (#1662).
+    blocking_unsettled_task: AtomicU64,
+    /// `blocking_run_gen` when `blocking_unsettled_task` was published.
+    /// A later blocking task bumps the run generation, and the stamp stops
+    /// applying.
+    blocking_unsettled_gen: AtomicU64,
+    /// Bumped when a blocking task is admitted after a wind-down. The
+    /// wind-down stamp does not cover that task.
+    blocking_run_gen: AtomicU64,
     /// Test gate held across the idle-mark gap. One runtime cannot take
     /// another's.
     finish_gate: Mutex<Option<BlockingFinishGate>>,
+    /// When set, publishing a blocking completion drops `finish_gate` the
+    /// way the barrier does when it ends. The hook must already own the
+    /// gate, or the coordinator never sees `entered`.
+    drop_gate_on_publish: AtomicBool,
     /// Id of the runtime bound in [`bind_runtime`], if any.
     runtime_id: Mutex<Option<tokio::runtime::Id>>,
     /// Gates the recheck thread hits. Same scope as `force_pool_busy`.
@@ -814,8 +828,11 @@ thread_local! {
         recheck_epoch: AtomicU64::new(0),
         force_pool_busy: AtomicBool::new(false),
         clock_hold_task: AtomicU64::new(0),
-        blocking_unsettled: AtomicBool::new(false),
+        blocking_unsettled_task: AtomicU64::new(0),
+        blocking_unsettled_gen: AtomicU64::new(0),
+        blocking_run_gen: AtomicU64::new(0),
         finish_gate: Mutex::new(None),
+        drop_gate_on_publish: AtomicBool::new(false),
         runtime_id: Mutex::new(None),
         hooks: Mutex::new(RecheckHooks::empty()),
         poke: Mutex::new(None),
@@ -981,6 +998,19 @@ fn install_blocking_finish_gate(
         Some(BlockingFinishGate { entered, release });
 }
 
+/// The next blocking completion drops the slot gate while publishing.
+/// Simulates the barrier ending in that window (#1662).
+fn arm_drop_finish_gate_on_publish(slot: &IdleWait) {
+    slot.drop_gate_on_publish.store(true, Ordering::Release);
+}
+
+fn take_finish_gate(slot: &IdleWait) -> Option<BlockingFinishGate> {
+    slot.finish_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
 /// A `spawn_blocking` closure has returned. The pool thread is not idle yet.
 /// That lag is not scenario work: the paused clock may step once the queue
 /// is empty (#1662). A test gate can hold the thread in the gap.
@@ -989,7 +1019,6 @@ fn on_blocking_task_finished(task_id: u64) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    let queued = handle.metrics().blocking_queue_depth();
     let slot = RUNTIMES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1002,22 +1031,47 @@ fn on_blocking_task_finished(task_id: u64) {
         slot.clock_hold_task.store(0, Ordering::Release);
         return;
     }
+    // Own the gate before publishing. The publish path drops a gate still
+    // in the slot: the barrier can end on this wake, and the ordering
+    // control does the same. A drop of the slot gate must not lose `entered`.
+    let gate = take_finish_gate(&slot);
+    let queued = handle.metrics().blocking_queue_depth();
     if queued == 0 {
-        slot.blocking_unsettled.store(true, Ordering::Release);
+        let gen = slot.blocking_run_gen.load(Ordering::Acquire);
+        slot.blocking_unsettled_gen.store(gen, Ordering::Release);
+        slot.blocking_unsettled_task
+            .store(task_id, Ordering::Release);
     } else {
-        slot.blocking_unsettled.store(false, Ordering::Release);
+        // The next task is already queued. This thread runs it on return.
+        admit_next_blocking_task(&slot);
+    }
+    if slot.drop_gate_on_publish.swap(false, Ordering::AcqRel) {
+        let _ = take_finish_gate(&slot);
     }
     let epoch = slot.epoch.load(Ordering::Acquire);
     wake_park_hook(&slot, epoch);
-    let gate = slot
-        .finish_gate
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
     if let Some(gate) = gate {
         let _ = gate.entered.send(());
         let _ = gate.release.recv();
     }
+    // A task queued while this hook held the gap starts on return. The
+    // queue is empty again once it is running, so `pool_busy` can miss it.
+    if handle.metrics().blocking_queue_depth() > 0 {
+        admit_next_blocking_task(&slot);
+    }
+}
+
+/// The pool thread is about to run a blocking task that is not the one
+/// that just returned. The wind-down stamp must not cover it (#1662).
+#[cfg(tokio_unstable)]
+fn admit_next_blocking_task(slot: &IdleWait) {
+    slot.blocking_run_gen.fetch_add(1, Ordering::Release);
+    slot.blocking_unsettled_task.store(0, Ordering::Release);
+}
+
+#[cfg(tokio_unstable)]
+fn clear_wind_down(slot: &IdleWait) {
+    slot.blocking_unsettled_task.store(0, Ordering::Release);
 }
 
 /// True when a blocking task besides [`AutoAdvanceHold`] is running or
@@ -1046,18 +1100,27 @@ fn pool_busy(handle: &tokio::runtime::Handle, slot: &IdleWait) -> bool {
         .saturating_sub(metrics.num_idle_blocking_threads());
     // The hold keeps one pool thread for the scenario.
     let extra = busy.saturating_sub(1);
-    if queued > 0 || extra == 0 {
-        // A queued task will run before the thread goes idle, and an idle
-        // thread has absorbed any earlier completion. Drop the wind-down bit.
-        slot.blocking_unsettled.store(false, Ordering::Release);
-        return queued > 0;
+    if queued > 0 {
+        // A queued task runs on this pool thread before it goes idle.
+        // Admitting it here, and again at the end of the terminate hook,
+        // covers a start that this sample does not see.
+        admit_next_blocking_task(slot);
+        return true;
     }
-    // `extra > 0` and nothing is queued. A closure that has already returned
-    // is still counted busy until this thread marks itself idle. That lag
-    // must not freeze the paused clock (#1662). The bit stays set across the
-    // park hook and the step: clearing it on the first look would freeze
-    // the clock again on the second.
-    !slot.blocking_unsettled.load(Ordering::Acquire)
+    if extra == 0 {
+        // The pool thread has absorbed the completion.
+        clear_wind_down(slot);
+        return false;
+    }
+    // `extra > 0` and the queue is empty. The closure that returned is
+    // still counted busy until this thread marks itself idle. That lag
+    // must not freeze the paused clock (#1662). The stamp stays across the
+    // park hook and the step. A later blocking task bumps the run
+    // generation, and the stamp no longer applies.
+    let unsettled = slot.blocking_unsettled_task.load(Ordering::Acquire);
+    let stamp = slot.blocking_unsettled_gen.load(Ordering::Acquire);
+    let run = slot.blocking_run_gen.load(Ordering::Acquire);
+    unsettled == 0 || stamp != run
 }
 
 /// The current-thread runtime has one worker. A queued task is not the
