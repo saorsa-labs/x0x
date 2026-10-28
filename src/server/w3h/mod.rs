@@ -8,14 +8,19 @@
 //! (`tower::ServiceExt::oneshot`); no harness traffic uses a socket. Each
 //! daemon still binds one idle loopback API listener that nothing uses.
 //!
-//! Time (plan §3b): a `spawn_blocking` clock gate inhibits tokio's
-//! auto-advance whenever no named barrier is open, and a second hold keeps
-//! auto-advance inhibited inside the barrier too. Virtual time moves only
-//! inside [`Sim::within`] / [`Sim::until`] / [`Sim::api`], in 1 ms steps,
-//! and only once the scheduler has no ready task and no blocking task
-//! besides that hold. A step while a pool thread or a wall-clock probe is
-//! still in flight lands at a different virtual time on each rerun (#1245).
-//! Every advance is attributed to a named barrier in the trace. The runtime
+//! Time (plan §3b): virtual time moves only inside [`Sim::within`] /
+//! [`Sim::until`] / [`Sim::api`]. With `--cfg tokio_unstable` (the W3-H
+//! job) a blocking hold keeps auto-advance inhibited for the whole
+//! scenario, and the barrier steps one millisecond only when the scheduler
+//! is idle and that hold is the only blocking task. The step reads the
+//! blocking-pool metrics, which exist only with that cfg. Without them the
+//! hold turns off tokio's freeze-during-`spawn_blocking` rule and virtual
+//! time runs at CPU speed (#1245). A build without the cfg keeps the clock
+//! gate: it stays closed outside a barrier, and an open barrier lets paused
+//! tokio auto-advance, which still freezes while a `spawn_blocking` task
+//! runs. A step while a pool thread or a wall-clock probe is still in
+//! flight lands at a different virtual time on each rerun (#1245). Every
+//! advance is attributed to a named barrier in the trace. The runtime
 //! takes the local queue before any blocking-pool injection, and W3-H
 //! filesystem and history commits run on the caller. When the
 //! entropy/wall-clock shim (`scripts/w3h/w3h_shim.c`) is preloaded, the
@@ -65,7 +70,8 @@ mod case_818;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(tokio_unstable)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -216,18 +222,19 @@ where
     // `u32::MAX` keeps the local queue first until it is empty. The seed
     // fixes `select!` and `watch` poll order on this runtime.
     builder.global_queue_interval(u32::MAX);
-    // The clock hold occupies one pool thread for the whole scenario.
-    // Every other `spawn_blocking` task shares the remaining thread, in
-    // spawn order. A wider pool lets the OS choose which completion wakes
-    // first, and that order moves `offline@` and same-instant stream
-    // direction between reruns (#1245).
-    builder.max_blocking_threads(2);
-    // Fires only when a barrier has asked to be woken at idle. Otherwise
-    // the callback returns without touching the clock, so a closed gate
-    // still parks and auto-advance outside `Sim` is unchanged.
-    builder.on_thread_park(note_idle_park);
+    // The 1 ms idle step needs blocking-pool metrics, so only the
+    // `tokio_unstable` build installs it. The other build keeps tokio's
+    // freeze-during-`spawn_blocking` rule and the default pool (#1245).
     #[cfg(tokio_unstable)]
     {
+        // The clock hold occupies one pool thread for the whole scenario.
+        // Every other `spawn_blocking` task shares the remaining thread, in
+        // spawn order. A wider pool lets the OS choose which completion
+        // wakes first, and that order moves `offline@` and same-instant
+        // stream direction between reruns (#1245).
+        builder.max_blocking_threads(2);
+        builder.on_thread_park(note_runtime_parked);
+        builder.on_thread_unpark(note_runtime_unparked);
         builder.disable_lifo_slot();
         builder.rng_seed(tokio::runtime::RngSeed::from_bytes(
             b"x0x-w3h-runtime-seed-v1",
@@ -245,8 +252,12 @@ where
 /// reuses threads, and waking a runtime that has already shut down is not
 /// defined.
 fn clear_idle_wait() {
+    #[cfg(tokio_unstable)]
     IDLE_WAIT.with(|slot| {
+        slot.epoch.fetch_add(1, Ordering::AcqRel);
+        slot.recheck_epoch.store(0, Ordering::Release);
         slot.ready.store(false, Ordering::Release);
+        slot.parked.store(false, Ordering::Release);
         *slot
             .waker
             .lock()
@@ -607,16 +618,29 @@ impl Shim {
     }
 }
 
+/// How long to wait before looking again at a pool that was busy at the
+/// last park. Tokio wakes the runtime when a blocking task finishes, and
+/// only then marks that pool thread idle. A park in that window must not
+/// sleep until the barrier's virtual budget (#1245).
+#[cfg(tokio_unstable)]
+const IDLE_RECHECK_INTERVAL: Duration = Duration::from_millis(2);
+
 /// One blocking task for the whole scenario. Its inhibit stays above zero,
 /// so paused tokio never auto-advances. Auto-advance parks for zero wall
 /// time and then skips the jump when any other thread has woken the
 /// driver (`did_wake`), which moved `offline@` and same-instant admission
 /// between reruns (#1245). [`drive_paused`] moves time instead.
+///
+/// Only the `tokio_unstable` build uses this. Without the blocking-pool
+/// metrics the hold would disable tokio's freeze-during-`spawn_blocking`
+/// rule and the idle step would run at CPU speed (#1245).
+#[cfg(tokio_unstable)]
 struct AutoAdvanceHold {
     release: std::sync::mpsc::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(tokio_unstable)]
 impl AutoAdvanceHold {
     /// Block until the pool thread is inside the closure, so the inhibit
     /// is held before the caller continues.
@@ -634,6 +658,7 @@ impl AutoAdvanceHold {
     }
 }
 
+#[cfg(tokio_unstable)]
 impl Drop for AutoAdvanceHold {
     fn drop(&mut self) {
         let _ = self.release.send(());
@@ -643,76 +668,148 @@ impl Drop for AutoAdvanceHold {
 }
 
 /// Set when [`note_idle_park`] sees an empty scheduler, cleared when
-/// [`IdlePulse`] observes it. Thread-local: one W3-H runtime per test
-/// thread, and the park hook runs on that same thread.
+/// [`IdlePulse`] observes it. Shared with the recheck thread through `Arc`.
+/// The thread-local owns the `Arc`: one W3-H runtime per test thread, and
+/// the park hook runs on that same thread.
+#[cfg(tokio_unstable)]
 struct IdleWait {
     waker: Mutex<Option<std::task::Waker>>,
     ready: AtomicBool,
+    /// The runtime thread is inside the park hook, or still parked.
+    parked: AtomicBool,
+    /// Bumped when a barrier returns, so a recheck from the previous
+    /// barrier cannot wake the next one.
+    epoch: AtomicU64,
+    /// Epoch of the in-flight recheck, or 0 when none is running.
+    recheck_epoch: AtomicU64,
 }
 
+#[cfg(tokio_unstable)]
 thread_local! {
-    static IDLE_WAIT: IdleWait = const {
-        IdleWait {
-            waker: Mutex::new(None),
-            ready: AtomicBool::new(false),
-        }
-    };
+    static IDLE_WAIT: Arc<IdleWait> = Arc::new(IdleWait {
+        waker: Mutex::new(None),
+        ready: AtomicBool::new(false),
+        parked: AtomicBool::new(false),
+        epoch: AtomicU64::new(1),
+        recheck_epoch: AtomicU64::new(0),
+    });
 }
 
 /// `AutoAdvanceHold` keeps one pool thread blocked for the whole scenario.
 /// Any further running or queued `spawn_blocking` task freezes the clock:
 /// stepping 1 ms on each wake while that task runs spends a different
 /// number of virtual milliseconds on each rerun (#1245).
-fn blocking_beyond_clock_hold() -> bool {
-    // These counters exist only with `--cfg tokio_unstable`, which is how
-    // the W3-H job is built. Without them the barrier still steps only at
-    // idle; it cannot see a pool thread that has not queued a task.
-    #[cfg(tokio_unstable)]
-    {
-        let metrics = tokio::runtime::Handle::current().metrics();
-        let busy = metrics
-            .num_blocking_threads()
-            .saturating_sub(metrics.num_idle_blocking_threads());
-        return metrics.blocking_queue_depth() > 0 || busy > 1;
+#[cfg(tokio_unstable)]
+fn pool_busy(handle: &tokio::runtime::Handle) -> bool {
+    let metrics = handle.metrics();
+    let busy = metrics
+        .num_blocking_threads()
+        .saturating_sub(metrics.num_idle_blocking_threads());
+    metrics.blocking_queue_depth() > 0 || busy > 1
+}
+
+/// The current-thread runtime has one worker. A queued task is not the
+/// barrier task that is polling right now, so the clock must stay put.
+#[cfg(tokio_unstable)]
+fn scheduler_has_queued_tasks() -> bool {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    metrics.global_queue_depth() > 0
+        || (metrics.num_workers() > 0 && metrics.worker_local_queue_depth(0) > 0)
+}
+
+#[cfg(tokio_unstable)]
+fn idle_waker_waiting(slot: &IdleWait) -> bool {
+    slot.waker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+}
+
+#[cfg(tokio_unstable)]
+fn take_idle_waker(slot: &IdleWait) -> Option<std::task::Waker> {
+    slot.waker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+#[cfg(tokio_unstable)]
+fn release_recheck(slot: &IdleWait, epoch: u64) {
+    let _ = slot
+        .recheck_epoch
+        .compare_exchange(epoch, 0, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// One thread for this barrier epoch. It wakes the barrier after the pool
+/// thread has had time to mark itself idle. It does not move virtual time.
+#[cfg(tokio_unstable)]
+fn arm_idle_recheck(slot: Arc<IdleWait>) {
+    let epoch = slot.epoch.load(Ordering::Acquire);
+    let previous = slot.recheck_epoch.swap(epoch, Ordering::AcqRel);
+    if previous == epoch {
+        return;
     }
-    #[cfg(not(tokio_unstable))]
-    false
+    let handle = tokio::runtime::Handle::current();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(IDLE_RECHECK_INTERVAL);
+        if slot.epoch.load(Ordering::Acquire) != epoch || !slot.parked.load(Ordering::Acquire) {
+            release_recheck(&slot, epoch);
+            return;
+        }
+        if pool_busy(&handle) {
+            continue;
+        }
+        if slot.epoch.load(Ordering::Acquire) != epoch || !slot.parked.load(Ordering::Acquire) {
+            release_recheck(&slot, epoch);
+            return;
+        }
+        release_recheck(&slot, epoch);
+        slot.ready.store(true, Ordering::Release);
+        if let Some(waker) = take_idle_waker(&slot) {
+            waker.wake();
+        }
+        return;
+    });
+}
+
+#[cfg(tokio_unstable)]
+fn note_runtime_parked() {
+    let slot = IDLE_WAIT.with(Arc::clone);
+    slot.parked.store(true, Ordering::Release);
+    note_idle_park();
+}
+
+#[cfg(tokio_unstable)]
+fn note_runtime_unparked() {
+    IDLE_WAIT.with(|slot| slot.parked.store(false, Ordering::Release));
 }
 
 /// Park hook. Wakes the open barrier when the scheduler has nothing ready
 /// and the only blocking task is the clock hold. A closed barrier stores
 /// no waker, so this returns without reading metrics.
+#[cfg(tokio_unstable)]
 fn note_idle_park() {
-    let interested = IDLE_WAIT.with(|slot| {
-        slot.waker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    });
-    if !interested {
+    let slot = IDLE_WAIT.with(Arc::clone);
+    if !idle_waker_waiting(&slot) {
         return;
     }
-    if blocking_beyond_clock_hold() {
-        IDLE_WAIT.with(|slot| slot.ready.store(false, Ordering::Release));
+    if pool_busy(&tokio::runtime::Handle::current()) {
+        slot.ready.store(false, Ordering::Release);
+        arm_idle_recheck(slot);
         return;
     }
-    IDLE_WAIT.with(|slot| {
-        slot.ready.store(true, Ordering::Release);
-        if let Some(waker) = slot
-            .waker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            waker.wake();
-        }
-    });
+    slot.ready.store(true, Ordering::Release);
+    if let Some(waker) = take_idle_waker(&slot) {
+        waker.wake();
+    }
 }
 
 /// Completes when the runtime is about to park and [`note_idle_park`]
 /// released the clock.
+#[cfg(tokio_unstable)]
 struct IdlePulse;
 
+#[cfg(tokio_unstable)]
 impl std::future::Future for IdlePulse {
     type Output = ();
 
@@ -740,21 +837,66 @@ impl std::future::Future for IdlePulse {
     }
 }
 
+/// Drops the idle waker when the barrier returns, including by panic.
+/// A waker left behind wakes once on the next park for no reason (#1245).
+#[cfg(tokio_unstable)]
+struct EndIdleWait;
+
+#[cfg(tokio_unstable)]
+impl Drop for EndIdleWait {
+    fn drop(&mut self) {
+        clear_idle_wait();
+    }
+}
+
 /// Poll `fut` until it is ready. Virtual time stays put while any task is
 /// ready or a blocking task besides [`AutoAdvanceHold`] is running. When
 /// the scheduler is idle, move one millisecond so the next timer fires on
 /// the same virtual instant on every rerun.
+#[cfg(tokio_unstable)]
 async fn drive_paused<F: std::future::Future>(fut: F) -> F::Output {
     tokio::pin!(fut);
+    let _end = EndIdleWait;
     IDLE_WAIT.with(|slot| slot.ready.store(false, Ordering::Release));
     loop {
         tokio::select! {
             biased;
             output = &mut fut => return output,
             _ = IdlePulse => {
+                if pool_busy(&tokio::runtime::Handle::current())
+                    || scheduler_has_queued_tasks()
+                {
+                    continue;
+                }
                 tokio::time::advance(Duration::from_millis(1)).await;
             }
         }
+    }
+}
+
+/// Clock while a barrier is open. The unstable build steps one millisecond
+/// at idle. The other build lets paused tokio auto-advance.
+async fn run_open_barrier<F: std::future::Future>(fut: F) -> F::Output {
+    #[cfg(tokio_unstable)]
+    {
+        drive_paused(fut).await
+    }
+    #[cfg(not(tokio_unstable))]
+    {
+        fut.await
+    }
+}
+
+/// Gate installed outside a barrier. The unstable build does not take a
+/// pool thread: [`AutoAdvanceHold`] already inhibits auto-advance.
+fn shut_clock_gate() -> ClockGate {
+    #[cfg(tokio_unstable)]
+    {
+        ClockGate::marker()
+    }
+    #[cfg(not(tokio_unstable))]
+    {
+        ClockGate::close()
     }
 }
 
@@ -768,18 +910,25 @@ struct ClockGate {
 impl ClockGate {
     fn close() -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let task = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
             let _ = wait.recv();
         });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("W3-H clock gate did not start");
         Self {
             release: Some(release),
             task: Some(task),
         }
     }
 
-    /// Nested-barrier token for [`Sim`]. It does not take a pool thread.
-    /// [`AutoAdvanceHold`] already inhibits auto-advance, and the second
-    /// pool thread must stay free for scenario work (#1245).
+    /// Nested-barrier token for [`Sim`] on the `tokio_unstable` build. It
+    /// does not take a pool thread. [`AutoAdvanceHold`] already inhibits
+    /// auto-advance, and the second pool thread must stay free for scenario
+    /// work (#1245).
+    #[cfg(tokio_unstable)]
     fn marker() -> Self {
         Self {
             release: None,
@@ -1013,7 +1162,9 @@ pub(crate) struct Sim {
     nodes: BTreeMap<String, SimNode>,
     gate: Mutex<Option<ClockGate>>,
     /// Kept for the scenario so auto-advance stays inhibited. Time moves
-    /// only in [`drive_paused`].
+    /// only in [`drive_paused`]. Absent without `tokio_unstable`: that
+    /// build uses [`ClockGate::close`] and tokio auto-advance instead.
+    #[cfg(tokio_unstable)]
     _clock_hold: AutoAdvanceHold,
     shim: Option<Shim>,
     logs: Arc<Mutex<Vec<CapturedLog>>>,
@@ -1259,7 +1410,8 @@ impl Sim {
             plane,
             fabric,
             nodes: BTreeMap::new(),
-            gate: Mutex::new(Some(ClockGate::marker())),
+            gate: Mutex::new(Some(shut_clock_gate())),
+            #[cfg(tokio_unstable)]
             _clock_hold: AutoAdvanceHold::acquire(),
             shim,
             logs,
@@ -1577,9 +1729,11 @@ impl Sim {
     }
 
     /// Run `fut` inside a named barrier. The clock gate opens, virtual time
-    /// steps only while the scheduler is idle, up to `budget`, then the
-    /// gate closes again. The barrier, its virtual duration and outcome
-    /// are recorded in the trace.
+    /// may advance up to `budget`, then the gate closes again. On the
+    /// `tokio_unstable` build the advance is one millisecond per idle park.
+    /// On any other build paused tokio auto-advances, and it freezes while
+    /// a `spawn_blocking` task runs. The barrier, its virtual duration and
+    /// outcome are recorded in the trace.
     pub(crate) async fn within<F: std::future::Future>(
         &self,
         name: &str,
@@ -1596,13 +1750,11 @@ impl Sim {
         self.fabric.mark(format!("barrier '{name}' open"));
         gate.open().await;
         // Wall clock is pull-based (`install_virt_time`); no 1 ms ticker.
-        // Auto-advance stays inhibited (`AutoAdvanceHold`). This steps
-        // virtual time by 1 ms whenever the barrier is idle.
-        let outcome = drive_paused(tokio::time::timeout(budget, fut)).await;
+        let outcome = run_open_barrier(tokio::time::timeout(budget, fut)).await;
         *self
             .gate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ClockGate::marker());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(shut_clock_gate());
         if let Some(shim) = self.shim {
             shim.set_wall(self.fabric.now());
         }

@@ -1,6 +1,8 @@
 //! W3-H S1 controls: the harness itself, before any failure case.
 //!
 //! - `w3h_clock_gate_*`: virtual time does not move outside a barrier.
+//! - `w3h_auto_advance_freezes_*`: without `tokio_unstable`, auto-advance
+//!   stays put while `spawn_blocking` runs.
 //! - `w3h_s1_control_*`: three real daemons, public API only, over the
 //!   fabric. The positive control must converge AND deliver group data; the
 //!   negative control (joiner offline) must fail for exactly the intended
@@ -249,10 +251,60 @@ fn w3h_drive_paused_freezes_while_spawn_blocking_runs() -> Result<()> {
             Ok(())
         })
         .await?;
-        super::drive_paused(sleeper).await.expect("sleeper join");
+        // The idle step must reach the timer in wall time. A park that
+        // misses the pool going idle used to wait out the virtual budget.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = tx.send(());
+        });
+        tokio::select! {
+            biased;
+            joined = super::drive_paused(sleeper) => {
+                joined.expect("sleeper join");
+            }
+            _ = rx => bail!("idle step stalled in wall time after spawn_blocking"),
+        }
         ensure!(
             tokio::time::Instant::now() >= start + Duration::from_millis(50),
             "idle barrier did not reach the 50 ms timer"
+        );
+        Ok(())
+    })
+}
+
+/// #1245: without `tokio_unstable` a barrier lets paused tokio auto-advance.
+/// That advance freezes while `spawn_blocking` runs, so a 50 ms timer must
+/// not fire during the pool task and must fire once the pool is idle.
+#[test]
+#[cfg(not(tokio_unstable))]
+fn w3h_auto_advance_freezes_while_spawn_blocking_runs() -> Result<()> {
+    super::block_on_paused(async move {
+        let start = tokio::time::Instant::now();
+        let sleeper = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        // Same clock as `Sim::within` on this build: the gate is open, and
+        // tokio auto-advances.
+        let gate = ClockGate::close();
+        gate.open().await;
+        tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        })
+        .await
+        .expect("blocking task");
+        ensure!(
+            tokio::time::Instant::now() == start,
+            "virtual time moved during spawn_blocking"
+        );
+        ensure!(
+            !sleeper.is_finished(),
+            "a 50 ms timer fired while a blocking task held the clock"
+        );
+        sleeper.await?;
+        ensure!(
+            tokio::time::Instant::now() >= start + Duration::from_millis(50),
+            "auto-advance did not reach the 50 ms timer"
         );
         Ok(())
     })
