@@ -6156,9 +6156,7 @@ impl HeartbeatContext {
             .load(std::sync::atomic::Ordering::Acquire);
         let (user_id, agent_certificate) = if include_user {
             (
-                self.identity
-                    .user_keypair()
-                    .map(identity::UserKeypair::user_id),
+                self.identity.disclosed_user_id(),
                 self.identity.agent_certificate().cloned(),
             )
         } else {
@@ -15139,7 +15137,7 @@ impl Agent {
         let addresses = filter_discovery_announcement_addrs(addresses, allow_local_scope);
 
         let (user_id, agent_certificate) = if include_user_identity {
-            let user_id = self.user_id().ok_or_else(|| {
+            let user_id = self.identity.disclosed_user_id().ok_or_else(|| {
                 error::IdentityError::Storage(std::io::Error::other(
                     "human identity disclosure requested but no user identity is configured — set user_key_path in your config.toml to point at your user keypair file",
                 ))
@@ -22167,6 +22165,28 @@ fn schedule_reconnect(
     tracker.insert(peer_id_bytes, handle);
 }
 
+/// The owner-issued certificate a certificate-only device (no user key)
+/// loads from `path`: test builds only (W3-H, #1572), and only when it
+/// verifies and binds `agent`. Production keeps loading `agent.cert` only
+/// beside the user key, so this is always `None` there.
+#[cfg(test)]
+async fn certificate_only_cert(
+    path: Option<&std::path::Path>,
+    agent: &identity::AgentKeypair,
+) -> Option<identity::AgentCertificate> {
+    let cert = storage::load_agent_certificate_from(path?).await.ok()?;
+    let binds_agent = cert.agent_id().is_ok_and(|id| id == agent.agent_id());
+    (binds_agent && cert.verify().is_ok()).then_some(cert)
+}
+
+#[cfg(not(test))]
+async fn certificate_only_cert(
+    _path: Option<&std::path::Path>,
+    _agent: &identity::AgentKeypair,
+) -> Option<identity::AgentCertificate> {
+    None
+}
+
 impl AgentBuilder {
     /// Set a custom path for the machine keypair.
     ///
@@ -22648,7 +22668,14 @@ impl AgentBuilder {
             cert_journal_path = journal_path;
             identity::Identity::new_with_user(machine_keypair, agent_keypair, user_kp, cert)
         } else {
-            identity::Identity::new(machine_keypair, agent_keypair)
+            let certificate_only =
+                certificate_only_cert(self.agent_cert_path.as_deref(), &agent_keypair).await;
+            match certificate_only {
+                Some(cert) => {
+                    identity::Identity::new_with_certificate(machine_keypair, agent_keypair, cert)
+                }
+                None => identity::Identity::new(machine_keypair, agent_keypair),
+            }
         };
 
         // Configure the bootstrap peer cache. The cache *instance* is owned
@@ -27102,6 +27129,42 @@ mod tests {
             "the zero-fanout miss must be counted"
         );
         agent.shutdown().await;
+    }
+
+    /// W3-H (#1572): a test build loads an owner-issued `agent.cert` with
+    /// no user key only when it binds this agent; the announce then names
+    /// the certificate's issuer.
+    #[tokio::test]
+    async fn certificate_only_device_loads_its_own_certificate() {
+        let owner = identity::UserKeypair::generate().expect("owner user key");
+        let agent_kp = identity::AgentKeypair::generate().expect("agent key");
+        let other = identity::AgentKeypair::generate().expect("other agent key");
+        for (issued_to, loads) in [(&agent_kp, true), (&other, false)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cert_path = dir.path().join("agent.cert");
+            let cert = identity::AgentCertificate::issue(&owner, issued_to).expect("issue");
+            storage::save_agent_certificate_to(&cert, cert_path.clone())
+                .await
+                .expect("save cert");
+            storage::save_agent_keypair_to(&agent_kp, dir.path().join("agent.key"))
+                .await
+                .expect("save agent key");
+            let agent = Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_agent_cert_path(&cert_path)
+                .with_identity_dir(dir.path())
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("agent");
+            let identity = agent.identity();
+            assert_eq!(identity.user_id(), None, "no user key: not the owner");
+            assert_eq!(identity.agent_certificate().is_some(), loads);
+            let disclosed = loads.then(|| owner.user_id());
+            assert_eq!(identity.disclosed_user_id(), disclosed);
+            agent.shutdown().await;
+        }
     }
 
     mod own_agent_certificate_lookup_797 {
