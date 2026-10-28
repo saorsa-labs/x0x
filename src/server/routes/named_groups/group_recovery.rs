@@ -10259,6 +10259,72 @@ mod tests {
         Ok(())
     }
 
+    /// #1658 (PR #1645 follow-up): a swap whose tree write leaves the
+    /// staged snapshot on disk but does not commit puts the original's
+    /// snapshot state back (Keep: the original's tree; Absent: no file),
+    /// sets the journal back to `Staging` and keeps the original record in
+    /// the roster files. The next swap then completes. Inert: an offline
+    /// agent.
+    #[tokio::test]
+    async fn a_failed_swap_tree_write_restores_the_originals_snapshot_state() -> anyhow::Result<()>
+    {
+        use super::super::{set_save_fault, SaveFault};
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, original_tree, staged, staged_tree) =
+            staged_tree_fixture(&state).await?;
+        let (state2, _dir2) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key2, original2, staged2, staged_tree2) = treeless_staged_fixture(&state2).await?;
+        for (state, key, original, staged, staged_tree, keep) in [
+            (
+                &state,
+                &key,
+                &original,
+                &staged,
+                &staged_tree,
+                Some(&original_tree),
+            ),
+            (&state2, &key2, &original2, &staged2, &staged_tree2, None),
+        ] {
+            let stable = original.stable_group_id().to_string();
+            let fault = set_save_fault(state, SaveFault::NamedNotReplacedAfterSnapshot);
+            assert!(swap_if_seated(state, &stable).await, "retried next tick");
+            let journal = open_journal(state, &stable)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("the journal stays open"))?;
+            assert_eq!(journal.phase, ReseatPhase::Staging);
+            match keep {
+                Some(original_tree) => {
+                    let envelope = snapshot_on_disk(state, key).await?;
+                    assert_eq!(envelope.state_hash, original.state_hash);
+                    assert!(
+                        envelope.snapshot == *original_tree,
+                        "Keep: the original's tree is back"
+                    );
+                }
+                None => assert!(!snapshot_exists(state, key).await?, "Absent: no file"),
+            }
+            let legacy = legacy_entry(&state.named_groups_path, key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+            assert_eq!(legacy.state_hash, original.state_hash);
+
+            drop(fault);
+            assert!(swap_if_seated(state, &stable).await);
+            assert!(open_journal(state, &stable).await.is_none(), "swapped");
+            let envelope = snapshot_on_disk(state, key).await?;
+            assert_eq!(envelope.state_hash, staged.state_hash);
+            assert!(
+                envelope.snapshot == *staged_tree,
+                "the retry writes the staged tree"
+            );
+            let legacy = legacy_entry(&state.named_groups_path, key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+            assert_eq!(legacy.state_hash, staged.state_hash);
+        }
+        Ok(())
+    }
+
     /// `staged`, one sealed metadata commit later.
     fn staged_metadata_commit(state: &AppState, staged: &GroupInfo) -> anyhow::Result<GroupInfo> {
         let mut next = staged.clone();
