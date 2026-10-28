@@ -928,16 +928,29 @@ async fn expect_green(case: &str, seed: u64, labels: &[&str]) -> Result<()> {
 /// ADR 0110 `s4_ordinary_admin_revoked`, base run and re-create variant:
 /// GREEN with the seal-ordering fix; RED on `main` (the seat 403) and with
 /// the §4 cover test neutralised.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-async fn w3h_1581_s4_ordinary_admin_revoked() -> Result<()> {
-    expect_green(
-        "w3h_1581_s4_ordinary_admin_revoked",
-        0x1581_0001,
-        &["A", "B", "C"],
-    )
-    .await
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
+)]
+fn w3h_1581_s4_ordinary_admin_revoked() -> Result<()> {
+    // The sibling shape: a sync test on `block_on_paused`'s runtime, the
+    // one runtime with the spawn-lineage hooks and #1245's queue rules.
+    // A `#[tokio::test]` runtime has no hooks, so every entropy draw
+    // counts a lineage miss and the D196 guard fails the shard (review
+    // of the first CI run).
+    super::block_on_paused(async move {
+        expect_green(
+            "w3h_1581_s4_ordinary_admin_revoked",
+            0x1581_0001,
+            &["A", "B", "C"],
+        )
+        .await
+    })
 }
