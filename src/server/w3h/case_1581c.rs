@@ -121,6 +121,9 @@ const CAUSE_NO_COMPLETION: &str = "A never completed the learned exclusion: afte
 const CAUSE_NO_COMMIT: &str = "D's fallback never committed the exclusion while A was down: the \
                                remove was not queued as the typed wait naming A, or D and C \
                                never reached H signed by D";
+const CAUSE_DATA_PLANE: &str = "A completed the learned exclusion with D's signer, but the data \
+                                plane did not follow: A or C did not decrypt the new traffic, \
+                                or B still could";
 
 /// The first wait before a retry of a typed `retry: true` 424 reply; it
 /// doubles per retry, up to [`RETRY_CAP`]. Virtual time.
@@ -867,15 +870,14 @@ async fn scenario(
     let bound = w.saturating_add(timing.completion_bound);
     let deadline = t0.saturating_add(bound);
     let (rm_status, rm_body, rm_retries) = remove_retrying(sim, &group, &b_hex, deadline).await?;
-    let body_text = rm_body.to_string();
-    let queued_typed = body_text.contains("waiting_for_designated_admin")
-        && body_text.to_ascii_lowercase().contains(&a_hex);
-    receipt.evidence(
-        "d_remove_queues_typed_waiting_for_designated_admin",
-        queued_typed,
-        format!("D DELETE members/{b_hex}: {rm_status} {rm_body} ({rm_retries} typed 424 retries)"),
-        at(sim),
-    );
+    let queued_typed = rm_body["waiting"]["cause"].as_str() == Some("waiting_for_designated_admin")
+        && rm_body["waiting"]["designated_admin"]
+            .as_str()
+            .is_some_and(|named| named.eq_ignore_ascii_case(&a_hex));
+    receipt.note(format!(
+        "D DELETE members/{b_hex}: {rm_status} {rm_body} ({rm_retries} typed 424 retries); the \
+         typed wait names A: {queued_typed}"
+    ));
 
     // D's fallback reaches H on the survivors that stayed online.
     let mut seen = Observations::default();
@@ -902,12 +904,10 @@ async fn scenario(
         seen.as_ref()
             .is_some_and(|seen| seen.head_committed_by.as_deref() == Some(d_hex.as_str()))
     });
-    receipt.evidence(
-        "d_fallback_commits_the_exclusion_while_a_is_down",
-        excluded(&h1, e0, leaves0) && signed_by_d,
-        format!("signer wanted D ({d_hex}); {}", describe_all(&h1)),
-        at(sim),
-    );
+    receipt.note(format!(
+        "D's fallback commit while A was down (signer wanted D ({d_hex})): {}",
+        describe_all(&h1)
+    ));
 
     // A restarts with the window expired and its head stale. Every
     // application frame toward A is dropped until the release point.
@@ -1013,12 +1013,9 @@ async fn scenario(
         );
         typed_observed = typed_seen_at.is_some();
         window_quiet = typed_seen_at.is_some() && sealed_early.is_none() && unchanged;
-        receipt.evidence(
-            "a_shows_the_typed_wait_and_seals_nothing_before_the_sync_wait",
-            window_quiet,
-            typed_detail.clone(),
-            at(sim),
-        );
+        receipt.note(format!(
+            "inside the pre-wait window (quiet {window_quiet}): {typed_detail}"
+        ));
         // Record (not assert) what main does past the sync wait under
         // the blackout, and A's own seal state at that instant.
         let read_at = restart_at
@@ -1095,16 +1092,12 @@ async fn scenario(
             }
         }
         typed_observed = observed;
-        receipt.evidence(
-            "a_exposes_waiting_for_head_sync_while_unsynced",
-            observed,
-            format!(
-                "polled after the release at {} us; frames dropped toward A while held: {}",
-                release_at.as_micros(),
-                hold.dropped()
-            ),
-            at(sim),
-        );
+        receipt.note(format!(
+            "A exposed the typed waiting_for_head_sync while unsynced (observed {observed}); \
+             polled after the release at {} us; frames dropped toward A while held: {}",
+            release_at.as_micros(),
+            hold.dropped()
+        ));
     }
 
     // The resume: A catches up to D's commit and its row completes from
@@ -1113,11 +1106,23 @@ async fn scenario(
     // is the design question the module doc names).
     let converge_bound = sync_wait.saturating_add(timing.completion_bound);
     let mut converged = false;
+    // "No fallback before sync", watched continuously on the resume arm
+    // too: A authoring an exclusion commit at any point (a stale-head
+    // seal that fork resolution might later paper over) is seen here,
+    // not only in the end read.
+    let mut a_authored = false;
     let waited = sim
         .until(
             "A completes the learned exclusion",
             converge_bound + secs(5),
             async |s: &Sim| {
+                if let Ok(Some(seen)) = try_view_now(s, "A", &group, &b).await {
+                    if seen.head_committed_by.as_deref() == Some(a_hex.as_str())
+                        && seen.epoch.is_some_and(|epoch| epoch > e0)
+                    {
+                        a_authored = true;
+                    }
+                }
                 let caught_up = view_now(s, "A", &group, &b)
                     .await
                     .is_ok_and(|seen| seen.epoch == Some(e0 + 1));
@@ -1184,18 +1189,14 @@ async fn scenario(
             b_after.1
         ));
     } else {
-        receipt.evidence(
-            "a_completes_the_learned_exclusion_without_a_second_rotation",
-            completed && h_once && still_signed_by_d && data_plane,
-            format!(
-                "A's row {final_row:?}; {}; {}; {}; {}",
-                describe_all(&end),
-                a_after.1,
-                c_after.1,
-                b_after.1
-            ),
-            at(sim),
-        );
+        receipt.note(format!(
+            "A completed the learned exclusion: row {final_row:?}; A authored an exclusion \
+             commit itself: {a_authored}; {}; {}; {}; {}",
+            describe_all(&end),
+            a_after.1,
+            c_after.1,
+            b_after.1
+        ));
     }
     receipt.request_delivered(
         "d_remove_b_queued_typed_then_committed",
@@ -1213,9 +1214,11 @@ async fn scenario(
         queued_typed
             && excluded(&h1, e0, leaves0)
             && signed_by_d
+            && typed_observed
             && completed
             && h_once
             && still_signed_by_d
+            && !a_authored
             && data_plane
     };
     if !passed {
@@ -1237,8 +1240,20 @@ async fn scenario(
                     "A left the stale head {sealed_early:?} after the restart, before the sync                      wait; {typed_detail}"
                 ),
             )
-        } else if !still_signed_by_d && !no_sync_past_wait {
+        } else if (!still_signed_by_d || a_authored) && !no_sync_past_wait {
             (CAUSE_STALE_SEAL, true, describe_all(&end))
+        } else if completed
+            && h_once
+            && still_signed_by_d
+            && !a_authored
+            && !data_plane
+            && !no_sync_past_wait
+        {
+            (
+                CAUSE_DATA_PLANE,
+                true,
+                format!("{}; {}; {}", a_after.1, c_after.1, b_after.1),
+            )
         } else if !completed && h_once && !no_sync_past_wait {
             (
                 CAUSE_NO_COMPLETION,
@@ -1337,9 +1352,11 @@ fn w3h_1581c_control_restart_stale_head_resume() -> Result<()> {
     })
 }
 
-/// ADR 0110 `s4_restart_stale_head`, the row's second run: the head
-/// catch-up stays unavailable past the restart sync wait, and A retains
-/// the typed `waiting_for_head_sync` instead of sealing its stale head.
+/// ADR 0110 `s4_restart_stale_head`, the row's second run, its
+/// "no fallback before sync" leg: with the head catch-up unavailable,
+/// A shows the typed `waiting_for_head_sync` and seals nothing through
+/// the restart sync wait. What main does past the wait (it seals the
+/// stale head; see the module doc) is recorded, not asserted.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),

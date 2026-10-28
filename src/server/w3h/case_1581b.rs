@@ -100,6 +100,9 @@ const CAUSE_NO_RECOVERY: &str = "the held eager frames were released at the retr
                                  designated admin A never sealed: after the completion bound \
                                  every survivor still lists B active, at epoch e0, with the same \
                                  leaf count";
+const CAUSE_DATA_PLANE: &str = "the survivors reached H with the expected signer, but the data \
+                                plane did not follow: C did not decrypt the new traffic, or B \
+                                still could";
 
 /// `label`'s view of `group`; `None` when it holds no record of it.
 #[derive(Debug, Clone)]
@@ -746,7 +749,27 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
             return Err(error);
         }
     }
-    let row_seen = row_seen.context("A's .evs row for B never appeared after the floor")?;
+    let row_seen = match row_seen {
+        Some(at) => at,
+        None => {
+            // The held delivery never reached A: the arm's own cause, not
+            // INFRA.
+            receipt.request_delivered(
+                "holders_hold_b_and_frames_reached_a",
+                false,
+                "A's .evs row for B never appeared after the floor".to_string(),
+                at(sim),
+            );
+            receipt.cause(
+                CAUSE_NO_RECOVERY,
+                Some("A's .evs row for B never appeared after the floor".to_string()),
+                true,
+                at(sim),
+            );
+            receipt.finish(FINAL_CONTROL, false, at(sim));
+            return Ok(());
+        }
+    };
     receipt.evidence(
         "a_t_obs_at_or_after_the_retry_floor",
         row_seen >= floor && !early_row,
@@ -808,18 +831,12 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
     let h_once = excluded(&end, e0, leaves0) && all_at(&end, e0 + 1);
     let in_bound = reached_after.is_some_and(|after| after <= deadline);
 
-    receipt.evidence(
-        "exclusion_signed_by_designated_a_no_sibling",
-        signed_by_a,
-        format!("signer wanted A ({a_hex}); {}", describe_all(&end)),
-        at(sim),
-    );
-    receipt.evidence(
-        "h_once_at_e0_plus_1_after_settle",
-        h_once && data_plane,
-        format!("{}; {}; {}", describe_all(&end), c_after.1, b_after.1),
-        at(sim),
-    );
+    receipt.note(format!(
+        "signer wanted A ({a_hex}) on every survivor: {signed_by_a}; {}; {}; {}",
+        describe_all(&end),
+        c_after.1,
+        b_after.1
+    ));
     receipt.note(format!(
         "control arm: H at {:?} after A's row sighting (bound {bound:?}); released hold: {}",
         reached_after,
@@ -864,6 +881,12 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
     if !passed {
         let (cause, ok, observed) = if h_once && !signed_by_a {
             (CAUSE_SIBLING_SIGNED, true, describe_all(&end))
+        } else if h_once && signed_by_a && in_bound && !data_plane {
+            (
+                CAUSE_DATA_PLANE,
+                true,
+                format!("{}; {}", c_after.1, b_after.1),
+            )
         } else if h_once && !in_bound {
             (
                 CAUSE_OVER_BOUND,
@@ -991,28 +1014,20 @@ async fn loss_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> Resu
     let in_bound = reached_after.is_some_and(|after| after <= bound);
     let not_early = first_move.is_some_and(|moved| moved >= w);
 
-    receipt.evidence(
-        "first_rekey_at_or_after_w",
-        not_early,
-        format!(
-            "first epoch move {first_move:?} after t=0; rank-1 fallback offset {:?}; at W/2: {}",
-            timing.fallback_offset(1),
-            describe_all(&mid)
-        ),
-        at(sim),
-    );
-    receipt.evidence(
-        "exclusion_signed_by_fallback_d",
-        signed_by_d,
-        format!("signer wanted D ({d_hex}); {}", describe_all(&end)),
-        at(sim),
-    );
-    receipt.evidence(
-        "h_once_at_e0_plus_1_after_settle",
-        h_once && data_plane,
-        format!("{}; {}; {}", describe_all(&end), c_after.1, b_after.1),
-        at(sim),
-    );
+    let mid_quiet = all_at(&mid, e0)
+        && mid.iter().all(|(_, seen)| {
+            seen.as_ref()
+                .is_some_and(|seen| seen.lists_b && !seen.quarantined)
+        });
+    receipt.note(format!(
+        "at W/2 (quiet {mid_quiet}): {}; first epoch move {first_move:?} after t=0 (rank-1 \
+         fallback offset {:?}); signer wanted D ({d_hex}): {signed_by_d}; {}; {}; {}",
+        describe_all(&mid),
+        timing.fallback_offset(1),
+        describe_all(&end),
+        c_after.1,
+        b_after.1
+    ));
     let holders_at_end = sim
         .at_instant("read the holders' revocations at the end", async {
             Ok::<_, anyhow::Error>((
@@ -1028,10 +1043,16 @@ async fn loss_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> Resu
         at(sim),
     );
 
-    let passed = h_once && data_plane && signed_by_d && in_bound && not_early;
+    let passed = h_once && data_plane && signed_by_d && in_bound && not_early && mid_quiet;
     if !passed {
         let (cause, ok, observed) = if h_once && !signed_by_d {
             (CAUSE_NOT_SIGNED_BY_D, true, describe_all(&end))
+        } else if h_once && signed_by_d && in_bound && !data_plane {
+            (
+                CAUSE_DATA_PLANE,
+                true,
+                format!("{}; {}", c_after.1, b_after.1),
+            )
         } else if h_once && !in_bound {
             (
                 CAUSE_FALLBACK_LATE,
