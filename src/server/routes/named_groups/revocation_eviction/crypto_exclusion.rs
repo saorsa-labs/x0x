@@ -5341,6 +5341,8 @@ mod daemon_tests {
             ReceiveOutcome::Applied,
             "the survivor installs the verified frame keyless (#1578)"
         );
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
         // The state the 409 names: the install moved the head, the
         // survivor holds no secret of the new epoch, and the durable
         // exclusion hold is active.
@@ -5378,6 +5380,57 @@ mod daemon_tests {
                 |text| text.contains(ng::GroupCiphertextHold::PendingGssRemoval.reason())
             ),
             "the refusal is the hold's typed reason: {body:?}"
+        );
+        // The other side of the boundary (the review's P3): a member
+        // with no secret and NO hold — a joiner awaiting its welcome
+        // share — keeps the waiting answer, the 424. The hold is the
+        // only thing that separates the two answers.
+        let joiner_id = "e4".repeat(16);
+        let mut joiner =
+            x0x::groups::GroupInfo::new("e3".into(), String::new(), survivor, joiner_id.clone());
+        joiner.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        joiner.add_member(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(survivor_hex.clone()),
+            None,
+        );
+        // A joiner holds no secret: genesis seats the creator's secret,
+        // and the welcome share has not arrived, so the seat waits.
+        joiner.shared_secret = None;
+        joiner.recompute_state_hash();
+        fx.replica
+            .named_groups
+            .write()
+            .await
+            .insert(joiner_id.clone(), joiner);
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &joiner_id),
+            0,
+            "the joiner's group has no hold"
+        );
+        let (status, body) = ng::secure_group_encrypt(
+            axum::extract::State(std::sync::Arc::clone(&fx.replica)),
+            axum::extract::Path(joiner_id),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            axum::Json(ng::SecureEncryptRequest {
+                payload_b64: base64::engine::general_purpose::STANDARD
+                    .encode(b"#1635 joiner probe"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FAILED_DEPENDENCY,
+            "a joiner with no hold keeps the waiting answer: {body:?}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("no shared secret available")),
+            "the joiner's refusal names the welcome wait, not the hold: {body:?}"
         );
         Ok(())
     }
