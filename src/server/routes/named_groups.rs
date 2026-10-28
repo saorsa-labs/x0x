@@ -1312,14 +1312,13 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     group_id: String,
     events: Vec<NamedGroupMetadataEvent>,
     truncated: bool,
-    /// Saved membership head of the responder. Absent on a KeyPackage reply
-    /// and on an old peer. A startup self-leave seal trusts this only when
-    /// it equals the local head after the page is applied. #1578: a
-    /// responder that installed a held exclusion's result keyless reports
-    /// the live hold's parent here — the newest head its secrets vouch
-    /// for — not the installed result; the field's wire shape is
-    /// unchanged, but its value can now name a head the responder does
-    /// not hold (pending the engineer's word).
+    /// Saved membership head of the responder. Absent on a KeyPackage
+    /// reply, on an old peer, and on a responder whose held exclusion's
+    /// share has not arrived (#1578: it installed the result keyless and
+    /// claims no head until a secret of that epoch installs). A present
+    /// value is always the responder's saved head. A startup self-leave
+    /// seal trusts this only when it equals the local head after the page
+    /// is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
 }
@@ -11812,14 +11811,14 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             (false, vec![request.group_id.clone()], None)
         }
     };
-    // #1578 (Engineer ruling, 25 Oct 00:26): the responder's saved head is
-    // its survivor-convergence evidence for the S4 deliveries of this
-    // group. A node that installed a GSS exclusion keyless reports the
-    // held exclusion's parent, not the installed result, so that local
-    // keyless fact never converges an author's delivery row.
+    // #1578 (Engineer ruling, 27 Oct 22:10 GMT): the responder's saved
+    // head is its survivor-convergence evidence for this group's S4
+    // deliveries. A node that installed a GSS exclusion keyless claims no
+    // head (None) — that local fact never converges an author's delivery
+    // row.
     let saved_head = match &held_group {
         Some((key, info)) => gss_share_hold::reported_head(state, key, info).await,
-        None => String::new(),
+        None => None,
     };
     let target_of_cached_add = {
         let logs = state.treekem_event_log.read().await;
@@ -11922,7 +11921,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         group_id: request.group_id.clone(),
         events,
         truncated,
-        responder_state_hash: Some(saved_head),
+        responder_state_hash: saved_head,
     };
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
@@ -13518,8 +13517,7 @@ async fn replay_parked_gss_removals(state: &Arc<AppState>, group_key: &str) {
                 .read()
                 .await
                 .get(group_key)
-                .cloned()
-                .is_some_and(|info| gss_share_hold::prune_exclusions(state, group_key, &info));
+                .is_some_and(|info| gss_share_hold::prune_exclusions(state, group_key, info));
             if pruned {
                 gss_share_hold::persist_logged(state, group_key).await;
             }

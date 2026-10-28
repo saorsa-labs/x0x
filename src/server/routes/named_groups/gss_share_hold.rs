@@ -176,52 +176,40 @@ pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
     })
 }
 
-/// #1578 (Engineer ruling, 25 Oct 00:26): the head this node reports for
-/// `group_key` in a catch-up answer. While this node holds no secret of a
-/// held exclusion's epoch — it installed that exclusion's result keyless —
-/// the report is the live hold's parent, the newest head of the chain this
-/// node's secrets vouch for, never the installed result: a keyless install
-/// is local fact only, it does not prove delivery of the share, and the
-/// author's delivery row must stay open until the share installs (then the
-/// report is the current head again, and it is share-proof). The parent of
-/// the lowest *live* hold is reported. In a chain of keyless installs
-/// only the newest hold stays live, so the report is the chain's first
-/// result — itself keyless-installed, though still the newest head this
-/// node's secrets vouch for. A superseded install keeps its hold for
-/// now (the conservative direction: the parent, not a covered head, is
-/// reported until the held chain replays); its release rides the
-/// stacked #1635. A node that holds
-/// a secret, or is held by no exclusion, reports its current head.
+/// #1578 (Engineer ruling, 27 Oct 22:10 GMT): the head this node claims
+/// for `group_key` in a catch-up answer. `None` while a held exclusion's
+/// share has not arrived — this node installed that exclusion's result
+/// keyless. The install is local fact only: it must never converge an
+/// author's delivery row, so the node claims no head until a secret of
+/// that epoch installs. A chain of keyless installs still claims no head.
+/// Every other node — one with a secret (a superseded install that keeps
+/// its hold included), one held only for a later epoch, one with no hold —
+/// claims its saved head.
 pub(super) async fn reported_head(
     state: &AppState,
     group_key: &str,
     info: &x0x::groups::GroupInfo,
-) -> String {
+) -> Option<String> {
     ensure_loaded(state).await;
-    let lot = state
-        .gss_share_holds
-        .exclusions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(held) = lot.get(group_key) else {
-        return info.state_hash.clone();
-    };
     // The #1578 keyless install: the head is a held exclusion's result and
-    // no secret of its epoch is held. A node with a secret, or held only
-    // for a later epoch (its head is not that exclusion's result), reports
-    // its current head.
+    // no secret of its epoch is held. The node makes no head claim at all;
+    // every other node reports its current head.
     let keyless = info.shared_secret.is_none()
-        && held
-            .iter()
-            .any(|hold| hold.secret_epoch == info.secret_epoch);
-    if !keyless {
-        return info.state_hash.clone();
+        && state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_key)
+            .is_some_and(|held| {
+                held.iter()
+                    .any(|hold| hold.secret_epoch == info.secret_epoch)
+            });
+    if keyless {
+        None
+    } else {
+        Some(info.state_hash.clone())
     }
-    held.iter()
-        .filter(|hold| holds(info, Some(hold.secret_epoch)))
-        .min_by_key(|hold| hold.secret_epoch)
-        .map(|hold| hold.parent_state_hash.clone())
-        .unwrap_or_else(|| info.state_hash.clone())
 }
 
 /// Whether a parked removal or ban, or a held crypto-only exclusion, still
@@ -785,5 +773,103 @@ pub(in crate::server) mod test_seam {
 
     pub(in crate::server) fn hold_file_exists(state: &AppState, group_key: &str) -> bool {
         hold_path(state, group_key).exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A GSS group at `secret_epoch` whose saved head is `head`. `secret`:
+    /// the shared secret this node holds, if any.
+    fn gss_group(secret_epoch: u64, secret: Option<Vec<u8>>, head: &str) -> x0x::groups::GroupInfo {
+        let mut info = x0x::groups::GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            AgentId([1; 32]),
+            "ab".repeat(16),
+        );
+        info.secret_epoch = secret_epoch;
+        info.shared_secret = secret;
+        info.state_hash = head.to_string();
+        info
+    }
+
+    /// Hold a verified exclusion of `secret_epoch` chained from `parent`,
+    /// as [`hold_exclusion`] would, without the durable write.
+    fn hold(state: &AppState, group_key: &str, parent: &str, secret_epoch: u64) {
+        push_exclusion(
+            state,
+            group_key,
+            ExclusionHold {
+                parent_state_hash: parent.to_string(),
+                secret_epoch,
+                removed: Vec::new(),
+            },
+        );
+    }
+
+    async fn test_state() -> (std::sync::Arc<AppState>, tempfile::TempDir) {
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state")
+    }
+
+    /// #1578: the node installed the held exclusion's result keyless (no
+    /// secret of the hold's epoch), so it claims no head at all.
+    #[tokio::test]
+    async fn keyless_hold_claims_no_head() {
+        let (state, _dir) = test_state().await;
+        hold(&state, "g", "parent-head", 2);
+        let info = gss_group(2, None, "keyless-result-head");
+        assert_eq!(reported_head(&state, "g", &info).await, None);
+    }
+
+    /// #1578: a chain of keyless installs claims no head: the newest
+    /// hold's epoch matches the saved head and no secret of it is held.
+    #[tokio::test]
+    async fn keyless_chain_claims_no_head() {
+        let (state, _dir) = test_state().await;
+        hold(&state, "g", "parent-e1", 1);
+        hold(&state, "g", "parent-e2", 2);
+        let info = gss_group(2, None, "keyless-result-head");
+        assert_eq!(reported_head(&state, "g", &info).await, None);
+    }
+
+    /// #1578: a superseded install keeps its hold, but it holds a secret
+    /// of a later epoch, so it claims its saved head.
+    #[tokio::test]
+    async fn superseded_install_claims_saved_head() {
+        let (state, _dir) = test_state().await;
+        hold(&state, "g", "parent-head", 1);
+        let info = gss_group(2, Some(vec![7; 32]), "saved-head");
+        assert_eq!(
+            reported_head(&state, "g", &info).await,
+            Some("saved-head".to_string())
+        );
+    }
+
+    /// #1578: a node held only for a later epoch claims its saved head:
+    /// that head is not the held exclusion's result.
+    #[tokio::test]
+    async fn later_epoch_hold_claims_saved_head() {
+        let (state, _dir) = test_state().await;
+        hold(&state, "g", "parent-head", 2);
+        let info = gss_group(1, Some(vec![7; 32]), "saved-head");
+        assert_eq!(
+            reported_head(&state, "g", &info).await,
+            Some("saved-head".to_string())
+        );
+    }
+
+    /// With no holds the node claims its saved head.
+    #[tokio::test]
+    async fn no_holds_claims_saved_head() {
+        let (state, _dir) = test_state().await;
+        let info = gss_group(1, Some(vec![7; 32]), "saved-head");
+        assert_eq!(
+            reported_head(&state, "g", &info).await,
+            Some("saved-head".to_string())
+        );
     }
 }

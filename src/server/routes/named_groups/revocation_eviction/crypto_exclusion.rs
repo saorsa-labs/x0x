@@ -21,10 +21,12 @@
 //!   the frame keyless — the head moves, the old secret is dropped, the
 //!   share hold stays — and a share that arrives once the seat publishes
 //!   a KEM key ends the hold. That keyless install is local fact only
-//!   (Engineer ruling, 25 Oct 00:26): it never proves delivery. While it
-//!   lasts the survivor reports the hold's parent, not the installed
-//!   result, and the author closes an unsealable seat only from its own
-//!   record that it skipped the seal — never from the recipient's report.
+//!   (Engineer ruling, 27 Oct 22:10 GMT): it never proves delivery, and
+//!   while it lasts the survivor claims no head in its catch-up answers
+//!   ([`super::super::gss_share_hold::reported_head`]), so it converges no
+//!   author's delivery row. The author's row for such a seat stays open
+//!   until it can seal (the seat publishes a KEM key) or a survivor's
+//!   head claim proves delivery.
 //! - **Hold (D76).** While an Active survivor's current verified advert
 //!   lacks `crypto_exclusion_v1`, the commit does not run. The obligation
 //!   shows `waiting_for_receiver_upgrade`, naming each holding survivor.
@@ -53,11 +55,10 @@
 //!   the frame again on each round until its verified catch-up answer
 //!   names the result head ([`note_survivor_head`]). Only then is it
 //!   `Converged`, and only a delivery whose recipients all converged ends.
-//!   One exception (Engineer ruling, 25 Oct 00:26, #1578): a seat this
-//!   author's own roster holds keyless — no KEM key to seal a share to —
-//!   closes from the author's skip record on the send's transport ACK;
-//!   whether that becomes a named exception to §3 L228 is with the
-//!   engineer.
+//!   A seat this author cannot seal a share to (no KEM key on its roster
+//!   seat, #1578) is no exception: its ACK closes nothing, and the row
+//!   stays open until the author can seal or a head claim proves
+//!   delivery.
 //! - **Restart** (`resume_crypto_exclusions` in the parent). A saved frame
 //!   is resent only after the group's head is synced
 //!   ([`super::group_head_synced`], not elapsed time alone) and only while
@@ -157,13 +158,6 @@ pub(super) struct CeDelivery {
     /// that secret to the recipient again, and the delivery runs while
     /// that secret is current (#1508 review P1).
     gss_epoch: Option<u64>,
-    /// #1578 (Engineer ruling, 25 Oct 00:26): the recipients of the
-    /// current round whose seat this author's roster shows with no KEM
-    /// public key, so it skipped the seal for them. This author's own
-    /// record — re-derived from the durable roster at every round — is
-    /// the only way it closes such a seat: a keyless survivor's head
-    /// report proves no share ([`super::super::gss_share_hold::reported_head`]).
-    keyless_seats: BTreeSet<[u8; 32]>,
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
 }
@@ -1011,27 +1005,14 @@ fn spawn_gss_share_to(state: &Arc<AppState>, info: &GroupInfo, recipient_hex: &s
 /// waiting for one would hold the verified frame for ever. The seat's
 /// KEM key is local data — not in the roster root or the state hash — so
 /// another member's view of the seat can differ; that is why the keyless
-/// install is local fact only: it never proves delivery, the node
-/// reports the hold's parent while it lasts
-/// ([`super::super::gss_share_hold::reported_head`]), and each author closes a
-/// seat only from its own record ([`seat_cannot_take_a_share`]).
+/// install is local fact only: it never proves delivery, and while it
+/// lasts this node claims no head in its catch-up answers
+/// ([`super::super::gss_share_hold::reported_head`]), so it converges no
+/// author's delivery row (Engineer ruling, 27 Oct 22:10 GMT).
 fn own_seat_cannot_take_a_share(state: &AppState, info: &GroupInfo) -> bool {
-    seat_cannot_take_a_share(info, state.agent.agent_id().as_bytes())
-}
-
-/// #1578 (Engineer ruling, 25 Oct 00:26): whether this author's roster
-/// shows `recipient`'s Active seat with no KEM public key, so no share
-/// can be sealed to that seat from here ([`spawn_gss_share_to`] reads
-/// the same seat field and skips the seal). The KEM key is local data,
-/// not covered by the roster root, so views can differ between members:
-/// this author closes only a seat it itself could not seal, never from
-/// another node's keyless fact. The record is durable in its basis — the
-/// persisted roster and the row's saved frame — so a restarted author
-/// re-derives it each round.
-fn seat_cannot_take_a_share(info: &GroupInfo, recipient: &[u8; 32]) -> bool {
-    let recipient_hex = hex::encode(recipient);
+    let own_hex = hex::encode(state.agent.agent_id().as_bytes());
     info.active_members()
-        .any(|member| member.agent_id == recipient_hex && member.kem_public_key_b64.is_none())
+        .any(|member| member.agent_id == own_hex && member.kem_public_key_b64.is_none())
 }
 
 /// A new delivery for a just-committed frame.
@@ -1062,7 +1043,6 @@ pub(super) fn new_delivery(
             resumed,
             gss_shares_pending,
             gss_epoch,
-            keyless_seats: BTreeSet::new(),
             recipients: recipients
                 .into_iter()
                 .map(|id| (id, RecipientDelivery::Due))
@@ -1342,25 +1322,6 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
                 continue;
             };
             let started = apply_round(&mut stored.recipients, updates);
-            if gss_current.is_some() {
-                // #1578 (Engineer ruling, 25 Oct 00:26): record, from the
-                // roster this round seals by, which started seats this
-                // author cannot seal a share to. The record is this
-                // author's own and is re-derived every round, so a seat
-                // that publishes a KEM key before the row ends is sealed
-                // to again; once the row completes from the skip record
-                // (the same ruling) it does not reopen — the survivor
-                // whose own view holds the key is on its own to request
-                // the share (the §3 exception question is with the
-                // engineer).
-                for (recipient, _) in &started {
-                    if seat_cannot_take_a_share(&info, recipient) {
-                        stored.keyless_seats.insert(*recipient);
-                    } else {
-                        stored.keyless_seats.remove(recipient);
-                    }
-                }
-            }
             if all_converged(&stored.recipients) {
                 inner.ce.deliveries.remove(&key);
                 inner.dirty = true;
@@ -1371,10 +1332,10 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
         for (recipient, attempt) in started {
             // §3 (#1508 review P1): a GSS survivor installs the frame only
             // with its new secret, so every send seals that secret again.
-            // #1578: a seat this author cannot seal is recorded above; no
-            // share is spawned for it, and its send's acceptance closes it
-            // from that record ([`spawn_send`]).
-            if gss_current.is_some() && !seat_cannot_take_a_share(&info, &recipient) {
+            // #1578: a seat with no roster KEM key cannot be sealed to;
+            // the spawn logs the skip, and such a survivor installs the
+            // frame keyless on receipt.
+            if gss_current.is_some() {
                 spawn_gss_share_to(state, &info, &hex::encode(recipient));
             }
             spawn_send(
@@ -1463,7 +1424,7 @@ fn spawn_send(
             &admission,
             resolve_within,
         );
-        let mut status = match tokio::time::timeout(CE_EXCHANGE_TIMEOUT, exchange).await {
+        let status = match tokio::time::timeout(CE_EXCHANGE_TIMEOUT, exchange).await {
             Ok(Ok(_)) => RecipientDelivery::Sent,
             Ok(Err(x0x::dm::DmError::RecipientUpgradeRequired { .. })) => {
                 RecipientDelivery::Lacking
@@ -1487,17 +1448,6 @@ fn spawn_send(
         };
         let mut inner = task_state.revocation_evictions.inner.lock().await;
         if let Some(delivery) = inner.ce.deliveries.get_mut(&key) {
-            // #1578 (Engineer ruling, 25 Oct 00:26): a seat this author
-            // recorded as unsealable can never report delivery of the
-            // share (the keyless survivor reports the hold's parent), so
-            // the carrier's acceptance of the frame is the last
-            // obligation this author has to it. Close it from the
-            // author's own record, not from the recipient's report.
-            if status == RecipientDelivery::Sent
-                && delivery.keyless_seats.contains(agent.as_bytes())
-            {
-                status = RecipientDelivery::Converged;
-            }
             finish_attempt(&mut delivery.recipients, agent.as_bytes(), attempt, status);
         }
     });
@@ -2236,9 +2186,10 @@ async fn install_gss(
     // holds) is dropped, and the share hold stays until a share of this
     // epoch installs — through the existing share path once the seat
     // publishes a KEM key (a re-join) or a later rotation seals to it.
-    // The install is local fact only (Engineer ruling, 25 Oct 00:26):
-    // while the hold lasts this node reports no head above the hold's
-    // parent, and the install never converges an author's delivery row.
+    // The install is local fact only (Engineer ruling, 27 Oct 22:10
+    // GMT): while the hold lasts this node claims no head in its
+    // catch-up answers, and the install converges no author's delivery
+    // row.
     let awaiting_share = waiting && promoted.is_none() && own_seat_cannot_take_a_share(state, info);
     if waiting && promoted.is_none() && !awaiting_share {
         tracing::info!(
@@ -4881,12 +4832,13 @@ mod daemon_tests {
     /// the author's delivery never converged. Now such a survivor
     /// installs the frame keyless: the head moves to the verified result,
     /// the old secret (which the excluded member holds) is dropped, and
-    /// new ciphertext stays withheld by the typed share hold. Round 1
-    /// (Engineer ruling, 25 Oct 00:26): that keyless install never proves
-    /// delivery — the survivor reports the hold's parent, not the result,
-    /// and the author closes the seat from its own record that it skipped
-    /// the seal, so the row completes with no share-proof report at all.
-    /// A KEM-seated survivor keeps the wait-for-share flow (the fixture
+    /// new ciphertext stays withheld by the typed share hold. That
+    /// keyless install never proves delivery (Engineer ruling, 27 Oct
+    /// 22:10 GMT): the survivor claims no head while the hold lasts, so
+    /// it converges no author's row, and the frame's transport ACK
+    /// closes nothing (ADR 0110 §3 L228) — the author's row stays open
+    /// until the seat publishes a KEM key and the share installs. A
+    /// KEM-seated survivor keeps the wait-for-share flow (the fixture
     /// test above).
     #[tokio::test]
     async fn a_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless() -> Result<()> {
@@ -4998,11 +4950,13 @@ mod daemon_tests {
             "the survivor left the parent head"
         );
 
-        // Round 1 (Engineer ruling, 25 Oct 00:26): the keyless install
-        // never proves delivery. The survivor's report is the hold's
-        // parent, not the installed result, and the author closes the
-        // seat from its own record that it skipped the seal — the same
-        // seat view — with no share-proof report at all.
+        // Engineer ruling, 27 Oct 22:10 GMT: the keyless install never
+        // proves delivery. The survivor claims no head while the hold
+        // lasts, so its catch-up answer converges nothing on the author,
+        // and the send's transport ACK never closes the seat (ADR 0110
+        // §3 L228): the row stays open until the author can seal — the
+        // seat publishes a KEM key — or a survivor's head claim proves
+        // delivery.
         let survivor_info = fx
             .replica
             .named_groups
@@ -5011,30 +4965,28 @@ mod daemon_tests {
             .get(&fx.group_id)
             .cloned()
             .context("group")?;
-        let reported =
-            ng::gss_share_hold::reported_head(&fx.replica, &fx.group_id, &survivor_info).await;
-        assert_ne!(
-            reported, result_head,
-            "a keyless install never reports the head it cannot vouch for"
-        );
         assert_eq!(
-            Some(reported.as_str()),
-            parent.as_deref(),
-            "the report is the hold's parent, the last head the survivor's secrets vouch for"
+            ng::gss_share_hold::reported_head(&fx.replica, &fx.group_id, &survivor_info).await,
+            None,
+            "a keyless install claims no head: the local fact converges no author's row"
+        );
+        assert!(
+            ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
+            "the durable hold is written to disk while the share is awaited"
         );
         super::super::note_catchup_head(
             &fx.state,
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
-            Some(reported.as_str()),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
         delivery_round(&fx.state, &key, &survivor).await;
-        assert_ne!(
+        assert_eq!(
             delivery_status(&fx.state, &key, &survivor).await,
             Some(RecipientDelivery::Sent),
-            "the unsealable seat closes from the author's skip record, never on a report"
+            "the carrier's acceptance is Sent, not delivery: an ACK closes no seat"
         );
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
         delivery_round(&fx.state, &key, &survivor).await;
@@ -5042,13 +4994,13 @@ mod daemon_tests {
         {
             let inner = fx.state.revocation_evictions.inner.lock().await;
             assert!(
-                !inner.ce.delivering().contains(&key),
-                "the author's own skip record ends the delivery"
+                inner.ce.delivering().contains(&key),
+                "the row stays open: this author cannot seal and no head claim arrived"
             );
             assert_eq!(
                 inner.store.get(&key).map(|row| row.phase),
-                Some(Phase::Complete),
-                "the obligation completes from the skip record, not from a keyless report"
+                Some(Phase::CommittedDeliveryPending),
+                "the obligation stays open until the seat can take a share"
             );
         }
 
@@ -5078,6 +5030,10 @@ mod daemon_tests {
             ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
             0
         );
+        assert!(
+            !ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
+            "the prune that ended the hold wrote the file: no hold residue survives it"
+        );
         Ok(())
     }
 
@@ -5085,15 +5041,15 @@ mod daemon_tests {
     /// author's view of the survivor's seat holds no KEM key (for
     /// example after an outbound snapshot that strips KEM keys) while
     /// the survivor's own copy has it, so the survivor takes the
-    /// wait-for-share path. Under the 25 Oct 00:26 ruling the author's
-    /// skip record closes the seat on the send's transport ACK and the
-    /// row completes with no share ever sealed — the survivor holds,
-    /// waiting for a share that will not come. Whether that
-    /// stranded-survivor case must keep the author's row open is with
-    /// the engineer (the PR body's FOR ENGINEER); this test pins today's
-    /// ruled behaviour in that direction.
+    /// wait-for-share path and the frame stays stashed at the parent
+    /// head. Under ADR 0110 §3 L228 (Engineer ruling, 27 Oct 22:10 GMT)
+    /// the send's transport ACK closes nothing: the author's row stays
+    /// open — it owes a share it cannot seal until its view learns the
+    /// key — so it keeps resending, and the row completes only when the
+    /// seat gains a key and the sealed share installs.
     #[tokio::test]
-    async fn an_author_keyless_seat_closes_while_the_keyed_survivor_waits() -> Result<()> {
+    async fn an_unsealable_seat_keeps_the_authors_row_open_while_the_keyed_survivor_waits(
+    ) -> Result<()> {
         use anyhow::Context as _;
         let fx = gss_leave_fixture_views(None, false, true).await?;
         advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
@@ -5141,55 +5097,73 @@ mod daemon_tests {
         let head_before = head_of(&fx.replica, &fx.group_id)
             .await
             .context("the head")?;
+        let outcome = receive(&fx.replica, admin, &frame).await;
         assert_eq!(
-            receive(&fx.replica, admin, &frame).await,
+            outcome,
             ReceiveOutcome::WaitingForShare,
             "the keyed survivor takes the wait-for-share path"
+        );
+        assert!(
+            outcome.is_retained() && outcome.head_evidence(),
+            "the waiting frame stays retained head evidence: the listener stashes it until the share arrives"
         );
         assert_eq!(
             head_of(&fx.replica, &fx.group_id).await.as_deref(),
             Some(head_before.as_str()),
             "nothing installs before the share"
         );
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            1,
+            "the waiting survivor holds: no new ciphertext until the share installs"
+        );
 
-        // The ruling's close: the send's ACK plus the author's own skip
-        // record end the row with the survivor still held.
+        // ADR 0110 §3 L228 (Engineer ruling, 27 Oct 22:10 GMT): the
+        // carrier's acceptance of the frame is Sent, not delivery. The
+        // author cannot seal this seat, but the ACK closes nothing and
+        // the row stays open, so a later view that learns the key seals
+        // and completes the row.
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
         delivery_round(&fx.state, &key, &survivor).await;
+        assert_eq!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Sent),
+            "the transport ACK leaves the seat Sent, never Converged"
+        );
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
         delivery_round(&fx.state, &key, &survivor).await;
         super::super::revocation_eviction_pass(&fx.state).await;
         {
             let inner = fx.state.revocation_evictions.inner.lock().await;
             assert!(
-                !inner.ce.delivering().contains(&key),
-                "the skip record ends the delivery (the 25 Oct 00:26 ruling)"
+                inner.ce.delivering().contains(&key),
+                "the row stays open: the author still owes a share it cannot seal"
             );
             assert_eq!(
                 inner.store.get(&key).map(|row| row.phase),
-                Some(Phase::Complete),
-                "the obligation completes from the skip record"
+                Some(Phase::CommittedDeliveryPending),
+                "the obligation is not falsely complete while the survivor waits"
             );
         }
         assert_ne!(
             head_of(&fx.replica, &fx.group_id).await.as_deref(),
             Some(result_head.as_str()),
-            "the stranded survivor: its view holds the key, the frame still waits for the share, and the author's row is closed"
+            "the stranded survivor: its view holds the key, the frame still waits for the share, and the author's row stays open"
         );
         Ok(())
     }
 
-    /// #1578 round 1, Claude P1/P2 (Engineer ruling, 25 Oct 00:26): the
-    /// KEM key of a roster seat is local data — not in the roster root or
-    /// the state hash — so the author and the survivor can disagree about
-    /// the seat. Here the author's view seats the survivor's KEM key and
-    /// seals the share, while the survivor's own copy shows no key, so
-    /// it installs the frame keyless. That local keyless fact must not
-    /// end the author's re-seal obligation: the survivor's catch-up
-    /// answer reports the hold's parent (the real serve path, not the
-    /// result head), the author's delivery row stays open and keeps the
-    /// share owed, and only the installed share — whose report is then
-    /// the result head, a share-proof — ends it.
+    /// #1578 round 1, Claude P1/P2 (Engineer ruling, 27 Oct 22:10 GMT):
+    /// the KEM key of a roster seat is local data — not in the roster
+    /// root or the state hash — so the author and the survivor can
+    /// disagree about the seat. Here the author's view seats the
+    /// survivor's KEM key and seals the share, while the survivor's own
+    /// copy shows no key, so it installs the frame keyless. That local
+    /// keyless fact must not end the author's re-seal obligation: the
+    /// survivor's catch-up answer claims no head at all (the real serve
+    /// path), the author's delivery row stays open and keeps the share
+    /// owed, and only the installed share — whose report is then the
+    /// result head, a share-proof — ends it.
     #[tokio::test]
     async fn a_divergent_seat_view_keyless_install_keeps_the_authors_row_open() -> Result<()> {
         use anyhow::Context as _;
@@ -5255,9 +5229,9 @@ mod daemon_tests {
             "the keyless install keeps the durable share hold"
         );
 
-        // The survivor's real catch-up answer carries the hold's parent,
-        // not the installed result: the local keyless fact never reaches
-        // the author as convergence evidence.
+        // The survivor's real catch-up answer claims no head at all
+        // while it holds no secret of the epoch: the local keyless fact
+        // never reaches the author as convergence evidence.
         let replica_info = fx
             .replica
             .named_groups
@@ -5300,9 +5274,8 @@ mod daemon_tests {
             "the keyless survivor never reports the installed result"
         );
         assert_eq!(
-            reported.as_deref(),
-            Some(decoded.body.prior_head.as_str()),
-            "the answer reports the hold's parent, the last head the survivor vouches for"
+            reported, None,
+            "the answer claims no head while the responder is keyless (the field keeps its saved-head meaning)"
         );
 
         // The author takes that answer: its row stays open. The re-seal
@@ -5357,16 +5330,22 @@ mod daemon_tests {
         let reported =
             ng::gss_share_hold::reported_head(&fx.replica, &fx.group_id, &sealed_info).await;
         assert_eq!(
-            reported, result_head,
+            reported.as_deref(),
+            Some(result_head.as_str()),
             "with the share held the report is the result head again: a share-proof"
         );
         super::super::note_catchup_head(
             &fx.state,
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
-            Some(reported.as_str()),
+            reported.as_deref(),
         )
         .await;
+        assert_eq!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Converged),
+            "the share-proof report converges the seat the author sealed"
+        );
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
         delivery_round(&fx.state, &key, &survivor).await;
         super::super::revocation_eviction_pass(&fx.state).await;
@@ -5523,15 +5502,16 @@ mod daemon_tests {
         Ok(())
     }
 
-    /// #1578 round 1 (Engineer ruling, 25 Oct 00:26), the author's
-    /// restart: the skip record is durable in its basis — the persisted
-    /// roster that seats the survivor with no KEM key and the row's saved
-    /// frame — so a restarted author re-derives it, and the resumed
-    /// delivery closes the seat from that own record alone. No
-    /// share-proof report exists in this test: before the fix round a
-    /// keyless seat could never complete the row.
+    /// #1578, the author's restart (Engineer ruling, 27 Oct 22:10 GMT):
+    /// the persisted roster still seats the survivor with no KEM key,
+    /// so the restarted author cannot seal to it. The resumed delivery
+    /// sends the frame again, the carrier accepts it, and nothing closes:
+    /// a transport ACK never closes a seat (ADR 0110 §3 L228), and the
+    /// keyless survivor's answer carries no head to converge the row
+    /// with. The row stays open across the author's restart, until the
+    /// seat publishes a KEM key and a sealed share installs.
     #[tokio::test]
-    async fn a_restarted_author_recloses_a_keyless_seat_from_its_own_record() -> Result<()> {
+    async fn a_restarted_author_keeps_an_unsealable_seat_row_open() -> Result<()> {
         use anyhow::Context as _;
         let fx = gss_leave_fixture_build(None, false).await?;
         // No advert before the commit: nothing sends yet, so the row is
@@ -5549,12 +5529,11 @@ mod daemon_tests {
         let frame = latest_frame_for_test(&fx.state, &fx.stable)
             .await
             .context("the GSS crypto-only exclusion committed")?;
-        let decoded = ce::decode_frame(&frame).context("frame")?;
-        let parent_head = decoded.body.prior_head.clone();
+        let _ = &frame; // the commit's frame exists; the restart resends it
 
         // The author restarts mid-delivery. The row and its frame persist,
         // the delivery resumes, and the durable roster still seats the
-        // survivor with no KEM key — the basis of the skip record.
+        // survivor with no KEM key.
         let mut restarted =
             ng::tests::secure_endpoint_test_state_at(fx.dir.path(), Arc::clone(&fx.state.agent))
                 .await?;
@@ -5578,14 +5557,16 @@ mod daemon_tests {
             .cloned()
             .context("group")?;
         assert!(
-            seat_cannot_take_a_share(&seated, survivor.as_bytes()),
+            seated.active_members().any(
+                |member| member.agent_id == survivor_hex && member.kem_public_key_b64.is_none()
+            ),
             "the persisted roster still seats the survivor with no KEM key"
         );
 
-        // The restarted author runs its round: the head round confirms on
-        // the keyless survivor's report (the hold's parent, on the chain),
-        // and the resumed send closes the seat from the re-derived skip
-        // record when the carrier takes the frame.
+        // The restarted author runs its rounds. The keyless survivor's
+        // answer claims no head (a None answer converges nothing), the
+        // head round still syncs on the restart wait, and the resumed
+        // send's acceptance leaves the seat Sent — never Converged.
         advertise_crypto_exclusion(&restarted, survivor);
         restarted
             .named_group_test_recorders
@@ -5596,15 +5577,15 @@ mod daemon_tests {
             &restarted,
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
-            Some(parent_head.as_str()),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
         delivery_round(&restarted, &key, &survivor).await;
-        assert_ne!(
+        assert_eq!(
             delivery_status(&restarted, &key, &survivor).await,
             Some(RecipientDelivery::Sent),
-            "the resumed send closes the seat from the re-derived skip record"
+            "the resumed send's acceptance is Sent: an ACK closes no seat"
         );
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
         delivery_round(&restarted, &key, &survivor).await;
@@ -5612,13 +5593,13 @@ mod daemon_tests {
         {
             let inner = restarted.revocation_evictions.inner.lock().await;
             assert!(
-                !inner.ce.delivering().contains(&key),
-                "the delivery ends from the author's own record"
+                inner.ce.delivering().contains(&key),
+                "the delivery stays open across the author's restart"
             );
             assert_eq!(
                 inner.store.get(&key).map(|row| row.phase),
-                Some(Phase::Complete),
-                "the restarted author completes the row with no share-proof report"
+                Some(Phase::CommittedDeliveryPending),
+                "the restarted author owes the share until the seat can take one"
             );
         }
         Ok(())
