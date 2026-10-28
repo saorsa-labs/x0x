@@ -280,6 +280,32 @@ async fn all_reach(sim: &Sim, labels: &[&str], group: &str, hash: &str) -> Resul
     Ok(())
 }
 
+/// Whether `label`'s gossip plane holds `other`. A pubsub topic's peers
+/// come from this plane (refreshed each second), not from a subscribe frame.
+async fn on_plane(sim: &Sim, label: &str, other: &str) -> bool {
+    let (Ok(state), Ok(other)) = (sim.state(label), sim.peer(other)) else {
+        return false;
+    };
+    match state.agent.network() {
+        Some(network) => network.gossip_plane_peers().await.contains(&other),
+        None => false,
+    }
+}
+
+/// Pubsub writes from `src` to `dst` delivered after write `cut` that
+/// carry `needle` (group metadata events are plaintext JSON in the frame).
+fn pubsub_delivered(sim: &Sim, src: &str, dst: &str, cut: usize, needle: &[u8]) -> Result<usize> {
+    use crate::network::sim::LaneClass;
+    let writes = sim
+        .fabric()
+        .delivered_writes_after(&sim.peer(src)?, &sim.peer(dst)?, cut);
+    Ok(writes
+        .iter()
+        .filter(|(w, _)| w.lane.class == LaneClass::PubSub)
+        .filter(|(w, _)| w.bytes.windows(needle.len()).any(|x| x == needle))
+        .count())
+}
+
 /// The `MemberAdded(member)` events `src` wrote since write `cut`: how
 /// many, and whether any carried a `reseat_mandate` or an `owner_mandate`.
 fn member_added_mandates(
@@ -374,8 +400,8 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     let link = invite(sim, "O", &group).await?;
     let (o, x, j) = (sim.peer("O")?.0, sim.peer("X")?.0, sim.peer("J")?.0);
 
-    // X is cut; O's r+1 publish (and its relays) is captured and held
-    // from J.
+    // X is cut from O and A; O's r+1 publish (and its relays) is captured
+    // and held from J.
     let held: Arc<Mutex<std::collections::HashSet<[u8; 32]>>> = Arc::default();
     let is_held = |held: &Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
                    msg: Option<[u8; 32]>| {
@@ -383,27 +409,56 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     };
     let capture = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let held_to_j = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // X reaches J only, from the partition on: the X~J link and gossip
+    // plane stay up, so X's later r+1′ publish has a path to J. Origins are
+    // tracked per message, so J relays nothing between X and O or A, and
+    // J (not yet a member) authors no group event.
+    let cut_x = move |origin: Key, dst: Key| (origin == x && dst != j) || (dst == x && origin != j);
     let hold = install_hold(sim);
     {
         let (held, capture) = (Arc::clone(&held), Arc::clone(&capture));
         set_hold(
             sim,
             &hold,
-            "X cut; O's r+1 captured",
+            "X reaches J only; O's r+1 captured",
             move |origin, dst, msg| {
                 if let (Some(id), true, Ok(mut set)) = (msg, origin == o, held.lock()) {
                     if capture.load(std::sync::atomic::Ordering::SeqCst) {
                         set.insert(id);
                     }
                 }
-                origin == x || dst == x || (dst == j && is_held(&held, msg))
+                cut_x(origin, dst) || (dst == j && is_held(&held, msg))
             },
         );
     }
     let x_hex = sim.agent_hex("X")?;
+    let recorded_from = sim
+        .state("O")?
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .map_or(0, |p| p.len());
     let path = format!("/groups/{group}/members/{x_hex}");
     let (code, body) = sim.api("O", Method::DELETE, &path, None).await?;
     ensure!(code.is_success(), "O removes X: {code} {body}");
+    // O's r+1 event bytes, as published. J is not yet a member, so no r+1
+    // frame to J exists to buffer; H-S3-c2 re-publishes these bytes.
+    let removal_event = {
+        let state = sim.state("O")?;
+        let published = state
+            .named_group_test_recorders
+            .publish_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let has = |b: &[u8], n: &[u8]| b.windows(n.len()).any(|w| w == n);
+        published
+            .iter()
+            .skip(recorded_from)
+            .find(|(_, b)| has(b, b"\"member_removed\"") && has(b, x_hex.as_bytes()))
+            .cloned()
+    };
+    let (removal_topic, removal_bytes) =
+        removal_event.context("O's r+1 removal event was not recorded")?;
     let removal = view(sim, "O", &group).await?;
     all_reach(sim, &["A"], &group, &removal.state_hash).await?;
     sim.within("the removal resends end", RESENDS_DONE + secs(2), async {
@@ -434,24 +489,40 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         .as_ref()
         .map_or_else(|| "no record".to_string(), View::describe);
 
-    // X reaches J only, and J hears only X (so its catch-up with O and A
-    // waits too, as the ADR orders it), until r+1′ lands. Then X is
-    // fully cut (its catch-up loop with J is #1685). H-S3-c keeps O's r+1
-    // gossip held from J; H-S3-c2 releases it.
-    let cut_x = move |origin: Key, dst: Key| (origin == x && dst != j) || (dst == x && origin != j);
+    // J hears only X (so its catch-up with O and A waits too, as the ADR
+    // orders it) until r+1′ lands. Then X is fully cut (its catch-up loop
+    // with J is #1685). H-S3-c keeps O's r+1 gossip held from J; H-S3-c2
+    // re-publishes it to J by gossip.
     set_hold(
         sim,
         &hold,
         "X reaches J only; J hears only X",
         move |origin, dst, _| cut_x(origin, dst) || (dst == j && origin != x),
     );
-    rename(sim, "X", &group, "w3h c X").await?;
+    // J is not on X's roster, so X's gossip publish is the only path for
+    // r+1′ to J. Each must hold the other on its gossip plane, then two
+    // topic refreshes pass, before X publishes.
+    let plane = sim
+        .until(
+            "X and J hold each other on the gossip plane",
+            SETUP,
+            async |s: &Sim| on_plane(s, "X", "J").await && on_plane(s, "J", "X").await,
+        )
+        .await
+        .is_ok();
+    sim.within("X's topic peers refresh", secs(4), async {
+        tokio::time::sleep(secs(2)).await;
+    })
+    .await?;
+    let forked_at = sim.fabric().mark_indexed("case: X publishes r+1′");
+    rename(sim, "X", &group, "w3h c X fork").await?;
     let fork = view(sim, "X", &group).await?;
     let on_fork = reaches(sim, "J", &group, &fork.state_hash, SETUP).await;
+    let fork_frames = pubsub_delivered(sim, "X", "J", forked_at, b"w3h c X fork")?;
     {
         let (held, held_to_j) = (Arc::clone(&held), Arc::clone(&held_to_j));
         let what = match both {
-            true => "X cut; canonical r+1 released to J",
+            true => "X cut; O's r+1 gossip passes to J",
             false => "X cut; O's r+1 gossip held from J",
         };
         set_hold(sim, &hold, what, move |origin, dst, msg| {
@@ -461,6 +532,33 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             }
             origin == x || dst == x || (!both && to_j)
         });
+    }
+    // H-S3-c2: O publishes its recorded r+1 bytes again (a new message ID,
+    // so the hold above does not match it); the case waits until a frame
+    // that carries them is delivered to J and J records the marker.
+    let mut canonical = 0;
+    if both && on_fork {
+        let released_at = sim
+            .fabric()
+            .mark_indexed("case: O re-publishes canonical r+1");
+        sim.state("O")?
+            .agent
+            .publish(&removal_topic, removal_bytes.clone())
+            .await?;
+        let _ = sim
+            .until(
+                "canonical r+1 reaches J and J records the marker",
+                SETUP,
+                async |s: &Sim| {
+                    canonical =
+                        pubsub_delivered(s, "O", "J", released_at, &removal_bytes).unwrap_or(0);
+                    canonical > 0
+                        && try_view_now(s, "J", &group)
+                            .await
+                            .is_ok_and(|v| v.is_some_and(|v| v.marker.is_some()))
+                },
+            )
+            .await;
     }
     let j0 = try_view_now(sim, "J", &group).await?;
     let j0_text = j0
@@ -489,8 +587,11 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     );
     receipt.evidence(
         "j_on_x_fork_at_r_plus_1_prime_with_its_gate",
-        on_fork && fork.state_revision == minted.state_revision + 1,
-        format!("X {}; J {j0_text}", fork.describe()),
+        plane && fork_frames > 0 && on_fork && fork.state_revision == minted.state_revision + 1,
+        format!(
+            "X~J gossip plane {plane}; r+1′ frames X->J {fork_frames}; X {}; J {j0_text}",
+            fork.describe()
+        ),
         at(sim),
     );
     if !(armed && on_fork) {
@@ -535,9 +636,8 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             "j_holds_marker_and_gap_before_the_reseat",
             held,
             format!(
-                "J {}; O's r+1 gossip frames to J after r+1′: {}",
-                j1.describe(),
-                held_to_j.load(std::sync::atomic::Ordering::SeqCst)
+                "J {}; re-published canonical r+1 frames O->J: {canonical}",
+                j1.describe()
             ),
             at(sim),
         );
@@ -586,7 +686,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         .map_or_else(|| "404".to_string(), Status::describe);
     receipt.note(format!(
         "after the advance: J {j_text}; J {}; states {states:?}; O's r+1 gossip frames to J \
-         after r+1′ (held in c, released in c2): {}",
+         after r+1′ (held in c): {}; re-published to J (c2): {canonical}",
         j1.describe(),
         held_to_j.load(std::sync::atomic::Ordering::SeqCst)
     ));
