@@ -23,18 +23,17 @@
 //!   A file with a newer layout is never rewritten, so the commit does not
 //!   occur either (fail closed). A file that cannot be read at all fails
 //!   the write the same way: only a missing file plans as empty (review).
-//!   A file that cannot be decoded also plans as empty, and the write
-//!   replaces it, as the first write after the quarantine does: that
-//!   quarantine happens now, at the write itself — the ADR 0108 §5a
-//!   transaction, as #1672 rules for these logs (the D120 amendment
-//!   covers each slice's own named files; its extension to these logs is
-//!   put to the engineer) — the damaged bytes move aside under the
-//!   history name before the rename, and a quarantine that fails fails
-//!   the write closed, so a log damaged after startup is never silently
-//!   overwritten (#1672). A quarantine that failed after its rename is
-//!   resumed by the next write: the verified pending copies become
-//!   history first, and a copy that fails verification stays pending and
-//!   refuses the replacement (§5a step 4).
+//!   A file that cannot be decoded refuses the write the same way, with
+//!   the typed decode reason, and the original path and bytes stay
+//!   untouched — ADR 0085 rule 4, unamended: the D120 amendment covers
+//!   each slice's own named files (`.evs`, `.evjournal`, `.hscert`), and
+//!   the 28 Oct 2026 engineer ruling keeps it off the replay-log family
+//!   (#1672), so a log damaged after startup is never overwritten and
+//!   never moved aside. No quarantine means no ADR 0108 §5a transaction
+//!   here and nothing for a later write to resume; the damaged bytes
+//!   stay at the path as evidence, the writes of that group's log refuse
+//!   until an operator deals with the file, and the frames it held are
+//!   recovered only from the bytes themselves.
 //!   Writes of one group's log serialize (one writer at a time per file,
 //!   #1579 fix round). In the rebind and owner-recovery logs each write
 //!   starts from the frames the file already holds, then memory's, then
@@ -58,10 +57,12 @@
 //!   catch-up round stops at the first frame the head rule refuses, and
 //!   neither the load nor memory keeps a below-head frame the chain does
 //!   not admit (#1579 fix round 3; the chain check is #1669's).
-//! - **Load.** A damaged file is quarantined (ADR 0108 §5a: pending name,
-//!   then history name), and that group starts with an empty log: its
-//!   frames are lost, the load never panics and never uses the damaged
-//!   bytes. A newer layout stays on disk, not loaded. A frame that is not
+//! - **Load.** A damaged file is refused with its typed decode reason,
+//!   left untouched and not loaded (ADR 0085 rule 4, unamended for these
+//!   logs): that group starts with an empty log, its frames are lost to
+//!   serving, the load never panics, never uses the damaged bytes and
+//!   writes nothing — the load of a damaged log races no writer. A newer
+//!   layout stays on disk, not loaded. A frame that is not
 //!   on this node's loaded chain is not held (a crash between the write and
 //!   the commit): a frame below the head is held only when its head is the
 //!   group's head or a retained commit — the chain test of the rule the
@@ -588,44 +589,18 @@ async fn lock_file_writes(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 /// Write `log` durably at `path`. A file with a newer layout is never
-/// rewritten. A file that cannot be read fails the write closed. A file
-/// that cannot be decoded is quarantined first, by the ADR 0108 §5a
-/// transaction as #1672 rules for these logs (the D120 amendment covers
-/// each slice's own named files; its extension to these logs is put to
-/// the engineer), and only then does the write
-/// replace the file, so a log damaged after startup is never silently
-/// overwritten (#1672); a quarantine that fails fails the write closed,
-/// and the next write resumes its pending copies before any replacement
-/// lands. Returns whether `log` is durable.
+/// rewritten. A file that cannot be read fails the write closed, and so
+/// does a file that cannot be decoded: ADR 0085 rule 4 stands unamended
+/// for these logs — the D120 amendment covers each slice's own named
+/// files, and the 28 Oct 2026 engineer ruling keeps it off the
+/// replay-log family (#1672) — so the write refuses with the typed
+/// decode reason and leaves the original path and bytes untouched.
+/// Returns whether `log` is durable.
 async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
     match crate::w3h_inline::fs::read(path).await {
-        // A missing file is the first write of this group's log — unless
-        // a quarantine moved the old one aside and failed before it
-        // finished, in which case the log lives only as pending copies.
-        // Resume that transaction first (ADR 0108 §5a): the verified
-        // copies become history; a copy that fails verification stays
-        // pending, and with no verified copy at all the write refuses —
-        // no new file lands at the path before the bytes it replaces
-        // are verified under the pending name (§5a step 4, #1672
-        // review).
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let (pending, verify_failed) = super::super::verified_pending_copies(path).await;
-            if verify_failed && pending.is_empty() {
-                tracing::warn!(
-                    path = %path.display(),
-                    "ADR 0110 S4: held frame log pending quarantine copy failed verification; the write fails closed"
-                );
-                return false;
-            }
-            for (_, copy) in pending {
-                if !super::super::finalize_quarantine(&copy).await {
-                    tracing::warn!(
-                        path = %copy.display(),
-                        "ADR 0110 S4: held frame log quarantine copy stayed pending"
-                    );
-                }
-            }
-        }
+        // A missing file is the first write of this group's log: nothing
+        // moved it aside, because these logs are never quarantined.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         // ADR 0085 rule 4: this write would rename over a file this
         // process cannot read, so it does not occur.
         Err(error) => {
@@ -642,30 +617,19 @@ async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
                 tracing::warn!(version, path = %path.display(), "ADR 0110 S4: held frame log has a newer layout; the commit does not occur");
                 return false;
             }
-            // #1672: preserve the damaged bytes before the rewrite. A
-            // quarantine that fails fails the write closed: when the
-            // rename failed the file is untouched, and when it failed
-            // later the bytes live as the pending copy, which the next
-            // write resumes below — never overwritten unread either way.
+            // ADR 0085 rule 4, unamended for these logs (#1672, 28 Oct
+            // 2026 engineer ruling): the write refuses with the typed
+            // decode reason and the damaged bytes stay at the path,
+            // untouched, as the evidence an operator can read. Before
+            // #1672 the write renamed over them with no copy and their
+            // frames were lost.
             Err(SidecarDecodeError::Damaged(reason)) => {
                 tracing::warn!(
                     reason,
                     path = %path.display(),
-                    "ADR 0110 S4: damaged held frame log; quarantining before the rewrite (ADR 0108 §5a)"
+                    "ADR 0110 S4: damaged held frame log; the write fails closed and the file is left untouched (ADR 0085 rule 4)"
                 );
-                match super::super::quarantine_file(path, &existing).await {
-                    Ok((_, pending)) => {
-                        super::super::finalize_quarantine(&pending).await;
-                    }
-                    Err(step) => {
-                        tracing::warn!(
-                            step,
-                            path = %path.display(),
-                            "ADR 0110 S4: held frame log quarantine failed; the write fails closed"
-                        );
-                        return false;
-                    }
-                }
+                return false;
             }
         },
     }
@@ -681,14 +645,15 @@ async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
     }
 }
 
-/// Read every file with `extension` in `dir`. A damaged file is
-/// quarantined and skipped; a newer layout is skipped and kept. Inside an
-/// ADR 0094 trial (`gate_open` false) a damaged file is skipped and left
-/// in place (§5). The load runs once per process, so that file is not
-/// quarantined later: the first write of its group's log after host
-/// commit quarantines it before the rewrite (#1672), and its frames are
-/// lost as in the quarantine case.
-async fn read_all_in(dir: &Path, extension: &str, gate_open: bool) -> Vec<ReplayLogV1> {
+/// Read every file with `extension` in `dir`. A damaged file is refused
+/// with its typed decode reason, left untouched and not loaded (ADR 0085
+/// rule 4, unamended for these logs: #1672, 28 Oct 2026 engineer
+/// ruling); a newer layout is skipped and kept. The load writes nothing,
+/// inside an ADR 0094 trial or outside one, so it races no writer — a
+/// load that meets a damaged log never moves what a writer put there
+/// (#1672 review). The load runs once per process; a file damaged after
+/// the load is refused by the write that finds it, bytes untouched.
+async fn read_all_in(dir: &Path, extension: &str) -> Vec<ReplayLogV1> {
     let mut logs = Vec::new();
     let Ok(mut entries) = crate::w3h_inline::fs::read_dir(dir).await else {
         return logs;
@@ -714,20 +679,14 @@ async fn read_all_in(dir: &Path, extension: &str, gate_open: bool) -> Vec<Replay
             Err(SidecarDecodeError::NewerFormat(version)) => {
                 tracing::warn!(version, path = %path.display(), "ADR 0110 S4: held frame log has a newer layout; not loaded");
             }
-            // An ADR 0094 trial starts no quarantine (§5).
-            Err(SidecarDecodeError::Damaged(reason)) if !gate_open => {
-                tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged held frame log inside an ADR 0094 trial; not loaded and not quarantined");
-            }
+            // ADR 0085 rule 4: the load refuses the file with an explicit
+            // error and leaves it untouched — never quarantined, never
+            // rewritten (the D120 amendment stays off these logs, 28 Oct
+            // 2026 engineer ruling). That group starts with an empty log:
+            // its frames are lost to serving, and the damaged bytes stay
+            // at the path as the evidence an operator can read.
             Err(SidecarDecodeError::Damaged(reason)) => {
-                tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged held frame log; quarantining (ADR 0108 §5a); its frames are lost");
-                match super::super::quarantine_file(&path, &bytes).await {
-                    Ok((_, pending)) => {
-                        super::super::finalize_quarantine(&pending).await;
-                    }
-                    Err(step) => {
-                        tracing::warn!(step, path = %path.display(), "ADR 0110 S4: held frame log quarantine failed");
-                    }
-                }
+                tracing::warn!(reason, path = %path.display(), "ADR 0110 S4: damaged held frame log; not loaded and left untouched (ADR 0085 rule 4)");
             }
         }
     }
@@ -790,9 +749,8 @@ async fn write_with<const CAP: usize, const KEEP: bool>(
     // the plan starts from them, under the per-file lock above. Without
     // the rule the plan is memory plus the new frame only (#1579 fix
     // round 3), so no read is needed. A frame that cannot be decoded is
-    // not merged; a newer layout still fails the write below (fail
-    // closed), and a damaged file is quarantined by the write below
-    // before it is replaced (#1672).
+    // not merged; a newer layout or a damaged file fails the write below
+    // (fail closed, ADR 0085 rule 4: #1672), bytes untouched.
     let file_frames = if KEEP {
         match crate::w3h_inline::fs::read(&path).await {
             Ok(existing) => decode(&existing).map(|log| log.frames).unwrap_or_default(),
@@ -901,8 +859,7 @@ pub(in super::super) async fn ensure_restored<const CAP: usize, const KEEP: bool
     if held(&mut *state.revocation_evictions.inner.lock().await).restored {
         return Restored::default();
     }
-    let gate_open = host_commit_gate_open(state);
-    let logs = read_all_in(&state.treekem_dir, extension, gate_open).await;
+    let logs = read_all_in(&state.treekem_dir, extension).await;
     let groups: HashMap<String, GroupInfo> = state
         .named_groups
         .read()
@@ -1008,7 +965,7 @@ pub(in super::super) mod tests {
         drop(before);
         let mut after = HeldLog::<CAP, true>::default();
         let resumes = after
-            .restore(read_all_in(dir.path(), extension, true).await, groups)
+            .restore(read_all_in(dir.path(), extension).await, groups)
             .resumes;
         let served = after.catchup_frames(&[stable.to_string()], 4);
         assert_eq!(served.len(), 1, "the frame is missing after the restart");
@@ -1022,7 +979,7 @@ pub(in super::super) mod tests {
         let planned = after.planned(&existing, stable, (6, "h6"), &Arc::new(vec![6]), true);
         assert!(write_at(&path, &planned).await);
         let mut again = HeldLog::<CAP, true>::default();
-        let _ = again.restore(read_all_in(dir.path(), extension, true).await, groups);
+        let _ = again.restore(read_all_in(dir.path(), extension).await, groups);
         assert!(again.catchup_frames(&[stable.to_string()], 5).is_empty());
         resumes
     }
@@ -1933,29 +1890,34 @@ pub(in super::super) mod tests {
         assert_eq!(truncated, Err(SidecarDecodeError::Damaged("hash_mismatch")));
     }
 
-    /// A damaged file fails closed: no panic, no frames, and the file is
-    /// moved aside under the ADR 0108 §5a history name. A newer layout is
-    /// not loaded and never rewritten, so the commit does not occur.
+    /// A damaged file fails closed: no panic, no frames, and the load
+    /// leaves it untouched at its path (ADR 0085 rule 4, unamended for
+    /// these logs — no quarantine, so no `.q-` copy exists either). A
+    /// newer layout is not loaded and never rewritten, so the commit
+    /// does not occur.
     #[tokio::test]
-    async fn a_corrupt_held_frame_log_is_quarantined_and_a_newer_one_is_kept() {
+    async fn a_corrupt_held_frame_log_is_left_untouched_and_a_newer_one_is_kept() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let damaged_bytes = b"X0XRPL1\0not a log".to_vec();
         let damaged = dir.path().join("aa.crblog");
-        crate::w3h_inline::fs::write(&damaged, b"X0XRPL1\0not a log")
+        crate::w3h_inline::fs::write(&damaged, &damaged_bytes)
             .await
             .expect("write");
-        assert!(read_all_in(dir.path(), REBIND_EXTENSION, true)
-            .await
-            .is_empty());
-        assert!(!damaged.exists(), "the damaged file is moved aside");
+        assert!(read_all_in(dir.path(), REBIND_EXTENSION).await.is_empty());
+        assert_eq!(
+            crate::w3h_inline::fs::read(&damaged)
+                .await
+                .expect("the damaged file is still there"),
+            damaged_bytes,
+            "the load leaves the damaged bytes untouched at the path"
+        );
         let mut entries = crate::w3h_inline::fs::read_dir(dir.path())
             .await
             .expect("read_dir");
-        let entry = entries.next_entry().await.expect("entry").expect("one");
-        let name = entry.file_name().to_string_lossy().into_owned();
-        assert!(
-            name.starts_with("aa.crblog.q-") && !name.ends_with(".pending"),
-            "{name}"
-        );
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.contains(".q-"), "no quarantine copy exists: {name}");
+        }
 
         let newer = dir.path().join("bb.crblog");
         let log = ReplayLogV1 {
@@ -1967,9 +1929,7 @@ pub(in super::super) mod tests {
         crate::w3h_inline::fs::write(&newer, &bytes)
             .await
             .expect("write");
-        assert!(read_all_in(dir.path(), REBIND_EXTENSION, true)
-            .await
-            .is_empty());
+        assert!(read_all_in(dir.path(), REBIND_EXTENSION).await.is_empty());
         assert!(
             !write_at(&newer, &log).await,
             "a newer layout blocks the commit"
@@ -1980,14 +1940,15 @@ pub(in super::super) mod tests {
         );
     }
 
-    /// #1672 (#1669 item 1): a log damaged after startup is never
-    /// silently overwritten. The write quarantines the damaged bytes
-    /// first (ADR 0108 §5a: pending name, then history name; #1672
-    /// rules this for these logs), and only then replaces the file, so
-    /// what the damaged bytes held survives the rewrite. Before, the
-    /// write renamed over them with no copy: their frames were lost.
+    /// #1672 (#1669 item 1), 28 Oct 2026 engineer ruling: a log damaged
+    /// after startup is never overwritten and never moved aside. ADR 0085
+    /// rule 4 stands unamended for these logs, so the write refuses with
+    /// the typed decode reason and the original path and bytes stay
+    /// untouched — byte-identical after the refused write, with no
+    /// quarantine copy beside them. Before, the write renamed over the
+    /// damaged bytes with no copy and their frames were lost.
     #[tokio::test]
-    async fn a_log_damaged_after_startup_is_quarantined_before_the_rewrite() {
+    async fn a_log_damaged_after_startup_refuses_the_write_and_keeps_the_bytes() {
         use crate::server::routes::named_groups as ng;
         fn rebind_held(inner: &mut S4Inner) -> &mut HeldLog<16, true> {
             &mut inner.rebind.log
@@ -2012,7 +1973,7 @@ pub(in super::super) mod tests {
         let path = log_path(&state, "g", REBIND_EXTENSION);
         std::fs::write(&path, &damaged).expect("write the damaged log");
         assert!(
-            write_received(
+            !write_received(
                 &state,
                 REBIND_EXTENSION,
                 rebind_held,
@@ -2021,104 +1982,103 @@ pub(in super::super) mod tests {
                 &Arc::new(b"next".to_vec())
             )
             .await,
-            "the write itself succeeds once the quarantine has the bytes"
+            "the write refuses; the caller installs nothing"
         );
-        // The damaged bytes survive under the ADR 0108 §5a history name.
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("file name");
-        let quarantine_prefix = format!("{file_name}.q-");
-        let mut copies = Vec::new();
+        assert_eq!(
+            std::fs::read(&path).expect("read the log"),
+            damaged,
+            "the refused write leaves the damaged bytes byte-identical"
+        );
+        // No quarantine copy exists: the D120 amendment stays off these
+        // logs, so nothing was moved aside under a `.q-` name.
         for entry in std::fs::read_dir(path.parent().expect("dir")).expect("read_dir") {
             let entry = entry.expect("entry");
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&quarantine_prefix) && !name.ends_with(".pending") {
-                copies.push(entry.path());
-            }
+            assert!(!name.contains(".q-"), "no quarantine copy exists: {name}");
         }
-        assert_eq!(copies.len(), 1, "one quarantine history copy of the log");
-        assert_eq!(
-            std::fs::read(&copies[0]).expect("read the copy"),
-            damaged,
-            "the quarantine copy holds the damaged bytes unchanged"
-        );
-        // The live file is the new write, and it decodes.
-        let on_disk = frames_on_disk(&state, REBIND_EXTENSION, "g").await;
-        assert_eq!(
-            on_disk
-                .iter()
-                .map(|frame| (frame.next_revision, frame.result_head.as_str()))
-                .collect::<Vec<_>>(),
-            vec![(6, "h6")],
-            "the rewrite replaced the damaged log with the new frame"
-        );
+        // The refused frame is not held in memory: a frame is remembered
+        // only after its commit or install succeeds.
+        let in_memory: Vec<String> = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .log
+            .catchup_frames(&["g".to_string()], 0)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert!(in_memory.is_empty(), "memory never holds the refused frame");
     }
 
-    /// Review of the #1672 fix (ADR 0108 §5a resume): a quarantine that
-    /// failed after its rename leaves the log only as pending copies.
-    /// The next write resumes that transaction before it replaces the
-    /// file: a verified copy becomes history, and a copy that fails
-    /// verification stays pending and refuses the write — no new file
-    /// lands at the path before the bytes it replaces are verified
-    /// under the pending name.
+    /// #1672 review (Claude, liveness): a load that meets a damaged log
+    /// must never take a write path — `read_all_in` quarantined without
+    /// the per-file write lock, so a load racing a writer could rename a
+    /// good log aside and wedge that group's writes for good. The load
+    /// now writes nothing: concurrent loads of a damaged log leave it
+    /// byte-identical, the write refuses with the typed reason (fail
+    /// closed, ADR 0085 rule 4), and the moment the damaged file is gone
+    /// the next write succeeds — the refusal is the ruled fail-closed on
+    /// damaged bytes, not a wedge.
     #[tokio::test]
-    async fn a_write_resumes_a_pending_quarantine_copy() {
-        use crate::groups::eviction as s4;
+    async fn concurrent_loads_leave_a_damaged_log_untouched_and_the_next_write_works() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("g.crblog");
-        let log = ReplayLogV1 {
+        let mut damaged = encode(&ReplayLogV1 {
             stable_group_id: "g".to_string(),
-            frames: vec![ReplayFrameV1 {
-                next_revision: 5,
-                result_head: "h5".to_string(),
-                authored: false,
-                frame: b"frame".to_vec(),
-            }],
-        };
-        // The failed quarantine's leftover: no file at the path, one
-        // pending copy whose embedded hash matches its bytes.
-        let damaged = b"damaged log bytes".to_vec();
-        let pending_name = s4::quarantine_pending_name("g.crblog", &[7u8; 16], &damaged);
-        let pending = path.with_file_name(&pending_name);
-        crate::w3h_inline::fs::write(&pending, &damaged)
+            frames: Vec::new(),
+        })
+        .expect("encode");
+        let at = damaged.len() - 1;
+        damaged[at] ^= 0x01;
+        crate::w3h_inline::fs::write(&path, &damaged)
             .await
-            .expect("write the pending copy");
-        assert!(
-            write_at(&path, &log).await,
-            "the write verifies the pending copy, then replaces the file"
+            .expect("write the damaged log");
+        let (first, second) = tokio::join!(
+            read_all_in(dir.path(), REBIND_EXTENSION),
+            read_all_in(dir.path(), REBIND_EXTENSION),
         );
-        assert!(!pending.exists(), "the verified copy left the pending name");
-        let history =
-            path.with_file_name(s4::quarantine_history_name(&pending_name).expect("history name"));
+        assert!(
+            first.is_empty() && second.is_empty(),
+            "the damaged log loads no frames"
+        );
         assert_eq!(
-            crate::w3h_inline::fs::read(&history)
+            crate::w3h_inline::fs::read(&path)
                 .await
-                .expect("history"),
+                .expect("the damaged log is still there"),
             damaged,
-            "the verified copy became history, bytes unchanged"
+            "the loads leave the damaged bytes byte-identical"
         );
-        assert_eq!(
-            file_frames_of(&path).await,
-            log.frames,
-            "the new file decodes"
-        );
-
-        // A copy that fails verification stays pending, and nothing
-        // replaces the absent file until the old bytes are verified.
-        crate::w3h_inline::fs::remove_file(&path)
-            .await
-            .expect("remove the live file");
-        let bad_name = s4::quarantine_pending_name("g.crblog", &[8u8; 16], b"other bytes");
-        let bad = path.with_file_name(&bad_name);
-        crate::w3h_inline::fs::write(&bad, b"corrupted copy")
-            .await
-            .expect("write the unverified copy");
+        for entry in std::fs::read_dir(dir.path()).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.contains(".q-"), "no quarantine copy exists: {name}");
+        }
         assert!(
-            !write_at(&path, &log).await,
-            "the write refuses while the only pending copy fails verification"
+            !write_at(
+                &path,
+                &ReplayLogV1 {
+                    stable_group_id: "g".to_string(),
+                    frames: Vec::new()
+                }
+            )
+            .await,
+            "the write of the damaged log refuses (ADR 0085 rule 4)"
         );
-        assert!(!path.exists(), "no replacement before the barrier clears");
-        assert!(bad.exists(), "the unverified copy stays pending");
+        // The operator deals with the damaged file; the group's log
+        // accepts its next write — no state survives the loads.
+        std::fs::remove_file(&path).expect("remove the damaged log");
+        assert!(
+            write_at(
+                &path,
+                &ReplayLogV1 {
+                    stable_group_id: "g".to_string(),
+                    frames: Vec::new()
+                }
+            )
+            .await,
+            "the group's log accepts its next write"
+        );
     }
 }
