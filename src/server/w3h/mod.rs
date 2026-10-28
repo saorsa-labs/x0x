@@ -11,7 +11,10 @@
 //! Time (plan §3b): a `spawn_blocking` clock gate inhibits tokio's
 //! auto-advance whenever no named barrier is open, so virtual time moves
 //! only inside [`Sim::within`] / [`Sim::until`] / [`Sim::api`], and every
-//! advance is attributed to a named barrier in the trace. When the
+//! advance is attributed to a named barrier in the trace. The runtime
+//! takes the local queue before any blocking-pool injection, and W3-H
+//! filesystem and history commits run on the caller, so a pool thread
+//! cannot move virtual time while the runtime is idle (#1245). When the
 //! entropy/wall-clock shim (`scripts/w3h/w3h_shim.c`) is preloaded, the
 //! wall clock is a fixed base plus virtual time: each `clock_gettime`
 //! pulls the current virtual offset (no 1 ms ticker race; #1245), and
@@ -56,6 +59,7 @@ mod case_1427;
 mod case_1471;
 mod case_811;
 mod case_818;
+mod case_969;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -203,6 +207,19 @@ where
     lineage::reset();
     let mut builder = tokio::runtime::Builder::new_current_thread();
     builder.enable_all().start_paused(true);
+    // A blocking-pool completion sits on the injection queue. Every 31
+    // polls the default interval takes that queue before the local queue,
+    // so the completion reorders tasks that were already ready (#1245).
+    // `u32::MAX` keeps the local queue first until it is empty. The seed
+    // fixes `select!` and `watch` poll order on this runtime.
+    builder.global_queue_interval(u32::MAX);
+    #[cfg(tokio_unstable)]
+    {
+        builder.disable_lifo_slot();
+        builder.rng_seed(tokio::runtime::RngSeed::from_bytes(
+            b"x0x-w3h-runtime-seed-v1",
+        ));
+    }
     lineage::install(&mut builder);
     let result = builder.build().expect("w3h runtime").block_on(future);
     ensure_lineage_recorded();
@@ -1125,7 +1142,7 @@ impl Sim {
             .identity_dir
             .clone()
             .context("sim nodes always have an identity dir")?;
-        tokio::fs::create_dir_all(&identity).await?;
+        crate::w3h_inline::fs::create_dir_all(&identity).await?;
         for (file, bytes) in [
             ("machine.key", provision.machine_key),
             ("agent.key", provision.agent_key),
