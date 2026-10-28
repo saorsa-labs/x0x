@@ -110,8 +110,14 @@ The inbox attributes these machines to the sender:
   One protected agent can pin 2 revoked machines. A further revoked
   machine for that agent can be evicted. Eviction takes a non-revoked
   pair first and does not drop a pinned pair. The pin uses the
-  revocation probe `x0xd` installs. A library embedder without that
-  probe does not pin. Losing a pinned pair would drop the attestation
+  revocation probe `x0xd` installs. A confirmed revocation counts toward
+  that pin. An unknown answer, including a busy revocation lock, does not
+  evict that pair and does not count as a confirmed newer revocation. A
+  move into the protected share is refused when the revoked and unknown
+  pairs do not fit. Those pairs stay in the share they already use. The
+  protected share does not grow past 16,384. A protected peer is removed
+  when its last accepted machine is gone and its relationship epoch is
+  gone. A library embedder without that probe does not pin. Losing a pinned pair would drop the attestation
   requirement, so that eviction is not a residual. That evicted machine
   is no longer attributed. A stranger insert does not evict a contact
   pair or a protected non-contact pair. A stranger flood that evicts a
@@ -128,7 +134,11 @@ The inbox attributes these machines to the sender:
   the stranger share. That move can evict a stranger pair. It is a
   residual until the next record. A library embedder that does not run
   the `x0xd` probe gets contact-only protection. Records already in the
-  cache when the probe is installed are classified again. After an eviction frees one of an agent's slots, a later
+  cache when the probe is installed are classified again. A group
+  membership change does not reclassify pairs by itself. The next
+  announcement, DM, contact change, or process start applies the new
+  standing. The contact bit is read while the relationship epoch stays
+  the same. A newer epoch discards that contact snapshot. After an eviction frees one of an agent's slots, a later
   admitted machine is recorded again. 4,096 overflowed agents can be named.
   Overflow does not refuse an unattested DM or ACK by itself. A
   revocation of an unrecorded machine is not attributed, and an

@@ -1725,9 +1725,9 @@ pub async fn serve_with_options(
         .write()
         .await
         .install_revoked_machine_probe(move |machine| match revoked_for_pin.try_read() {
-            Ok(set) => set.is_machine_revoked(machine),
-            // A busy lock must not evict a pair that may be revoked.
-            Err(_) => true,
+            Ok(set) => Some(set.is_machine_revoked(&machine)),
+            // Unknown: do not evict the pair, and do not count it as revoked.
+            Err(_) => None,
         });
     let known_agents = agent
         .authenticated_machine_bindings()

@@ -109,6 +109,8 @@ fn certificate_for_grant(
         (None, Some(Some(cert))) => Some(Some(cert)),
         (None, Some(None)) => None,
         (Some(None), Some(cert)) => Some(cert),
+        // `discovery_cert` is `Copy`, so this arm stays for exhaustiveness.
+        // The early return above already handled `Some(Some(_))`.
         (Some(Some(_)), _) => None,
     }
 }
