@@ -902,7 +902,14 @@ async fn truncated_catchup_page_does_not_seal() -> Result<()> {
     };
     // The transport sender is an active peer, not the leaver. The commit
     // signature is the author.
-    handle_treekem_catchup_response(&fixture.state, &peer, true, truncated).await;
+    handle_treekem_catchup_response(
+        &fixture.state,
+        &peer,
+        &clean_sender_machine(),
+        true,
+        truncated,
+    )
+    .await;
     assert_eq!(
         live_epoch(&fixture.state, &fixture.group_id).await,
         fixture.epoch_before,
@@ -919,6 +926,7 @@ async fn truncated_catchup_page_does_not_seal() -> Result<()> {
     handle_treekem_catchup_response(
         &fixture.state,
         &fixture.state.agent.agent_id(),
+        &clean_sender_machine(),
         true,
         empty_catchup(&fixture.group_id, false),
     )
@@ -932,6 +940,7 @@ async fn truncated_catchup_page_does_not_seal() -> Result<()> {
     handle_treekem_catchup_response(
         &fixture.state,
         &peer,
+        &clean_sender_machine(),
         true,
         empty_catchup(&fixture.group_id, false),
     )
@@ -2013,6 +2022,7 @@ async fn deliver_catchup(
     handle_treekem_catchup_response(
         state,
         sender,
+        &clean_sender_machine(),
         true,
         TreeKemCatchupResponse {
             message_type: "treekem_catchup_response".to_string(),
@@ -2326,7 +2336,14 @@ async fn startup_seals_only_after_the_peer_reports_the_saved_head() -> Result<()
         ),
         key_package_reply(&fixture.group_id, Some(head.clone())),
     ] {
-        handle_treekem_catchup_response(&fixture.state, &witness, true, page).await;
+        handle_treekem_catchup_response(
+            &fixture.state,
+            &witness,
+            &clean_sender_machine(),
+            true,
+            page,
+        )
+        .await;
         assert_eq!(
             live_epoch(&fixture.state, &fixture.group_id).await,
             fixture.epoch_before,
@@ -2337,6 +2354,7 @@ async fn startup_seals_only_after_the_peer_reports_the_saved_head() -> Result<()
     handle_treekem_catchup_response(
         &fixture.state,
         &witness,
+        &clean_sender_machine(),
         true,
         catchup_page(&fixture.group_id, false, Some(head)),
     )
@@ -2380,6 +2398,7 @@ async fn cold_responder_newer_head_does_not_clear_the_startup_gate() -> Result<(
     handle_treekem_catchup_request(
         &responder.state,
         &requester,
+        &clean_sender_machine(),
         true,
         TreeKemCatchupRequest {
             message_type: "treekem_catchup_request".to_string(),
@@ -2416,7 +2435,14 @@ async fn cold_responder_newer_head_does_not_clear_the_startup_gate() -> Result<(
     startup_self_leave_rekey(&committer.state).await;
     let mut foreign = page;
     foreign.group_id = committer.group_id.clone();
-    handle_treekem_catchup_response(&committer.state, &witness, true, foreign).await;
+    handle_treekem_catchup_response(
+        &committer.state,
+        &witness,
+        &clean_sender_machine(),
+        true,
+        foreign,
+    )
+    .await;
     assert_eq!(
         live_epoch(&committer.state, &committer.group_id).await,
         committer.epoch_before,
@@ -2744,6 +2770,7 @@ async fn startup_gates_every_group_before_either_send() -> Result<()> {
     handle_treekem_catchup_response(
         &first.state,
         &witness,
+        &clean_sender_machine(),
         true,
         catchup_page(&first.group_id, false, Some(head)),
     )
@@ -2788,6 +2815,7 @@ async fn departed_startup_peer_stops_blocking_while_a_survivor_remains() -> Resu
     handle_treekem_catchup_response(
         &fixture.state,
         &survivor,
+        &clean_sender_machine(),
         true,
         catchup_page(&fixture.group_id, false, Some(head)),
     )
@@ -2851,6 +2879,7 @@ async fn matching_head_is_kept_while_another_peers_page_is_open() -> Result<()> 
     handle_treekem_catchup_response(
         &fixture.state,
         &peer_a,
+        &clean_sender_machine(),
         true,
         catchup_page(&fixture.group_id, true, Some(head.clone())),
     )
@@ -2863,6 +2892,7 @@ async fn matching_head_is_kept_while_another_peers_page_is_open() -> Result<()> 
     handle_treekem_catchup_response(
         &fixture.state,
         &peer_b,
+        &clean_sender_machine(),
         true,
         catchup_page(&fixture.group_id, false, Some(head.clone())),
     )
@@ -2875,6 +2905,7 @@ async fn matching_head_is_kept_while_another_peers_page_is_open() -> Result<()> 
     handle_treekem_catchup_response(
         &fixture.state,
         &peer_a,
+        &clean_sender_machine(),
         true,
         catchup_page(&fixture.group_id, false, Some(head)),
     )
@@ -3586,6 +3617,7 @@ async fn other_daemon_matching_head_does_not_clear_this_startup_hold() -> Result
     handle_treekem_catchup_response(
         &admin.state,
         &member_id,
+        &clean_sender_machine(),
         true,
         catchup_page(&admin.group_id, false, Some(h1.clone())),
     )
@@ -3601,7 +3633,14 @@ async fn other_daemon_matching_head_does_not_clear_this_startup_hold() -> Result
     );
 
     let witness_page = catchup_page(&admin.group_id, false, Some(h2.clone()));
-    handle_treekem_catchup_response(&admin.state, &witness, true, witness_page.clone()).await;
+    handle_treekem_catchup_response(
+        &admin.state,
+        &witness,
+        &clean_sender_machine(),
+        true,
+        witness_page.clone(),
+    )
+    .await;
     assert_eq!(
         saved_head(&admin.state, &admin.group_id).await,
         h1,
@@ -3621,7 +3660,14 @@ async fn other_daemon_matching_head_does_not_clear_this_startup_hold() -> Result
         StatusCode::CONFLICT
     );
 
-    handle_treekem_catchup_response(&member_state, &witness, true, witness_page).await;
+    handle_treekem_catchup_response(
+        &member_state,
+        &witness,
+        &clean_sender_machine(),
+        true,
+        witness_page,
+    )
+    .await;
     assert_eq!(saved_head(&member_state, &admin.group_id).await, h2);
     assert_eq!(
         saved_head(&admin.state, &admin.group_id).await,
@@ -3962,7 +4008,7 @@ async fn epoch_ahead_ciphertext_requests_catchup_and_converges() -> Result<()> {
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
         }
     };
-    handle_treekem_catchup_request(admin, &victim_id, true, request).await;
+    handle_treekem_catchup_request(admin, &victim_id, &clean_sender_machine(), true, request).await;
     let served = admin
         .named_group_test_recorders
         .catchup_responses
@@ -3976,7 +4022,7 @@ async fn epoch_ahead_ciphertext_requests_catchup_and_converges() -> Result<()> {
         !page.events.is_empty(),
         "the page carries the missed removal"
     );
-    handle_treekem_catchup_response(victim, &admin_id, true, page).await;
+    handle_treekem_catchup_response(victim, &admin_id, &clean_sender_machine(), true, page).await;
     assert_eq!(
         live_epoch(victim, group_id).await,
         admin_epoch,
@@ -4238,7 +4284,7 @@ async fn newer_epoch_observation_survives_a_late_older_epoch_page() -> Result<()
             limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
         }
     };
-    handle_treekem_catchup_request(admin, &victim_id, true, request).await;
+    handle_treekem_catchup_request(admin, &victim_id, &clean_sender_machine(), true, request).await;
     let served = admin
         .named_group_test_recorders
         .catchup_responses
@@ -4287,7 +4333,8 @@ async fn newer_epoch_observation_survives_a_late_older_epoch_page() -> Result<()
         "the running recovery takes the newer epoch"
     );
 
-    handle_treekem_catchup_response(victim, &admin_id, true, late_page).await;
+    handle_treekem_catchup_response(victim, &admin_id, &clean_sender_machine(), true, late_page)
+        .await;
     assert_eq!(
         live_epoch(victim, group_id).await,
         first_epoch,

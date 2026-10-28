@@ -653,7 +653,8 @@ async fn issue1139_catchup_page_converges_second_joiner() -> Result<()> {
         "a one-event Home catch-up page is {one_event} B; DM budget {}",
         crate::dm::MAX_PAYLOAD_BYTES
     );
-    handle_treekem_catchup_response(&s.j2, &s.authority_id, true, page).await;
+    handle_treekem_catchup_response(&s.j2, &s.authority_id, &clean_sender_machine(), true, page)
+        .await;
     assert_eq!(join_state(&s.j2, &s.group_key).await, "active");
     assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
     Ok(())
