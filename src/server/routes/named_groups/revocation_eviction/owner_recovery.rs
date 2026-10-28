@@ -43,8 +43,7 @@ use x0x::identity::AgentId;
 
 use super::crypto_exclusion::{
     all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, next_attempt,
-    note_converged, seat_cannot_take_a_share, write_allowed, HeadRule, RecipientDelivery,
-    RoundUpdate,
+    note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
 use super::mandate_store::{self, PendingOrcV1};
@@ -116,12 +115,6 @@ struct CommitDelivery {
     /// restored delivery keeps it: the sealed shares were not durable, the
     /// secret is, in the persisted group (#1508 review).
     reshare_epoch: Option<u64>,
-    /// #1633 (Engineer call, 25 Oct): the started seats of the current
-    /// round whose seat this author's roster shows with no KEM public key,
-    /// so [`seal_gss_share`] skipped the seal for them (#1578). The
-    /// carrier's acceptance of the frame closes such a seat from this
-    /// author's own record, never from the recipient's report.
-    keyless_seats: BTreeSet<[u8; 32]>,
 }
 
 /// A GSS share that arrived before the recovery that makes its sender an
@@ -530,7 +523,6 @@ async fn ensure_restored(state: &AppState) {
                 resumed: true,
                 removed,
                 reshare_epoch,
-                keyless_seats: BTreeSet::new(),
             });
     }
 }
@@ -1511,7 +1503,6 @@ async fn finish_commit(
                 resumed: false,
                 removed: removed_ids,
                 reshare_epoch,
-                keyless_seats: BTreeSet::new(),
             },
         );
     }
@@ -1645,21 +1636,6 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             .await
             .orc
             .install_commit_round(&stable, &delivery.result_head, updates);
-        if delivery.reshare_epoch.is_some() && !started.is_empty() {
-            // #1633 (Engineer call, 25 Oct): record which started seats
-            // this author cannot seal a share to, from the same roster
-            // the reshare reads. The record is re-derived every round.
-            let mut inner = state.revocation_evictions.inner.lock().await;
-            if let Some(stored) = inner.orc.deliveries.get_mut(&stable) {
-                for (recipient, _) in &started {
-                    if seat_cannot_take_a_share(&info, recipient) {
-                        stored.keyless_seats.insert(*recipient);
-                    } else {
-                        stored.keyless_seats.remove(recipient);
-                    }
-                }
-            }
-        }
         ask_heads(state, &stable, head_asks);
         for (recipient, attempt) in started {
             spawn_commit_send(state, &stable, &delivery, AgentId(recipient), attempt);
@@ -1734,24 +1710,8 @@ fn spawn_commit_send(
     let reshare_epoch = delivery.reshare_epoch;
     let _spawned = state.spawn_detached(async move {
         let rule = HeadRule::Current(result_head.clone());
-        let mut status = send_guarded(&task_state, &stable, &agent, rule, bytes.as_slice()).await;
+        let status = send_guarded(&task_state, &stable, &agent, rule, bytes.as_slice()).await;
         let mut inner = task_state.revocation_evictions.inner.lock().await;
-        // #1633 (Engineer call, 25 Oct): an unsealable seat can never
-        // report delivery (a keyless GSS survivor waits below the
-        // recovery for a share that no holder seals), so the carrier's
-        // acceptance of the frame is the last obligation this author has
-        // to it. Close it from the author's own record, not from the
-        // recipient's report.
-        if status == RecipientDelivery::Sent
-            && inner
-                .orc
-                .deliveries
-                .get(stable.as_str())
-                .filter(|stored| stored.result_head == result_head)
-                .is_some_and(|stored| stored.keyless_seats.contains(agent.as_bytes()))
-        {
-            status = RecipientDelivery::Converged;
-        }
         let recorded = inner.orc.finish_commit_attempt(
             &stable,
             &result_head,
@@ -3644,7 +3604,6 @@ mod tests {
             resumed: false,
             removed: BTreeSet::new(),
             reshare_epoch: None,
-            keyless_seats: BTreeSet::new(),
         }
     }
 
@@ -5806,24 +5765,40 @@ mod restart_tests {
         Ok(())
     }
 
-    /// #1633 (Engineer call, 25 Oct): a GSS owner recovery aimed at a
-    /// permanently KEM-less survivor. The commit seats the KEM key (F1 §5
-    /// fail-closed), but the author's local view of the key then
-    /// disappears — it is local data, not in the roster root (#1578) — so
-    /// no share can be sealed to the seat again: the survivor waits below
-    /// the recovery for good. Before the fix the row stayed open for
-    /// good; now each round re-derives the unsealable seat from the
-    /// author's own roster, and the carrier's acceptance of the frame
-    /// closes it from that record.
+    /// #1633: a GSS owner recovery aimed at a survivor whose seat this
+    /// author's roster shows with no KEM public key, so no share can be
+    /// sealed to it. ADR 0110 §3 L228 holds: survivor convergence, not a
+    /// transport ACK, proves delivery. The carrier takes the frame each
+    /// round, but that closes no seat — the close call of 25 Oct (an
+    /// author-side skip record) was withdrawn on 27 Oct — and a keyless
+    /// survivor claims no head while it is keyless (#1627, 28 Oct 02:09
+    /// GMT), so it converges no author's row: the obligation stays open.
+    /// The KEM key is local data, not in the roster root (#1578), so the
+    /// recovery is the re-seated key, the resealed share, and the report
+    /// the survivor makes after it installs head and secret together.
     #[tokio::test]
-    async fn a_keyless_seat_closes_the_recovery_row_from_the_authors_record() -> Result<()> {
+    async fn a_keyless_seat_stays_pending_until_the_reseated_key_installs_the_share() -> Result<()>
+    {
         let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
-        let (author, survivor, info, _committed, _frame, _admin) =
+        let (author, survivor, info, committed, frame, _admin) =
             committed_gss_recovery(author_dir.path(), survivor_dir.path(), None, None).await?;
         let stable = info.stable_group_id().to_string();
         let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
-        // The author's local view of the survivor's KEM key disappears:
-        // from here no share can be sealed to that seat again.
+        let new_secret = committed.shared_secret.clone().context("new secret")?;
+        // The seat's KEM key is local data (#1578): keep it, then remove
+        // the author's view of it, so no share can be sealed to the seat.
+        let saved_kem = author
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .context("group")?
+            .members_v2
+            .get(&survivor_hex)
+            .context("survivor seat")?
+            .kem_public_key_b64
+            .clone()
+            .context("the fixture seats a KEM key")?;
         author
             .named_groups
             .write()
@@ -5834,10 +5809,25 @@ mod restart_tests {
             .get_mut(&survivor_hex)
             .context("survivor seat")?
             .kem_public_key_b64 = None;
-        // The author's rounds run. The re-derived skip record closes the
-        // seat when the carrier takes the frame; no head report exists.
-        let mut closed = false;
-        for _ in 0..250 {
+        // The survivor holds the frame Retained: it has its key, but the
+        // share that must land with the head did not come.
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Retained { verified: true },
+            "the frame waits for its share"
+        );
+
+        // Pending phase: the author's rounds run. The carrier takes the
+        // frame every round, but no ACK closes a seat (ADR 0110 §3), so
+        // the obligation stays open while the seat cannot take a share.
+        let shares_to_survivor = |author: &Arc<AppState>| {
+            scheduled_shares(author)
+                .into_iter()
+                .filter(|(to, _)| to == &survivor_hex)
+                .count()
+        };
+        let sealed = shares_to_survivor(&author);
+        for _ in 0..25 {
             if let Some(delivery) = author
                 .revocation_evictions
                 .inner
@@ -5850,15 +5840,60 @@ mod restart_tests {
                 delivery.next_at = Instant::now();
             }
             worker_tick(&author).await;
-            if !still_delivering(&author, &stable, &survivor).await {
-                closed = true;
-                break;
-            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
-            closed,
-            "the carrier's acceptance closes the keyless seat from the author's own record"
+            still_delivering(&author, &stable, &survivor).await,
+            "the carrier's acceptance of the frame closes no keyless seat"
+        );
+        assert_eq!(
+            shares_to_survivor(&author),
+            sealed,
+            "no new share is sealed while the seat has no KEM key"
+        );
+        assert_eq!(
+            head_of(&survivor, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the survivor stays below the recovery, Retained frame and no share"
+        );
+
+        // Recovery: the seat re-joins keyed. The author's next round seals
+        // the share again; the parked share and the Retained frame make
+        // head and secret install together, and only the report of that
+        // installed head ends the delivery.
+        author
+            .named_groups
+            .write()
+            .await
+            .get_mut(&stable)
+            .context("group")?
+            .members_v2
+            .get_mut(&survivor_hex)
+            .context("survivor seat")?
+            .kem_public_key_b64 = Some(saved_kem);
+        let share = next_share(&author, &stable, &survivor_hex, sealed).await?;
+        let early = super::super::super::apply_named_group_metadata_event(
+            &survivor,
+            share,
+            author.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!early.accepted, "the share is parked until its recovery");
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Applied,
+            "the share makes head and secret install together"
+        );
+        let held = survivor.named_groups.read().await[&stable].clone();
+        assert_eq!(held.state_hash, committed.state_hash);
+        assert_eq!(held.secret_epoch, committed.secret_epoch);
+        assert_eq!(held.shared_secret.as_deref(), Some(new_secret.as_slice()));
+        report_head(&author, &survivor, &stable).await?;
+        assert!(
+            !still_delivering(&author, &stable, &survivor).await,
+            "only the installed share's report ends the delivery"
         );
         author.agent.shutdown().await;
         survivor.agent.shutdown().await;

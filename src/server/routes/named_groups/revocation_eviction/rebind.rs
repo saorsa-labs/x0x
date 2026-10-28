@@ -53,15 +53,13 @@ use crate as x0x;
 use crate::server::state::AppState;
 use x0x::groups::cert_rebind as cr;
 use x0x::groups::eviction::{self as s4, EvictionKey, ObligationRow, WaitingCause, WaitingState};
-use x0x::groups::owner_recovery::{crypto_kind, RecoveryCryptoKind};
 use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 use x0x::identity::{AgentCertificate, AgentId};
 use x0x::logging::LogHexId;
 
 use super::crypto_exclusion::{
     all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
-    next_attempt, note_converged, seat_cannot_take_a_share, write_allowed, HeadRule,
-    RecipientDelivery, RoundUpdate,
+    next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
 
@@ -95,14 +93,6 @@ struct Delivery {
     /// A restart restored this delivery from the held log: each round
     /// waits for the group's §2 head sync first (#1508 review F3).
     resumed: bool,
-    /// #1633 (Engineer call, 25 Oct): the started seats of the current
-    /// round whose seat this author's roster shows with no KEM public key
-    /// (#1578). The rebind carries no key material, but a GSS group's
-    /// keyless survivor can never take a share, so its head report can
-    /// stay below this frame's result for good (a live hold or a parked
-    /// removal). The carrier's acceptance of the frame closes such a seat
-    /// from this author's own record, never from the recipient's report.
-    keyless_seats: BTreeSet<[u8; 32]>,
 }
 
 /// The seat agent's `waiting_for_admin_rebind` (§4a, D155).
@@ -230,7 +220,6 @@ async fn ensure_restored(state: &AppState) {
                 next_at: Instant::now(),
                 started: Instant::now(),
                 resumed: true,
-                keyless_seats: BTreeSet::new(),
             });
     }
 }
@@ -507,7 +496,6 @@ async fn commit_locked(
                 next_at: Instant::now(),
                 started: Instant::now(),
                 resumed: false,
-                keyless_seats: BTreeSet::new(),
             },
         );
         let key = EvictionKey::new(next.stable_group_id(), seat);
@@ -1536,18 +1524,9 @@ fn complete_send(
     key: &(String, String),
     recipient: &[u8; 32],
     attempt: u64,
-    mut status: RecipientDelivery,
+    status: RecipientDelivery,
 ) -> bool {
     rebind.deliveries.get_mut(key).is_some_and(|delivery| {
-        // #1633 (Engineer call, 25 Oct): an unsealable seat can never
-        // report delivery above its holds (the keyless GSS survivor
-        // reports the lowest live hold's parent), so the carrier's
-        // acceptance of the frame is the last obligation this author has
-        // to it. Close it from the author's own record, not from the
-        // recipient's report.
-        if status == RecipientDelivery::Sent && delivery.keyless_seats.contains(recipient) {
-            status = RecipientDelivery::Converged;
-        }
         finish_attempt(&mut delivery.recipients, recipient, attempt, status)
     })
 }
@@ -1662,22 +1641,6 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             &key,
             updates,
         );
-        if crypto_kind(&info) == RecoveryCryptoKind::Gss && !started.is_empty() {
-            // #1633 (Engineer call, 25 Oct): record which started seats
-            // this author could not seal a share to, from the same roster
-            // the group's share path reads. The record is re-derived
-            // every round.
-            let mut inner = state.revocation_evictions.inner.lock().await;
-            if let Some(stored) = inner.rebind.deliveries.get_mut(&key) {
-                for (recipient, _) in &started {
-                    if seat_cannot_take_a_share(&info, recipient) {
-                        stored.keyless_seats.insert(*recipient);
-                    } else {
-                        stored.keyless_seats.remove(recipient);
-                    }
-                }
-            }
-        }
         ask_heads(state, &key.0, head_asks);
         for (recipient, attempt) in started {
             spawn_send(
@@ -2371,7 +2334,6 @@ mod tests {
             next_at: Instant::now(),
             started: Instant::now(),
             resumed: false,
-            keyless_seats: BTreeSet::new(),
         }
     }
 
@@ -2615,25 +2577,29 @@ mod daemon_tests {
         .await
     }
 
-    /// #1633 (Engineer call, 25 Oct): a committed rebind of a GSS group
-    /// aimed at a permanently KEM-less survivor. The frame carries no key
-    /// material, but the survivor's head report can stay below the
-    /// result for good (a live hold or a parked GSS removal pins it), so
-    /// before the fix the row stayed open for good. Now the round records
-    /// the unsealable seat from the author's own roster, and the
-    /// carrier's acceptance of the frame closes it from that record.
+    /// #1633: a committed rebind of a GSS group aimed at a survivor whose
+    /// roster seat carries no KEM public key (#1578). The Engineer call of
+    /// 25 Oct, to close such a row from the author's own record, was
+    /// withdrawn on 27 Oct. ADR 0110 §3 L228 governs: survivor
+    /// convergence, not a transport ACK, proves delivery. While the seat
+    /// is keyless, the survivor claims no head in its catch-up answers
+    /// (#1627, David's ruling, 28 Oct 02:09 GMT), so a keyless disclaimer
+    /// converges nothing and the carrier's acceptance of the frame holds
+    /// the row at `Sent`. The row ends only when the seat takes a KEM key
+    /// and the survivor reports the result head.
     #[tokio::test]
-    async fn a_keyless_seat_closes_the_rebind_row_from_the_authors_record() -> Result<()> {
+    async fn a_keyless_seat_stays_pending_until_a_head_report_converges_it() -> Result<()> {
         let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
         let admin = state.agent.agent_id();
         let survivor = AgentId([0x88; 32]);
+        let survivor_id = *survivor.as_bytes();
         let survivor_hex = hex::encode(survivor.as_bytes());
         let group_id = "cc".repeat(16);
         let mut info = GroupInfo::new("cb".into(), String::new(), admin, group_id.clone());
         info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
         // `add_member` seats the survivor with no KEM key.
         info.add_member(
-            survivor_hex,
+            survivor_hex.clone(),
             GroupRole::Member,
             Some(hex::encode(admin.as_bytes())),
             None,
@@ -2643,7 +2609,7 @@ mod daemon_tests {
             .named_groups
             .write()
             .await
-            .insert(group_id, info.clone());
+            .insert(group_id.clone(), info.clone());
         // The survivor's current verified advert sets `certificate_rebind_v1`.
         advertise(
             &state,
@@ -2664,32 +2630,124 @@ mod daemon_tests {
                 Delivery {
                     bytes: Arc::new(b"X0XCR1\0rebind".to_vec()),
                     result_head: info.state_hash.clone(),
-                    recipients: BTreeMap::from([(*survivor.as_bytes(), RecipientDelivery::Due)]),
+                    recipients: BTreeMap::from([(survivor_id, RecipientDelivery::Due)]),
                     next_at: Instant::now(),
                     started: Instant::now(),
                     resumed: false,
-                    keyless_seats: BTreeSet::new(),
                 },
             );
+        let row_present = || {
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            async move {
+                state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .rebind
+                    .deliveries
+                    .contains_key(&key)
+            }
+        };
+        let seat_status = || {
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            async move {
+                state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .rebind
+                    .deliveries
+                    .get(&key)
+                    .and_then(|delivery| delivery.recipients.get(&survivor_id).copied())
+            }
+        };
         drive_deliveries(&state).await;
-        let mut done = false;
+        let mut accepted = false;
         for _ in 0..250 {
-            let closed = {
-                let inner = state.revocation_evictions.inner.lock().await;
-                inner.rebind.deliveries.get(&key).is_none_or(|delivery| {
-                    delivery.recipients.get(survivor.as_bytes())
-                        == Some(&RecipientDelivery::Converged)
-                })
-            };
-            if closed {
-                done = true;
+            if seat_status().await == Some(RecipientDelivery::Sent) {
+                accepted = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
-            done,
-            "the carrier's acceptance closes the keyless seat from the author's own record"
+            accepted,
+            "the carrier's acceptance is Sent, not delivery: an ACK closes no seat (ADR 0110 §3)"
+        );
+        assert!(
+            row_present().await,
+            "the row stays open after the carrier's acceptance"
+        );
+        assert_eq!(
+            seat_status().await,
+            Some(RecipientDelivery::Sent),
+            "the seat stays Sent after the carrier's acceptance"
+        );
+        // The answer a keyless survivor really serves (#1627, David's
+        // ruling, 28 Oct 02:09 GMT): no `responder_state_hash` at all.
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            None,
+        )
+        .await;
+        assert!(
+            row_present().await,
+            "a keyless disclaimer converges nothing — the survivor claims no head while keyless"
+        );
+        assert_eq!(
+            seat_status().await,
+            Some(RecipientDelivery::Sent),
+            "a keyless disclaimer converges nothing — the survivor claims no head while keyless"
+        );
+        // The rebind frame carries no key material: the survivor can hold
+        // and report the result head only once it can take the group's
+        // secret. Seat a KEM key for it on the author's roster copy.
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let stored = groups.get_mut(&group_id).expect("the author's roster copy");
+            stored
+                .members_v2
+                .get_mut(&survivor_hex)
+                .expect("the survivor's seat")
+                .kem_public_key_b64 = Some(BASE64.encode(&kem.public_bytes));
+        }
+        // The share-proof report: the survivor now holds the result head.
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            Some(&info.state_hash),
+        )
+        .await;
+        let mut converged = false;
+        for _ in 0..250 {
+            if seat_status().await == Some(RecipientDelivery::Converged) {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            converged,
+            "only the survivor's report that holds the result head converges the seat"
+        );
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            if let Some(delivery) = inner.rebind.deliveries.get_mut(&key) {
+                delivery.next_at = Instant::now();
+            }
+        }
+        drive_deliveries(&state).await;
+        assert!(
+            !row_present().await,
+            "only the reported result head ends the delivery"
         );
         Ok(())
     }

@@ -5141,6 +5141,159 @@ mod daemon_tests {
         Ok(())
     }
 
+    /// #1635 fix round (Codex P1, 28 Oct): the delayed-exclusion shape.
+    /// The survivor already installed the exclusion keyless — its head is
+    /// the result H1, it holds no secret and its seat carries no KEM key
+    /// — while an admin is still at H0, the exclusion frame not yet
+    /// arrived on its own delivery row. Before David's 28 Oct 02:09 GMT
+    /// ruling the keyless survivor reported the hold's parent H0 in its
+    /// catch-up answers: the lagging admin's classify passed (the report
+    /// named its own head), its head round confirmed and its startup
+    /// check satisfied the peer, so the admin could seal at H0 against
+    /// the H1 chain. The ruling closes the vector at the source: the
+    /// keyless survivor's served answer omits `responder_state_hash`, so
+    /// the lagging admin reads no head from it. The parent shape — the
+    /// pre-fix answer — is pinned as the vector: it passes both gates.
+    #[tokio::test]
+    async fn a_keyless_survivors_answer_confirms_no_lagging_admins_round() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let admin = fx.state.agent.agent_id();
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        // The replica's post-leave state is H0 — the lagging admin's view.
+        // It is cloned BEFORE the frame moves the replica to H1.
+        let parent_info = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        let parent_head = parent_info.state_hash.clone();
+        let stable = parent_info.stable_group_id().to_string();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the survivor installs the verified frame keyless (#1578)"
+        );
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+
+        // The lagging admin: still at H0, the exclusion not yet arrived.
+        // Its head round is open and its startup gate waits on the
+        // survivor.
+        let (lagging, _lagging_dir) = ng::tests::secure_endpoint_test_state().await?;
+        lagging
+            .named_groups
+            .write()
+            .await
+            .insert(fx.group_id.clone(), parent_info);
+        {
+            let mut inner = lagging.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
+                stable.clone(),
+                super::super::HeadRound::new(&parent_head, Instant::now()),
+            );
+        }
+        ng::self_leave_startup_require(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            std::slice::from_ref(&survivor_hex),
+        );
+
+        // The real served answer of the keyless survivor at H1: no head.
+        // The gated serve answers a member requester (the author, as the
+        // fixture test above asks); the answer the lagging admin reads
+        // from the gated carrier is this same page.
+        let served = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
+        assert_eq!(
+            served, None,
+            "the keyless survivor claims no head (David's ruling, 28 Oct 02:09 GMT)"
+        );
+        super::super::note_catchup_head(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
+        {
+            let inner = lagging.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner.head_rounds.get(&stable).expect("the round").confirmed,
+                "the keyless disclaimer confirms no round: no seal at H0 against the H1 chain"
+            );
+        }
+        ng::self_leave_startup_note_verified_head(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
+        assert!(
+            ng::self_leave_startup_open(&lagging, &fx.group_id),
+            "the absent field satisfies no startup peer"
+        );
+
+        // The ruled-out shape: had the keyless survivor reported the
+        // hold's parent H0 — the pre-fix answer — both gates would pass.
+        // That is the vector the keyless absence closes, pinned here.
+        super::super::note_catchup_head(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            Some(&parent_head),
+        )
+        .await;
+        {
+            let inner = lagging.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.head_rounds.get(&stable).expect("the round").confirmed,
+                "a parent report is OnLocalChain at H0: the vector the keyless absence closes"
+            );
+        }
+        ng::self_leave_startup_note_verified_head(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            Some(&parent_head),
+        )
+        .await;
+        assert!(
+            !ng::self_leave_startup_open(&lagging, &fx.group_id),
+            "a parent report would satisfy the startup peer: the vector, pinned"
+        );
+        Ok(())
+    }
+
     /// #1578 review (Claude, 28 Oct): the keyless install writes its
     /// durable hold BEFORE the apply. If the apply is then refused — the
     /// snapshot the install seals by no longer chains, as a sibling
