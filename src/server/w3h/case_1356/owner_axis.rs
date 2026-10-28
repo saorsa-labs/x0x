@@ -59,9 +59,6 @@ async fn announce_all(sim: &Sim, labels: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// An OwnerCertified TreeKEM group that is not the Home policy: admin-only
-/// writes keep it off ADR 0109 §4's Home gate (`home_gate_closed`) and out
-/// of Home adoption (#1687). Hidden + MlsEncrypted keeps the TreeKEM plane.
 /// `admin` seals a rename. A seal checks every member's certificate and the
 /// first try may start the fetches it needs; the creator's seat carries no
 /// certificate, so each retry refreshes O's certificate announce.
@@ -88,6 +85,9 @@ async fn seal_rename(sim: &Sim, admin: &str, group: &str, name: &str) -> Result<
     .with_context(|| format!("{admin}'s last seal answer: {last}"))
 }
 
+/// An OwnerCertified TreeKEM group that is not the Home policy: admin-only
+/// writes keep it off ADR 0109 §4's Home gate (`home_gate_closed`) and out
+/// of Home adoption (#1687). Hidden + MlsEncrypted keeps the TreeKEM plane.
 async fn create_group(sim: &Sim, owner: &crate::identity::UserKeypair) -> Result<String> {
     let policy = crate::groups::GroupPolicy {
         admission: crate::groups::GroupAdmission::OwnerCertified(owner.user_id()),
