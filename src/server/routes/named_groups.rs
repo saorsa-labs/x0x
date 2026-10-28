@@ -6710,6 +6710,26 @@ where
     let (legacy_json, home_suite_json) =
         encode_named_groups_store_excluding_pending_stubs(state, &candidate, rebind_group_id)
             .await?;
+    // ADR 0109 §4 (#1570, Codex P1): the encode holds back a placeheld
+    // group whose authoritative record was not durable. Its legacy entry
+    // keeps its last durable form, which still holds the marker, so the
+    // clear is not on disk. Write and publish nothing; the live record
+    // stays contained (fail closed), and the caller retries.
+    let mut touched: Vec<&String> = before
+        .keys()
+        .chain(candidate.keys())
+        .filter(|key| before.get(*key) != candidate.get(*key))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    if touched.iter().any(|key| {
+        before
+            .get(*key)
+            .or_else(|| candidate.get(*key))
+            .is_some_and(|info| group_recovery::is_held_back(state, info.stable_group_id()))
+    }) {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
     let prejournaled = if let Some(group_id) = rebind_group_id {
         match prepare_rebind_journal_for_groups(state, group_id, &candidate).await {
             RebindOutcome::Failed(error) => {
@@ -6750,13 +6770,6 @@ where
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
     ) {
         let mut groups = state.named_groups.write().await;
-        let mut touched: Vec<&String> = before
-            .keys()
-            .chain(candidate.keys())
-            .filter(|key| before.get(*key) != candidate.get(*key))
-            .collect();
-        touched.sort_unstable();
-        touched.dedup();
         // Validate every touched key before committing any of them, including
         // additions/removals and all local-only fields in GroupInfo equality.
         if touched
@@ -7634,7 +7647,9 @@ async fn persist_named_group_info_inner(
 enum RebindOutcome {
     /// Group is not on the TreeKEM plane (or withdrawn/unknown), or the
     /// group has NO snapshot and NO live TreeKEM group on this node
-    /// (pre-existing degradation this write neither caused nor can heal).
+    /// (pre-existing degradation this write neither caused nor can heal),
+    /// or its placeheld record is held back (#1570): the saved roster keeps
+    /// the old record, so the snapshot keeps its binding.
     NotApplicable,
     /// Envelope re-bound (or repaired) and persisted crash-atomically.
     Rebound,
@@ -7689,6 +7704,20 @@ async fn prepare_rebind_journal_for_groups(
             encode_named_groups_store_excluding_pending_stubs(state, groups, Some(group_id))
                 .await
                 .map_err(|e| anyhow::anyhow!("named groups encode for journal: {e}"))?;
+        // ADR 0109 §4 (#1570, Codex P1): the encode above sets the
+        // held-back state, so this check must follow it. A held-back
+        // placeheld group keeps its last durable record in the legacy
+        // views, so the rebound envelope would bind a snapshot that is
+        // newer than the saved roster, and `restore_treekem_groups`
+        // rejects that pair at restart. Write no journal: the snapshot keeps its saved binding.
+        // When the worker later saves the record durably, the snapshot is
+        // older than the roster with the same security binding, which the
+        // restart re-binds (#457).
+        if groups.get(group_id).is_some_and(|record| {
+            group_recovery::is_held_back(state, record.stable_group_id())
+        }) {
+            return Ok(RebindOutcome::NotApplicable);
+        }
         // The LEGACY journal carries the legacy half (its postcard shape
         // is the downgrade-safe replay carrier — old binaries decode and
         // replay exactly this); the separate `.hsjournal` carries the
@@ -7750,11 +7779,11 @@ async fn prepare_rebind_journal_for_groups(
             }
             Err(e) => return Err(anyhow::anyhow!("TreeKEM journal write: {e}")),
         }
-        Ok(())
+        Ok(RebindOutcome::Rebound)
     }
     .await;
     match journalled {
-        Ok(()) => RebindOutcome::Rebound,
+        Ok(outcome) => outcome,
         Err(e) => {
             discard_rebind_journal(state, group_id).await;
             RebindOutcome::Failed(e)
@@ -47237,6 +47266,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1570_held_back_rebind;
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;

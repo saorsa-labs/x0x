@@ -1474,19 +1474,24 @@ pub(super) fn held_back_outcome(
     outcome: std::io::Result<super::AtomicWriteOutcome>,
 ) -> std::io::Result<super::AtomicWriteOutcome> {
     use super::AtomicWriteOutcome;
-    let held_back = || {
-        with_placeheld(state, |placeheld| {
-            placeheld
-                .get(stable)
-                .is_some_and(|entry| entry.authoritative_failed)
-        })
-    };
     match outcome {
-        Ok(AtomicWriteOutcome::Durable) if held_back() => {
+        Ok(AtomicWriteOutcome::Durable) if is_held_back(state, stable) => {
             Ok(AtomicWriteOutcome::ReplacedNotDurable)
         }
         outcome => outcome,
     }
+}
+
+/// #1570: `stable`'s group is placeheld and its authoritative record was
+/// not durable in the last legacy encode ([`legacy_store_view`]). Its
+/// legacy entry kept its last durable form, so a change to it made in that
+/// encode is not on disk.
+pub(super) fn is_held_back(state: &AppState, stable: &str) -> bool {
+    with_placeheld(state, |placeheld| {
+        placeheld
+            .get(stable)
+            .is_some_and(|entry| entry.authoritative_failed)
+    })
 }
 
 fn is_placeheld(state: &AppState, stable: &str) -> bool {
@@ -1581,7 +1586,7 @@ async fn needs_placeholder(state: &AppState, info: &GroupInfo, body: &GroupRecov
 
 /// Register `info`'s group as placeheld before the legacy write of an
 /// arming transition. The legacy view holds `info`'s real record.
-fn begin_placehold(state: &AppState, key: &str, info: &GroupInfo) {
+pub(super) fn begin_placehold(state: &AppState, key: &str, info: &GroupInfo) {
     let stable = info.stable_group_id().to_string();
     with_placeheld(state, |placeheld| {
         placeheld.entry(stable).or_insert_with(|| Placeheld {
@@ -10737,6 +10742,90 @@ mod tests {
             matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
             "both writes are durable: {outcome:?}"
         );
+        Ok(())
+    }
+
+    /// Codex P1 on #1646 (#1570), ADR 0109 §4 "publish only when both are
+    /// durable": a marker retirement of a placeheld group whose sidecar
+    /// cannot be written is not published. The encode holds the group
+    /// back, so its legacy entry keeps the marked placeholder. Before the
+    /// fix the legacy write was `Durable`, the cleared record went to the
+    /// live map, and task ingest resumed with no durable clear behind it.
+    /// Once the sidecar is writable again, the retry retires the marker.
+    /// Inert.
+    #[tokio::test]
+    async fn marker_retirement_is_not_published_while_its_sidecar_write_fails() -> anyhow::Result<()>
+    {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _ata) = marker_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        // The contained group is placeheld, with a durable authoritative
+        // record that holds the marker.
+        begin_placehold(&state, &key, &info);
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        assert!(is_placeheld(&state, &stable));
+        assert!(!is_held_back(&state, &stable));
+        let durable = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("placeheld legacy entry"))?;
+        assert!(s3::is_s3_placeholder(&durable));
+        assert!(durable.fork_quarantine.is_some());
+
+        // The group's sidecar cannot be written: a non-empty directory
+        // holds its name. The retirement clears the marker, so the record
+        // differs from the durable one and must be written again.
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::remove_file(&path).await?;
+        tokio::fs::create_dir_all(path.join("blocked")).await?;
+        assert!(
+            !retire_marker_attested(&state, &key, &info).await,
+            "the clear is not durable, so it is not published"
+        );
+        assert!(is_held_back(&state, &stable));
+        assert!(
+            live_marker(&state, &key).await,
+            "the live record stays contained"
+        );
+        let held = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("held legacy entry"))?;
+        assert_eq!(
+            serde_json::to_value(&held)?,
+            serde_json::to_value(&durable)?,
+            "the legacy file keeps the marked placeholder"
+        );
+        let backing = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .sidecars
+            .get(&stable)
+            .and_then(|body| body.authoritative_record.clone())
+            .ok_or_else(|| anyhow::anyhow!("authoritative record"))?;
+        let backing: GroupInfo = serde_json::from_slice(&backing)?;
+        assert!(
+            backing.fork_quarantine.is_some(),
+            "the authoritative record still holds the marker"
+        );
+        assert!(is_placeheld(&state, &stable), "the group stays placeheld");
+
+        // The sidecar is writable again: the retry is durable, and only
+        // then is the marker gone.
+        tokio::fs::remove_dir_all(&path).await?;
+        assert!(retire_marker_attested(&state, &key, &info).await);
+        assert!(!is_held_back(&state, &stable));
+        assert!(!live_marker(&state, &key).await);
+        assert!(!disk_marker(&state, &key).await?);
+        let record = sidecar_on_disk(&state, &stable)
+            .await?
+            .authoritative_record
+            .ok_or_else(|| anyhow::anyhow!("authoritative record on disk"))?;
+        let record: GroupInfo = serde_json::from_slice(&record)?;
+        assert!(record.fork_quarantine.is_none());
         Ok(())
     }
 
