@@ -2201,7 +2201,9 @@ async fn install_gss(
     // The install is local fact only (Engineer ruling, 27 Oct 22:10 GMT:
     // it never proves delivery, and an ACK closes no seat): while it
     // lasts this node claims no head in its catch-up answers (David's
-    // ruling, 28 Oct 02:09 GMT: the absence is keyless-only; every other
+    // ruling, 28 Oct 02:09 GMT: the absence is keyless-only, and the
+    // Engineer ruling of 28 Oct 09:35 GMT scopes it to encrypted groups
+    // — a SignedPublic member keeps main's answer; every other
     // responder, a superseded intermediate head included, serves exactly
     // main's answer), and the install converges no author's delivery
     // row. That head claim reads the group state itself, so it holds
@@ -5840,15 +5842,17 @@ mod daemon_tests {
 
     /// #1578, the author's restart (Engineer ruling, 27 Oct 22:10 GMT):
     /// the persisted roster still seats the survivor with no KEM key,
-    /// so the restarted author cannot seal to it. The survivor here is
-    /// keyed and waiting — it holds the old secret at the parent head —
-    /// so its served answer is that saved head, a head the author's row
-    /// cannot converge on (only the result head, which an installed
-    /// share proves, does that). The resumed delivery sends the frame
-    /// again, the carrier accepts it, and nothing closes: a transport
-    /// ACK never closes a seat (ADR 0110 §3 L228). The row stays open
-    /// across the author's restart, until the seat re-joins with a
-    /// verified KEM binding and a sealed share installs.
+    /// so the restarted author cannot seal to it. The survivor's seat is
+    /// keyless in its own copy too, but it holds the old secret at the
+    /// parent head, so it is no keyless survivor of the ruling — a node
+    /// that holds a secret vouches for the head it holds, and its served
+    /// answer is that saved head, a head the author's row cannot
+    /// converge on (only the result head, which an installed share
+    /// proves, does that). The resumed delivery sends the frame again,
+    /// the carrier accepts it, and nothing closes: a transport ACK never
+    /// closes a seat (ADR 0110 §3 L228). The row stays open across the
+    /// author's restart, until the seat re-joins with a verified KEM
+    /// binding and a sealed share installs.
     #[tokio::test]
     async fn a_restarted_author_keeps_an_unsealable_seat_row_open() -> Result<()> {
         use anyhow::Context as _;
@@ -5903,12 +5907,14 @@ mod daemon_tests {
         );
 
         // The restarted author runs its rounds. The survivor still holds
-        // the old secret at a head behind the result, so its real served
-        // answer is that saved head — a head the author's row cannot
-        // converge on (only the result head, which an installed share
-        // proves, does that). The head round still syncs on the restart
-        // wait, and the resumed send's acceptance leaves the seat Sent —
-        // never Converged.
+        // the old secret at a head behind the result (its keyless seat
+        // changes nothing: a node that holds a secret vouches for the
+        // head it holds), so its real served answer is exactly that
+        // saved head — a head the author's row cannot converge on (only
+        // the result head, which an installed share proves, does that).
+        // The head round still syncs on the restart wait, and the
+        // resumed send's acceptance leaves the seat Sent — never
+        // Converged.
         advertise_crypto_exclusion(&restarted, survivor);
         restarted
             .named_group_test_recorders
@@ -5917,8 +5923,17 @@ mod daemon_tests {
         super::super::revocation_eviction_pass(&restarted).await;
         let served =
             served_responder_head(&fx.replica, fx.state.agent.agent_id(), &fx.group_id).await?;
-        assert_ne!(
-            served, None,
+        let survivor_saved_head = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .map(|info| info.state_hash.clone())
+            .context("the survivor's group")?;
+        assert_eq!(
+            served.as_deref(),
+            Some(survivor_saved_head.as_str()),
             "the survivor holds a secret, so its answer keeps the field's saved-head meaning"
         );
         super::super::note_catchup_head(
@@ -5950,6 +5965,228 @@ mod daemon_tests {
                 "the restarted author owes the share until the seat can take one"
             );
         }
+        Ok(())
+    }
+
+    /// #1578 rc4 (Engineer ruling, 28 Oct 09:35 GMT; Claude blocking 1,
+    /// Codex P2 on #1635): a SignedPublic group is GSS-plane by default
+    /// and holds no secret and no seat KEM key by design, so an
+    /// invite-joined member is not a keyless survivor. The rc3
+    /// predicate matched every such member, disclaimed its head for
+    /// ever, and left its S4 rows no survivor-convergence evidence. The
+    /// confidentiality check keeps main's answer: the member serves its
+    /// saved head, and that served answer feeds `note_survivor_head`
+    /// and confirms the head round. This test fails if the check is
+    /// dropped.
+    #[tokio::test]
+    async fn a_signed_public_member_serves_its_head_and_feeds_survivor_convergence() -> Result<()> {
+        use x0x::groups::{GroupPolicy, GroupRole};
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let (replica, _replica_dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let member = replica.agent.agent_id();
+        let member_hex = hex::encode(member.as_bytes());
+        let group_id = "d1".repeat(16);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "signed-public".into(),
+            String::new(),
+            admin,
+            group_id.clone(),
+            GroupPolicy {
+                confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+                ..GroupPolicy::default()
+            },
+        );
+        assert_eq!(info.secure_plane, x0x::mls::SecureGroupPlane::Gss);
+        assert!(
+            info.shared_secret.is_none(),
+            "a SignedPublic group holds no secret by design"
+        );
+        // The invite-joined member's seat carries no KEM key (the
+        // roster projection seats none): the rc3 predicate's other three
+        // inputs all hold.
+        info.add_member(member_hex.clone(), GroupRole::Member, Some(admin_hex), None);
+        assert!(
+            info.active_members()
+                .any(|seat| seat.agent_id == member_hex && seat.kem_public_key_b64.is_none()),
+            "the member's seat is seated with no KEM key, as a projection seats it"
+        );
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        replica
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        // The author owes a delivery whose result is the shared head.
+        let key = EvictionKey::new(stable.clone(), [0x11; 32]);
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .deliveries
+            .insert(
+                key.clone(),
+                CeDelivery {
+                    bytes: Arc::new(Vec::new()),
+                    result_head: info.state_hash.clone(),
+                    next_revision: 1,
+                    resumed: false,
+                    gss_shares_pending: false,
+                    gss_epoch: None,
+                    recipients: [(*member.as_bytes(), RecipientDelivery::Due)]
+                        .into_iter()
+                        .collect(),
+                    next_at: Instant::now(),
+                },
+            );
+        // The worker keeps a head round only for groups with open work;
+        // the delivery row above is that work, so the round exists.
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                super::super::HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: std::collections::BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: std::collections::BTreeSet::new(),
+                },
+            );
+        // The real served answer of the SignedPublic member.
+        let served = served_responder_head(&replica, admin, &group_id).await?;
+        assert_eq!(
+            served.as_deref(),
+            Some(info.state_hash.as_str()),
+            "a SignedPublic member keeps main's answer: its saved head"
+        );
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &member_hex,
+            served.as_deref(),
+        )
+        .await;
+        assert_eq!(
+            delivery_status(&state, &key, &member).await,
+            Some(RecipientDelivery::Converged),
+            "the served answer feeds note_survivor_head: the seat converges"
+        );
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .head_rounds
+                .get(&stable)
+                .is_some_and(|round| round.confirmed),
+            "the served answer confirms the head round"
+        );
+        Ok(())
+    }
+
+    /// #1578 rc4 (Claude blocking 1): an `MlsEncrypted` joiner that
+    /// still waits for its welcome share holds no secret and its own
+    /// seat is not an Active keyless seat — the joiner's stub does not
+    /// seat it at all; the seat arrives with the KEM key its
+    /// `MemberJoined` published. It is not a keyless survivor either:
+    /// its served answer keeps main's meaning and feeds
+    /// `note_survivor_head` while the share is still on its way.
+    #[tokio::test]
+    async fn an_encrypted_group_joiner_waiting_for_its_share_serves_its_head() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let (joiner, _joiner_dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let member = joiner.agent.agent_id();
+        let member_hex = hex::encode(member.as_bytes());
+        let group_id = "d2".repeat(16);
+        let info = x0x::groups::GroupInfo::new(
+            "waiting-joiner".into(),
+            String::new(),
+            admin,
+            group_id.clone(),
+        );
+        assert_eq!(info.secure_plane, x0x::mls::SecureGroupPlane::Gss);
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        // The joiner's stub: the committed base the invite carried seats
+        // everyone but the joiner (its seat arrives with the KEM key its
+        // own `MemberJoined` published), and no secret is kept — the
+        // authority's sealed share delivers it. The secret and its epoch
+        // are local data: the saved head is the base head unchanged.
+        let mut stub = info.clone();
+        stub.shared_secret = None;
+        stub.secret_epoch = 5;
+        assert!(
+            !super::own_seat_cannot_take_a_share(&joiner, &stub),
+            "the waiting joiner's own seat is not an Active keyless seat"
+        );
+        joiner
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), stub);
+        // The author owes a delivery whose result is the shared head.
+        let key = EvictionKey::new(stable, [0x22; 32]);
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .deliveries
+            .insert(
+                key.clone(),
+                CeDelivery {
+                    bytes: Arc::new(Vec::new()),
+                    result_head: info.state_hash.clone(),
+                    next_revision: 1,
+                    resumed: false,
+                    gss_shares_pending: false,
+                    gss_epoch: None,
+                    recipients: [(*member.as_bytes(), RecipientDelivery::Due)]
+                        .into_iter()
+                        .collect(),
+                    next_at: Instant::now(),
+                },
+            );
+        // The real served answer of the waiting joiner.
+        let served = served_responder_head(&joiner, admin, &group_id).await?;
+        assert_eq!(
+            served.as_deref(),
+            Some(info.state_hash.as_str()),
+            "a waiting joiner keeps main's answer: its saved head"
+        );
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &member_hex,
+            served.as_deref(),
+        )
+        .await;
+        assert_eq!(
+            delivery_status(&state, &key, &member).await,
+            Some(RecipientDelivery::Converged),
+            "the served answer feeds note_survivor_head: the seat converges"
+        );
         Ok(())
     }
 

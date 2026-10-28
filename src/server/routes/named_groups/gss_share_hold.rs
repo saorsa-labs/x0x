@@ -176,32 +176,44 @@ pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
     })
 }
 
-/// #1578 (David's ruling, 28 Oct 02:09 GMT): the head this node claims
-/// for a group in a catch-up answer, from the narrow inputs its caller
-/// copied under the groups read lock. `None` exactly while the node is
-/// keyless on the GSS plane: the group's secrets are GSS-delivered, the
-/// node holds no secret of its saved head's epoch, and its own roster
-/// seat carries no KEM public key — the #1578 keyless install. Such a
-/// node can never identify a share sealed to its seat, so its install
-/// is local fact only and must never converge an author's delivery row:
-/// no peer sees convergence evidence from it until a secret of that
-/// epoch installs, and a chain of keyless installs claims no head at
-/// all. The claim is derived from the group state itself, never from
-/// the hold file: a hold write that fails, and the restart after it,
-/// cannot turn a keyless install into a head claim (the installed GSS
-/// head keeps implying its key). Every other responder — one with a
-/// secret (a superseded intermediate install included), one whose
-/// waiting keeps the old secret, a member of any other plane (a TreeKEM
-/// joiner holds heads with no GSS secret and no seat KEM key by design,
-/// so the keyless marker is meaningless there), and a responder that
-/// does not know the group — claims its saved head, exactly as on main.
+/// #1578 (David's ruling, 28 Oct 02:09 GMT; Engineer ruling, 28 Oct
+/// 09:35 GMT): the head this node claims for a group in a catch-up
+/// answer, from the narrow inputs its caller copied under the groups
+/// read lock. `None` exactly while the node is a keyless GSS survivor
+/// of an encrypted group: the policy is `MlsEncrypted` (a SignedPublic
+/// group is GSS-plane by default and holds no secret and no seat KEM
+/// key by design — its members are not keyless survivors), the group's
+/// secrets are GSS-delivered, the node holds no secret of its saved
+/// head's epoch, and its own roster seat carries no KEM public key —
+/// the #1578 keyless install. Such a node can never identify a share
+/// sealed to its seat, so its install is local fact only and must never
+/// converge an author's delivery row: no peer sees convergence evidence
+/// from it until a secret of that epoch installs, and a chain of
+/// keyless installs claims no head at all. The claim is derived from
+/// the group state itself, never from the hold file: a hold write that
+/// fails, and the restart after it, cannot turn a keyless install into
+/// a head claim (the installed GSS head keeps implying its key). Every
+/// other responder — one with a secret (a superseded intermediate
+/// install included), one whose waiting keeps the old secret, a
+/// SignedPublic member, an encrypted-group joiner that still waits for
+/// its welcome share (its own seat is not an Active keyless seat: it is
+/// not seated yet, or seated with the KEM key its `MemberJoined`
+/// published), a member of any other plane (a TreeKEM joiner holds
+/// heads with no GSS secret and no seat KEM key by design, so the
+/// keyless marker is meaningless there), and a responder that does not
+/// know the group — claims its saved head, exactly as on main.
+/// Disclosed residue: an encrypted-group member whose own-view roster
+/// lost the KEM key before any share installed omits while in that
+/// state — the same class as the ruled keyless state (no key of the
+/// epoch, no seat key), converging nothing.
 pub(super) fn reported_head(
     gss_plane: bool,
+    encrypted: bool,
     saved_head: &str,
     has_secret: bool,
     own_seat_keyless: bool,
 ) -> Option<String> {
-    if gss_plane && !has_secret && own_seat_keyless {
+    if gss_plane && encrypted && !has_secret && own_seat_keyless {
         None
     } else {
         Some(saved_head.to_string())
@@ -785,8 +797,24 @@ mod tests {
     #[test]
     fn a_keyless_install_claims_no_head_with_no_hold_anywhere() {
         assert_eq!(
-            reported_head(true, "keyless-result-head", false, true),
+            reported_head(true, true, "keyless-result-head", false, true),
             None
+        );
+    }
+
+    /// #1578 rc4 (Engineer ruling, 28 Oct 09:35 GMT; Claude blocking 1,
+    /// Codex P2 on #1635): a SignedPublic group is GSS-plane by default
+    /// and holds no secret and no seat KEM key by design, so its members
+    /// are not keyless survivors. Every invite-joined SignedPublic
+    /// member matched the rc3 predicate and disclaimed its head for
+    /// ever, with no survivor-convergence evidence left for its S4
+    /// removal, rebind and owner-recovery rows. The confidentiality
+    /// check keeps main's answer.
+    #[test]
+    fn a_signed_public_member_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(true, false, "saved-head", false, true),
+            Some("saved-head".to_string())
         );
     }
 
@@ -797,7 +825,7 @@ mod tests {
     #[test]
     fn a_non_gss_member_claims_its_saved_head() {
         assert_eq!(
-            reported_head(false, "saved-head", false, true),
+            reported_head(false, true, "saved-head", false, true),
             Some("saved-head".to_string())
         );
     }
@@ -810,7 +838,7 @@ mod tests {
     #[test]
     fn a_superseded_intermediate_install_claims_its_saved_head() {
         assert_eq!(
-            reported_head(true, "saved-head", false, false),
+            reported_head(true, true, "saved-head", false, false),
             Some("saved-head".to_string())
         );
     }
@@ -822,7 +850,7 @@ mod tests {
     #[test]
     fn a_keyless_seat_that_holds_the_secret_claims_its_saved_head() {
         assert_eq!(
-            reported_head(true, "saved-head", true, true),
+            reported_head(true, true, "saved-head", true, true),
             Some("saved-head".to_string())
         );
     }
@@ -831,7 +859,7 @@ mod tests {
     #[test]
     fn a_keyed_node_claims_its_saved_head() {
         assert_eq!(
-            reported_head(true, "saved-head", true, false),
+            reported_head(true, true, "saved-head", true, false),
             Some("saved-head".to_string())
         );
     }

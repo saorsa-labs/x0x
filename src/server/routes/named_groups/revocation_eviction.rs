@@ -536,18 +536,23 @@ fn note_head_report(
     }
 }
 
-/// #1578 rc3 (review finding 2, closed under David's 28 Oct 02:09 GMT
-/// ruling): the catch-up answer of a keyless holder carries no
+/// #1578 rc4 (Engineer ruling, 28 Oct 09:35 GMT; Codex P1, both PRs):
+/// the catch-up answer of a keyless holder carries no
 /// `responder_state_hash`. From a current peer that absence is the
-/// keyless state itself — every other responder serves the field — and a
-/// node that holds no secret of its saved head's epoch can never report
-/// a head on the local chain, so waiting for it to would keep the round
-/// unresolved for ever and block every removal, ban and seal of the
-/// group at `waiting_for_head_sync`. The disclaimer is that holder's own
-/// resolution: it answered this round, and its earlier conflicting
-/// report no longer blocks. An old peer's field-less answer clears
-/// nothing in practice: an old peer never served a head, so it was never
-/// in the set.
+/// keyless state itself — every other responder serves the field — and
+/// the answer counts: the holder is not silent, so the re-ask loop
+/// stops counting it. It erases no evidence. Becoming keyless does not
+/// invalidate the head the holder reported, and its exclusion frames
+/// travel separately, so the conflicting report persists until the
+/// holder itself reports a head on the local chain — possible again
+/// once its seat is keyed (the documented leave-and-re-join recovery;
+/// David's 02:25 key-republication ruling is a follow-up) — or it is no
+/// longer a holder (ADR 0110 §2, the rule applied to head-sync retries
+/// on 22 Oct). Until then removals, bans and seals wait at
+/// `waiting_for_head_sync`: expiry alone cannot authorize a known stale
+/// seal. An old peer's field-less answer changes nothing here in
+/// practice: an old peer never served a head, so it was never in the
+/// set.
 fn note_head_disclaimed(
     rounds: &mut HashMap<String, HeadRound>,
     asks: &mut HeadRoundAsks,
@@ -565,7 +570,6 @@ fn note_head_disclaimed(
     round_asks(asks, stable_group_id, round.started)
         .answered
         .insert(sender);
-    round.conflicting.remove(&sender);
 }
 
 /// Other active members that could hold a later head of `info`: every
@@ -829,9 +833,10 @@ pub(in crate::server) async fn seal_probe_for_test(
 /// convergence evidence for the S4 deliveries of the group
 /// ([`crypto_exclusion::note_survivor_head`]). An absent field is the
 /// #1578 keyless disclaimer (David's ruling, 28 Oct 02:09 GMT): no head
-/// is convergence evidence, and the sender's unresolved head evidence
-/// ends ([`note_head_disclaimed`]) instead of blocking the round for
-/// ever.
+/// is convergence evidence, and the sender's answer counts for the ask
+/// cadence only ([`note_head_disclaimed`]). Its unresolved head evidence
+/// persists: a keyless reply does not prove the head the sender reported
+/// reached the local chain (ADR 0110 §2).
 pub(in crate::server) async fn note_catchup_head(
     state: &AppState,
     group_ids: &[String],
@@ -864,7 +869,8 @@ pub(in crate::server) async fn note_catchup_head(
     let mut inner = state.revocation_evictions.inner.lock().await;
     let Some((report, installed)) = classified else {
         // The keyless disclaimer: it names no head, so the survivor-head
-        // pass gets nothing and the round's evidence of this holder ends.
+        // pass gets nothing; the holder answered, and its unresolved
+        // evidence stays (ADR 0110 §2).
         let state_inner = &mut *inner;
         note_head_disclaimed(
             &mut state_inner.head_rounds,
@@ -4800,17 +4806,20 @@ pub(super) mod tests {
             .synced("h2", 2, false, true, later, wait));
     }
 
-    /// #1578 rc3 (review finding 2, closed under David's 28 Oct 02:09
-    /// GMT ruling): a holder reported a head this node does not have,
-    /// then went keyless — it installed a verified exclusion without the
-    /// secret, and its catch-up answers carry no `responder_state_hash`
+    /// #1578 rc4 (Engineer ruling, 28 Oct 09:35 GMT; Codex P1): a
+    /// holder reported a head this node does not have, then went
+    /// keyless — its catch-up answers carry no `responder_state_hash`
     /// for as long as it holds no key. That answer is a disclaimer, not
-    /// silence: the holder can never report a head on the local chain,
-    /// so its earlier conflicting report no longer blocks the seal, and
-    /// the round stops re-asking it. Before the fix the absent field was
-    /// dropped before the round saw it, and the seal waited for ever.
+    /// silence: the round stops re-asking the holder. It is not a
+    /// resolution: becoming keyless does not invalidate the head the
+    /// holder reported (its exclusion frames travel separately), so the
+    /// conflicting report persists until the holder itself reports a
+    /// head on the local chain — possible again once its seat is keyed,
+    /// the documented leave-and-re-join recovery — or it is no longer a
+    /// holder (ADR 0110 §2). The rc3 code erased the entry on the
+    /// disclaimer; this test fails if that comes back.
     #[test]
-    fn a_keyless_disclaimer_resolves_a_conflicting_head_report() {
+    fn a_keyless_disclaimer_keeps_the_conflicting_head_evidence() {
         let wait = Duration::from_secs(13);
         let start = Instant::now();
         let mut rounds = HashMap::new();
@@ -4828,20 +4837,20 @@ pub(super) mod tests {
             start,
         );
         let later = start + Duration::from_secs(3);
-        // The keyless answer: no head at all. A's conflicting report
-        // resolves, and A answered this round.
+        // The keyless answer: no head at all. A answered this round, and
+        // its conflicting report stays.
         note_head_disclaimed(&mut rounds, &mut asks, "g", "h1", a, later);
         assert!(
-            !rounds.get("g").expect("round").conflicting.contains(&a),
-            "the disclaimer resolves the conflicting report"
+            rounds.get("g").expect("round").conflicting.contains(&a),
+            "the disclaimer erases no evidence: a keyless reply does not prove the reported head reached the local chain"
         );
         assert_eq!(
             refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, later, wait),
             vec![b],
             "the keyless holder answered this round: only the silent one is re-asked"
         );
-        // B confirms, and the round syncs after the bounded wait: the
-        // keyless holder no longer holds the group's seals hostage.
+        // B confirms and the full wait elapses. The stale-head seal must
+        // not follow: A's reported head is still unresolved evidence.
         note_head_report(
             &mut rounds,
             &mut asks,
@@ -4853,11 +4862,75 @@ pub(super) mod tests {
         );
         let settled = start + wait * 10;
         assert!(
+            !rounds
+                .get("g")
+                .expect("round")
+                .synced("h1", 2, false, true, settled, wait),
+            "another confirmation plus the elapsed wait must not seal from the stale head"
+        );
+        // The liveness path the ruling names: the seat is keyed again
+        // (the leave-and-re-join recovery), the holder catches up and
+        // reports a head on the local chain — only now does the round
+        // sync.
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            a,
+            HeadReport::OnLocalChain,
+            settled,
+        );
+        assert!(
             rounds
                 .get("g")
                 .expect("round")
                 .synced("h1", 2, false, true, settled, wait),
-            "no waiting_for_head_sync for ever behind a keyless holder"
+            "the holder's own on-chain report resolves its entry"
+        );
+    }
+
+    /// #1578 rc4 (Claude test gap): the disclaimer's two side branches.
+    /// A report for a new local head restarts the round first and keeps
+    /// the conflicting evidence; a group with no round creates none —
+    /// the disclaimer is an answer, not a new obligation.
+    #[test]
+    fn a_keyless_disclaimer_restarts_on_a_new_head_and_creates_no_round() {
+        let wait = Duration::from_secs(13);
+        let start = Instant::now();
+        let mut rounds = HashMap::new();
+        let mut asks = HeadRoundAsks::new();
+        let a = [8; 32];
+        let holders = [a];
+        refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            a,
+            HeadReport::Unknown,
+            start,
+        );
+        let later = start + Duration::from_secs(3);
+        note_head_disclaimed(&mut rounds, &mut asks, "g", "h2", a, later);
+        let round = rounds.get("g").expect("round");
+        assert_eq!(
+            round.head, "h2",
+            "the disclaimer restarts the round on the new head"
+        );
+        assert!(
+            round.conflicting.contains(&a),
+            "the restart carries the unresolved evidence"
+        );
+        // No round, no ask: nothing is created for a group the worker
+        // never opened a round for.
+        let before = rounds.len();
+        note_head_disclaimed(&mut rounds, &mut asks, "other", "h9", a, later);
+        assert_eq!(rounds.len(), before, "the disclaimer creates no round");
+        assert!(
+            !asks.contains_key("other"),
+            "the disclaimer opens no ask round either"
         );
     }
 
@@ -7081,16 +7154,20 @@ pub(super) mod tests {
         Ok(())
     }
 
-    /// #1578 rc3 (review finding 2): the same liveness case through the
-    /// real entry point. The keyless survivor first reported a head this
-    /// node does not have (a conflicting entry), then its catch-up
-    /// answers lost `responder_state_hash` (the keyless disclaimer,
-    /// David's ruling 28 Oct 02:09 GMT). The absent field must reach the
-    /// round and resolve the entry — before the fix `note_catchup_head`
-    /// returned before the round saw it, and the group's removals, bans
-    /// and seals waited at `waiting_for_head_sync` for ever.
+    /// #1578 rc4 (Engineer ruling, 28 Oct 09:35 GMT; Codex P1): the
+    /// same case through the real entry point. The keyless survivor
+    /// first reported a head this node does not have (a conflicting
+    /// entry), then its catch-up answers lost `responder_state_hash`
+    /// (the keyless disclaimer, David's ruling 28 Oct 02:09 GMT). The
+    /// absent field must reach the round and count as the survivor's
+    /// answer — and it must NOT resolve the entry: a keyless reply does
+    /// not prove the reported head reached the local chain, so another
+    /// confirmer plus the elapsed restart wait leaves the group at
+    /// `waiting_for_head_sync` (ADR 0110 §2: expiry alone cannot
+    /// authorize a known stale seal). The rc3 code cleared the entry;
+    /// this test fails if that comes back.
     #[tokio::test]
-    async fn a_served_keyless_answer_resolves_the_conflicting_entry() -> anyhow::Result<()> {
+    async fn a_served_keyless_answer_keeps_the_conflicting_entry() -> anyhow::Result<()> {
         let (state, _dir) =
             crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
         let group_id = "c7".repeat(16);
@@ -7113,6 +7190,8 @@ pub(super) mod tests {
             .insert(group_id.clone(), info.clone());
         let survivor = [5; 32];
         let survivor_hex = hex::encode(survivor);
+        let confirmer = [6; 32];
+        let confirmer_hex = hex::encode(confirmer);
         state
             .revocation_evictions
             .inner
@@ -7134,13 +7213,13 @@ pub(super) mod tests {
         {
             let inner = state.revocation_evictions.inner.lock().await;
             assert!(
-                !inner
+                inner
                     .head_rounds
                     .get(&stable)
                     .expect("the round")
                     .conflicting
                     .contains(&survivor),
-                "the keyless disclaimer resolves the conflicting entry"
+                "the keyless disclaimer keeps the conflicting entry"
             );
             assert!(
                 inner
@@ -7150,6 +7229,35 @@ pub(super) mod tests {
                 "the keyless survivor answered: the round does not re-ask it every 2 s"
             );
         }
+        // Another confirmer plus the elapsed restart wait: still
+        // waiting_for_head_sync — the stale-head seal cannot follow.
+        note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &confirmer_hex,
+            Some(&info.state_hash),
+        )
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(state.revocation_evictions.timing.restart_sync_wait * 10).await;
+        assert!(
+            !group_head_synced(&state, &group_id).await,
+            "another confirmation plus the elapsed wait must not seal from the stale head"
+        );
+        // The liveness path the ruling names: the seat is keyed again
+        // (the leave-and-re-join recovery), the survivor catches up and
+        // reports the local head — only now does the round sync.
+        note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            Some(&info.state_hash),
+        )
+        .await;
+        assert!(
+            group_head_synced(&state, &group_id).await,
+            "the survivor's own on-chain report resolves its entry"
+        );
         Ok(())
     }
 
