@@ -258,14 +258,24 @@ enum SendPoll {
     /// A reply succeeded, or carried key material; the reply is carried,
     /// and the arm fails at once.
     Violation(String),
+    /// A refusal outside the §4 contract (a seat 403, a 500, any wrong
+    /// shape); the reply is carried, and the arm fails on it. The §4
+    /// cover is intact — no key escaped — so the remaining probes still
+    /// run and complete the receipt.
+    Unexpected(String),
+    /// The request itself failed before any reply: a harness fault, not
+    /// a verdict about the design. The case is marked INFRA.
+    Infra(String),
 }
 
 /// Poll `label`'s member send until it answers the definitive refusal
 /// (`budget` virtual time), recording each earlier reply shape once. The
 /// §4 409 wait (`waiting_for_eligible_admin_revocation`, exit
-/// `group_admin_revoked`) is an allowed earlier phase. A reply that
-/// succeeds, or carries key material, stops the poll at once: that is
-/// the leak the row's cover exists to prevent. Uses barrier-free reads.
+/// `group_admin_revoked`) is the only allowed earlier phase; any other
+/// refusal shape fails the arm at once. A reply that succeeds, or carries
+/// key material, stops the poll at once: that is the leak the row's cover
+/// exists to prevent. A request that fails before any reply is an
+/// infrastructure fault. Uses barrier-free reads.
 async fn until_refused(
     sim: &Sim,
     label: &str,
@@ -275,6 +285,8 @@ async fn until_refused(
 ) -> Result<SendPoll> {
     let mut phases: Vec<String> = Vec::new();
     let mut violation: Option<String> = None;
+    let mut unexpected: Option<String> = None;
+    let mut infra: Option<String> = None;
     let refused = sim
         .until(
             &format!("{label} derives group_admin_revoked"),
@@ -289,7 +301,8 @@ async fn until_refused(
                     )
                     .await
                 else {
-                    return false;
+                    infra = Some(format!("{label} encrypt request failed before any reply"));
+                    return true;
                 };
                 match classify_refusal(status, &body, a_hex) {
                     Refusal::Definitive => true,
@@ -297,22 +310,28 @@ async fn until_refused(
                         violation = Some(format!("{label} encrypt: {status} {body}"));
                         true
                     }
-                    _ => {
+                    Refusal::Wait => {
                         let phase = format!("{status} {body}");
                         if !phases.contains(&phase) {
                             phases.push(phase);
                         }
                         false
                     }
+                    Refusal::Other => {
+                        unexpected = Some(format!("{label} encrypt: {status} {body}"));
+                        true
+                    }
                 }
             },
         )
         .await
         .is_ok();
-    Ok(match violation {
-        Some(reply) => SendPoll::Violation(reply),
-        None if refused => SendPoll::Reached(phases),
-        None => SendPoll::WaitedOut(phases),
+    Ok(match (violation, unexpected, infra) {
+        (Some(reply), _, _) => SendPoll::Violation(reply),
+        (_, Some(reply), _) => SendPoll::Unexpected(reply),
+        (_, _, Some(error)) => SendPoll::Infra(error),
+        (None, None, None) if refused => SendPoll::Reached(phases),
+        (None, None, None) => SendPoll::WaitedOut(phases),
     })
 }
 
@@ -359,6 +378,28 @@ async fn send_refusal(
         SendPoll::Violation(reply) => {
             leak(receipt, name, &reply, passed, at);
             Ok(true)
+        }
+        SendPoll::Unexpected(reply) => {
+            // Not a leak — no key escaped — so the remaining probes still
+            // run; the arm has failed either way.
+            record(
+                receipt,
+                name,
+                &(
+                    false,
+                    format!(
+                        "{label} encrypt answered a refusal outside the §4 contract (not the \
+                         typed 409 wait, not the definitive 410): {reply}"
+                    ),
+                ),
+                passed,
+                at,
+            );
+            Ok(false)
+        }
+        SendPoll::Infra(error) => {
+            receipt.infra(format!("{name}: {error}"), at);
+            Ok(false)
         }
     }
 }
