@@ -1165,18 +1165,23 @@ fn arm_idle_recheck(slot: Arc<IdleWait>, handle: tokio::runtime::Handle) {
             let _finished = take_recheck_finished(&worker);
             loop {
                 std::thread::sleep(IDLE_RECHECK_INTERVAL);
-                if worker.epoch.load(Ordering::Acquire) != epoch
-                    || !worker.parked.load(Ordering::Acquire)
-                {
+                if worker.epoch.load(Ordering::Acquire) != epoch {
                     leave_recheck(&mut claim, &handle);
                     return;
                 }
+                // A reactor wake clears `parked` in `after_unpark` even when
+                // the thread does not stay asleep. The poke socket is one
+                // such wake. Leaving on that flicker, once the pool is idle,
+                // skips this gate. The next park then publishes `ready`
+                // itself (#1676).
                 if pool_busy(&handle, &worker) {
+                    if !worker.parked.load(Ordering::Acquire) {
+                        leave_recheck(&mut claim, &handle);
+                        return;
+                    }
                     continue;
                 }
-                if worker.epoch.load(Ordering::Acquire) != epoch
-                    || !worker.parked.load(Ordering::Acquire)
-                {
+                if worker.epoch.load(Ordering::Acquire) != epoch {
                     leave_recheck(&mut claim, &handle);
                     return;
                 }
