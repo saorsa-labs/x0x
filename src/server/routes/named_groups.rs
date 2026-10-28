@@ -6710,11 +6710,14 @@ where
     let (legacy_json, home_suite_json) =
         encode_named_groups_store_excluding_pending_stubs(state, &candidate, rebind_group_id)
             .await?;
-    // ADR 0109 §4 (#1570, Codex P1): the encode holds back a placeheld
-    // group whose authoritative record was not durable. Its legacy entry
-    // keeps its last durable form, which still holds the marker, so the
-    // clear is not on disk. Write and publish nothing; the live record
-    // stays contained (fail closed), and the caller retries.
+    // ADR 0109 §4 (#1570): the encode holds back a placeheld group whose
+    // authoritative record was not durable. Its legacy entry keeps its last
+    // committed form, which still holds the marker, so the clear is not on
+    // disk. Write and publish nothing; the live record stays contained
+    // (fail closed), and the caller retries.
+    if group_recovery::change_held_back(state, &before, &candidate) {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
     let mut touched: Vec<&String> = before
         .keys()
         .chain(candidate.keys())
@@ -6722,14 +6725,6 @@ where
         .collect();
     touched.sort_unstable();
     touched.dedup();
-    if touched.iter().any(|key| {
-        before
-            .get(*key)
-            .or_else(|| candidate.get(*key))
-            .is_some_and(|info| group_recovery::is_held_back(state, info.stable_group_id()))
-    }) {
-        return Ok(AtomicWriteOutcome::NotReplaced);
-    }
     let prejournaled = if let Some(group_id) = rebind_group_id {
         match prepare_rebind_journal_for_groups(state, group_id, &candidate).await {
             RebindOutcome::Failed(error) => {
@@ -6893,7 +6888,23 @@ where
         (before, after)
     };
 
-    let outcome = save_named_groups_checked_unlocked(state).await;
+    // ADR 0109 §4 (#1570 rc4): encode, then the one commit check, then
+    // write. A mutation that touches a held-back group writes nothing and
+    // is rolled back, so no caller acknowledges it or runs its effects
+    // (snapshot deletion, withdrawal publication).
+    let encoded = {
+        let groups = state.named_groups.read().await;
+        encode_named_groups_store_excluding_pending_stubs(state, &groups, None).await
+    };
+    let outcome = match encoded {
+        Ok(_) if group_recovery::change_held_back(state, &before, &after) => {
+            Ok(AtomicWriteOutcome::NotReplaced)
+        }
+        Ok((legacy_json, home_suite_json)) => {
+            save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+        }
+        Err(error) => Err(error),
+    };
     if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
         compare_and_restore_named_groups(state, &before, &after).await;
     }
@@ -40874,7 +40885,7 @@ async fn encode_named_groups_store_for_state(
 ) -> std::io::Result<(String, String)> {
     // Stack budget (see `migrate_unsplit_home_suite_store_if_needed`): the
     // S3 sidecar writer future lives on the heap, not in every save path.
-    match Box::pin(group_recovery::legacy_store_view(state, groups)).await? {
+    match Box::pin(group_recovery::legacy_store_view(state, groups)).await {
         Some(view) => encode_named_groups_store(&view),
         None => encode_named_groups_store(groups),
     }
@@ -41017,6 +41028,9 @@ async fn save_named_groups_store_checked(
             .store(true, Ordering::Release),
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
     }
+    // ADR 0109 §4 (#1570 rc4): a placeheld group's committed legacy form
+    // advances only when this write landed.
+    group_recovery::commit_legacy_write(state, &outcome);
     outcome
 }
 
@@ -47267,6 +47281,7 @@ pub(in crate::server) mod tests {
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
     mod issue1570_held_back_rebind;
+    mod issue1570_held_back_tombstone;
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
