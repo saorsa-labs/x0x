@@ -10,6 +10,8 @@ pub mod apply;
 pub(crate) mod fleet_policy;
 #[cfg(unix)]
 mod inventory_accounts;
+#[cfg(unix)]
+mod inventory_procfs;
 pub(crate) mod journal;
 pub(crate) mod log_flush;
 pub mod manifest;
@@ -485,7 +487,9 @@ pub(crate) fn restore_backup_binary(target: &Path, backup: &Path) -> std::io::Re
 /// missing backup restores nothing. A rename that fails after an earlier
 /// rename succeeded can still leave a daemon/CLI pair on mixed versions;
 /// the caller logs that state for manual recovery and still exits
-/// `EX_TEMPFAIL`.
+/// `EX_TEMPFAIL`. After the renames, every directory that received one is
+/// synced, so the restore survives a power loss immediately after the
+/// caller's `EX_TEMPFAIL` exit (issue #1595, Claude #1565 finding 1).
 pub(crate) fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
     for (target, backup) in artifacts {
         if !backup.is_file() {
@@ -501,6 +505,17 @@ pub(crate) fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std:
     }
     for (target, backup) in artifacts {
         restore_backup_binary(target, backup)?;
+    }
+    let mut synced = Vec::new();
+    for (target, _) in artifacts {
+        let Some(parent) = target.parent() else {
+            continue;
+        };
+        if parent.as_os_str().is_empty() || synced.contains(&parent) {
+            continue;
+        }
+        std::fs::File::open(parent)?.sync_all()?;
+        synced.push(parent);
     }
     Ok(())
 }

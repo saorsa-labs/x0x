@@ -4720,6 +4720,7 @@ pub(in crate::server) async fn reseat_group_member(
     let authorisation = match ReseatAuthorisation::sign(fields, keypair) {
         Ok(authorisation) => authorisation,
         Err(error) => {
+            revoke_unpaired_reseat_invite(&state, &group_key, &subject_hex, &invite).await;
             return super::api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("cannot sign the re-seat authorisation: {error}"),
@@ -4745,6 +4746,12 @@ pub(in crate::server) async fn reseat_group_member(
     })
     .await
     {
+        // #1648: the store failed, so no authorisation pairs with the
+        // minted invite. Revoke it before the route answers. This is the
+        // mirror of the pre-mint rule above: there the replaced invite
+        // must not outlive the store, here the new one must not outlive
+        // its failed store.
+        revoke_unpaired_reseat_invite(&state, &group_key, &subject_hex, &invite).await;
         return super::api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "the re-seat authorisation is not durable".to_string(),
@@ -5320,6 +5327,36 @@ async fn revoke_replaced_reseat_invite(
         super::persist_named_group_info(state, group_key, next).await,
         Ok(super::AtomicWriteOutcome::Durable)
     )
+}
+
+/// #1648: between the durable mint and the sidecar store the invite is
+/// live, but no recorded authorisation pairs with it. A failure in that
+/// window — the authorisation signature, or a sidecar store that is not
+/// durable — revokes the minted invite before the route answers, so no
+/// orphan invite stays consumable. The revocation is a durable roster
+/// write under the caller-held membership lock. A revocation that is
+/// itself not durable is logged; the 1-hour invite expiry stays the
+/// backstop for that double failure. The caller holds the group's
+/// membership lock.
+async fn revoke_unpaired_reseat_invite(
+    state: &AppState,
+    group_key: &str,
+    subject_hex: &str,
+    invite: &x0x::groups::invite::SignedInvite,
+) {
+    if !revoke_replaced_reseat_invite(
+        state,
+        group_key,
+        std::slice::from_ref(&invite.invite_secret),
+    )
+    .await
+    {
+        tracing::error!(
+            group_id = %LogHexId::group(group_key),
+            subject = %LogHexId::agent(subject_hex),
+            "ADR 0109 S3: a failed authorisation leaves its minted invite live; the revocation is not durable"
+        );
+    }
 }
 
 /// Mint a re-seat invite for the promoted-admin path (§3a): an InviteV4
@@ -7679,6 +7716,84 @@ mod tests {
         Ok(())
     }
 
+    /// Mark the group's sidecar as at fault (§4): every `update_sidecar`
+    /// write is then not durable, which is the injected authorisation
+    /// store failure of the #1648 tests.
+    async fn fail_the_authorisation_store(state: &Arc<AppState>, stable: &str) {
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .sidecar_status
+            .insert(
+                stable.to_string(),
+                SidecarFault::Unavailable {
+                    file: s3::sidecar_file_name(stable),
+                    cause: "injected store failure (#1648)".to_string(),
+                },
+            );
+    }
+
+    /// #1648 (follow-up to the #1533 review, finding 1), owner path: the
+    /// authorisation store fails after `mint_invite_transaction` made the
+    /// invite durable. The route answers 503 and the minted invite is
+    /// revoked, in memory and on disk, because no authorisation pairs
+    /// with it. Before the fix the revoke set came only from
+    /// `issued_reseats`, which never recorded it, and the orphan stayed
+    /// consumable as an ordinary 1-hour admin invite until expiry. Inert.
+    #[tokio::test]
+    async fn a_failed_authorisation_store_revokes_the_minted_invite() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let subject = "ab".repeat(32);
+        let (key, info, basis) = removed_subject_group(&state, &subject, None).await?;
+        let stable = info.stable_group_id().to_string();
+        fail_the_authorisation_store(&state, &stable).await;
+
+        let (status, body) = call_reseat(&state, &key, &subject, &basis).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"], "the re-seat authorisation is not durable");
+        assert_eq!(
+            reseat_pairing(&state, &key, &stable).await,
+            (Vec::new(), Vec::new()),
+            "no authorisation recorded and no live invite"
+        );
+        // The revocation is durable: no live secret stays on disk.
+        let on_disk = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert!(on_disk.issued_invites.is_empty(), "no orphan on disk");
+        Ok(())
+    }
+
+    /// #1648 on the promoted-admin path (§3a): the same store failure,
+    /// after `mint_reseat_invite`'s durable roster write recorded the
+    /// invite as an ordinary issued invite. The failed store revokes it
+    /// there too. Inert.
+    #[tokio::test]
+    async fn a_failed_authorisation_store_revokes_the_promoted_mint() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let subject_kp = x0x::identity::AgentKeypair::generate()?;
+        let subject = hex::encode(subject_kp.agent_id().as_bytes());
+        let (key, stable, basis) = promoted_reseat_group(&state, &subject_kp).await?;
+        fail_the_authorisation_store(&state, &stable).await;
+
+        let (status, body) = call_reseat(&state, &key, &subject, &basis).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(
+            reseat_pairing(&state, &key, &stable).await,
+            (Vec::new(), Vec::new()),
+            "no authorisation recorded and no live invite"
+        );
+        // The revocation is durable: an owner-axis record is kept in the
+        // Home-suite store.
+        let on_disk = legacy_entry(&state.home_suite_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("home-suite entry"))?;
+        assert!(on_disk.issued_invites.is_empty(), "no orphan on disk");
+        Ok(())
+    }
+
     /// ADR 0109 §4 (D120): after a damaged sidecar is quarantined and
     /// rebuilt, `GET /groups/:id/recovery` on an Active admin shows
     /// `issued_reseats_lost: true`, since the unconsumed authorisations
@@ -9399,6 +9514,7 @@ mod tests {
         super::super::handle_treekem_catchup_response(
             &state,
             &owner.agent_id(),
+            &clean_sender_machine(),
             true,
             super::super::TreeKemCatchupResponse {
                 message_type: "treekem_catchup_response".to_string(),
@@ -9535,6 +9651,12 @@ mod tests {
             .map(|info| info.state_hash.clone())
     }
 
+    /// A machine id no revocation set lists: recovery pages must stay on the
+    /// clean side of the #1616 machine gate.
+    fn clean_sender_machine() -> x0x::identity::MachineId {
+        x0x::identity::MachineId([0x16; 32])
+    }
+
     /// One catch-up page from `sender` carrying `events`.
     async fn deliver_page(
         state: &Arc<AppState>,
@@ -9545,6 +9667,7 @@ mod tests {
         super::super::handle_treekem_catchup_response(
             state,
             &sender,
+            &clean_sender_machine(),
             true,
             super::super::TreeKemCatchupResponse {
                 message_type: "treekem_catchup_response".to_string(),

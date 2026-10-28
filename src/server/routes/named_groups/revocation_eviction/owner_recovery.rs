@@ -23,7 +23,9 @@
 //!   the held log ([`replay_log`]), then the ordinary chained apply with
 //!   the roster change as its only mutation, then the crypto removal proof.
 //! - **Restart.** A delivery that a restart restored waits for the §2 head
-//!   sync before each round.
+//!   sync before each round. The owner's `waiting_for_recovery_member`
+//!   wait and a member's held mandate load from the group's
+//!   pending-mandate file after a restart (#1625).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -40,10 +42,11 @@ use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 
 use super::crypto_exclusion::{
-    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, next_attempt,
-    note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
+    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
+    next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
+use super::mandate_store::{self, PendingOrcV1};
 use super::rebind::replay_log;
 
 /// The owner node's typed state until the promoted member commits.
@@ -70,6 +73,9 @@ const ORC_LOG_PER_GROUP: usize = x0x::groups::eviction::MAX_REPLAY_FRAMES_PER_GR
 /// The owner node's delivery of one mandate.
 #[derive(Debug, Clone)]
 struct MandateDelivery {
+    /// The signed mandate the wait is for, so it survives a restart
+    /// ([`mandate_store`], #1625).
+    mandate: orc::SignedOwnerRecoveryMandateV1,
     bytes: Arc<Vec<u8>>,
     mandate_id: String,
     promoted: [u8; 32],
@@ -150,9 +156,11 @@ pub(super) struct OrcState {
     early_shares: Vec<ParkedShare>,
     /// Catch-up commits held until their recovery installs.
     held_events: Vec<HeldEvent>,
+    /// The pending-mandate files were read this process (#1625).
+    mandates_restored: bool,
     /// Authored and installed recovery commits, for catch-up serving; the
     /// authored and the received frames are durable ([`replay_log`]).
-    log: replay_log::HeldLog<ORC_LOG_PER_GROUP>,
+    log: replay_log::HeldLog<ORC_LOG_PER_GROUP, true>,
 }
 
 impl OrcState {
@@ -289,15 +297,188 @@ impl OrcState {
     }
 }
 
-fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP> {
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP, true> {
     &mut inner.orc.log
+}
+
+/// #1625: write the group's pending-mandate file through the shared
+/// durable writer, behind the ADR 0094 host-commit gate like the other S4
+/// files. Called after each memory change, best effort: a failed write
+/// leaves the memory state as it is, and a restart then loses that side,
+/// as before the file existed. The `.evs`/`.evh` writer lock serializes
+/// the write with its snapshot, so two changes of one group cannot write
+/// out of order.
+async fn persist_mandates(state: &AppState, stable: &str) {
+    // §5: no S4 file write inside an ADR 0094 trial.
+    if !super::host_commit_gate_open(state) {
+        return;
+    }
+    let _writer = state.revocation_evictions.evs_writer.lock().await;
+    let (owner_wait, member_hold) = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        (
+            inner.orc.mandates.get(stable).map(|d| d.mandate.clone()),
+            inner
+                .orc
+                .pending
+                .get(stable)
+                .map(|pending| pending.mandate.clone()),
+        )
+    };
+    if owner_wait.is_none() && member_hold.is_none() {
+        mandate_store::retire(state, stable).await;
+        return;
+    }
+    let durable = mandate_store::write(
+        state,
+        &PendingOrcV1 {
+            stable_group_id: stable.to_string(),
+            owner_wait,
+            member_hold,
+        },
+    )
+    .await;
+    if !durable {
+        tracing::warn!(group_id = %super::super::LogHexId::group(stable), "ADR 0110 S4: the pending owner-recovery state is not durable; a restart can lose it");
+    }
+}
+
+/// #1625: load the pending-mandate files once per process and install
+/// each side that still applies. A loaded mandate is installed only after
+/// it verifies against the loaded group again, so a restart never
+/// installs an unverified mandate; the full §4b(1) checks run again at
+/// each commit attempt. A quarantined group keeps its sides, as the live
+/// refusal path does: the containment can lift. A file whose sides can
+/// never apply again (no group, no owner, a failed signature, a head past
+/// the mandate's parent) is retired at load, outside a trial.
+async fn restore_mandates(state: &AppState) {
+    if state
+        .revocation_evictions
+        .inner
+        .lock()
+        .await
+        .orc
+        .mandates_restored
+    {
+        return;
+    }
+    let gate_open = super::host_commit_gate_open(state);
+    let files = mandate_store::read_all(state, gate_open).await;
+    let groups: HashMap<String, GroupInfo> = state
+        .named_groups
+        .read()
+        .await
+        .values()
+        .map(|info| (info.stable_group_id().to_string(), info.clone()))
+        .collect();
+    let local = *state.agent.agent_id().as_bytes();
+    let mut stale: Vec<String> = Vec::new();
+    let mut wake = false;
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    if inner.orc.mandates_restored {
+        return;
+    }
+    inner.orc.mandates_restored = true;
+    for file in files {
+        let Some(info) = groups.get(&file.stable_group_id) else {
+            stale.push(file.stable_group_id.clone());
+            continue;
+        };
+        let Some(owner) = info.policy.admission.owner_certified_user_id() else {
+            stale.push(file.stable_group_id.clone());
+            continue;
+        };
+        // The side applies while this node's head is the mandate's parent
+        // or behind it (the member may still catch up): a head past the
+        // parent consumed the mandate or forked away from it.
+        let applies = |mandate: &orc::SignedOwnerRecoveryMandateV1| {
+            mandate.body.stable_group_id == file.stable_group_id
+                && (info.state_hash == mandate.body.parent_head
+                    || info.state_revision < mandate.body.parent_revision)
+        };
+        let mut kept = false;
+        if let Some(mandate) = file.owner_wait {
+            if inner.orc.mandates.contains_key(&file.stable_group_id) {
+                // A mandate signed in this process is the newer wait.
+                kept = true;
+            } else {
+                let restored = if applies(&mandate)
+                    && orc::verify_mandate_signature(&mandate, owner).is_ok()
+                {
+                    orc::encode_frame(&orc::OwnerRecoveryFrameV1::Mandate(mandate.clone())).ok()
+                } else {
+                    None
+                };
+                if let Some(bytes) = restored {
+                    let promoted = mandate.body.promoted;
+                    inner.orc.mandates.insert(
+                        file.stable_group_id.clone(),
+                        MandateDelivery {
+                            promoted,
+                            mandate_id: orc::mandate_id(&mandate),
+                            parent_head: mandate.body.parent_head.clone(),
+                            bytes: Arc::new(bytes),
+                            mandate,
+                            recipients: BTreeMap::from([(promoted, RecipientDelivery::Due)]),
+                            next_at: Instant::now(),
+                        },
+                    );
+                    kept = true;
+                }
+            }
+        }
+        if let Some(mandate) = file.member_hold {
+            if inner.orc.pending.contains_key(&file.stable_group_id) {
+                kept = true;
+            } else if mandate.body.promoted == local
+                && applies(&mandate)
+                && orc::verify_mandate_signature(&mandate, owner).is_ok()
+            {
+                inner.orc.pending.insert(
+                    file.stable_group_id.clone(),
+                    PendingMandate {
+                        mandate,
+                        wait: None,
+                        next_at: Instant::now(),
+                    },
+                );
+                kept = true;
+                wake = true;
+            }
+        }
+        if !kept {
+            stale.push(file.stable_group_id.clone());
+        }
+    }
+    drop(inner);
+    if wake {
+        state.agent.s4_revocation_intake().request_reconcile();
+    }
+    // §5: no S4 file write inside an ADR 0094 trial; a later process
+    // re-reads and re-drops what the file holds. Under the sidecar writer
+    // lock, and only while the group still holds no side in memory, so a
+    // mandate that arrived while the files were read cannot lose its file.
+    if gate_open && !stale.is_empty() {
+        let _writer = state.revocation_evictions.evs_writer.lock().await;
+        for stable in stale {
+            let live = {
+                let inner = state.revocation_evictions.inner.lock().await;
+                inner.orc.mandates.contains_key(&stable) || inner.orc.pending.contains_key(&stable)
+            };
+            if !live {
+                mandate_store::retire(state, &stable).await;
+            }
+        }
+    }
 }
 
 /// Load the durable recovery frames once, and deliver an authored commit
 /// that is still its group's head again (#1508 review). A received commit
 /// that a crash stopped before its install goes to the stash: the next
-/// pass receives it again, with every receiver check.
+/// pass receives it again, with every receiver check. The pending
+/// mandates load here too (#1625).
 async fn ensure_restored(state: &AppState) {
+    restore_mandates(state).await;
     let restored = replay_log::ensure_restored(state, replay_log::RECOVERY_EXTENSION, held).await;
     let local = *state.agent.agent_id().as_bytes();
     let mut inner = state.revocation_evictions.inner.lock().await;
@@ -525,6 +706,7 @@ pub(in crate::server) async fn sign_recovery_mandate(
             .insert(
                 stable.clone(),
                 MandateDelivery {
+                    mandate: mandate.clone(),
                     bytes: Arc::new(bytes),
                     mandate_id: mandate_id.clone(),
                     promoted: *promoted.as_bytes(),
@@ -533,6 +715,9 @@ pub(in crate::server) async fn sign_recovery_mandate(
                     next_at: Instant::now(),
                 },
             );
+        // #1625: the owner's `waiting_for_recovery_member` wait is written
+        // to the pending-mandate file, so a restart of the owner keeps it.
+        persist_mandates(state, &stable).await;
     }
     tracing::info!(
         group_id = %super::super::LogHexId::group(&group_key),
@@ -616,6 +801,9 @@ async fn drive_mandates(state: &Arc<AppState>) {
                 .is_some_and(|stored| stored.mandate_id == delivery.mandate_id)
             {
                 inner.orc.mandates.remove(&stable);
+                drop(inner);
+                // #1625: the ended wait leaves the pending-mandate file.
+                persist_mandates(state, &stable).await;
             }
             continue;
         }
@@ -778,13 +966,16 @@ async fn accept_mandate(state: &Arc<AppState>, mandate: orc::SignedOwnerRecovery
         .orc
         .pending
         .insert(
-            stable,
+            stable.clone(),
             PendingMandate {
                 mandate,
                 wait: None,
                 next_at: now,
             },
         );
+    // #1625: the held mandate is written to the pending-mandate file, so a
+    // restart of the promoted member keeps it.
+    persist_mandates(state, &stable).await;
     state.agent.s4_revocation_intake().request_reconcile();
 }
 
@@ -856,6 +1047,18 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
             {
                 set_wait(state, stable, Some((refusal.as_str(), Vec::new()))).await;
             }
+            // #1625: a refusal that more data can clear is transient: the
+            // containment can lift a quarantine, the revocation sets can
+            // converge, and the seat's own state can change. Keep the
+            // mandate with the typed cause and retry; every check runs
+            // again before any commit, and a fresh mandate from the owner
+            // replaces this one. Before, the drop made the recovery wait
+            // for the owner's 5 s resend or a fresh signature.
+            orc::OwnerRecoveryRefusal::RecoveryGroupQuarantined
+            | orc::OwnerRecoveryRefusal::RecoveryProofInvalid
+            | orc::OwnerRecoveryRefusal::RecoveryMemberIneligible => {
+                set_wait(state, stable, Some((refusal.as_str(), Vec::new()))).await;
+            }
             _ => {
                 tracing::info!(
                     group_id = %ng::LogHexId::group(&group_key),
@@ -863,15 +1066,24 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
                     "ADR 0110 S4: owner recovery mandate refused"
                 );
                 // Drop only the mandate this attempt checked; a newer one
-                // that arrived meanwhile gets its own attempt.
-                let mut inner = state.revocation_evictions.inner.lock().await;
-                if inner
-                    .orc
-                    .pending
-                    .get(stable)
-                    .is_some_and(|held| held.mandate == pending.mandate)
-                {
-                    inner.orc.pending.remove(stable);
+                // that arrived meanwhile gets its own attempt. The head
+                // left the mandate's parent (the recovery committed or the
+                // group forked) or the signer is not the owner, so this
+                // mandate can never chain here.
+                let dropped = {
+                    let mut inner = state.revocation_evictions.inner.lock().await;
+                    let dropped = inner
+                        .orc
+                        .pending
+                        .get(stable)
+                        .is_some_and(|held| held.mandate == pending.mandate);
+                    if dropped {
+                        inner.orc.pending.remove(stable);
+                    }
+                    dropped
+                };
+                if dropped {
+                    persist_mandates(state, stable).await;
                 }
             }
         }
@@ -1255,7 +1467,7 @@ async fn finish_commit(
         ),
     };
     if !persisted {
-        replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+        replay_log::rewrite_without(state, ext, held, &stable, at).await;
         rollback(&mut tree, &next, "owner_recovery_persist_failed");
         tracing::error!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: persist failed");
         set_wait(state, &stable, None).await;
@@ -1294,6 +1506,9 @@ async fn finish_commit(
             },
         );
     }
+    // #1625: the consumed mandate leaves the pending-mandate file, so a
+    // restart cannot resurrect it.
+    persist_mandates(state, &stable).await;
     tracing::info!(
         group_id = %ng::LogHexId::group(group_key),
         removed = removed.len(),
@@ -1531,8 +1746,13 @@ fn spawn_commit_send(
 /// Serve the recovery commit frames this node holds for the group (any of
 /// `group_ids`) above `from_revision` to a catch-up requester, oldest
 /// first, on the distinct gated carrier only, never inside a legacy
-/// catch-up page (§4b(1) "Mixed versions"). Each write uses the guarded
-/// admission with [`HeadRule::OnChain`] and the `owner_recovery_v1` gate.
+/// catch-up page (§4b(1) "Mixed versions"). A competing frame kept as
+/// fork evidence (#1579) is not on this node's verified chain, so it is
+/// skipped, not served, and it does not stop the round. A
+/// fork-quarantined group serves nothing on purpose: `head_rule_admits`
+/// refuses every frame of it, so the skip leaves the round empty. Each
+/// write uses the guarded admission with [`HeadRule::OnChain`] and the
+/// `owner_recovery_v1` gate.
 ///
 /// The author's frames survive a restart ([`replay_log`]). A GSS frame
 /// moves the requester's epoch without the secret, so an admin also seals
@@ -1553,8 +1773,25 @@ pub(in crate::server) async fn serve_catchup(
         .orc
         .log
         .catchup_frames(group_ids, from_revision);
+    if frames.is_empty() {
+        return;
+    }
+    // The frames all come from one group (`catchup_frames` serves the
+    // first of `group_ids` that has a log).
+    let Some(first_group) = frames.first().map(|(group, _, _)| group.clone()) else {
+        return;
+    };
+    let Some((_, info)) = group_by_stable(state, &first_group).await else {
+        return;
+    };
     let mut gss_groups = BTreeSet::new();
     for (group_id, result_head, bytes) in frames {
+        // #1579: a competing frame kept as fork evidence is not on this
+        // node's verified chain. It is never served, and it does not stop
+        // the round for the frames that are.
+        if !head_rule_admits(&info, &HeadRule::OnChain(result_head.clone())) {
+            continue;
+        }
         if matches!(
             orc::decode_frame(&bytes),
             Ok(orc::OwnerRecoveryFrameV1::Commit(frame))
@@ -2948,7 +3185,7 @@ async fn receive_commit(
     {
         Ok(next) => next,
         Err(error) => {
-            replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+            replay_log::rewrite_without(state, ext, held, &stable, at).await;
             tracing::info!(group_id = %ng::LogHexId::group(&group_key), "ADR 0110 S4: owner recovery commit refused by the chained apply: {error}");
             return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
         }
@@ -3022,7 +3259,7 @@ async fn receive_commit(
                     guard,
                     "owner_recovery_proof_failed",
                 );
-                replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+                replay_log::rewrite_without(state, ext, held, &stable, at).await;
                 return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
             }
             match ng::persist_treekem_and_named_groups_atomic_with_info(
@@ -3457,6 +3694,19 @@ mod tests {
 
     fn mandate_delivery(mandate_id: &str, promoted: [u8; 32]) -> MandateDelivery {
         MandateDelivery {
+            mandate: orc::SignedOwnerRecoveryMandateV1 {
+                body: orc::OwnerRecoveryMandateBodyV1 {
+                    stable_group_id: "g".to_string(),
+                    parent_head: "parent".to_string(),
+                    parent_revision: 1,
+                    revoked_admins: Vec::new(),
+                    promoted,
+                    promoted_certificate_digest: String::new(),
+                    owner_public_key: Vec::new(),
+                    issued_at_ms: 0,
+                },
+                signature: Vec::new(),
+            },
             bytes: Arc::new(vec![4, 5, 6]),
             mandate_id: mandate_id.to_string(),
             promoted,
@@ -3601,6 +3851,9 @@ mod tests {
 
     /// #1357: recovery commit frames are held for catch-up serving, oldest
     /// first, above the requested revision, deduplicated and bounded.
+    /// #1579: a frame at a held revision with a different result head is a
+    /// competing commit: it is kept beside the held one, as fork evidence,
+    /// and it never replaces it.
     #[test]
     fn catchup_frames_are_bounded_ordered_and_above_the_revision() {
         let mut orc = OrcState::default();
@@ -3619,12 +3872,15 @@ mod tests {
         let all = orc.log.catchup_frames(&["x".into(), "g".into()], 0);
         assert_eq!(all.len(), ORC_LOG_PER_GROUP);
         let heads: Vec<&str> = all.iter().map(|(_, head, _)| head.as_str()).collect();
-        let expected: Vec<String> = (3..=total).map(|revision| format!("h{revision}")).collect();
+        let mut expected: Vec<String> =
+            (4..=total).map(|revision| format!("h{revision}")).collect();
+        expected.push("dup".to_string());
         assert_eq!(heads, expected);
         assert!(all.iter().all(|(id, _, _)| id == "g"));
         let tail = orc.log.catchup_frames(&["g".into()], total - 1);
-        assert_eq!(tail.len(), 1);
+        assert_eq!(tail.len(), 2, "the competing frame is held too");
         assert_eq!(tail[0].1, format!("h{total}"));
+        assert_eq!(tail[1].1, "dup");
         assert!(orc.log.catchup_frames(&["other".into()], 0).is_empty());
     }
 
@@ -4041,6 +4297,75 @@ mod tests {
         state.agent.shutdown().await;
     }
 
+    /// #1576: a held mandate's group where the mandate's named (revoked)
+    /// admin is the only other active member has no head holders left.
+    /// The worker pass's round excludes that admin, so nobody is asked;
+    /// the §2 head gate (`group_head_synced`, which gates the mandate's
+    /// seal) must agree and open once the restart minimum elapsed, with
+    /// no confirmed round. Before the fix the gate still counted the
+    /// revoked admin as a holder, so the seal waited the full restart
+    /// sync wait for an answer that cannot come.
+    #[tokio::test]
+    async fn a_held_mandate_with_no_head_holders_opens_the_head_gate() {
+        let (_dir, mut state, info, _admin_hex) = recovery_fixture().await;
+        // A restart sync wait no paused-clock auto-advance can cover, so
+        // only the holder count can open the round.
+        Arc::get_mut(&mut state)
+            .expect("the fresh state is not shared yet")
+            .revocation_evictions = super::super::S4Runtime::new(x0x::groups::eviction::S4Timing {
+            restart_sync_wait: Duration::from_secs(3600),
+            ..x0x::groups::eviction::S4Timing::default()
+        });
+        let stable = info.stable_group_id().to_string();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        // The restart minimum elapses. The mandate is the group's only S4
+        // work — no row and no queued ban — so the worker keeps the
+        // group's head round through the owner-recovery plane alone, and
+        // only the owner-recovery exclusions can drop the revoked admin
+        // from the holders. The round for the current head just started
+        // and has no answer yet, as a seal attempt right after a new head
+        // meets.
+        tokio::time::pause();
+        tokio::time::advance(state.revocation_evictions.timing.restart_sync_wait).await;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.store.rows().next().is_none(),
+                "no row: the mandate is the only work"
+            );
+            assert!(
+                inner.orc.head_round_groups().contains_key(&stable),
+                "the mandate's group keeps a head round with its named admin excluded"
+            );
+            inner.head_rounds.insert(
+                stable.clone(),
+                super::super::HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        }
+        assert!(
+            super::super::group_head_synced(&state, &stable).await,
+            "no holders left: the gate opens without a confirmed round"
+        );
+        // The held mandate seals on that gate.
+        try_commit(&state, &stable).await;
+        let committed = state.named_groups.read().await[&stable].clone();
+        assert_eq!(
+            committed.state_revision,
+            info.state_revision + 1,
+            "the recovery commits without waiting the restart sync wait"
+        );
+        state.agent.shutdown().await;
+    }
+
     /// The restart minimum elapses (paused clock) and a holder confirms
     /// `info`'s head, so `group_head_synced` holds for it.
     async fn sync_head(state: &Arc<AppState>, info: &GroupInfo) {
@@ -4205,6 +4530,85 @@ mod tests {
             wait(Arc::clone(&state), stable.clone()).await,
             Some(Some(upgrade)),
             "the mandate is held until L upgrades"
+        );
+        state.agent.shutdown().await;
+    }
+
+    /// #1625: `try_commit` keeps a held mandate across a refusal that more
+    /// data can clear. A quarantined group refuses the attempt; the
+    /// mandate stays held with the typed cause, and once the containment
+    /// lifts the same mandate commits. Before the fix the refusal dropped
+    /// it, so the recovery waited for the owner's 5 s resend or a fresh
+    /// signature.
+    #[tokio::test]
+    async fn a_transient_refusal_keeps_the_held_mandate() {
+        let (_dir, state, info, _admin_hex) = recovery_fixture().await;
+        let stable = info.stable_group_id().to_string();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        sync_head(&state, &info).await;
+
+        let quarantined = {
+            let mut quarantined = info.clone();
+            quarantined.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+                revision: 1,
+                state_hash: "other".into(),
+                committed_by: String::new(),
+                observed_at_ms: 0,
+                snapshot: x0x::groups::ForkSnapshot {
+                    terminal_commit: info.terminal_commit_header(),
+                    conflicting_commit: info.terminal_commit_header(),
+                    classification: None,
+                },
+                no_anchor: true,
+            });
+            quarantined
+        };
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(stable.clone(), quarantined);
+        try_commit(&state, &stable).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let pending = inner
+                .orc
+                .pending
+                .get(&stable)
+                .expect("#1625: the refusal keeps the held mandate");
+            assert_eq!(
+                pending.wait.as_ref().map(|(cause, _)| *cause),
+                Some(orc::OwnerRecoveryRefusal::RecoveryGroupQuarantined.as_str()),
+                "the wait names the transient refusal"
+            );
+        }
+        assert_eq!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&stable)
+                .map(|held| held.state_hash.clone()),
+            Some(info.state_hash.clone()),
+            "no commit while the group is quarantined"
+        );
+
+        // The containment lifts: the same mandate commits, with no resend
+        // and no fresh signature.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(stable.clone(), info.clone());
+        try_commit(&state, &stable).await;
+        let committed = state.named_groups.read().await[&stable].clone();
+        assert_eq!(
+            committed.state_revision,
+            info.state_revision + 1,
+            "the kept mandate commits once the refusal clears"
         );
         state.agent.shutdown().await;
     }
@@ -4506,6 +4910,131 @@ mod restart_tests {
             "the restarted receiver serves the exact frame at catch-up"
         );
         restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1625: the owner's `waiting_for_recovery_member` wait and the
+    /// promoted member's held mandate are durable. The owner signs for
+    /// another node, both processes restart, and the member still holds
+    /// the mandate and commits the recovery once its head syncs; the owner
+    /// still shows the wait. Before the fix both sides were memory-only,
+    /// so the recovery waited for the owner's 5 s resend or a fresh
+    /// signature.
+    #[tokio::test]
+    async fn a_restart_keeps_the_held_mandate_and_the_owner_wait() -> Result<()> {
+        let owner_dir = tempfile::tempdir()?;
+        let member_dir = tempfile::tempdir()?;
+        let user = || x0x::identity::UserKeypair::from_seed(&[0x72; 32]);
+        let owner = offline_daemon(owner_dir.path(), Some(user()?)).await?;
+        let member = offline_daemon(member_dir.path(), None).await?;
+        let owner_kp = owner.agent.identity().user_keypair().context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let info = recovery_parent(owner_kp, &admin, [member.agent.identity().agent_keypair()])?;
+        let stable = info.stable_group_id().to_string();
+        for state in [&owner, &member] {
+            hold_persisted(state, &info).await?;
+            revoke(state, &admin).await?;
+        }
+        let member_hex = hex::encode(member.agent.agent_id().as_bytes());
+        let (status, Json(body)) =
+            sign_recovery_mandate(&owner, owner_kp, &stable, &member_hex).await;
+        anyhow::ensure!(status == StatusCode::ACCEPTED, "mandate: {body}");
+        let mandate = {
+            let inner = owner.revocation_evictions.inner.lock().await;
+            let bytes = inner.orc.mandates[&stable].bytes.clone();
+            match orc::decode_frame(&bytes)? {
+                orc::OwnerRecoveryFrameV1::Mandate(mandate) => mandate,
+                _ => anyhow::bail!("an X0XORC1 mandate frame"),
+            }
+        };
+        // No carrier in this fixture: the frame is handed to the member's
+        // intake, as the direct-message listener would.
+        accept_mandate(&member, mandate).await;
+        {
+            let inner = member.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.orc.pending.contains_key(&stable),
+                "the member holds the mandate"
+            );
+        }
+        // The member restarts while its group is quarantined: the refusal
+        // path keeps a held mandate across a quarantine, so the restart
+        // must keep it too (#1625 review).
+        let mut quarantined = info.clone();
+        quarantined.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 1,
+            state_hash: "other".into(),
+            committed_by: String::new(),
+            observed_at_ms: 0,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        hold_persisted(&member, &quarantined).await?;
+
+        owner.agent.shutdown().await;
+        drop(owner);
+        member.agent.shutdown().await;
+        drop(member);
+        let owner = offline_daemon(owner_dir.path(), Some(user()?)).await?;
+        let member = zero_restart_wait(offline_daemon(member_dir.path(), None).await?)?;
+        ensure_restored(&member).await;
+        ensure_restored(&owner).await;
+        {
+            let inner = member.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.orc.pending.contains_key(&stable),
+                "#1625: the held mandate survived the restart under quarantine"
+            );
+        }
+        {
+            let inner = owner.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.orc.mandates.contains_key(&stable),
+                "#1625: the owner's wait survived the restart"
+            );
+            assert_eq!(inner.orc.mandates[&stable].parent_head, info.state_hash);
+        }
+
+        // The containment lifts and the restarted member commits the held
+        // mandate on its own: the owner is offline, so no resend and no
+        // fresh signature exist.
+        member
+            .named_groups
+            .write()
+            .await
+            .insert(stable.clone(), info.clone());
+        revoke(&member, &admin).await?;
+        {
+            let mut round = HeadRound::new(&info.state_hash, Instant::now());
+            round.confirmed = true;
+            member
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .head_rounds
+                .insert(stable.clone(), round);
+        }
+        try_commit(&member, &stable).await;
+        let committed = member.named_groups.read().await[&stable].clone();
+        assert_eq!(
+            committed.state_revision,
+            info.state_revision + 1,
+            "the restarted member commits the held mandate"
+        );
+        assert_eq!(
+            committed.members_v2[&member_hex].role,
+            x0x::groups::GroupRole::Admin
+        );
+        // The consumed mandate leaves the file: a second restart cannot
+        // resurrect it.
+        assert!(!mandate_store::path(&member, &stable).exists());
+        member.agent.shutdown().await;
+        owner.agent.shutdown().await;
         Ok(())
     }
 
@@ -5612,6 +6141,143 @@ mod restart_tests {
             .map(|(_, share)| share)
             .next_back()
             .context("Q seals its current secret to the survivor")
+    }
+
+    /// #1579: a competing recovery frame kept below the head never stops
+    /// the catch-up round — proven at the real `serve_catchup` loop. Two
+    /// promoted members hold the owner key and seal competing recoveries
+    /// from one parent; this node commits its own and holds the other as
+    /// evidence, first in the log. The round skips the competitor, sends
+    /// the on-chain frame (the test-build in-process stand-in admits it)
+    /// and then seals the current secret to the requester: the scheduled
+    /// share is the evidence the round ran past the competitor to its
+    /// end. A `return` at the skip ends the round on the competitor, and
+    /// no share is sealed.
+    #[tokio::test]
+    async fn the_catchup_round_skips_a_competing_recovery_frame_and_seals_the_share() -> Result<()>
+    {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let owner_seed = [0x73; 32];
+        let author = offline_author(author_dir.path(), owner_seed).await?;
+        let survivor = zero_restart_wait(
+            offline_daemon(
+                survivor_dir.path(),
+                Some(x0x::identity::UserKeypair::from_seed(&owner_seed)?),
+            )
+            .await?,
+        )?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let survivor_id = survivor.agent.agent_id();
+        let survivor_hex = hex::encode(survivor_id.as_bytes());
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let mut info = recovery_parent(
+            owner,
+            &admin,
+            [
+                author.agent.identity().agent_keypair(),
+                survivor.agent.identity().agent_keypair(),
+            ],
+        )?;
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        {
+            use base64::Engine as _;
+            for (state, seat) in [
+                (&author, author_hex.clone()),
+                (&survivor, survivor_hex.clone()),
+            ] {
+                info.members_v2
+                    .get_mut(&seat)
+                    .context("seat")?
+                    .kem_public_key_b64 = Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(&state.agent_kem_keypair.public_bytes),
+                );
+            }
+        }
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        for state in [&author, &survivor] {
+            hold_persisted(state, &info).await?;
+            revoke(state, &admin).await?;
+        }
+        // Each daemon holds the other's current verified advert, so the
+        // capability gate never withholds and no commit waits on D76.
+        let bits = x0x::dm::CapabilityRegistry::current().bits;
+        let now = x0x::dm_capability::now_unix_ms();
+        super::tests::advertise(&author, survivor_id, bits, now);
+        super::tests::advertise(&survivor, author.agent.agent_id(), bits, now);
+        // The survivor seals a competing recovery from the same parent.
+        let (competed, competitor_bytes) = commit_own_recovery(&survivor, &stable, &info).await?;
+        // The competitor enters this node's log first: the evidence the
+        // round must serve past, before this node commits its own branch.
+        {
+            let mut inner = author.revocation_evictions.inner.lock().await;
+            inner.orc.log.remember(
+                &stable,
+                competed.state_revision,
+                competed.state_hash.as_str(),
+                Arc::new(competitor_bytes),
+                false,
+            );
+        }
+        let (committed, _bytes) = commit_own_recovery(&author, &stable, &info).await?;
+        anyhow::ensure!(
+            committed.state_revision == competed.state_revision
+                && committed.state_hash != competed.state_hash,
+            "the two recoveries compete at one revision"
+        );
+        let order: Vec<String> = author
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .log
+            .catchup_frames(std::slice::from_ref(&stable), info.state_revision)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert_eq!(
+            order,
+            vec![competed.state_hash.clone(), committed.state_hash.clone()],
+            "the round meets the competitor first, then the on-chain frame"
+        );
+        // The real round: skip the competitor, serve the on-chain frame,
+        // seal the current secret to the requester.
+        let before = scheduled_shares(&author).len();
+        serve_catchup(
+            &author,
+            &survivor_id,
+            std::slice::from_ref(&stable),
+            info.state_revision,
+        )
+        .await;
+        let share = scheduled_shares(&author)
+            .into_iter()
+            .skip(before)
+            .filter(|(to, _)| *to == survivor_hex)
+            .map(|(_, share)| share)
+            .next_back()
+            .context("the round served past the competitor and sealed the share")?;
+        let expected = <[u8; 32]>::try_from(
+            committed
+                .shared_secret
+                .as_deref()
+                .context("the committed secret")?,
+        )?;
+        assert_eq!(
+            open_share(&share, &survivor.agent_kem_keypair)?,
+            (committed.secret_epoch, expected),
+            "the share opens to the current secret"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
     }
 
     /// Codex P1 (#1508 rc12 r3): the recovery promotes P, P promotes Q,
