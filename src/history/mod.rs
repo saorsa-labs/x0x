@@ -59,6 +59,8 @@ where
             return Ok(f());
         }
     }
+    #[cfg(test)]
+    crate::w3h_inline::note_blocking_admission();
     tokio::task::spawn_blocking(f).await
 }
 

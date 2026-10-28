@@ -11,8 +11,17 @@
 //!   stamp excuses only the thread that published it.
 //! - `w3h_blocking_task_queued_after_the_finish_check_keeps_the_clock_still`:
 //!   a task queued after the finish hook's queue check does not inherit it.
+//! - `w3h_blocking_task_popped_after_the_admission_snapshot_keeps_the_clock_still`:
+//!   the same pool thread pops a task queued after the admission snapshot.
+//! - `w3h_blocking_task_running_before_the_pool_sample_keeps_the_clock_still`:
+//!   that task is running, and the queue is empty, before the next pool sample.
+//! - `w3h_blocking_task_after_unseen_idle_keeps_the_clock_still`: the pool
+//!   thread goes idle without a sample, then a new task brings the busy
+//!   count back.
 //! - `w3h_retired_idle_slot_ignores_a_leftover_pool_thread`: the next runtime
 //!   does not share the previous idle slot.
+//! - `w3h_zero_task_id_does_not_publish_a_wind_down`: a task id of 0 does
+//!   not arm the excuse.
 //! - `w3h_finish_gate_is_owned_before_completion_is_published`: the terminate
 //!   hook owns the finish gate before it publishes completion.
 //! - `w3h_recheck_*`: the unstable recheck thread re-arms after a lost park,
@@ -256,7 +265,7 @@ fn w3h_drive_paused_freezes_while_spawn_blocking_runs() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
         super::drive_paused(async {
-            tokio::task::spawn_blocking(|| {
+            super::spawn_blocking(|| {
                 std::thread::sleep(std::time::Duration::from_millis(80));
             })
             .await
@@ -324,7 +333,7 @@ fn w3h_blocking_completion_does_not_stall_paused_time() -> Result<()> {
         super::install_blocking_finish_gate(&slot, entered_tx, release_gate_rx);
         let (release_task_tx, release_task_rx) = std::sync::mpsc::channel::<()>();
         let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
-        let blocker = tokio::task::spawn_blocking(move || {
+        let blocker = super::spawn_blocking(move || {
             let _ = release_task_rx.recv();
         });
         let coord = std::thread::spawn(move || {
@@ -424,7 +433,7 @@ fn w3h_next_blocking_task_keeps_the_paused_clock_still() -> Result<()> {
         let (release_b_tx, release_b_rx) = std::sync::mpsc::channel::<()>();
         let (measure_tx, measure_rx) = tokio::sync::oneshot::channel::<()>();
         let (measured_tx, measured_rx) = std::sync::mpsc::channel::<()>();
-        let _task_a = tokio::task::spawn_blocking(move || {
+        let _task_a = super::spawn_blocking(move || {
             let _ = release_a_rx.recv();
         });
         let coord = std::thread::spawn(move || {
@@ -458,7 +467,7 @@ fn w3h_next_blocking_task_keeps_the_paused_clock_still() -> Result<()> {
             entered_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("first blocking task did not reach the idle-mark gap");
-            let _task_b = handle.spawn_blocking(move || {
+            let _task_b = super::spawn_blocking_on(&handle, move || {
                 let _ = b_started_tx.send(());
                 let _ = release_b_rx.recv();
             });
@@ -482,20 +491,10 @@ fn w3h_next_blocking_task_keeps_the_paused_clock_still() -> Result<()> {
             biased;
             stepped = super::drive_paused(async move {
                 measure_rx.await.expect("stall coordinator");
-                let (slice_tx, slice_rx) = tokio::sync::oneshot::channel::<()>();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                    let _ = slice_tx.send(());
-                });
-                tokio::select! {
-                    biased;
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {
-                        bail!(
-                            "paused clock stepped while the next blocking task ran"
-                        );
-                    }
-                    _ = slice_rx => Ok(()),
-                }
+                clock_stays_still_while_blocking(
+                    "paused clock stepped while the next blocking task ran",
+                )
+                .await
             }) => {
                 let _ = measured_tx.send(());
                 stepped?;
@@ -520,7 +519,7 @@ fn w3h_finish_gate_is_owned_before_completion_is_published() -> Result<()> {
         super::install_blocking_finish_gate(&slot, entered_tx, release_rx);
         super::arm_drop_finish_gate_on_publish(&slot);
         let (release_task_tx, release_task_rx) = std::sync::mpsc::channel::<()>();
-        let task = tokio::task::spawn_blocking(move || {
+        let task = super::spawn_blocking(move || {
             let _ = release_task_rx.recv();
         });
         let _ = release_task_tx.send(());
@@ -557,11 +556,11 @@ fn w3h_wind_down_does_not_step_while_another_blocking_task_runs() -> Result<()> 
         let (overlap_done_tx, overlap_done_rx) = std::sync::mpsc::channel::<()>();
         let (idle_tx, idle_rx) = tokio::sync::oneshot::channel::<()>();
         let (idle_done_tx, idle_done_rx) = std::sync::mpsc::channel::<()>();
-        let _task_b = tokio::task::spawn_blocking(move || {
+        let _task_b = super::spawn_blocking(move || {
             let _ = b_started_tx.send(());
             let _ = release_b_rx.recv();
         });
-        let _task_a = tokio::task::spawn_blocking(move || {
+        let _task_a = super::spawn_blocking(move || {
             let _ = a_started_tx.send(());
             let _ = release_a_rx.recv();
         });
@@ -673,7 +672,7 @@ fn w3h_blocking_task_queued_after_the_finish_check_keeps_the_clock_still() -> Re
         let (release_b_tx, release_b_rx) = std::sync::mpsc::channel::<()>();
         let (measure_tx, measure_rx) = tokio::sync::oneshot::channel::<()>();
         let (measured_tx, measured_rx) = std::sync::mpsc::channel::<()>();
-        let _task_a = tokio::task::spawn_blocking(move || {
+        let _task_a = super::spawn_blocking(move || {
             let _ = release_a_rx.recv();
         });
         let coord = std::thread::spawn(move || {
@@ -707,7 +706,7 @@ fn w3h_blocking_task_queued_after_the_finish_check_keeps_the_clock_still() -> Re
             entered_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("finish hook did not pass the queue check");
-            let _task_b = handle.spawn_blocking(move || {
+            let _task_b = super::spawn_blocking_on(&handle, move || {
                 let _ = b_started_tx.send(());
                 let _ = release_b_rx.recv();
             });
@@ -746,8 +745,230 @@ fn w3h_blocking_task_queued_after_the_finish_check_keeps_the_clock_still() -> Re
     })
 }
 
+/// Claude path 1: B is queued after the admission snapshot, and the same
+/// pool thread pops it. The queue is empty again before the clock is allowed
+/// to sample.
+#[test]
+#[cfg(tokio_unstable)]
+fn w3h_blocking_task_popped_after_the_admission_snapshot_keeps_the_clock_still() -> Result<()> {
+    late_admission_after_snapshot(true)
+}
+
+/// Codex: B is already running, the queue is empty, and the busy count is
+/// back to the wind-down value, before the first pool sample that can step
+/// the clock.
+#[test]
+#[cfg(tokio_unstable)]
+fn w3h_blocking_task_running_before_the_pool_sample_keeps_the_clock_still() -> Result<()> {
+    late_admission_after_snapshot(false)
+}
+
+#[cfg(tokio_unstable)]
+fn late_admission_after_snapshot(same_thread: bool) -> Result<()> {
+    let what = if same_thread {
+        "paused clock stepped while the same pool thread ran a task admitted after the snapshot"
+    } else {
+        "paused clock stepped while a task admitted after the snapshot was already running"
+    };
+    super::block_on_paused(async move {
+        let _hold = super::AutoAdvanceHold::acquire();
+        let slot = super::idle_slot();
+        super::set_force_pool_busy(&slot, true);
+        let slot_for_coord = std::sync::Arc::clone(&slot);
+        let handle = tokio::runtime::Handle::current();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_gate_tx, release_gate_rx) = std::sync::mpsc::channel::<()>();
+        super::install_after_admission_check_gate(entered_tx, release_gate_rx);
+        let (a_tid_tx, a_tid_rx) = std::sync::mpsc::channel();
+        let (b_tid_tx, b_tid_rx) = std::sync::mpsc::channel();
+        let (b_started_tx, b_started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_b_tx, release_b_rx) = std::sync::mpsc::channel::<()>();
+        let (measure_tx, measure_rx) = tokio::sync::oneshot::channel::<()>();
+        let (measured_tx, measured_rx) = std::sync::mpsc::channel::<()>();
+        let _task_a = super::spawn_blocking(move || {
+            let _ = a_tid_tx.send(std::thread::current().id());
+        });
+        let coord = std::thread::spawn(move || {
+            struct Release {
+                slot: std::sync::Arc<super::IdleWait>,
+                gate: Option<std::sync::mpsc::Sender<()>>,
+                task_b: Option<std::sync::mpsc::Sender<()>>,
+            }
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    super::set_force_pool_busy(&self.slot, false);
+                    if let Some(gate) = self.gate.take() {
+                        let _ = gate.send(());
+                    }
+                    if let Some(task_b) = self.task_b.take() {
+                        let _ = task_b.send(());
+                    }
+                }
+            }
+            let mut release = Release {
+                slot: std::sync::Arc::clone(&slot_for_coord),
+                gate: Some(release_gate_tx),
+                task_b: Some(release_b_tx),
+            };
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("finish hook did not reach the admission snapshot");
+            let a_tid = a_tid_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("first blocking task did not report its thread");
+            assert!(
+                excuse_matches(&slot_for_coord),
+                "wind-down was not published at the admission snapshot"
+            );
+            let _task_b = super::spawn_blocking_on(&handle, move || {
+                let _ = b_tid_tx.send(std::thread::current().id());
+                let _ = b_started_tx.send(());
+                let _ = release_b_rx.recv();
+            });
+            assert!(
+                admission_voids_excuse(&slot_for_coord),
+                "spawning the next task did not record an admission"
+            );
+            if let Some(gate) = release.gate.take() {
+                let _ = gate.send(());
+            }
+            b_started_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("task admitted after the snapshot did not start");
+            let b_tid = b_tid_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("second blocking task did not report its thread");
+            if same_thread {
+                assert_eq!(
+                    a_tid, b_tid,
+                    "the pool thread that finished the first task did not pop the next one"
+                );
+            }
+            assert_eq!(
+                handle.metrics().blocking_queue_depth(),
+                0,
+                "the next task was still queued when the clock was allowed to sample"
+            );
+            assert_eq!(
+                super::blocking_extra(&handle),
+                1,
+                "the busy count did not return to the wind-down value before the sample"
+            );
+            assert!(
+                admission_voids_excuse(&slot_for_coord),
+                "the excuse was cleared before the sample, so the admission count was not what held the clock"
+            );
+            super::set_force_pool_busy(&slot_for_coord, false);
+            let _ = measure_tx.send(());
+            let _ = measured_rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(release);
+        });
+        let (wall_tx, wall_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let _ = wall_tx.send(());
+        });
+        tokio::select! {
+            biased;
+            stepped = super::drive_paused(async move {
+                measure_rx.await.expect("stall coordinator");
+                clock_stays_still_while_blocking(what).await
+            }) => {
+                let _ = measured_tx.send(());
+                stepped?;
+            }
+            _ = wall_rx => bail!("barrier stalled after a task was admitted past the snapshot"),
+        }
+        coord.join().expect("stall coordinator");
+        Ok(())
+    })
+}
+
+/// Claude path 2: the finishing thread goes idle without `pool_busy` seeing
+/// it, then B is admitted and the busy count returns to the published value.
+#[test]
+#[cfg(tokio_unstable)]
+fn w3h_blocking_task_after_unseen_idle_keeps_the_clock_still() -> Result<()> {
+    super::block_on_paused(async move {
+        let _hold = super::AutoAdvanceHold::acquire();
+        let slot = super::idle_slot();
+        super::set_force_pool_busy(&slot, true);
+        let slot_for_coord = std::sync::Arc::clone(&slot);
+        let handle = tokio::runtime::Handle::current();
+        let (b_started_tx, b_started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_b_tx, release_b_rx) = std::sync::mpsc::channel::<()>();
+        let (measure_tx, measure_rx) = tokio::sync::oneshot::channel::<()>();
+        let (measured_tx, measured_rx) = std::sync::mpsc::channel::<()>();
+        let _task_a = super::spawn_blocking(|| {});
+        let coord = std::thread::spawn(move || {
+            struct Release {
+                slot: std::sync::Arc<super::IdleWait>,
+                task_b: Option<std::sync::mpsc::Sender<()>>,
+            }
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    super::set_force_pool_busy(&self.slot, false);
+                    if let Some(task_b) = self.task_b.take() {
+                        let _ = task_b.send(());
+                    }
+                }
+            }
+            let release = Release {
+                slot: std::sync::Arc::clone(&slot_for_coord),
+                task_b: Some(release_b_tx),
+            };
+            wait_until_idle(
+                &slot_for_coord,
+                |slot| super::blocking_extra(&handle) == 0 && excuse_matches(slot),
+                "wind-down was not still armed after the pool thread went idle unseen",
+            );
+            let _task_b = super::spawn_blocking_on(&handle, move || {
+                let _ = b_started_tx.send(());
+                let _ = release_b_rx.recv();
+            });
+            b_started_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("task admitted after the unseen idle did not start");
+            assert_eq!(
+                super::blocking_extra(&handle),
+                1,
+                "the busy count did not return to the wind-down value"
+            );
+            assert!(
+                admission_voids_excuse(&slot_for_coord),
+                "the new admission did not void the excuse that survived the idle gap"
+            );
+            super::set_force_pool_busy(&slot_for_coord, false);
+            let _ = measure_tx.send(());
+            let _ = measured_rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(release);
+        });
+        let (wall_tx, wall_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            let _ = wall_tx.send(());
+        });
+        tokio::select! {
+            biased;
+            stepped = super::drive_paused(async move {
+                measure_rx.await.expect("stall coordinator");
+                clock_stays_still_while_blocking(
+                    "paused clock stepped after a new task restored the wind-down busy count",
+                )
+                .await
+            }) => {
+                let _ = measured_tx.send(());
+                stepped?;
+            }
+            _ = wall_rx => bail!("barrier stalled after an unseen idle"),
+        }
+        coord.join().expect("stall coordinator");
+        Ok(())
+    })
+}
+
 /// A leftover pool thread can write the idle slot it already holds. The
-/// next runtime on this test thread must not see that write.
+/// fresh slot's excuse inputs stay at zero while that write runs.
 #[test]
 #[cfg(tokio_unstable)]
 fn w3h_retired_idle_slot_ignores_a_leftover_pool_thread() {
@@ -758,41 +979,124 @@ fn w3h_retired_idle_slot_ignores_a_leftover_pool_thread() {
         !std::sync::Arc::ptr_eq(&old, &fresh),
         "a new runtime reused the previous idle slot"
     );
-    old.blocking_run_gen
-        .fetch_add(5, std::sync::atomic::Ordering::Release);
-    old.blocking_unsettled_task
-        .store(9, std::sync::atomic::Ordering::Release);
-    old.blocking_unsettled_extra
-        .store(4, std::sync::atomic::Ordering::Release);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_writer = std::sync::Arc::clone(&stop);
+    let writer = std::thread::spawn(move || {
+        let order = std::sync::atomic::Ordering::Release;
+        while !stop_writer.load(std::sync::atomic::Ordering::Acquire) {
+            old.blocking_admissions.store(u64::MAX, order);
+            old.blocking_finished.store(u64::MAX, order);
+            old.blocking_unsettled_task.store(9, order);
+            old.blocking_unsettled_admissions.store(4, order);
+            old.pool_samples.store(u64::MAX, order);
+        }
+    });
+    let order = std::sync::atomic::Ordering::Acquire;
+    for _ in 0..1_000 {
+        assert_eq!(
+            fresh.blocking_admissions.load(order),
+            0,
+            "leftover admission write landed on the fresh slot"
+        );
+        assert_eq!(
+            fresh.blocking_finished.load(order),
+            0,
+            "leftover completion write landed on the fresh slot"
+        );
+        assert_eq!(
+            fresh.blocking_unsettled_task.load(order),
+            0,
+            "leftover excuse write landed on the fresh slot"
+        );
+        assert_eq!(
+            fresh.blocking_unsettled_admissions.load(order),
+            0,
+            "leftover recorded admission landed on the fresh slot"
+        );
+        assert_eq!(
+            fresh.pool_samples.load(order),
+            0,
+            "leftover sample write landed on the fresh slot"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&fresh, &super::idle_slot()),
+            "the harness stopped reading the fresh slot"
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    writer.join().expect("leftover writer");
+}
+
+/// A task id of 0 does not arm a wind-down. The clock then waits for the
+/// idle mark instead of stepping over a later task.
+#[test]
+#[cfg(tokio_unstable)]
+fn w3h_zero_task_id_does_not_publish_a_wind_down() {
+    super::retire_idle_slot();
+    let slot = super::idle_slot();
+    let order = std::sync::atomic::Ordering::Release;
+    slot.blocking_admissions.store(3, order);
+    super::publish_wind_down(&slot, 0);
+    let order = std::sync::atomic::Ordering::Acquire;
+    assert_eq!(slot.blocking_unsettled_task.load(order), 0);
     assert_eq!(
-        fresh
-            .blocking_run_gen
-            .load(std::sync::atomic::Ordering::Acquire),
+        slot.blocking_unsettled_admissions.load(order),
         0,
-        "leftover generation write landed on the new runtime"
-    );
-    assert_eq!(
-        fresh
-            .blocking_unsettled_task
-            .load(std::sync::atomic::Ordering::Acquire),
-        0,
-        "leftover stamp write landed on the new runtime"
+        "a zero task id stored an admission snapshot"
     );
 }
 
 #[cfg(tokio_unstable)]
+fn excuse_matches(slot: &super::IdleWait) -> bool {
+    let order = std::sync::atomic::Ordering::Acquire;
+    let unsettled = slot.blocking_unsettled_task.load(order);
+    unsettled != 0
+        && slot.blocking_admissions.load(order) == slot.blocking_unsettled_admissions.load(order)
+}
+
+#[cfg(tokio_unstable)]
+fn admission_voids_excuse(slot: &super::IdleWait) -> bool {
+    let order = std::sync::atomic::Ordering::Acquire;
+    slot.blocking_unsettled_task.load(order) != 0
+        && slot.blocking_admissions.load(order) > slot.blocking_unsettled_admissions.load(order)
+}
+
+/// The clock must stay put across a real pool sample. A wall slice is not
+/// the oracle: a slow host can finish that slice before the paused clock
+/// has had a chance to step.
+#[cfg(tokio_unstable)]
 async fn clock_stays_still_while_blocking(what: &str) -> Result<()> {
-    let (slice_tx, slice_rx) = tokio::sync::oneshot::channel::<()>();
+    let origin = tokio::time::Instant::now();
+    let slot = super::idle_slot();
+    let seen = slot.pool_samples.load(std::sync::atomic::Ordering::Acquire);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let slot_watch = std::sync::Arc::clone(&slot);
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let _ = slice_tx.send(());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let order = std::sync::atomic::Ordering::Acquire;
+        while std::time::Instant::now() < deadline {
+            if slot_watch.pool_samples.load(order) > seen {
+                let _ = done_tx.send(true);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = done_tx.send(false);
     });
     tokio::select! {
         biased;
         _ = tokio::time::sleep(Duration::from_millis(1)) => {
             bail!("{what}");
         }
-        _ = slice_rx => Ok(()),
+        sampled = done_rx => {
+            let sampled = sampled.expect("pool sample watcher ended");
+            ensure!(
+                sampled,
+                "the pool was not sampled while the blocking task ran"
+            );
+            ensure!(tokio::time::Instant::now() == origin, "{what}");
+            Ok(())
+        }
     }
 }
 
