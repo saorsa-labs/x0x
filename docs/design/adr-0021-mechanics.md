@@ -72,7 +72,10 @@ inbox topic and the compatibility gossip bus both use that function.
 
 The inbox attributes these machines to the sender:
 
-- the retained authenticated binding
+- every machine the authenticated-binding cache has accepted for the sender.
+  That includes the retained binding and any machine a later binding replaced.
+  LRU eviction drops the retained entry and does not drop this set. The set
+  is process memory. A restart drops it with the cache.
 - a machine on the sender's contact
 - a machine named by a binding tombstone for that agent
 - the machine the envelope claims

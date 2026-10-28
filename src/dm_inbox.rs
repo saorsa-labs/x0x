@@ -154,10 +154,19 @@ pub(crate) struct AuthenticatedMachineBinding {
 /// a retained machine, its expiry metadata, or drops a binding (clear /
 /// eviction) wakes ADR-0074 §4 stream reauth — including the DM attestation
 /// writer `record_authenticated_machine_binding`.
+///
+/// `accepted_machines` is the #1659 attribution memory. It records every
+/// machine this cache has accepted for an agent. A later binding replaces
+/// the retained machine and leaves the earlier machine in that set. LRU
+/// eviction drops the retained entry and does not drop the set. The set is
+/// process memory, like the cache itself.
 #[derive(Debug)]
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
     by_machine: std::collections::BTreeSet<([u8; 32], [u8; 32])>,
+    /// Machines accepted for each agent, including machines a later binding
+    /// replaced (#1659). Not removed by LRU eviction.
+    accepted_machines: std::collections::HashMap<AgentId, std::collections::HashSet<MachineId>>,
     capacity: usize,
     recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
@@ -170,6 +179,7 @@ impl Default for AuthenticatedMachineBindingCache {
         Self {
             entries: std::collections::HashMap::new(),
             by_machine: Default::default(),
+            accepted_machines: std::collections::HashMap::new(),
             recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
@@ -193,11 +203,31 @@ impl AuthenticatedMachineBindingCache {
         Self {
             entries: std::collections::HashMap::new(),
             by_machine: Default::default(),
+            accepted_machines: std::collections::HashMap::new(),
             recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
             change_notify: None,
         }
+    }
+
+    /// Machines this cache has accepted for `agent_id`.
+    ///
+    /// The retained binding is one of them. A machine a later update replaced
+    /// stays in the list. #1659 uses the list so a machine revocation remains
+    /// attributable after the retained binding moves.
+    pub(crate) fn machines_accepted_for(&self, agent_id: &AgentId) -> Vec<MachineId> {
+        self.accepted_machines
+            .get(agent_id)
+            .map(|machines| machines.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn remember_accepted_machine(&mut self, agent_id: AgentId, machine_id: MachineId) {
+        self.accepted_machines
+            .entry(agent_id)
+            .or_default()
+            .insert(machine_id);
     }
 
     /// Wake `notify` on every future retained-machine / expiry / clear /
@@ -318,6 +348,10 @@ impl AuthenticatedMachineBindingCache {
                     || existing.cert_not_after != cert_not_after
                     || existing.cert_digest != cert_digest
                     || existing.announced_at != announced_at;
+                // #1659: keep the machine this binding is about to replace.
+                // The retained slot moves. The revocation attribution does not.
+                self.remember_accepted_machine(agent_id, existing.machine_id);
+                self.remember_accepted_machine(agent_id, machine_id);
                 self.by_machine.remove(&(existing.machine_id.0, agent_id.0));
                 self.by_machine.insert((machine_id.0, agent_id.0));
                 existing.machine_id = machine_id;
@@ -352,6 +386,7 @@ impl AuthenticatedMachineBindingCache {
         }
 
         self.by_machine.insert((machine_id.0, agent_id.0));
+        self.remember_accepted_machine(agent_id, machine_id);
         self.entries.insert(
             agent_id,
             AuthenticatedMachineBinding {
@@ -378,15 +413,17 @@ impl AuthenticatedMachineBindingCache {
             .map(|binding| binding.machine_id)
     }
 
-    /// Drop every retained binding. A process restart does this by exiting.
-    /// Tests use it to empty the registry while a transport connection stays up.
+    /// Drop every retained binding and the accepted-machine set. A process
+    /// restart does this by exiting. Tests use it to empty the registry
+    /// while a transport connection stays up.
     #[cfg(test)]
     pub(crate) fn clear_for_test(&mut self) {
-        let had_entries = !self.entries.is_empty();
+        let had_state = !self.entries.is_empty() || !self.accepted_machines.is_empty();
         self.entries.clear();
         self.by_machine.clear();
+        self.accepted_machines.clear();
         self.recency.clear();
-        if had_entries {
+        if had_state {
             self.notify_changed();
         }
     }
@@ -1474,15 +1511,21 @@ impl InboxPipeline {
     /// #1659: an unattested DM is refused when any machine this inbox
     /// attributes to `agent` is revoked.
     ///
-    /// Attribution is the retained binding, a contact machine, a binding
-    /// tombstone, or the machine the envelope claims. Locks are taken one
-    /// at a time: the contact read ends before the revocation read.
+    /// Attribution is every machine the authenticated-binding cache has
+    /// accepted for the sender (the retained binding and any machine a
+    /// later binding replaced), a contact machine, a binding tombstone, or
+    /// the machine the envelope claims. Locks are taken one at a time.
     async fn unattested_sender_has_machine_revocation(
         &self,
         agent: AgentId,
         retained: Option<MachineId>,
         claimed: MachineId,
     ) -> bool {
+        let accepted_machines = self
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .machines_accepted_for(&agent);
         let contact_machines: Vec<MachineId> = self
             .contacts
             .read()
@@ -1492,7 +1535,14 @@ impl InboxPipeline {
             .map(|record| record.machine_id)
             .collect();
         let revoked = self.revocation_set.read().await;
-        sender_has_known_machine_revocation(&revoked, &agent, retained, claimed, &contact_machines)
+        sender_has_known_machine_revocation(
+            &revoked,
+            &agent,
+            retained,
+            claimed,
+            &contact_machines,
+            &accepted_machines,
+        )
     }
 
     async fn handle_incoming(
@@ -1658,9 +1708,12 @@ impl InboxPipeline {
         //
         // #1659 (David, 28 Oct 2026): once any machine the inbox attributes
         // to this sender is revoked, an absent attestation is a refusal.
-        // Both subscription loops (inbox topic and compatibility bus) call
-        // this function. A valid attestation still takes the Ok(Some) arm.
-        // A sender with no known machine revocation keeps this path.
+        // The authenticated-binding cache keeps every machine it has
+        // accepted, so a later attestation that replaces the retained
+        // binding does not drop that requirement. Both subscription loops
+        // (inbox topic and compatibility bus) call this function. A valid
+        // attestation still takes the Ok(Some) arm. A sender with no known
+        // machine revocation keeps this path.
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let claimed_machine_id = MachineId(envelope.sender_machine_id);
         //
@@ -2834,18 +2887,28 @@ fn drop_if_sender_revoked(
 /// #1659: whether an unattested DM's sender has a known machine revocation.
 ///
 /// A machine revocation counts when the inbox can attribute that machine to
-/// the sender. An unrelated machine revocation does not.
+/// the sender. Attribution is the claimed machine, the retained binding,
+/// every machine the authenticated-binding cache has accepted for the
+/// sender, a contact machine, or a binding tombstone. An unrelated machine
+/// revocation does not count.
 fn sender_has_known_machine_revocation(
     revoked: &RevocationSet,
     agent: &AgentId,
     retained: Option<MachineId>,
     claimed: MachineId,
     contact_machines: &[MachineId],
+    accepted_machines: &[MachineId],
 ) -> bool {
     if revoked.is_machine_revoked(&claimed) {
         return true;
     }
     if retained.is_some_and(|machine| revoked.is_machine_revoked(&machine)) {
+        return true;
+    }
+    if accepted_machines
+        .iter()
+        .any(|machine| revoked.is_machine_revoked(machine))
+    {
         return true;
     }
     if contact_machines
@@ -5326,6 +5389,121 @@ mod tests {
             .expect("delivery stream closed");
         assert_eq!(delivered.machine_id, clean.machine_id());
         assert_eq!(delivered.trust_decision, Some(TrustDecision::Accept));
+    }
+
+    /// #1659: machine A is known only through a DM attestation. Revoking A
+    /// blocks an unattested DM. A valid attested DM from clean machine B
+    /// then replaces the retained binding. The sender has no contact-machine
+    /// entry and no binding tombstone for A. An unattested DM that claims B
+    /// is still refused: the origin-attestation requirement stays after the
+    /// binding update.
+    #[tokio::test]
+    async fn issue1659_revocation_survives_binding_update_without_contact() {
+        let sender = test_keypair();
+        let machine_a = MachineKeypair::generate().expect("machine A keygen");
+        let machine_b = MachineKeypair::generate().expect("machine B keygen");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+
+        let attested_a = attested_payload_message(&harness, &sender, &machine_a, 0x81);
+        harness
+            .pipeline
+            .handle_incoming(attested_a, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        let delivered_a = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("the attested DM from A must be delivered")
+            .expect("delivery stream closed");
+        assert_eq!(delivered_a.machine_id, machine_a.machine_id());
+
+        insert_machine_revocation(&harness, &machine_a).await;
+        assert!(
+            harness
+                .pipeline
+                .contacts
+                .read()
+                .await
+                .machines(&sender.agent_id())
+                .is_empty(),
+            "A must be known only through the DM attestation, not a contact"
+        );
+        assert!(
+            harness
+                .pipeline
+                .revocation_set
+                .read()
+                .await
+                .binding_tombstone_machines(&sender.agent_id())
+                .is_empty(),
+            "this sequence has no binding tombstone for A"
+        );
+
+        let unattested_a = payload_message(&harness, &sender, machine_a.machine_id(), 0x82);
+        harness
+            .pipeline
+            .handle_incoming(unattested_a, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            1,
+            "revoking A must block an unattested DM while the binding still names A"
+        );
+
+        let attested_b = attested_payload_message(&harness, &sender, &machine_b, 0x83);
+        harness
+            .pipeline
+            .handle_incoming(attested_b, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        let delivered_b = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("a valid attestation from clean machine B must be accepted")
+            .expect("delivery stream closed");
+        assert_eq!(delivered_b.machine_id, machine_b.machine_id());
+        assert_eq!(
+            authenticated_machine_binding_for_testing(
+                &harness.pipeline.authenticated_machine_bindings,
+                &sender.agent_id(),
+            )
+            .await,
+            Some(machine_b.machine_id()),
+            "B's attestation must replace the retained binding"
+        );
+        assert!(harness
+            .pipeline
+            .contacts
+            .read()
+            .await
+            .machines(&sender.agent_id())
+            .is_empty());
+        assert!(harness
+            .pipeline
+            .revocation_set
+            .read()
+            .await
+            .binding_tombstone_machines(&sender.agent_id())
+            .is_empty());
+
+        let unattested_b = payload_message(&harness, &sender, machine_b.machine_id(), 0x84);
+        harness
+            .pipeline
+            .handle_incoming(unattested_b, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            2,
+            "an unattested DM claiming B must stay refused after the binding leaves revoked A"
+        );
+        assert_no_delivery(&mut harness.receiver).await;
     }
 
     /// #213 REPLAY: an attestation captured from DM-1 (request R1) is
