@@ -345,6 +345,13 @@ pub(super) fn classify(
         SavedFrameState::Superseded if delivery_retained(info, result_head) => {
             ResumeAction::Deliver
         }
+        // #1574 item 3: this arm runs only when `delivery_retained` is
+        // false — a later epoch change followed the result, the same rule
+        // the live `drive` drops its delivery on ("never send old crypto
+        // material"). That evidence is enough: the result commit is on
+        // the verified chain (chain catch-up serves the removal), the
+        // newer epoch's secret is the one members hold, and the row still
+        // completes only on the verified exclusion proof.
         SavedFrameState::Superseded => ResumeAction::Discard,
         SavedFrameState::Abandoned => ResumeAction::Abandon,
         SavedFrameState::Fork => ResumeAction::Fork,

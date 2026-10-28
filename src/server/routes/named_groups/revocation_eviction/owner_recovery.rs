@@ -4269,6 +4269,75 @@ mod tests {
         state.agent.shutdown().await;
     }
 
+    /// #1576: a held mandate's group where the mandate's named (revoked)
+    /// admin is the only other active member has no head holders left.
+    /// The worker pass's round excludes that admin, so nobody is asked;
+    /// the §2 head gate (`group_head_synced`, which gates the mandate's
+    /// seal) must agree and open once the restart minimum elapsed, with
+    /// no confirmed round. Before the fix the gate still counted the
+    /// revoked admin as a holder, so the seal waited the full restart
+    /// sync wait for an answer that cannot come.
+    #[tokio::test]
+    async fn a_held_mandate_with_no_head_holders_opens_the_head_gate() {
+        let (_dir, mut state, info, _admin_hex) = recovery_fixture().await;
+        // A restart sync wait no paused-clock auto-advance can cover, so
+        // only the holder count can open the round.
+        Arc::get_mut(&mut state)
+            .expect("the fresh state is not shared yet")
+            .revocation_evictions = super::super::S4Runtime::new(x0x::groups::eviction::S4Timing {
+            restart_sync_wait: Duration::from_secs(3600),
+            ..x0x::groups::eviction::S4Timing::default()
+        });
+        let stable = info.stable_group_id().to_string();
+        let owner = state.agent.identity().user_keypair().unwrap();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        // The restart minimum elapses. The mandate is the group's only S4
+        // work — no row and no queued ban — so the worker keeps the
+        // group's head round through the owner-recovery plane alone, and
+        // only the owner-recovery exclusions can drop the revoked admin
+        // from the holders. The round for the current head just started
+        // and has no answer yet, as a seal attempt right after a new head
+        // meets.
+        tokio::time::pause();
+        tokio::time::advance(state.revocation_evictions.timing.restart_sync_wait).await;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.store.rows().next().is_none(),
+                "no row: the mandate is the only work"
+            );
+            assert!(
+                inner.orc.head_round_groups().contains_key(&stable),
+                "the mandate's group keeps a head round with its named admin excluded"
+            );
+            inner.head_rounds.insert(
+                stable.clone(),
+                super::super::HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        }
+        assert!(
+            super::super::group_head_synced(&state, &stable).await,
+            "no holders left: the gate opens without a confirmed round"
+        );
+        // The held mandate seals on that gate.
+        try_commit(&state, &stable).await;
+        let committed = state.named_groups.read().await[&stable].clone();
+        assert_eq!(
+            committed.state_revision,
+            info.state_revision + 1,
+            "the recovery commits without waiting the restart sync wait"
+        );
+        state.agent.shutdown().await;
+    }
+
     /// The restart minimum elapses (paused clock) and a holder confirms
     /// `info`'s head, so `group_head_synced` holds for it.
     async fn sync_head(state: &Arc<AppState>, info: &GroupInfo) {
