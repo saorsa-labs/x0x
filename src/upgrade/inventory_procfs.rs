@@ -84,6 +84,8 @@ pub(crate) fn parse_credentials(bytes: &[u8]) -> io::Result<Credentials> {
 /// required, parented by the sole `/` mount; stacked roots refuse without
 /// assuming row order. Proc submounts refuse except systemd's exact binfmt_misc
 /// path with autofs/binfmt_misc type, which cannot hide process or boot evidence.
+/// Mount and propagation IDs are u64 tokens, not proof of kernel allocation.
+/// The binfmt exception checks only path/type, not that subtree's parent/root.
 /// This is not proof that the observer is in the initial host namespaces.
 pub(crate) fn check_mountinfo(bytes: &[u8]) -> io::Result<()> {
     bounded(bytes)?;
@@ -169,7 +171,8 @@ fn proc_option(option: &[u8]) -> io::Result<()> {
     }
 }
 
-/// mountinfo uses the mounts(5) escapes for space, tab, newline and backslash.
+/// The four octal escapes are described in getmntent(3): space, tab, newline
+/// and backslash. mountinfo permits these escapes in mount paths.
 /// Decode before classifying a path; malformed/unknown escapes refuse.
 fn mount_path(bytes: &[u8]) -> io::Result<Vec<u8>> {
     if !bytes.starts_with(b"/") {
@@ -221,16 +224,14 @@ fn bounded(bytes: &[u8]) -> io::Result<()> {
 }
 
 fn number(bytes: &[u8]) -> io::Result<u64> {
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid("noncanonical unsigned decimal"))?;
     if bytes.is_empty()
         || !bytes.iter().all(u8::is_ascii_digit)
         || (bytes.len() > 1 && bytes[0] == b'0')
     {
         return Err(invalid("noncanonical unsigned decimal"));
     }
-    std::str::from_utf8(bytes)
-        .map_err(|_| invalid("non-ASCII number"))?
-        .parse()
-        .map_err(|_| invalid("number exceeds u64"))
+    text.parse().map_err(|_| invalid("number exceeds u64"))
 }
 
 fn numeric_id(bytes: &[u8]) -> io::Result<u32> {
