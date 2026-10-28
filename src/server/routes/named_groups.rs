@@ -1313,12 +1313,14 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     events: Vec<NamedGroupMetadataEvent>,
     truncated: bool,
     /// Saved membership head of the responder. Absent on a KeyPackage
-    /// reply, on an old peer, and on a responder whose held exclusion's
-    /// share has not arrived (#1578: it installed the result keyless,
-    /// holds no secret of that epoch, and claims no head until a secret
-    /// of it installs). A present value is always the responder's saved
-    /// head. A startup self-leave seal trusts this only when it equals
-    /// the local head after the page is applied.
+    /// reply, on an old peer, and on a responder that installed a GSS
+    /// exclusion keyless (#1578, David's ruling 28 Oct 02:09 GMT: while
+    /// it holds no secret of its saved head's epoch and its own roster
+    /// seat carries no KEM key, it claims no head). Every other
+    /// responder — a superseded intermediate install included — serves
+    /// exactly main's value. A present value is always the responder's
+    /// saved head. A startup self-leave seal trusts this only when it
+    /// equals the local head after the page is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
 }
@@ -11804,31 +11806,21 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             keys.dedup();
             // #1578 review: the head claim needs only these values;
             // cloning the whole GroupInfo per catch-up request is waste.
+            // The plane gate and the seat check read the saved state: the
+            // keyless marker of the ruling below is a GSS-plane fact (a
+            // TreeKEM joiner holds heads with no GSS secret and no seat
+            // KEM key by design), and it lives in the group state, not in
+            // a sidecar file.
             let claim = (
-                key.clone(),
+                info.secure_plane == x0x::mls::SecureGroupPlane::Gss,
                 info.state_hash.clone(),
-                info.secret_epoch,
                 info.shared_secret.is_some(),
+                revocation_eviction::crypto_exclusion::own_seat_cannot_take_a_share(state, info),
             );
             (info.has_active_member(&sender_hex), keys, Some(claim))
         } else {
             (false, vec![request.group_id.clone()], None)
         }
-    };
-    // #1578: the responder's saved head is its survivor-convergence
-    // evidence for this group's S4 deliveries. A node that installed a
-    // GSS exclusion keyless claims no head (None) — that local fact
-    // never converges an author's delivery row. The absence is interim
-    // and fail-closed: whether a keyless node should instead report the
-    // live hold's parent head is an open wire question with David. Every
-    // other responder, an unknown group included, keeps main's answer.
-    let saved_head = match &held_group {
-        Some((key, saved_head, secret_epoch, has_secret)) => {
-            gss_share_hold::reported_head(state, key, saved_head, *secret_epoch, *has_secret).await
-        }
-        // Exactly main's answer for a group this responder does not
-        // know: a present, empty saved head.
-        None => Some(String::new()),
     };
     let target_of_cached_add = {
         let logs = state.treekem_event_log.read().await;
@@ -11850,6 +11842,24 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
         return;
     }
+    // #1578 (David's ruling, 28 Oct 02:09 GMT): the responder's saved head
+    // is its survivor-convergence evidence for this group's S4 deliveries.
+    // A keyless GSS responder — the group's secrets are GSS-delivered, it
+    // installed a verified exclusion without the secret, and its own
+    // roster seat carries no KEM key — claims no head while that state
+    // lasts; the local install never converges an author's delivery row.
+    // The inputs were copied under the groups read lock; the derivation
+    // itself runs only after the request is authorized, so an unauthorized
+    // requester costs no hold-file read. Every other responder, a
+    // superseded intermediate head, a member of any other plane, and a
+    // group this responder does not know included, keeps main's answer:
+    // the saved head, present and empty for the unknown group.
+    let saved_head = match &held_group {
+        Some((gss_plane, saved_head, has_secret, own_seat_keyless)) => {
+            gss_share_hold::reported_head(*gss_plane, saved_head, *has_secret, *own_seat_keyless)
+        }
+        None => Some(String::new()),
+    };
     // ADR 0110 §4: crypto-only exclusions in the requested range go to a
     // capable requester on their own gated carrier, never in this page.
     if authorized {

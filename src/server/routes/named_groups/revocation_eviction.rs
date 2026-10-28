@@ -536,6 +536,38 @@ fn note_head_report(
     }
 }
 
+/// #1578 rc3 (review finding 2, closed under David's 28 Oct 02:09 GMT
+/// ruling): the catch-up answer of a keyless holder carries no
+/// `responder_state_hash`. From a current peer that absence is the
+/// keyless state itself — every other responder serves the field — and a
+/// node that holds no secret of its saved head's epoch can never report
+/// a head on the local chain, so waiting for it to would keep the round
+/// unresolved for ever and block every removal, ban and seal of the
+/// group at `waiting_for_head_sync`. The disclaimer is that holder's own
+/// resolution: it answered this round, and its earlier conflicting
+/// report no longer blocks. An old peer's field-less answer clears
+/// nothing in practice: an old peer never served a head, so it was never
+/// in the set.
+fn note_head_disclaimed(
+    rounds: &mut HashMap<String, HeadRound>,
+    asks: &mut HeadRoundAsks,
+    stable_group_id: &str,
+    current_head: &str,
+    sender: [u8; 32],
+    now: Instant,
+) {
+    let Some(round) = rounds.get_mut(stable_group_id) else {
+        return;
+    };
+    if round.head != current_head {
+        round.restart(current_head, now);
+    }
+    round_asks(asks, stable_group_id, round.started)
+        .answered
+        .insert(sender);
+    round.conflicting.remove(&sender);
+}
+
 /// Other active members that could hold a later head of `info`: every
 /// active member except this node and the targets of open rows.
 fn head_holders(
@@ -795,16 +827,17 @@ pub(in crate::server) async fn seal_probe_for_test(
 /// (`responder_state_hash`). The sender is an active, unrevoked member;
 /// the handler checked that. §3: the same answer is the sender's survivor
 /// convergence evidence for the S4 deliveries of the group
-/// ([`crypto_exclusion::note_survivor_head`]).
+/// ([`crypto_exclusion::note_survivor_head`]). An absent field is the
+/// #1578 keyless disclaimer (David's ruling, 28 Oct 02:09 GMT): no head
+/// is convergence evidence, and the sender's unresolved head evidence
+/// ends ([`note_head_disclaimed`]) instead of blocking the round for
+/// ever.
 pub(in crate::server) async fn note_catchup_head(
     state: &AppState,
     group_ids: &[String],
     sender_hex: &str,
     reported: Option<&str>,
 ) {
-    let Some(reported) = reported else {
-        return;
-    };
     let Ok(sender) = super::parse_agent_id_hex(sender_hex) else {
         return;
     };
@@ -815,16 +848,34 @@ pub(in crate::server) async fn note_catchup_head(
                 (
                     info.stable_group_id().to_string(),
                     info.state_hash.clone(),
-                    classify_head_report(info, reported),
-                    installed_heads(info, reported),
+                    reported.map(|reported| {
+                        (
+                            classify_head_report(info, reported),
+                            installed_heads(info, reported),
+                        )
+                    }),
                 )
             })
         })
     };
-    let Some((stable, head, report, installed)) = current else {
+    let Some((stable, head, classified)) = current else {
         return;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
+    let Some((report, installed)) = classified else {
+        // The keyless disclaimer: it names no head, so the survivor-head
+        // pass gets nothing and the round's evidence of this holder ends.
+        let state_inner = &mut *inner;
+        note_head_disclaimed(
+            &mut state_inner.head_rounds,
+            &mut state_inner.head_round_asks,
+            &stable,
+            &head,
+            *sender.as_bytes(),
+            Instant::now(),
+        );
+        return;
+    };
     // §3: the answer is also the sender's convergence evidence for the
     // S4 deliveries of this group whose result it holds.
     crypto_exclusion::note_survivor_head(&mut inner, &stable, sender.as_bytes(), &installed);
@@ -4749,6 +4800,67 @@ pub(super) mod tests {
             .synced("h2", 2, false, true, later, wait));
     }
 
+    /// #1578 rc3 (review finding 2, closed under David's 28 Oct 02:09
+    /// GMT ruling): a holder reported a head this node does not have,
+    /// then went keyless — it installed a verified exclusion without the
+    /// secret, and its catch-up answers carry no `responder_state_hash`
+    /// for as long as it holds no key. That answer is a disclaimer, not
+    /// silence: the holder can never report a head on the local chain,
+    /// so its earlier conflicting report no longer blocks the seal, and
+    /// the round stops re-asking it. Before the fix the absent field was
+    /// dropped before the round saw it, and the seal waited for ever.
+    #[test]
+    fn a_keyless_disclaimer_resolves_a_conflicting_head_report() {
+        let wait = Duration::from_secs(13);
+        let start = Instant::now();
+        let mut rounds = HashMap::new();
+        let mut asks = HeadRoundAsks::new();
+        let (a, b) = ([8; 32], [9; 32]);
+        let holders = [a, b];
+        refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, start, wait);
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            a,
+            HeadReport::Unknown,
+            start,
+        );
+        let later = start + Duration::from_secs(3);
+        // The keyless answer: no head at all. A's conflicting report
+        // resolves, and A answered this round.
+        note_head_disclaimed(&mut rounds, &mut asks, "g", "h1", a, later);
+        assert!(
+            !rounds.get("g").expect("round").conflicting.contains(&a),
+            "the disclaimer resolves the conflicting report"
+        );
+        assert_eq!(
+            refresh_head_round(&mut rounds, &mut asks, "g", "h1", &holders, later, wait),
+            vec![b],
+            "the keyless holder answered this round: only the silent one is re-asked"
+        );
+        // B confirms, and the round syncs after the bounded wait: the
+        // keyless holder no longer holds the group's seals hostage.
+        note_head_report(
+            &mut rounds,
+            &mut asks,
+            "g",
+            "h1",
+            b,
+            HeadReport::OnLocalChain,
+            later,
+        );
+        let settled = start + wait * 10;
+        assert!(
+            rounds
+                .get("g")
+                .expect("round")
+                .synced("h1", 2, false, true, settled, wait),
+            "no waiting_for_head_sync for ever behind a keyless holder"
+        );
+    }
+
     /// #1508 Codex P1, the head-change path: a new local head starts a new
     /// round, in [`refresh_head_round`] and in [`note_head_report`]. The
     /// new round keeps A's unresolved report and asks A again; another
@@ -6966,6 +7078,78 @@ pub(super) mod tests {
             !group_head_synced(&state, &group_id).await,
             "a removal waiting for its share is unresolved head evidence"
         );
+        Ok(())
+    }
+
+    /// #1578 rc3 (review finding 2): the same liveness case through the
+    /// real entry point. The keyless survivor first reported a head this
+    /// node does not have (a conflicting entry), then its catch-up
+    /// answers lost `responder_state_hash` (the keyless disclaimer,
+    /// David's ruling 28 Oct 02:09 GMT). The absent field must reach the
+    /// round and resolve the entry — before the fix `note_catchup_head`
+    /// returned before the round saw it, and the group's removals, bans
+    /// and seals waited at `waiting_for_head_sync` for ever.
+    #[tokio::test]
+    async fn a_served_keyless_answer_resolves_the_conflicting_entry() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "c7".repeat(16);
+        let mut info = GroupInfo::new(
+            "keyless-disclaimer".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.secret_epoch = 4;
+        info.shared_secret = Some(vec![7; 32]);
+        info.security_binding = Some("gss:epoch=4".to_string());
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        let survivor = [5; 32];
+        let survivor_hex = hex::encode(survivor);
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::from([survivor]),
+                },
+            );
+        // The served answer of a keyless survivor: the field is absent.
+        note_catchup_head(&state, std::slice::from_ref(&group_id), &survivor_hex, None).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner
+                    .head_rounds
+                    .get(&stable)
+                    .expect("the round")
+                    .conflicting
+                    .contains(&survivor),
+                "the keyless disclaimer resolves the conflicting entry"
+            );
+            assert!(
+                inner
+                    .head_round_asks
+                    .values()
+                    .any(|asks| asks.answered.contains(&survivor)),
+                "the keyless survivor answered: the round does not re-ask it every 2 s"
+            );
+        }
         Ok(())
     }
 
