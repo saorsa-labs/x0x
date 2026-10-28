@@ -5957,11 +5957,18 @@ async fn swap_staged_tree(
         None => None,
     };
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    // The original's snapshot state, which a failed tree write puts back.
-    // Read it before the `Swapping` mark below: that mark ends the cover.
-    let cover = if guard.is_some() && journal.phase != ReseatPhase::Swapping {
-        match super::reseat_snapshot_cover(state, key).await {
-            Ok(cover) => cover,
+    // The original's snapshot state and both roster stores, which a failed
+    // tree write puts back. Read them before the `Swapping` mark below:
+    // that mark ends the covers.
+    let before = if guard.is_some() && journal.phase != ReseatPhase::Swapping {
+        let read = async {
+            let Some(cover) = super::reseat_snapshot_cover(state, key).await? else {
+                return anyhow::Ok(None);
+            };
+            Ok(Some((cover, super::read_roster_stores(state).await?)))
+        };
+        match read.await {
+            Ok(before) => before,
             Err(error) => {
                 tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the swap is retried: {error}");
                 return false;
@@ -5997,11 +6004,17 @@ async fn swap_staged_tree(
         Err(error) if super::self_leave_persist_left_epoch_installed(&error) => true,
         Err(error) => {
             tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged tree is not durable yet; the original stays on disk and the swap is retried: {error}");
-            // The write can stop after the snapshot file and before its
-            // commit point: put the original's snapshot state back.
-            if let Some(cover) = cover {
+            // The write can stop after the sidecar and the snapshot file and
+            // before its commit point: put the original's snapshot state and
+            // both roster stores back. Otherwise a restart loads the staged
+            // record beside the original's tree, and at equal epochs the
+            // startup re-bind (#457) pairs them.
+            if let Some((cover, rosters)) = before {
                 if let Err(error) = super::restore_reseat_snapshot_cover(state, key, cover).await {
                     tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot put the original's TreeKEM snapshot back after a failed swap: {error}");
+                }
+                if let Err(error) = super::restore_roster_stores(state, rosters, key).await {
+                    tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot put the roster stores back after a failed swap: {error}");
                 }
             }
             let _ = update_sidecar(state, stable, move |body| {
@@ -8763,7 +8776,18 @@ mod tests {
     async fn staged_tree_fixture(
         state: &Arc<AppState>,
     ) -> anyhow::Result<(String, GroupInfo, Vec<u8>, GroupInfo, Vec<u8>)> {
-        let key = "e9".repeat(16);
+        staged_tree_fixture_with(state, "e9", None).await
+    }
+
+    /// [`staged_tree_fixture`] under `"<byte>" * 16`; with `owner` both
+    /// records are on that owner's axis (`OwnerCertified`), so the roster
+    /// files keep them in the Home-Suite sidecar.
+    async fn staged_tree_fixture_with(
+        state: &Arc<AppState>,
+        byte: &str,
+        owner: Option<x0x::identity::UserId>,
+    ) -> anyhow::Result<(String, GroupInfo, Vec<u8>, GroupInfo, Vec<u8>)> {
+        let key = byte.repeat(16);
         let group_id = hex::decode(&key)?;
         let creator = state.agent.agent_id();
         let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id);
@@ -8782,6 +8806,13 @@ mod tests {
         let mut staged = original.clone();
         staged.seal_commit(state.agent.identity().agent_keypair(), 2_000)?;
         assert_eq!(staged.security_binding, original.security_binding);
+        // The owner axis is set after the seal, which would otherwise need
+        // certificate evidence.
+        if let Some(owner) = owner {
+            for info in [&mut original, &mut staged] {
+                info.policy.admission = x0x::groups::GroupAdmission::OwnerCertified(owner);
+            }
+        }
         original.fork_quarantine = Some(original_marker(state, &original));
         // The original, durable with its tree, as before the re-seat.
         super::super::persist_treekem_and_named_groups_atomic_with_info(
@@ -8895,6 +8926,76 @@ mod tests {
             .await?
             .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
         assert_eq!(legacy.state_hash, staged.state_hash);
+        Ok(())
+    }
+
+    /// #1645 (Codex P1 on #1683), ADR 0109 §3 step 3: the swap's tree
+    /// write replaces the Home-Suite sidecar before its commit point. When
+    /// a later write fails, the swap puts both roster stores back with the
+    /// original's snapshot, so a restart loads the original record beside
+    /// the original's tree. Before the fix the sidecar kept the staged
+    /// record, and at the same epoch the startup re-bind (#457) paired it
+    /// with the original's tree. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_failed_owner_certified_swap_restarts_on_the_original_pair() -> anyhow::Result<()> {
+        use super::super::{set_save_fault, SaveFault};
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?.user_id();
+        let (key, original, original_tree, staged, staged_tree) =
+            staged_tree_fixture_with(&state, "eb", Some(owner)).await?;
+        let stable = original.stable_group_id().to_string();
+        let sidecar_before = tokio::fs::read(&state.home_suite_groups_path).await?;
+        let named_before = tokio::fs::read(&state.named_groups_path).await?;
+
+        let fault = set_save_fault(&state, SaveFault::NamedNotReplacedAfterSnapshot);
+        assert!(swap_if_seated(&state, &stable).await, "retried next tick");
+        drop(fault);
+        assert_eq!(
+            open_journal(&state, &stable).await.map(|j| j.phase),
+            Some(ReseatPhase::Staging)
+        );
+        assert!(
+            tokio::fs::read(&state.home_suite_groups_path).await? == sidecar_before,
+            "the sidecar is back"
+        );
+        assert!(tokio::fs::read(&state.named_groups_path).await? == named_before);
+
+        // A restart on these files: the original record from the sidecar,
+        // paired with the original's tree.
+        let roster = super::super::load_named_groups_merged(
+            &state.named_groups_path,
+            &state.home_suite_groups_path,
+        )
+        .await?;
+        let loaded = roster
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("the group loads"))?;
+        assert!(loaded.policy.admission.owner_certified_user_id().is_some());
+        assert_eq!(
+            loaded.state_hash, original.state_hash,
+            "the original record"
+        );
+        let restored =
+            super::super::restore_treekem_groups(&roster, state.agent.as_ref(), &state.treekem_dir)
+                .await;
+        let tree = restored
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("the original tree restores"))?;
+        assert!(tree.lock().await.to_snapshot_bytes()? == original_tree);
+
+        // The retry swaps: the staged record and its tree reach disk.
+        assert!(swap_if_seated(&state, &stable).await);
+        assert!(open_journal(&state, &stable).await.is_none(), "swapped");
+        let roster = super::super::load_named_groups_merged(
+            &state.named_groups_path,
+            &state.home_suite_groups_path,
+        )
+        .await?;
+        let loaded = roster
+            .get(&key)
+            .ok_or_else(|| anyhow::anyhow!("the group loads"))?;
+        assert_eq!(loaded.state_hash, staged.state_hash);
+        assert!(snapshot_on_disk(&state, &key).await?.snapshot == staged_tree);
         Ok(())
     }
 

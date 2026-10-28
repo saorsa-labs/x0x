@@ -6939,6 +6939,11 @@ pub(in crate::server) enum SaveFault {
     /// write (the candidate install) is `ReplacedNotDurable` after the
     /// rename and its corrective re-save fails.
     PreflightOkThenReplacedNotDurableAfterWriteThenError = 6,
+    /// #1658: only the TreeKEM atomic persist reads it. The snapshot file
+    /// is written, then the named half fails as `NotReplaced` and the
+    /// journal pair is discarded: the transaction does not commit, but the
+    /// new snapshot is on disk (the failed re-seat swap's tree write).
+    NamedNotReplacedAfterSnapshot = 7,
 }
 
 // #470 — per-instance fault helpers; all `#[cfg(test)]` so no trace in
@@ -34429,7 +34434,9 @@ pub(super) async fn reseat_snapshot_cover(
 
 /// #1567: put `cover` back on disk as `<group_id_hex>.snap` (a failed swap
 /// left the staged tree there): write the original's envelope, or remove
-/// the file.
+/// the file. Both are durable: the removal syncs the directory, or a power
+/// loss can bring the staged file back, and the next cover read takes it
+/// for the original's.
 pub(super) async fn restore_reseat_snapshot_cover(
     state: &AppState,
     group_id_hex: &str,
@@ -34440,14 +34447,63 @@ pub(super) async fn restore_reseat_snapshot_cover(
             persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, envelope).await
         }
         ReseatSnapshotCover::Absent => {
-            match tokio::fs::remove_file(treekem_snapshot_path(&state.treekem_dir, group_id_hex))
-                .await
-            {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(anyhow::anyhow!("treekem snapshot remove: {e}")),
+            let path = treekem_snapshot_path(&state.treekem_dir, group_id_hex);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow::anyhow!("treekem snapshot remove: {e}")),
             }
+            sync_parent_dir_for_path(&path)
+                .map_err(|e| anyhow::anyhow!("treekem snapshot remove: directory sync: {e}"))
         }
+    }
+}
+
+/// #1645 (Codex P1 on #1683): the bytes of both roster stores (the
+/// Home-Suite sidecar, then `named_groups.json`; `None` for a file that is
+/// not there) before the re-seat swap's tree write. That write replaces
+/// the sidecar before its commit point, so a failure after it must put
+/// both files back, as it puts the original's snapshot back.
+pub(super) struct RosterStoresBefore {
+    home_suite: Option<Vec<u8>>,
+    named: Option<Vec<u8>>,
+}
+
+async fn read_if_present(path: &FsPath) -> Result<Option<Vec<u8>>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
+    }
+}
+
+/// Read [`RosterStoresBefore`]. Caller holds
+/// `named_groups_persistence_lock` until any restore.
+pub(super) async fn read_roster_stores(state: &AppState) -> Result<RosterStoresBefore> {
+    Ok(RosterStoresBefore {
+        home_suite: read_if_present(&state.home_suite_groups_path).await?,
+        named: read_if_present(&state.named_groups_path).await?,
+    })
+}
+
+/// Put both roster stores back to `before`: the sidecar first, as every
+/// save path writes it first. Caller holds `named_groups_persistence_lock`
+/// since [`read_roster_stores`].
+pub(super) async fn restore_roster_stores(
+    state: &AppState,
+    before: RosterStoresBefore,
+    group_id_hex: &str,
+) -> Result<()> {
+    restore_home_suite_sidecar(state, before.home_suite.as_deref(), Some(group_id_hex)).await;
+    let Some(named) = before.named else {
+        return Ok(());
+    };
+    match write_named_groups_json_atomic(&state.named_groups_path, &String::from_utf8_lossy(&named))
+        .await
+    {
+        Ok(AtomicWriteOutcome::Durable) => Ok(()),
+        Ok(outcome) => Err(anyhow::anyhow!("named groups restore: {outcome:?}")),
+        Err(e) => Err(anyhow::anyhow!("named groups restore: {e}")),
     }
 }
 
@@ -34966,6 +35022,13 @@ async fn persist_treekem_and_named_groups_atomic_locked(
             discard_seal_journal_pair(state, group_id_hex).await;
             return Err(e);
         }
+    }
+    #[cfg(test)]
+    if state.named_groups_save_fault.load(Ordering::SeqCst)
+        == SaveFault::NamedNotReplacedAfterSnapshot as u8
+    {
+        discard_seal_journal_pair(state, group_id_hex).await;
+        anyhow::bail!("named groups replacement did not occur");
     }
     let outcome = write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
         .await
