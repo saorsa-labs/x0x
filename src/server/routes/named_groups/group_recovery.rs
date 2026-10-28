@@ -235,6 +235,19 @@ impl S3Runtime {
         true
     }
 
+    /// #1645: put the re-seat journal `expected` of `stable` back to
+    /// `Staging` in memory only, so the covers apply again before the
+    /// durable write ([`end_swap_after_rollback`]). The next sidecar write
+    /// of the group writes it.
+    async fn reset_phase_in_memory(&self, stable: &str, expected: [u8; 32]) {
+        let _writer = self.writer.lock().await;
+        let mut inner = self.inner.lock().await;
+        if let Some(body) = inner.sidecars.get_mut(stable) {
+            reset_journal_to_staging(body, expected);
+        }
+        self.refresh_staging(stable, inner.sidecars.get(stable));
+    }
+
     /// [`Self::hold_reseat_marker`] over every record of a roster.
     pub(in crate::server) fn hold_reseat_markers(
         &self,
@@ -332,6 +345,8 @@ enum SwapRollbackStop {
     AfterSidecar,
     /// The Home-Suite sidecar restore fails; the rollback goes on.
     SidecarRestoreFails,
+    /// The files are back, and the durable `Staging` write fails.
+    PhaseWriteFails,
 }
 
 /// A sidecar fault (§4, ADR 0108 §5a): S3 makes no transition for the
@@ -5959,9 +5974,10 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
 /// together, and the `Swapping` journal swaps them in (#1645, Codex P1 on
 /// #1683). The rollback puts the original's snapshot back, then the
 /// Home-Suite sidecar, then `named_groups.json`. Only when all three are
-/// durable does it discard the transaction journals and put the journal
-/// back to `Staging` (the covers apply again): a restart then loads the
-/// original pair, which rolls back. A restore that fails keeps the
+/// durable does [`end_swap_after_rollback`] put the journal back to
+/// `Staging` (in memory first, so the covers apply again), discard the
+/// transaction journals and make the phase durable: a restart then loads
+/// the original pair, which rolls back. A restore that fails keeps the
 /// journals and `Swapping`. Either way the next tick retries. A group with
 /// no tree (GSS) needs only the mark. Returns whether the swap may go on
 /// to [`lift_staging_marker`].
@@ -6035,18 +6051,62 @@ async fn swap_staged_tree(
                 return false;
             };
             if rollback_swap_files(state, stable, key, cover, &rosters).await {
-                super::discard_seal_journal_pair(state, key).await;
-                let _ = update_sidecar(state, stable, move |body| {
-                    if let Some(open) = body.reseat_journal.as_mut() {
-                        if open.record_digest == expected {
-                            open.phase = ReseatPhase::Staging;
-                        }
-                    }
-                })
-                .await;
+                end_swap_after_rollback(state, stable, key, expected).await;
             }
             false
         }
+    }
+}
+
+/// #1645 (Codex P1 on #1645 and #1683): the original's files are all back
+/// after a failed swap; end the swap. The order makes every point recover
+/// to the original pair, whichever write fails:
+///
+/// 1. The journal goes back to `Staging` in memory, while this caller
+///    still holds `named_groups_persistence_lock`. The covers apply again
+///    before any other roster or tree write can run, so every later write
+///    (of any group) keeps the original record and the original's tree on
+///    disk. With `Swapping` left in memory, a later whole-roster save wrote
+///    the staged record beside the restored original tree.
+/// 2. The swap's transaction journals are discarded. They hold the staged
+///    pair, and the files no longer need them: a restart replays nothing
+///    and loads the original pair.
+/// 3. The durable `Staging` write, checked. When it fails, the sidecar on
+///    disk still says `Swapping`; a restart loads the original record
+///    under it, and `staged_join_lost` rolls back to the original pair.
+///    The next sidecar write of the group, or the next swap attempt,
+///    makes the memory phase durable.
+async fn end_swap_after_rollback(state: &AppState, stable: &str, key: &str, expected: [u8; 32]) {
+    state
+        .group_recovery
+        .reset_phase_in_memory(stable, expected)
+        .await;
+    super::discard_seal_journal_pair(state, key).await;
+    #[cfg(test)]
+    let fault = state.group_recovery.inner.lock().await.swap_rollback_stop
+        == Some(SwapRollbackStop::PhaseWriteFails);
+    #[cfg(not(test))]
+    let fault = false;
+    let durable = !fault
+        && update_sidecar_if(state, stable, |body| {
+            reset_journal_to_staging(body, expected)
+        })
+        .await
+            == SidecarWrite::Written;
+    if !durable {
+        tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the rolled-back swap's `Staging` phase is not durable yet; the original pair is on disk and a restart rolls back to it");
+    }
+}
+
+/// Put `body`'s re-seat journal `expected` back to `Staging`. Returns
+/// whether that journal is open.
+fn reset_journal_to_staging(body: &mut GroupRecoveryV1, expected: [u8; 32]) -> bool {
+    match body.reseat_journal.as_mut() {
+        Some(open) if open.record_digest == expected => {
+            open.phase = ReseatPhase::Staging;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -9186,6 +9246,73 @@ mod tests {
                 "{stop:?}: the swap resumes from its phase"
             );
         }
+        Ok(())
+    }
+
+    /// #1645 (Codex P1 on #1645 and #1683), ADR 0109 §3: the original's
+    /// files are back after a failed swap and the durable `Staging` write
+    /// fails. Then another whole-roster save runs, and the node restarts.
+    /// The restart loads the original record with the original's tree and
+    /// rolls back. Before the fix the journals were gone and memory kept
+    /// `Swapping`, so that save wrote the staged record beside the
+    /// restored original tree: a torn pair. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_failed_phase_reset_then_a_roster_save_restarts_on_the_original_pair(
+    ) -> anyhow::Result<()> {
+        use super::super::{set_save_fault, SaveFault};
+        let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?.user_id();
+        let (key, original, original_tree, staged, staged_tree) =
+            staged_tree_fixture_with(&state, "e9", Some(owner)).await?;
+        let stable = original.stable_group_id().to_string();
+        state.group_recovery.inner.lock().await.swap_rollback_stop =
+            Some(SwapRollbackStop::PhaseWriteFails);
+        let fault = set_save_fault(&state, SaveFault::NamedNotReplacedAfterSnapshot);
+        assert!(swap_if_seated(&state, &stable).await, "retried next tick");
+        drop(fault);
+        state.group_recovery.inner.lock().await.swap_rollback_stop = None;
+        assert_eq!(
+            sidecar_on_disk(&state, &stable)
+                .await?
+                .reseat_journal
+                .map(|journal| journal.phase),
+            Some(ReseatPhase::Swapping),
+            "the phase reset is not durable"
+        );
+        assert_eq!(
+            open_journal(&state, &stable)
+                .await
+                .map(|journal| journal.phase),
+            Some(ReseatPhase::Staging),
+            "memory is back to `Staging`: the covers apply"
+        );
+
+        // Another whole-roster save, as for any other group.
+        let outcome = super::super::persist_named_groups_mutation(&state, |_| true).await?;
+        assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert_eq!(
+            legacy.state_hash, original.state_hash,
+            "the original record stays"
+        );
+
+        let restarted = restart_at(state, dir.path()).await?;
+        let staged_pair = holds_a_matching_pair(
+            &restarted,
+            &key,
+            &original,
+            &original_tree,
+            &staged,
+            &staged_tree,
+        )
+        .await?;
+        assert!(!staged_pair, "the restart loads the original pair");
+        assert!(
+            open_journal(&restarted, &stable).await.is_none(),
+            "the restart rolls back"
+        );
         Ok(())
     }
 
