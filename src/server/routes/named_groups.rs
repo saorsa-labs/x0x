@@ -34044,6 +34044,22 @@ pub(in crate::server) async fn secure_group_encrypt(
     }
 
     let Some(key) = info.secure_message_key() else {
+        // #1578 (David's approval, 28 Oct 08:59 GMT; Claude P1 on
+        // #1635): a keyless GSS install holds the ciphertext boundary,
+        // and the hold's typed 409 — not the waiting-joiner 424 — is
+        // the answer for exactly this state (the API-docs row and the
+        // W3-H case `w3h_1578_red_…` promise it). The hold is what
+        // separates the keyless survivor from a joiner that merely
+        // awaits its welcome share, which keeps the 424 below.
+        let keyless_hold = crate::server::resolve_group_entry_locked(&groups, &id).is_some_and(
+            |(group_key, entry)| pending_gss_removal_withholds(&state, group_key, entry),
+        );
+        if keyless_hold {
+            return api_error(
+                StatusCode::CONFLICT,
+                GroupCiphertextHold::PendingGssRemoval.reason(),
+            );
+        }
         return api_error(
             StatusCode::FAILED_DEPENDENCY,
             "no shared secret available — await welcome or ask admin to re-share",

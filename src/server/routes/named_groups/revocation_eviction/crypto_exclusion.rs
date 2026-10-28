@@ -5296,6 +5296,92 @@ mod daemon_tests {
         Ok(())
     }
 
+    /// #1635 review round 5 (Claude P1 at a00ab3a): a keyless GSS
+    /// install holds the ciphertext boundary, and
+    /// `POST /groups/:id/secure/encrypt` must answer the typed 409
+    /// (David's approval, 28 Oct 08:59 GMT; the API-docs row and the
+    /// W3-H case `w3h_1578_red_…` promise the same). The GSS arm read
+    /// `secure_message_key()` before the hold check, and a keyless
+    /// install holds no secret, so the route fell into the
+    /// waiting-joiner 424. The hold check in the keyless arm serves the
+    /// typed refusal; a member with no hold (a joiner awaiting its
+    /// welcome share) keeps the 424. This test fails if the 424 comes
+    /// back.
+    #[tokio::test]
+    async fn a_keyless_survivors_encrypt_answers_the_typed_409_not_the_joiners_424() -> Result<()> {
+        use anyhow::Context as _;
+        use base64::Engine as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let admin = fx.state.agent.agent_id();
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the survivor installs the verified frame keyless (#1578)"
+        );
+        // The state the 409 names: the install moved the head, the
+        // survivor holds no secret of the new epoch, and the durable
+        // exclusion hold is active.
+        {
+            let groups = fx.replica.named_groups.read().await;
+            let info = groups.get(&fx.group_id).context("group")?;
+            assert!(
+                info.shared_secret.is_none(),
+                "the install is keyless: no secret of the new epoch"
+            );
+        }
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            1,
+            "the exclusion hold is active"
+        );
+        let (status, body) = ng::secure_group_encrypt(
+            axum::extract::State(std::sync::Arc::clone(&fx.replica)),
+            axum::extract::Path(fx.group_id.clone()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            axum::Json(ng::SecureEncryptRequest {
+                payload_b64: base64::engine::general_purpose::STANDARD.encode(b"#1635 probe"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "the keyless survivor's encrypt answers the typed 409, not the joiner's 424: {body:?}"
+        );
+        assert!(
+            body["error"].as_str().is_some_and(
+                |text| text.contains(ng::GroupCiphertextHold::PendingGssRemoval.reason())
+            ),
+            "the refusal is the hold's typed reason: {body:?}"
+        );
+        Ok(())
+    }
+
     /// #1578 review (Claude, 28 Oct): the keyless install writes its
     /// durable hold BEFORE the apply. If the apply is then refused — the
     /// snapshot the install seals by no longer chains, as a sibling
