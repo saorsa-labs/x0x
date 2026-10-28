@@ -5,7 +5,10 @@
 //!   stays put while `spawn_blocking` runs.
 //! - `w3h_recheck_*`: the unstable recheck thread re-arms after a lost park,
 //!   including when the pool stays busy across disarm, and does not publish
-//!   `ready` into the next barrier.
+//!   `ready` into the next barrier. It also must not wake the barrier in the
+//!   gap after the driver returns and before `after_unpark` clears `parked`.
+//! - `w3h_spawn_blocking_completion_does_not_resume_block_on_mid_chain`:
+//!   `block_on` does not poll its future in the middle of a ready task chain.
 //! - `w3h_s1_control_*`: three real daemons, public API only, over the
 //!   fabric. The positive control must converge AND deliver group data; the
 //!   negative control (joiner offline) must fail for exactly the intended
@@ -630,6 +633,211 @@ fn w3h_recheck_ready_stays_on_its_barrier_epoch() -> Result<()> {
         ensure!(
             !ready,
             "a recheck from the previous barrier published ready={ready}"
+        );
+        Ok(())
+    })
+}
+
+/// #1245: `parked` stays true from the driver wake until `after_unpark`.
+/// A recheck that publishes `ready` in that gap polls the barrier before a
+/// task the wake already queued. This case freezes the gap, lets the
+/// recheck act, then requires the queued task to have run first.
+#[test]
+#[cfg(tokio_unstable)]
+fn w3h_recheck_does_not_wake_the_barrier_in_the_unpark_gap() -> Result<()> {
+    super::block_on_paused(async move {
+        let _hold = super::AutoAdvanceHold::acquire();
+        let handle = tokio::runtime::Handle::current();
+        let slot = super::idle_slot();
+        let slot_for_coord = std::sync::Arc::clone(&slot);
+        super::set_force_pool_busy(&slot, true);
+        let (publish_entered_tx, publish_entered_rx) = std::sync::mpsc::channel();
+        let (publish_release_tx, publish_release_rx) = std::sync::mpsc::channel();
+        super::install_before_publish_gate(publish_entered_tx, publish_release_rx);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        super::install_recheck_finished(finished_tx);
+        let (unpark_entered_tx, unpark_entered_rx) = std::sync::mpsc::channel();
+        let (unpark_release_tx, unpark_release_rx) = std::sync::mpsc::channel();
+
+        let daemon_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gap_open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let barrier_first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recorded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let daemon_for_coord = std::sync::Arc::clone(&daemon_ran);
+        let gap_for_coord = std::sync::Arc::clone(&gap_open);
+
+        let coord = std::thread::spawn(move || {
+            struct Release {
+                publish: Option<std::sync::mpsc::Sender<()>>,
+                unpark: Option<std::sync::mpsc::Sender<()>>,
+            }
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    if let Some(publish) = self.publish.take() {
+                        let _ = publish.send(());
+                    }
+                    if let Some(unpark) = self.unpark.take() {
+                        let _ = unpark.send(());
+                    }
+                }
+            }
+            let mut release = Release {
+                publish: Some(publish_release_tx),
+                unpark: Some(unpark_release_tx),
+            };
+            let order = std::sync::atomic::Ordering::Acquire;
+            wait_until_idle(
+                &slot_for_coord,
+                |slot| {
+                    let epoch = slot.epoch.load(order);
+                    slot.parked.load(order) && slot.recheck_epoch.load(order) == epoch
+                },
+                "recheck was not armed while the runtime was parked",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if !slot_for_coord.parked.load(order) {
+                panic!("runtime left the park before the unpark gap was armed");
+            }
+            super::install_unpark_gap_gate(&slot_for_coord, unpark_entered_tx, unpark_release_rx);
+            let daemon_ran = daemon_for_coord;
+            handle.spawn(async move {
+                daemon_ran.store(true, std::sync::atomic::Ordering::Release);
+            });
+            unpark_entered_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("runtime did not stop in the unpark gap");
+            super::set_force_pool_busy(&slot_for_coord, false);
+            publish_entered_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("recheck did not stop before publish");
+            gap_for_coord.store(true, std::sync::atomic::Ordering::Release);
+            let publish = release.publish.take().expect("publish sender");
+            let _ = publish.send(());
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("recheck did not finish while the unpark gap was held");
+            let unpark = release.unpark.take().expect("unpark sender");
+            let _ = unpark.send(());
+        });
+
+        let sleeper = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let (wall_tx, wall_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            let _ = wall_tx.send(());
+        });
+        let daemon_for_barrier = std::sync::Arc::clone(&daemon_ran);
+        let gap_for_barrier = std::sync::Arc::clone(&gap_open);
+        let barrier_for_poll = std::sync::Arc::clone(&barrier_first);
+        let recorded_for_poll = std::sync::Arc::clone(&recorded);
+        let stepped = tokio::select! {
+            biased;
+            stepped = super::drive_paused(async move {
+                std::future::poll_fn(|_cx| {
+                    let order = std::sync::atomic::Ordering::Acquire;
+                    if gap_for_barrier.load(order)
+                        && !recorded_for_poll.swap(true, std::sync::atomic::Ordering::AcqRel)
+                        && !daemon_for_barrier.load(order)
+                    {
+                        barrier_for_poll.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    if daemon_for_barrier.load(order) {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                Ok::<(), anyhow::Error>(())
+            }) => stepped,
+            _ = wall_rx => bail!("unpark-gap case stalled"),
+        };
+        let coord_result = coord.join();
+        stepped?;
+        coord_result.expect("unpark-gap coordinator");
+        ensure!(
+            !barrier_first.load(std::sync::atomic::Ordering::Acquire),
+            "the barrier was polled before the task queued by the wake"
+        );
+        ensure!(
+            daemon_ran.load(std::sync::atomic::Ordering::Acquire),
+            "the queued task did not run"
+        );
+        ensure!(
+            !sleeper.is_finished(),
+            "the 30 s timer fired inside the wall bound"
+        );
+        Ok(())
+    })
+}
+
+/// #1245: `block_on` polls its future every `event_interval` tasks (61).
+/// A `spawn_blocking` completion wakes that future, so the poll lands in
+/// the middle of a daemon task chain and the chain is cut. With the
+/// interval at `u32::MAX` every queued task runs before the future resumes.
+#[test]
+#[cfg(tokio_unstable)]
+fn w3h_spawn_blocking_completion_does_not_resume_block_on_mid_chain() -> Result<()> {
+    const CHAIN: u16 = 80;
+    super::block_on_paused(async move {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u16>::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            let _ = go_rx.recv();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("blocking task did not start");
+        let baseline = super::task_terminations();
+        for i in 0..CHAIN {
+            let log = std::sync::Arc::clone(&log);
+            let go = if i == 0 { Some(go_tx.clone()) } else { None };
+            tokio::spawn(async move {
+                if let Some(go) = go {
+                    let _ = go.send(());
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while super::task_terminations() == baseline {
+                        if std::time::Instant::now() > deadline {
+                            panic!("blocking task did not terminate before the chain continued");
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+                log.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(i);
+            });
+        }
+        drop(go_tx);
+        let (wall_tx, wall_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            let _ = wall_tx.send(());
+        });
+        let log_for_end = std::sync::Arc::clone(&log);
+        tokio::select! {
+            biased;
+            result = async move {
+                blocker.await.expect("blocking task");
+                log_for_end
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(CHAIN);
+                Ok::<(), anyhow::Error>(())
+            } => result,
+            _ = wall_rx => bail!("spawn_blocking chain stalled"),
+        }?;
+        let log = log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        ensure!(
+            log.len() == usize::from(CHAIN) + 1 && log.last() == Some(&CHAIN),
+            "block_on resumed before the ready chain finished: {log:?}"
         );
         Ok(())
     })
