@@ -6,14 +6,14 @@
 //! Control, expected GREEN on `main`: A joins O's OwnerCertified group, O
 //! promotes it, and A's own seal reaches O.
 //!
-//! H-S3-c/c2 setup change (Engineer, 28 Oct 2026): J joins with a fresh
-//! invite before X's partition, so J keeps a record. The ADR's stale invite
-//! made J's join time out and drop its stub on `main`, which is not the
-//! row's RED. O's removal of X (r+1) is the held commit; X's rename (r+1′)
-//! reaches J only; O's rename (r+2) stands in for the ADR's v2 seal. Each
-//! red arm keeps its `_red_` name and expects GREEN (the ADR 0109
-//! behaviour). A failure with the observation `CAUSE_C` names is RED; any
-//! other failure is INFRA.
+//! H-S3-c/c2 follow the ADR setup on a non-Home OwnerCertified group: J
+//! redeems invite I (minted at r) after O removes X (r+1), so O's seal of
+//! J (r+2) carries the owner's v2 terminal attestation and arms J's gap
+//! gate; the case checks the gate before the window. X's rename (r+1′)
+//! then reaches J only. Each red arm keeps its `_red_` name and expects
+//! GREEN (the ADR 0109 behaviour). A failure is RED only when J shows the
+//! row's main observation (`CAUSE_C`); a missing prerequisite or any other
+//! failure is INFRA.
 
 use super::*;
 
@@ -59,11 +59,45 @@ async fn announce_all(sim: &Sim, labels: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// An OwnerCertified TreeKEM group that is not the Home policy: admin-only
+/// writes keep it off ADR 0109 §4's Home gate (`home_gate_closed`) and out
+/// of Home adoption (#1687). Hidden + MlsEncrypted keeps the TreeKEM plane.
+/// `admin` seals a rename. A seal checks every member's certificate and the
+/// first try may start the fetches it needs; the creator's seat carries no
+/// certificate, so each retry refreshes O's certificate announce.
+async fn seal_rename(sim: &Sim, admin: &str, group: &str, name: &str) -> Result<()> {
+    let path = format!("/groups/{group}");
+    let mut last = String::new();
+    sim.until(
+        &format!("{admin} seals a rename"),
+        SETUP,
+        async |s: &Sim| {
+            let body = Some(json!({"name": name}));
+            match s.request(admin, Method::PATCH, &path, body).await {
+                Ok((code, _)) if code.is_success() => true,
+                answer => {
+                    last = format!("{answer:?}");
+                    let body = json!({"include_user_identity": true, "human_consent": true});
+                    let _ = s.request("O", Method::POST, "/announce", Some(body)).await;
+                    false
+                }
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("{admin}'s last seal answer: {last}"))
+}
+
 async fn create_group(sim: &Sim, owner: &crate::identity::UserKeypair) -> Result<String> {
     let policy = crate::groups::GroupPolicy {
         admission: crate::groups::GroupAdmission::OwnerCertified(owner.user_id()),
+        write_access: crate::groups::GroupWriteAccess::AdminOnly,
         ..crate::groups::GroupPolicyPreset::PrivateSecure.to_policy()
     };
+    ensure!(
+        policy != crate::groups::GroupPolicy::home(&owner.user_id()),
+        "the fixture policy must not be the Home policy"
+    );
     let body = json!({"name": "w3h owner axis", "display_name": "O", "policy": policy});
     let (code, created) = sim.api("O", Method::POST, "/groups", Some(body)).await?;
     ensure!(code.is_success(), "create: {code} {created}");
@@ -73,8 +107,24 @@ async fn create_group(sim: &Sim, owner: &crate::identity::UserKeypair) -> Result
         .to_string())
 }
 
-/// `member` redeems a fresh invite from O in the owner-pinned join mode and
-/// is seated.
+/// `member` redeems `link` in the owner-pinned join mode.
+async fn redeem(
+    sim: &Sim,
+    member: &str,
+    link: &str,
+    owner: &crate::identity::UserKeypair,
+) -> Result<(StatusCode, Value)> {
+    let body = json!({
+        "invite": link,
+        "display_name": member,
+        "mode": "home",
+        "expected_owner_user_id": hex::encode(owner.user_id().as_bytes()),
+    });
+    sim.api(member, Method::POST, "/groups/join", Some(body))
+        .await
+}
+
+/// `member` redeems a fresh invite from O and is seated.
 async fn join_owner(
     sim: &Sim,
     member: &str,
@@ -82,15 +132,7 @@ async fn join_owner(
     owner: &crate::identity::UserKeypair,
 ) -> Result<()> {
     let link = invite(sim, "O", group).await?;
-    let body = json!({
-        "invite": link,
-        "display_name": member,
-        "mode": "home",
-        "expected_owner_user_id": hex::encode(owner.user_id().as_bytes()),
-    });
-    let (code, joined) = sim
-        .api(member, Method::POST, "/groups/join", Some(body))
-        .await?;
+    let (code, joined) = redeem(sim, member, &link, owner).await?;
     ensure!(code.is_success(), "{member} join: {code} {joined}");
     let hex = sim.agent_hex(member)?;
     sim.until(&format!("{member} is seated"), SETUP, async |s: &Sim| {
@@ -139,15 +181,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         at(sim),
     );
     let since = sim.fabric().mark_indexed("case: A renames");
-    // A seal checks every member's certificate; the first try may start
-    // the fetches it needs.
-    let path = format!("/groups/{group}");
-    sim.until("A seals a rename", SETUP, async |s: &Sim| {
-        let body = Some(json!({"name": "w3h owner axis A"}));
-        let sealed = s.request("A", Method::PATCH, &path, body).await;
-        sealed.is_ok_and(|(code, _)| code.is_success())
-    })
-    .await?;
+    seal_rename(sim, "A", &group, "w3h owner axis A").await?;
     let head = view(sim, "A", &group).await?;
     let applied = sim
         .until("O applies A's seal", SETUP, async |s: &Sim| {
@@ -173,8 +207,9 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
 
 const C_LABELS: &[&str] = &["O", "A", "X", "J"];
 const FINAL_C: &str = "j_reseat_required_then_promoted_admin_reseats_it_with_the_owner_offline";
-const CAUSE_C: &str = "a candidate sub-check of the row fails on this build; `observed` lists \
-                       each failing step (typed state, refs, mandate kind, epochs, keys, O)";
+const CAUSE_C: &str = "the row's main observation: after the advance J stays on X's fork r+1′ \
+                       with its gap gate armed and no typed re-seat state (H-S3-c: no marker); \
+                       `observed` lists each failing candidate step";
 /// H-S3-c: "Advance 30 min".
 const GATE_WINDOW: Duration = Duration::from_secs(30 * 60);
 
@@ -275,9 +310,8 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         start_certified(sim, label, &owner, false).await?;
     }
     mesh(sim, C_LABELS).await?;
-    // O is an owned install: its deferred Home provisioning adopts a
-    // Home-shaped group and seals a commit it never publishes (#1687). Let
-    // O create its own Home first, then announce.
+    // O is an owned install: let its deferred Home provisioning finish
+    // before the announces, so it runs outside the row.
     sim.until("O provisions its Home", SETUP, async |s: &Sim| {
         let home = s.request("O", Method::GET, "/home", None).await;
         home.is_ok_and(|(code, body)| code.is_success() && body["state"] != "provisioning_pending")
@@ -302,7 +336,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     })
     .await?;
     let group = create_group(sim, &owner).await?;
-    for member in ["A", "X", "J"] {
+    for member in ["A", "X"] {
         join_owner(sim, member, &group, &owner).await?;
     }
     for admin in ["A", "X"] {
@@ -316,62 +350,52 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     // Each admin seals once before the partition: a seal starts the
     // certificate fetches it needs.
     for admin in ["A", "X"] {
-        let path = format!("/groups/{group}");
-        let name = format!("w3h c {admin} warm");
-        let mut last = String::new();
-        sim.until(&format!("{admin} can seal"), SETUP, async |s: &Sim| {
-            let body = Some(json!({"name": name}));
-            match s.request(admin, Method::PATCH, &path, body).await {
-                Ok((code, _)) if code.is_success() => true,
-                answer => {
-                    // The creator's seat carries no certificate: refresh
-                    // O's certificate announce for the retry.
-                    last = format!("{answer:?}");
-                    let body = json!({"include_user_identity": true, "human_consent": true});
-                    let _ = s.request("O", Method::POST, "/announce", Some(body)).await;
-                    false
-                }
-            }
-        })
-        .await
-        .with_context(|| format!("{admin}'s last seal answer: {last}"))?;
+        seal_rename(sim, admin, &group, &format!("w3h c {admin} warm")).await?;
         let head = view(sim, admin, &group).await?;
-        all_reach(sim, C_LABELS, &group, &head.state_hash).await?;
+        all_reach(sim, &["O", "A", "X"], &group, &head.state_hash).await?;
     }
+    // S0 skew (as `case_818`): four state-only policy changes before the
+    // mint (r is taken after them) put J's stub roster clock, seeded from
+    // r, above O's r+2 MemberAdded, so the frontier gate does not queue
+    // J's seal and the refused chain reaches the owner-anchored gap check
+    // (ADR 0109, #818 part 2). A rename bumps the roster clock too, so it cannot skew.
+    // `read_access` keeps the policy non-Home throughout.
+    for read_access in ["public", "members_only", "public", "members_only"] {
+        let path = format!("/groups/{group}/policy");
+        let body = Some(json!({"read_access": read_access}));
+        let (code, answer) = sim.api("O", Method::PATCH, &path, body).await?;
+        ensure!(code.is_success(), "policy {read_access}: {code} {answer}");
+    }
+    let head = view(sim, "O", &group).await?;
+    all_reach(sim, &["A", "X"], &group, &head.state_hash).await?;
+    // Invite I at r; J redeems it only after O removes X.
     let minted = view(sim, "O", &group).await?;
+    let link = invite(sim, "O", &group).await?;
     let (o, x, j) = (sim.peer("O")?.0, sim.peer("X")?.0, sim.peer("J")?.0);
 
-    // X is cut from O and A; its link with J stays open for r+1′ only.
-    let cut_x = move |origin: Key, dst: Key| (origin == x && dst != j) || (dst == x && origin != j);
-    let hold = install_hold(sim);
-    set_hold(sim, &hold, "X reaches J only", move |origin, dst, _| {
-        cut_x(origin, dst)
-    });
-    rename(sim, "X", &group, "w3h c X").await?;
-    let fork = view(sim, "X", &group).await?;
-    all_reach(sim, &["J"], &group, &fork.state_hash).await?;
-    let j0 = view(sim, "J", &group).await?;
-
-    // X fully cut (its catch-up loop with J is #1685). H-S3-c holds O's
-    // r+1 gossip from J; H-S3-c2 releases it.
+    // X is cut; O's r+1 publish (and its relays) is captured and held
+    // from J.
     let held: Arc<Mutex<std::collections::HashSet<[u8; 32]>>> = Arc::default();
-    let capture = Arc::new(std::sync::atomic::AtomicBool::new(!both));
+    let is_held = |held: &Arc<Mutex<std::collections::HashSet<[u8; 32]>>>,
+                   msg: Option<[u8; 32]>| {
+        msg.is_some_and(|id| held.lock().map_or(true, |h| h.contains(&id)))
+    };
+    let capture = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let held_to_j = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hold = install_hold(sim);
     {
         let (held, capture) = (Arc::clone(&held), Arc::clone(&capture));
         set_hold(
             sim,
             &hold,
-            "X cut; O's r+1 held from J (c only)",
+            "X cut; O's r+1 captured",
             move |origin, dst, msg| {
-                let Ok(mut held) = held.lock() else {
-                    return true;
-                };
-                if let (Some(id), true) = (msg, origin == o) {
+                if let (Some(id), true, Ok(mut set)) = (msg, origin == o, held.lock()) {
                     if capture.load(std::sync::atomic::Ordering::SeqCst) {
-                        held.insert(id);
+                        set.insert(id);
                     }
                 }
-                origin == x || dst == x || (dst == j && msg.is_some_and(|id| held.contains(&id)))
+                origin == x || dst == x || (dst == j && is_held(&held, msg))
             },
         );
     }
@@ -386,29 +410,105 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     })
     .await?;
     capture.store(false, std::sync::atomic::Ordering::SeqCst);
-    rename(sim, "O", &group, "w3h c O seal").await?;
+
+    // J redeems I; O seals J (r+2) and its join result carries the owner's
+    // v2 terminal attestation, which arms J's gap gate.
+    let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
+    let join_t = sim.fabric().now();
+    let (join_code, join_answer) = redeem(sim, "J", &link, &owner).await?;
+    let j_hex = sim.agent_hex("J")?;
+    let armed = sim
+        .until("O seals J and J's gap gate arms", SETUP, async |s: &Sim| {
+            let o_lists = view_now(s, "O", &group)
+                .await
+                .is_ok_and(|v| v.lists(&j_hex));
+            let gate = try_view_now(s, "J", &group).await.ok().flatten();
+            o_lists && gate.is_some_and(|v| v.gap_refusal.is_some())
+        })
+        .await
+        .is_ok();
     let sealed = view(sim, "O", &group).await?;
-    all_reach(sim, &["A"], &group, &sealed.state_hash).await?;
-    let joined_at = sim.fabric().mark_indexed("case: O's r+2 sent");
+    let gate = try_view_now(sim, "J", &group).await?;
+    let gate_text = gate
+        .as_ref()
+        .map_or_else(|| "no record".to_string(), View::describe);
+
+    // X reaches J only, and J hears only X (so its catch-up with O and A
+    // waits too, as the ADR orders it), until r+1′ lands. Then X is
+    // fully cut (its catch-up loop with J is #1685). H-S3-c keeps O's r+1
+    // gossip held from J; H-S3-c2 releases it.
+    let cut_x = move |origin: Key, dst: Key| (origin == x && dst != j) || (dst == x && origin != j);
+    set_hold(
+        sim,
+        &hold,
+        "X reaches J only; J hears only X",
+        move |origin, dst, _| cut_x(origin, dst) || (dst == j && origin != x),
+    );
+    rename(sim, "X", &group, "w3h c X").await?;
+    let fork = view(sim, "X", &group).await?;
+    let on_fork = reaches(sim, "J", &group, &fork.state_hash, SETUP).await;
+    {
+        let (held, held_to_j) = (Arc::clone(&held), Arc::clone(&held_to_j));
+        let what = match both {
+            true => "X cut; canonical r+1 released to J",
+            false => "X cut; O's r+1 gossip held from J",
+        };
+        set_hold(sim, &hold, what, move |origin, dst, msg| {
+            let to_j = dst == j && is_held(&held, msg);
+            if to_j {
+                held_to_j.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            origin == x || dst == x || (!both && to_j)
+        });
+    }
+    let j0 = try_view_now(sim, "J", &group).await?;
+    let j0_text = j0
+        .as_ref()
+        .map_or_else(|| "no record".to_string(), View::describe);
     receipt.setup_done(at(sim));
+    // Prerequisites: a missing one is INFRA, never RED.
+    let gate_reason = gate.as_ref().and_then(|v| v.gap_refusal.as_deref());
+    let armed = armed && gate_reason == Some("owner_attested_stale_base_gap");
+    let on_fork = on_fork && j0.as_ref().is_some_and(|v| v.gap_refusal.is_some());
     receipt.evidence(
-        "j_on_x_fork_and_x_removed_at_r_plus_1",
-        sealed.owner_axis
-            && fork.state_revision == minted.state_revision + 1
-            && j0.state_hash == fork.state_hash
+        "j_gap_gate_armed_by_o_v2_seal_before_the_window",
+        armed
+            && sealed.owner_axis
             && removal.state_revision == minted.state_revision + 1
             && !removal.lists(&x_hex)
             && sealed.state_revision == minted.state_revision + 2,
         format!(
-            "mint {}; X {}; J {}; O after removal {}; O after seal {}",
-            minted.state_revision,
-            fork.describe(),
-            j0.describe(),
+            "join {join_code} {join_answer}; O at the mint {}; O after removal {}; O after J's \
+             seal {}; J then {gate_text}",
+            minted.describe(),
             removal.describe(),
             sealed.describe()
         ),
         at(sim),
     );
+    receipt.evidence(
+        "j_on_x_fork_at_r_plus_1_prime_with_its_gate",
+        on_fork && fork.state_revision == minted.state_revision + 1,
+        format!("X {}; J {j0_text}", fork.describe()),
+        at(sim),
+    );
+    if !(armed && on_fork) {
+        // INFRA: name the daemons' WARN logs since J's join.
+        let logs: Vec<String> = sim
+            .logs_containing(&[])
+            .into_iter()
+            .filter(|log| log.at >= join_t)
+            .take(40)
+            .map(|log| log.text.chars().take(300).collect())
+            .collect();
+        receipt.note(format!("WARN logs since J's join: {}", logs.join(" | ")));
+        // On `main` (28 Oct 2026) O's seal carries the owner mandate, so
+        // `classify_refused_joiner_fork_chain` returns at the owner-mandate
+        // check before it records the gap (#1689 rc1 evidence).
+        receipt.note("J's gate did not arm before the window: the row's prerequisite is missing");
+        receipt.finish(FINAL_C, false, at(sim));
+        return Ok(());
+    }
 
     // The advance: J's recovery states, sampled each poll.
     let mut states: Vec<String> = Vec::new();
@@ -441,6 +541,20 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     };
     let first_typed = states.iter().position(|s| s.contains("reseat_required"));
     let unchanged = first_typed.is_some_and(|i| states[i..].iter().all(|s| *s == states[i]));
+    let home_gated = states.iter().any(|s| s.contains("home_gate_closed"));
+    receipt.evidence(
+        "j_recovery_not_home_gated",
+        !home_gated,
+        format!("J's recovery states over the advance {states:?}"),
+        at(sim),
+    );
+    // The row's `main` observation (ADR 0109 §10): J stays on X's fork
+    // with its gate armed and no typed state in any sample.
+    let baseline = j1.state_hash == fork.state_hash
+        && j1.gap_refusal.is_some()
+        && !states.is_empty()
+        && states.iter().all(|s| s == "None{None}")
+        && (both || j1.marker.is_none());
     let to_j = delivered_after(sim, "O", "J", joined_at)?;
     receipt.request_delivered(
         "o_reached_j",
@@ -452,8 +566,10 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         .as_ref()
         .map_or_else(|| "404".to_string(), Status::describe);
     receipt.note(format!(
-        "after the advance: J {j_text}; J {}; states {states:?}",
-        j1.describe()
+        "after the advance: J {j_text}; J {}; states {states:?}; O's r+1 gossip frames to J \
+         after r+1′ (held in c, released in c2): {}",
+        j1.describe(),
+        held_to_j.load(std::sync::atomic::Ordering::SeqCst)
     ));
 
     // The capability floor: A holds O's current mandate advert, then O stops.
@@ -478,7 +594,6 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         .await
         .is_ok();
     sim.stop("O", RestartMode::Graceful).await?;
-    let j_hex = sim.agent_hex("J")?;
     let path = format!("/groups/{group}/members/{j_hex}");
     let (code, body) = sim.api("A", Method::DELETE, &path, None).await?;
     ensure!(code.is_success(), "A removes J: {code} {body}");
@@ -539,7 +654,10 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         head.describe()
     ));
     let mut checks: Vec<(&str, bool)> = vec![
-        ("j_gate_armed", j1.gap_refusal.is_some()),
+        (
+            "j_gate_still_armed_after_the_advance",
+            j1.gap_refusal.is_some(),
+        ),
         ("j_typed_reseat_required_not_on_chain", typed),
         (
             if both {
@@ -606,7 +724,8 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             j1.describe(),
             head.describe()
         );
-        receipt.cause(CAUSE_C, Some(observed), true, at(sim));
+        // RED only with the row's own baseline; any other failure is INFRA.
+        receipt.cause(CAUSE_C, Some(observed), baseline, at(sim));
     }
     receipt.finish(FINAL_C, failing.is_empty(), at(sim));
     Ok(())
