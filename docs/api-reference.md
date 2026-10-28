@@ -3582,20 +3582,32 @@ reaper counters:
 
 ### `GET /diagnostics/dm`
 
-`stats.incoming_dropped_revoked` counts DMs and ACKs dropped because the
-sender's agent is revoked, or because a machine this cache still
-attributes to that sender is revoked. An overflowed attribution set
-does not by itself refuse an unattested message. The daemon refuses
-for overflow only when a revoked machine is also attributed to that
-sender. That refusal increments `incoming_dropped_revoked`. An internal
-counter for the same drop stays off this response. The daemon emits a
-rate-limited warning for it, one remembered sender at a time, for 256
-senders. A further sender shares one interval. One remembered sender
-cannot suppress the warning for a different remembered sender.
-Stranger-budget eviction is the same kind of warning. A machine past the
-per-agent cap is not recorded, and a revocation of that machine does not
-move `incoming_dropped_revoked` for an unattested DM or ACK that claims
-a different, clean machine.
+`stats.incoming_dropped_revoked` counts every DM or ACK the inbox drops
+for one of these reasons:
+
+- the sender's agent is revoked
+- a machine this cache still attributes to that sender is revoked
+- the sender's attribution set overflowed and a revoked machine is also
+  attributed to that sender
+- the stranger revocation pin cap is full (2,048 pinned pairs, half of
+  the 4,096 stranger share) and the sender is a stranger
+
+An overflowed attribution set does not by itself refuse an unattested
+message. The pin-cap refusal does. It is fail-closed for a new
+unattested stranger DM or ACK, including one that claims a clean machine
+this cache does not attribute. A Trusted or Known contact, and a
+protected non-contact, are not refused for the pin cap. Each of those
+refusals increments `incoming_dropped_revoked`. An internal counter for
+the overflow and pin-cap drops stays off this response. The daemon emits
+a rate-limited warning for them, one remembered sender at a time, for
+256 senders. A further sender shares one interval while every remembered
+interval is still open. A slot whose interval has expired is reused. One
+remembered sender cannot suppress the warning for a different remembered
+sender. Stranger-budget eviction is the same kind of warning. A machine
+past the per-agent cap is not recorded. A revocation of that unrecorded
+machine does not move `incoming_dropped_revoked` for an unattested DM or
+ACK that claims a different, clean machine, unless the pin-cap rule
+above already refuses that stranger.
 
 `x0x diagnostics dm [--agent <64-hex-agent-id>]` adds `per_peer_digest` (schema 2)
 to the existing DM diagnostics. Optional `?agent=<64-hex-agent-id>` selects exactly

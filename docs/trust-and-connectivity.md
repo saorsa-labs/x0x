@@ -332,12 +332,17 @@ protected non-contact share of 16,384, and a stranger LRU of 4,096, and
 is not recorded, and the restart residual are in
 [ADR-0021 mechanics](design/adr-0021-mechanics.md). An unknown revocation
 answer does not evict a protected pair or a stranger pair and does not
-count as a confirmed revocation. A revoked pair in either share stays
-pinned, up to 2 machines for that agent. Overflow does not
-refuse an unattested DM or ACK by itself. When it does refuse, because
-a revoked machine is also attributed, the drop increments
-`incoming_dropped_revoked`. An unattested DM or ACK that
-claims a different, clean machine can still be accepted. An agent-key
+count as a confirmed revocation. A revoked pair in the protected share
+stays pinned, up to 2 machines for that agent. A revoked stranger pair
+stays pinned on the same per-agent limit, and only up to 2,048 pins in
+the stranger share. Eviction does not drop one of those pins to make
+room. When that pin cap is full, an unattested DM or ACK from a stranger
+is refused. Overflow does not refuse an unattested DM or ACK by itself.
+When the daemon does refuse, because a revoked machine is also
+attributed, or because the stranger pin cap is full, the drop increments
+`incoming_dropped_revoked`. An unattested DM or ACK that claims a
+different, clean machine can still be accepted when the sender is not a
+stranger under a full pin cap. An agent-key
 compromise is not stopped by this check: the holder can mint a fresh
 machine and a valid attestation.
 A binding tombstone blocks only the named pair. Containing the
