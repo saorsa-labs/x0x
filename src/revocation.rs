@@ -1047,6 +1047,26 @@ impl RevocationSet {
         self.revoked_machines.contains(id)
     }
 
+    /// Machines named by a binding tombstone for `agent`.
+    ///
+    /// The list is the union of ad-hoc binding records and bundle-retired
+    /// pairings. Callers use it to attribute a machine revocation to an
+    /// agent (#1659). It does not itself mean the machine is revoked.
+    #[must_use]
+    pub(crate) fn binding_tombstone_machines(&self, agent: &AgentId) -> Vec<MachineId> {
+        let mut machines = Vec::new();
+        for &(id, machine) in self
+            .binding_epochs
+            .keys()
+            .chain(self.bundle_retired_epochs.keys())
+        {
+            if &id == agent && !machines.contains(&machine) {
+                machines.push(machine);
+            }
+        }
+        machines
+    }
+
     /// Whether an `(agent, machine)` binding is retired (ADR-0043 check
     /// **B**): the grow-only union of bundle `retired_bindings` and ad-hoc
     /// v2 tombstones.

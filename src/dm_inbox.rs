@@ -1471,6 +1471,30 @@ async fn durable_history_logical_request(
 }
 
 impl InboxPipeline {
+    /// #1659: an unattested DM is refused when any machine this inbox
+    /// attributes to `agent` is revoked.
+    ///
+    /// Attribution is the retained binding, a contact machine, a binding
+    /// tombstone, or the machine the envelope claims. Locks are taken one
+    /// at a time: the contact read ends before the revocation read.
+    async fn unattested_sender_has_machine_revocation(
+        &self,
+        agent: AgentId,
+        retained: Option<MachineId>,
+        claimed: MachineId,
+    ) -> bool {
+        let contact_machines: Vec<MachineId> = self
+            .contacts
+            .read()
+            .await
+            .machines(&agent)
+            .iter()
+            .map(|record| record.machine_id)
+            .collect();
+        let revoked = self.revocation_set.read().await;
+        sender_has_known_machine_revocation(&revoked, &agent, retained, claimed, &contact_machines)
+    }
+
     async fn handle_incoming(
         &self,
         msg: PubSubMessage,
@@ -1630,7 +1654,13 @@ impl InboxPipeline {
         // where the envelope machine claim is sender-controlled: prefer the
         // retained machine from an accepted, verified identity announcement;
         // the claim is only a best-effort fallback for agents with no
-        // authenticated binding. See docs/adr/0021-dm-origin-machine-attestation.md.
+        // authenticated binding. See docs/design/adr-0021-mechanics.md.
+        //
+        // #1659 (David, 28 Oct 2026): once any machine the inbox attributes
+        // to this sender is revoked, an absent attestation is a refusal.
+        // Both subscription loops (inbox topic and compatibility bus) call
+        // this function. A valid attestation still takes the Ok(Some) arm.
+        // A sender with no known machine revocation keeps this path.
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let claimed_machine_id = MachineId(envelope.sender_machine_id);
         //
@@ -1679,6 +1709,33 @@ impl InboxPipeline {
                     .write()
                     .await
                     .resolve(&sender_agent_id);
+                // A claim that disagrees with the retained binding is already
+                // a drop below. The refusal applies when this path would
+                // otherwise accept the DM (credit the binding, or take the
+                // claim fallback).
+                let accepts_unattested = !matches!(
+                    authenticated_machine_id,
+                    Some(authenticated) if authenticated != claimed_machine_id
+                );
+                if accepts_unattested
+                    && self
+                        .unattested_sender_has_machine_revocation(
+                            sender_agent_id,
+                            authenticated_machine_id,
+                            claimed_machine_id,
+                        )
+                        .await
+                {
+                    self.dm.record_incoming_dropped_revoked();
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "inbound_unattested_after_machine_revocation",
+                        sender = %hex::encode(envelope.sender_agent_id),
+                        claimed_machine = %hex::encode(claimed_machine_id.as_bytes()),
+                        "DM dropped: unattested after a machine revocation for this agent"
+                    );
+                    return;
+                }
                 match authenticated_machine_id {
                     Some(authenticated) if authenticated != claimed_machine_id => {
                         self.dm.record_incoming_trust_rejected(sender_agent_id);
@@ -2772,6 +2829,35 @@ fn drop_if_sender_revoked(
     } else {
         false
     }
+}
+
+/// #1659: whether an unattested DM's sender has a known machine revocation.
+///
+/// A machine revocation counts when the inbox can attribute that machine to
+/// the sender. An unrelated machine revocation does not.
+fn sender_has_known_machine_revocation(
+    revoked: &RevocationSet,
+    agent: &AgentId,
+    retained: Option<MachineId>,
+    claimed: MachineId,
+    contact_machines: &[MachineId],
+) -> bool {
+    if revoked.is_machine_revoked(&claimed) {
+        return true;
+    }
+    if retained.is_some_and(|machine| revoked.is_machine_revoked(&machine)) {
+        return true;
+    }
+    if contact_machines
+        .iter()
+        .any(|machine| revoked.is_machine_revoked(machine))
+    {
+        return true;
+    }
+    revoked
+        .binding_tombstone_machines(agent)
+        .into_iter()
+        .any(|machine| revoked.is_machine_revoked(&machine))
 }
 
 /// Register a gossip-DM sender's agent→machine pairing in DirectMessaging —
@@ -5053,19 +5139,12 @@ mod tests {
         );
     }
 
-    /// #213 TRANSITION-WINDOW RESIDUAL — pinned, documented behavior (ADR
-    /// 0021 "Downgrade / mixed-version"). An attacker holding the agent key
-    /// STRIPS the attestation entirely: the envelope degrades to the legacy
-    /// claim path, and on a cold receiver with no retained binding the
-    /// claim of unrevoked machine B is accepted even though the true origin
-    /// A is revoked. Under the transition policy (accept-with-binding-
-    /// fallback for unattested DMs) this DM IS delivered — the exact
-    /// residual #213 narrows to unattested senders only.
-    ///
-    /// This test intentionally asserts the residual EXISTS: when the
-    /// `DmCapabilities` attestation hard-require follow-up lands, delivery
-    /// stops and this test must be flipped to `assert_no_delivery` — it
-    /// fails-positive the day the residual actually closes.
+    /// #213 strip residual, after #1659. The receiver has no retained binding
+    /// and does not attribute revoked origin A to the sender: A is not a
+    /// contact machine and not a binding tombstone. ADR 0021 still accepts
+    /// the clean claim of B. #1659 refuses the same strip once a machine
+    /// revocation is known for the sender
+    /// (`issue1659_unattested_pre213_claim_is_refused_when_agent_machine_is_revoked`).
     #[tokio::test]
     async fn strip_downgrade_residual_delivered_under_transition_policy() {
         let sender = test_keypair();
@@ -5083,15 +5162,170 @@ mod tests {
 
         let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
             .await
-            .expect(
-                "transition policy accepts unattested DMs on the claim path — \
-                 flip this to assert_no_delivery when the hard-require lands",
-            )
+            .expect("ADR 0021 still accepts this unattributed strip")
             .expect("delivery stream closed");
         assert_eq!(
             delivered.machine_id, unrevoked_b,
             "strip residual: the unattested claim of B is accepted (ADR 0021 residual)"
         );
+    }
+
+    async fn record_contact_machine(harness: &InboxHarness, agent: &AgentId, machine: MachineId) {
+        harness
+            .pipeline
+            .contacts
+            .write()
+            .await
+            .add_machine(agent, crate::contacts::MachineRecord::new(machine, None));
+    }
+
+    async fn insert_machine_revocation(harness: &InboxHarness, machine: &MachineKeypair) {
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(machine.machine_id()),
+            machine.public_key(),
+            machine.secret_key(),
+            now_unix_ms() / 1000,
+            Some("compromised machine".to_string()),
+        )
+        .expect("sign machine revocation");
+        harness
+            .pipeline
+            .revocation_set
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("insert machine revocation");
+    }
+
+    /// #1659: the absent-attestation path credits a DM to the retained clean
+    /// binding. A second machine of the same agent is revoked and still
+    /// recorded on the contact (announcements keep that record). An
+    /// unattested DM that names the clean binding must be refused on both
+    /// subscription loops (per-agent inbox topic and the compatibility bus).
+    /// Both loops call `handle_incoming`; `ack_legacy_bus` is the only
+    /// difference between them.
+    #[tokio::test]
+    async fn issue1659_unattested_dm_naming_clean_binding_is_refused() {
+        let sender = test_keypair();
+        let clean = MachineKeypair::generate().expect("clean machine keygen");
+        let revoked = MachineKeypair::generate().expect("revoked machine keygen");
+        let mut harness = make_inbox_harness(&sender, Some(clean.machine_id()), None).await;
+        record_contact_machine(&harness, &sender.agent_id(), revoked.machine_id()).await;
+        insert_machine_revocation(&harness, &revoked).await;
+
+        for (ack_legacy_bus, request_byte) in [(false, 0x71u8), (true, 0x72u8)] {
+            let message = payload_message(&harness, &sender, clean.machine_id(), request_byte);
+            harness
+                .pipeline
+                .handle_incoming(
+                    message,
+                    ack_legacy_bus,
+                    crate::dm::DmAckIngress::Subscription,
+                )
+                .await;
+        }
+
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            2,
+            "each unattested DM must hit the machine-revocation refusal"
+        );
+    }
+
+    /// #1659, pre-#213 peer: no retained binding, so today's code accepts the
+    /// clean claim. The sender's contact still names a revoked machine, so
+    /// the unattested DM is refused.
+    #[tokio::test]
+    async fn issue1659_unattested_pre213_claim_is_refused_when_agent_machine_is_revoked() {
+        let sender = test_keypair();
+        let revoked = MachineKeypair::generate().expect("revoked machine keygen");
+        let clean_claim = MachineId([0xE5; 32]);
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        record_contact_machine(&harness, &sender.agent_id(), revoked.machine_id()).await;
+        insert_machine_revocation(&harness, &revoked).await;
+
+        let message = payload_message(&harness, &sender, clean_claim, 0x73);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            1
+        );
+    }
+
+    /// #1659 control: a machine revocation for some other device does not
+    /// belong to this agent. The absent-attestation path still delivers.
+    #[tokio::test]
+    async fn issue1659_unattested_dm_accepted_when_agent_has_no_machine_revocation() {
+        let sender = test_keypair();
+        let clean = MachineId([0xC6; 32]);
+        let unrelated = MachineKeypair::generate().expect("unrelated machine keygen");
+        let mut harness = make_inbox_harness(&sender, Some(clean), None).await;
+        record_contact_machine(&harness, &sender.agent_id(), clean).await;
+        insert_machine_revocation(&harness, &unrelated).await;
+
+        let message = payload_message(&harness, &sender, clean, 0x74);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("an agent with no machine revocation still accepts an unattested DM")
+            .expect("delivery stream closed");
+        assert_eq!(delivered.sender, sender.agent_id());
+        assert_eq!(delivered.machine_id, clean);
+        assert_eq!(delivered.trust_decision, Some(TrustDecision::Accept));
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            0
+        );
+    }
+
+    /// #1659: a fresh origin attestation still authenticates the current
+    /// machine after another machine of the same agent was revoked.
+    #[tokio::test]
+    async fn issue1659_attested_dm_accepted_when_another_machine_is_revoked() {
+        let sender = test_keypair();
+        let clean = MachineKeypair::generate().expect("clean machine keygen");
+        let revoked = MachineKeypair::generate().expect("revoked machine keygen");
+        let mut harness = make_inbox_harness(&sender, Some(clean.machine_id()), None).await;
+        record_contact_machine(&harness, &sender.agent_id(), revoked.machine_id()).await;
+        insert_machine_revocation(&harness, &revoked).await;
+
+        let message = attested_payload_message(&harness, &sender, &clean, 0x75);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("a valid origin attestation is still accepted")
+            .expect("delivery stream closed");
+        assert_eq!(delivered.machine_id, clean.machine_id());
+        assert_eq!(delivered.trust_decision, Some(TrustDecision::Accept));
     }
 
     /// #213 REPLAY: an attestation captured from DM-1 (request R1) is

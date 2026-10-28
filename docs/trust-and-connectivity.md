@@ -307,6 +307,11 @@ store confirms that agent on that machine:
 - the authenticated binding. Its writers are class A announcements, ADR 0021
   origin attestations, and one local source: a card the local user imports
   (`POST /agent/card/import`, token-authenticated, `Agent::pin_card_binding`).
+  Once any machine the DM inbox attributes to a sender is revoked, an
+  unattested DM on the inbox topic or the compatibility bus is refused
+  (#1659; David, 28 Oct 2026). The attribution set and the remaining
+  absent-attestation path are in
+  [ADR-0021 mechanics](design/adr-0021-mechanics.md).
   A card import is a local-user pin for its (agent, machine). It is
   newest-wins, so a stale card never rolls back a fresher binding. No network
   input reaches it.

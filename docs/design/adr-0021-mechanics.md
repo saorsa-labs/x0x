@@ -61,6 +61,32 @@ revoked origin A fails even when the envelope claims unrevoked B: claiming B
 requires B's machine signature (unforgeable), and carrying A's valid
 attestation names A, which EP3 rejects.
 
+### Absent attestation after a machine revocation (#1659)
+
+David approved this receiver rule on 28 Oct 2026 at 02:08 GMT. The wire
+format is unchanged.
+
+Once any machine the inbox attributes to the sender is revoked,
+`InboxPipeline::handle_incoming` refuses an unattested DM. The per-agent
+inbox topic and the compatibility gossip bus both use that function.
+
+The inbox attributes these machines to the sender:
+
+- the retained authenticated binding
+- a machine on the sender's contact
+- a machine named by a binding tombstone for that agent
+- the machine the envelope claims
+
+An older pre-#213 peer of that sender is refused the same way. A valid
+origin attestation is still accepted. EP3 still drops an attested DM whose
+resolved machine is revoked.
+
+A sender with none of those machines revoked keeps the absent-attestation
+path above. A machine revocation for some other device does not change that
+sender's path. A cold receiver that cannot attribute the revoked machine to
+the sender still follows the ADR 0021 claim fallback. That is the remaining
+strip residual.
+
 ---
 
 ### Portable-agent move policy (A → B)
