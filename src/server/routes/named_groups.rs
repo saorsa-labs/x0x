@@ -47212,6 +47212,7 @@ pub(in crate::server) mod tests {
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
+    mod issue1649_reseat_mandate_receive;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
