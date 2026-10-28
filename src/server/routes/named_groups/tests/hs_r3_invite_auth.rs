@@ -769,6 +769,115 @@ async fn join_tampered_base_refuses_before_missing_owner_countersignature() -> R
     Ok(())
 }
 
+/// ADR 0109 §3a check 1 and row H-S3-rm4 (1)/(2): a re-seat invite that
+/// arrives at plain `POST /groups/join` is refused as
+/// `reseat_invite_outside_staging`, before any stub, and is counted under
+/// that reason. The invite has the shape that only §3a's mint makes: an
+/// owner-axis policy, signed by the inviter alone, with no inline owner
+/// key. An ordinary owner-axis invite with only its countersignature
+/// removed keeps `invite_owner_countersignature_missing`. Inert (offline
+/// agents, no network).
+#[tokio::test]
+async fn reseat_invite_at_plain_join_is_refused_outside_staging() -> Result<()> {
+    let (authority, _dir, owner_kp) = r3_owner_authority_state().await?;
+    let group_id = "9e".repeat(32);
+    r3_insert_group(&authority, &group_id, r3_owner_certified_policy(&owner_kp)).await;
+    let info = authority
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .context("seeded group")?;
+
+    let dir = tempfile::tempdir()?;
+    let joiner_agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key(AgentKeypair::generate()?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await?,
+    );
+    let joiner = secure_endpoint_test_state_at(dir.path(), joiner_agent).await?;
+
+    // The §3a mint (`mint_reseat_invite`): agent key alone, addressed to
+    // the subject, no owner key and no owner countersignature.
+    let mut reseat = x0x::groups::invite::SignedInvite::new(
+        info.mls_group_id.clone(),
+        info.name.clone(),
+        &authority.agent.agent_id(),
+        x0x::groups::invite::DEFAULT_EXPIRY_SECS,
+    );
+    crate::server::routes::identity::populate_invite_base_state_v4(
+        &mut reseat,
+        &info,
+        Some(joiner.agent.agent_id()),
+    );
+    reseat
+        .sign_v4(authority.agent.identity().agent_keypair(), None)
+        .map_err(|e| anyhow::anyhow!("re-seat sign failed: {e:?}"))?;
+    assert!(reseat.owner_public_key_b64.is_none());
+
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner)),
+        Json(JoinGroupRequest {
+            invite: reseat.to_link(),
+            display_name: None,
+            mode: Some("home".into()),
+            expected_owner_user_id: Some(hex::encode(owner_kp.user_id().as_bytes())),
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = response_json(response).await?.1;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("reseat_invite_outside_staging")),
+        "a re-seat invite outside the staging join has its own reason"
+    );
+    assert!(
+        joiner.named_groups.read().await.is_empty(),
+        "the refusal comes before any stub"
+    );
+
+    // Control: an ordinary owner-axis invite, countersignature removed.
+    let (owner_invite, _) = assemble_signed_v4_invite(
+        &authority,
+        &info,
+        x0x::groups::invite::DEFAULT_EXPIRY_SECS,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("v4 mint failed: {e:?}"))?;
+    let mut stripped = owner_invite;
+    stripped.owner_countersignature_b64 = None;
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner)),
+        Json(JoinGroupRequest {
+            invite: stripped.to_link(),
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = response_json(response).await?.1;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (
+            StatusCode::CONFLICT,
+            json!("invite_owner_countersignature_missing")
+        ),
+        "an ordinary invite keeps the countersignature reason"
+    );
+    assert!(joiner.named_groups.read().await.is_empty());
+    Ok(())
+}
+
 /// r3 (#468 A5 / Fable 2 + Codex 9) → r4 (addendum item 7): fork
 /// evidence through the REAL wrapper — the first authenticated
 /// conflicting commit records ONE evidence entry durably (the lineage

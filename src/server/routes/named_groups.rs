@@ -7417,7 +7417,11 @@ pub(in crate::server) async fn persist_named_group_info(
     group_id: &str,
     info: x0x::groups::GroupInfo,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    let stable = info.stable_group_id().to_string();
     let outcome = persist_named_group_info_inner(state, group_id, info).await;
+    // ADR 0109 §4 (#1570 review): a held-back placeheld group's change is
+    // not durable, even when the roster file is.
+    let outcome = group_recovery::held_back_outcome(state, &stable, outcome);
     if matches!(
         &outcome,
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
@@ -21892,6 +21896,20 @@ pub(in crate::server) async fn join_group_via_invite(
     join_group_via_invite_inner(state, req, false).await
 }
 
+/// ADR 0109 §3a: the shape that only the promoted-admin re-seat mint
+/// makes. The policy has an owner axis, and the inviter-signed view has no
+/// inline owner key. An ordinary mint on an owner axis always carries the
+/// owner key (else `MintInviteError::OwnerKeyUnavailable`), and the key is
+/// inside the inviter-signed view, so it cannot be removed after signing.
+/// No new invite field is used.
+fn is_reseat_invite_shape(invite: &x0x::groups::invite::SignedInvite) -> bool {
+    invite.owner_public_key_b64.is_none()
+        && invite
+            .policy
+            .as_ref()
+            .is_some_and(|policy| policy.admission.owner_certified_user_id().is_some())
+}
+
 /// `POST /groups/join`, and (with `reseat_staging`) ADR 0109 §3's staged
 /// join. A staged join may redeem §3a's promoted-admin re-seat invite,
 /// which has no owner countersignature: its caller has already run §3a's
@@ -22091,10 +22109,17 @@ pub(super) async fn join_group_via_invite_inner(
     // sigs, owner half (A2 step 8): the owner countersignature verifies
     // only after the base it commits to has re-derived.
     if let Err(refusal) = invite.verify_v4_owner_countersignature() {
-        let reseat_invite = reseat_staging
-            && refusal == x0x::groups::invite::InviteRefusal::OwnerCountersignatureMissing;
-        if !reseat_invite {
-            return refuse_invite(&state, &invite, refusal.reason());
+        let missing = refusal == x0x::groups::invite::InviteRefusal::OwnerCountersignatureMissing;
+        let staged_reseat = reseat_staging && missing;
+        if !staged_reseat {
+            let reason = if missing && is_reseat_invite_shape(&invite) {
+                // ADR 0109 §3a check 1: a re-seat invite is redeemed
+                // only through the §3 staging join.
+                "reseat_invite_outside_staging"
+            } else {
+                refusal.reason()
+            };
+            return refuse_invite(&state, &invite, reason);
         }
     }
 

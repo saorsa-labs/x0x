@@ -1214,10 +1214,11 @@ fn placeheld_key<'a>(
 /// wholly after that change.
 ///
 /// #1570: when one group's authoritative record cannot be made durable,
-/// only that group is held back. Its legacy entry stays in its last durable
-/// form ([`unsynced_legacy_entry`]), it is marked `authoritative_failed`
-/// (its transition is not published, [`confirm_placeheld_write`]), and the
-/// other groups are saved.
+/// only that group is held back. Its legacy entry under every key stays in
+/// its last durable form ([`unsynced_legacy_entry`]), it is marked
+/// `authoritative_failed` (its transition is not published,
+/// [`confirm_placeheld_write`], [`held_back_outcome`]), and the other
+/// groups are saved.
 ///
 /// # Errors
 ///
@@ -1265,9 +1266,12 @@ pub(super) async fn legacy_store_view(
         };
         for (key, info) in groups {
             if info.stable_group_id() == stable.as_str() {
+                // #1570 review: every key of a held-back group keeps the
+                // last durable form. An alias never gets a placeholder of
+                // a live record that has no durable backing.
                 let legacy = match &held_back {
-                    Some(held) if *key == canonical => held.clone(),
-                    _ => s3_placeholder(info),
+                    Some(held) => held.clone(),
+                    None => s3_placeholder(info),
                 };
                 view.get_or_insert_with(|| groups.clone())
                     .insert(key.clone(), legacy);
@@ -1440,9 +1444,10 @@ async fn unsynced_legacy_entry(
 /// `ReplacedNotDurable` when a durable authoritative record backs the
 /// placeholder on disk (the record stays contained and the worker writes
 /// again), `Dropped` when none does (the legacy views hold the real
-/// record, so the arming is rolled back).
+/// record, so the arming is rolled back). A `ReplacedNotDurable` input
+/// (see [`held_back_outcome`]) follows the same rule.
 fn confirm_placeheld_write(state: &AppState, stable: &str, write: LegacyWrite) -> LegacyWrite {
-    if write != LegacyWrite::Durable {
+    if write == LegacyWrite::Dropped {
         return write;
     }
     with_placeheld(state, |placeheld| match placeheld.get(stable) {
@@ -1455,6 +1460,33 @@ fn confirm_placeheld_write(state: &AppState, stable: &str, write: LegacyWrite) -
         }
         _ => write,
     })
+}
+
+/// #1570 review, §4 "publish only when both are durable": the outcome of
+/// a per-group roster save for `stable`'s group. A `Durable` roster save
+/// is `ReplacedNotDurable` for a placeheld group whose authoritative write
+/// failed in that save: its legacy entry kept its last durable form, so
+/// its change is not durable yet. The worker writes it again. Other
+/// outcomes do not change.
+pub(super) fn held_back_outcome(
+    state: &AppState,
+    stable: &str,
+    outcome: std::io::Result<super::AtomicWriteOutcome>,
+) -> std::io::Result<super::AtomicWriteOutcome> {
+    use super::AtomicWriteOutcome;
+    let held_back = || {
+        with_placeheld(state, |placeheld| {
+            placeheld
+                .get(stable)
+                .is_some_and(|entry| entry.authoritative_failed)
+        })
+    };
+    match outcome {
+        Ok(AtomicWriteOutcome::Durable) if held_back() => {
+            Ok(AtomicWriteOutcome::ReplacedNotDurable)
+        }
+        outcome => outcome,
+    }
 }
 
 fn is_placeheld(state: &AppState, stable: &str) -> bool {
@@ -5414,8 +5446,27 @@ async fn mint_reseat_invite(
 
 // ─── §3 The subject's staged join and swap ─────────────────────────────────
 
-async fn refuse_authorisation(state: &AppState, stable: &str, revision: u64, cause: &str) {
-    tracing::info!(group_id = %LogHexId::group(stable), cause, "ADR 0109 S3: authorisation_refused");
+/// The `cause` that `authorisation_refused {cause}` reports (§3, row
+/// H-S3-d3): `signature`, `signer`, `subject`, `basis`,
+/// `base_seats_subject` or `expired`. The internal checks give finer
+/// causes; each signer check maps to `signer`, the subject check to
+/// `subject` and each basis check to `basis`. Any other cause is reported
+/// as it is. The log keeps the fine cause.
+fn authorisation_refused_cause(check: &str) -> &str {
+    match check {
+        "signer_not_inviter"
+        | "signer_not_admin_on_base"
+        | "signer_not_admin_locally"
+        | "signer_revoked" => "signer",
+        "subject_mismatch" => "subject",
+        "basis_not_live" | "basis_unknown" => "basis",
+        other => other,
+    }
+}
+
+async fn refuse_authorisation(state: &AppState, stable: &str, revision: u64, check: &str) {
+    let cause = authorisation_refused_cause(check);
+    tracing::info!(group_id = %LogHexId::group(stable), cause, check, "ADR 0109 S3: authorisation_refused");
     let now = Instant::now();
     let mut inner = state.group_recovery.inner.lock().await;
     let subject = inner
@@ -10569,6 +10620,126 @@ mod tests {
         Ok(())
     }
 
+    /// #1570 review: a held-back group keeps its last durable form under
+    /// every key that holds it, not only under its canonical key. An alias
+    /// key keeps the placeholder of the durable authoritative record, not
+    /// a placeholder of the changed live record that has no backing.
+    #[tokio::test]
+    async fn an_unwritable_sidecar_keeps_every_alias_in_its_durable_form() -> anyhow::Result<()> {
+        use super::super::AtomicWriteOutcome;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let alias = format!("{key}-alias");
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(alias.clone(), info.clone());
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+        let durable = legacy_entry(&state.named_groups_path, &alias)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("armed alias entry"))?;
+        assert!(s3::is_s3_placeholder(&durable));
+
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::remove_file(&path).await?;
+        tokio::fs::create_dir_all(path.join("blocked")).await?;
+        {
+            let mut groups = state.named_groups.write().await;
+            for spelling in [&key, &alias] {
+                if let Some(live) = groups.get_mut(spelling.as_str()) {
+                    live.description = "changed while blocked".to_string();
+                }
+            }
+        }
+        let outcome = super::super::save_named_groups_checked(&state).await;
+        assert!(matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+        for spelling in [&key, &alias] {
+            let held = legacy_entry(&state.named_groups_path, spelling)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("held legacy entry"))?;
+            assert_eq!(
+                serde_json::to_value(&held)?,
+                serde_json::to_value(&durable)?,
+                "{spelling} keeps the durable placeholder"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1570 review: before any authoritative record is durable, a failed
+    /// authoritative write keeps the real record under every key of the
+    /// group. No alias gets a placeholder that has no backing.
+    #[tokio::test]
+    async fn a_held_back_alias_never_gets_a_placeholder_without_backing() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let alias = format!("{key}-alias");
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(alias.clone(), info.clone());
+        tokio::fs::write(sidecar_dir(&state), b"not a directory").await?;
+        begin_placehold(&state, &key, &info);
+        let outcome = super::super::save_named_groups_checked(&state).await;
+        assert_eq!(
+            confirm_placeheld_write(&state, &stable, LegacyWrite::of(&outcome)),
+            LegacyWrite::Dropped
+        );
+        for spelling in [&key, &alias] {
+            let legacy = legacy_entry(&state.named_groups_path, spelling)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+            assert!(
+                !s3::is_s3_placeholder(&legacy),
+                "{spelling}: no placeholder without backing"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1570 review, ADR 0109 §4 "publish only when both are durable": a
+    /// per-group save of a held-back group does not report `Durable` while
+    /// the group's authoritative write failed. Once the sidecar is
+    /// writable again, the same save is `Durable`.
+    #[tokio::test]
+    async fn a_held_back_group_save_is_not_reported_durable() -> anyhow::Result<()> {
+        use super::super::AtomicWriteOutcome;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::remove_file(&path).await?;
+        tokio::fs::create_dir_all(path.join("blocked")).await?;
+        let mut next = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("live record"))?;
+        next.description = "changed while blocked".to_string();
+        let outcome = super::super::persist_named_group_info(&state, &key, next.clone()).await;
+        assert!(
+            !matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "the authoritative write failed, so the save is not durable: {outcome:?}"
+        );
+
+        tokio::fs::remove_dir_all(&path).await?;
+        next.description = "changed after unblock".to_string();
+        let outcome = super::super::persist_named_group_info(&state, &key, next).await;
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "both writes are durable: {outcome:?}"
+        );
+        Ok(())
+    }
+
     /// ADR 0109 §4 "Crash reconciliation at load", file level only (no
     /// daemon): the loader's splice replaces a placeholder by the record
     /// its binding names, keeps the stronger containment, keeps a real
@@ -10836,6 +11007,28 @@ mod tests {
         )
     }
 
+    /// ADR 0109 row H-S3-d3: the reported `authorisation_refused` cause
+    /// uses the ADR words. Each fine internal check maps to one of them.
+    #[test]
+    fn authorisation_refused_cause_uses_the_adr_vocabulary() {
+        for (check, cause) in [
+            ("signature", "signature"),
+            ("signer_not_inviter", "signer"),
+            ("signer_not_admin_on_base", "signer"),
+            ("signer_not_admin_locally", "signer"),
+            ("signer_revoked", "signer"),
+            ("subject_mismatch", "subject"),
+            ("basis_not_live", "basis"),
+            ("basis_unknown", "basis"),
+            ("base_seats_subject", "base_seats_subject"),
+            ("expired", "expired"),
+            ("group_mismatch", "group_mismatch"),
+            ("reseat_invite_unpaired", "reseat_invite_unpaired"),
+        ] {
+            assert_eq!(authorisation_refused_cause(check), cause, "{check}");
+        }
+    }
+
     /// #1533 review (Codex P1, re-seat authority): a Member signs an
     /// authorisation and an invite whose own base roster names it Admin.
     /// The subject anchors authority in its own verified roster, where the
@@ -10857,10 +11050,7 @@ mod tests {
             (revision, &hash),
         )?;
         let refusal = deliver_offer(&state, &info, &forger, offer).await;
-        assert_eq!(
-            refusal.as_deref(),
-            Some("authorisation_refused:signer_not_admin_locally")
-        );
+        assert_eq!(refusal.as_deref(), Some("authorisation_refused:signer"));
         original_kept(&state, &key, &info).await
     }
 
@@ -10923,7 +11113,8 @@ mod tests {
 
     /// A `Removal` basis is checked against this node's own chain: a
     /// commit it holds that does not remove it, or a removal after the
-    /// invite base, is `basis_unknown`, even from a local admin. Before
+    /// invite base, is `basis_unknown` (reported as cause `basis`), even
+    /// from a local admin. Before
     /// the fix any live `RecoveryRef` let any removal pass. Inert.
     #[tokio::test]
     async fn a_removal_basis_is_checked_against_the_local_chain() -> anyhow::Result<()> {
@@ -10940,7 +11131,7 @@ mod tests {
         let offer = reseat_offer(&info, &admin, local, held_not_a_removal, (revision, &hash))?;
         assert_eq!(
             deliver_offer(&state, &info, &admin, offer).await.as_deref(),
-            Some("authorisation_refused:basis_unknown")
+            Some("authorisation_refused:basis")
         );
         original_kept(&state, &key, &info).await?;
         let after_base = ReseatBasis::Removal {
@@ -10950,7 +11141,7 @@ mod tests {
         let offer = reseat_offer(&info, &admin, local, after_base, (revision, &hash))?;
         assert_eq!(
             deliver_offer(&state, &info, &admin, offer).await.as_deref(),
-            Some("authorisation_refused:basis_unknown")
+            Some("authorisation_refused:basis")
         );
         original_kept(&state, &key, &info).await
     }
