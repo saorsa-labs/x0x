@@ -140,6 +140,52 @@ macro_rules! inventory_procfs_regression_tests {
                 }
             }
             #[test]
+            fn mountinfo_accepts_each_safe_option_in_both_option_columns() {
+                let normal = String::from_utf8(MOUNT.to_vec()).unwrap();
+                for option in [
+                    "rw", "ro", "nosuid", "nodev", "noexec", "relatime", "strictatime",
+                    "noatime", "nodiratime", "sync", "async", "dirsync", "lazytime",
+                    "nosymfollow", "mand", "hidepid=0", "hidepid=off", "gid=0",
+                    "gid=4294967294",
+                ] {
+                    for delimiter in ["/proc rw,nosuid,nodev,noexec", "- proc proc rw"] {
+                        let prefix = delimiter.rsplit_once(' ').unwrap().0;
+                        let s = normal.replace(delimiter, &format!("{prefix} {option}"));
+                        check_mountinfo(s.as_bytes()).unwrap_or_else(|e| panic!("{option}: {e}"));
+                    }
+                }
+            }
+            #[test]
+            fn mountinfo_allows_empty_source_but_no_other_empty_column() {
+                check_mountinfo(MOUNT).unwrap();
+                let row = "60 23 0:9 / /run/extra rw shared:2 - tmpfs source rw";
+                let columns: Vec<_> = row.split(' ').collect();
+                for index in 0..columns.len() {
+                    let mut changed = columns.clone();
+                    changed[index] = "";
+                    let mut bytes = MOUNT.to_vec();
+                    bytes.extend_from_slice(changed.join(" ").as_bytes());
+                    assert_eq!(check_mountinfo(&bytes).is_ok(), index == 9, "column {index}");
+                }
+            }
+            #[test]
+            fn stat_requires_every_prefix_through_starttime() {
+                let normal = String::from_utf8(stat(b"worker")).unwrap();
+                let (prefix, tail) = normal.split_once(") ").unwrap();
+                let fields: Vec<_> = tail.split_whitespace().collect();
+                assert_eq!(fields.len(), 20);
+                parse_stat(normal.as_bytes()).unwrap();
+                for count in 0..fields.len() {
+                    let cut = format!("{prefix}) {}", fields[..count].join(" "));
+                    assert!(parse_stat(cut.as_bytes()).is_err(), "{count} fields");
+                }
+                let mut bad = normal.replace("4194304", "\u{00ff}").into_bytes();
+                assert!(parse_stat(&bad).is_err());
+                bad = normal.into_bytes();
+                bad[0] = 0xff;
+                assert!(parse_stat(&bad).is_err());
+            }
+            #[test]
             fn mountinfo_refuses_bind_root_wrong_fs_missing_and_duplicate_roots() {
                 let normal = String::from_utf8(MOUNT.to_vec()).unwrap();
                 let proc = normal.lines().nth(1).unwrap();
