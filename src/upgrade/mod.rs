@@ -35,6 +35,8 @@ pub mod verification_probe;
 mod inventory_argv;
 #[cfg(unix)]
 mod inventory_commands;
+#[cfg(unix)]
+mod inventory_roots;
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;
