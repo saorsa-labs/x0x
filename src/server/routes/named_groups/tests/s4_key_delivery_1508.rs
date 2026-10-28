@@ -79,7 +79,10 @@ fn is_s4_state(body: &serde_json::Value) -> bool {
     )
 }
 
-/// The four admin routes that admit a member or deliver a group key.
+/// The admin routes that admit a member, deliver a group key or advance
+/// the state chain. This node is an ordinary Member of the seeded group,
+/// so a route that runs its own seat gate before the §4 refusal answers
+/// 403 instead of the typed state (#1581: `seal` did).
 async fn admin_route_bodies(
     state: &Arc<AppState>,
     group_key: &str,
@@ -117,8 +120,20 @@ async fn admin_route_bodies(
         }),
     )
     .await;
+    let seal = seal_group_state(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_key.to_string()),
+    )
+    .await
+    .into_response();
     let mut out = Vec::new();
-    for (name, response) in [("approve", approve), ("ban", ban), ("remove", remove)] {
+    for (name, response) in [
+        ("approve", approve),
+        ("ban", ban),
+        ("remove", remove),
+        ("seal", seal),
+    ] {
         let (status, body) = body_of(response).await;
         out.push((name, status, body));
     }

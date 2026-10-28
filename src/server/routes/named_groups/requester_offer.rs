@@ -276,7 +276,7 @@ async fn validate_requester_offer_bytes(
 
 pub(in crate::server) async fn load_requester_offer_outbox(state: &AppState) -> Result<(), String> {
     let path: &Path = &state.requester_offer_outbox_path;
-    let bytes = match tokio::fs::read(path).await {
+    let bytes = match crate::w3h_inline::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
@@ -288,7 +288,7 @@ pub(in crate::server) async fn load_requester_offer_outbox(state: &AppState) -> 
     let outcome = validate_requester_offer_bytes(&bytes, path).await;
     if let Err(error) = outcome {
         let aside = path.with_extension(format!("corrupt-{}", now_millis_u64()));
-        let _ = tokio::fs::rename(path, &aside).await;
+        let _ = crate::w3h_inline::fs::rename(path, &aside).await;
         return Err(format!("{error} (file moved aside to {})", aside.display()));
     }
     let file = validate_requester_offer_bytes(&bytes, path).await?;

@@ -217,3 +217,21 @@ test-group = "quic-localhost"
 filter = "test(=v047_pinned_peer_stores_accepts_and_rejects_both_ways)"
 test-group = "quic-localhost"
 slow-timeout = { period = "120s", terminate-after = 8 }
+
+# The #1614 pair test (ADR 0083, issue #1593) stands up two loopback
+# daemons, and after its readiness loop saw every show gate true, the
+# 10 s result deadline was still missed in full-parallel runs: run
+# 40171754003 reported `unconfirmed` after 11.3 s in both the Test
+# Suite and the Coverage Gate, and run 40173660640 (an unrelated
+# branch) returned `refused` / target_needs_upgrade in 1.2 s when the
+# capability verdict moved between readiness and dispatch. The same
+# head passed its Test Suite in runs 40161481685, 40170405745 and
+# 40501044013. The pair is the multi-endpoint loopback shape this
+# group exists to serialise (#316, #1283). Group placement plus a
+# scheduler reservation keeps it off the parallel pile in both jobs.
+# The ambient-load attribution is unverified (#702). Not retries, not
+# wider deadlines (ADR 0025 — a flake is not an observation).
+[[profile.default.overrides]]
+filter = "test(remote_show_opens_on_the_other_owner_daemon)"
+test-group = "quic-localhost"
+threads-required = 4
