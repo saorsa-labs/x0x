@@ -92,6 +92,10 @@ const CAUSE_EARLY_SIBLING: &str = "a non-designated admin rekeyed before the ran
 const CAUSE_NO_FALLBACK: &str = "no ranked fallback with total A loss: after W plus the \
                                  completion bound every survivor still lists B active, at epoch \
                                  e0, with the same leaf count";
+const CAUSE_NOT_SIGNED_BY_D: &str = "survivors reached H, but the head commit is not signed by \
+                                     the rank-1 fallback D";
+const CAUSE_FALLBACK_LATE: &str = "survivors reached H with signer D, but later than W plus the \
+                                   completion bound from t = 0";
 const CAUSE_NO_RECOVERY: &str = "the held eager frames were released at the retry floor, but the \
                                  designated admin A never sealed: after the completion bound \
                                  every survivor still lists B active, at epoch e0, with the same \
@@ -824,12 +828,22 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
 
     // The trigger reached its targets: the holders hold the record, and
     // at least one frame reached A after t = 0 (the held delivery).
+    // Only the lanes the hold can delay count: stream writes toward A
+    // pass undelayed, so they prove nothing about the held delivery.
     let mut toward_a = 0usize;
     for src in ["B", "D", "C"] {
         toward_a += sim
             .fabric()
             .delivered_writes_after(&sim.peer(src)?, &sim.peer("A")?, trigger)
-            .len();
+            .iter()
+            .filter(|(write, _)| {
+                use crate::network::sim::LaneClass;
+                matches!(
+                    write.lane.class,
+                    LaneClass::Direct | LaneClass::RelayedDm | LaneClass::PubSub | LaneClass::Bulk
+                )
+            })
+            .count();
     }
     let d_holds = sim
         .at_instant(
@@ -1017,7 +1031,16 @@ async fn loss_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> Resu
     let passed = h_once && data_plane && signed_by_d && in_bound && not_early;
     if !passed {
         let (cause, ok, observed) = if h_once && !signed_by_d {
-            (CAUSE_SIBLING_SIGNED, true, describe_all(&end))
+            (CAUSE_NOT_SIGNED_BY_D, true, describe_all(&end))
+        } else if h_once && !in_bound {
+            (
+                CAUSE_FALLBACK_LATE,
+                true,
+                format!(
+                    "H at {reached_after:?} after t=0; the bound is {bound:?}; {}",
+                    describe_all(&end)
+                ),
+            )
         } else if h_once && !not_early {
             (
                 CAUSE_EARLY_SIBLING,

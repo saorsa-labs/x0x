@@ -850,6 +850,14 @@ jobs:
           --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
           --require w3h_1581_s4_ordinary_admin_revoked
           --expect w3h_1581_s4_ordinary_admin_revoked=GREEN
+          --require w3h_1581b_control_dropped_eager_frame_retry_floor
+          --expect w3h_1581b_control_dropped_eager_frame_retry_floor=GREEN
+          --require w3h_1581b_red_dropped_eager_frame_total_a_loss
+          --expect w3h_1581b_red_dropped_eager_frame_total_a_loss=GREEN
+          --require w3h_1581c_control_restart_stale_head_resume
+          --expect w3h_1581c_control_restart_stale_head_resume=GREEN
+          --require w3h_1581c_red_restart_stale_head_no_sync_past_wait
+          --expect w3h_1581c_red_restart_stale_head_no_sync_past_wait=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable

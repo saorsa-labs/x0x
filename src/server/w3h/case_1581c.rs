@@ -118,6 +118,9 @@ const CAUSE_NO_TYPED_STATE: &str = "no typed waiting_for_head_sync: A's public S
                                     cause while its head was stale";
 const CAUSE_NO_COMPLETION: &str = "A never completed the learned exclusion: after the release \
                                    A's row stayed open, or its epoch never reached D's";
+const CAUSE_NO_COMMIT: &str = "D's fallback never committed the exclusion while A was down: the \
+                               remove was not queued as the typed wait naming A, or D and C \
+                               never reached H signed by D";
 
 /// The first wait before a retry of a typed `retry: true` 424 reply; it
 /// doubles per retry, up to [`RETRY_CAP`]. Virtual time.
@@ -962,9 +965,9 @@ async fn scenario(
     let mut typed_detail = String::new();
     let mut window_quiet = false;
     let mut typed_observed = false;
+    let mut sealed_early: Option<Duration> = None;
     if no_sync_past_wait {
         let mut typed_seen_at: Option<Duration> = None;
-        let mut sealed_early: Option<Duration> = None;
         let window = sync_wait.saturating_sub(Duration::from_secs(1));
         // The watch runs the whole window (it ends at the boundary, not
         // at the first typed sighting), so a seal at any point inside it
@@ -1216,7 +1219,25 @@ async fn scenario(
             && data_plane
     };
     if !passed {
-        let (cause, ok, observed) = if !still_signed_by_d && !no_sync_past_wait {
+        let (cause, ok, observed) = if !queued_typed || !excluded(&h1, e0, leaves0) || !signed_by_d
+        {
+            (
+                CAUSE_NO_COMMIT,
+                true,
+                format!(
+                    "D's remove {rm_status} {rm_body}; at D's commit: {}",
+                    describe_all(&h1)
+                ),
+            )
+        } else if no_sync_past_wait && sealed_early.is_some() {
+            (
+                CAUSE_STALE_SEAL,
+                true,
+                format!(
+                    "A left the stale head {sealed_early:?} after the restart, before the sync                      wait; {typed_detail}"
+                ),
+            )
+        } else if !still_signed_by_d && !no_sync_past_wait {
             (CAUSE_STALE_SEAL, true, describe_all(&end))
         } else if !completed && h_once && !no_sync_past_wait {
             (
