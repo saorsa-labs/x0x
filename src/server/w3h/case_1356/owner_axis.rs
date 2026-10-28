@@ -213,6 +213,9 @@ const CAUSE_C: &str = "the row's main observation: after the advance J stays on 
                        `observed` lists each failing candidate step";
 /// H-S3-c: "Advance 30 min".
 const GATE_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// X publishes its r+1′ bytes again after this long with no frame to J.
+/// J's join poll ends about 120 s after the join, so retries fit inside it.
+const FORK_REPUBLISH: Duration = Duration::from_secs(10);
 
 type Key = crate::network::sim::Key;
 type Policy = Box<dyn Fn(Key, Key, Option<[u8; 32]>) -> bool + Send + Sync>;
@@ -514,10 +517,57 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         tokio::time::sleep(secs(2)).await;
     })
     .await?;
+    let x_recorded_from = sim
+        .state("X")?
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .map_or(0, |p| p.len());
     let forked_at = sim.fabric().mark_indexed("case: X publishes r+1′");
     rename(sim, "X", &group, "w3h c X fork").await?;
     let fork = view(sim, "X", &group).await?;
-    let on_fork = reaches(sim, "J", &group, &fork.state_hash, SETUP).await;
+    // X's r+1′ event bytes, as published. A publish can have no eager
+    // peer for the topic yet ("zero successful ordinary EAGER fan-out"),
+    // and J drops its stub when its join poll ends, so X publishes the
+    // same bytes again (a new message ID) until a frame reaches J.
+    let fork_event = {
+        let state = sim.state("X")?;
+        let published = state
+            .named_group_test_recorders
+            .publish_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        published
+            .iter()
+            .skip(x_recorded_from)
+            .find(|(_, b)| b.windows(12).any(|w| w == b"w3h c X fork"))
+            .cloned()
+    };
+    let (fork_topic, fork_bytes) = fork_event.context("X's r+1′ rename event was not recorded")?;
+    let mut fork_publishes = 1;
+    let mut last_publish = sim.fabric().now();
+    let on_fork = sim
+        .until("J applies X's r+1′", SETUP, async |s: &Sim| {
+            let delivered = pubsub_delivered(s, "X", "J", forked_at, b"w3h c X fork").unwrap_or(0);
+            if delivered == 0 && s.fabric().now() >= last_publish + FORK_REPUBLISH {
+                if let Ok(state) = s.state("X") {
+                    if state
+                        .agent
+                        .publish(&fork_topic, fork_bytes.clone())
+                        .await
+                        .is_ok()
+                    {
+                        fork_publishes += 1;
+                    }
+                }
+                last_publish = s.fabric().now();
+            }
+            view_now(s, "J", &group)
+                .await
+                .is_ok_and(|v| v.state_hash == fork.state_hash)
+        })
+        .await
+        .is_ok();
     let fork_frames = pubsub_delivered(sim, "X", "J", forked_at, b"w3h c X fork")?;
     {
         let (held, held_to_j) = (Arc::clone(&held), Arc::clone(&held_to_j));
@@ -589,7 +639,8 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         "j_on_x_fork_at_r_plus_1_prime_with_its_gate",
         plane && fork_frames > 0 && on_fork && fork.state_revision == minted.state_revision + 1,
         format!(
-            "X~J gossip plane {plane}; r+1′ frames X->J {fork_frames}; X {}; J {j0_text}",
+            "X~J gossip plane {plane}; r+1′ frames X->J {fork_frames} (X publishes \
+             {fork_publishes}); X {}; J {j0_text}",
             fork.describe()
         ),
         at(sim),
@@ -737,7 +788,9 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             let Some(jv) = seen.observe(try_view_now(s, "J", &group)).await else {
                 return true;
             };
-            let Some(st) = seen.observe(status_now(s, "J", &group)).await else {
+            // No call on J's API until the swap (the row's "with no call on
+            // J's API"): see [`membership_now`].
+            let Some(membership) = seen.observe(membership_now(s, "J", &group)).await else {
                 return true;
             };
             let Some(again) = seen.observe(try_view_now(s, "J", &group)).await else {
@@ -750,7 +803,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             if !same_record(jv.as_ref(), again.as_ref()) {
                 return false; // J moved between its reads: no consistent sample.
             }
-            let membership = st.as_ref().and_then(|st| st.membership.as_deref());
+            let membership = membership.as_deref();
             let sample = (jv.as_ref(), membership);
             let base = (&j1, base_membership.as_deref());
             match staging(sample, &a, base, j_removal.state_revision) {
@@ -776,7 +829,11 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     let j2 = sim
         .at_instant("read J's group", try_view_now(sim, "J", &group))
         .await??;
-    let membership = status(sim, "J", &group).await?.and_then(|st| st.membership);
+    // The probe, not `GET /groups/:id`: with no swap J is still in staging,
+    // and the GET does not return in one virtual instant there.
+    let membership = sim
+        .at_instant("read J's membership", membership_now(sim, "J", &group))
+        .await??;
     let (adds, reseat_mandate, owner_mandate) = member_added_mandates(sim, cut, "A", "J")?;
     let j2_text = j2
         .as_ref()
@@ -862,6 +919,36 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     let red = baseline || early_active.is_some();
     conclude(receipt, &failing, observed, red, at(sim));
     Ok(())
+}
+
+/// `label`'s `membership_state` for `group` (the label `GET /groups/:id`
+/// reports), read from the daemon's state; `None` with no record of it.
+///
+/// The staging samples must not call J's API: H-S3-c says "with no call on
+/// J's API, J stays contained until the swap". `GET /groups/:id` is not a
+/// pure read. It swaps a seated staging record in (`recovery_json`) and
+/// applies retained owner-cert joins (`retry_pending_owner_cert_joins`), so
+/// it can change J and it can block. In CI run 40730491973, three of four
+/// row runs were INFRA with "a read was still running when the wait ended
+/// (10 started, 9 completed)". A sample makes four reads, so read 10 was the
+/// GET of the third sample. This probe reads the same label from J's state
+/// with no side effects. It admits nothing, so the #1166
+/// `disallowed_methods` rule is allowed here.
+#[allow(clippy::disallowed_methods)]
+async fn membership_now(sim: &Sim, label: &str, group: &str) -> Result<Option<String>> {
+    let state = sim.state(label)?;
+    let info = {
+        let groups = state.named_groups.read().await;
+        match crate::server::resolve_group_entry_locked(&groups, group) {
+            Some((_, info)) => info.clone(),
+            None => return Ok(None),
+        }
+    };
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    let membership =
+        crate::server::routes::named_groups::local_join_membership_state(&state, &info, &local)
+            .await;
+    Ok(Some(membership.to_string()))
 }
 
 /// One staging sample of J's live record, from A's re-seat call on.
