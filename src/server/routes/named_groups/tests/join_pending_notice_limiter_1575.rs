@@ -6,7 +6,9 @@
 //! tests pin the spend facts both reviewers demanded: one token per
 //! (group, member) per 30 s window and 20 per minute globally, both
 //! checked BEFORE any ML-DSA work; a refunded token spendable again,
-//! exactly once; a cached re-serve spends nothing; and the cache
+//! exactly once — including through the serve path itself, via the
+//! test-only forced-sign-failure seam; a throttle refusal burning no
+//! global token; a cached re-serve spends nothing; and the cache
 //! write-back re-checks the staged row after the signature, so a restage
 //! in the gap leaves the cache empty.
 
@@ -274,6 +276,122 @@ fn a_refunded_token_is_spendable_again() {
         !limiter.reserve("g", "m22nd"),
         "exactly one token came back — the next new pair is still stopped"
     );
+}
+
+/// PR #1639 review round 4: a THROTTLED reserve burns no global token.
+/// The member window refuses the second reserve for the same pair; that
+/// refusal must leave the global bucket whole — the full budget is still
+/// spendable on fresh pairs afterwards. (A `reserve` that charged the
+/// global bucket before the member-window check fails the loop.)
+#[test]
+fn a_throttled_reserve_does_not_burn_the_global_budget() {
+    let mut limiter = JoinRefusalSignLimiter::default();
+    assert!(limiter.reserve("g", "m1"));
+    assert!(
+        !limiter.reserve("g", "m1"),
+        "the member window holds the pair for the full 30 s"
+    );
+    // One token is gone (the first reserve); the remaining
+    // BUDGET - 1 must ALL still be spendable on fresh pairs.
+    for i in 0..JOIN_REFUSAL_GLOBAL_BUDGET - 1 {
+        assert!(
+            limiter.reserve("g", &format!("fresh-{i}")),
+            "fresh pair {i} takes a token — the throttle refusal above burned nothing"
+        );
+    }
+    assert!(
+        !limiter.reserve("g", "next"),
+        "only now is the global bucket empty: exactly one token was ever spent"
+    );
+}
+
+/// PR #1639 review round 4: a FAILED signature refunds the token through
+/// the serve path itself. The next sign is forced to fail (the test-only
+/// failure seam): the serve returns nothing, and the very next serve for
+/// the same joiner signs and serves at once — the member window was
+/// dropped, not held. A direct drain afterwards takes exactly
+/// `BUDGET - 1` tokens (the successful re-serve's one), proving the
+/// failed attempt returned its global token too.
+#[tokio::test]
+async fn a_failed_signature_refunds_the_token_through_the_serve() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let joiner = AgentKeypair::generate()?;
+    let joiner_id = joiner.agent_id();
+    let joiner_hex = hex::encode(joiner_id.as_bytes());
+    let group_key = "78".repeat(16);
+    let attempt = "at1575-lim6".to_string();
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING,
+        JoinPendingNoticeDetail {
+            count: Some(1),
+            ..JoinPendingNoticeDetail::default()
+        },
+        None,
+    )
+    .await;
+    insert_verified_advert(
+        &state,
+        &joiner_id,
+        x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1,
+    )
+    .await;
+
+    join_egress_test_barrier::force_next_notice_sign_failure();
+    assert!(
+        serve_staged_join_pending_notice(
+            &state,
+            &group_key,
+            &joiner_hex,
+            &attempt,
+            &joiner_id,
+            None,
+            false,
+        )
+        .await
+        .is_none(),
+        "a failed signature serves nothing"
+    );
+    let served = serve_staged_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        &joiner_id,
+        None,
+        false,
+    )
+    .await
+    .expect("the refunded token lets the very next serve sign at once");
+    let Ok(JoinResultMessage::Pending { notice }) = serde_json::from_slice(&served) else {
+        panic!("the re-served payload is the Pending arm");
+    };
+    assert!(
+        !notice.signature_b64.is_empty(),
+        "the second serve produced a real signature"
+    );
+
+    // The failed sign spent no global token: after the successful
+    // re-serve's single spend, the drain empties the other BUDGET - 1.
+    {
+        let mut limiter = state
+            .join_pending_notice_sign_limiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut drained = 0;
+        while limiter.reserve("drain-after-refund", &format!("m{drained}")) {
+            drained += 1;
+        }
+        assert_eq!(
+            drained,
+            JOIN_REFUSAL_GLOBAL_BUDGET - 1,
+            "the failed signature returned its global token; only the re-serve spent one"
+        );
+    }
+    Ok(())
 }
 
 /// PR #1639 review round 4: the cache write-back re-checks the staged row

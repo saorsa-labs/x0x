@@ -42332,10 +42332,25 @@ async fn serve_staged_join_pending_notice(
             use base64::Engine as _;
             let signing_kp = state.agent.identity().agent_keypair();
             let canonical = canonical_join_pending_notice_bytes(&notice);
-            let sig = match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            // #1575 (round 4): a test can force the next sign to fail to
+            // prove the refund below runs; production always signs for real.
+            #[cfg(test)]
+            let sign_outcome = if join_egress_test_barrier::take_notice_sign_failure() {
+                Err(ant_quic::crypto::pqc::types::PqcError::SigningFailed(
+                    "test-forced".to_string(),
+                ))
+            } else {
+                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                    signing_kp.secret_key(),
+                    &canonical,
+                )
+            };
+            #[cfg(not(test))]
+            let sign_outcome = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
                 signing_kp.secret_key(),
                 &canonical,
-            ) {
+            );
+            let sig = match sign_outcome {
                 Ok(sig) => sig,
                 Err(error) => {
                     state
@@ -42462,13 +42477,113 @@ async fn join_pending_notice_serving_blocked(
         ))
 }
 
+/// ADR 0108 §8 (PR #1639 review round 4, seam hardening): the `Pending`
+/// reply's final eligibility check, run synchronously at the transport
+/// seam immediately before the write. Per the `SeamAdmission` contract
+/// (`x0x::dm`): it NEVER blocks — every lock is a `try_*`, and contention
+/// withholds (fail closed, a retryable refusal at the joiner's next poll).
+/// It re-runs the serving conditions the pre-phase checked — the joiner
+/// revoked or a revocation resync gap, the group withdrawn, quarantined or
+/// unknown, the joiner's seat removed or banned, this node no longer
+/// Active, a Result or Refused staged for the attempt during delivery —
+/// and re-resolves the staged row to the served canonical bytes, so a ban,
+/// a withdrawal or a superseding answer that lands between the pre-phase
+/// and the write stops the reply at the last moment before the bytes go
+/// out (§8's one admitted direct exchange).
+fn join_pending_notice_seam_admissible(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    served_canonical_hash: &str,
+) -> bool {
+    let Ok(joiner_agent) = parse_agent_id_hex(member_agent_id) else {
+        return false;
+    };
+    let revoked_joiner = {
+        let revocation_set = state.agent.revocation_set();
+        let Ok(set) = revocation_set.try_read() else {
+            return false;
+        };
+        if set.revocation_resync_required() {
+            return false;
+        }
+        set.is_agent_revoked(&joiner_agent)
+    };
+    if revoked_joiner {
+        return false;
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    {
+        let Ok(groups) = state.named_groups.try_read() else {
+            return false;
+        };
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return false;
+        };
+        if info.withdrawn
+            || info.is_fork_quarantined()
+            || info
+                .members_v2
+                .get(member_agent_id)
+                .is_some_and(|seat| seat.is_removed() || seat.is_banned())
+            || !info.has_active_member(&local_hex)
+        {
+            return false;
+        }
+    }
+    let staged_result_supersedes = {
+        let Ok(results) = state.pending_join_results.try_read() else {
+            return false;
+        };
+        results
+            .get(&join_result_key(group_id, member_agent_id))
+            .is_some_and(|pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+    };
+    if staged_result_supersedes {
+        return false;
+    }
+    let refusal_staged = {
+        let Ok(refusals) = state.pending_join_refusals.try_lock() else {
+            return false;
+        };
+        refusals.contains_key(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+    };
+    if refusal_staged {
+        return false;
+    }
+    let Ok(notices) = state.pending_join_notices.try_lock() else {
+        return false;
+    };
+    notices
+        .get(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+        .is_some_and(|staged| {
+            staged_join_pending_notice_is_current(staged)
+                && join_pending_notice_hash(&wire_body_for_staged_notice(
+                    group_id,
+                    member_agent_id,
+                    attempt_id,
+                    staged,
+                )) == served_canonical_hash
+        })
+}
+
 /// ADR 0108 §8 (PR #1639 review round 4): the staged-row half of the
-/// `Pending` reply's admission, synchronous so it can also run at the
-/// transport seam immediately before the write: the notice for the exact
-/// attempt is still staged, inside BOTH of its 10-minute clocks, and still
-/// resolves to exactly the canonical bytes that were signed — a restage
-/// that changed the cause or detail (or dropped the row for a terminal
-/// answer) withholds the reply.
+/// `Pending` reply's admission (the async pre-phase's copy): the notice
+/// for the exact attempt is still staged, inside BOTH of its 10-minute
+/// clocks, and still resolves to exactly the canonical bytes that were
+/// signed — a restage that changed the cause or detail (or dropped the row
+/// for a terminal answer) withholds the reply. The seam's own copy is
+/// [`join_pending_notice_seam_admissible`], which takes the same facts
+/// with `try_*` locks only.
 fn join_pending_notice_row_current(
     state: &AppState,
     group_id: &str,
@@ -42499,9 +42614,13 @@ fn join_pending_notice_row_current(
 /// seam, so a ban or a withdrawal during delivery could not stop the
 /// reply. The pre-phase re-takes the group's membership lock and re-runs
 /// §8's serving conditions ([`join_pending_notice_serving_blocked`]) plus
-/// the staged-row check; the seam re-checks the row synchronously at the
-/// write. The served bytes themselves name what may still be written: the
-/// reply's canonical notice hash must still be the staged row's.
+/// the staged-row check; the seam re-runs the same conditions
+/// synchronously at the write with `try_*` locks only
+/// ([`join_pending_notice_seam_admissible`]), so a ban, a withdrawal or a
+/// superseding answer landing between the pre-phase and the write also
+/// stops the reply. The served bytes themselves name what may still be
+/// written: the reply's canonical notice hash must still be the staged
+/// row's.
 fn join_pending_notice_admission(
     state: &Arc<AppState>,
     group_id: &str,
@@ -42555,7 +42674,7 @@ fn join_pending_notice_admission(
             let seam_member = member_agent_id.clone();
             let seam_attempt = attempt_id.clone();
             let seam: x0x::dm::SeamAdmission = Box::new(move || {
-                join_pending_notice_row_current(
+                join_pending_notice_seam_admissible(
                     &seam_state,
                     &seam_group,
                     &seam_member,
@@ -45472,6 +45591,20 @@ pub(in crate::server) mod join_egress_test_barrier {
         }
     }
 
+    /// #1575 (PR #1639 review round 4): force the NEXT join-pending-notice
+    /// signature to fail, so a test can prove the serve path refunds the
+    /// limiter token when the ML-DSA run errors. One-shot: the next sign
+    /// consumes the failure.
+    static FAIL_NEXT_NOTICE_SIGN: AtomicBool = AtomicBool::new(false);
+
+    pub(in crate::server) fn force_next_notice_sign_failure() {
+        FAIL_NEXT_NOTICE_SIGN.store(true, Ordering::SeqCst);
+    }
+
+    pub(in crate::server) fn take_notice_sign_failure() -> bool {
+        FAIL_NEXT_NOTICE_SIGN.swap(false, Ordering::SeqCst)
+    }
+
     pub(in crate::server) async fn park(recipient: &str, point: &'static str) {
         let gate = GATES
             .lock()
@@ -45724,11 +45857,11 @@ async fn answer_join_pending_notice_fetch(
                     // no §8 check at the write, so a ban or a withdrawal
                     // during delivery could not stop the reply. The
                     // admission re-runs §8's serving conditions under the
-                    // membership lock and the seam re-checks the staged row
-                    // immediately before the write (PR #1639 review round
-                    // 4). A withheld or lost reply means the joiner retries
-                    // at its next poll (D145: one direct exchange, no
-                    // hidden resend).
+                    // membership lock and the seam re-runs them again,
+                    // synchronously and non-blocking, immediately before
+                    // the write (PR #1639 review round 4). A withheld or
+                    // lost reply means the joiner retries at its next poll
+                    // (D145: one direct exchange, no hidden resend).
                     drop(notice_section);
                     let admission = join_pending_notice_admission(
                         state,

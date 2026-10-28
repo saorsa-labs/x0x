@@ -2394,3 +2394,210 @@ async fn a_ban_during_delivery_withholds_the_pending_reply() -> Result<()> {
     }
     Ok(())
 }
+
+/// §8 (PR #1639 review round 4, seam hardening): the seam half of the
+/// `Pending` reply's admission — the synchronous final check at the
+/// transport write — withholds after a mid-delivery change the pre-phase
+/// could no longer see. Each leg serves the current row, opens its
+/// admission (the pre-phase admits; the seam returns true — the control),
+/// then mutates the world exactly as it could change during a real
+/// delivery: a restage that changes the notice withholds the stale bytes;
+/// a Result staged during delivery closes the seam and a restaged row
+/// does not reopen it while the Result is fresh; and a BAN that lands
+/// during delivery stops the write. Every seam check runs with `try_*`
+/// locks (the `SeamAdmission` contract), exercised here uncontended;
+/// contention withholds is the fail-closed reading of the same code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_seam_recheck_withholds_mid_delivery_changes() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let joiner = AgentKeypair::generate()?;
+    let joiner_id = joiner.agent_id();
+    let joiner_hex = hex::encode(joiner_id.as_bytes());
+    let group_key = "73c".repeat(10);
+    let admin = AgentKeypair::generate()?;
+    {
+        let mut info = x0x::groups::GroupInfo::new(
+            "1575w".to_string(),
+            String::new(),
+            admin.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+    }
+    let (_, _, _, joined_event) = signed_member_joined_event_for_test(
+        &joiner,
+        &group_key,
+        &hex::encode(state.agent.agent_id().as_bytes()),
+        "1575w-secret",
+        x0x::groups::GroupRole::Member,
+    )?;
+    let attempt = member_joined_event_attempt_id(&joined_event).expect("attempt id");
+    insert_verified_advert(
+        &state,
+        &joiner_id,
+        x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1,
+    )
+    .await;
+
+    // Each leg stages `count`, serves the CURRENT row, opens its admission
+    // (the pre-phase admits and the seam's FnOnce call returns true — the
+    // control), and hands back a callable mirror of the same seam check
+    // (`SeamAdmission` is FnOnce: one call per physical exchange) for the
+    // leg's mutation. A restage that changes the notice moves
+    // `issued_at_ms`, so a later leg must serve its own bytes; the limiter
+    // reset keeps every leg's sign inside a fresh window.
+    let seam_after = |count: u32| {
+        let state = Arc::clone(&state);
+        let group_key = group_key.clone();
+        let joiner_hex = joiner_hex.clone();
+        let attempt = attempt.clone();
+        async move {
+            *state
+                .join_pending_notice_sign_limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                JoinRefusalSignLimiter::default();
+            stage_join_pending_notice(
+                &state,
+                &group_key,
+                &joiner_hex,
+                &attempt,
+                JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING,
+                JoinPendingNoticeDetail {
+                    count: Some(count),
+                    ..JoinPendingNoticeDetail::default()
+                },
+                None,
+            )
+            .await;
+            let served = serve_staged_join_pending_notice(
+                &state,
+                &group_key,
+                &joiner_hex,
+                &attempt,
+                &joiner_id,
+                None,
+                false,
+            )
+            .await
+            .expect("the eligible world serves its staged notice");
+            let admission =
+                join_pending_notice_admission(&state, &group_key, &joiner_hex, &attempt, &served);
+            let seam = admission()
+                .await
+                .expect("the pre-phase admits the eligible world");
+            assert!(seam(), "an unchanged world admits at the seam");
+            let Ok(JoinResultMessage::Pending { notice }) = serde_json::from_slice(&served) else {
+                panic!("the served payload is the Pending arm");
+            };
+            let served_hash = join_pending_notice_hash(&notice);
+            move || {
+                join_pending_notice_seam_admissible(
+                    &state,
+                    &group_key,
+                    &joiner_hex,
+                    &attempt,
+                    &served_hash,
+                )
+            }
+        }
+    };
+
+    // (i) The row re-resolve: a restage that changes the notice changes
+    // the canonical bytes; the seam resolves the staged row again and
+    // withholds the stale reply (no Result, no ban — the bytes alone).
+    let seam_one = seam_after(1).await;
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING,
+        JoinPendingNoticeDetail {
+            count: Some(2),
+            ..JoinPendingNoticeDetail::default()
+        },
+        None,
+    )
+    .await;
+    assert!(
+        !seam_one(),
+        "a restaged notice withholds the stale bytes at the seam"
+    );
+
+    // (ii) The control the withheld leg needs: the CURRENT row's own
+    // freshly served bytes (deterministic nonce, pinned issued_at_ms)
+    // admit at the seam.
+    let seam_two = seam_after(2).await;
+    assert!(
+        seam_two(),
+        "the current row's own served bytes admit at the seam"
+    );
+
+    // (iii) A Result staged DURING delivery closes the seam, and a
+    // restaged notice row does not reopen it while the Result is fresh —
+    // §8's selection order (Result before notice) holds at the write.
+    stage_join_result(
+        &state,
+        &group_key,
+        &joiner_hex,
+        joined_event.clone(),
+        Some(&attempt),
+    )
+    .await;
+    assert!(
+        !seam_two(),
+        "a Result staged during delivery closes the seam"
+    );
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING,
+        JoinPendingNoticeDetail {
+            count: Some(2),
+            ..JoinPendingNoticeDetail::default()
+        },
+        None,
+    )
+    .await;
+    assert!(
+        !seam_two(),
+        "a restaged row does not reopen the seam while the Result is fresh"
+    );
+
+    // (iv) With the terminal answer gone, a fresh serve reopens the seam;
+    // a BAN landed during delivery — the last mutation the pre-phase
+    // could miss — stops the write.
+    state
+        .pending_join_results
+        .write()
+        .await
+        .remove(&join_result_key(&group_key, &joiner_hex));
+    let seam_four = seam_after(2).await;
+    {
+        let mut groups = state.named_groups.write().await;
+        if let Some(info) = groups.get_mut(&group_key) {
+            info.ban_member(&joiner_hex, None);
+        }
+    }
+    assert!(
+        !seam_four(),
+        "a mid-delivery ban stops the write at the seam"
+    );
+    Ok(())
+}
