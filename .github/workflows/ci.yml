@@ -483,6 +483,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Prepare launcher evidence and scratch
+        shell: bash
+        run: |
+          mkdir -p "$HOME/x0x-codex/evidence/1375/ci/scratch"
+          printf 'TMPDIR=%s\n' "$HOME/x0x-codex/evidence/1375/ci/scratch" >>"$GITHUB_ENV"
+
       - name: Install Rust 1.95.0
         uses: dtolnay/rust-toolchain@master
         with:
@@ -515,6 +521,20 @@ jobs:
           CARGO_BUILD_JOBS: 4
         run: cargo build --locked --example linux690_systemd_probe
 
+      - name: Build the private launcher lifecycle tests
+        shell: bash
+        run: |
+          mkdir -p "$HOME/x0x-codex/evidence/1375/ci"
+          cargo test --locked --bin x0x-launcher --no-run --message-format=json >"$HOME/x0x-codex/evidence/1375/ci/build.jsonl"
+          python3 - <<'PY_PATH'
+          import json, os, pathlib
+          records = pathlib.Path.home().joinpath('x0x-codex/evidence/1375/ci/build.jsonl').read_text().splitlines()
+          paths = [r['executable'] for line in records if (r := json.loads(line)).get('executable') and r.get('profile', {}).get('test')]
+          assert len(paths) == 1, paths
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('LAUNCHER_TESTS=' + paths[0] + '\n')
+          PY_PATH
+
       - name: Exercise inert runner controls
         run: python3 -B scripts/ci/test_linux690_systemd_acceptance.py -v
 
@@ -524,7 +544,7 @@ jobs:
       - name: Prepare Linux acceptance custody
         shell: bash
         run: |
-          artifact="${RUNNER_TEMP}/linux690-systemd-acceptance"
+          artifact="${HOME}/x0x-codex/evidence/1375/ci/linux690-systemd-acceptance"
           mkdir -m 700 "${artifact}"
           git rev-parse HEAD >"${artifact}/source-head.txt"
           git rev-parse 'HEAD^{tree}' >"${artifact}/source-tree.txt"
@@ -535,11 +555,12 @@ jobs:
         id: systemd_acceptance
         shell: bash
         run: |
-          artifact="${RUNNER_TEMP}/linux690-systemd-acceptance"
+          artifact="${HOME}/x0x-codex/evidence/1375/ci/linux690-systemd-acceptance"
           set +e
           sudo scripts/ci/linux690-systemd-acceptance.sh \
             --probe "${GITHUB_WORKSPACE}/target/debug/examples/linux690_systemd_probe" \
             --manager system \
+            --launcher-tests "${LAUNCHER_TESTS}" \
             --artifact-root "${artifact}"
           acceptance_status=$?
           set -e
@@ -556,7 +577,7 @@ jobs:
         run: |
           # A sibling keeps the dropped fixture owner from traversing the
           # acceptance directory after it has been returned to the runner.
-          artifact="${RUNNER_TEMP}/linux690-systemd-literals"
+          artifact="${HOME}/x0x-codex/evidence/1375/ci/linux690-systemd-literals"
           python3 -B scripts/ci/test_systemd_literals.py --self-test
           set +e
           sudo python3 -B scripts/ci/test_systemd_literals.py \
@@ -566,7 +587,7 @@ jobs:
           set -e
           sudo chown -R "$(id -u):$(id -g)" "${artifact}"
           printf 'LITERAL_ACCEPTANCE_EXIT=%s\n' "${literal_status}" >"${artifact}/workflow-exit.txt"
-          mv "${artifact}" "${RUNNER_TEMP}/linux690-systemd-acceptance/literals"
+          mv "${artifact}" "${HOME}/x0x-codex/evidence/1375/ci/linux690-systemd-acceptance/literals"
           exit "${literal_status}"
 
       - name: Upload Linux systemd acceptance custody
@@ -574,7 +595,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: linux690-systemd-acceptance
-          path: ${{ runner.temp }}/linux690-systemd-acceptance/
+          path: ~/x0x-codex/evidence/1375/ci/
           if-no-files-found: error
 
 

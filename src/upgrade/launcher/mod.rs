@@ -3,12 +3,30 @@
 #![allow(dead_code)]
 
 mod child;
+mod control;
 mod filesystem;
 #[path = "../journal.rs"]
 mod journal;
 #[path = "../probe.rs"]
 mod probe;
+mod recovery;
+mod run;
+
+pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
+    child::candidate_boot(version)
+}
+pub(crate) fn candidate_boot_for_fixture(version: &str) -> io::Result<()> {
+    child::candidate_boot_owned(version)
+}
+pub(crate) fn fixture_receipt(request: &[u8]) -> io::Result<serde_json::Value> {
+    control::fixture_receipt(request)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod lifecycle;
+
 const ENABLED: bool = false;
+
 impl Clock {
     fn now() -> io::Result<Self> {
         let clock = probe::ProbeClock::now()?;
@@ -19,18 +37,6 @@ impl Clock {
     }
 }
 
-pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
-    child::candidate_boot(version)
-}
-pub(crate) fn candidate_boot_for_fixture(version: &str) -> io::Result<()> {
-    child::candidate_boot_owned(version)
-}
-mod control;
-mod recovery;
-pub(crate) fn fixture_receipt(request: &[u8]) -> io::Result<serde_json::Value> {
-    control::fixture_receipt(request)
-}
-mod run;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
