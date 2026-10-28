@@ -85,6 +85,13 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # W3-H idle-step code is behind `tokio_unstable`. The plain clippy
+      # above does not build it (#1245, #1654).
+      - name: Run clippy under tokio_unstable
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        env:
+          RUSTFLAGS: --cfg tokio_unstable
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest
@@ -781,6 +788,8 @@ jobs:
           --expect w3h_1161_card_import_invite=GREEN
           --require w3h_1161_control_share_withheld_is_red
           --expect w3h_1161_control_share_withheld_is_red=RED
+          --require w3h_969_leave_rekey_restart_seals_under_the_current_epoch
+          --expect w3h_969_leave_rekey_restart_seals_under_the_current_epoch=GREEN
           --require w3h_1471_forged_card_import_invite
           --expect w3h_1471_forged_card_import_invite=GREEN
           --require w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined
@@ -839,6 +848,8 @@ jobs:
           --expect w3h_1356_red_s3_t_deferred_until_host_commit=GREEN
           --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
           --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
+          --require w3h_1581_s4_ordinary_admin_revoked
+          --expect w3h_1581_s4_ordinary_admin_revoked=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable

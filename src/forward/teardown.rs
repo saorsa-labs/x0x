@@ -195,6 +195,9 @@ pub(crate) struct LiveStreams {
     /// [`Self::cancel_all`] so a register that races or follows shutdown
     /// cannot obtain an uncancelled bridge token.
     closed: CancellationToken,
+    /// Re-check passes the reauth loop has finished. Test builds only.
+    #[cfg(test)]
+    passes: AtomicU64,
 }
 
 /// Registration of one live stream. Its token fires on teardown; dropping
@@ -226,7 +229,17 @@ impl LiveStreams {
             streams: std::sync::Mutex::new(HashMap::new()),
             diag,
             closed: CancellationToken::new(),
+            #[cfg(test)]
+            passes: AtomicU64::new(0),
         }
+    }
+
+    /// Test seam (#1666): how many re-check passes the reauth loop has
+    /// finished. A pass can do more than one grant read, so an idle grant
+    /// reader does not prove that the pass is done; this count does.
+    #[cfg(test)]
+    pub(crate) fn passes_for_testing(&self) -> u64 {
+        self.passes.load(Ordering::Acquire)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, LiveEntry>> {
@@ -726,6 +739,8 @@ pub(crate) fn spawn_reauth_loop(
                         _ = &mut pass => break,
                     }
                 }
+                #[cfg(test)]
+                live.passes.fetch_add(1, Ordering::Release);
             }
             {
                 // Bound cooldown by the earliest pending event deadline so

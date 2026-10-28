@@ -451,6 +451,29 @@ const GOSSIP_PUBSUB_RECV_CAPACITY: usize = 10_000;
 /// Capacity for low-volume control-style inbound gossip channels.
 const GOSSIP_CONTROL_RECV_CAPACITY: usize = 4_000;
 
+/// Bound for one Membership-lane egress send (#1395, from #288).
+///
+/// HyParView/SWIM membership handlers answer every inbound frame with
+/// egress (Ping → Ack, Join → ForwardJoin fan-out) and saorsa-gossip
+/// awaits that send raw — only the pubsub lane wraps its per-peer sends
+/// in a timeout. The send parks in `open_uni()` when the remote stops
+/// returning uni-stream credit (its recv queue undrained: the transport
+/// still ACKs, so the connection looks healthy while the app is not
+/// reading), and the 5 s membership watchdog then cancels the handler
+/// mid-protocol. The 2026-07-30 fleet evidence (#288) is exactly that
+/// signature — `bytes=2` frames at `elapsed_ms=5001`, two stalled peers
+/// pinning all four dispatcher workers, 0.29–2.21% of membership frames
+/// timed out — and the #1395 loopback repro measures a 100% lane timeout
+/// ratio against one stalled remote on an otherwise idle host.
+///
+/// 1 s bounds the dominant single-send handlers (Ping/Ack/NeighborReply)
+/// well inside the watchdog; a Join fan-out to a fully stalled active
+/// view (up to 12 sequential sends) can still reach it, but each send
+/// has by then completed or failed cleanly instead of parking forever.
+/// A timed-out send returns `SendFailed`, not `PeerNotConnected`: the
+/// connection is live, and eviction belongs to SWIM's suspect→dead path.
+const MEMBERSHIP_EGRESS_SEND_BOUND: Duration = Duration::from_secs(1);
+
 /// Maximum allowed size for bincode deserialization of untrusted network input.
 ///
 /// Prevents memory exhaustion from crafted payloads with large length prefixes.
@@ -8519,33 +8542,72 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
 
             // Send via ant-quic Node
             //
-            // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
-            // per-peer sends in a small timeout; a multi-second liveness repair on
-            // this path turns healthy gossip degradation into a timeout/log storm.
-            let send_result = if dial_pin_table().is_empty() {
-                // #1112 (round 13): generation binding is a pin-era
-                // behaviour. With nothing pinned it guards nothing and
-                // would only turn reconnect-race sends into failures, so
-                // the pre-#1112 plain send stands.
-                node.send(&ant_peer, &buf).await
-            } else {
-                match checked_generation {
-                    Some(generation) => node.send_on_generation(&ant_peer, generation, &buf).await,
-                    // No live session at capture time (#1112 round 12):
-                    // the structured PeerNotConnected — the #380 contract
-                    // (saorsa evicts on it), never a plain error that
-                    // would cool instead of evicting.
-                    None => {
-                        return Err(
+            // Do not run `ensure_peer_send_ready` here. A multi-second
+            // liveness repair on this path turns healthy gossip degradation
+            // into a timeout/log storm. Only the pubsub lane wraps its
+            // per-peer sends in its own timeout upstream; the Membership
+            // lane is bounded at this seam instead (`MEMBERSHIP_EGRESS_SEND_BOUND`).
+            let send = async {
+                if dial_pin_table().is_empty() {
+                    // #1112 (round 13): generation binding is a pin-era
+                    // behaviour. With nothing pinned it guards nothing and
+                    // would only turn reconnect-race sends into failures, so
+                    // the pre-#1112 plain send stands.
+                    node.send(&ant_peer, &buf)
+                        .await
+                        .map_err(|e| map_gossip_send_error(e, peer))
+                } else {
+                    match checked_generation {
+                        Some(generation) => node
+                            .send_on_generation(&ant_peer, generation, &buf)
+                            .await
+                            .map_err(|e| map_gossip_send_error(e, peer)),
+                        // No live session at capture time (#1112 round 12):
+                        // the structured PeerNotConnected — the #380 contract
+                        // (saorsa evicts on it), never a plain error that
+                        // would cool instead of evicting.
+                        None => Err(
                             saorsa_gossip_transport::GossipTransportError::PeerNotConnected {
                                 peer_id: peer,
+                            }
+                            .into(),
+                        ),
+                    }
+                }
+            };
+            let send_result = if stream_type == GossipStreamType::Membership {
+                // #1395: a stalled remote (transport ACKing, app not
+                // reading) parks `open_uni()` for the connection's
+                // lifetime. Fail fast with SendFailed so the dispatcher
+                // worker is released; SWIM/HyParView retransmit on their
+                // own cadence and SWIM's suspect→dead path owns eviction.
+                // debug, not warn: under a sustained stall this fires once
+                // per message (#600); the dispatch counters are the
+                // lossless record and SWIM warns when it marks the peer.
+                match tokio::time::timeout(MEMBERSHIP_EGRESS_SEND_BOUND, send).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        debug!(
+                            peer = %crate::logging::LogTransportPeerId::from(&ant_peer),
+                            bound_ms = MEMBERSHIP_EGRESS_SEND_BOUND.as_millis(),
+                            "[1/6 network] membership send exceeded its bound; remote is not reading its gossip streams"
+                        );
+                        return Err(
+                            saorsa_gossip_transport::GossipTransportError::SendFailed {
+                                peer_id: peer,
+                                source: anyhow::anyhow!(
+                                    "membership send exceeded {} ms bound: remote not reading its gossip streams",
+                                    MEMBERSHIP_EGRESS_SEND_BOUND.as_millis()
+                                ),
                             }
                             .into(),
                         );
                     }
                 }
+            } else {
+                send.await
             };
-            send_result.map_err(|e| map_gossip_send_error(e, peer))?;
+            send_result?;
 
             debug!(
                 "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
