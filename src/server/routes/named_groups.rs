@@ -1583,6 +1583,14 @@ pub(in crate::server) struct PendingJoinRefusal {
 const JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING: &str = "owner_certificate_pending";
 const JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN: &str = "no_eligible_admin";
 
+/// Engineer ruling, 27 Oct 2026 (PR #1639 review round 3): staging for the
+/// D154 cause `no_eligible_admin` stays OFF until the notice-only rotation
+/// slice lands. Real joiners never send `attempt_evidence` in this slice, so
+/// the evidence-bound staging arm is reachable only by a sender that mints
+/// its own `MemberJoined`; the rotation slice re-enables it bound to a real
+/// invite or attempt.
+const D154_STAGING_ENABLED: bool = false;
+
 /// ADR 0108 §8: a cause name must be 1 to 64 bytes of `[a-z0-9_]`. A name
 /// a joiner does not know is shown as `unrecognized_cause`, never a decode
 /// failure, so the registry stays open — this gate only keeps a staged
@@ -1724,6 +1732,19 @@ pub(in crate::server) struct PendingJoinNotice {
     pub(in crate::server) created_at: Instant,
 }
 
+/// ADR 0108 §8: a staged notice is current while BOTH of its clocks sit
+/// inside the 10-minute lifetime — `created_at` (refreshed when a restage
+/// of the same cause and detail renews the row) and `issued_at_ms` (pinned
+/// at first staging; the clock the joiner's freshness check runs on). The
+/// issued-at clock is what stops a refire from re-polling one attempt id
+/// forever: the joiner drops notices past it, so the member never serves
+/// or refreshes for one past it either (PR #1639 review round 3).
+fn staged_join_pending_notice_is_current(notice: &PendingJoinNotice) -> bool {
+    notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+        && now_millis_u64().saturating_sub(notice.issued_at_ms)
+            < PENDING_JOIN_RESULT_TTL.as_millis() as u64
+}
+
 /// ADR 0108 §8 staging: insert or refresh the notice for one attempt.
 /// TTL-swept at the join staging lifetime, like the staged refusals the
 /// staging sits beside. §8's selection order (Result, then Refused, then
@@ -1760,11 +1781,14 @@ async fn stage_join_pending_notice(
         .pending_join_notices
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    notices.retain(|_, notice| notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    notices.retain(|_, notice| staged_join_pending_notice_is_current(notice));
     // §8: a restaging of the SAME cause and detail is the same notice —
     // its `issued_at_ms` and cached signature stay, so the wire bytes (and
     // the joiner's `held_notice_hash`) change only when the cause or
-    // detail changes. Only the TTL window refreshes.
+    // detail changes. Only the TTL window refreshes. A restage of a row
+    // past its issued-at lifetime starts a fresh notice instead (the sweep
+    // above removed it), so the joiner's freshness clock never sees a
+    // notice older than the lifetime.
     if let Some(existing) = notices.get_mut(&key) {
         if existing.cause == cause && existing.detail == detail {
             existing.created_at = Instant::now();
@@ -1942,20 +1966,35 @@ async fn evaluate_polled_join_pending_notice(
     }
     match join_artifact_no_eligible_admin(state, group_id).await {
         Err(JoinArtifactRefusal::NoEligibleAdmin) => {
-            // D154 staging is evidence-bound (see the contract above): with
-            // no verified `attempt_evidence` the cover holds but nothing
-            // stages — a sender naming itself cannot manufacture a notice.
-            if let Some(inviter) = verified_evidence_inviter {
-                stage_join_pending_notice(
-                    state,
-                    group_id,
-                    member_agent_id,
-                    attempt_id,
-                    JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
-                    JoinPendingNoticeDetail::default(),
-                    Some(inviter.to_string()),
-                )
-                .await;
+            // Engineer ruling, 27 Oct 2026 (PR #1639 review round 3):
+            // staging for `no_eligible_admin` stays OFF until the D154
+            // notice-only rotation slice lands. A real joiner never sends
+            // `attempt_evidence` in this slice, so only a forged
+            // `MemberJoined` could reach this arm — and the evidence check
+            // proves no more than §8's minimum (the event is self-
+            // consistently signed by the sender's own key), not that any
+            // member saw the invite. The rotation slice re-enables staging
+            // bound to a real invite or attempt, with the Active
+            // stub-roster seat check D154 names.
+            if D154_STAGING_ENABLED {
+                if let Some(inviter) = verified_evidence_inviter {
+                    stage_join_pending_notice(
+                        state,
+                        group_id,
+                        member_agent_id,
+                        attempt_id,
+                        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+                        JoinPendingNoticeDetail::default(),
+                        Some(inviter.to_string()),
+                    )
+                    .await;
+                }
+            } else {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    member = %LogHexId::agent(member_agent_id),
+                    "ADR 0108 §8: no_eligible_admin staging stays off until the D154 rotation slice"
+                );
             }
         }
         // The D154 cover ended, so only the D154 cause clears at this
@@ -18270,8 +18309,9 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
         StatusCode::OK,
         serde_json::json!({
             "join_state": if pending { "pending_authority_commit" } else { "idle" },
-            // §8: present only while a verified notice is held for the
-            // current attempt; a later Result or Refused replaces it.
+            // §8: the key is always present and null unless a verified
+            // notice is held for the current attempt; a later Result or
+            // Refused replaces it.
             "pending_cause": pending_cause,
             "last_join_outcome": outcome.as_ref().map(|o| serde_json::json!({
                 "outcome": o.outcome,
@@ -42170,35 +42210,51 @@ async fn serve_staged_join_pending_notice(
         );
         return None;
     }
-    let mut notices = state
-        .pending_join_notices
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    notices.retain(|_, notice| notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
     let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
-    let staged = notices.get_mut(&key)?;
-    // §8 (D154): a notice-only request is answered with at most one
-    // member-signed `no_eligible_admin` — never the S2 cause, never a
-    // Result, Refused, Welcome, key or roster.
-    if notice_only && staged.cause != JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN {
-        return None;
-    }
-    let mut notice = wire_body_for_staged_notice(group_id, member_agent_id, attempt_id, staged);
-    let canonical_hash = join_pending_notice_hash(&notice);
-    if held_notice_hash == Some(canonical_hash.as_str()) {
-        // §8: the joiner already holds exactly these bytes — send nothing.
-        return None;
-    }
-    let signature_b64 = staged
-        .cached
-        .as_ref()
-        .and_then(|cached| {
-            (cached.canonical_hash == canonical_hash).then(|| cached.signature_b64.clone())
-        })
-        .or_else(|| {
+    let (mut notice, canonical_hash, cached_signature, member_key_rides) = {
+        let mut notices = state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        notices.retain(|_, notice| staged_join_pending_notice_is_current(notice));
+        let staged = notices.get_mut(&key)?;
+        // §8 (D154): a notice-only request is answered with at most one
+        // member-signed `no_eligible_admin` — never the S2 cause, never a
+        // Result, Refused, Welcome, key or roster.
+        if notice_only && staged.cause != JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN {
+            return None;
+        }
+        let notice = wire_body_for_staged_notice(group_id, member_agent_id, attempt_id, staged);
+        let canonical_hash = join_pending_notice_hash(&notice);
+        if held_notice_hash == Some(canonical_hash.as_str()) {
+            // §8: the joiner already holds exactly these bytes — send nothing.
+            return None;
+        }
+        let cached_signature = staged
+            .cached
+            .as_ref()
+            .filter(|cached| cached.canonical_hash == canonical_hash)
+            .map(|cached| cached.signature_b64.clone());
+        let member_key_rides = staged.cause == JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN
+            && staged.inviter_agent_id.as_deref() != Some(&staged.signer_agent_id);
+        (notice, canonical_hash, cached_signature, member_key_rides)
+    };
+    let signature_b64 = match cached_signature {
+        Some(cached) => cached,
+        None => {
             // §8 Q3 (values pending): the same bounded limiter shape as the
             // refusal signatures — 1 per (group, member) / 30 s and 20/min
-            // globally, charged atomically.
+            // globally. ML-DSA runs OUTSIDE the global notices mutex, and
+            // the token is reserved only after signing succeeds, so a
+            // failed signature spends nothing (PR #1639 review round 3).
+            use base64::Engine as _;
+            let signing_kp = state.agent.identity().agent_keypair();
+            let canonical = canonical_join_pending_notice_bytes(&notice);
+            let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                signing_kp.secret_key(),
+                &canonical,
+            )
+            .ok()?;
             let mut limiter = state
                 .join_pending_notice_sign_limiter
                 .lock()
@@ -42211,25 +42267,30 @@ async fn serve_staged_join_pending_notice(
                 );
                 return None;
             }
-            use base64::Engine as _;
-            let signing_kp = state.agent.identity().agent_keypair();
-            let canonical = canonical_join_pending_notice_bytes(&notice);
-            let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-                signing_kp.secret_key(),
-                &canonical,
-            )
-            .ok()?;
             let signature_b64 = BASE64.encode(sig.as_bytes());
-            staged.cached = Some(CachedJoinPendingNotice {
-                canonical_hash: canonical_hash.clone(),
-                signature_b64: signature_b64.clone(),
-            });
-            Some(signature_b64)
-        })?;
+            // Cache the signature for the next serve of the same bytes. The
+            // write-back re-checks the row under a fresh lock: a restage
+            // that changed the cause or detail in the gap changed the
+            // canonical bytes, and the cache is skipped.
+            let mut notices = state
+                .pending_join_notices
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(staged) = notices.get_mut(&key) {
+                let current =
+                    wire_body_for_staged_notice(group_id, member_agent_id, attempt_id, staged);
+                if join_pending_notice_hash(&current) == canonical_hash {
+                    staged.cached = Some(CachedJoinPendingNotice {
+                        canonical_hash: canonical_hash.clone(),
+                        signature_b64: signature_b64.clone(),
+                    });
+                }
+            }
+            signature_b64
+        }
+    };
     notice.signature_b64 = signature_b64;
-    if staged.cause == JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN
-        && staged.inviter_agent_id.as_deref() != Some(&staged.signer_agent_id)
-    {
+    if member_key_rides {
         use base64::Engine as _;
         notice.signer_public_key_b64 = Some(
             BASE64.encode(
@@ -42248,25 +42309,45 @@ async fn serve_staged_join_pending_notice(
     serde_json::to_vec(&response).ok()
 }
 
-/// §8: the joiner's advert is unknown — refresh it through the existing
-/// targeted capability request route and serve nothing until it verifies.
-/// Best-effort: the 600 s advert cadence converges even when this publish
-/// is lost.
-fn publish_join_notice_capability_refresh(state: &AppState, joiner: &AgentId) {
-    let Some(pubsub) = state.agent.pubsub() else {
-        return;
+/// §8 (PR #1639 review round 3, finding 1): the joiner's advert is unknown
+/// — ask it to republish through the shared single-flight capability
+/// registry (the same route as strict sends), and ONLY when a notice for
+/// this exact attempt is still staged inside its lifetime. A verified fetch
+/// for an unknown group or an unstaged attempt publishes nothing — one
+/// small DM must not buy a network-wide member broadcast. Best-effort: the
+/// 600 s advert cadence converges even when this refresh is lost.
+fn refresh_join_notice_capability(
+    state: &AppState,
+    joiner: &AgentId,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+) {
+    let staged_and_current = {
+        let notices = state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        notices
+            .get(&join_refusal_refusal_key(
+                group_id,
+                member_agent_id,
+                attempt_id,
+            ))
+            .is_some_and(staged_join_pending_notice_is_current)
     };
+    if !staged_and_current {
+        return;
+    }
+    let agent = Arc::clone(&state.agent);
     let joiner = *joiner;
     state.spawn_detached(async move {
-        if let Err(error) =
-            crate::dm_capability_service::publish_targeted_capability_request(&pubsub, joiner).await
-        {
-            tracing::debug!(
-                recipient = %hex::encode(joiner.as_bytes()),
-                %error,
-                "ADR 0108 §8: capability refresh request publish failed; the advert cadence converges"
-            );
-        }
+        agent
+            .refresh_application_capability(
+                joiner,
+                x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1,
+            )
+            .await;
     });
 }
 
@@ -42275,6 +42356,10 @@ fn publish_join_notice_capability_refresh(state: &AppState, joiner: &AgentId) {
 async fn send_join_result_response(state: &AppState, sender: &AgentId, payload: &[u8]) {
     let payload_len = payload.len();
     let payload_hash = hex::encode(blake3::hash(payload).as_bytes());
+    // §8 test seam: proves which fetch shapes yield a Result or Refused
+    // reply (a notice-only fetch must never reach this point).
+    #[cfg(test)]
+    join_egress_test_barrier::park(&hex::encode(sender.as_bytes()), "join_result_response").await;
     if let Err(e) = state
         .agent
         .send_direct_with_config(sender, payload.to_vec(), direct_message_send_config())
@@ -45298,6 +45383,95 @@ pub(in crate::server) async fn handle_join_result_message(
     handle_join_result_message_bound(state, sender, verified, msg, None).await;
 }
 
+/// ADR 0108 §8 (D154, #1575): the notice half of a fetch with no staged
+/// Result — re-evaluate the notice causes for the attempt, then answer a
+/// capable fetch with the signed `Pending` arm under §8's serving
+/// conditions (capability-gated, `held_notice_hash`-deduped; one direct
+/// exchange, no hidden resend, D145 pre-admission). Runs inside the group's
+/// membership critical section (`notice_section` is `None` only for an
+/// unknown group); the send happens after the section is released (PR
+/// #1639 review round 2). Returns `true` when a response was sent.
+#[allow(clippy::too_many_arguments)]
+async fn answer_join_pending_notice_fetch(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: Option<&str>,
+    attempt_evidence: Option<&NamedGroupMetadataEvent>,
+    accepts_pending_notice: bool,
+    held_notice_hash: Option<&str>,
+    notice_only: bool,
+    notice_section: Option<tokio::sync::MutexGuard<'_, ()>>,
+) -> bool {
+    let verified_evidence_inviter =
+        attempt_evidence
+            .zip(attempt_id)
+            .and_then(|(evidence, attempt_id)| {
+                verified_join_attempt_evidence(group_id, member_agent_id, attempt_id, evidence)
+            });
+    evaluate_polled_join_pending_notice(
+        state,
+        group_id,
+        member_agent_id,
+        attempt_id,
+        verified_evidence_inviter.as_deref(),
+    )
+    .await;
+    if accepts_pending_notice && attempt_id.is_some() {
+        match state
+            .agent
+            .capability_store()
+            .verified_registry_supports(sender, x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1)
+        {
+            Some(true) => {
+                let response = serve_staged_join_pending_notice(
+                    state,
+                    group_id,
+                    member_agent_id,
+                    attempt_id.unwrap_or_default(),
+                    sender,
+                    held_notice_hash,
+                    notice_only,
+                )
+                .await;
+                if let Some(response) = response {
+                    // The payload is built under the critical section (local
+                    // work + one lazy signature, like the refusal path); the
+                    // SEND happens after the section is released — a direct
+                    // send waits out its full ack timeout and must never
+                    // hold the group's membership lock (PR #1639 review
+                    // round 2). One direct exchange, no hidden resend
+                    // (D145).
+                    drop(notice_section);
+                    #[cfg(test)]
+                    join_egress_test_barrier::park(member_agent_id, "join_pending_notice").await;
+                    send_join_result_response(state, sender, &response).await;
+                    return true;
+                }
+            }
+            // §8 (PR #1639 review round 3, finding 1): an unknown advert
+            // refreshes ONLY when a notice for this attempt is actually
+            // staged, and only through the shared single-flight registry —
+            // a verified fetch for an unknown group must not trigger a
+            // member broadcast. Some(false) — a current verified advert
+            // without the bit — needs no refresh.
+            None => {
+                refresh_join_notice_capability(
+                    state,
+                    sender,
+                    group_id,
+                    member_agent_id,
+                    attempt_id.unwrap_or_default(),
+                );
+            }
+            Some(false) => {}
+        }
+    }
+    drop(notice_section);
+    false
+}
+
 async fn handle_join_result_message_bound(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -45339,6 +45513,36 @@ async fn handle_join_result_message_bound(
             // signature nor receive a receipt.
             if !verified && accepts_refusal {
                 tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "#477: refusal-capable fetch over an UNVERIFIED direct message — no refusal served");
+            }
+            // ADR 0108 §8 (D154, PR #1639 review round 3, finding 2): a
+            // notice-only request never yields a Result or a Refused and
+            // cannot admit or seat — the shielded owner-certificate retry
+            // and the staged-Result lookup below are skipped entirely; only
+            // the notice serve can answer it, at most one `Pending`.
+            if notice_only {
+                if verified {
+                    let membership_arc =
+                        group_membership_lock_for_known_group(state, &group_id).await;
+                    let notice_section = match &membership_arc {
+                        Some(arc) => Some(arc.lock().await),
+                        None => None,
+                    };
+                    answer_join_pending_notice_fetch(
+                        state,
+                        sender,
+                        &group_id,
+                        &member_agent_id,
+                        attempt_id.as_deref(),
+                        attempt_evidence.as_deref(),
+                        accepts_pending_notice,
+                        held_notice_hash.as_deref(),
+                        notice_only,
+                        notice_section,
+                    )
+                    .await;
+                }
+                tracing::debug!(group_id = %group_id, member = %member_agent_id, "ADR 0108 §8: notice-only fetch answered with at most one Pending");
+                return;
             }
             // #447: the joiner is still polling — its certificate evidence
             // may have resolved since the last volley rejection (async blob
@@ -45446,74 +45650,19 @@ async fn handle_join_result_message_bound(
                             None => None,
                         },
                     };
-                    let verified_evidence_inviter = attempt_evidence
-                        .as_deref()
-                        .zip(attempt_id.as_deref())
-                        .and_then(|(evidence, attempt_id)| {
-                            verified_join_attempt_evidence(
-                                &group_id,
-                                &member_agent_id,
-                                attempt_id,
-                                evidence,
-                            )
-                        });
-                    evaluate_polled_join_pending_notice(
+                    answer_join_pending_notice_fetch(
                         state,
+                        sender,
                         &group_id,
                         &member_agent_id,
                         attempt_id.as_deref(),
-                        verified_evidence_inviter.as_deref(),
+                        attempt_evidence.as_deref(),
+                        accepts_pending_notice,
+                        held_notice_hash.as_deref(),
+                        notice_only,
+                        notice_section,
                     )
                     .await;
-                    if accepts_pending_notice && attempt_id.is_some() {
-                        match state.agent.capability_store().verified_registry_supports(
-                            sender,
-                            x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1,
-                        ) {
-                            Some(true) => {
-                                let response = serve_staged_join_pending_notice(
-                                    state,
-                                    &group_id,
-                                    &member_agent_id,
-                                    attempt_id.as_deref().unwrap_or_default(),
-                                    sender,
-                                    held_notice_hash.as_deref(),
-                                    notice_only,
-                                )
-                                .await;
-                                if let Some(response) = response {
-                                    // The payload is built under the
-                                    // critical section (local work + one
-                                    // lazy signature, like the refusal
-                                    // path); the SEND happens after the
-                                    // section is released — a direct send
-                                    // waits out its full ack timeout and
-                                    // must never hold the group's
-                                    // membership lock (PR #1639 review
-                                    // round 2). One direct exchange, no
-                                    // hidden resend (D145).
-                                    drop(notice_section);
-                                    #[cfg(test)]
-                                    join_egress_test_barrier::park(
-                                        &member_agent_id,
-                                        "join_pending_notice",
-                                    )
-                                    .await;
-                                    send_join_result_response(state, sender, &response).await;
-                                    return;
-                                }
-                            }
-                            // §8: an unknown advert refreshes through the
-                            // existing route; nothing is served until it
-                            // verifies. Some(false) — a current verified
-                            // advert without the bit — needs no refresh.
-                            None => {
-                                publish_join_notice_capability_refresh(state, sender);
-                            }
-                            Some(false) => {}
-                        }
-                    }
-                    drop(notice_section);
                 }
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;

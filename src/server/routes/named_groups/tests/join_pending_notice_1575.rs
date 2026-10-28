@@ -1,18 +1,20 @@
 //! #1575 (ADR 0108 §8 + D154): the local staging half of the join pending
 //! notice. While a join attempt is held, the member that receives the
 //! joiner's verified, attempt-bound join-result poll stages the typed
-//! notice cause — `no_eligible_admin` while verified revocations cover
-//! every admin seat (D154, ADR 0110 §4), and `owner_certificate_pending`
-//! with the pending-seat count on every `OwnerCertMemberPending` seal
-//! refusal (§8's S2 row). A staged Result or Refused for the same attempt
+//! notice cause — `owner_certificate_pending` with the pending-seat count
+//! on every `OwnerCertMemberPending` seal refusal (§8's S2 row), and
+//! `no_eligible_admin` while verified revocations cover every admin seat
+//! (D154, ADR 0110 §4). A staged Result or Refused for the same attempt
 //! replaces the notice; a poll whose conditions no longer hold drops it.
 //!
-//! The wire half (#1575) binds the D154 staging to the fetch's verified
-//! `attempt_evidence` — the joiner's own signed `MemberJoined` whose
-//! blake3 is the attempt id (#1628 review item 2) — so a verified sender
-//! that merely names itself as `member_agent_id` stages nothing. The
-//! signed `JoinPendingNotice`, the `JoinResultMessage::Pending` arm and
-//! the joiner's `pending_cause` status field are proven in
+//! The engineer ruling of 27 Oct 2026 (PR #1639 review round 3) keeps the
+//! D154 `no_eligible_admin` staging OFF until the notice-only rotation
+//! slice lands: real joiners never send `attempt_evidence` in this slice,
+//! so the evidence-bound arm is reachable only by a sender that mints its
+//! own `MemberJoined`. The drop rules for an already-staged D154 notice
+//! stay proven below against a directly staged row. The signed
+//! `JoinPendingNotice`, the `JoinResultMessage::Pending` arm and the
+//! joiner's `pending_cause` status field are proven in
 //! `join_pending_notice_wire_1575`.
 
 use super::*;
@@ -120,13 +122,16 @@ async fn evidence_poll_as_joiner(
     attempt
 }
 
-/// D154: while verified revocations cover every admin seat, any Active
-/// member that receives the joiner's verified, EVIDENCE-bound poll stages
-/// the single cause `no_eligible_admin`, with no detail, signed by itself.
-/// An eligible admin, an unverified poll, a poll without an attempt id and
-/// — #1628 review item 2 — a poll without verified evidence stage nothing.
+/// D154: while verified revocations cover every admin seat, the poll-side
+/// staging for `no_eligible_admin` stays OFF (engineer ruling, 27 Oct 2026,
+/// PR #1639 review round 3) — not even a verified, evidence-bound poll
+/// stages it, because the evidence check proves only that the event is
+/// self-consistently signed by the sender's own key, and a real joiner
+/// never sends evidence in this slice. An eligible admin, an unverified
+/// poll and a poll without verified evidence likewise stage nothing, and
+/// the poll-time drop rules still run against a directly staged row.
 #[tokio::test]
-async fn no_eligible_admin_poll_stages_the_d154_notice() -> Result<()> {
+async fn no_eligible_admin_polls_stage_nothing_until_the_rotation_slice() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
     let admin = AgentKeypair::generate()?;
     let joiner = AgentKeypair::generate()?;
@@ -191,20 +196,37 @@ async fn no_eligible_admin_poll_stages_the_d154_notice() -> Result<()> {
         "no notice without verified attempt evidence"
     );
 
-    // D154: the verified, evidence-bound poll stages the notice.
+    // Engineer ruling, 27 Oct 2026: the verified, evidence-bound poll
+    // stages NOTHING under the cover either — `no_eligible_admin` staging
+    // is off until the D154 notice-only rotation slice lands, so a forged
+    // MemberJoined buys no notice and no signing budget.
     evidence_poll_as_joiner(&state, &group_key, &joiner_id, &evidence).await;
-    let notice = staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt)
-        .expect("the D154 notice is staged for the evidence-bound attempt");
-    assert_eq!(notice.0, "no_eligible_admin");
-    assert_eq!(notice.1, hex::encode(state.agent.agent_id().as_bytes()));
-    assert_eq!(
-        notice.2,
-        JoinPendingNoticeDetail::default(),
-        "no_eligible_admin carries no detail"
+    assert!(
+        staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt).is_none(),
+        "no_eligible_admin staging is off until the rotation slice"
+    );
+    assert!(
+        state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "the evidence-bound poll staged nothing at all"
     );
 
-    // A poll without an attempt id is not attempt-bound: nothing stages,
-    // and the notice staged above is still the only one.
+    // The poll-time drop rules stay live against a directly staged row (the
+    // shape the poll path staged before the ruling). A poll without an
+    // attempt id is not attempt-bound: the row is left untouched.
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+        JoinPendingNoticeDetail::default(),
+        Some(inviter_hex.clone()),
+    )
+    .await;
     handle_join_result_message(
         &state,
         &joiner_id,
@@ -224,21 +246,10 @@ async fn no_eligible_admin_poll_stages_the_d154_notice() -> Result<()> {
         },
     )
     .await;
-    {
-        let notices = state
-            .pending_join_notices
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(
-            notices.len(),
-            1,
-            "a poll without an attempt id stages nothing"
-        );
-        assert!(
-            notices.contains_key(&join_refusal_refusal_key(&group_key, &joiner_hex, &attempt)),
-            "the only staged notice is still the attempt-bound one"
-        );
-    }
+    assert!(
+        staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt).is_some(),
+        "a poll without an attempt id does not touch the staged row"
+    );
 
     // §8: a group that is gone (deleted here) drops its staged notice at
     // the next poll for the same attempt.
@@ -253,8 +264,10 @@ async fn no_eligible_admin_poll_stages_the_d154_notice() -> Result<()> {
 
 /// §8: the notice is dropped when its cause clears. A second, unrevoked
 /// admin seat ends the cover, and the joiner's next poll drops the staged
-/// notice. A banned joiner seat and a revoked joiner agent each block
-/// staging the same way.
+/// notice. A banned joiner seat and a revoked joiner agent each drop it at
+/// the next poll the same way. (The poll-side D154 staging is off until the
+/// rotation slice, so the row is staged directly — the same shape the poll
+/// path staged before the ruling.)
 #[tokio::test]
 async fn notice_clears_when_its_cause_clears() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -274,7 +287,17 @@ async fn notice_clears_when_its_cause_clears() -> Result<()> {
         "1575-secret",
         x0x::groups::GroupRole::Member,
     )?;
-    let attempt = evidence_poll_as_joiner(&state, &group_key, &joiner_id, &evidence).await;
+    let attempt = member_joined_event_attempt_id(&evidence).expect("attempt id");
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+        JoinPendingNoticeDetail::default(),
+        Some(inviter_hex.clone()),
+    )
+    .await;
     assert!(
         staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt).is_some(),
         "staged under the cover"
@@ -298,8 +321,8 @@ async fn notice_clears_when_its_cause_clears() -> Result<()> {
         "the notice is dropped once an admin is eligible again"
     );
 
-    // A banned joiner seat never stages: seat the joiner, ban it, restore
-    // the cover by revoking the second admin.
+    // A banned joiner seat drops the staged notice: seat the joiner, ban
+    // it, restore the cover by revoking the second admin.
     revoke_agent(&state, &admin2).await;
     {
         let mut groups = state.named_groups.write().await;
@@ -313,13 +336,23 @@ async fn notice_clears_when_its_cause_clears() -> Result<()> {
         info.ban_member(&joiner_hex, Some(hex::encode(admin.agent_id().as_bytes())));
         info.recompute_state_hash();
     }
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+        JoinPendingNoticeDetail::default(),
+        Some(inviter_hex.clone()),
+    )
+    .await;
     evidence_poll_as_joiner(&state, &group_key, &joiner_id, &evidence).await;
     assert!(
         staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt).is_none(),
-        "no notice for a Banned seat"
+        "a Banned seat drops the staged notice"
     );
 
-    // A revoked joiner agent never stages either.
+    // A revoked joiner agent drops it the same way.
     revoke_agent(&state, &joiner).await;
     {
         let mut groups = state.named_groups.write().await;
@@ -327,10 +360,20 @@ async fn notice_clears_when_its_cause_clears() -> Result<()> {
         info.remove_member(&joiner_hex, Some(hex::encode(admin.agent_id().as_bytes())));
         info.recompute_state_hash();
     }
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+        JoinPendingNoticeDetail::default(),
+        Some(inviter_hex.clone()),
+    )
+    .await;
     evidence_poll_as_joiner(&state, &group_key, &joiner_id, &evidence).await;
     assert!(
         staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt).is_none(),
-        "no notice for a revoked joiner agent"
+        "a revoked joiner agent drops the staged notice"
     );
     Ok(())
 }
@@ -355,7 +398,17 @@ async fn result_and_refusal_replace_the_staged_notice() -> Result<()> {
     )?;
     seed_group_with_local_member(&state, &group_key, &admin).await;
     revoke_agent(&state, &admin).await;
-    let attempt = evidence_poll_as_joiner(&state, &group_key, &joiner_id, &joined_event).await;
+    let attempt = member_joined_event_attempt_id(&joined_event).expect("attempt id");
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+        JoinPendingNoticeDetail::default(),
+        Some(inviter_hex.clone()),
+    )
+    .await;
     assert!(
         staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt).is_some(),
         "staged under the cover"
@@ -406,16 +459,27 @@ async fn result_and_refusal_replace_the_staged_notice() -> Result<()> {
     );
 
     // A Result for the SAME attempt replaces a freshly staged notice (the
-    // refusal above is cleared first: §8 forbids staging beside it).
+    // refusal above is cleared first: §8 forbids staging beside it). The
+    // poll-side D154 staging is off until the rotation slice, so the row is
+    // staged directly.
     state
         .pending_join_refusals
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(&join_refusal_refusal_key(&group_key, &joiner_hex, &attempt));
-    evidence_poll_as_joiner(&state, &group_key, &joiner_id, &joined_event).await;
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+        JoinPendingNoticeDetail::default(),
+        Some(inviter_hex.clone()),
+    )
+    .await;
     assert!(
         staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt).is_some(),
-        "re-staged under the cover"
+        "re-staged for the same attempt"
     );
     stage_join_result(
         &state,
@@ -566,10 +630,10 @@ async fn no_notice_is_staged_beside_a_staged_refusal_for_the_attempt() -> Result
 
 /// §8's S2 row exit: `owner_certificate_pending` clears when the bytes
 /// arrive (the seal succeeds) or the attempt ends — never on a poll that
-/// merely finds an eligible admin. The poll keeps the S2 notice, and
-/// replaces it with `no_eligible_admin` only under the D154 cover with a
-/// verified evidence-bound poll (no admin can seal, so that is the live
-/// cause).
+/// merely finds an eligible admin, and not under the D154 cover either:
+/// the poll-side D154 staging is off until the rotation slice (engineer
+/// ruling, 27 Oct 2026), so the evidence-bound poll under the cover keeps
+/// the S2 cause too.
 #[tokio::test]
 async fn owner_cert_pending_notice_survives_a_poll_with_an_eligible_admin() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -622,12 +686,14 @@ async fn owner_cert_pending_notice_survives_a_poll_with_an_eligible_admin() -> R
         .expect("the S2 notice survives an evidence-less poll under the cover");
     assert_eq!(notice.0, "owner_certificate_pending");
 
-    // Under the cover the evidence-bound poll replaces it with the live
-    // cause.
+    // Under the cover the evidence-bound poll KEEPS the S2 cause: the
+    // D154 staging is off until the rotation slice (engineer ruling,
+    // 27 Oct 2026), so the live-cause replacement is the rotation slice's
+    // to re-enable.
     evidence_poll_as_joiner(&state, &group_key, &joiner_id, &joined_event).await;
     let notice = staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt)
-        .expect("the D154 notice replaces the stale S2 cause");
-    assert_eq!(notice.0, "no_eligible_admin");
+        .expect("the S2 notice survives the evidence poll under the cover");
+    assert_eq!(notice.0, "owner_certificate_pending");
     Ok(())
 }
 
@@ -700,8 +766,10 @@ async fn a_poll_stages_no_notice_over_a_staged_refusal() -> Result<()> {
     )?;
     let attempt = member_joined_event_attempt_id(&joined_event).expect("attempt id");
     seed_group_with_local_member(&state, &group_key, &admin).await;
-    // The D154 cover holds, so an evidence-bound poll would stage a notice
-    // without the staged refusal.
+    // The D154 cover holds and the fetch below carries verified evidence.
+    // The poll-side staging is off until the rotation slice, so this also
+    // guards the §8 re-check itself for the slice that re-enables it:
+    // nothing stages over a staged refusal.
     revoke_agent(&state, &admin).await;
     stage_join_refusal(
         &state,

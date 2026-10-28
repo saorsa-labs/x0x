@@ -11,7 +11,11 @@
 //! separation; forged, replayed, stale and mis-bound notices refused;
 //! a staged Result or Refused superseding any Pending; capability-gated
 //! serving with `held_notice_hash` dedup; and the joiner's held cause on
-//! join-status.
+//! join-status. The PR #1639 review round 3 additions: a notice-only
+//! fetch never yields a Result or Refused and never admits or seats; the
+//! unknown-advert capability refresh publishes only for a staged notice,
+//! through the single-flight registry; and a notice past its issued-at
+//! lifetime is not served.
 
 use super::*;
 use x0x::identity::AgentKeypair;
@@ -182,6 +186,54 @@ fn canonical_notice_bytes_carry_the_domain_and_every_field() {
         refusal_layout,
         "notice bytes are disjoint from refusal-receipt bytes"
     );
+    // The nonce and the detail digests participate too — the two fields the
+    // per-field sweep above cannot reach (every body there shares one
+    // nonce and no digests).
+    let mut other_nonce = notice_body(
+        "g",
+        "m",
+        "s",
+        "a1",
+        "owner_certificate_pending",
+        detail.clone(),
+        123,
+    );
+    other_nonce.nonce = "5758".to_string();
+    assert_ne!(
+        bytes,
+        canonical_join_pending_notice_bytes(&other_nonce),
+        "the nonce participates in the canonical bytes"
+    );
+    let with_digests = notice_body(
+        "g",
+        "m",
+        "s",
+        "a1",
+        "owner_certificate_pending",
+        JoinPendingNoticeDetail {
+            digests: vec!["ab".repeat(64)],
+            ..detail.clone()
+        },
+        123,
+    );
+    assert_ne!(
+        bytes,
+        canonical_join_pending_notice_bytes(&with_digests),
+        "the detail digests participate in the canonical bytes"
+    );
+    // Frozen vector (PR #1639 review round 3): the exact canonical bytes
+    // for a fixed body — any layout change (field order, prefix width,
+    // domain) breaks this line. Decoded by hand once: the domain tag, then
+    // the length-prefixed group/member/signer/attempt/cause strings, the
+    // presence-byte count, the absent revision, the empty digests vector,
+    // the u64-BE issued_at_ms (123) and the length-prefixed nonce "5757".
+    assert_eq!(
+        hex::encode(&bytes),
+        "7830782e6e616d65645f67726f75702e6a6f696e5f70656e64696e672e7631\
+         0000000167000000016d0000000173000000026131000000196f776e65725f\
+         63657274696669636174655f70656e64696e67010000000200000000000000\
+         00000000007b0000000435373537"
+    );
 }
 
 /// Seed a joiner-side fixture: this node becomes the JOINER, holding a
@@ -271,6 +323,28 @@ async fn joiner_holds_only_verified_current_notices() -> Result<()> {
         ..JoinPendingNoticeDetail::default()
     };
     let now = now_millis_u64();
+
+    // A notice past its lifetime is refused BEFORE anything is held, so the
+    // freshness check alone carries the rejection — the newest-first rule
+    // below has nothing to compare against yet (PR #1639 review round 3:
+    // the replay case further down is also older than the held notice, so
+    // it alone could not prove the freshness check).
+    let stale_first = signed_notice(
+        notice_body(
+            &group_key,
+            &joiner_hex,
+            &inviter_hex,
+            &attempt_id,
+            "owner_certificate_pending",
+            detail.clone(),
+            now.saturating_sub(PENDING_JOIN_RESULT_TTL.as_millis() as u64 + 1),
+        ),
+        &inviter,
+    );
+    assert!(
+        !verify_and_hold_join_pending_notice(&state, true, &stale_first).await,
+        "a stale notice is refused with nothing held (freshness carries it)"
+    );
 
     // Unverified ingress is refused even with a perfect signature.
     let good = signed_notice(
@@ -737,11 +811,17 @@ async fn notice_serving_is_capability_gated_and_once_per_change() -> Result<()> 
     Ok(())
 }
 
-/// §8 (D154): a notice-only fetch stages the member-signed cause through
-/// the handler exactly like a normal evidence-bound poll, and — being
-/// notice-only — never probes the staged refusal.
-#[tokio::test]
-async fn notice_only_polls_stage_the_d154_cause() -> Result<()> {
+/// §8 (D154, PR #1639 review round 3, finding 2): a notice-only fetch
+/// never yields a Result or a Refused and cannot admit or seat. With a
+/// staged Result for the member AND a retained owner-certificate join the
+/// shielded retry would consume, the notice-only poll sends nothing (both
+/// egress gates stay closed) and leaves both untouched. The normal fetch
+/// beside it proves both observables are live: it runs the retry (the
+/// malformed retention is removed) and serves the staged Result. The
+/// poll-side D154 staging is off until the rotation slice (engineer
+/// ruling, 27 Oct 2026), so nothing stages either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notice_only_fetches_never_yield_a_result_or_seat_a_member() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
     let admin = AgentKeypair::generate()?;
     let joiner = AgentKeypair::generate()?;
@@ -762,28 +842,22 @@ async fn notice_only_polls_stage_the_d154_cause() -> Result<()> {
         None,
         None,
     );
+    // Seat the joiner Active so the eligibility re-check on the staged
+    // Result below would PASS: if the notice-only early return were gone,
+    // the fetch would fall through and SERVE that Result (caught by the
+    // armed `join_result` egress gate).
+    info.add_member(
+        joiner_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        None,
+        None,
+    );
     info.recompute_state_hash();
     state
         .named_groups
         .write()
         .await
         .insert(group_key.clone(), info);
-    // D154 cover: every admin seat revoked.
-    let record = x0x::revocation::RevocationRecord::sign(
-        x0x::revocation::RevokedSubject::Agent(admin.agent_id()),
-        admin.public_key(),
-        admin.secret_key(),
-        now_millis_u64() / 1_000,
-        Some("test".to_string()),
-    )
-    .expect("sign revocation");
-    assert!(state
-        .agent
-        .revocation_set()
-        .write()
-        .await
-        .verify_and_insert(record, None)
-        .expect("self-revocation verifies"));
     let (_, _, _, evidence) = signed_member_joined_event_for_test(
         &joiner,
         &group_key,
@@ -792,7 +866,36 @@ async fn notice_only_polls_stage_the_d154_cause() -> Result<()> {
         x0x::groups::GroupRole::Member,
     )?;
     let attempt = member_joined_event_attempt_id(&evidence).expect("attempt id");
+    // A staged Result for the member — the terminal admission answer the
+    // fall-through path would serve, roster and all.
+    stage_join_result(
+        &state,
+        &group_key,
+        &joiner_hex,
+        evidence.clone(),
+        Some(&attempt),
+    )
+    .await;
+    // A retained owner-certificate join whose member id does not parse: the
+    // shielded retry removes exactly this shape when it runs (a run also
+    // re-applies retained events, which can seat).
+    let malformed_member = "zz-not-an-agent-id";
+    state.owner_cert_pending_joins.write().await.insert(
+        join_result_key(&group_key, malformed_member),
+        PendingOwnerCertJoin {
+            group_id: group_key.clone(),
+            event_group_key: group_key.clone(),
+            member_agent_id: malformed_member.to_string(),
+            event: evidence.clone(),
+            retained_at: std::time::Instant::now(),
+        },
+    );
 
+    // The notice-only fetch: verified, evidence-bound, refusal-capable —
+    // every temptation — sends NOTHING and runs neither the retry nor the
+    // Result lookup.
+    let armed_result = join_egress_test_barrier::arm(&joiner_hex, "join_result");
+    let armed_response = join_egress_test_barrier::arm(&joiner_hex, "join_result_response");
     handle_join_result_message(
         &state,
         &joiner_id,
@@ -808,13 +911,84 @@ async fn notice_only_polls_stage_the_d154_cause() -> Result<()> {
             accepts_pending_notice: true,
             held_notice_hash: None,
             notice_only: true,
-            attempt_evidence: Some(Box::new(evidence)),
+            attempt_evidence: Some(Box::new(evidence.clone())),
         },
     )
     .await;
-    let notice = staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt)
-        .expect("the notice-only evidence-bound poll stages the D154 notice");
-    assert_eq!(notice.0, "no_eligible_admin");
+    assert!(
+        !armed_result.gate.reached(),
+        "a notice-only fetch never yields a Result"
+    );
+    assert!(
+        !armed_response.gate.reached(),
+        "a notice-only fetch never yields a Refused (or any other reply)"
+    );
+    drop(armed_result);
+    drop(armed_response);
+    assert!(
+        state
+            .owner_cert_pending_joins
+            .read()
+            .await
+            .contains_key(&join_result_key(&group_key, malformed_member)),
+        "a notice-only fetch skips the owner-certificate retry (no admit, no seat)"
+    );
+    assert!(
+        staged_join_pending_notice(&state, &group_key, &joiner_hex, &attempt).is_none(),
+        "nothing stages on a notice-only fetch until the rotation slice"
+    );
+
+    // Control: the SAME fetch shape without notice_only runs the retry (the
+    // malformed retention is removed) and serves the staged Result (the
+    // egress gate is reached, then released).
+    let armed_result = join_egress_test_barrier::arm(&joiner_hex, "join_result");
+    let control_state = Arc::clone(&state);
+    let control_joiner = joiner_id;
+    let control_group = group_key.clone();
+    let control_attempt = attempt.clone();
+    let control = tokio::spawn(async move {
+        handle_join_result_message(
+            &control_state,
+            &control_joiner,
+            true,
+            JoinResultMessage::FetchRequest {
+                group_id: control_group.clone(),
+                member_agent_id: hex::encode(control_joiner.as_bytes()),
+                from_revision: None,
+                base_state_hash: None,
+                accepts_refusal: true,
+                accepts_control_blob_ref: false,
+                attempt_id: Some(control_attempt),
+                accepts_pending_notice: true,
+                held_notice_hash: None,
+                notice_only: false,
+                attempt_evidence: None,
+            },
+        )
+        .await;
+    });
+    let mut control_reached = false;
+    for _ in 0..200 {
+        if armed_result.gate.reached() {
+            control_reached = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        control_reached,
+        "the control fetch reaches the Result send point"
+    );
+    drop(armed_result);
+    control.await.expect("the control fetch completes");
+    assert!(
+        !state
+            .owner_cert_pending_joins
+            .read()
+            .await
+            .contains_key(&join_result_key(&group_key, malformed_member)),
+        "the control fetch runs the owner-certificate retry"
+    );
     Ok(())
 }
 
@@ -1032,6 +1206,295 @@ async fn the_pending_reply_is_sent_outside_the_membership_section() -> Result<()
     assert!(
         lock_free_while_sending,
         "the Pending reply send held the group's membership critical section"
+    );
+    Ok(())
+}
+
+/// §8 (D154, #1628 review item 2, PR #1639 review round 3): the
+/// attempt-evidence check rejects a mismatched group, a mismatched member,
+/// an attempt id that is not the event's blake3 and a tampered signature;
+/// only the joiner's own signed `MemberJoined` bound to this group, member
+/// and attempt verifies. The check proves exactly §8's minimum — the event
+/// is self-consistently signed by the sender's own key — and no more,
+/// which is why the D154 staging stays off until the rotation slice binds
+/// the evidence to a real invite or attempt.
+#[test]
+fn attempt_evidence_verification_rejects_mismatches() -> Result<()> {
+    let inviter = AgentKeypair::generate()?;
+    let joiner = AgentKeypair::generate()?;
+    let other = AgentKeypair::generate()?;
+    let group_key = "734".repeat(10);
+    let inviter_hex = hex::encode(inviter.agent_id().as_bytes());
+    let joiner_hex = hex::encode(joiner.agent_id().as_bytes());
+    let (_, _, _, evidence) = signed_member_joined_event_for_test(
+        &joiner,
+        &group_key,
+        &inviter_hex,
+        "1575w-secret",
+        x0x::groups::GroupRole::Member,
+    )?;
+    let attempt = member_joined_event_attempt_id(&evidence).expect("attempt id");
+
+    // The joiner's own evidence verifies and names the inviter.
+    assert_eq!(
+        verified_join_attempt_evidence(&group_key, &joiner_hex, &attempt, &evidence),
+        Some(inviter_hex.clone()),
+        "the joiner's own signed event is evidence"
+    );
+    // A different group.
+    assert_eq!(
+        verified_join_attempt_evidence(&"72".repeat(32), &joiner_hex, &attempt, &evidence),
+        None,
+        "an event for another group is not evidence here"
+    );
+    // A different member.
+    assert_eq!(
+        verified_join_attempt_evidence(
+            &group_key,
+            &hex::encode(other.agent_id().as_bytes()),
+            &attempt,
+            &evidence
+        ),
+        None,
+        "another member's event is not evidence"
+    );
+    // An attempt id that is not the event's blake3.
+    assert_eq!(
+        verified_join_attempt_evidence(&group_key, &joiner_hex, "not-the-attempt", &evidence),
+        None,
+        "the attempt id must be the event's blake3"
+    );
+    // A tampered signature: the attempt id is the blake3 of the canonical
+    // bytes AND the raw signature, so any tamper breaks the binding.
+    let mut tampered = evidence.clone();
+    match &mut tampered {
+        NamedGroupMetadataEvent::MemberJoined { signature_b64, .. } => {
+            let mut bytes = signature_b64.clone().into_bytes();
+            let last = bytes.last_mut().expect("non-empty signature");
+            *last = if *last == b'A' { b'B' } else { b'A' };
+            *signature_b64 = String::from_utf8(bytes).expect("utf8");
+        }
+        _ => panic!("the evidence is a MemberJoined"),
+    }
+    assert_eq!(
+        verified_join_attempt_evidence(&group_key, &joiner_hex, &attempt, &tampered),
+        None,
+        "a tampered signature does not verify"
+    );
+    Ok(())
+}
+
+/// §8 (PR #1639 review round 3, finding 4): a staged notice is served only
+/// inside its issued-at lifetime. A restage refreshes the staging clock but
+/// never `issued_at_ms`, so a notice whose issued-at clock has run past the
+/// 10-minute lifetime is not served even though its row is young — the
+/// joiner would drop it as stale.
+#[tokio::test]
+async fn a_notice_past_its_issued_lifetime_is_not_served() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let joiner = AgentKeypair::generate()?;
+    let joiner_id = joiner.agent_id();
+    let joiner_hex = hex::encode(joiner_id.as_bytes());
+    let group_key = "735".repeat(10);
+    let attempt = "at1575-lifetime".to_string();
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING,
+        JoinPendingNoticeDetail::default(),
+        None,
+    )
+    .await;
+    insert_verified_advert(
+        &state,
+        &joiner_id,
+        x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1,
+    )
+    .await;
+    // A young row whose issued-at clock is past the lifetime: backdate
+    // `issued_at_ms` only (the staging clock stays fresh — exactly the
+    // refire shape, where every poll restages the row but the joiner's
+    // freshness clock keeps running).
+    {
+        let mut notices = state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        notices
+            .get_mut(&join_refusal_refusal_key(&group_key, &joiner_hex, &attempt))
+            .expect("staged notice")
+            .issued_at_ms =
+            now_millis_u64().saturating_sub(PENDING_JOIN_RESULT_TTL.as_millis() as u64 + 1);
+    }
+    assert!(
+        serve_staged_join_pending_notice(
+            &state,
+            &group_key,
+            &joiner_hex,
+            &attempt,
+            &joiner_id,
+            None,
+            false,
+        )
+        .await
+        .is_none(),
+        "a notice past its issued-at lifetime is not served"
+    );
+    Ok(())
+}
+
+/// §8 (PR #1639 review round 3, finding 1): an unknown advert refreshes
+/// through the shared single-flight registry ONLY when a notice for the
+/// fetched attempt is actually staged — a verified fetch for an unknown
+/// group, or a known group with no staged notice, publishes nothing on the
+/// targeted capability request topic. With a staged notice the refresh
+/// fires once, and immediate re-polls inside the single-flight window
+/// publish nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_capability_refresh_publishes_only_for_a_staged_notice() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let loopback_addr: std::net::SocketAddr = "127.0.0.1:0".parse()?;
+    // Hermetic plane (the hs_f2 pattern): loopback bind, no bootstrap, no
+    // mDNS, no port mapping, a network id unique to this run — the node
+    // has nothing to dial and nothing to discover.
+    let network_id = format!(
+        "1575-refresh-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_agent_cert_path(dir.path().join("agent.cert"))
+            .with_peer_cache_disabled()
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_network_config(x0x::network::NetworkConfig {
+                bind_addr: Some(loopback_addr),
+                bootstrap_nodes: Vec::new(),
+                port_mapping_enabled: false,
+                mdns_enabled: false,
+                network_id: Some(network_id),
+                ..x0x::network::NetworkConfig::default()
+            })
+            .build()
+            .await?,
+    );
+    agent.join_network().await?;
+    let state = secure_endpoint_test_state_at(dir.path(), Arc::clone(&agent)).await?;
+    let joiner = AgentKeypair::generate()?;
+    let joiner_id = joiner.agent_id();
+    let joiner_hex = hex::encode(joiner_id.as_bytes());
+    let group_key = "733".repeat(10);
+    let attempt = "at1575-refresh".to_string();
+
+    let mut requests = state
+        .agent
+        .subscribe(crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC)
+        .await?;
+    // Let the local subscription activate before the first fetch.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let fetch = |state: &Arc<AppState>, group_id: String| {
+        let state = Arc::clone(state);
+        let joiner_hex = joiner_hex.clone();
+        let attempt = attempt.clone();
+        async move {
+            handle_join_result_message(
+                &state,
+                &joiner_id,
+                true,
+                JoinResultMessage::FetchRequest {
+                    group_id,
+                    member_agent_id: joiner_hex,
+                    from_revision: None,
+                    base_state_hash: None,
+                    accepts_refusal: true,
+                    accepts_control_blob_ref: false,
+                    attempt_id: Some(attempt),
+                    accepts_pending_notice: true,
+                    held_notice_hash: None,
+                    notice_only: false,
+                    attempt_evidence: None,
+                },
+            )
+            .await;
+        }
+    };
+
+    // An unknown group with no staged notice: the fetch publishes nothing.
+    fetch(&state, "71".repeat(32)).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), requests.recv())
+            .await
+            .is_err(),
+        "an unknown-group fetch publishes no capability request"
+    );
+
+    // A known group with no staged notice: still nothing.
+    {
+        let admin = AgentKeypair::generate()?;
+        let mut info = x0x::groups::GroupInfo::new(
+            "1575w".to_string(),
+            String::new(),
+            admin.agent_id(),
+            group_key.clone(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        info.add_member(
+            hex::encode(state.agent.agent_id().as_bytes()),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.clone(), info);
+    }
+    fetch(&state, group_key.clone()).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), requests.recv())
+            .await
+            .is_err(),
+        "a fetch with no staged notice publishes no capability request"
+    );
+
+    // A staged notice: the refresh fires exactly once through the
+    // single-flight registry, and immediate re-polls inside the flight
+    // window publish nothing more.
+    stage_join_pending_notice(
+        &state,
+        &group_key,
+        &joiner_hex,
+        &attempt,
+        JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING,
+        JoinPendingNoticeDetail::default(),
+        None,
+    )
+    .await;
+    fetch(&state, group_key.clone()).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), requests.recv())
+            .await
+            .is_ok(),
+        "a staged notice refreshes the joiner's advert"
+    );
+    fetch(&state, group_key.clone()).await;
+    fetch(&state, group_key).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), requests.recv())
+            .await
+            .is_err(),
+        "re-polls inside the single-flight window publish nothing more"
     );
     Ok(())
 }
