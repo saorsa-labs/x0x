@@ -85,6 +85,13 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # W3-H idle-step code is behind `tokio_unstable`. The plain clippy
+      # above does not build it (#1245, #1654).
+      - name: Run clippy under tokio_unstable
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        env:
+          RUSTFLAGS: --cfg tokio_unstable
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest
@@ -843,6 +850,8 @@ jobs:
           --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
           --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
           --expect w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless=GREEN
+          --require w3h_1581_s4_ordinary_admin_revoked
+          --expect w3h_1581_s4_ordinary_admin_revoked=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable

@@ -82,6 +82,7 @@ async fn a_revoked_requester_gets_no_pages_and_an_active_member_still_does() -> 
     handle_treekem_catchup_request(
         &state,
         &active.agent_id(),
+        &clean_sender_machine(),
         true,
         catchup_request(&group_id, &active.agent_id()),
     )
@@ -94,6 +95,7 @@ async fn a_revoked_requester_gets_no_pages_and_an_active_member_still_does() -> 
     handle_treekem_catchup_request(
         &state,
         &revoked.agent_id(),
+        &clean_sender_machine(),
         true,
         catchup_request(&group_id, &revoked.agent_id()),
     )
@@ -119,6 +121,7 @@ async fn a_revoked_requester_gets_no_pages_and_an_active_member_still_does() -> 
     handle_treekem_catchup_request(
         &state,
         &active.agent_id(),
+        &clean_sender_machine(),
         true,
         catchup_request(&group_id, &active.agent_id()),
     )
@@ -132,6 +135,7 @@ async fn a_revoked_requester_gets_no_pages_and_an_active_member_still_does() -> 
     handle_treekem_catchup_request(
         &state,
         &active.agent_id(),
+        &clean_sender_machine(),
         true,
         catchup_request(&group_id, &active.agent_id()),
     )

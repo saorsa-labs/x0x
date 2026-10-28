@@ -131,7 +131,7 @@ pub(super) struct RebindState {
     deliveries: HashMap<(String, String), Delivery>,
     /// Frames held for catch-up; the authored and the received frames are
     /// durable ([`replay_log`]).
-    log: replay_log::HeldLog<CRB_LOG_PER_GROUP>,
+    log: replay_log::HeldLog<CRB_LOG_PER_GROUP, true>,
     stash: FrameStash<CRB_STASH_CAP>,
     /// Verified renewals an admin holds for a seat, from a hand-off.
     renewals: HashMap<EvictionKey, AgentCertificate>,
@@ -177,7 +177,7 @@ impl RebindState {
     }
 }
 
-fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROUP> {
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROUP, true> {
     &mut inner.rebind.log
 }
 
@@ -470,7 +470,7 @@ async fn commit_locked(
         Err(error) => Err(error.to_string()),
     };
     if let Err(error) = persisted {
-        replay_log::rewrite_from_memory(state, ext, held, stable).await;
+        replay_log::rewrite_without(state, ext, held, stable, at).await;
         return Err(CommitError::Persist(error));
     }
     ng::refresh_group_card_cache_from_info(state, group_key, &next).await;
@@ -1714,10 +1714,14 @@ fn spawn_send(
 /// `group_ids`) above `from_revision`, oldest first, to a catch-up
 /// requester, on the distinct gated carrier only. A requester without a
 /// current verified advert setting `certificate_rebind_v1` gets nothing:
-/// the frame never goes into a legacy-decoded catch-up page. Each write
-/// uses [`guarded_admission_for`] with [`HeadRule::OnChain`]: ADR 0107's
-/// serving guard plus D60 under the membership lock, re-checked at the
-/// seam immediately before the physical write.
+/// the frame never goes into a legacy-decoded catch-up page. A competing
+/// frame kept as fork evidence (#1579) is not on this node's verified
+/// chain, so it is skipped, not served, and it does not stop the round.
+/// A fork-quarantined group serves nothing on purpose: `head_rule_admits`
+/// refuses every frame of it, so the skip leaves the round empty.
+/// Each write uses [`guarded_admission_for`] with [`HeadRule::OnChain`]:
+/// ADR 0107's serving guard plus D60 under the membership lock,
+/// re-checked at the seam immediately before the physical write.
 pub(in crate::server) async fn serve_catchup(
     state: &Arc<AppState>,
     requester: &AgentId,
@@ -1733,7 +1737,27 @@ pub(in crate::server) async fn serve_catchup(
         .rebind
         .log
         .catchup_frames(group_ids, from_revision);
+    // The frames all come from one group (`catchup_frames` serves the
+    // first of `group_ids` that has a log).
+    let info = {
+        let groups = state.named_groups.read().await;
+        frames.first().and_then(|(group, _, _)| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group)
+                .cloned()
+        })
+    };
+    let Some(info) = info else {
+        return;
+    };
     for (group_id, result_head, bytes) in frames {
+        // #1579: a competing frame kept as fork evidence is not on this
+        // node's verified chain. It is never served, and it does not stop
+        // the round for the frames that are.
+        if !head_rule_admits(&info, &HeadRule::OnChain(result_head.clone())) {
+            continue;
+        }
         let admission = guarded_admission_for(
             state,
             &group_id,
@@ -2032,7 +2056,7 @@ pub(in crate::server) async fn receive(
     {
         Ok(next) => next,
         Err(error) => {
-            replay_log::rewrite_from_memory(state, ext, held, stable).await;
+            replay_log::rewrite_without(state, ext, held, stable, at).await;
             tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0110 S4: certificate rebind commit refused: {error}");
             return ReceiveOutcome::Refused(cr::CertificateRebindRefusal::StateMismatch);
         }
@@ -2842,13 +2866,15 @@ pub(super) mod restart_tests {
         info
     }
 
-    /// An `OwnerCertified` group: `admin` is its admin, and `seat` and the
-    /// receiver are certified Members. Each certificate expires in ten
-    /// minutes. The frame rebinds `seat`'s certificate.
+    /// An `OwnerCertified` group: `admin` is its admin, and `seat`,
+    /// `peer` and the receiver are certified Members. Each certificate
+    /// expires in ten minutes. The frame rebinds `seat`'s certificate;
+    /// the competing frame renews `peer`'s.
     struct RebindFixture {
         owner: UserKeypair,
         admin: AgentKeypair,
         seat: AgentKeypair,
+        peer: AgentKeypair,
         info: GroupInfo,
     }
 
@@ -2857,6 +2883,7 @@ pub(super) mod restart_tests {
             let owner = UserKeypair::generate()?;
             let admin = AgentKeypair::generate()?;
             let seat = AgentKeypair::generate()?;
+            let peer = AgentKeypair::generate()?;
             let now = now_unix_ms() / 1000;
             let mut info = GroupInfo::new(
                 "crb".to_string(),
@@ -2867,7 +2894,7 @@ pub(super) mod restart_tests {
             info.policy.admission =
                 x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
             let admin_hex = hex::encode(admin.agent_id().as_bytes());
-            for member in [&seat, receiver] {
+            for member in [&seat, receiver, &peer] {
                 info.add_member(
                     hex::encode(member.agent_id().as_bytes()),
                     GroupRole::Member,
@@ -2875,7 +2902,7 @@ pub(super) mod restart_tests {
                     None,
                 );
             }
-            for member in [&admin, &seat, receiver] {
+            for member in [&admin, &seat, receiver, &peer] {
                 let cert = AgentCertificate::issue_with_expiry(&owner, member, Some(now + 600))?;
                 cr::install_certificate(
                     &mut info,
@@ -2884,16 +2911,32 @@ pub(super) mod restart_tests {
                 );
             }
             info.recompute_state_hash();
+            // The held state is a sealed parent, so its head is a retained
+            // commit: a later frame that does not chain from this node's
+            // head can be checked against it (#1579, the sibling rule).
+            // The admin renews its own certificate once; every fixture
+            // frame seals on that state.
+            let renewal = AgentCertificate::issue_with_expiry(&owner, &admin, Some(now + 900))?;
+            let (parent, _) = cr::seal(
+                &info,
+                *admin.agent_id().as_bytes(),
+                &renewal,
+                &admin,
+                now_unix_ms(),
+            )
+            .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
             Ok(Self {
                 owner,
                 admin,
                 seat,
-                info,
+                peer,
+                info: parent,
             })
         }
 
-        /// The admin's signed rebind of the seat, and its result head.
-        fn frame(&self) -> Result<(Vec<u8>, String)> {
+        /// The admin's signed rebind of the seat, its result head, and
+        /// the state the frame installs (the chain it retains).
+        fn frame_with_state(&self) -> Result<(Vec<u8>, String, GroupInfo)> {
             let now_ms = now_unix_ms();
             let renewal = AgentCertificate::issue_with_expiry(
                 &self.owner,
@@ -2901,6 +2944,35 @@ pub(super) mod restart_tests {
                 Some(now_ms / 1000 + 6000),
             )?;
             let seat = *self.seat.agent_id().as_bytes();
+            let (next, frame) = cr::seal(&self.info, seat, &renewal, &self.admin, now_ms)
+                .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+            let bytes = cr::encode_frame(&frame)?;
+            Ok((bytes, next.state_hash.clone(), next))
+        }
+
+        /// The admin's signed rebind of the seat, and its result head.
+        fn frame(&self) -> Result<(Vec<u8>, String)> {
+            let (bytes, head, _) = self.frame_with_state()?;
+            Ok((bytes, head))
+        }
+
+        /// A second, different rebind on the same parent: a competing
+        /// commit at the same revision (#1579) — the admin renews the
+        /// `peer` member, so a different roster root and result head. It
+        /// does not rebind the same seat again: after one of the pair
+        /// installs, that seat's committed certificate is the renewal,
+        /// and #1533 r11's sibling rule leaves a same-seat sibling
+        /// unvalidated (`CertificateEvidenceMissing` — the parent's
+        /// certificate bytes are gone). A sibling of another seat keeps
+        /// every certificate the rule reads, whichever frame installs.
+        fn competing_frame(&self) -> Result<(Vec<u8>, String)> {
+            let now_ms = now_unix_ms();
+            let renewal = AgentCertificate::issue_with_expiry(
+                &self.owner,
+                &self.peer,
+                Some(now_ms / 1000 + 7000),
+            )?;
+            let seat = *self.peer.agent_id().as_bytes();
             let (next, frame) = cr::seal(&self.info, seat, &renewal, &self.admin, now_ms)
                 .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
             let bytes = cr::encode_frame(&frame)?;
@@ -3048,6 +3120,278 @@ pub(super) mod restart_tests {
         let frames = served(&restarted, &stable, fixture.info.state_revision).await;
         assert_eq!(frames, vec![(result_head, bytes)]);
         restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1579: a received frame at a revision the `.crblog` already holds
+    /// — the crash window left it there, memory has not installed it — is
+    /// written beside the held frame, never in its place, and both stay
+    /// durable. After the restart one installs and the other, a valid
+    /// sibling, contains the group as fork evidence. The competing frame
+    /// renews another member's seat: #1533 r11's sibling rule reads the
+    /// parent's certificate bytes for the signer and the rebound seat, so
+    /// a same-seat sibling is unprovable once one of the pair installs.
+    #[tokio::test]
+    async fn a_competing_rebind_frame_is_kept_as_fork_evidence() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes1, head1) = fixture.frame()?;
+        let (bytes2, head2) = fixture.competing_frame()?;
+        assert_ne!(head1, head2, "the fixture frames compete at one revision");
+
+        // The installs fail after each frame write (a crash at that
+        // point): the first frame stays in the file, and the second is
+        // written beside it.
+        let blocked = block_install(&receiver).await?;
+        assert_eq!(
+            receive(&receiver, fixture.admin.agent_id(), &bytes1).await,
+            ReceiveOutcome::LocalFailure
+        );
+        assert_eq!(
+            receive(&receiver, fixture.admin.agent_id(), &bytes2).await,
+            ReceiveOutcome::LocalFailure
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&receiver, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 2, "the competing frame is written");
+        assert_eq!(
+            (on_disk[0].result_head.as_str(), on_disk[0].frame.as_slice()),
+            (head1.as_str(), bytes1.as_slice()),
+            "the held frame is never replaced"
+        );
+        assert_eq!(
+            (on_disk[1].result_head.as_str(), on_disk[1].frame.as_slice()),
+            (head2.as_str(), bytes2.as_slice()),
+            "the competing frame is kept"
+        );
+
+        // The process dies before either install. The restart re-receives
+        // both: one installs, the other contains the group.
+        receiver.agent.shutdown().await;
+        drop(receiver);
+        unblock_install(blocked).await?;
+        let restarted = offline_daemon(dir.path(), None).await?;
+        ensure_restored(&restarted).await;
+        retry_stash(&restarted).await;
+        let head = head_of(&restarted, &stable).await.context("the head")?;
+        assert!(
+            head == head1 || head == head2,
+            "one of the competing pair installed: {head}"
+        );
+        assert!(
+            quarantine_of(&restarted, &stable).await.is_some(),
+            "the other frame contains the group as fork evidence"
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&restarted, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 2, "both frames stay durable as evidence");
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1579 review: a revision holds two file-only frames plus the
+    /// newest write's, and no more. A signer can seal many distinct
+    /// valid frames at one revision; without the bound they fill the
+    /// per-group cap and the oldest frames leave — the catch-up window
+    /// below the head. Four distinct frames are written at one revision:
+    /// the first two and the newest stay, the third leaves.
+    #[tokio::test]
+    async fn a_revision_keeps_two_file_only_frames_and_the_newest() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes1, head1) = fixture.frame()?;
+        let (bytes2, head2) = fixture.competing_frame()?;
+        let mut heads = vec![head1.clone(), head2.clone()];
+        let mut frames_in = vec![bytes1, bytes2];
+        for offset in [9000, 9500] {
+            let now_ms = now_unix_ms();
+            let renewal = AgentCertificate::issue_with_expiry(
+                &fixture.owner,
+                &fixture.seat,
+                Some(now_ms / 1000 + offset),
+            )?;
+            let (next, frame) = cr::seal(
+                &fixture.info,
+                *fixture.seat.agent_id().as_bytes(),
+                &renewal,
+                &fixture.admin,
+                now_ms,
+            )
+            .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+            heads.push(next.state_hash);
+            frames_in.push(cr::encode_frame(&frame)?);
+        }
+        let [h1, h2, h3, h4] = heads.as_slice() else {
+            anyhow::bail!("four frames");
+        };
+        assert!(h1 != h2 && h1 != h3 && h1 != h4 && h2 != h3 && h2 != h4 && h3 != h4);
+
+        let _blocked = block_install(&receiver).await?;
+        for bytes in &frames_in {
+            assert_eq!(
+                receive(&receiver, fixture.admin.agent_id(), bytes).await,
+                ReceiveOutcome::LocalFailure,
+                "the install stays blocked; the writes happen"
+            );
+        }
+        let on_disk =
+            replay_log::tests::frames_on_disk(&receiver, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(
+            on_disk.len(),
+            3,
+            "two file-only frames and the newest: the third leaves, not the catch-up window"
+        );
+        assert_eq!(
+            (
+                on_disk[0].result_head.as_str(),
+                on_disk[1].result_head.as_str(),
+                on_disk[2].result_head.as_str()
+            ),
+            (h1.as_str(), h2.as_str(), h4.as_str()),
+            "the first two and the newest stay"
+        );
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Install a verified advert for `peer`, as the daemon-tests helper
+    /// does: the catch-up gate reads the requester's current verified
+    /// advert.
+    fn advertise(state: &AppState, peer: AgentId, bits: u64, created_at_unix_ms: u64) {
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+        assert!(
+            state.agent.capability_store().insert(
+                peer,
+                x0x::identity::MachineId([4; 32]),
+                capabilities,
+                created_at_unix_ms,
+            ),
+            "verified capability advert"
+        );
+    }
+
+    /// The tracing text `f` produces. These tests run on the current-thread
+    /// runtime, so the thread-local default subscriber sees every event of
+    /// the awaited future.
+    async fn captured_tracing(f: impl std::future::Future<Output = ()>) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f.await;
+        drop(_guard);
+        let bytes = std::mem::take(&mut *sink.0.lock().expect("sink"));
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// #1579: a competing frame kept below the head never stops the
+    /// catch-up round — proven at the real `serve_catchup` loop, offline.
+    /// The log holds the competitor first, then the on-chain frame (the
+    /// installed sibling's branch is this node's head). The loop's head
+    /// rule skips the competitor and still attempts the on-chain frame's
+    /// send, which goes through the real guarded admission and the
+    /// test-build in-process pinned stand-in: the stand-in's admitted
+    /// marker in the captured log is the evidence that the send ran and
+    /// passed the gate. A `return` at the skip (or serving the competitor,
+    /// whose send the seam refuses) ends the round on the competitor, and
+    /// the capture then holds no marker — the frame after the competitor
+    /// never leaves.
+    #[tokio::test]
+    async fn the_catchup_round_serves_past_a_competing_frame_below_the_head() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        let (bytes1, head1, head1_state) = fixture.frame_with_state()?;
+        let (bytes2, head2) = fixture.competing_frame()?;
+        assert_ne!(head1, head2, "the fixture frames compete at one revision");
+        // This node installed the sibling's branch: head1 is the head, and
+        // the competitor at the same revision is evidence only.
+        hold_persisted(&receiver, &head1_state).await?;
+        let revision = head1_state.state_revision;
+        {
+            let mut inner = receiver.revocation_evictions.inner.lock().await;
+            inner
+                .rebind
+                .log
+                .remember(&stable, revision, head2.as_str(), Arc::new(bytes2), false);
+            inner
+                .rebind
+                .log
+                .remember(&stable, revision, head1.as_str(), Arc::new(bytes1), false);
+        }
+        let order: Vec<String> = receiver
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .log
+            .catchup_frames(std::slice::from_ref(&stable), fixture.info.state_revision)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert_eq!(
+            order,
+            vec![head2.clone(), head1.clone()],
+            "the round meets the competitor first, then the on-chain frame"
+        );
+        // A capable member asks this node for catch-up.
+        let requester = fixture.peer.agent_id();
+        advertise(
+            &receiver,
+            requester,
+            x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+            now_unix_ms(),
+        );
+        let captured = captured_tracing(async {
+            serve_catchup(
+                &receiver,
+                &requester,
+                std::slice::from_ref(&stable),
+                fixture.info.state_revision,
+            )
+            .await;
+        })
+        .await;
+        assert!(
+            captured.contains("certificate rebind catch-up send refused or failed")
+                && captured.contains(x0x::dm::PINNED_STANDIN_ADMITTED),
+            "the round skipped the competitor and attempted the on-chain frame's send:\n{captured}"
+        );
+        receiver.agent.shutdown().await;
         Ok(())
     }
 

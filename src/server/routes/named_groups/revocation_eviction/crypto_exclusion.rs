@@ -4566,6 +4566,13 @@ mod daemon_tests {
             .collect()
     }
 
+    /// #1616: the transport machine of a simulated DM whose sender device
+    /// is clean — the same id named_groups' `clean_sender_machine` uses,
+    /// which no test revokes.
+    fn clean_sender_machine() -> x0x::identity::MachineId {
+        x0x::identity::MachineId([0x16; 32])
+    }
+
     /// The `responder_state_hash` this node really serves in a catch-up
     /// answer for `group_id` (#1578 review: the tests feed the served
     /// answer, never a hand-built value).
@@ -4585,6 +4592,7 @@ mod daemon_tests {
         ng::handle_treekem_catchup_request(
             state,
             &requester,
+            &clean_sender_machine(),
             true,
             ng::TreeKemCatchupRequest {
                 message_type: "treekem_catchup_request".to_string(),
@@ -5810,6 +5818,7 @@ mod daemon_tests {
         ng::handle_treekem_catchup_request(
             &state,
             &requester,
+            &clean_sender_machine(),
             true,
             ng::TreeKemCatchupRequest {
                 message_type: "treekem_catchup_request".to_string(),

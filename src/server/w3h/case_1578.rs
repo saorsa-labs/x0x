@@ -306,6 +306,9 @@ async fn served_head_claim(
         crate::server::routes::named_groups::handle_treekem_catchup_request(
             &state,
             &requester_id,
+            // #1616: the DM's QUIC-authenticated sender machine; clean
+            // here (the clean-machine id no test revokes).
+            &crate::identity::MachineId([0x16; 32]),
             true,
             request,
         )

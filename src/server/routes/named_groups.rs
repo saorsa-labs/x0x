@@ -83,7 +83,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, MutexGuard, RwLock};
 use x0x::contacts::TrustLevel;
-use x0x::identity::AgentId;
+use x0x::identity::{AgentId, MachineId};
 use x0x::logging::LogHexId;
 use x0x::Agent;
 
@@ -5776,18 +5776,6 @@ async fn classify_refused_joiner_fork_chain(
     if commit.verify_structure().is_err() {
         return false;
     }
-    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
-    // this same mandate; if it produced a successor, the lineage gate
-    // above is still empty and the marker was handled there — never
-    // record the owner's own anchored chain as fork evidence.
-    if let (Some(owner_id), Some(mandate)) = (
-        current.policy.admission.owner_certified_user_id(),
-        owner_mandate,
-    ) {
-        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
-            return false;
-        }
-    }
     let base = x0x::groups::state_commit::AlternateChainBase {
         group_id: current.stable_group_id(),
         base_revision: current.state_revision,
@@ -5842,6 +5830,21 @@ async fn classify_refused_joiner_fork_chain(
             "joiner served chain is owner-anchored to this exact terminal — stale-base gap, not fork evidence"
         );
         return true;
+    }
+    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
+    // this same mandate; if it produced a successor, the lineage check at
+    // the top of this fn is still empty and the marker was handled there —
+    // never record the owner's own anchored chain as fork evidence. This check
+    // sits AFTER the v2 gap branch: an owner seal of a stale-base joiner
+    // carries both the mandate and the v2 terminal binding, and it must
+    // still arm the ADR 0109 gap gate (H-S3-c).
+    if let (Some(owner_id), Some(mandate)) = (
+        current.policy.admission.owner_certified_user_id(),
+        owner_mandate,
+    ) {
+        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
+            return false;
+        }
     }
     if served_chain_owner_v1_only {
         // A genuine v1 signature authenticates the parent, but cannot
@@ -11703,6 +11706,7 @@ pub(in crate::server) async fn w3h_rebind_delivery_report(state: &Arc<AppState>)
 pub(in crate::server) async fn dispatch_treekem_catchup_message(
     state: &Arc<AppState>,
     sender: &AgentId,
+    machine_id: &MachineId,
     verified: bool,
     payload: &[u8],
 ) -> bool {
@@ -11721,8 +11725,18 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
         };
         let serve_state = Arc::clone(state);
         let requester = *sender;
+        // #1616: the QUIC-authenticated sender machine of the DM, so the
+        // serve can refuse a revoked device (ADR 0110 D70).
+        let sender_machine = *machine_id;
         let _admitted = state.spawn_detached(async move {
-            handle_treekem_catchup_request(&serve_state, &requester, verified, request).await;
+            handle_treekem_catchup_request(
+                &serve_state,
+                &requester,
+                &sender_machine,
+                verified,
+                request,
+            )
+            .await;
             drop(slot);
         });
         return true;
@@ -11742,9 +11756,17 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
     // runs shielded; awaiting it keeps the responses in arrival order.
     let apply_state = Arc::clone(state);
     let sender = *sender;
+    let sender_machine = *machine_id;
     state
         .run_shielded(Box::pin(async move {
-            handle_treekem_catchup_response(&apply_state, &sender, verified, response).await;
+            handle_treekem_catchup_response(
+                &apply_state,
+                &sender,
+                &sender_machine,
+                verified,
+                response,
+            )
+            .await;
         }))
         .await
         .is_some()
@@ -11753,6 +11775,7 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
 pub(in crate::server) async fn handle_treekem_catchup_request(
     state: &Arc<AppState>,
     sender: &AgentId,
+    machine_id: &MachineId,
     verified: bool,
     request: TreeKemCatchupRequest,
 ) {
@@ -11765,6 +11788,14 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // keeps its Active seat until the S4 eviction commits, so the roster
     // check below alone cannot refuse it. Drop the request on the same
     // path the response handler uses for a revoked sender; no typed reply.
+    // #1616 (ADR 0110 D70): a machine revocation denies that device only;
+    // the portable agent keeps its Active seat, so the same roster check
+    // cannot refuse the device either — the DM's QUIC-authenticated
+    // sender machine refuses it, under its own operator sentence.
+    // #1622 (ADR 0110 D70): a binding revocation retires the pairing
+    // only — the agent keeps its seat and the device stays clean — so
+    // neither gate above can refuse it; the pairing itself does, under
+    // its own operator sentence.
     // A pending revocation resync also refuses (fail-closed, as the
     // response handler does), under its own operator sentence.
     {
@@ -11775,6 +11806,22 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 group_id = %LogHexId::group(&request.group_id),
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request from a revoked requester"
+            );
+            return;
+        }
+        if revoked.is_machine_revoked(machine_id) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %LogHexId::agent(&sender_hex),
+                "rejecting TreeKEM catch-up request from a machine-revoked requester"
+            );
+            return;
+        }
+        if revoked.is_binding_revoked(sender, machine_id) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %LogHexId::agent(&sender_hex),
+                "rejecting TreeKEM catch-up request from a requester with a revoked agent-machine binding"
             );
             return;
         }
@@ -12067,6 +12114,7 @@ pub(in crate::server) fn catchup_846_gate_armed(info: &x0x::groups::GroupInfo) -
 pub(in crate::server) async fn handle_treekem_catchup_response(
     state: &Arc<AppState>,
     sender: &AgentId,
+    machine_id: &MachineId,
     verified: bool,
     response: TreeKemCatchupResponse,
 ) {
@@ -12077,7 +12125,17 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
-        if revoked.is_agent_revoked(sender) || revoked.revocation_resync_required() {
+        // #1616 (ADR 0110 D70): a machine-revoked device is dropped with
+        // its agent. Its portable agent keeps the Active seat the roster
+        // check below sees, so the machine gate must fire first.
+        // #1622 (ADR 0110 D70): a revoked agent-machine binding retires
+        // the pairing only — agent and device each stay clean — so the
+        // pairing itself is dropped here, before the roster check.
+        if revoked.is_agent_revoked(sender)
+            || revoked.is_machine_revoked(machine_id)
+            || revoked.is_binding_revoked(sender, machine_id)
+            || revoked.revocation_resync_required()
+        {
             return;
         }
     }
@@ -28585,7 +28643,9 @@ async fn owner_certified_seal_with_eviction(
 /// chain and republish the signed public card (no-op payload change —
 /// used to refresh / repair / force-propagate the chain).
 ///
-/// Admin or higher only.
+/// Admin or higher only — except that the §4 refusal below runs first:
+/// while every admin seat is revoked, members get the typed
+/// `group_admin_revoked` state, not the seat 403 (ADR 0110 §4b(3)).
 ///
 /// ADR-0038: for OwnerCertified groups this endpoint is the full
 /// re-verification point — see `owner_certified_seal_with_eviction`.
@@ -28599,6 +28659,14 @@ pub(in crate::server) async fn seal_group_state(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key. Like the
+    // other §4 routes (invite, remove, ban, approve, reseal), this runs
+    // before the caller's seat gate: every member gets the typed state,
+    // not the seat 403 (#1581, ADR 0110 §4b(3) "seal on B and C").
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     {
         // #1166 S3: the admin trio (the inlined caller_role gate and
@@ -28608,11 +28676,6 @@ pub(in crate::server) async fn seal_group_state(
         if let Err(resp) = group_access::admit_admin_group_route(&groups, &id, &local_hex) {
             return resp;
         }
-    }
-    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
-    // message, admission or key reaches a revoked admin key.
-    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
-        return resp;
     }
     // ADR 0110 §2: a seal that would evict a pending S4 target before
     // this node's fallback time is deferred (`waiting_for_designated_admin`).
@@ -47212,6 +47275,9 @@ pub(in crate::server) mod tests {
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
     mod issue1577_revoked_catchup_request;
+    mod issue1616_machine_revoked_catchup;
+    mod issue1622_binding_revoked_catchup;
+    mod issue1649_reseat_mandate_receive;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -47230,6 +47296,14 @@ pub(in crate::server) mod tests {
     #[path = "issue1224_unsigned_group_card.rs"]
     mod unsigned_group_card_1224;
     mod wp_c;
+
+    /// #1616: the transport machine of a simulated DM whose sender device
+    /// is clean. The catch-up handlers thread the QUIC-authenticated sender
+    /// machine of the direct message; tests that do not exercise a machine
+    /// revocation pass this id, which no test revokes.
+    fn clean_sender_machine() -> MachineId {
+        MachineId([0x16; 32])
+    }
 
     fn fake_group_state_commit(
         group_id: &str,
@@ -64235,7 +64309,14 @@ pub(in crate::server) mod tests {
         let response = member_keyed_treekem_catchup_response(&w_state, &log_keys, &request)
             .await
             .expect("independent witness W serves B's cached event");
-        handle_treekem_catchup_response(&a_state, &w_state.agent.agent_id(), true, response).await;
+        handle_treekem_catchup_response(
+            &a_state,
+            &w_state.agent.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response,
+        )
+        .await;
         assert_eq!(
             member_treekem_kp(&a_state, &group_id, &member_hex)
                 .await
@@ -65521,8 +65602,14 @@ pub(in crate::server) mod tests {
             responder_state_hash: None,
         };
         let unauthorized = x0x::identity::AgentKeypair::generate()?;
-        handle_treekem_catchup_response(state, &unauthorized.agent_id(), true, response.clone())
-            .await;
+        handle_treekem_catchup_response(
+            state,
+            &unauthorized.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response.clone(),
+        )
+        .await;
         assert!(
             member_treekem_kp(state, &group_id, &member_hex)
                 .await
@@ -65547,7 +65634,14 @@ pub(in crate::server) mod tests {
             .write()
             .await
             .verify_and_insert(revocation, None)?;
-        handle_treekem_catchup_response(state, &courier_id, true, response).await;
+        handle_treekem_catchup_response(
+            state,
+            &courier_id,
+            &clean_sender_machine(),
+            true,
+            response,
+        )
+        .await;
         assert!(
             member_treekem_kp(state, &group_id, &member_hex)
                 .await
