@@ -3874,12 +3874,7 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
                     advance_round(subject, now, from_pending);
                 }
                 AttestRefusalReason::BaseBeyondRetention => {
-                    let all_beyond = !subject.asked.is_empty()
-                        && subject
-                            .asked
-                            .values()
-                            .all(|answer| answer == "base_beyond_retention");
-                    if all_beyond {
+                    if every_reached_admin_beyond_retention(&subject.asked) {
                         subject.view = SubjectView::Readmission {
                             cause: "base_beyond_retention",
                         };
@@ -3898,6 +3893,20 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
         }
         AttestAnswer::Reseat { .. } => {}
     }
+}
+
+/// §3 "Beyond retention" (D97): the node enters `readmission_required`
+/// when every admin it has *reached* refuses with `base_beyond_retention`
+/// and none attests. A target that never answered (`pending`) was not
+/// reached, and a `not_an_admin` answer is not an admin's; neither blocks
+/// the state. An unreachable admin may still attest later, which leaves
+/// the state (§8).
+fn every_reached_admin_beyond_retention(asked: &BTreeMap<String, String>) -> bool {
+    let mut reached = asked
+        .values()
+        .filter(|answer| !matches!(answer.as_str(), "pending" | "not_an_admin"))
+        .peekable();
+    reached.peek().is_some() && reached.all(|answer| answer == "base_beyond_retention")
 }
 
 /// §2 "Conflict": this node holds a recorded attestation conflict.
@@ -11589,5 +11598,32 @@ mod tests {
             "a flood of unknown requesters does not evict a roster subject"
         );
         Ok(())
+    }
+
+    /// §3 "Beyond retention" (H-S3-r): an admin that never answered, or a
+    /// member's `not_an_admin`, does not block `readmission_required`; any
+    /// other answer from a reached admin does.
+    #[test]
+    fn readmission_counts_only_reached_admins() {
+        let asked = |rows: &[(&str, &str)]| -> BTreeMap<String, String> {
+            rows.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect()
+        };
+        let bbr = "base_beyond_retention";
+        assert!(every_reached_admin_beyond_retention(&asked(&[("a", bbr)])));
+        assert!(every_reached_admin_beyond_retention(&asked(&[
+            ("a", bbr),
+            ("b", "pending"),
+            ("m", "not_an_admin"),
+        ])));
+        assert!(!every_reached_admin_beyond_retention(&asked(&[])));
+        assert!(!every_reached_admin_beyond_retention(&asked(&[(
+            "b", "pending"
+        )])));
+        assert!(!every_reached_admin_beyond_retention(&asked(&[
+            ("a", bbr),
+            ("c", "attester_behind"),
+        ])));
     }
 }
