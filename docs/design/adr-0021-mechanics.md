@@ -86,8 +86,10 @@ The inbox attributes these machines to the sender:
   the sender. An identity announcement records its machine when that
   announcement is accepted. A DM records its machine only after decryption
   succeeds. An ACK records its machine only when the trust check admits it
-  and a local waiter matches. A refused DM, an undecryptable DM, and an
-  unsolicited ACK do not take a slot. The set includes the retained
+  and a local waiter matches. An undecryptable DM does not take a slot.
+  A later admitted DM or ACK through the retained binding left by that
+  undecryptable DM does take a slot. A refused DM and an unsolicited ACK
+  do not take a slot. The set includes the retained
   binding, a machine a later binding replaced, and a verified machine that
   lost timestamp selection. Evicting a retained binding does not drop this
   set. One agent can record 8 machines. A ninth machine for that agent is
@@ -95,19 +97,38 @@ The inbox attributes these machines to the sender:
   or Known contacts use the remainder, 45,056 pairs. Protected
   non-contacts use 16,384 pairs. A protected non-contact is a member of
   a group whose admission needs an invite or approval (invite-only,
-  request-access, or owner-certified), or a grant party, and is not a
-  Trusted or Known contact. OpenJoin membership does not protect a
-  peer. Strangers, including OpenJoin co-members, share a bounded LRU
-  of 4,096 pairs. That share stays available when the other shares are
-  full. A new pair past a non-contact share evicts the least-recently
-  used pair in that share. That evicted machine is no longer attributed.
-  A stranger insert does not evict a contact pair or a protected
-  non-contact pair. A stranger flood that evicts a stranger pair is a
-  residual. Standing is chosen again on every record and on every
+  request-access, or owner-certified), or a verified grant party, and
+  is not a Trusted or Known contact. A received grant's party is its
+  verified grantor and its grantee. An agent that is only listed in the
+  grant is not a party. The grantor is verified when the peer's
+  certificate names the grant owner and is not expired. OpenJoin
+  membership does not protect a peer. Strangers, including OpenJoin
+  co-members, share a bounded LRU of 4,096 pairs. That share stays
+  available when the other shares are full. A new pair past a
+  non-contact share evicts the least-recently used pair in that share
+  that is not pinned. A revoked machine of a protected agent is pinned.
+  One protected agent can pin 2 revoked machines. A further revoked
+  machine for that agent can be evicted. Eviction takes a non-revoked
+  pair first and does not drop a pinned pair. The pin uses the
+  revocation probe `x0xd` installs. A library embedder without that
+  probe does not pin. Losing a pinned pair would drop the attestation
+  requirement, so that eviction is not a residual. That evicted machine
+  is no longer attributed. A stranger insert does not evict a contact
+  pair or a protected non-contact pair. A stranger flood that evicts a
+  stranger pair is a residual. Relationship epochs remember 8,192
+  agents. A further agent evicts the oldest stranger epoch, then the
+  oldest protected epoch, and a contact epoch only when no other epoch
+  remains. Evicting an epoch does not drop a machine attribution.
+  Promoting an agent into the contact share drops that agent's pairs
+  which do not fit the contact remainder, so the stranger share stays
+  available. Standing is chosen again on every record and on every
   contact change. Deleting or downgrading a contact keeps protection
-  that still comes from a qualifying group or a grant. A library
-  embedder that does not run the `x0xd` probe gets contact-only
-  protection. After an eviction frees one of an agent's slots, a later
+  that still comes from a qualifying group or a grant. A quarantine
+  reblock clears that protection too and moves the agent's pairs into
+  the stranger share. That move can evict a stranger pair. It is a
+  residual until the next record. A library embedder that does not run
+  the `x0xd` probe gets contact-only protection. Records already in the
+  cache when the probe is installed are classified again. After an eviction frees one of an agent's slots, a later
   admitted machine is recorded again. 4,096 overflowed agents can be named.
   Overflow does not refuse an unattested DM or ACK by itself. A
   revocation of an unrecorded machine is not attributed, and an
@@ -118,7 +139,9 @@ The inbox attributes these machines to the sender:
   The daemon does not persist the set. Rebuilding a replaced machine from
   disk would need a new stored format, which this rule does not add. When
   the stranger pool evicts or the name list fills, the cache emits a
-  rate-limited warning on a monotonic clock. An unattested refusal that
+  rate-limited warning on a monotonic clock, one sender at a time, for
+  256 senders. One sender cannot suppress the warning for a different
+  sender. An unattested refusal that
   also finds an overflowed set is an internal counter and the same kind of
   warning. It is not a field of `GET /diagnostics/dm`.
 - a machine on the sender's contact

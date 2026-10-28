@@ -1719,6 +1719,42 @@ pub async fn serve_with_options(
         }),
     )
     .await;
+    let revoked_for_pin = std::sync::Arc::clone(&agent.revocation_set);
+    agent
+        .authenticated_machine_bindings()
+        .write()
+        .await
+        .install_revoked_machine_probe(move |machine| match revoked_for_pin.try_read() {
+            Ok(set) => set.is_machine_revoked(machine),
+            // A busy lock must not evict a pair that may be revoked.
+            Err(_) => true,
+        });
+    let known_agents = agent
+        .authenticated_machine_bindings()
+        .read()
+        .await
+        .attribution_agents();
+    if !known_agents.is_empty() {
+        let protected: std::collections::HashSet<crate::identity::AgentId> = {
+            let contacts = state.contacts.read().await;
+            known_agents
+                .iter()
+                .copied()
+                .filter(|peer| {
+                    contacts.get(peer).is_some_and(|contact| {
+                        matches!(
+                            contact.trust_level,
+                            crate::contacts::TrustLevel::Trusted
+                                | crate::contacts::TrustLevel::Known
+                        )
+                    })
+                })
+                .collect()
+        };
+        let bindings = agent.authenticated_machine_bindings();
+        let mut cache = bindings.write().await;
+        cache.reclassify_attribution(|peer| protected.contains(&peer));
+    }
 
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).

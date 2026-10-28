@@ -14920,23 +14920,16 @@ impl Agent {
                         announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
                     );
                 }
-                let contacts = contact_store.read().await;
-                let contact = matches!(
-                    contacts
-                        .get(&announcement.agent_id)
-                        .map(|contact| contact.trust_level),
-                    Some(contacts::TrustLevel::Trusted | contacts::TrustLevel::Known)
-                );
-                // Probe before the bindings write lock. Hold the contacts
-                // read until the standing is stored so a trust change cannot
-                // be overwritten by this snapshot.
-                dm_inbox::set_resolved_attribution_standing(
+                // Probe before the bindings write lock. The contact bit is
+                // re-read if a concurrent resolve wins the epoch. The
+                // contacts lock is not held while groups and grants are scanned.
+                dm_inbox::with_contact_standing(
                     &authenticated_machine_bindings,
+                    &contact_store,
                     announcement.agent_id,
-                    contact,
+                    |_| (),
                 )
                 .await;
-                drop(contacts);
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,

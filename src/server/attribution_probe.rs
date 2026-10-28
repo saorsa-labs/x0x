@@ -402,4 +402,130 @@ mod tests {
             "stored Blocked trust must not keep contact protection"
         );
     }
+
+    #[tokio::test]
+    async fn received_grant_protects_grantor_and_grantee_only() {
+        let local_owner = UserKeypair::generate().expect("local owner");
+        let local = AgentKeypair::generate().expect("local");
+        let grantor = UserKeypair::generate().expect("grantor");
+        let grantor_agent = AgentKeypair::generate().expect("grantor agent");
+        let listed = AgentKeypair::generate().expect("listed");
+        let grantor_cert = AgentCertificate::issue(&grantor, &grantor_agent).expect("grantor cert");
+        let listed_cert = AgentCertificate::issue(&local_owner, &listed).expect("listed cert");
+        let now = 1_700_000_000_u64;
+        let grants = ShareGrantStore::in_memory(local.agent_id(), Some(local_owner.user_id()));
+        let revoked = RevocationSet::new();
+        let empty = HashMap::new();
+        grants
+            .accept(
+                ShareGrant::sign(
+                    &grantor,
+                    [9; 32],
+                    Grantee::Agent(local.agent_id()),
+                    vec![listed.agent_id()],
+                    vec![ShareCap::Dm],
+                    now - 1,
+                    now + 60,
+                )
+                .expect("received grant"),
+                now,
+            )
+            .await
+            .expect("store received grant");
+
+        let listed_only = answer(AttributionProbeInput {
+            groups: Some(&empty),
+            local: local.agent_id(),
+            peer: listed.agent_id(),
+            grants: Some(&grants),
+            revoked: Some(&revoked),
+            discovery_cert: Some(None),
+            evidence: None,
+            now_secs: now,
+        });
+        assert_eq!(
+            listed_only,
+            Some(false),
+            "an agent listed in a received grant is not protected"
+        );
+        let listed_with_other_cert = answer(AttributionProbeInput {
+            groups: Some(&empty),
+            local: local.agent_id(),
+            peer: listed.agent_id(),
+            grants: Some(&grants),
+            revoked: Some(&revoked),
+            discovery_cert: Some(Some(&listed_cert)),
+            evidence: None,
+            now_secs: now,
+        });
+        assert_eq!(listed_with_other_cert, Some(false));
+        let grantor_party = answer(AttributionProbeInput {
+            groups: Some(&empty),
+            local: local.agent_id(),
+            peer: grantor_agent.agent_id(),
+            grants: Some(&grants),
+            revoked: Some(&revoked),
+            discovery_cert: Some(Some(&grantor_cert)),
+            evidence: None,
+            now_secs: now,
+        });
+        assert_eq!(
+            grantor_party,
+            Some(true),
+            "the verified grantor is protected"
+        );
+        let busy_revocation = answer(AttributionProbeInput {
+            groups: Some(&empty),
+            local: local.agent_id(),
+            peer: grantor_agent.agent_id(),
+            grants: Some(&grants),
+            revoked: None,
+            discovery_cert: Some(Some(&grantor_cert)),
+            evidence: None,
+            now_secs: now,
+        });
+        assert_eq!(
+            busy_revocation, None,
+            "a busy revocation lock keeps the stored standing"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_identity_type_does_not_apply_trust() {
+        use crate::contacts::TrustLevel;
+        use crate::server::routes::contacts::{update_contact, UpdateContactRequest};
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("state");
+        let member = AgentId([0x91; 32]);
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&member, TrustLevel::Known);
+        let req: UpdateContactRequest = serde_json::from_value(serde_json::json!({
+            "trust_level": "trusted",
+            "identity_type": "not-a-type"
+        }))
+        .expect("update body");
+        let response = update_contact(
+            State(std::sync::Arc::clone(&state)),
+            Path(hex::encode(member.0)),
+            Json(req),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state.contacts.read().await.trust_level(&member),
+            TrustLevel::Known,
+            "an invalid identity type must not change trust"
+        );
+    }
 }

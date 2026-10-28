@@ -20,20 +20,18 @@ use crate::contacts::{IdentityType, TrustLevel};
 
 /// Re-evaluate attribution after a contact add, change, or delete.
 ///
-/// The contacts lock is held until the standing is stored. Group membership
-/// and a live grant still protect the peer when the contact itself does not.
+/// The contact bit is re-read on each attempt. The probe does not run
+/// while the contacts lock is held. Group membership and a live grant
+/// still protect the peer when the contact itself does not.
 pub(in crate::server) async fn sync_contact_relationship(
     state: &Arc<AppState>,
     agent_id: x0x::identity::AgentId,
 ) {
-    let store = state.contacts.read().await;
-    let contact = store.get(&agent_id).is_some_and(|contact| {
-        matches!(contact.trust_level, TrustLevel::Trusted | TrustLevel::Known)
-    });
-    crate::dm_inbox::set_resolved_attribution_standing(
+    crate::dm_inbox::with_contact_standing(
         &state.agent.authenticated_machine_bindings(),
+        &state.contacts,
         agent_id,
-        contact,
+        |_| (),
     )
     .await;
 }
@@ -163,29 +161,37 @@ pub(in crate::server) async fn update_contact(
 
     let mut store = state.contacts.write().await;
 
-    if let Some(ref tl_str) = req.trust_level {
-        let trust_level: TrustLevel = match tl_str.parse() {
-            Ok(t) => t,
+    let trust_level = if let Some(ref tl_str) = req.trust_level {
+        match tl_str.parse::<TrustLevel>() {
+            Ok(level) => Some(level),
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "ok": false, "error": e })),
                 );
             }
-        };
+        }
+    } else {
+        None
+    };
+    let identity_type = if let Some(ref it_str) = req.identity_type {
+        match it_str.parse::<IdentityType>() {
+            Ok(kind) => Some(kind),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": e })),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(trust_level) = trust_level {
         store.set_trust(&agent_id, trust_level);
     }
-
-    if let Some(ref it_str) = req.identity_type {
-        let identity_type: IdentityType = match it_str.parse() {
-            Ok(t) => t,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "ok": false, "error": e })),
-                );
-            }
-        };
+    if let Some(identity_type) = identity_type {
         store.set_identity_type(&agent_id, identity_type);
     }
 
