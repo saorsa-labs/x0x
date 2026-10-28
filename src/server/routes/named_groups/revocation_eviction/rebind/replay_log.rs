@@ -24,7 +24,12 @@
 //!   occur either (fail closed). A file that cannot be read at all fails
 //!   the write the same way: only a missing file plans as empty (review).
 //!   A file that cannot be decoded also plans as empty, and the write
-//!   replaces it, as the first write after the quarantine does.
+//!   replaces it, as the first write after the quarantine does: that
+//!   quarantine happens now, at the write itself (ADR 0108 §5a; ADR 0085
+//!   rule 4, amended by D120) — the damaged bytes move aside under the
+//!   history name before the rename, and a quarantine that fails fails
+//!   the write closed, so a log damaged after startup is never silently
+//!   overwritten (#1672).
 //!   Writes of one group's log serialize (one writer at a time per file,
 //!   #1579 fix round). In the rebind and owner-recovery logs each write
 //!   starts from the frames the file already holds, then memory's, then
@@ -33,24 +38,32 @@
 //!   ones the bound below drops. A frame at a revision the file already
 //!   holds, with a different result head, is a competing commit: the
 //!   pair is the fork evidence that two commits claimed one revision
-//!   (#1579), and a revision holds at most two file-only frames plus the
-//!   newest write's — a third file-only frame leaves with the next
-//!   write, so a signer cannot fill the per-group cap at one revision
-//!   and evict the catch-up window below the head. A refused commit or
+//!   (#1579), and a revision holds the newest two file-only frames plus
+//!   the newest write's — the oldest file-only frame leaves with the
+//!   next write, so an old crash leftover never pushes out a newer frame
+//!   still waiting to install (#1669), and a signer cannot fill the
+//!   per-group cap at one revision and evict the catch-up window below
+//!   the head. A refused commit or
 //!   install removes its own frame first and no other
 //!   ([`rewrite_without`]). The crypto-only exclusion log keeps the
 //!   #1508 rule — a received frame never replaces a held one, so one
 //!   frame per revision — and its writes plan from memory plus the new
 //!   frame only, as before #1579: a stale frame only the file holds, at
-//!   any revision, leaves with the next write, because the load holds it
-//!   with no chain check and that log's catch-up round stops at the first
-//!   frame the head rule refuses (#1579 fix round 3).
+//!   any revision, leaves with the next write, because that log's
+//!   catch-up round stops at the first frame the head rule refuses, and
+//!   neither the load nor memory keeps a below-head frame the chain does
+//!   not admit (#1579 fix round 3; the chain check is #1669's).
 //! - **Load.** A damaged file is quarantined (ADR 0108 §5a: pending name,
 //!   then history name), and that group starts with an empty log: its
 //!   frames are lost, the load never panics and never uses the damaged
 //!   bytes. A newer layout stays on disk, not loaded. A frame that is not
 //!   on this node's loaded chain is not held (a crash between the write and
-//!   the commit). In the rebind and owner-recovery logs, of a competing
+//!   the commit): a frame below the head is held only when its head is the
+//!   group's head or a retained commit — the rule the catch-up round
+//!   serves, `HeadRule::OnChain` (#1669) — so a competing or stale frame
+//!   below the head stays in the file as evidence, takes no per-group cap
+//!   slot after a restart and is never served. In the rebind and
+//!   owner-recovery logs, of a competing
 //!   pair at the head revision the chain's frame is held; the other stays
 //!   in the file as evidence and is never served (#1579). An authored
 //!   frame that is still the group's head gets its delivery again. A
@@ -73,6 +86,7 @@ use crate::groups::eviction::SidecarDecodeError;
 use crate::groups::GroupInfo;
 use crate::server::state::AppState;
 
+use super::super::crypto_exclusion::{head_rule_admits, HeadRule};
 use super::super::{host_commit_gate_open, S4Inner};
 
 /// Extension of the certificate-rebind log.
@@ -267,9 +281,9 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
     /// log) the file is planned from memory plus the new frame only, as
     /// before #1579 (#1579 fix round 3): a stale frame only the file
     /// holds — at any revision, claimed or not — leaves with the write,
-    /// because `restore` holds it with no chain check and that log's
-    /// catch-up round stops at the first frame the head rule refuses,
-    /// stranding every frame after it.
+    /// because that log's catch-up round stops at the first frame the
+    /// head rule refuses, stranding every frame after it, and `restore`
+    /// holds no below-head frame the chain does not admit (#1669).
     fn planned(
         &self,
         file_frames: &[ReplayFrameV1],
@@ -289,23 +303,18 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
             // frames per revision are the pair this log exists to keep
             // (before the winner installs, both are file-only); a frame
             // memory also holds is the installed chain, kept by the
-            // bound. The per-group cap still trims what the merge built,
-            // and the trim drops the lowest revision, memory-held or not:
-            // every fork kept shrinks the window below the head.
-            let mut competing: std::collections::BTreeMap<u64, u32> =
-                std::collections::BTreeMap::new();
-            for frame in file_frames {
-                let held = self.log.get(stable).is_some_and(|log| {
-                    log.iter().any(|e| {
-                        e.next_revision == frame.next_revision && e.result_head == frame.result_head
-                    })
-                });
-                if !held {
-                    let seen = competing.entry(frame.next_revision).or_insert(0);
-                    *seen += 1;
-                    if *seen > 2 {
-                        continue;
-                    }
+            // bound. The two places go to a revision's newest two
+            // file-only frames (#1669, [`kept_file_frames`]), so an old
+            // crash leftover leaves before a newer frame still waiting
+            // to install. The per-group cap still trims what the merge
+            // built, and the trim drops the lowest revision,
+            // memory-held or not: every fork kept shrinks the window
+            // below the head.
+            let file_frames: Vec<&ReplayFrameV1> = file_frames.iter().collect();
+            let keep = kept_file_frames(&self.log, stable, &file_frames);
+            for (frame, keep) in file_frames.into_iter().zip(keep) {
+                if !keep {
+                    continue;
                 }
                 scratch.remember(
                     stable,
@@ -351,25 +360,20 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
         // no place: with the file holding [A, B, C] at one revision and
         // A refused, B and C keep the two places and A is gone — not the
         // shape where A and B consume the bound and the valid C leaves
-        // (review). Memory never holds the refused commit (a frame is
-        // remembered only after its commit or install succeeds), so
-        // skipping the file frames removes it everywhere.
-        let mut competing: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
-        for frame in file_frames {
-            if frame.next_revision == refused_revision && frame.result_head == refused_head {
+        // (review). The two places go to the newest two frames left
+        // (#1669, [`kept_file_frames`]). Memory never holds the refused
+        // commit (a frame is remembered only after its commit or install
+        // succeeds), so skipping the file frames removes it everywhere.
+        let file_frames: Vec<&ReplayFrameV1> = file_frames
+            .iter()
+            .filter(|frame| {
+                !(frame.next_revision == refused_revision && frame.result_head == refused_head)
+            })
+            .collect();
+        let keep = kept_file_frames(&self.log, stable, &file_frames);
+        for (frame, keep) in file_frames.into_iter().zip(keep) {
+            if !keep {
                 continue;
-            }
-            let held = self.log.get(stable).is_some_and(|log| {
-                log.iter().any(|e| {
-                    e.next_revision == frame.next_revision && e.result_head == frame.result_head
-                })
-            });
-            if !held {
-                let seen = competing.entry(frame.next_revision).or_insert(0);
-                *seen += 1;
-                if *seen > 2 {
-                    continue;
-                }
             }
             scratch.remember(
                 stable,
@@ -417,6 +421,17 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
                     }
                     continue;
                 }
+                // #1669: of the frames below the head only the chain's
+                // are held, under the same rule the catch-up round serves
+                // (`HeadRule::OnChain`). A competing or stale frame below
+                // the head is fork evidence that lives only in the file;
+                // held with no chain check it took a per-group cap slot
+                // after a restart and escaped the two-per-revision bound.
+                if !at_head
+                    && !head_rule_admits(info, &HeadRule::OnChain(frame.result_head.clone()))
+                {
+                    continue;
+                }
                 let bytes = Arc::new(frame.frame);
                 let (revision, head) = (frame.next_revision, frame.result_head);
                 self.remember(&stable, revision, &head, Arc::clone(&bytes), frame.authored);
@@ -433,6 +448,39 @@ impl<const CAP: usize, const KEEP_COMPETING: bool> HeldLog<CAP, KEEP_COMPETING> 
         }
         restored
     }
+}
+
+/// #1669: which of `file_frames` a keep-competing plan merges from the
+/// file: every frame the group's memory also holds, and of a revision's
+/// other frames its newest two — the last two in file order, because a
+/// write appends its frame after the ones the file already holds. The
+/// first two in file order kept the places before, so an old crash
+/// leftover could take a place and push out a newer frame still waiting
+/// to install (an owner recovery waiting for its share); a crash at that
+/// point lost it (#1669 review). The per-revision bound of two is
+/// #1579's: a signer sealing many frames at one revision fills no cap.
+fn kept_file_frames(
+    log: &HashMap<String, VecDeque<HeldFrame>>,
+    stable: &str,
+    file_frames: &[&ReplayFrameV1],
+) -> Vec<bool> {
+    let mut keep = vec![false; file_frames.len()];
+    let mut newest: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+    for (at, frame) in file_frames.iter().enumerate().rev() {
+        let held = log.get(stable).is_some_and(|entries| {
+            entries.iter().any(|e| {
+                e.next_revision == frame.next_revision && e.result_head == frame.result_head
+            })
+        });
+        if held {
+            keep[at] = true;
+            continue;
+        }
+        let seen = newest.entry(frame.next_revision).or_insert(0);
+        *seen += 1;
+        keep[at] = *seen <= 2;
+    }
+    keep
 }
 
 /// Encode one file.
@@ -522,13 +570,56 @@ async fn lock_file_writes(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 /// Write `log` durably at `path`. A file with a newer layout is never
-/// rewritten. Returns whether `log` is durable.
+/// rewritten. A file that cannot be read fails the write closed. A file
+/// that cannot be decoded is quarantined first — ADR 0108 §5a, the
+/// amendment of ADR 0085 rule 4 (D120) — and only then does the write
+/// replace the file, so a log damaged after startup is never silently
+/// overwritten (#1672); a quarantine that fails fails the write closed.
+/// Returns whether `log` is durable.
 async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
-    if let Ok(existing) = crate::w3h_inline::fs::read(path).await {
-        if let Err(SidecarDecodeError::NewerFormat(version)) = decode(&existing) {
-            tracing::warn!(version, path = %path.display(), "ADR 0110 S4: held frame log has a newer layout; the commit does not occur");
+    match crate::w3h_inline::fs::read(path).await {
+        // A missing file is the first write of this group's log.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // ADR 0085 rule 4: this write would rename over a file this
+        // process cannot read, so it does not occur.
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "ADR 0110 S4: held frame log could not be read; the write fails closed"
+            );
             return false;
         }
+        Ok(existing) => match decode(&existing) {
+            Ok(_) => {}
+            Err(SidecarDecodeError::NewerFormat(version)) => {
+                tracing::warn!(version, path = %path.display(), "ADR 0110 S4: held frame log has a newer layout; the commit does not occur");
+                return false;
+            }
+            // #1672: preserve the damaged bytes before the rewrite. A
+            // quarantine that fails fails the write closed, so the file
+            // is left untouched rather than overwritten.
+            Err(SidecarDecodeError::Damaged(reason)) => {
+                tracing::warn!(
+                    reason,
+                    path = %path.display(),
+                    "ADR 0110 S4: damaged held frame log; quarantining before the rewrite (ADR 0108 §5a)"
+                );
+                match super::super::quarantine_file(path, &existing).await {
+                    Ok((_, pending)) => {
+                        super::super::finalize_quarantine(&pending).await;
+                    }
+                    Err(step) => {
+                        tracing::warn!(
+                            step,
+                            path = %path.display(),
+                            "ADR 0110 S4: held frame log quarantine failed; the write fails closed"
+                        );
+                        return false;
+                    }
+                }
+            }
+        },
     }
     let Ok(bytes) = encode(log) else {
         return false;
@@ -547,7 +638,8 @@ async fn write_at(path: &Path, log: &ReplayLogV1) -> bool {
 /// ADR 0094 trial (`gate_open` false) a damaged file is skipped and left
 /// in place (§5). The load runs once per process, so that file is not
 /// quarantined later: the first write of its group's log after host
-/// commit replaces it, and its frames are lost as in the quarantine case.
+/// commit quarantines it before the rewrite (#1672), and its frames are
+/// lost as in the quarantine case.
 async fn read_all_in(dir: &Path, extension: &str, gate_open: bool) -> Vec<ReplayLogV1> {
     let mut logs = Vec::new();
     let Ok(mut entries) = crate::w3h_inline::fs::read_dir(dir).await else {
@@ -651,8 +743,8 @@ async fn write_with<const CAP: usize, const KEEP: bool>(
     // the rule the plan is memory plus the new frame only (#1579 fix
     // round 3), so no read is needed. A frame that cannot be decoded is
     // not merged; a newer layout still fails the write below (fail
-    // closed), and a damaged file is replaced by this write, as by the
-    // first write after the quarantine.
+    // closed), and a damaged file is quarantined by the write below
+    // before it is replaced (#1672).
     let file_frames = if KEEP {
         match crate::w3h_inline::fs::read(&path).await {
             Ok(existing) => decode(&existing).map(|log| log.frames).unwrap_or_default(),
@@ -782,8 +874,37 @@ pub(in super::super) async fn ensure_restored<const CAP: usize, const KEEP: bool
 pub(in super::super) mod tests {
     use super::*;
 
+    /// A retained commit with only the fields the head rule reads: the
+    /// revision and the state hash.
+    fn retained_commit_at(
+        revision: u64,
+        state_hash: &str,
+    ) -> crate::groups::state_commit::RetainedCommit {
+        crate::groups::state_commit::RetainedCommit {
+            commit: crate::groups::state_commit::GroupStateCommit {
+                group_id: "g".to_string(),
+                revision,
+                prev_state_hash: None,
+                roster_root: String::new(),
+                policy_hash: String::new(),
+                public_meta_hash: String::new(),
+                security_binding: None,
+                state_hash: state_hash.to_string(),
+                withdrawn: false,
+                committed_by: String::new(),
+                committed_at: 0,
+                signer_public_key: String::new(),
+                signature: String::new(),
+            },
+            roster: std::collections::BTreeMap::new(),
+            meta: None,
+        }
+    }
+
     /// The committed after-image of a two-member group: revision 5, head
-    /// `h5`, with `survivor` Active.
+    /// `h5`, with `survivor` Active. Revision 4 (`h4`) is the retained
+    /// commit before it, so a below-head frame whose head is on the
+    /// chain restores (#1669).
     pub(in super::super::super) fn committed_group(
         local: crate::identity::AgentId,
         survivor: [u8; 32],
@@ -797,6 +918,7 @@ pub(in super::super) mod tests {
         );
         info.state_revision = 5;
         info.state_hash = "h5".to_string();
+        info.commit_log.push(retained_commit_at(4, "h4"));
         let stable = info.stable_group_id().to_string();
         (stable.clone(), HashMap::from([(stable, info)]))
     }
@@ -1001,6 +1123,51 @@ pub(in super::super) mod tests {
         assert!(above.catchup_frames(&[stable], 4).is_empty());
     }
 
+    /// #1669: after a restart, a competing or stale frame below the head
+    /// takes no per-group cap slot. `restore` holds a below-head frame
+    /// only when its head is on the loaded chain (`HeadRule::OnChain`);
+    /// before, every below-head frame was held with no chain check, so
+    /// junk frames filled the cap and `remember`'s trim evicted the
+    /// chain's own frame — part of the catch-up window this log serves.
+    #[test]
+    fn off_chain_frames_below_the_head_take_no_cap_slot_after_a_restart() {
+        let (local, survivor) = (crate::identity::AgentId([1; 32]), [2u8; 32]);
+        let (stable, groups) = committed_group(local, survivor);
+        let frame_at = |revision: u64, head: &str| ReplayFrameV1 {
+            next_revision: revision,
+            result_head: head.to_string(),
+            authored: false,
+            frame: vec![revision as u8],
+        };
+        // Below the head (revision 5): a stale leftover the chain passed
+        // by, a competing frame at the retained revision, and the
+        // retained revision's own frame. A cap of 2 holds only the last
+        // two remembered.
+        let mut log = HeldLog::<2, true>::default();
+        let restored = log.restore(
+            vec![ReplayLogV1 {
+                stable_group_id: stable.clone(),
+                frames: vec![
+                    frame_at(3, "h3-stale"),
+                    frame_at(4, "h4-competes"),
+                    frame_at(4, "h4"),
+                ],
+            }],
+            &groups,
+        );
+        assert!(restored.resumes.is_empty() && restored.received.is_empty());
+        let served: Vec<String> = log
+            .catchup_frames(std::slice::from_ref(&stable), 0)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert_eq!(
+            served,
+            vec!["h4".to_string()],
+            "only the chain's below-head frame is held; the others stay file evidence"
+        );
+    }
+
     /// #1579 fix round: the crypto-only exclusion log keeps the #1508
     /// rule — one frame per revision, in memory, in its file and after a
     /// restore — because its catch-up round stops at the first frame the
@@ -1069,13 +1236,16 @@ pub(in super::super) mod tests {
         );
 
         // The load: even a pair a foreign file holds below the head —
-        // this code writes no pair — restores as one held frame, so that
-        // round never serves, and never stops at, a competing frame.
+        // this code writes no pair — restores as the chain's one frame
+        // (#1669: a below-head frame is held only when its head is on
+        // the chain), so that round never serves, and never stops at, a
+        // competing frame.
         let (local, survivor) = (crate::identity::AgentId([1; 32]), [2u8; 32]);
         let (stable, mut groups) = committed_group(local, survivor);
         let info = groups.get_mut(&stable).expect("group");
         info.state_revision = 6;
         info.state_hash = "h6".to_string();
+        info.commit_log.push(retained_commit_at(5, "h5a"));
         let pair = ReplayLogV1 {
             stable_group_id: stable.clone(),
             frames: vec![
@@ -1109,10 +1279,10 @@ pub(in super::super) mod tests {
     /// frame only, as before #1579. A stale frame only the file holds — a
     /// crash-window frame whose revision a different commit later took, so
     /// neither memory nor the new write claims it — must not survive the
-    /// write: `restore` holds it (it is below the head, with no chain
-    /// check), and the crypto-exclusion catch-up round stops at the first
+    /// write: the crypto-exclusion catch-up round stops at the first
     /// frame the head rule refuses, so the stale frame would strand every
-    /// frame after it.
+    /// frame after it, and a load that held it again (#1669 keeps such a
+    /// frame out of memory) would serve it first.
     #[tokio::test]
     async fn a_celog_write_drops_a_stale_file_frame_at_an_unclaimed_revision() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1152,11 +1322,14 @@ pub(in super::super) mod tests {
         // The restart: the group's head has moved past the stale revision,
         // and the frames the round holds are the file's, so no stale frame
         // is held — nothing stops the round before the frames after it.
+        // The retained commits put the file's frames on the chain (#1669).
         let (local, survivor) = (crate::identity::AgentId([1; 32]), [2u8; 32]);
         let (stable, mut groups) = committed_group(local, survivor);
         let info = groups.get_mut(&stable).expect("group");
         info.state_revision = 10;
         info.state_hash = "h10".to_string();
+        info.commit_log.push(retained_commit_at(6, "h6"));
+        info.commit_log.push(retained_commit_at(9, "h9"));
         let mut after = HeldLog::<16, false>::default();
         let restored = after.restore(
             vec![ReplayLogV1 {
@@ -1446,8 +1619,9 @@ pub(in super::super) mod tests {
     /// #1579 review: `rewrite_without` keeps the same two-file-only-frames
     /// bound as a write. The file holds four frames only it has at one
     /// revision and the first is refused: the refused frame leaves before
-    /// the bound counts, so the second and the third keep the two places
-    /// and the fourth leaves.
+    /// the bound counts, and the two places go to the newest two frames
+    /// the file still holds — the third and the fourth — so the oldest of
+    /// the three left leaves (#1669).
     #[tokio::test]
     async fn a_refusal_keeps_two_file_only_frames_at_the_refused_revision() {
         use crate::server::routes::named_groups as ng;
@@ -1485,8 +1659,67 @@ pub(in super::super) mod tests {
             .collect();
         assert_eq!(
             held,
-            vec![(5, "h5b"), (5, "h5c")],
-            "the refusal keeps the next two file-only frames; the fourth leaves"
+            vec![(5, "h5c"), (5, "h5d")],
+            "the refusal keeps the newest two file-only frames; the oldest leaves"
+        );
+    }
+
+    /// #1669: the file-only bound of a revision keeps the newest two
+    /// frames in file order — the last two — so an old crash leftover
+    /// leaves before a newer frame still waiting to install. Before, the
+    /// first two in file order kept the places: with two stale leftovers
+    /// and a newer waiting frame at one revision, the next write dropped
+    /// the waiting frame, and a crash at that point lost it.
+    #[tokio::test]
+    async fn the_bound_keeps_the_newest_two_file_only_frames() {
+        use crate::server::routes::named_groups as ng;
+        fn rebind_held(inner: &mut S4Inner) -> &mut HeldLog<16, true> {
+            &mut inner.rebind.log
+        }
+        let (state, _dir) = ng::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        // Three received frames at revision 7, none installed (a local
+        // fault held each in the file): two old crash leftovers, then a
+        // newer frame still waiting to install.
+        for (head, bytes) in [
+            ("h7a", b"a".to_vec()),
+            ("h7b", b"b".to_vec()),
+            ("h7c", b"c".to_vec()),
+        ] {
+            assert!(
+                write_received(
+                    &state,
+                    REBIND_EXTENSION,
+                    rebind_held,
+                    "g",
+                    (7, head),
+                    &Arc::new(bytes)
+                )
+                .await
+            );
+        }
+        // A later, unrelated write replans the file.
+        assert!(
+            write_received(
+                &state,
+                REBIND_EXTENSION,
+                rebind_held,
+                "g",
+                (8, "h8"),
+                &Arc::new(b"8".to_vec())
+            )
+            .await
+        );
+        let on_disk = frames_on_disk(&state, REBIND_EXTENSION, "g").await;
+        let held: Vec<(u64, &str)> = on_disk
+            .iter()
+            .map(|frame| (frame.next_revision, frame.result_head.as_str()))
+            .collect();
+        assert_eq!(
+            held,
+            vec![(7, "h7b"), (7, "h7c"), (8, "h8")],
+            "the oldest leftover leaves; the newer waiting frame stays"
         );
     }
 
@@ -1601,6 +1834,81 @@ pub(in super::super) mod tests {
         assert_eq!(
             crate::w3h_inline::fs::read(&newer).await.expect("kept"),
             bytes
+        );
+    }
+
+    /// #1672 (#1669 item 1): a log damaged after startup is never
+    /// silently overwritten. The write quarantines the damaged bytes
+    /// first (ADR 0108 §5a: pending name, then history name — ADR 0085
+    /// rule 4 as amended by D120), and only then replaces the file, so
+    /// what the damaged bytes held survives the rewrite. Before, the
+    /// write renamed over them with no copy: their frames were lost.
+    #[tokio::test]
+    async fn a_log_damaged_after_startup_is_quarantined_before_the_rewrite() {
+        use crate::server::routes::named_groups as ng;
+        fn rebind_held(inner: &mut S4Inner) -> &mut HeldLog<16, true> {
+            &mut inner.rebind.log
+        }
+        let (state, _dir) = ng::tests::secure_endpoint_test_state()
+            .await
+            .expect("test state");
+        // A good log, then damage after startup: a flipped byte in the
+        // trailing hash, which no load in this process has seen.
+        let good = ReplayLogV1 {
+            stable_group_id: "g".to_string(),
+            frames: vec![ReplayFrameV1 {
+                next_revision: 5,
+                result_head: "h5a".to_string(),
+                authored: false,
+                frame: b"first".to_vec(),
+            }],
+        };
+        let mut damaged = encode(&good).expect("encode");
+        let at = damaged.len() - 1;
+        damaged[at] ^= 0x01;
+        let path = log_path(&state, "g", REBIND_EXTENSION);
+        std::fs::write(&path, &damaged).expect("write the damaged log");
+        assert!(
+            write_received(
+                &state,
+                REBIND_EXTENSION,
+                rebind_held,
+                "g",
+                (6, "h6"),
+                &Arc::new(b"next".to_vec())
+            )
+            .await,
+            "the write itself succeeds once the quarantine has the bytes"
+        );
+        // The damaged bytes survive under the ADR 0108 §5a history name.
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("file name");
+        let quarantine_prefix = format!("{file_name}.q-");
+        let mut copies = Vec::new();
+        for entry in std::fs::read_dir(path.parent().expect("dir")).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&quarantine_prefix) && !name.ends_with(".pending") {
+                copies.push(entry.path());
+            }
+        }
+        assert_eq!(copies.len(), 1, "one quarantine history copy of the log");
+        assert_eq!(
+            std::fs::read(&copies[0]).expect("read the copy"),
+            damaged,
+            "the quarantine copy holds the damaged bytes unchanged"
+        );
+        // The live file is the new write, and it decodes.
+        let on_disk = frames_on_disk(&state, REBIND_EXTENSION, "g").await;
+        assert_eq!(
+            on_disk
+                .iter()
+                .map(|frame| (frame.next_revision, frame.result_head.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(6, "h6")],
+            "the rewrite replaced the damaged log with the new frame"
         );
     }
 }
