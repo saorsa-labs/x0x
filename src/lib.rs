@@ -7686,7 +7686,7 @@ impl Agent {
             .own_cert_pair
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            (self.identity.user_id(), Some(renewal.clone()));
+            (self.identity.disclosed_user_id(), Some(renewal.clone()));
         tracing::info!(
             agent_id = %hex::encode(self.agent_id().as_bytes()),
             not_after = ?renewal.not_after(),
@@ -23205,7 +23205,7 @@ impl AgentBuilder {
         // immediately on restart, even before the next gossip heartbeat.
         // L3: capture the identity's cert pair before it moves into the
         // struct — the blob responder serves this pair to fetchers.
-        let own_pair_user = identity.user_id();
+        let own_pair_user = identity.disclosed_user_id();
         let own_pair_cert = identity.agent_certificate().cloned();
         Ok(Agent {
             move_state,
@@ -27163,6 +27163,21 @@ mod tests {
             assert_eq!(identity.agent_certificate().is_some(), loads);
             let disclosed = loads.then(|| owner.user_id());
             assert_eq!(identity.disclosed_user_id(), disclosed);
+            // The blob responder serves the pair the announce advertises
+            // (a cold fetch of the certificate by its digest).
+            let (user, cert) = agent
+                .own_cert_pair
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert_eq!(user, disclosed);
+            let advertised =
+                announce_v3::cert_digest(&disclosed, &identity.agent_certificate().cloned());
+            let served = agent
+                .announce_blob_cache
+                .serve_request(&advertised, &user, &cert)
+                .await;
+            assert_eq!(served.is_some(), loads, "the advertised digest is served");
             agent.shutdown().await;
         }
     }
