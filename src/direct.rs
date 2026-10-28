@@ -556,7 +556,8 @@ pub struct DmDiagnosticsStats {
     pub incoming_decode_failed: u64,
     pub incoming_signature_failed: u64,
     pub incoming_trust_rejected: u64,
-    /// DMs dropped because the sender's agent identity has been revoked.
+    /// DMs dropped because the sender's agent identity or an attributed
+    /// machine has been revoked.
     /// Non-zero means a revoked peer is still attempting to communicate.
     /// An unattested refusal that also has an overflowed attribution set
     /// is counted only on an internal counter and a rate-limited warning.

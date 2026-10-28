@@ -961,7 +961,7 @@ pub(in crate::server) async fn import_agent_card(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let (effective_trust, change_ignored) = {
+    let (effective_trust, change_ignored, stored_trust) = {
         let mut store = state.contacts.write().await;
         let existing = store.get(&agent_id).cloned();
 
@@ -993,13 +993,14 @@ pub(in crate::server) async fn import_agent_card(
         };
 
         store.add(contact);
-        (eff, ignored)
+        let stored = store.get(&agent_id).map(|c| c.trust_level).unwrap_or(eff);
+        (eff, ignored, stored)
     };
     crate::dm_inbox::set_attribution_relationship(
         &state.agent.authenticated_machine_bindings(),
         agent_id,
         matches!(
-            effective_trust,
+            stored_trust,
             x0x::contacts::TrustLevel::Trusted | x0x::contacts::TrustLevel::Known
         ),
     )

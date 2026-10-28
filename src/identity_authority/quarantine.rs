@@ -369,6 +369,8 @@ pub(crate) struct TickInputs {
     pub(crate) revoked: std::sync::Arc<tokio::sync::RwLock<RevocationSet>>,
     pub(crate) moves: std::sync::Arc<tokio::sync::RwLock<MoveState>>,
     pub(crate) contacts: std::sync::Arc<tokio::sync::RwLock<ContactStore>>,
+    /// Authenticated bindings. A reblock clears attribution protection.
+    pub(crate) authenticated: crate::dm_inbox::AuthenticatedMachineBindings,
     /// The revocation stores' directory (`None` uses the default, as the
     /// identity listener does).
     pub(crate) identity_dir: Option<PathBuf>,
@@ -446,9 +448,15 @@ pub(crate) async fn run_once(inputs: &TickInputs, now: u64) -> bool {
         pending
     };
     if !reblock.is_empty() {
-        let mut contacts = inputs.contacts.write().await;
+        {
+            let mut contacts = inputs.contacts.write().await;
+            for agent in &reblock {
+                contacts.set_trust(agent, TrustLevel::Blocked);
+            }
+        }
         for agent in &reblock {
-            contacts.set_trust(agent, TrustLevel::Blocked);
+            crate::dm_inbox::set_attribution_relationship(&inputs.authenticated, *agent, false)
+                .await;
         }
     }
     for agent in &evict {

@@ -13990,6 +13990,7 @@ impl Agent {
                 revoked: std::sync::Arc::clone(&self.revocation_set),
                 moves: std::sync::Arc::clone(&self.move_state),
                 contacts: std::sync::Arc::clone(&self.contact_store),
+                authenticated: self.authenticated_machine_bindings(),
                 identity_dir: self.identity_dir.clone(),
                 evidence: std::sync::Arc::clone(self.peer_evidence()),
                 local_user: self.user_id(),
@@ -14919,7 +14920,7 @@ impl Agent {
                         announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
                     );
                 }
-                let relationship = {
+                let contact = {
                     let store = contact_store.read().await;
                     matches!(
                         store
@@ -14928,10 +14929,12 @@ impl Agent {
                         Some(contacts::TrustLevel::Trusted | contacts::TrustLevel::Known)
                     )
                 };
-                authenticated_machine_bindings
-                    .write()
-                    .await
-                    .set_relationship_peer(announcement.agent_id, relationship);
+                {
+                    let mut cache = authenticated_machine_bindings.write().await;
+                    let relationship =
+                        cache.resolve_relationship(announcement.agent_id, contact);
+                    cache.set_relationship_peer(announcement.agent_id, relationship);
+                }
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,

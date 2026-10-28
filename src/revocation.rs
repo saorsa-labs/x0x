@@ -3989,7 +3989,6 @@ mod tests {
         });
         let mut set = RevocationSet::new();
         assert!(set.union_bundle_retired(&bindings));
-        // The same machine in both indexes must not change the answer.
         let record = RevocationRecord::sign(
             RevokedSubject::Machine(revoked),
             machine_kp.public_key(),
@@ -3999,6 +3998,8 @@ mod tests {
         )
         .unwrap();
         assert!(set.verify_and_insert(record, None).unwrap());
+        // This machine is both a tombstone and a machine revocation.
+        // The answer is revoked for this agent only.
         assert!(set.any_tombstone_machine_revoked(&agent));
         assert!(!set.any_tombstone_machine_revoked(&AgentId([0x72; 32])));
         assert_eq!(set.binding_tombstone_machines(&agent).len(), 512);

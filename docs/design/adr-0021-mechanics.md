@@ -63,17 +63,19 @@ attestation names A, which EP3 rejects.
 
 ### Absent attestation after a machine revocation (#1659)
 
-David approved this receiver rule on 28 Oct 2026 at 02:08 GMT. The wire
-format is unchanged.
+David approved this receiver rule on 28 Oct 2026 at 02:08 GMT (D283).
+The wire format is unchanged.
 
 When this receiver can attribute a revoked machine to an agent, the DM
 inbox requires that sender's origin (device) attestation and refuses an
-unattested DM from an older pre-#213 peer. That is a deliberate partial
-override of ADR 0021's accept-with-binding-fallback transition policy,
-and it applies only when the link is known here. A sender this receiver
-cannot link to a revoked machine keeps that policy. The check runs before
-the body match, so an unattested ACK from such a sender is refused the
-same way.
+unattested DM from an older pre-#213 peer. The same rule covers an
+unattested ACK on the DM lane. An ACK is delivery evidence. It must not
+be accepted from a device this receiver would refuse a DM from. The
+trigger is the same for both: only once the agent has a machine
+revocation. That is a deliberate partial override of ADR 0021's
+accept-with-binding-fallback transition policy, and it applies only when
+the link is known here. A sender this receiver cannot link to a revoked
+machine keeps that policy. The check runs before the body match.
 
 `InboxPipeline::handle_incoming` is the check. The per-agent inbox topic
 and the compatibility gossip bus both use that function.
@@ -89,17 +91,21 @@ The inbox attributes these machines to the sender:
   binding, a machine a later binding replaced, and a verified machine that
   lost timestamp selection. Evicting a retained binding does not drop this
   set. One agent can record 8 machines. A ninth machine for that agent is
-  not recorded. The cache holds 65,536 pairs. Agents that are not Trusted
-  or Known contacts share a bounded LRU of 4,096 pairs. A new stranger
-  pair evicts the least-recently used stranger pair. That evicted machine
-  is no longer attributed. A stranger insert does not evict a Trusted or
-  Known contact. Downgrading or removing the contact moves its pairs into
-  the stranger pool. 4,096 overflowed agents can be named. Overflow does
-  not refuse an unattested DM or ACK by itself. A revocation of an
-  unrecorded machine is not attributed, and an unattested DM that claims a
-  clean machine can still be accepted. That loss of attribution is a
-  residual. A valid attestation is still accepted. The set is process
-  memory. It lasts until process restart, including a self-update restart.
+  not recorded. The cache holds 65,536 pairs. Agents that are not
+  Trusted or Known contacts, group members, or grant parties share a
+  bounded LRU of 4,096 pairs. A new stranger pair evicts the
+  least-recently used stranger pair. That evicted machine is no longer
+  attributed. A stranger insert does not evict a Trusted or Known
+  contact, a group member, or a grant party. Downgrading or removing
+  that privilege moves its pairs into the stranger pool. After a
+  stranger eviction frees one of an agent's slots, a later admitted
+  machine is recorded again. 4,096 overflowed agents can be named.
+  Overflow does not refuse an unattested DM or ACK by itself. A
+  revocation of an unrecorded machine is not attributed, and an
+  unattested DM or ACK that claims a different, clean machine can still
+  be accepted. That loss of attribution is a residual. A valid
+  attestation is still accepted. The set is process memory. It lasts
+  until process restart, including a self-update restart.
   The daemon does not persist the set. Rebuilding a replaced machine from
   disk would need a new stored format, which this rule does not add. When
   the stranger pool evicts or the name list fills, the cache emits a
@@ -133,11 +139,13 @@ rebuilt in this process still count. Those records already persist.
 The accepted-machine history does not.
 
 Cap residual. A machine past the per-agent cap of 8 is not in the
-accepted set. Revoking that machine does not make an unattested DM fail.
-An unattested DM that claims a clean machine this receiver still
-attributes can be accepted. A stranger pair the LRU evicted is the same
-kind of gap for that one machine. The next verified announcement or
-decrypted DM from that stranger can take a slot again.
+accepted set. Revoking that machine does not make an unattested DM that
+claims a different, clean machine fail. An unattested DM that claims a
+clean machine this receiver still attributes can be accepted. A stranger
+pair the LRU evicted is the same kind of gap for that one machine. The
+next verified announcement or decrypted DM from that stranger can take a
+slot again. An agent that passed the cap records again after a stranger
+eviction frees one of its slots.
 
 Tombstone residual. A binding tombstone that names a revoked machine
 keeps refusing that agent's unattested DMs for as long as the revocation

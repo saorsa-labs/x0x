@@ -3582,13 +3582,14 @@ reaper counters:
 
 ### `GET /diagnostics/dm`
 
-`stats.incoming_dropped_revoked` counts DMs dropped because the sender's
-agent or an attributed machine is revoked. An unattested refusal where the
-attribution set has also overflowed is not a field of this object. The
-daemon counts it internally and emits a rate-limited warning. Stranger-budget
-eviction is the same kind of warning. A machine past the per-agent cap is
-not recorded, and a revocation of that machine does not move
-`incoming_dropped_revoked`.
+`stats.incoming_dropped_revoked` counts DMs and ACKs dropped because the
+sender's agent or an attributed machine is revoked. An unattested refusal
+where the attribution set has also overflowed is not a field of this
+object. The daemon counts it internally and emits a rate-limited warning.
+Stranger-budget eviction is the same kind of warning. A machine past the
+per-agent cap is not recorded, and a revocation of that machine does not
+move `incoming_dropped_revoked` for an unattested DM or ACK that claims
+a different, clean machine.
 
 `x0x diagnostics dm [--agent <64-hex-agent-id>]` adds `per_peer_digest` (schema 2)
 to the existing DM diagnostics. Optional `?agent=<64-hex-agent-id>` selects exactly

@@ -172,6 +172,39 @@ pub(crate) struct AuthenticatedMachineBinding {
 /// eviction) wakes ADR-0074 §4 stream reauth — including the DM attestation
 /// writer `record_authenticated_machine_binding`.
 ///
+/// Group-member and grant-party check for attribution. `Some(true)` keeps
+/// that agent's pairs out of the stranger LRU, the same way a Trusted or
+/// Known contact does. `None` means the check could not run; callers keep
+/// the flag already stored. The closure must not lock this cache.
+#[derive(Clone)]
+pub(crate) struct AttributionRelationshipProbe {
+    inner: std::sync::Arc<dyn Fn(AgentId) -> Option<bool> + Send + Sync>,
+}
+
+impl std::fmt::Debug for AttributionRelationshipProbe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AttributionRelationshipProbe")
+    }
+}
+
+impl AttributionRelationshipProbe {
+    pub(crate) fn from_fn(probe: impl Fn(AgentId) -> bool + Send + Sync + 'static) -> Self {
+        Self::from_answer(move |agent_id| Some(probe(agent_id)))
+    }
+
+    pub(crate) fn from_answer(
+        probe: impl Fn(AgentId) -> Option<bool> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: std::sync::Arc::new(probe),
+        }
+    }
+
+    fn answer(&self, agent_id: AgentId) -> Option<bool> {
+        (self.inner)(agent_id)
+    }
+}
+
 /// `accepted_machines` is the #1659 attribution memory. An identity
 /// announcement records its machine when the announcement is accepted. A
 /// DM records its machine only after decryption succeeds. An ACK records
@@ -181,13 +214,16 @@ pub(crate) struct AuthenticatedMachineBinding {
 /// a retained binding does not drop the set. Stranger pairs are a bounded
 /// LRU of 4,096: a new stranger pair evicts the least-recently used
 /// stranger pair, and that evicted machine is no longer attributed. A
-/// Trusted or Known contact is not in that pool, and a stranger insert
-/// does not evict a contact. Downgrading or removing the contact drops
-/// the privilege and moves those pairs into the stranger pool. One agent
-/// can record 8 machines. A further machine for that agent is not recorded.
-/// The cache holds 65,536 pairs. A machine past the per-agent cap is not
-/// recorded. That loss of attribution is a residual. The set is process
-/// memory. A restart, including a self-update restart, drops it.
+/// Trusted or Known contact, a group member, or a grant party is not in
+/// that pool, and a stranger insert does not evict one of them.
+/// Downgrading or removing that privilege moves those pairs into the
+/// stranger pool. One agent can record 8 machines. A further machine is
+/// not recorded while the agent is at that cap. After a stranger eviction
+/// frees a slot, a later admitted machine is recorded again. The cache
+/// holds 65,536 pairs. A machine past the per-agent cap is not recorded.
+/// That loss of attribution is a residual. The set is process memory. A
+/// restart, including a self-update restart, drops it. An undecryptable
+/// DM can move the retained binding and does not admit that machine.
 #[derive(Debug)]
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
@@ -198,8 +234,13 @@ pub struct AuthenticatedMachineBindingCache {
     /// Agents whose verified history did not fit in the per-agent or pair cap.
     /// A machine past the cap is not in `accepted_machines`.
     overflowed_agents: std::collections::HashSet<AgentId>,
-    /// Trusted or Known contacts. Their pairs do not use the stranger budget.
+    /// Trusted or Known contacts, and peers the relationship probe names
+    /// (group members and grant parties). Their pairs do not use the
+    /// stranger budget.
     relationship_peers: std::collections::HashSet<AgentId>,
+    /// Group members and grant parties. Checked when a pair is recorded.
+    /// Absent means only the contact flag above protects a peer.
+    relationship_probe: Option<AttributionRelationshipProbe>,
     attribution_pairs_len: usize,
     attribution_stranger_pairs_len: usize,
     attribution_per_agent: usize,
@@ -208,7 +249,8 @@ pub struct AuthenticatedMachineBindingCache {
     attribution_overflow_agents: usize,
     /// Agents that overflowed after the name list was full.
     attribution_unnamed_overflows: u64,
-    /// Stranger pairs evicted because the stranger budget was full.
+    /// Stranger pairs the LRU dropped, plus an insert refused when no
+    /// stranger pair could be dropped.
     attribution_stranger_overflows: u64,
     /// Last attribution-cap warning, monotonic milliseconds. One cache.
     attribution_overflow_warn_ms: u64,
@@ -231,6 +273,7 @@ impl Default for AuthenticatedMachineBindingCache {
             accepted_machines: std::collections::HashMap::new(),
             overflowed_agents: std::collections::HashSet::new(),
             relationship_peers: std::collections::HashSet::new(),
+            relationship_probe: None,
             attribution_pairs_len: 0,
             attribution_stranger_pairs_len: 0,
             attribution_per_agent: ACCEPTED_MACHINES_PER_AGENT,
@@ -269,6 +312,7 @@ impl AuthenticatedMachineBindingCache {
             accepted_machines: std::collections::HashMap::new(),
             overflowed_agents: std::collections::HashSet::new(),
             relationship_peers: std::collections::HashSet::new(),
+            relationship_probe: None,
             attribution_pairs_len: 0,
             attribution_stranger_pairs_len: 0,
             attribution_per_agent: ACCEPTED_MACHINES_PER_AGENT,
@@ -333,12 +377,13 @@ impl AuthenticatedMachineBindingCache {
         self.overflowed_agents.contains(agent_id)
     }
 
-    /// Mark or clear the Trusted/Known privilege for `agent_id`.
+    /// Mark or clear eviction protection for `agent_id`.
     ///
     /// A downgrade or removal moves that agent's pairs into the stranger
     /// pool, which may evict the least-recently used stranger pair. A
     /// promotion takes those pairs out of the pool. Stranger inserts never
-    /// evict a pair while this flag is set.
+    /// evict a pair while this flag is set. Callers set the flag for a
+    /// Trusted or Known contact, a group member, or a grant party.
     pub(crate) fn set_relationship_peer(&mut self, agent_id: AgentId, relationship: bool) {
         if relationship {
             if self.relationship_peers.insert(agent_id) {
@@ -361,7 +406,7 @@ impl AuthenticatedMachineBindingCache {
         self.attribution_unnamed_overflows
     }
 
-    /// Stranger pairs refused after the stranger budget filled.
+    /// Stranger LRU evictions, plus inserts refused because nothing could be evicted.
     #[cfg(test)]
     pub(crate) fn attribution_stranger_overflows(&self) -> u64 {
         self.attribution_stranger_overflows
@@ -373,10 +418,37 @@ impl AuthenticatedMachineBindingCache {
         self.attribution_stranger_pairs_len
     }
 
-    fn remember_accepted_machine(&mut self, agent_id: AgentId, machine_id: MachineId) {
-        if self.overflowed_agents.contains(&agent_id) {
-            return;
+    /// Install the group-member and grant-party check. Replaces any
+    /// previous probe. The probe does not by itself move stored pairs;
+    /// the next record applies it through [`Self::set_relationship_peer`].
+    pub(crate) fn install_relationship_probe(&mut self, probe: AttributionRelationshipProbe) {
+        self.relationship_probe = Some(probe);
+    }
+
+    /// Whether `agent_id` is a group member or a grant party.
+    ///
+    /// `None` means the probe could not answer. No probe means the agent
+    /// is not protected by this check.
+    pub(crate) fn protected_relationship(&self, agent_id: AgentId) -> Option<bool> {
+        self.relationship_probe
+            .as_ref()
+            .map(|probe| probe.answer(agent_id))
+            .unwrap_or(Some(false))
+    }
+
+    /// Contact trust, or the probe, or the flag already stored when the
+    /// probe cannot answer. A busy lock must not clear protection.
+    pub(crate) fn resolve_relationship(&self, agent_id: AgentId, contact: bool) -> bool {
+        if contact {
+            return true;
         }
+        match self.protected_relationship(agent_id) {
+            Some(answer) => answer,
+            None => self.relationship_peers.contains(&agent_id),
+        }
+    }
+
+    fn remember_accepted_machine(&mut self, agent_id: AgentId, machine_id: MachineId) {
         let relationship = self.relationship_peers.contains(&agent_id);
         if self
             .accepted_machines
@@ -426,6 +498,9 @@ impl AuthenticatedMachineBindingCache {
             self.touch_stranger(agent_id, machine_id);
             self.attribution_stranger_pairs_len += 1;
         }
+        // A slot was free, so this agent can record again. The next
+        // machine past the cap sets the overflow flag once more.
+        self.overflowed_agents.remove(&agent_id);
     }
 
     fn agent_accepted_len(&self, agent_id: &AgentId) -> usize {
@@ -505,11 +580,10 @@ impl AuthenticatedMachineBindingCache {
 
     fn warn_attribution_pressure(&mut self, agent_id: AgentId) {
         let now = monotonic_ms();
-        if now.saturating_sub(self.attribution_overflow_warn_ms) < UNATTESTED_DROP_WARN_INTERVAL_MS
-        {
+        if !warn_interval_open(self.attribution_overflow_warn_ms, now) {
             return;
         }
-        self.attribution_overflow_warn_ms = now;
+        self.attribution_overflow_warn_ms = now.max(1);
         tracing::warn!(
             agent = %hex::encode(agent_id.as_bytes()),
             unnamed = self.attribution_unnamed_overflows,
@@ -628,7 +702,10 @@ impl AuthenticatedMachineBindingCache {
             (Some(digest), None) => (Some(digest), None),
             (None, None) => (known_digest, existing.and_then(|b| b.cert_not_after)),
         };
-        self.upsert_binding(agent_id, machine_id, announced_at, digest, not_after, true);
+        // The announced-binding store uses this writer. It keeps the
+        // retained binding and does not take an attribution slot. The
+        // authenticated store records a slot through `record`.
+        self.upsert_binding(agent_id, machine_id, announced_at, digest, not_after, false);
     }
 
     /// x0x #1150 (r7e): a verified certificate blob for `digest` landed for
@@ -675,15 +752,17 @@ impl AuthenticatedMachineBindingCache {
                     || existing.cert_not_after != cert_not_after
                     || existing.cert_digest != cert_digest
                     || existing.announced_at != announced_at;
-                // #1659: keep a machine this binding is about to replace when
-                // that machine was already attributed, or when this write
-                // itself records attribution. A DM refresh does not take a
-                // slot for the new machine until decryption succeeds.
+                // #1659: keep a machine this binding is about to replace
+                // only when that machine was already admitted. A retained
+                // binding left by an undecryptable DM is not admitted.
+                // This write records the new machine only when the caller
+                // is recording. A DM refresh does not take a slot until
+                // decryption succeeds.
                 let replaced_already = self
                     .accepted_machines
                     .get(&agent_id)
                     .is_some_and(|machines| machines.contains(&existing.machine_id));
-                if remember_new || replaced_already {
+                if replaced_already {
                     self.remember_accepted_machine(agent_id, existing.machine_id);
                 }
                 if remember_new {
@@ -810,6 +889,15 @@ pub(crate) async fn set_attribution_relationship(
         .write()
         .await
         .set_relationship_peer(agent_id, relationship);
+}
+
+/// Install the group-member and grant-party check on the authenticated
+/// binding cache. The announced-binding store does not use it.
+pub(crate) async fn install_attribution_relationship_probe(
+    bindings: &AuthenticatedMachineBindings,
+    probe: AttributionRelationshipProbe,
+) {
+    bindings.write().await.install_relationship_probe(probe);
 }
 
 /// Retain the freshest accepted, authenticated agent→machine announcement.
@@ -1886,13 +1974,19 @@ async fn durable_history_logical_request(
 
 impl InboxPipeline {
     async fn sender_is_relationship(&self, agent: AgentId) -> bool {
-        let store = self.contacts.read().await;
-        store.get(&agent).is_some_and(|contact| {
-            matches!(
-                contact.trust_level,
-                crate::contacts::TrustLevel::Trusted | crate::contacts::TrustLevel::Known
-            )
-        })
+        let contact = {
+            let store = self.contacts.read().await;
+            store.get(&agent).is_some_and(|contact| {
+                matches!(
+                    contact.trust_level,
+                    crate::contacts::TrustLevel::Trusted | crate::contacts::TrustLevel::Known
+                )
+            })
+        };
+        self.authenticated_machine_bindings
+            .read()
+            .await
+            .resolve_relationship(agent, contact)
     }
 
     /// Move the retained binding so a share-grant check sees this origin.
@@ -2130,15 +2224,22 @@ impl InboxPipeline {
         // the claim is only a best-effort fallback for agents with no
         // authenticated binding. See docs/design/adr-0021-mechanics.md.
         //
-        // #1659 (David, 28 Oct 2026, 02:08 GMT): when this receiver can
-        // attribute a revoked machine to the sender, an absent attestation
-        // is a refusal. A DM records that machine only after decryption
-        // succeeds. An announcement records it when the announcement is
-        // accepted. A machine past the per-agent cap is not recorded.
-        // Revoking that machine does not attribute it, so an unattested DM
-        // that claims a clean machine can still be accepted. Stranger pairs
-        // are an LRU: a later stranger evicts an older stranger and stays
-        // protected. A contact is not evicted by that insert.
+        // #1659 (David, 28 Oct 2026, 02:08 GMT, D283): when this receiver
+        // can attribute a revoked machine to the sender, an absent
+        // attestation is a refusal. The same rule covers an unattested
+        // ACK on this lane. An ACK is delivery evidence. It is not
+        // accepted from a device this receiver would refuse a DM from.
+        // The trigger is the same for both: only once the agent has a
+        // machine revocation. A DM records that machine only after
+        // decryption succeeds. An announcement records it when the
+        // announcement is accepted. An admitted ACK records it when a
+        // waiter matches. A machine past the per-agent cap is not
+        // recorded. Revoking that machine does not attribute it, so an
+        // unattested DM or ACK that claims a different, clean machine
+        // can still be accepted. Stranger pairs are an LRU: a later
+        // stranger evicts an older stranger and stays protected. A
+        // Trusted or Known contact, a group member, and a grant party
+        // are not evicted by that insert.
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let claimed_machine_id = MachineId(envelope.sender_machine_id);
         let mut fresh_attestation = false;
@@ -3436,6 +3537,14 @@ fn monotonic_ms() -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// True when a rate-limited warning may be emitted.
+///
+/// A stored timestamp of 0 means no warning has been emitted yet. The
+/// first event in the process must not be dropped.
+fn warn_interval_open(last_ms: u64, now: u64) -> bool {
+    last_ms == 0 || now.saturating_sub(last_ms) >= UNATTESTED_DROP_WARN_INTERVAL_MS
+}
+
 /// Emit one unattested-drop warning per interval. Later DMs still increment
 /// their counter.
 fn warn_unattested_drop(
@@ -3447,13 +3556,13 @@ fn warn_unattested_drop(
 ) {
     let now = monotonic_ms();
     let prev = last_ms.load(std::sync::atomic::Ordering::Relaxed);
-    if now.saturating_sub(prev) < UNATTESTED_DROP_WARN_INTERVAL_MS {
+    if !warn_interval_open(prev, now) {
         return;
     }
     if last_ms
         .compare_exchange(
             prev,
-            now,
+            now.max(1),
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
         )
@@ -7276,9 +7385,10 @@ mod tests {
         assert!(machines.contains(&current));
     }
 
-    /// A verified machine that loses timestamp selection is still attributed.
-    /// `record_announcement` is the announced-binding writer. `record` is the
-    /// DM attestation writer. Both share `upsert_binding`.
+    /// A verified machine that loses timestamp selection is still attributed
+    /// when the caller is recording. `record` is that writer. An
+    /// announced-binding `record_announcement` moves the retained binding
+    /// and does not take a slot.
     #[test]
     fn older_verified_machine_stays_attributed_when_newer_binding_wins() {
         let mut bindings = AuthenticatedMachineBindingCache::default();
@@ -7286,7 +7396,7 @@ mod tests {
         let newer = MachineId([0xB6; 32]);
         let older = MachineId([0xC7; 32]);
         bindings.record(agent, newer, 200);
-        bindings.record_announcement(agent, older, 100, None, None);
+        bindings.record(agent, older, 100);
         assert_eq!(
             bindings.peek(&agent).map(|binding| binding.machine_id),
             Some(newer)
@@ -7294,6 +7404,17 @@ mod tests {
         let machines = bindings.machines_accepted_for(&agent);
         assert!(machines.contains(&older));
         assert!(machines.contains(&newer));
+
+        let mut announced = AuthenticatedMachineBindingCache::default();
+        announced.record_announcement(agent, older, 100, None, None);
+        assert!(
+            announced.machines_accepted_for(&agent).is_empty(),
+            "the announced-binding store does not take an attribution slot"
+        );
+        assert_eq!(
+            announced.peek(&agent).map(|binding| binding.machine_id),
+            Some(older)
+        );
     }
 
     /// The pair cap refuses one more agent and does not drop a stored pair.
@@ -7362,8 +7483,10 @@ mod tests {
     }
 
     /// The production caps are 8, 65,536 and 4,096. Filling the stranger LRU
-    /// with announcements leaves a later stranger protected and a contact in
-    /// place.
+    /// through `record` (the authenticated announcement writer) leaves a
+    /// later stranger protected and a contact in place. The check passes a
+    /// clean retained machine, so it fails if the revoked machine was
+    /// evicted from the accepted set.
     #[test]
     fn issue1659_real_caps_keep_a_later_stranger_after_announcements() {
         let mut cache = AuthenticatedMachineBindingCache::default();
@@ -7399,7 +7522,7 @@ mod tests {
             let mut machine = [0xB1; 32];
             agent[..4].copy_from_slice(&index.to_le_bytes());
             machine[..4].copy_from_slice(&index.to_le_bytes());
-            cache.record_announcement(AgentId(agent), MachineId(machine), 1, None, None);
+            cache.record(AgentId(agent), MachineId(machine), 1);
         }
         assert_eq!(
             cache.attribution_stranger_pairs_len(),
@@ -7413,7 +7536,7 @@ mod tests {
         let machine_r_kp = MachineKeypair::generate().expect("machine R");
         let machine_r = machine_r_kp.machine_id();
         let machine_c = MachineId([0xD3; 32]);
-        cache.record_announcement(later, machine_r, 2, None, None);
+        cache.record(later, machine_r, 2);
         assert!(cache.machines_accepted_for(&later).contains(&machine_r));
         assert_eq!(
             cache.attribution_stranger_pairs_len(),
@@ -7444,7 +7567,7 @@ mod tests {
             sender_unattested_attribution(
                 &revoked,
                 &later,
-                Some(machine_r),
+                Some(machine_c),
                 machine_c,
                 &[],
                 &accepted,
@@ -7473,16 +7596,17 @@ mod tests {
 
         cache.set_relationship_peer(former, false);
         assert_eq!(cache.attribution_stranger_pairs_len(), 1);
-        cache.record_announcement(AgentId([0x33; 32]), MachineId([0x03; 32]), 2, None, None);
+        cache.record(AgentId([0x33; 32]), MachineId([0x03; 32]), 2);
         assert!(cache.machines_accepted_for(&former).is_empty());
         assert!(cache.machines_accepted_for(&kept).contains(&kept_machine));
         assert_eq!(cache.attribution_stranger_pairs_len(), 1);
     }
 
-    /// A process restart is a new empty cache. The live cache still attributes
-    /// the revoked machine. The restarted cache does not, so the same
-    /// unattested claim is accepted. Contacts and tombstones are separate
-    /// persisted records and are not this set.
+    /// A new empty cache models a process restart of this set. It does not
+    /// reload contacts or tombstones. Those records are separate. This
+    /// shows only that a machine known solely from the previous accepted
+    /// set is absent, so an unattested claim of a different clean machine
+    /// is accepted.
     #[test]
     fn issue1659_restart_drops_cache_only_machine_attribution() {
         let agent = AgentId([0xA1; 32]);
@@ -7527,6 +7651,214 @@ mod tests {
             sender_unattested_attribution(&revoked, &agent, None, machine_b, &[], &[], false),
             UnattestedAttribution::Allow,
             "after restart a machine known only from the previous cache is not attributed"
+        );
+    }
+
+    /// After the per-agent cap, a stranger eviction frees a slot and a later
+    /// admitted machine is recorded. The overflow flag does not stick.
+    #[test]
+    fn issue1659_overflow_then_eviction_readmits() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        cache.set_stranger_pair_limit_for_test(8);
+        let agent = AgentId([0xA9; 32]);
+        for index in 0..8u8 {
+            cache.record(agent, MachineId([index; 32]), u64::from(index) + 1);
+        }
+        let refused = MachineId([0x09; 32]);
+        cache.record(agent, refused, 20);
+        assert!(!cache.machines_accepted_for(&agent).contains(&refused));
+        assert!(cache.attribution_requires_attestation(&agent));
+        assert_eq!(cache.machines_accepted_for(&agent).len(), 8);
+
+        let refreshed = MachineId([0x00; 32]);
+        cache.remember_accepted_machine(agent, refreshed);
+        assert!(cache.attribution_requires_attestation(&agent));
+
+        let other = AgentId([0xB9; 32]);
+        cache.record(other, MachineId([0xB9; 32]), 30);
+        let admitted = MachineId([0x0A; 32]);
+        cache.record(agent, admitted, 40);
+        let accepted = cache.machines_accepted_for(&agent);
+        assert!(
+            accepted.contains(&admitted),
+            "a freed slot records the next admitted machine"
+        );
+        assert!(
+            accepted.contains(&refreshed),
+            "a refreshed pair is not the first stranger evicted"
+        );
+        assert!(!accepted.contains(&MachineId([0x01; 32])));
+        assert!(!cache.attribution_requires_attestation(&agent));
+    }
+
+    /// An undecryptable DM leaves machine A in the retained binding only.
+    /// A later matching ACK from machine B records B and does not record A.
+    #[tokio::test]
+    async fn issue1659_undecryptable_dm_then_ack_records_only_the_admitted_machine() {
+        let sender = test_keypair();
+        let machine_a = MachineKeypair::generate().expect("machine A");
+        let machine_b = MachineKeypair::generate().expect("machine B");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let wrong_kem = AgentKemKeypair::generate().expect("wrong kem");
+        let created_at = now_unix_ms();
+        let body = EnvelopeBuilder::build_payload_body(
+            &[0xE4; 16],
+            sender.agent_id().as_bytes(),
+            harness.recipient_agent_id.as_bytes(),
+            created_at,
+            b"not for this recipient".to_vec(),
+            None,
+            &wrong_kem.public_bytes,
+        )
+        .expect("build body");
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_V1,
+            request_id: [0xE4; 16],
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine_a.machine_id().as_bytes(),
+            recipient_agent_id: *harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms: created_at,
+            expires_at_unix_ms: created_at + 60_000,
+            body,
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let mut attestation = DmOriginAttestation::for_envelope(
+            &envelope,
+            machine_a.public_key().as_bytes().to_vec(),
+        );
+        attestation.sign(&machine_a).expect("attest A");
+        envelope.origin_attestation = Some(attestation);
+        let message = wrap_in_pubsub(&harness, &sender, &envelope);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+
+        let request_id = [0xE6; 16];
+        let _waiter = harness.pipeline.inflight.register(
+            request_id,
+            sender.agent_id(),
+            Some(machine_b.machine_id()),
+        );
+        let ack = attested_ack_message(&harness, &sender, &machine_b, 0xE6);
+        harness
+            .pipeline
+            .handle_incoming(ack, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        let accepted = harness
+            .pipeline
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .machines_accepted_for(&sender.agent_id());
+        assert!(
+            accepted.contains(&machine_b.machine_id()),
+            "a matched admitted ACK records its machine"
+        );
+        assert!(
+            !accepted.contains(&machine_a.machine_id()),
+            "the undecryptable machine must not take a slot when B is admitted"
+        );
+    }
+
+    /// A group member and a grant party stay attributed when strangers fill
+    /// the LRU. Neither peer is a Trusted or Known contact.
+    #[tokio::test]
+    async fn issue1659_group_member_and_grant_party_survive_stranger_flood() {
+        let harness_sender = test_keypair();
+        let member = test_keypair();
+        let party = test_keypair();
+        let member_id = member.agent_id();
+        let party_id = party.agent_id();
+        let member_machine = MachineKeypair::generate().expect("member machine");
+        let party_machine = MachineKeypair::generate().expect("party machine");
+        let mut harness = make_inbox_harness(&harness_sender, None, None).await;
+        {
+            let mut cache = harness
+                .pipeline
+                .authenticated_machine_bindings
+                .write()
+                .await;
+            cache.set_stranger_pair_limit_for_test(1);
+            cache.install_relationship_probe(AttributionRelationshipProbe::from_fn(move |agent| {
+                agent == member_id || agent == party_id
+            }));
+        }
+        for (sender, machine, byte) in [
+            (&member, &member_machine, 0x71_u8),
+            (&party, &party_machine, 0x72),
+        ] {
+            let message = attested_payload_message(&harness, sender, machine, byte);
+            harness
+                .pipeline
+                .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+                .await;
+            let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+                .await
+                .expect("a protected peer DM is delivered")
+                .expect("delivery stream closed");
+            assert_eq!(delivered.sender, sender.agent_id());
+        }
+        let stranger_a = test_keypair();
+        let stranger_b = test_keypair();
+        let machine_a = MachineKeypair::generate().expect("stranger A");
+        let machine_b = MachineKeypair::generate().expect("stranger B");
+        for (sender, machine, byte) in [
+            (&stranger_a, &machine_a, 0x73_u8),
+            (&stranger_b, &machine_b, 0x74),
+        ] {
+            let message = attested_payload_message(&harness, sender, machine, byte);
+            harness
+                .pipeline
+                .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+                .await;
+            let _delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+                .await
+                .expect("an attested stranger DM is delivered")
+                .expect("delivery stream closed");
+        }
+        let cache = harness.pipeline.authenticated_machine_bindings.read().await;
+        assert!(cache
+            .machines_accepted_for(&member_id)
+            .contains(&member_machine.machine_id()));
+        assert!(cache
+            .machines_accepted_for(&party_id)
+            .contains(&party_machine.machine_id()));
+        assert_eq!(cache.attribution_stranger_pairs_len(), 1);
+        assert!(cache
+            .machines_accepted_for(&stranger_a.agent_id())
+            .is_empty());
+        assert!(cache
+            .machines_accepted_for(&stranger_b.agent_id())
+            .contains(&machine_b.machine_id()));
+    }
+
+    #[test]
+    fn issue1659_unknown_relationship_probe_keeps_protection() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        let agent = AgentId([0xC1; 32]);
+        let machine = MachineId([0xC2; 32]);
+        cache.set_relationship_peer(agent, true);
+        cache.record(agent, machine, 1);
+        cache.install_relationship_probe(AttributionRelationshipProbe::from_answer(|_| None));
+        let keep = cache.resolve_relationship(agent, false);
+        assert!(keep, "a probe that cannot answer must not clear protection");
+        cache.set_relationship_peer(agent, keep);
+        cache.set_stranger_pair_limit_for_test(1);
+        let stranger = AgentId([0xC3; 32]);
+        cache.record(stranger, MachineId([0xC4; 32]), 2);
+        cache.record(stranger, MachineId([0xC5; 32]), 3);
+        assert!(
+            cache.machines_accepted_for(&agent).contains(&machine),
+            "a protected pair survives a stranger flood while the probe is unknown"
+        );
+        cache.install_relationship_probe(AttributionRelationshipProbe::from_fn(|_| false));
+        assert!(
+            !cache.resolve_relationship(agent, false),
+            "a definite negative answer clears protection"
         );
     }
 

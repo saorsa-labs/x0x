@@ -1676,6 +1676,65 @@ pub async fn serve_with_options(
         .await);
     }
 
+    let grants = agent.owner_trust.share_grant_store();
+    let revoked_for_probe = std::sync::Arc::clone(&agent.revocation_set);
+    let discovery_for_probe = std::sync::Arc::clone(&agent.identity_discovery_cache);
+    let groups_for_probe = std::sync::Arc::downgrade(&state);
+    crate::dm_inbox::install_attribution_relationship_probe(
+        &agent.authenticated_machine_bindings(),
+        crate::dm_inbox::AttributionRelationshipProbe::from_answer(move |peer| {
+            let group_member = groups_for_probe.upgrade().and_then(|state| {
+                let groups = state.named_groups.try_read().ok()?;
+                let local = hex::encode(state.agent.agent_id().as_bytes());
+                let peer_hex = hex::encode(peer.as_bytes());
+                Some(groups.values().any(|group| {
+                    !group.withdrawn
+                        && group
+                            .members_v2
+                            .get(&local)
+                            .is_some_and(|member| member.is_active())
+                        && group
+                            .members_v2
+                            .get(&peer_hex)
+                            .is_some_and(|member| member.is_active())
+                }))
+            });
+            if group_member == Some(true) {
+                return Some(true);
+            }
+            let Some(grants) = grants.as_ref() else {
+                return group_member;
+            };
+            let Ok(revoked) = revoked_for_probe.try_read() else {
+                return None;
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            let cert = match discovery_for_probe.try_read() {
+                Ok(cache) => Some(
+                    cache
+                        .get(&peer)
+                        .and_then(|found| found.agent_certificate.clone()),
+                ),
+                Err(_) => None,
+            };
+            let Some(cert) = cert else {
+                return match grants.try_evidence_related(peer, None, &revoked, now) {
+                    Some(true) => Some(true),
+                    Some(false) | None => None,
+                };
+            };
+            match grants.try_evidence_related(peer, cert.as_ref(), &revoked, now) {
+                Some(true) => Some(true),
+                Some(false) => group_member,
+                None => None,
+            }
+        }),
+    )
+    .await;
+
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and
     // start the periodic + on-change pass loop (shuts down with the watch).
     if let Some(sync) = state.owner_sync.as_ref() {
