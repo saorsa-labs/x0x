@@ -34486,19 +34486,47 @@ pub(super) async fn read_roster_stores(state: &AppState) -> Result<RosterStoresB
     })
 }
 
-/// Put both roster stores back to `before`: the sidecar first, as every
-/// save path writes it first. Caller holds `named_groups_persistence_lock`
-/// since [`read_roster_stores`].
-pub(super) async fn restore_roster_stores(
+/// Put the Home-Suite sidecar back to `before` (write its bytes, or remove
+/// a file that was not there), durably. Unlike
+/// [`restore_home_suite_sidecar`], the outcome is returned: the re-seat
+/// swap keeps its transaction journals until this is durable. Caller holds
+/// `named_groups_persistence_lock` since [`read_roster_stores`].
+pub(super) async fn restore_home_suite_store(
     state: &AppState,
-    before: RosterStoresBefore,
-    group_id_hex: &str,
+    before: &RosterStoresBefore,
 ) -> Result<()> {
-    restore_home_suite_sidecar(state, before.home_suite.as_deref(), Some(group_id_hex)).await;
-    let Some(named) = before.named else {
+    let path = &state.home_suite_groups_path;
+    match before.home_suite.as_deref() {
+        Some(bytes) => {
+            match write_home_suite_sidecar(state, &String::from_utf8_lossy(bytes)).await {
+                Ok(AtomicWriteOutcome::Durable) => Ok(()),
+                Ok(outcome) => Err(anyhow::anyhow!("Home-Suite sidecar restore: {outcome:?}")),
+                Err(e) => Err(anyhow::anyhow!("Home-Suite sidecar restore: {e}")),
+            }
+        }
+        None => {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(anyhow::anyhow!("Home-Suite sidecar remove: {e}")),
+            }
+            sync_parent_dir_for_path(path)
+                .map_err(|e| anyhow::anyhow!("Home-Suite sidecar remove: directory sync: {e}"))
+        }
+    }
+}
+
+/// Put `named_groups.json` back to `before`, durably. A file that was not
+/// there stays as it is: every roster save writes it. Caller holds
+/// `named_groups_persistence_lock` since [`read_roster_stores`].
+pub(super) async fn restore_named_store(
+    state: &AppState,
+    before: &RosterStoresBefore,
+) -> Result<()> {
+    let Some(named) = before.named.as_deref() else {
         return Ok(());
     };
-    match write_named_groups_json_atomic(&state.named_groups_path, &String::from_utf8_lossy(&named))
+    match write_named_groups_json_atomic(&state.named_groups_path, &String::from_utf8_lossy(named))
         .await
     {
         Ok(AtomicWriteOutcome::Durable) => Ok(()),
@@ -34712,7 +34740,15 @@ async fn refresh_retained_treekem_journal_snapshot(
 /// the caller reports as failed and rolls back. Discarding it only when the
 /// named write did not land keeps the #457 rule "never discard a journal
 /// whose named half is durable" (the caller then aligns the live group).
-async fn discard_seal_journal_pair(state: &AppState, group_id_hex: &str) {
+/// [`discard_seal_journal_pair`] unless the caller keeps the pair
+/// ([`persist_treekem_and_named_groups_atomic_locked`]'s `keep_journals`).
+async fn discard_unless_kept(state: &AppState, group_id_hex: &str, keep: bool) {
+    if !keep {
+        discard_seal_journal_pair(state, group_id_hex).await;
+    }
+}
+
+pub(super) async fn discard_seal_journal_pair(state: &AppState, group_id_hex: &str) {
     let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
     if let Err(e) = tokio::fs::remove_file(&journal_path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -34755,17 +34791,25 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     // the same marker).
     state.group_recovery.hold_reseat_marker(&mut info);
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    persist_treekem_and_named_groups_atomic_locked(state, group_id_hex, info, group).await
+    persist_treekem_and_named_groups_atomic_locked(state, group_id_hex, info, group, false).await
 }
 
 /// [`persist_treekem_and_named_groups_atomic_with_info`] for a caller that
 /// already holds `named_groups_persistence_lock` (the ADR 0109 re-seat
 /// swap, #1567).
+///
+/// With `keep_journals`, a write that fails after the commit point keeps
+/// the journal pair (#1645, Codex P1 on #1683): a restart then replays this
+/// transaction, so the files are a matching pair until the caller has put
+/// the previous files back and discards the pair itself
+/// ([`discard_seal_journal_pair`]). A withdrawn group's pair is always
+/// discarded.
 async fn persist_treekem_and_named_groups_atomic_locked(
     state: &AppState,
     group_id_hex: &str,
     info: x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
+    keep_journals: bool,
 ) -> anyhow::Result<()> {
     let stable_group_id = info.stable_group_id().to_string();
     #[cfg(test)]
@@ -34975,12 +35019,12 @@ async fn persist_treekem_and_named_groups_atomic_locked(
     let sidecar_outcome = match write_home_suite_sidecar(state, &home_suite_json).await {
         Ok(outcome) => outcome,
         Err(e) => {
-            discard_seal_journal_pair(state, group_id_hex).await;
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             return Err(anyhow::anyhow!("Home-Suite sidecar write: {e}"));
         }
     };
     if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
-        discard_seal_journal_pair(state, group_id_hex).await;
+        discard_unless_kept(state, group_id_hex, keep_journals).await;
         anyhow::bail!("Home-Suite sidecar replacement did not occur");
     }
     match persist_treekem_snapshot_bytes_typed(&state.treekem_dir, group_id_hex, snapshot_envelope)
@@ -35001,7 +35045,7 @@ async fn persist_treekem_and_named_groups_atomic_locked(
             );
         }
         Err(e) => {
-            discard_seal_journal_pair(state, group_id_hex).await;
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             return Err(anyhow::anyhow!("treekem snapshot write: {e}"));
         }
     }
@@ -35027,7 +35071,7 @@ async fn persist_treekem_and_named_groups_atomic_locked(
     if state.named_groups_save_fault.load(Ordering::SeqCst)
         == SaveFault::NamedNotReplacedAfterSnapshot as u8
     {
-        discard_seal_journal_pair(state, group_id_hex).await;
+        discard_unless_kept(state, group_id_hex, keep_journals).await;
         anyhow::bail!("named groups replacement did not occur");
     }
     let outcome = write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
@@ -35066,7 +35110,7 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         AtomicWriteOutcome::NotReplaced => {
             // #1187: the named half did not land, so the journal must not
             // replay this transaction at restart (the caller rolls back).
-            discard_seal_journal_pair(state, group_id_hex).await;
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             anyhow::bail!("named groups replacement did not occur");
         }
     }

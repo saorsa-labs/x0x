@@ -316,6 +316,22 @@ struct S3Inner {
     /// §1 step 2: signed ATAs keyed by `(group, subject, from_state_hash)`,
     /// reused until [`s3::ATA_ARM_WINDOW`] expires.
     ata_cache: HashMap<(String, String, String), AdminTerminalAttestation>,
+    /// Test only: where a failed swap's rollback stops (#1645).
+    #[cfg(test)]
+    swap_rollback_stop: Option<SwapRollbackStop>,
+}
+
+/// Test only (#1645): a crash point in a failed swap's rollback, or a
+/// Home-Suite restore that fails.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapRollbackStop {
+    /// The process stops after the snapshot restore.
+    AfterSnapshot,
+    /// The process stops after the Home-Suite sidecar restore.
+    AfterSidecar,
+    /// The Home-Suite sidecar restore fails; the rollback goes on.
+    SidecarRestoreFails,
 }
 
 /// A sidecar fault (§4, ADR 0108 §5a): S3 makes no transition for the
@@ -5938,11 +5954,17 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
 /// paired on disk at every point. A crash before the transaction's
 /// journal loads the original pair, which rolls back.
 ///
-/// A failed tree write that did not reach the commit point puts the
-/// original's snapshot state back and the journal back to `Staging` (the
-/// covers apply again), and the next tick retries. A group with no tree
-/// (GSS) needs only the mark. Returns whether the swap may go on to
-/// [`lift_staging_marker`].
+/// A failed tree write keeps its transaction journals, so until the
+/// rollback is durable a restart replays the staged record and its tree
+/// together, and the `Swapping` journal swaps them in (#1645, Codex P1 on
+/// #1683). The rollback puts the original's snapshot back, then the
+/// Home-Suite sidecar, then `named_groups.json`. Only when all three are
+/// durable does it discard the transaction journals and put the journal
+/// back to `Staging` (the covers apply again): a restart then loads the
+/// original pair, which rolls back. A restore that fails keeps the
+/// journals and `Swapping`. Either way the next tick retries. A group with
+/// no tree (GSS) needs only the mark. Returns whether the swap may go on
+/// to [`lift_staging_marker`].
 async fn swap_staged_tree(
     state: &AppState,
     stable: &str,
@@ -5999,35 +6021,75 @@ async fn swap_staged_tree(
     let Some(info) = state.named_groups.read().await.get(key).cloned() else {
         return false;
     };
-    match super::persist_treekem_and_named_groups_atomic_locked(state, key, info, &guard).await {
+    match super::persist_treekem_and_named_groups_atomic_locked(state, key, info, &guard, true)
+        .await
+    {
         Ok(()) => true,
         Err(error) if super::self_leave_persist_left_epoch_installed(&error) => true,
         Err(error) => {
-            tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged tree is not durable yet; the original stays on disk and the swap is retried: {error}");
+            tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged tree is not durable yet; the original is put back and the swap is retried: {error}");
             // The write can stop after the sidecar and the snapshot file and
-            // before its commit point: put the original's snapshot state and
-            // both roster stores back. Otherwise a restart loads the staged
-            // record beside the original's tree, and at equal epochs the
-            // startup re-bind (#457) pairs them.
-            if let Some((cover, rosters)) = before {
-                if let Err(error) = super::restore_reseat_snapshot_cover(state, key, cover).await {
-                    tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot put the original's TreeKEM snapshot back after a failed swap: {error}");
-                }
-                if let Err(error) = super::restore_roster_stores(state, rosters, key).await {
-                    tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot put the roster stores back after a failed swap: {error}");
-                }
-            }
-            let _ = update_sidecar(state, stable, move |body| {
-                if let Some(open) = body.reseat_journal.as_mut() {
-                    if open.record_digest == expected {
-                        open.phase = ReseatPhase::Staging;
+            // before its commit point. Its journals stay, so a crash before
+            // the original's files are back replays the staged pair.
+            let Some((cover, rosters)) = before else {
+                return false;
+            };
+            if rollback_swap_files(state, stable, key, cover, &rosters).await {
+                super::discard_seal_journal_pair(state, key).await;
+                let _ = update_sidecar(state, stable, move |body| {
+                    if let Some(open) = body.reseat_journal.as_mut() {
+                        if open.record_digest == expected {
+                            open.phase = ReseatPhase::Staging;
+                        }
                     }
-                }
-            })
-            .await;
+                })
+                .await;
+            }
             false
         }
     }
+}
+
+/// #1645: put the original's snapshot state and both roster stores back
+/// after a failed swap, in the order the swap's transaction wrote them.
+/// Returns whether all three are durable.
+async fn rollback_swap_files(
+    state: &AppState,
+    stable: &str,
+    key: &str,
+    cover: super::ReseatSnapshotCover,
+    rosters: &super::RosterStoresBefore,
+) -> bool {
+    #[cfg(test)]
+    let stop = state.group_recovery.inner.lock().await.swap_rollback_stop;
+    if let Err(error) = super::restore_reseat_snapshot_cover(state, key, cover).await {
+        tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot put the original's TreeKEM snapshot back after a failed swap; the staged pair stays recoverable: {error}");
+        return false;
+    }
+    #[cfg(test)]
+    if stop == Some(SwapRollbackStop::AfterSnapshot) {
+        return false;
+    }
+    let sidecar = match () {
+        #[cfg(test)]
+        () if stop == Some(SwapRollbackStop::SidecarRestoreFails) => {
+            Err(anyhow::anyhow!("test fault"))
+        }
+        () => super::restore_home_suite_store(state, rosters).await,
+    };
+    if let Err(error) = sidecar {
+        tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot put the Home-Suite sidecar back after a failed swap; the staged pair stays recoverable: {error}");
+        return false;
+    }
+    #[cfg(test)]
+    if stop == Some(SwapRollbackStop::AfterSidecar) {
+        return false;
+    }
+    if let Err(error) = super::restore_named_store(state, rosters).await {
+        tracing::error!(group_id = %LogHexId::group(stable), "ADR 0109 S3: cannot put named_groups.json back after a failed swap; the staged pair stays recoverable: {error}");
+        return false;
+    }
+    true
 }
 
 /// §3 step 3: the swap's roster write. The staged record (every record of
@@ -8996,6 +9058,187 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("the group loads"))?;
         assert_eq!(loaded.state_hash, staged.state_hash);
         assert!(snapshot_on_disk(&state, &key).await?.snapshot == staged_tree);
+        Ok(())
+    }
+
+    /// A restart on `dir`, in `x0xd`'s start order: replay the TreeKEM
+    /// transaction journals, load the rosters and the trees, then load the
+    /// S3 sidecars and resume the re-seat journals.
+    async fn restart_at(
+        state: Arc<AppState>,
+        dir: &std::path::Path,
+    ) -> anyhow::Result<Arc<AppState>> {
+        let agent = Arc::clone(&state.agent);
+        super::super::recover_treekem_named_journals(
+            &state.named_groups_path,
+            &state.home_suite_groups_path,
+            &state.treekem_dir,
+        )
+        .await?;
+        drop(state);
+        let restarted = super::super::tests::secure_endpoint_test_state_at(dir, agent).await?;
+        let roster = restarted.named_groups.read().await.clone();
+        let trees = super::super::restore_treekem_groups(
+            &roster,
+            restarted.agent.as_ref(),
+            &restarted.treekem_dir,
+        )
+        .await;
+        restarted.treekem_groups.write().await.extend(trees);
+        load_sidecars(&restarted).await;
+        resume_journals(&restarted).await;
+        Ok(restarted)
+    }
+
+    /// The record that `state` holds under `key`, its tree when loaded,
+    /// and the tree on disk are one pair: the original record with the
+    /// original's tree, or the staged record with the staged tree. Returns
+    /// whether it is the staged pair.
+    async fn holds_a_matching_pair(
+        state: &AppState,
+        key: &str,
+        original: &GroupInfo,
+        original_tree: &[u8],
+        staged: &GroupInfo,
+        staged_tree: &[u8],
+    ) -> anyhow::Result<bool> {
+        let record = state
+            .named_groups
+            .read()
+            .await
+            .get(key)
+            .map(|record| record.state_hash.clone())
+            .ok_or_else(|| anyhow::anyhow!("the group loads"))?;
+        // The fixture's staged tree is not from this agent's seed, so a
+        // restart cannot load it: then only the files are compared.
+        let tree = match state.treekem_groups.read().await.get(key).cloned() {
+            Some(tree) => Some(tree.lock().await.to_snapshot_bytes()?),
+            None => None,
+        };
+        let on_disk = snapshot_on_disk(state, key).await?;
+        let staged_pair = record == staged.state_hash;
+        let (want_tree, want_hash) = if staged_pair {
+            (staged_tree, &staged.state_hash)
+        } else {
+            anyhow::ensure!(record == original.state_hash, "an unknown record loads");
+            (original_tree, &original.state_hash)
+        };
+        anyhow::ensure!(
+            tree.as_deref().is_none_or(|tree| tree == want_tree) && on_disk.snapshot == want_tree,
+            "torn pair: the {} record loads with another tree",
+            if staged_pair { "staged" } else { "original" }
+        );
+        anyhow::ensure!(
+            &on_disk.state_hash == want_hash,
+            "the snapshot binds another record"
+        );
+        Ok(staged_pair)
+    }
+
+    /// #1645 (Codex P1 on #1683 and #1645), ADR 0109 §3: a crash part way
+    /// through a failed swap's rollback restarts on a matching pair. The
+    /// swap's transaction journals stay until the original's files are
+    /// all back, so the restart replays the staged record with its tree
+    /// and the `Swapping` journal swaps them in. Before the fix the
+    /// journals were gone: after the snapshot restore the sidecar held the
+    /// staged record beside the original's tree, and at the same epoch the
+    /// startup re-bind (#457) paired them. Inert: an offline agent.
+    #[tokio::test]
+    async fn an_interrupted_swap_rollback_restarts_on_a_matching_pair() -> anyhow::Result<()> {
+        use super::super::{set_save_fault, SaveFault};
+        for (byte, stop) in [
+            ("ec", SwapRollbackStop::AfterSnapshot),
+            ("ed", SwapRollbackStop::AfterSidecar),
+        ] {
+            let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+            let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?.user_id();
+            let (key, original, original_tree, staged, staged_tree) =
+                staged_tree_fixture_with(&state, byte, Some(owner)).await?;
+            let stable = original.stable_group_id().to_string();
+            state.group_recovery.inner.lock().await.swap_rollback_stop = Some(stop);
+            let fault = set_save_fault(&state, SaveFault::NamedNotReplacedAfterSnapshot);
+            assert!(swap_if_seated(&state, &stable).await, "{stop:?}");
+            drop(fault);
+            assert_eq!(
+                open_journal(&state, &stable).await.map(|j| j.phase),
+                Some(ReseatPhase::Swapping),
+                "{stop:?}"
+            );
+            let journal = super::super::treekem_journal_path(&state.treekem_dir, &key);
+            assert!(
+                tokio::fs::try_exists(&journal).await?,
+                "{stop:?}: the transaction journal stays"
+            );
+            let restarted = restart_at(state, dir.path()).await?;
+            let staged_pair = holds_a_matching_pair(
+                &restarted,
+                &key,
+                &original,
+                &original_tree,
+                &staged,
+                &staged_tree,
+            )
+            .await?;
+            assert!(staged_pair, "{stop:?}: the restart replays the staged pair");
+            assert_eq!(
+                open_journal(&restarted, &stable).await.map(|j| j.phase),
+                Some(ReseatPhase::Swapping),
+                "{stop:?}: the swap resumes from its phase"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1645 (Codex P1): a Home-Suite restore that fails is not ignored.
+    /// The swap keeps its transaction journals and `Swapping`, so a crash
+    /// restarts on the staged pair, and in process the next tick retries
+    /// the swap. Before the fix the failure was logged, the journals were
+    /// gone and the journal went back to `Staging`: the sidecar kept the
+    /// staged record beside the original's tree. Inert.
+    #[tokio::test]
+    async fn a_failed_home_suite_restore_keeps_the_swap_recoverable() -> anyhow::Result<()> {
+        use super::super::{set_save_fault, SaveFault};
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?.user_id();
+        for crash in [true, false] {
+            let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+            let byte = if crash { "ee" } else { "ef" };
+            let (key, original, original_tree, staged, staged_tree) =
+                staged_tree_fixture_with(&state, byte, Some(owner)).await?;
+            let stable = original.stable_group_id().to_string();
+            state.group_recovery.inner.lock().await.swap_rollback_stop =
+                Some(SwapRollbackStop::SidecarRestoreFails);
+            let fault = set_save_fault(&state, SaveFault::NamedNotReplacedAfterSnapshot);
+            assert!(swap_if_seated(&state, &stable).await);
+            drop(fault);
+            assert_eq!(
+                open_journal(&state, &stable).await.map(|j| j.phase),
+                Some(ReseatPhase::Swapping)
+            );
+            let journal = super::super::treekem_journal_path(&state.treekem_dir, &key);
+            assert!(tokio::fs::try_exists(&journal).await?);
+            let state = if crash {
+                restart_at(state, dir.path()).await?
+            } else {
+                state.group_recovery.inner.lock().await.swap_rollback_stop = None;
+                assert!(swap_if_seated(&state, &stable).await, "the retry swaps");
+                state
+            };
+            assert!(
+                holds_a_matching_pair(
+                    &state,
+                    &key,
+                    &original,
+                    &original_tree,
+                    &staged,
+                    &staged_tree
+                )
+                .await?,
+                "crash {crash}: the staged pair"
+            );
+            if !crash {
+                assert!(open_journal(&state, &stable).await.is_none(), "swapped");
+            }
+        }
         Ok(())
     }
 
