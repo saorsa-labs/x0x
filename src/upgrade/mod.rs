@@ -10,6 +10,8 @@ pub mod apply;
 pub(crate) mod fleet_policy;
 #[cfg(unix)]
 mod inventory_accounts;
+#[cfg(unix)]
+mod inventory_procfs;
 pub(crate) mod journal;
 pub(crate) mod log_flush;
 pub mod manifest;
