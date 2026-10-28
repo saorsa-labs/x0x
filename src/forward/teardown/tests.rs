@@ -1512,8 +1512,22 @@ async fn kick_during_spacing_deadline_from_event() {
     tokio::time::sleep(Duration::from_millis(1)).await;
 
     // First pass: no-op kick so the loop enters spacing.
+    let passes = w.live.passes_for_testing();
     w.kick.notify_waiters();
     tokio::task::yield_now().await;
+    // The pass reads the grant store on blocking workers (#1239), which end
+    // on wall time. Wait until the pass is done before paused time moves or
+    // the grant is revoked: a late first pass sees the revocation and tears
+    // the stream down at once. An idle grant reader is not enough, because
+    // an inbound pass does two reads (machine gate, then opener).
+    let pass_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while w.live.passes_for_testing() == passes {
+        assert!(
+            std::time::Instant::now() < pass_deadline,
+            "the first reauth pass must finish"
+        );
+        tokio::task::yield_now().await;
+    }
     tokio::time::advance(Duration::from_millis(100)).await;
     tokio::task::yield_now().await;
 
