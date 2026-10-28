@@ -3,6 +3,8 @@
 //! - `w3h_clock_gate_*`: virtual time does not move outside a barrier.
 //! - `w3h_auto_advance_freezes_*`: without `tokio_unstable`, auto-advance
 //!   stays put while `spawn_blocking` runs.
+//! - `w3h_blocking_completion_does_not_stall_paused_time`: a finished
+//!   blocking task does not add a wall stall before the paused clock steps.
 //! - `w3h_recheck_*`: the unstable recheck thread re-arms after a lost park,
 //!   including when the pool stays busy across disarm, and does not publish
 //!   `ready` into the next barrier. It also must not wake the barrier in the
@@ -292,6 +294,100 @@ fn w3h_drive_paused_freezes_while_spawn_blocking_runs() -> Result<()> {
         ensure!(
             !sleeper.is_finished(),
             "the 30 s timer fired inside the wall bound"
+        );
+        Ok(())
+    })
+}
+
+/// #1662: once a blocking closure has returned, the paused clock must step
+/// even though Tokio has not yet marked that pool thread idle. The finish
+/// gate holds the thread in that gap. Waiting for the idle mark stalls the
+/// wall clock.
+#[test]
+#[cfg(tokio_unstable)]
+fn w3h_blocking_completion_does_not_stall_paused_time() -> Result<()> {
+    super::block_on_paused(async move {
+        let _hold = super::AutoAdvanceHold::acquire();
+        let slot = super::idle_slot();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_gate_tx, release_gate_rx) = std::sync::mpsc::channel::<()>();
+        super::install_blocking_finish_gate(&slot, entered_tx, release_gate_rx);
+        let (release_task_tx, release_task_rx) = std::sync::mpsc::channel::<()>();
+        let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = release_task_rx.recv();
+        });
+        let coord = std::thread::spawn(move || {
+            struct Release(Option<std::sync::mpsc::Sender<()>>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    if let Some(release) = self.0.take() {
+                        let _ = release.send(());
+                    }
+                }
+            }
+            let release = Release(Some(release_gate_tx));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let order = std::sync::atomic::Ordering::Acquire;
+            while std::time::Instant::now() < deadline {
+                if slot.parked.load(order) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            if !slot.parked.load(order) {
+                panic!("runtime did not park while the blocking task held the pool");
+            }
+            let _ = release_task_tx.send(());
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("blocking task did not reach the idle-mark gap");
+            let started = std::time::Instant::now();
+            let moved = moved_rx
+                .recv_timeout(std::time::Duration::from_millis(40))
+                .is_ok();
+            let elapsed = started.elapsed();
+            drop(release);
+            (moved, elapsed)
+        });
+        let virtual_start = tokio::time::Instant::now();
+        let (wall_tx, wall_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let _ = wall_tx.send(());
+        });
+        tokio::select! {
+            biased;
+            stepped = super::drive_paused(async move {
+                let origin = tokio::time::Instant::now();
+                std::future::poll_fn(move |_cx| {
+                    if tokio::time::Instant::now() > origin {
+                        let _ = moved_tx.send(());
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                blocker.await.expect("blocking task");
+                Ok::<(), anyhow::Error>(())
+            }) => stepped?,
+            _ = wall_rx => bail!("paused step stalled on the wall after a blocking task"),
+        }
+        let (moved, elapsed) = coord.join().expect("stall coordinator");
+        let advanced = tokio::time::Instant::now().saturating_duration_since(virtual_start);
+        ensure!(
+            moved,
+            "paused clock did not move while the pool thread was still winding down \
+             (wall wait {elapsed:?})"
+        );
+        ensure!(
+            elapsed < std::time::Duration::from_millis(5),
+            "wall stall {elapsed:?} after the blocking task returned"
+        );
+        ensure!(
+            advanced >= Duration::from_millis(1),
+            "paused clock advanced {advanced:?}"
         );
         Ok(())
     })
