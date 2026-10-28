@@ -4119,7 +4119,7 @@ pub(super) async fn finalize_quarantine(pending: &FsPath) -> bool {
 
 /// ADR 0108 §5a resume: the verified pending copies of `file` (set `V`) in
 /// `txid` order. A copy that fails verification stays pending.
-async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bool) {
+pub(super) async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bool) {
     let Some(dir) = path.parent() else {
         return (Vec::new(), false);
     };
