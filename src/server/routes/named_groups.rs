@@ -9231,6 +9231,37 @@ fn recovery_seat_may_receive_key_package(
         .is_some_and(|member| member.state == x0x::groups::GroupMemberState::Removed)
 }
 
+/// #1113 / #1567: a Removed seat may take back its KeyPackage bytes from
+/// the member's own signed `MemberJoined`, with no inviter attestation,
+/// when the bytes hash to the KeyPackage hash that the verified roster
+/// commits for the seat. A Welcome joiner needs this: its roster has no
+/// `added_by` for the members seated before it (the v4 invite roster is a
+/// projection without it), so the inviter attestation never verifies
+/// there. The leaf-removal proof of a self-leave reads these bytes.
+fn removed_seat_self_signed_key_package(
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    let NamedGroupMetadataEvent::MemberJoined {
+        member_agent_id,
+        treekem_key_package_b64: Some(kp_b64),
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let seat_commits_bytes = info.members_v2.get(member_agent_id).is_some_and(|member| {
+        member.state == x0x::groups::GroupMemberState::Removed
+            && member
+                .treekem_key_package_hash
+                .as_deref()
+                .is_some_and(|expected| {
+                    blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
+                })
+    });
+    seat_commits_bytes && verify_member_joined_key_package_event(event)
+}
+
 fn verify_authority_attested_member_joined_recovery(
     info: &x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
@@ -10201,18 +10232,8 @@ async fn apply_recovered_member_key_package_locked(
         let Some(info) = groups.get(&storage_key) else {
             return false;
         };
-        let authority_ok = verify_authority_attested_member_joined_recovery(info, event);
-        let removed_member = info.members_v2.get(member_agent_id).filter(|member| {
-            member.state == x0x::groups::GroupMemberState::Removed
-                && member
-                    .treekem_key_package_hash
-                    .as_deref()
-                    .is_some_and(|expected| {
-                        blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
-                    })
-        });
-        if !authority_ok
-            && (removed_member.is_none() || !verify_member_joined_key_package_event(event))
+        if !verify_authority_attested_member_joined_recovery(info, event)
+            && !removed_seat_self_signed_key_package(info, event)
         {
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
@@ -10297,6 +10318,34 @@ pub(in crate::server) async fn s4_seal_probe_for_test(
     target_hex: &str,
 ) -> String {
     revocation_eviction::seal_probe_for_test(state, group_id, target_hex).await
+}
+
+/// W3-H (#1567, test builds only): remove this node's cached copies of
+/// `member_agent_id`'s `MemberJoined` for `group_id`, as when its one
+/// gossip delivery came before this node could apply it. Returns `false`
+/// when the roster already holds the member's KeyPackage bytes (then the
+/// catch-up path is not under test), or when the group is unknown.
+#[cfg(test)]
+pub(in crate::server) async fn forget_member_join_copy_for_test(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+) -> bool {
+    let roster_holds_bytes = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return false;
+        };
+        info.members_v2
+            .get(member_agent_id)
+            .and_then(current_member_treekem_key_package)
+            .is_some()
+    };
+    if roster_holds_bytes {
+        return false;
+    }
+    let _status = prune_treekem_cache_member(state, group_id, member_agent_id, "w3h_1567").await;
+    true
 }
 
 /// W3-H (#1357, test builds only): whether this node can resolve
@@ -12244,10 +12293,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                         }
                     }
                 }
+                // #1567: the same two proofs as the install below. The
+                // member-keyed answer for a self-leaver is checked on its
+                // Removed seat too: on a Welcome joiner the inviter
+                // attestation never verifies, and a refused answer left the
+                // crypto-only exclusion waiting for this evidence for ever.
                 let recovery_event = member_joined_kp_cache_entry(&event)
                     .map(|(_, ev)| ev)
                     .filter(|ev| {
                         verify_authority_attested_member_joined_recovery(&response_info, ev)
+                            || removed_seat_self_signed_key_package(&response_info, ev)
                     });
                 // A survivor may relay a signed removal. The transport sender
                 // is that survivor. The author is the verified commit signer.
@@ -65997,6 +66052,106 @@ pub(in crate::server) mod tests {
                 .await
                 .is_some(),
             "recovery depends on historical commit authority, not current role"
+        );
+        Ok(())
+    }
+
+    /// #1567: a Welcome joiner's roster has no `added_by` for the members
+    /// seated before it, so the inviter attestation never verifies there.
+    /// After such a member self-leaves, the member-keyed catch-up answer
+    /// must still install its own signed KeyPackage on the Removed seat
+    /// when the bytes match the committed hash; with any other committed
+    /// hash nothing installs. Before the fix the answer was always refused
+    /// and the crypto-only exclusion waited for this evidence for ever.
+    #[tokio::test]
+    async fn catchup_installs_self_signed_key_package_on_removed_seat_without_added_by(
+    ) -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0xa5, 0xa6).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        let committed_hash = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group exists");
+            let seat = info.members_v2.get_mut(&member_hex).expect("seat exists");
+            // The Welcome joiner's view: no inviter on the seat, and the
+            // member has left.
+            seat.added_by = None;
+            seat.state = x0x::groups::GroupMemberState::Removed;
+            seat.treekem_key_package_hash
+                .clone()
+                .expect("the roster commits the package hash")
+        };
+        let courier = x0x::identity::AgentKeypair::generate()?;
+        insert_active_member_without_kp(
+            state,
+            &group_id,
+            &hex::encode(courier.agent_id().as_bytes()),
+            &inviter_hex,
+        )
+        .await;
+        let response = TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: fixture.stable_group_id.clone(),
+            events: vec![fixture.event.clone()],
+            truncated: false,
+            responder_state_hash: None,
+        };
+
+        // Negative control: the roster commits other bytes for the seat.
+        {
+            let mut groups = state.named_groups.write().await;
+            let seat = groups
+                .get_mut(&group_id)
+                .and_then(|info| info.members_v2.get_mut(&member_hex))
+                .expect("seat exists");
+            seat.treekem_key_package_hash = Some("00".repeat(32));
+        }
+        handle_treekem_catchup_response(
+            state,
+            &courier.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response.clone(),
+        )
+        .await;
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "bytes that the roster does not commit never install"
+        );
+
+        {
+            let mut groups = state.named_groups.write().await;
+            let seat = groups
+                .get_mut(&group_id)
+                .and_then(|info| info.members_v2.get_mut(&member_hex))
+                .expect("seat exists");
+            seat.treekem_key_package_hash = Some(committed_hash);
+        }
+        handle_treekem_catchup_response(
+            state,
+            &courier.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response,
+        )
+        .await;
+        let installed = member_treekem_kp(state, &group_id, &member_hex).await;
+        let NamedGroupMetadataEvent::MemberJoined {
+            treekem_key_package_b64: Some(expected),
+            ..
+        } = &fixture.event
+        else {
+            panic!("fixture event is a package-bearing MemberJoined");
+        };
+        assert_eq!(
+            installed.as_deref(),
+            Some(expected.as_str()),
+            "the Removed seat takes back its own signed, committed KeyPackage"
         );
         Ok(())
     }
