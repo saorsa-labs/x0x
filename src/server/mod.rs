@@ -1003,8 +1003,9 @@ pub async fn serve_with_options(
     // deliberately: a tokio task cannot report on a runtime that stopped
     // polling it. Never fires inside the startup grace or after shutdown
     // begins (the shutdown watch disarms it). The probe sleeps on the wall
-    // clock. Under the W3-H shim that wake lands at a different virtual
-    // time on each rerun, so the harness does not start it (#1245).
+    // clock. W3-H already leaves the watchdog off (`Sim::daemon_config`).
+    // `shim_active()` is false outside tests, so this guard does not change
+    // a production daemon (#1245).
     if config.api_watchdog.enabled && !crate::w3h_inline::shim_active() {
         api_watchdog::spawn_api_watchdog(
             &config.api_watchdog,
