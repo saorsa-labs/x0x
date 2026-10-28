@@ -1680,22 +1680,18 @@ impl AutoApplyUpgrader {
                         // Engineer ruling 23 Oct 2026: a flush that started
                         // and failed or overran left this daemon stopped
                         // behind the hook (no API, no network). Record the
-                        // failed-release hold first so the restart loop this
-                        // exit creates cannot re-apply the same release,
-                        // restore every binary this transaction swapped, and
-                        // exit EX_TEMPFAIL so the service manager restarts
-                        // the daemon on the old version.
-                        if let Err(hold_error) = super::shutdown_flush::hold_failed_release(
+                        // failed-release hold first — or spend one of the
+                        // bounded producer-drain retries (issue #1595) — so
+                        // the restart loop this exit creates cannot re-apply
+                        // a release that fails deterministically, restore
+                        // every binary this transaction swapped, and exit
+                        // EX_TEMPFAIL so the service manager restarts the
+                        // daemon on the old version.
+                        super::shutdown_flush::hold_or_retry_started_failure(
                             &plan.data_root,
                             target_version,
-                            &failure.to_string(),
-                        ) {
-                            error!(
-                                error = %hold_error,
-                                "cannot persist the failed-upgrade hold; the next \
-                                 automatic check may retry this release once more"
-                            );
-                        }
+                            &failure,
+                        );
                         // No swap manifest means no fresh backup this
                         // transaction owns. Restoring `<exe>.backup` could
                         // install a backup an earlier upgrade left (engineer

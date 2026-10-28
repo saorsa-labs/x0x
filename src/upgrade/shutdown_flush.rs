@@ -23,6 +23,28 @@ pub(crate) const LIMIT: Duration = Duration::from_secs(30);
 pub(crate) const RECORD: &str = "upgrade-flush.json";
 pub(crate) const ROLLBACK_RECORD: &str = "upgrade-flush-rollback.json";
 pub(crate) const HOLD_RECORD: &str = "upgrade-flush-hold.json";
+pub(crate) const RETRY_RECORD: &str = "upgrade-flush-producer-retries.json";
+/// Refusal the shutdown tail reports when a producer (an HTTP request that
+/// missed the drain bound, an aborted grace straggler, a shielded apply past
+/// its bound) was still running at the drain bound. A started-flush failure
+/// carrying exactly this cause is transient, so it draws the bounded retry
+/// budget below instead of an immediate per-release hold (issue #1595,
+/// Claude #1565 finding 4). The producer and the classifier share this
+/// constant so the marker cannot drift.
+pub(crate) const PRODUCERS_UNFINISHED: &str = "shutdown producers remain unfinished";
+/// Fixed bounded retries for a started-flush failure caused only by
+/// unfinished producers at the drain bound (issue #1595): one slow request
+/// at upgrade time must not hold a release forever. After this many
+/// producer-drain failures of one release, the per-release hold applies. A
+/// constant, not configuration (same ruling as `LIMIT`).
+pub(crate) const PRODUCER_DRAIN_RETRIES: u32 = 2;
+/// Fixed bounded wait for the flush worker's completion message after a
+/// started failure (issue #1595): the caller's `EX_TEMPFAIL` exit gives the
+/// worker this long to finish its last durable write, then exits anyway —
+/// a stalled worker must never park a daemon that already stopped. The
+/// worker's completion send is its final statement, so receiving it proves
+/// every write finished. A constant, not configuration.
+pub(crate) const WORKER_JOIN_BOUND: Duration = Duration::from_secs(2);
 /// Hard ceiling for a test-supplied flush budget; the registration clamp
 /// only refuses a zero budget and this ceiling.
 #[cfg(test)]
@@ -32,6 +54,11 @@ pub(crate) const MAX_LIMIT: Duration = Duration::from_secs(3600);
 /// flush for recovery: earlier failures leave the daemon serving and are
 /// ordinary refusals (engineer ruling, 23 Oct 2026).
 type Hook = Arc<dyn Fn(Deadline, &AtomicBool) -> io::Result<()> + Send + Sync>;
+
+/// Metadata preflight the flush owner registers with the roots its hook
+/// walks: it names the first path the flush would refuse, so upgrade
+/// admission can surface it before any byte changes (issue #1595).
+pub(crate) type Preflight = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 /// Failures distinguish a request that never owned admission from an owned
 /// refusal before stop and an owned failure after the stop commit point.
@@ -123,6 +150,21 @@ impl Deadline {
             cancelled: Arc::new(Mutex::new(false)),
         })
     }
+
+    /// Ceiling for the metadata-only admission preflight (issue #1595): no
+    /// fsync runs under it, so the generous bound only stops a walk that is
+    /// not making progress. Built on the same suspend-inclusive clock the
+    /// flush itself checks.
+    pub(crate) fn preflight() -> io::Result<Self> {
+        let limit = LIMIT.saturating_mul(4);
+        let (boot_id, now) = clock()?;
+        Ok(Self {
+            instant: Instant::now() + limit,
+            boot_id,
+            deadline_ms: now.saturating_add(limit.as_millis() as u64),
+            cancelled: Arc::new(Mutex::new(false)),
+        })
+    }
 }
 static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Entry>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -135,6 +177,9 @@ struct Entry {
     shutdown_pending: AtomicBool,
     unused_released: tokio::sync::Notify,
     limit: Duration,
+    /// The owner's metadata preflight over the roots the hook walks. `None`
+    /// for owners that register no tree walk (tests, bare registrations).
+    preflight: Option<Preflight>,
     #[cfg(test)]
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
@@ -188,10 +233,24 @@ impl Drop for Registration {
     }
 }
 
-// Production registers the fixed budget. The explicit-budget registration
-// and acknowledge variants are the regression macros' test seams.
+// Production registers the fixed budget and its preflight. The plain,
+// explicit-budget and acknowledge variants are the regression macros'
+// test seams.
+#[cfg(test)]
 pub(crate) fn register(root: PathBuf, hook: Hook) -> io::Result<Registration> {
-    register_inner(root, hook, LIMIT)
+    register_inner(root, hook, LIMIT, None)
+}
+
+/// Register with the metadata preflight that admission runs before any
+/// upgrade byte changes (issue #1595). The daemon's flush owner uses this
+/// to refuse early — naming the offending path — on state its hook could
+/// never walk.
+pub(crate) fn register_with_preflight(
+    root: PathBuf,
+    hook: Hook,
+    preflight: Preflight,
+) -> io::Result<Registration> {
+    register_inner(root, hook, LIMIT, Some(preflight))
 }
 
 #[cfg(test)]
@@ -200,10 +259,15 @@ pub(crate) fn register_with_limit(
     hook: Hook,
     limit: Duration,
 ) -> io::Result<Registration> {
-    register_inner(root, hook, limit)
+    register_inner(root, hook, limit, None)
 }
 
-fn register_inner(root: PathBuf, hook: Hook, limit: Duration) -> io::Result<Registration> {
+fn register_inner(
+    root: PathBuf,
+    hook: Hook,
+    limit: Duration,
+    preflight: Option<Preflight>,
+) -> io::Result<Registration> {
     // The clamp bounds only test-supplied budgets; production passes LIMIT.
     #[cfg(test)]
     let limit = limit.max(Duration::from_millis(1)).min(MAX_LIMIT);
@@ -223,6 +287,7 @@ fn register_inner(root: PathBuf, hook: Hook, limit: Duration) -> io::Result<Regi
         shutdown_pending: AtomicBool::new(false),
         unused_released: tokio::sync::Notify::new(),
         limit,
+        preflight,
         #[cfg(test)]
         workers: Mutex::new(Vec::new()),
     });
@@ -250,9 +315,28 @@ pub(crate) fn ensure_ready(root: &Path) -> io::Result<()> {
     {
         return Err(io::Error::other("shutdown flush data root changed"));
     }
-    hooks.insert(supplied_root, entry);
+    hooks.insert(supplied_root, Arc::clone(&entry));
     drop(hooks);
-    check_previous(&root)
+    check_previous(&root)?;
+    // Admission preflight (issue #1595): an upgrade whose flush could never
+    // walk the shutdown state must not change bytes first. The owner's scan
+    // names the offending path — an operator's symlink is the known case —
+    // so the refusal surfaces before the swap instead of as a started-flush
+    // failure after the daemon already stopped.
+    if let Some(preflight) = &entry.preflight {
+        if let Err(error) = preflight() {
+            tracing::error!(
+                %error,
+                "shutdown state cannot be flushed; the upgrade is refused before any \
+                 byte changes; remove the offending path (or relocate the store it \
+                 names) so a supervised upgrade can flush"
+            );
+            return Err(io::Error::other(format!(
+                "shutdown state cannot be flushed: {error}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Carried by the admitted replacement worker and its restart continuation.
@@ -507,6 +591,113 @@ pub(crate) fn release_is_held(root: &Path, target: &semver::Version) -> io::Resu
     } else {
         Ok(None)
     }
+}
+
+/// True when a started-flush failure was caused only by unfinished
+/// producers at the drain bound — the exact refusal `finish` reports
+/// through the receipt channel. Every other cause (a refused symlink, a
+/// stalled fsync, an overrun) keeps the immediate hold.
+pub(crate) fn producers_unfinished(error: &io::Error) -> bool {
+    error.to_string() == PRODUCERS_UNFINISHED
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryRecord {
+    schema_version: u32,
+    record_kind: String,
+    retried_version: String,
+    failures: u32,
+}
+
+fn validate_retry(bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(io::Error::other(
+            "producer-drain retry record exceeds size limit",
+        ));
+    }
+    let record: RetryRecord = serde_json::from_slice(bytes)?;
+    if record.schema_version != 1
+        || record.record_kind != "shutdown_flush_producer_retries"
+        || semver::Version::parse(&record.retried_version).is_err()
+        || record.failures == 0
+    {
+        return Err(io::Error::other("unknown producer-drain retry record"));
+    }
+    Ok(())
+}
+
+/// Count one more producer-drain failure of `version` and say whether the
+/// per-release hold must apply (issue #1595). A failure of a different
+/// release resets the count — a release that later applied never carries
+/// another release's budget. The count persists across the `EX_TEMPFAIL`
+/// restarts that retry the release; it is private durability state, not
+/// configuration, and nothing but a producers-only failure reads it.
+fn note_producer_drain_failure(root: &Path, version: &str) -> io::Result<bool> {
+    let failures = match super::journal::read_auxiliary_record(&root.join(RETRY_RECORD)) {
+        Ok(bytes) => {
+            validate_retry(&bytes)?;
+            let prior: RetryRecord = serde_json::from_slice(&bytes)?;
+            if prior.retried_version == version {
+                prior.failures.saturating_add(1)
+            } else {
+                1
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 1,
+        Err(error) => return Err(error),
+    };
+    let record = RetryRecord {
+        schema_version: 1,
+        record_kind: "shutdown_flush_producer_retries".into(),
+        retried_version: version.to_string(),
+        failures,
+    };
+    super::journal::write_auxiliary_record(&root.join(RETRY_RECORD), &record, validate_retry)?;
+    Ok(failures > PRODUCER_DRAIN_RETRIES)
+}
+
+/// Apply the failure policy of a started-flush failure (issue #1595): a
+/// failure caused only by unfinished producers at the drain bound draws
+/// the bounded retry budget — the restart retries the release, no hold —
+/// while every other cause, a spent budget, or a count that cannot be
+/// persisted holds the release. Returns true when the hold was written.
+/// `error` is the failure's cause; it is named in the hold record.
+pub(crate) fn hold_or_retry_started_failure(
+    root: &Path,
+    version: &str,
+    failure: &FlushFailure,
+) -> bool {
+    let error = failure.error();
+    if producers_unfinished(error) {
+        match note_producer_drain_failure(root, version) {
+            Ok(false) => {
+                tracing::warn!(
+                    held_release = %version,
+                    retries = PRODUCER_DRAIN_RETRIES,
+                    "started flush failed only because producers missed the drain \
+                     bound; the restart retries this release instead of holding it"
+                );
+                return false;
+            }
+            Ok(true) => {}
+            Err(count_error) => {
+                tracing::error!(
+                    %count_error,
+                    held_release = %version,
+                    "cannot persist the producer-drain retry count; holding the release"
+                );
+            }
+        }
+    }
+    if let Err(hold_error) = hold_failed_release(root, version, &error.to_string()) {
+        tracing::error!(
+            %hold_error,
+            "cannot persist the failed-upgrade hold; the next automatic \
+             check may retry this release once more"
+        );
+    }
+    true
 }
 
 /// Announce an active hold at startup, loudly; never remove it here.
@@ -825,6 +1016,23 @@ fn acknowledge_inner(
                 validate,
             ) {
                 tracing::error!(%error, "failed to persist shutdown flush rollback request");
+            }
+            // Bounded join of the flush worker (issue #1595): its completion
+            // message is the worker's final statement, so receiving it proves
+            // every durable write it started has finished before the caller's
+            // exit. Wait a short fixed window — never longer — then continue
+            // anyway; a stalled worker must not park the stopped daemon. An
+            // already-finished worker answers instantly, so only a genuinely
+            // stuck hook pays the bound.
+            if matches!(
+                receive.recv_timeout(WORKER_JOIN_BOUND),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                tracing::warn!(
+                    wait = ?WORKER_JOIN_BOUND,
+                    "shutdown flush worker did not report completion; \
+                     the EX_TEMPFAIL exit continues without it"
+                );
             }
         } else {
             // Engineer ruling, 24 Oct 2026: a flush refused before the daemon
@@ -1155,5 +1363,146 @@ mod reservation_release_regressions {
     enum Refusal {
         Prepare,
         Hook,
+    }
+
+    /// Issue #1595: a producers-only drain failure draws the fixed bounded
+    /// retry budget before the per-release hold; every other started
+    /// failure, and a count that cannot be persisted, holds immediately.
+    #[test]
+    fn producer_drain_failures_retry_then_hold_and_reset_per_release() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        for attempt in 1..=(PRODUCER_DRAIN_RETRIES + 1) {
+            let held = hold_or_retry_started_failure(
+                &root,
+                "2.0.0",
+                &FlushFailure::Started(io::Error::other(PRODUCERS_UNFINISHED)),
+            );
+            assert_eq!(
+                held,
+                attempt > PRODUCER_DRAIN_RETRIES,
+                "attempt {attempt} of the release"
+            );
+        }
+        assert_eq!(
+            release_is_held(&root, &semver::Version::new(2, 0, 0))
+                .unwrap()
+                .as_deref(),
+            Some("2.0.0")
+        );
+        assert!(release_is_held(&root, &semver::Version::new(2, 0, 1))
+            .unwrap()
+            .is_none());
+        // A different release resets the budget on a fresh root: neither a
+        // first failure nor a failure of a new release writes a hold.
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        assert!(!hold_or_retry_started_failure(
+            &root,
+            "2.0.0",
+            &FlushFailure::Started(io::Error::other(PRODUCERS_UNFINISHED))
+        ));
+        assert!(!hold_or_retry_started_failure(
+            &root,
+            "3.0.0",
+            &FlushFailure::Started(io::Error::other(PRODUCERS_UNFINISHED))
+        ));
+        assert!(failed_release_hold(&root).unwrap().is_none());
+        // A non-producers cause never touches the budget.
+        let held = hold_or_retry_started_failure(
+            &root,
+            "2.0.0",
+            &FlushFailure::Started(io::Error::other(
+                "unverified symlink in shutdown state: /x/store/link",
+            )),
+        );
+        assert!(held);
+        assert!(failed_release_hold(&root).unwrap().is_some());
+        // An unreadable retry record is treated as spent: the release is
+        // held rather than retried without a count.
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join(RETRY_RECORD), b"not a record").unwrap();
+        let held = hold_or_retry_started_failure(
+            &root,
+            "2.0.0",
+            &FlushFailure::Started(io::Error::other(PRODUCERS_UNFINISHED)),
+        );
+        assert!(held, "an unparsable count must hold, not retry forever");
+    }
+
+    /// Issue #1595: after a started failure the caller's EX_TEMPFAIL exit
+    /// waits one short fixed window for the worker's completion message,
+    /// then continues — a stuck worker must not park the stopped daemon,
+    /// and a finished worker must not pay the window at all.
+    #[test]
+    fn started_failure_waits_one_bounded_window_for_a_stuck_worker() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let owner = register_with_limit(
+            root.clone(),
+            Arc::new(move |deadline, stopped| {
+                deadline.commit_stop(stopped)?;
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .map_err(io::Error::other)
+            }),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let worker_root = root.clone();
+        let started = Instant::now();
+        let caller = std::thread::spawn(move || {
+            acknowledge(
+                &worker_root,
+                Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap(),
+                || Ok(()),
+            )
+        });
+        let result = caller.join().unwrap();
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        owner.join_workers();
+        assert!(matches!(result, Err(FlushFailure::Started(_))));
+        assert!(
+            elapsed >= WORKER_JOIN_BOUND,
+            "the caller did not wait for the worker's completion: {elapsed:?}"
+        );
+        assert!(
+            elapsed < WORKER_JOIN_BOUND + Duration::from_secs(3),
+            "the wait was not bounded: {elapsed:?}"
+        );
+        assert!(root.join(ROLLBACK_RECORD).is_file());
+    }
+
+    #[test]
+    fn started_failure_with_a_finished_worker_does_not_wait() {
+        let dir = fixture();
+        let root = dir.path().canonicalize().unwrap();
+        let owner = register(
+            root.clone(),
+            Arc::new(|deadline, stopped| {
+                deadline.commit_stop(stopped)?;
+                Err(io::Error::other("injected started flush failure"))
+            }),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = acknowledge(
+            &root,
+            Binding::new(uuid::Uuid::new_v4().to_string(), 1, &"plan").unwrap(),
+            || Ok(()),
+        );
+        let elapsed = started.elapsed();
+        owner.join_workers();
+        assert!(matches!(result, Err(FlushFailure::Started(_))));
+        assert!(
+            elapsed < WORKER_JOIN_BOUND,
+            "a finished worker must not delay the exit: {elapsed:?}"
+        );
     }
 }

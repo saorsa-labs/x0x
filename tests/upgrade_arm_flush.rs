@@ -137,6 +137,146 @@ macro_rules! arm_flush_regression_tests {
             }
 
             #[test]
+            fn flush_refusals_name_the_offending_path() {
+                // Issue #1595: an operator-facing refusal must name the path
+                // that caused it, or the operator cannot find the symlink to
+                // remove. The walk refuses the link itself and any other
+                // unsupported type (a FIFO) the same way.
+                let (dir, _, _, _) = fixture();
+                let store = dir.path().join("store");
+                std::fs::create_dir_all(&store).unwrap();
+                let link = store.join("link");
+                std::os::unix::fs::symlink(dir.path().join("elsewhere"), &link).unwrap();
+                let deadline = shutdown_flush::Deadline::for_test(Duration::from_secs(5)).unwrap();
+                let refusal = sync_tree(dir.path(), &deadline).unwrap_err();
+                assert!(refusal.to_string().contains("unverified symlink"), "{refusal}");
+                assert!(refusal.to_string().contains(&link.display().to_string()), "{refusal}");
+                std::fs::remove_file(&link).unwrap();
+                let fifo = store.join("pipe");
+                let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+                    .unwrap();
+                // SAFETY: mkfifo only reads the passed path string and creates
+                // the named pipe at it; the path is owned by this test.
+                assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+                let refusal = sync_tree(dir.path(), &deadline).unwrap_err();
+                assert!(refusal.to_string().contains("unsupported shutdown state file type"), "{refusal}");
+                assert!(refusal.to_string().contains(&fifo.display().to_string()), "{refusal}");
+            }
+
+            #[test]
+            fn arm_producers_only_started_failure_retries_before_the_hold() {
+                // Issue #1595: the same bounded retry budget covers the
+                // arm-and-flush path. A started failure caused only by
+                // unfinished producers restores and classifies FlushFailed
+                // on every attempt; the first budget failures write no
+                // hold, so the exit-75 restart retries the release, and the
+                // spent budget finally holds it.
+                let mut carried: Option<Vec<u8>> = None;
+                for attempt in 1..=(shutdown_flush::PRODUCER_DRAIN_RETRIES + 1) {
+                    let (dir, _, request, state, cli, backup) = swapped_cli_fixture();
+                    let root = dir.path().canonicalize().unwrap();
+                    if let Some(prior) = &carried {
+                        std::fs::write(root.join(shutdown_flush::RETRY_RECORD), prior).unwrap();
+                    }
+                    let owner = shutdown_flush::register(root.clone(), Arc::new(
+                        |deadline, stopped| {
+                            deadline.commit_stop(stopped)?;
+                            Err(io::Error::other(shutdown_flush::PRODUCERS_UNFINISHED))
+                        },
+                    ))
+                    .unwrap();
+                    let failure =
+                        arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
+                    owner.join_workers();
+                    assert!(matches!(failure, ArmFailure::FlushFailed(_)));
+                    assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                    assert!(!backup.exists(), "the fresh backup is consumed by the restore");
+                    assert_eq!(
+                        root.join(shutdown_flush::HOLD_RECORD).exists(),
+                        attempt > shutdown_flush::PRODUCER_DRAIN_RETRIES,
+                        "attempt {attempt}"
+                    );
+                    carried = Some(std::fs::read(root.join(shutdown_flush::RETRY_RECORD)).unwrap());
+                }
+            }
+
+            #[test]
+            fn arm_started_failure_from_a_refused_symlink_holds_and_restores() {
+                // Issue #1595 item 1: a flush failure forced by a symlink
+                // under the data root is a started failure — the daemon
+                // stopped behind the hook — so it must end in the restore,
+                // the per-release hold and the EX_TEMPFAIL classification,
+                // never a plain refusal.
+                let (dir, _, request, state, cli, backup) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let link = root.join("store-link");
+                std::os::unix::fs::symlink(root.join("elsewhere"), &link).unwrap();
+                let walk_root = root.clone();
+                let owner = shutdown_flush::register(root.clone(), Arc::new(
+                    move |deadline, stopped| {
+                        deadline.commit_stop(stopped)?;
+                        sync_tree(&walk_root, &deadline)
+                    },
+                ))
+                .unwrap();
+                let failure = arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
+                owner.join_workers();
+                assert!(matches!(failure, ArmFailure::FlushFailed(_)));
+                assert!(failure.to_string().contains("unverified symlink"), "{failure}");
+                assert!(failure.to_string().contains(&link.display().to_string()), "{failure}");
+                assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                assert!(!backup.exists());
+                assert!(root.join(shutdown_flush::ROLLBACK_RECORD).is_file());
+                assert!(root.join(shutdown_flush::HOLD_RECORD).is_file());
+            }
+
+            #[test]
+            fn admission_preflight_names_the_offending_symlink() {
+                // Issue #1595: the same refusal must surface before an
+                // upgrade is attempted — at flush admission, before any
+                // byte changes — naming the path.
+                let (dir, _, _, _) = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                std::fs::create_dir_all(root.join("store")).unwrap();
+                let link = root.join("store/link");
+                std::os::unix::fs::symlink(root.join("elsewhere"), &link).unwrap();
+                let scan_roots = vec![root.clone()];
+                let owner = shutdown_flush::register_with_preflight(
+                    root.clone(),
+                    Arc::new(|_, _| Ok(())),
+                    Arc::new(move || scan_flush_state(&scan_roots)),
+                )
+                .unwrap();
+                let refusal = shutdown_flush::ensure_ready(&root).unwrap_err();
+                assert!(refusal.to_string().contains("cannot be flushed"), "{refusal}");
+                assert!(refusal.to_string().contains("unverified symlink"), "{refusal}");
+                assert!(refusal.to_string().contains(&link.display().to_string()), "{refusal}");
+                drop(owner);
+            }
+
+            #[test]
+            fn admission_preflight_accepts_a_clean_tree_and_the_control_socket() {
+                // The daemon's own control socket lives under the data root;
+                // the admission walk must accept it exactly as the flush does,
+                // and a clean tree must not refuse the next upgrade.
+                let (dir, _, _, _) = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                std::fs::create_dir_all(root.join("store")).unwrap();
+                std::fs::write(root.join("store/state"), b"state").unwrap();
+                let socket = root.join(SOCKET);
+                std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                let scan_roots = vec![root.clone()];
+                let owner = shutdown_flush::register_with_preflight(
+                    root.clone(),
+                    Arc::new(|_, _| Ok(())),
+                    Arc::new(move || scan_flush_state(&scan_roots)),
+                )
+                .unwrap();
+                shutdown_flush::ensure_ready(&root).unwrap();
+                drop(owner);
+            }
+
+            #[test]
             fn shutdown_state_barrier_stops_after_a_sync_returns_past_the_deadline() {
                 let (dir, _, _, _) = fixture();
                 let root = dir.path().canonicalize().unwrap();
@@ -571,6 +711,92 @@ macro_rules! arm_flush_regression_tests {
                     }
                     let _ = guard.shutdown_until(Instant::now() + Duration::from_secs(1));
                 }
+            }
+
+            // Socket execution belongs to the isolated Linux CI runner.
+            #[cfg_attr(not(target_os = "linux"), ignore = "requires isolated Linux network namespace")]
+            #[tokio::test]
+            async fn arm_symlink_started_failure_exits_tempfail_without_the_shutdown_tail() {
+                // Issue #1595 / Claude #1566 finding 1: the EX_TEMPFAIL exit
+                // after a failed started flush must not depend on the server
+                // shutdown tail reaching `finish` — a hung Agent shutdown
+                // must not park the stopped daemon forever. A symlink under
+                // the data root forces exactly that failure; the receipt a
+                // finished tail would send is supplied by hand and `finish`
+                // is never called.
+                use std::io::Write;
+                use tracing_subscriber::prelude::*;
+                struct Sink;
+                impl Write for Sink {
+                    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                        Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let (dir, _, mut request, _, cli, backup) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                let link = root.join("store-link");
+                std::os::unix::fs::symlink(root.join("elsewhere"), &link).unwrap();
+                let agent = Arc::new(crate::Agent::builder()
+                    .with_identity_dir(&root).with_user_key_path(root.join("user.key"))
+                    .with_machine_key(root.join("machine.key"))
+                    .with_agent_key_path(root.join("agent.key"))
+                    .with_agent_cert_path(root.join("agent.cert"))
+                    .with_contact_store_path(root.join("contacts.json"))
+                    .with_peer_cache_disabled().build().await.unwrap());
+                assert!(agent.network().is_none());
+                let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+                    &root, Arc::clone(&agent)).await.unwrap();
+                let mut notified = state.shutdown_notify.subscribe();
+                request["token"] = json!(state.api_token);
+                let (writer, mut guard) = log_flush::acknowledged(Sink).unwrap();
+                let dispatch = tracing::Dispatch::new(tracing_subscriber::registry()
+                    .with(log_flush::FlushLayer::new(vec![writer]).unwrap()));
+                let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+                let observed_exit = Arc::clone(&exit_code);
+                let mut owner = tracing::dispatcher::with_default(&dispatch,
+                    || FlushOwner::start(&state, &root, &root,
+                        Arc::new(move |code| observed_exit.store(code, std::sync::atomic::Ordering::SeqCst))))
+                    .unwrap();
+                let mut stream = tokio::net::UnixStream::connect(root.join(SOCKET)).await.unwrap();
+                let mut encoded = serde_json::to_vec(&request).unwrap(); encoded.push(b'\n');
+                stream.write_all(&encoded).await.unwrap();
+                // The hook committed the stop; hand it the receipt a finished
+                // shutdown tail would have sent, then let the walk refuse the
+                // symlink exactly as in production.
+                tokio::time::timeout(Duration::from_secs(5), notified.changed()).await.unwrap().unwrap();
+                owner.complete.try_send(Ok(())).unwrap();
+                let mut response = String::new();
+                tokio::time::timeout(Duration::from_secs(5),
+                    tokio::io::BufReader::new(&mut stream).read_line(&mut response))
+                    .await.unwrap().unwrap();
+                let response: Value = serde_json::from_str(&response).unwrap();
+                let error = response["error"].as_str().unwrap();
+                assert!(error.contains("unverified symlink in shutdown state"), "{error}");
+                assert!(error.contains(&link.display().to_string()), "{error}");
+                // The exit follows the reply from the control loop itself.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while exit_code.load(std::sync::atomic::Ordering::SeqCst) == -1
+                    && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(
+                    exit_code.load(std::sync::atomic::Ordering::SeqCst),
+                    crate::upgrade::restart::flush_failure_exit_code(),
+                    "a failed started flush must exit without the shutdown tail"
+                );
+                // Recovery completed before the exit: the old bytes are back,
+                // the release is held and the journal no longer blocks apply.
+                assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                assert!(!backup.exists());
+                assert!(root.join(shutdown_flush::HOLD_RECORD).is_file());
+                assert!(!journal::read_boot_records(&root).blocks_apply());
+                owner.control.abort(); let _ = (&mut owner.control).await;
+                state.exec_service.shutdown().await;
+                agent.try_shutdown().await.unwrap();
+                let _ = guard.shutdown_until(Instant::now() + Duration::from_secs(1));
             }
 
             #[tokio::test(start_paused = true)]
