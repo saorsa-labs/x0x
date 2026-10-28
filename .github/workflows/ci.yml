@@ -85,6 +85,13 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # W3-H idle-step code is behind `tokio_unstable`. The plain clippy
+      # above does not build it (#1245, #1654).
+      - name: Run clippy under tokio_unstable
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        env:
+          RUSTFLAGS: --cfg tokio_unstable
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest

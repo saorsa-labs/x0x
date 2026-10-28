@@ -1002,8 +1002,11 @@ pub async fn serve_with_options(
     // aborted for restart with a core dump. Runs on std::thread
     // deliberately: a tokio task cannot report on a runtime that stopped
     // polling it. Never fires inside the startup grace or after shutdown
-    // begins (the shutdown watch disarms it).
-    if config.api_watchdog.enabled {
+    // begins (the shutdown watch disarms it). The probe sleeps on the wall
+    // clock. W3-H already leaves the watchdog off (`Sim::daemon_config`).
+    // `shim_active()` is false outside tests, so this guard does not change
+    // a production daemon (#1245).
+    if config.api_watchdog.enabled && !crate::w3h_inline::shim_active() {
         api_watchdog::spawn_api_watchdog(
             &config.api_watchdog,
             actual_api_addr,
