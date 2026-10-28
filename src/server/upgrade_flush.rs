@@ -22,8 +22,8 @@ pub(super) struct FlushOwner {
     complete: mpsc::SyncSender<io::Result<()>>,
     control: tokio::task::JoinHandle<()>,
     socket: PathBuf,
-    /// Process exit used after a started flush failed. A seam so tests can
-    /// observe the EX_TEMPFAIL code instead of ending the test process.
+    /// Process exit after a completed socket flush or a started failure.
+    /// Tests capture the carried status instead of ending the test process.
     exit: Arc<dyn Fn(i32) + Send + Sync>,
     /// Set (with a stored permit) by the control loop after a started flush
     /// failed and its recovery finished; `finish` exits EX_TEMPFAIL on it.
@@ -97,7 +97,8 @@ impl FlushOwner {
         let stop = super::routes::daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         let (complete, receive) = mpsc::sync_channel(1);
         let receive = Mutex::new(receive);
-        let registration = shutdown_flush::register(
+        let preflight_roots = roots.clone();
+        let registration = shutdown_flush::register_with_preflight(
             root.clone(),
             Arc::new(move |deadline, stopped| {
                 // The deadline decision and stop marker share the waiter's
@@ -115,6 +116,7 @@ impl FlushOwner {
                 deadline.check()?;
                 log_flush::flush_captured(&hook_logs, deadline.instant)
             }),
+            Arc::new(move || scan_flush_state(&preflight_roots)),
         )?;
         let state = Arc::new(ControlContext {
             api_token: state.api_token.clone(),
@@ -123,6 +125,8 @@ impl FlushOwner {
         });
         let flush_failed = Arc::new(tokio::sync::Notify::new());
         let failure_signal = Arc::clone(&flush_failed);
+        let control_exit = Arc::clone(&exit);
+        let control_logs = Arc::clone(&logs);
         let control = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let mut bytes = Vec::new();
@@ -146,8 +150,9 @@ impl FlushOwner {
                     )))
                 };
                 let started_flush_failed = matches!(response, Err(ArmFailure::FlushFailed(_)));
+                let success_exit = response.as_ref().ok().map(|armed| armed.exit_code);
                 let value = match response {
-                    Ok(receipt) => serde_json::json!({"receipt": receipt}),
+                    Ok(armed) => serde_json::json!({"receipt": armed.receipt}),
                     Err(error) => serde_json::json!({"error": error.to_string()}),
                 };
                 if let Ok(mut bytes) = serde_json::to_vec(&value) {
@@ -155,12 +160,34 @@ impl FlushOwner {
                     let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&bytes))
                         .await;
                 }
+                if let Some(code) = success_exit {
+                    // The live receipt proves the barriers completed. End the
+                    // old participant after the existing bounded reply attempt,
+                    // even if the requester disconnected or `finish` is parked.
+                    // Do not log or wait for another shutdown notification after
+                    // the acknowledged log barrier. The frozen owner retains
+                    // restart/reap/start authority; this only ends this process.
+                    (control_exit)(code);
+                }
                 // Only after the reply is written does the failed flush end
-                // this process: `arm` has completed its recovery attempt,
-                // and `finish` exits
-                // EX_TEMPFAIL for a service-manager restart on it.
+                // this process. `arm` completed its recovery (the hold, the
+                // restore, the journal archive), so the daemon behind the
+                // hook is stopped with no API and no network. Exit
+                // EX_TEMPFAIL from the control loop itself (issue #1595,
+                // Claude #1566 finding 1): waiting for the shutdown tail to
+                // reach `finish` would park that stopped daemon forever if
+                // the Agent shutdown hangs, the exact state the 23 Oct 2026
+                // ruling forbids. The stored permit still lets an already
+                // parked `finish` exit first; either path ends the process.
                 if started_flush_failed {
                     failure_signal.notify_one();
+                    tracing::error!(
+                        exit_code = crate::upgrade::restart::flush_failure_exit_code(),
+                        "acknowledged shutdown flush failed; exiting EX_TEMPFAIL \
+                         for a service-manager restart on the previous binary"
+                    );
+                    log_flush::flush_before_exit(Some(&control_logs));
+                    (control_exit)(crate::upgrade::restart::flush_failure_exit_code());
                 }
             }
         });
@@ -190,7 +217,10 @@ impl FlushOwner {
                 if producers_finished {
                     Ok(())
                 } else {
-                    Err(io::Error::other("shutdown producers remain unfinished"))
+                    // The shared marker names the one transient started-flush
+                    // cause that draws the bounded retry budget instead of an
+                    // immediate hold (issue #1595).
+                    Err(io::Error::other(shutdown_flush::PRODUCERS_UNFINISHED))
                 }
             });
             let _ = self.complete.try_send(result);
@@ -245,6 +275,16 @@ struct AdmittedArm {
     /// Recovery verifies every backup before starting the restore.
     restore_set: Vec<(PathBuf, PathBuf)>,
     journal: Box<journal::JournalRecord>,
+    /// Completion status from this participant's frozen restart owner.
+    exit_code: i32,
+}
+
+/// Only the live acknowledgement creates successful completion authority.
+/// The socket still serializes the receipt alone; this status stays local.
+#[derive(Debug)]
+struct ArmedFlush {
+    receipt: shutdown_flush::Receipt,
+    exit_code: i32,
 }
 
 fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<AdmittedArm> {
@@ -291,12 +331,21 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
             "arm request names a different old participant",
         ));
     }
-    if participant.restart.mode == journal::RestartOwner::LauncherChild {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "launcher-child handoff ownership is not implemented",
-        ));
-    }
+    let exit_code = match participant.restart.mode {
+        journal::RestartOwner::SupervisedExit => participant
+            .restart
+            .supervised_exit_code
+            .unwrap_or_else(crate::upgrade::restart::supervised_exit_code),
+        // Stop cleanly for the existing external handoff owner. This path
+        // neither requests a supervisor restart nor starts a helper/candidate.
+        journal::RestartOwner::TransactionalHandoff => 0,
+        journal::RestartOwner::LauncherChild => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "launcher-child handoff ownership is not implemented",
+            ));
+        }
+    };
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs())
@@ -337,6 +386,7 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
         handoff,
         restore_set,
         journal: record,
+        exit_code,
     })
 }
 
@@ -346,11 +396,7 @@ struct ArmPreparation {
     wrote_handoff: bool,
 }
 
-fn arm(
-    state: &ControlContext,
-    root: &Path,
-    bytes: &[u8],
-) -> Result<shutdown_flush::Receipt, ArmFailure> {
+fn arm(state: &ControlContext, root: &Path, bytes: &[u8]) -> Result<ArmedFlush, ArmFailure> {
     let admitted = match admit(state, root, bytes) {
         Ok(admitted) => admitted,
         Err(error) => return Err(ArmFailure::Refused(error)),
@@ -378,6 +424,7 @@ fn arm(
         handoff,
         restore_set,
         journal,
+        exit_code,
     } = current;
     let handoff_path = root.join(journal::HANDOFF_FILE_NAME);
     // Serialize a late prepare with refusal cleanup, including a timed-out
@@ -407,25 +454,17 @@ fn arm(
         &reservation,
     );
     match flush {
-        Ok(receipt) => Ok(receipt),
+        Ok(receipt) => Ok(ArmedFlush { receipt, exit_code }),
         Err(shutdown_flush::FlushFailure::NotOwned(error)) => Err(ArmFailure::Refused(error)),
         Err(failure @ shutdown_flush::FlushFailure::Started(_)) => {
             // The flush started and the daemon stopped behind the hook. Hold
-            // the failed release first (engineer ruling, 23 Oct 2026) so the
-            // restart this exit creates cannot re-apply it, then restore
+            // the failed release first — or spend one of the bounded
+            // producer-drain retries (engineer ruling, 23 Oct 2026;
+            // issue #1595) — so the restart this exit creates cannot
+            // re-apply a release that fails deterministically, then restore
             // every binary the transaction swapped and leave the EX_TEMPFAIL
-            // exit to `finish`.
-            if let Err(error) = shutdown_flush::hold_failed_release(
-                root,
-                &plan.candidate_version,
-                &failure.to_string(),
-            ) {
-                tracing::error!(
-                    %error,
-                    "cannot persist the failed-upgrade hold; the next automatic \
-                     check may retry this release once more"
-                );
-            }
+            // exit to the control loop after its reply.
+            shutdown_flush::hold_or_retry_started_failure(root, &plan.candidate_version, &failure);
             let recovery_complete = match restore_arm(
                 root,
                 *journal,
@@ -561,11 +600,24 @@ fn sync_tree(path: &Path, deadline: &shutdown_flush::Deadline) -> io::Result<()>
     sync_tree_with(path, deadline, &mut std::fs::File::sync_all)
 }
 
+/// Metadata-only walk of the flush roots with the flush's own refusal
+/// rules (issue #1595). No fsync runs, so a long clock ceiling bounds only
+/// the walk. Sockets — including this control plane's own — are accepted
+/// exactly as at flush time; the first refused path is named in the error
+/// so admission can surface it before an upgrade changes any byte.
+pub(super) fn scan_flush_state(roots: &[PathBuf]) -> io::Result<()> {
+    let deadline = shutdown_flush::Deadline::preflight()?;
+    for root in roots {
+        sync_tree_with(root, &deadline, &mut |_| Ok(()))?;
+    }
+    Ok(())
+}
+
 // All producers are drained before this barrier. A symlink is not a verified
-// store root; refuse it rather than silently omit storage from the receipt.
-// A path that vanishes mid-walk (the CLI deletes a scratch file under the
-// shared identity root between read_dir and open) has nothing left to sync:
-// skip it instead of failing the flush.
+// store root; refuse it — naming the path — rather than silently omit
+// storage from the receipt. A path that vanishes mid-walk (the CLI deletes
+// a scratch file under the shared identity root between read_dir and open)
+// has nothing left to sync: skip it instead of failing the flush.
 fn sync_tree_with(
     path: &Path,
     deadline: &shutdown_flush::Deadline,
@@ -579,7 +631,10 @@ fn sync_tree_with(
     };
     deadline.check()?;
     if meta.file_type().is_symlink() {
-        return Err(io::Error::other("unverified symlink in shutdown state"));
+        return Err(io::Error::other(format!(
+            "unverified symlink in shutdown state: {}",
+            path.display()
+        )));
     }
     if meta.is_dir() {
         deadline.check()?;
@@ -609,7 +664,10 @@ fn sync_tree_with(
     } else {
         use std::os::unix::fs::FileTypeExt;
         if !meta.file_type().is_socket() {
-            return Err(io::Error::other("unsupported shutdown state file type"));
+            return Err(io::Error::other(format!(
+                "unsupported shutdown state file type: {}",
+                path.display()
+            )));
         }
     }
     Ok(())
