@@ -137,8 +137,9 @@ const ACCEPTED_MACHINES_PER_AGENT: usize = 8;
 /// agent overflowed and does not evict another agent's pairs.
 const ACCEPTED_MACHINE_PAIR_CAPACITY: usize = 65_536;
 /// Pairs that agents who are not Trusted or Known contacts may record.
-/// Throwaway peers share this budget and cannot fill
-/// [`ACCEPTED_MACHINE_PAIR_CAPACITY`].
+/// The pool is a bounded LRU. A new stranger pair evicts the least-recently
+/// used stranger pair. It does not evict a contact pair, and it does not
+/// fill [`ACCEPTED_MACHINE_PAIR_CAPACITY`].
 const ACCEPTED_MACHINE_STRANGER_PAIRS: usize = 4_096;
 /// #1659: agents that can be named as overflowed. A further agent is
 /// counted and is not a reason to refuse any other sender.
@@ -171,18 +172,22 @@ pub(crate) struct AuthenticatedMachineBinding {
 /// eviction) wakes ADR-0074 §4 stream reauth — including the DM attestation
 /// writer `record_authenticated_machine_binding`.
 ///
-/// `accepted_machines` is the #1659 attribution memory. It records a
-/// verified machine after that DM's attestation and trust checks admit it.
+/// `accepted_machines` is the #1659 attribution memory. An identity
+/// announcement records its machine when the announcement is accepted. A
+/// DM records its machine only after decryption succeeds. An ACK records
+/// its machine only after the trust check admits it and a waiter matches.
 /// The set includes the retained binding, a machine a later binding
-/// replaced, and a verified machine that lost timestamp selection. LRU
-/// eviction drops the retained entry and does not drop the set. One agent
-/// can record 8 machines. The cache holds 65,536 pairs. Agents that are
-/// not Trusted or Known contacts share 4,096 of those pairs, so throwaway
-/// peers cannot fill the cache. A machine past either cap is not recorded.
-/// Overflow does not refuse an unattested DM by itself. A revocation of an
-/// unrecorded machine is not attributed, and an unattested DM that claims
-/// a clean machine can still be accepted. That loss of attribution is a
-/// residual. The set is process memory. A restart drops it.
+/// replaced, and a verified machine that lost timestamp selection. Evicting
+/// a retained binding does not drop the set. Stranger pairs are a bounded
+/// LRU of 4,096: a new stranger pair evicts the least-recently used
+/// stranger pair, and that evicted machine is no longer attributed. A
+/// Trusted or Known contact is not in that pool, and a stranger insert
+/// does not evict a contact. Downgrading or removing the contact drops
+/// the privilege and moves those pairs into the stranger pool. One agent
+/// can record 8 machines. A further machine for that agent is not recorded.
+/// The cache holds 65,536 pairs. A machine past the per-agent cap is not
+/// recorded. That loss of attribution is a residual. The set is process
+/// memory. A restart, including a self-update restart, drops it.
 #[derive(Debug)]
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
@@ -203,10 +208,14 @@ pub struct AuthenticatedMachineBindingCache {
     attribution_overflow_agents: usize,
     /// Agents that overflowed after the name list was full.
     attribution_unnamed_overflows: u64,
-    /// Stranger pairs refused because the stranger budget was full.
+    /// Stranger pairs evicted because the stranger budget was full.
     attribution_stranger_overflows: u64,
-    /// Last attribution-cap warning, unix milliseconds. One cache, not one process.
+    /// Last attribution-cap warning, monotonic milliseconds. One cache.
     attribution_overflow_warn_ms: u64,
+    /// Least-recently used stranger pairs. Contacts are not in this order.
+    stranger_order: std::collections::BTreeSet<(u64, [u8; 32], [u8; 32])>,
+    stranger_index: std::collections::HashMap<([u8; 32], [u8; 32]), u64>,
+    stranger_clock: u64,
     capacity: usize,
     recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
@@ -231,6 +240,9 @@ impl Default for AuthenticatedMachineBindingCache {
             attribution_unnamed_overflows: 0,
             attribution_stranger_overflows: 0,
             attribution_overflow_warn_ms: 0,
+            stranger_order: std::collections::BTreeSet::new(),
+            stranger_index: std::collections::HashMap::new(),
+            stranger_clock: 0,
             recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
@@ -266,6 +278,9 @@ impl AuthenticatedMachineBindingCache {
             attribution_unnamed_overflows: 0,
             attribution_stranger_overflows: 0,
             attribution_overflow_warn_ms: 0,
+            stranger_order: std::collections::BTreeSet::new(),
+            stranger_index: std::collections::HashMap::new(),
+            stranger_clock: 0,
             recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
@@ -318,9 +333,20 @@ impl AuthenticatedMachineBindingCache {
         self.overflowed_agents.contains(agent_id)
     }
 
-    /// Mark `agent_id` as a Trusted or Known contact before the next record.
-    pub(crate) fn note_relationship_peer(&mut self, agent_id: AgentId) {
-        self.relationship_peers.insert(agent_id);
+    /// Mark or clear the Trusted/Known privilege for `agent_id`.
+    ///
+    /// A downgrade or removal moves that agent's pairs into the stranger
+    /// pool, which may evict the least-recently used stranger pair. A
+    /// promotion takes those pairs out of the pool. Stranger inserts never
+    /// evict a pair while this flag is set.
+    pub(crate) fn set_relationship_peer(&mut self, agent_id: AgentId, relationship: bool) {
+        if relationship {
+            if self.relationship_peers.insert(agent_id) {
+                self.reclassify_as_contact(agent_id);
+            }
+        } else if self.relationship_peers.remove(&agent_id) {
+            self.reclassify_as_stranger(agent_id);
+        }
     }
 
     /// Lower the stranger-pair budget. Call this before any stranger `record`.
@@ -351,32 +377,41 @@ impl AuthenticatedMachineBindingCache {
         if self.overflowed_agents.contains(&agent_id) {
             return;
         }
+        let relationship = self.relationship_peers.contains(&agent_id);
         if self
             .accepted_machines
             .get(&agent_id)
             .is_some_and(|machines| machines.contains(&machine_id))
         {
+            if !relationship {
+                self.touch_stranger(agent_id, machine_id);
+            }
             return;
         }
-        let relationship = self.relationship_peers.contains(&agent_id);
-        let agent_len = self
-            .accepted_machines
-            .get(&agent_id)
-            .map(|machines| machines.len())
-            .unwrap_or(0);
-        let stranger_full =
-            !relationship && self.attribution_stranger_pairs_len >= self.attribution_stranger_pairs;
-        if stranger_full
-            && agent_len < self.attribution_per_agent
-            && self.attribution_pairs_len < self.attribution_pairs
-        {
-            // The shared pair cap still has room for Trusted and Known contacts.
-            self.attribution_stranger_overflows =
-                self.attribution_stranger_overflows.saturating_add(1);
-            self.warn_attribution_pressure(agent_id);
+        if self.agent_accepted_len(&agent_id) >= self.attribution_per_agent {
+            self.mark_attribution_overflow(agent_id);
             return;
         }
-        if agent_len >= self.attribution_per_agent
+        if self.attribution_pairs_len >= self.attribution_pairs {
+            // A contact can take a stranger slot. A stranger cannot take a
+            // contact slot, and one contact cannot evict another.
+            let freed = relationship && self.evict_lru_stranger();
+            if !freed {
+                self.mark_attribution_overflow(agent_id);
+                return;
+            }
+        }
+        if !relationship && self.attribution_stranger_pairs_len >= self.attribution_stranger_pairs {
+            if self.evict_lru_stranger() {
+                self.warn_attribution_pressure(agent_id);
+            } else {
+                self.attribution_stranger_overflows =
+                    self.attribution_stranger_overflows.saturating_add(1);
+                self.warn_attribution_pressure(agent_id);
+                return;
+            }
+        }
+        if self.agent_accepted_len(&agent_id) >= self.attribution_per_agent
             || self.attribution_pairs_len >= self.attribution_pairs
         {
             self.mark_attribution_overflow(agent_id);
@@ -388,12 +423,88 @@ impl AuthenticatedMachineBindingCache {
             .insert(machine_id);
         self.attribution_pairs_len += 1;
         if !relationship {
+            self.touch_stranger(agent_id, machine_id);
             self.attribution_stranger_pairs_len += 1;
         }
     }
 
+    fn agent_accepted_len(&self, agent_id: &AgentId) -> usize {
+        self.accepted_machines
+            .get(agent_id)
+            .map(|machines| machines.len())
+            .unwrap_or(0)
+    }
+
+    fn touch_stranger(&mut self, agent_id: AgentId, machine_id: MachineId) {
+        let key = (agent_id.0, machine_id.0);
+        if let Some(seq) = self.stranger_index.get(&key).copied() {
+            self.stranger_order.remove(&(seq, key.0, key.1));
+        }
+        self.stranger_clock = self.stranger_clock.saturating_add(1);
+        let seq = self.stranger_clock;
+        self.stranger_order.insert((seq, key.0, key.1));
+        self.stranger_index.insert(key, seq);
+    }
+
+    /// Drop the least-recently used stranger pair. Contact pairs stay.
+    fn evict_lru_stranger(&mut self) -> bool {
+        let Some((seq, agent, machine)) = self.stranger_order.iter().next().copied() else {
+            return false;
+        };
+        self.stranger_order.remove(&(seq, agent, machine));
+        self.stranger_index.remove(&(agent, machine));
+        let agent_id = AgentId(agent);
+        let machine_id = MachineId(machine);
+        let removed = self
+            .accepted_machines
+            .get_mut(&agent_id)
+            .is_some_and(|machines| machines.remove(&machine_id));
+        if self
+            .accepted_machines
+            .get(&agent_id)
+            .is_some_and(|machines| machines.is_empty())
+        {
+            self.accepted_machines.remove(&agent_id);
+        }
+        if removed {
+            self.attribution_pairs_len = self.attribution_pairs_len.saturating_sub(1);
+            self.attribution_stranger_pairs_len =
+                self.attribution_stranger_pairs_len.saturating_sub(1);
+        }
+        self.attribution_stranger_overflows = self.attribution_stranger_overflows.saturating_add(1);
+        true
+    }
+
+    fn reclassify_as_contact(&mut self, agent_id: AgentId) {
+        for machine in self.machines_accepted_for(&agent_id) {
+            let key = (agent_id.0, machine.0);
+            if let Some(seq) = self.stranger_index.remove(&key) {
+                self.stranger_order.remove(&(seq, key.0, key.1));
+                self.attribution_stranger_pairs_len =
+                    self.attribution_stranger_pairs_len.saturating_sub(1);
+            }
+        }
+    }
+
+    fn reclassify_as_stranger(&mut self, agent_id: AgentId) {
+        for machine in self.machines_accepted_for(&agent_id) {
+            let key = (agent_id.0, machine.0);
+            if self.stranger_index.contains_key(&key) {
+                continue;
+            }
+            self.touch_stranger(agent_id, machine);
+            self.attribution_stranger_pairs_len += 1;
+        }
+        while self.attribution_stranger_pairs_len > self.attribution_stranger_pairs {
+            if !self.evict_lru_stranger() {
+                break;
+            }
+            self.warn_attribution_pressure(agent_id);
+        }
+    }
+
     fn warn_attribution_pressure(&mut self, agent_id: AgentId) {
-        let now = now_unix_ms();
+        let now = monotonic_ms();
         if now.saturating_sub(self.attribution_overflow_warn_ms) < UNATTESTED_DROP_WARN_INTERVAL_MS
         {
             return;
@@ -405,7 +516,7 @@ impl AuthenticatedMachineBindingCache {
             stranger_overflows = self.attribution_stranger_overflows,
             stranger_pairs = self.attribution_stranger_pairs_len,
             pairs = self.attribution_pairs_len,
-            "attribution cap reached; a machine past the cap is not recorded, and an unattested DM for that machine can still be accepted"
+            "attribution cap reached; a machine past the per-agent cap is not recorded, and an evicted stranger machine is no longer attributed"
         );
     }
 
@@ -463,6 +574,27 @@ impl AuthenticatedMachineBindingCache {
             announced_at,
             cert_digest,
             cert_not_after,
+            true,
+        );
+    }
+
+    /// Move the retained binding to a freshly verified origin without taking
+    /// a new attribution slot. Grant evaluation reads this binding. The slot
+    /// is recorded only after decryption succeeds.
+    fn refresh_retained_origin(
+        &mut self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        announced_at: u64,
+    ) {
+        let existing = self.entries.get(&agent_id).copied();
+        self.upsert_binding(
+            agent_id,
+            machine_id,
+            announced_at,
+            existing.and_then(|binding| binding.cert_digest),
+            existing.and_then(|binding| binding.cert_not_after),
+            false,
         );
     }
 
@@ -496,7 +628,7 @@ impl AuthenticatedMachineBindingCache {
             (Some(digest), None) => (Some(digest), None),
             (None, None) => (known_digest, existing.and_then(|b| b.cert_not_after)),
         };
-        self.upsert_binding(agent_id, machine_id, announced_at, digest, not_after);
+        self.upsert_binding(agent_id, machine_id, announced_at, digest, not_after, true);
     }
 
     /// x0x #1150 (r7e): a verified certificate blob for `digest` landed for
@@ -530,6 +662,7 @@ impl AuthenticatedMachineBindingCache {
         announced_at: u64,
         cert_digest: Option<[u8; 32]>,
         cert_not_after: Option<u64>,
+        remember_new: bool,
     ) {
         let tick = self.next_tick();
         if let Some(mut existing) = self.entries.get(&agent_id).copied() {
@@ -542,10 +675,20 @@ impl AuthenticatedMachineBindingCache {
                     || existing.cert_not_after != cert_not_after
                     || existing.cert_digest != cert_digest
                     || existing.announced_at != announced_at;
-                // #1659: keep the machine this binding is about to replace.
-                // The retained slot moves. The revocation attribution does not.
-                self.remember_accepted_machine(agent_id, existing.machine_id);
-                self.remember_accepted_machine(agent_id, machine_id);
+                // #1659: keep a machine this binding is about to replace when
+                // that machine was already attributed, or when this write
+                // itself records attribution. A DM refresh does not take a
+                // slot for the new machine until decryption succeeds.
+                let replaced_already = self
+                    .accepted_machines
+                    .get(&agent_id)
+                    .is_some_and(|machines| machines.contains(&existing.machine_id));
+                if remember_new || replaced_already {
+                    self.remember_accepted_machine(agent_id, existing.machine_id);
+                }
+                if remember_new {
+                    self.remember_accepted_machine(agent_id, machine_id);
+                }
                 self.by_machine.remove(&(existing.machine_id.0, agent_id.0));
                 self.by_machine.insert((machine_id.0, agent_id.0));
                 existing.machine_id = machine_id;
@@ -554,8 +697,12 @@ impl AuthenticatedMachineBindingCache {
                 existing.cert_digest = cert_digest;
             } else {
                 // Verified, and older than the retained binding. The retained
-                // machine stays. #1659 still attributes this machine.
-                self.remember_accepted_machine(agent_id, machine_id);
+                // machine stays. #1659 attributes this machine when the
+                // caller is recording, not when a DM is only refreshing
+                // the retained binding ahead of decryption.
+                if remember_new {
+                    self.remember_accepted_machine(agent_id, machine_id);
+                }
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));
@@ -584,7 +731,9 @@ impl AuthenticatedMachineBindingCache {
         }
 
         self.by_machine.insert((machine_id.0, agent_id.0));
-        self.remember_accepted_machine(agent_id, machine_id);
+        if remember_new {
+            self.remember_accepted_machine(agent_id, machine_id);
+        }
         self.entries.insert(
             agent_id,
             AuthenticatedMachineBinding {
@@ -627,6 +776,9 @@ impl AuthenticatedMachineBindingCache {
         self.attribution_unnamed_overflows = 0;
         self.attribution_stranger_overflows = 0;
         self.attribution_overflow_warn_ms = 0;
+        self.stranger_order.clear();
+        self.stranger_index.clear();
+        self.stranger_clock = 0;
         self.recency.clear();
         if had_state {
             self.notify_changed();
@@ -647,6 +799,18 @@ impl AuthenticatedMachineBindingCache {
 
 /// Shared retained cache of authenticated agent→machine bindings.
 pub type AuthenticatedMachineBindings = Arc<RwLock<AuthenticatedMachineBindingCache>>;
+
+/// Move `agent_id` into or out of the contact attribution pool.
+pub(crate) async fn set_attribution_relationship(
+    bindings: &AuthenticatedMachineBindings,
+    agent_id: AgentId,
+    relationship: bool,
+) {
+    bindings
+        .write()
+        .await
+        .set_relationship_peer(agent_id, relationship);
+}
 
 /// Retain the freshest accepted, authenticated agent→machine announcement.
 ///
@@ -1721,27 +1885,45 @@ async fn durable_history_logical_request(
 }
 
 impl InboxPipeline {
-    /// Record attribution for an attested DM that the revocation, pairing,
-    /// and trust checks have admitted. A refused DM does not take a slot.
-    /// Trusted and Known contacts use the shared pair cap. Every other
-    /// agent uses the stranger budget.
+    async fn sender_is_relationship(&self, agent: AgentId) -> bool {
+        let store = self.contacts.read().await;
+        store.get(&agent).is_some_and(|contact| {
+            matches!(
+                contact.trust_level,
+                crate::contacts::TrustLevel::Trusted | crate::contacts::TrustLevel::Known
+            )
+        })
+    }
+
+    /// Move the retained binding so a share-grant check sees this origin.
+    /// Does not take an attribution slot.
+    async fn refresh_admitted_origin(&self, agent: AgentId, machine: MachineId, announced_at: u64) {
+        let relationship = self.sender_is_relationship(agent).await;
+        let mut cache = self.authenticated_machine_bindings.write().await;
+        cache.set_relationship_peer(agent, relationship);
+        cache.refresh_retained_origin(agent, machine, announced_at);
+    }
+
+    /// Record attribution after decryption succeeded, or after an admitted
+    /// ACK matched a waiter. A refused or undecryptable DM does not take a slot.
+    async fn remember_admitted_origin(&self, agent: AgentId, machine: MachineId) {
+        let relationship = self.sender_is_relationship(agent).await;
+        let mut cache = self.authenticated_machine_bindings.write().await;
+        cache.set_relationship_peer(agent, relationship);
+        cache.remember_accepted_machine(agent, machine);
+    }
+
+    /// Record the retained binding and attribution together. Used for an
+    /// admitted ACK, which has no ciphertext of its own.
     async fn attribute_admitted_origin(
         &self,
         agent: AgentId,
         machine: MachineId,
         announced_at: u64,
     ) {
-        let relationship = {
-            let store = self.contacts.read().await;
-            matches!(
-                store.get(&agent).map(|contact| contact.trust_level),
-                Some(crate::contacts::TrustLevel::Trusted | crate::contacts::TrustLevel::Known)
-            )
-        };
+        let relationship = self.sender_is_relationship(agent).await;
         let mut cache = self.authenticated_machine_bindings.write().await;
-        if relationship {
-            cache.note_relationship_peer(agent);
-        }
+        cache.set_relationship_peer(agent, relationship);
         cache.record(agent, machine, announced_at);
     }
 
@@ -1948,12 +2130,15 @@ impl InboxPipeline {
         // the claim is only a best-effort fallback for agents with no
         // authenticated binding. See docs/design/adr-0021-mechanics.md.
         //
-        // #1659 (David, 28 Oct 2026, 02:08 GMT): once any machine the inbox
-        // attributes to this sender is revoked, an absent attestation is a
-        // refusal. Attribution is recorded only after this DM is admitted.
-        // A machine past the per-agent cap is not recorded. Revoking that
-        // machine does not attribute it, so an unattested DM that claims a
-        // clean machine can still be accepted.
+        // #1659 (David, 28 Oct 2026, 02:08 GMT): when this receiver can
+        // attribute a revoked machine to the sender, an absent attestation
+        // is a refusal. A DM records that machine only after decryption
+        // succeeds. An announcement records it when the announcement is
+        // accepted. A machine past the per-agent cap is not recorded.
+        // Revoking that machine does not attribute it, so an unattested DM
+        // that claims a clean machine can still be accepted. Stranger pairs
+        // are an LRU: a later stranger evicts an older stranger and stays
+        // protected. A contact is not evicted by that insert.
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let claimed_machine_id = MachineId(envelope.sender_machine_id);
         let mut fresh_attestation = false;
@@ -2116,10 +2301,6 @@ impl InboxPipeline {
         let admitted_at = envelope.created_at_unix_ms / 1000;
         match envelope.body.clone() {
             DmBody::Ack(ack) => {
-                if fresh_attestation {
-                    self.attribute_admitted_origin(sender_agent_id, sender_machine_id, admitted_at)
-                        .await;
-                }
                 // The ACK's own `protocol_version` names the receipt semantics
                 // the recipient is claiming; the waiter accepts it only if
                 // that matches what the send negotiated (ADR 0030 §2).
@@ -2133,6 +2314,23 @@ impl InboxPipeline {
                     ack.outcome,
                     ack_ingress,
                 );
+                // An unsolicited ACK, or one the trust check rejects, does
+                // not take an attribution slot. There is no ciphertext to
+                // wait for: a matching admitted ACK records immediately.
+                let trust_admits = {
+                    let store = self.contacts.read().await;
+                    !matches!(
+                        TrustEvaluator::new(&store).evaluate(&TrustContext {
+                            agent_id: &sender_agent_id,
+                            machine_id: &sender_machine_id,
+                        }),
+                        TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch
+                    )
+                };
+                if fresh_attestation && resolved && trust_admits {
+                    self.attribute_admitted_origin(sender_agent_id, sender_machine_id, admitted_at)
+                        .await;
+                }
                 tracing::debug!(
                     acked = %hex::encode(ack.acks_request_id),
                     protocol_version = envelope.protocol_version,
@@ -2173,18 +2371,60 @@ impl InboxPipeline {
         let origin_authenticated = origin.authenticated();
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let admitted_at = envelope.created_at_unix_ms / 1000;
-        let decision = {
+        let mut decision = {
             let store = self.contacts.read().await;
             TrustEvaluator::new(&store).evaluate(&TrustContext {
                 agent_id: &sender_agent_id,
                 machine_id: &sender_machine_id,
             })
         };
-        // ADR-0070 §2: a current `Dm` ShareGrant for this agent promotes an
-        // Unknown/AcceptWithFlag sender to Accept. Rejections are never
-        // overridden; the grant pairs only on the authenticated binding.
-        let decision = match (&self.share_grant_gate, decision) {
-            (Some(gate), TrustDecision::Unknown | TrustDecision::AcceptWithFlag)
+        // Explicit denials win before the binding moves and before a
+        // ShareGrant can promote the decision (ADR-0070 §2).
+        if matches!(
+            decision,
+            TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch
+        ) {
+            self.dm.record_incoming_trust_rejected(sender_agent_id);
+            let outcome = DmAckOutcome::RejectedByPolicy {
+                reason: decision.to_string(),
+            };
+            self.cache.insert_for_protocol(
+                envelope.dedupe_key(),
+                outcome.clone(),
+                envelope.protocol_version,
+            );
+            if !self.silent_reject {
+                // A refusal makes no durability claim, so it is stamped
+                // with the requested version rather than downgraded to v1:
+                // a strict v2 sender must learn it was rejected instead of
+                // waiting out its ACK budget on a receipt it would ignore
+                // (ADR 0030 drivers — no black hole, bounded latency).
+                let _ = self
+                    .publish_ack_for_protocol(
+                        sender_agent_id,
+                        envelope.request_id,
+                        outcome,
+                        envelope.protocol_version,
+                        ack_legacy_bus,
+                    )
+                    .await;
+            }
+            return;
+        }
+
+        if matches!(origin, PayloadOrigin::FreshAttestation) {
+            self.refresh_admitted_origin(sender_agent_id, sender_machine_id, admitted_at)
+                .await;
+        }
+
+        // ADR-0070 §2: a current `Dm` ShareGrant promotes Unknown or
+        // AcceptWithFlag to Accept. The grant reads the retained binding,
+        // which now names this DM's verified origin.
+        if matches!(
+            decision,
+            TrustDecision::Unknown | TrustDecision::AcceptWithFlag
+        ) {
+            if let Some(gate) = &self.share_grant_gate {
                 if gate
                     .dm_allowed(
                         &self.contacts,
@@ -2192,12 +2432,12 @@ impl InboxPipeline {
                         &sender_agent_id,
                         &sender_machine_id,
                     )
-                    .await =>
-            {
-                TrustDecision::Accept
+                    .await
+                {
+                    decision = TrustDecision::Accept;
+                }
             }
-            (_, decision) => decision,
-        };
+        }
 
         tracing::info!(
             target: "dm.trace",
@@ -2206,43 +2446,6 @@ impl InboxPipeline {
             sender = %hex::encode(sender_agent_id.as_bytes()),
             decision = %decision,
         );
-
-        match decision {
-            TrustDecision::RejectBlocked | TrustDecision::RejectMachineMismatch => {
-                self.dm.record_incoming_trust_rejected(sender_agent_id);
-                let outcome = DmAckOutcome::RejectedByPolicy {
-                    reason: decision.to_string(),
-                };
-                self.cache.insert_for_protocol(
-                    envelope.dedupe_key(),
-                    outcome.clone(),
-                    envelope.protocol_version,
-                );
-                if !self.silent_reject {
-                    // A refusal makes no durability claim, so it is stamped
-                    // with the requested version rather than downgraded to v1:
-                    // a strict v2 sender must learn it was rejected instead of
-                    // waiting out its ACK budget on a receipt it would ignore
-                    // (ADR 0030 drivers — no black hole, bounded latency).
-                    let _ = self
-                        .publish_ack_for_protocol(
-                            sender_agent_id,
-                            envelope.request_id,
-                            outcome,
-                            envelope.protocol_version,
-                            ack_legacy_bus,
-                        )
-                        .await;
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        if matches!(origin, PayloadOrigin::FreshAttestation) {
-            self.attribute_admitted_origin(sender_agent_id, sender_machine_id, admitted_at)
-                .await;
-        }
 
         let aad = envelope.aead_aad();
         let plaintext = match decrypt_payload(&self.kem_keypair, &payload, &aad) {
@@ -2255,6 +2458,10 @@ impl InboxPipeline {
         if plaintext.request_id != envelope.request_id {
             self.dm.record_incoming_decode_failed();
             return;
+        }
+        if matches!(origin, PayloadOrigin::FreshAttestation) {
+            self.remember_admitted_origin(sender_agent_id, sender_machine_id)
+                .await;
         }
 
         // ADR 0030 §1/§2: a v2 envelope is answered by the durable path or not
@@ -3158,7 +3365,8 @@ enum PayloadOrigin {
     Claim,
     /// Already authenticated by the retained binding. Do not record again.
     Retained,
-    /// Fresh attestation that the trust check admitted. Record attribution.
+    /// Fresh attestation. The retained binding moves before grant
+    /// evaluation. Attribution waits until decryption succeeds.
     FreshAttestation,
 }
 
@@ -3218,6 +3426,16 @@ fn sender_unattested_attribution(
     UnattestedAttribution::Revoked
 }
 
+/// Monotonic milliseconds since the first call in this process.
+///
+/// Rate limits use this clock. A step backwards in the wall clock must not
+/// silence the next warning, and a step forwards must not emit one per DM.
+fn monotonic_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Emit one unattested-drop warning per interval. Later DMs still increment
 /// their counter.
 fn warn_unattested_drop(
@@ -3227,7 +3445,7 @@ fn warn_unattested_drop(
     claimed_machine: &[u8],
     message: &'static str,
 ) {
-    let now = now_unix_ms();
+    let now = monotonic_ms();
     let prev = last_ms.load(std::sync::atomic::Ordering::Relaxed);
     if now.saturating_sub(prev) < UNATTESTED_DROP_WARN_INTERVAL_MS {
         return;
@@ -3657,6 +3875,37 @@ mod tests {
             origin_attestation: None,
         };
         sign_envelope_with_agent(&mut envelope, sender);
+        wrap_in_pubsub(harness, sender, &envelope)
+    }
+
+    /// Attested ACK. `machine` signs the origin. No waiter is registered here.
+    fn attested_ack_message(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        machine: &MachineKeypair,
+        request_byte: u8,
+    ) -> PubSubMessage {
+        let created_at_unix_ms = now_unix_ms();
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_V1,
+            request_id: [request_byte; 16],
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine.machine_id().as_bytes(),
+            recipient_agent_id: *harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms,
+            expires_at_unix_ms: created_at_unix_ms + 60_000,
+            body: DmBody::Ack(crate::dm::DmAckBody {
+                acks_request_id: [request_byte; 16],
+                outcome: DmAckOutcome::Accepted,
+            }),
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        sign_envelope_with_agent(&mut envelope, sender);
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
+        attestation.sign(machine).expect("machine attest");
+        envelope.origin_attestation = Some(attestation);
         wrap_in_pubsub(harness, sender, &envelope)
     }
 
@@ -6109,7 +6358,13 @@ mod tests {
         assert_eq!(delivered.machine_id, machine_c.machine_id());
         let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
         assert_eq!(stats.incoming_dropped_revoked, 0);
-        assert_eq!(stats.incoming_dropped_attribution_overflow, 0);
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .incoming_dropped_attribution_overflow_for_test(),
+            0
+        );
     }
 
     /// #1659: attacker overflow must not refuse an unrelated sender who holds
@@ -6161,7 +6416,13 @@ mod tests {
             .await;
         let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
         assert_eq!(stats.incoming_dropped_revoked, 0);
-        assert_eq!(stats.incoming_dropped_attribution_overflow, 0);
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .incoming_dropped_attribution_overflow_for_test(),
+            0
+        );
 
         let legacy = payload_message(&harness, &unrelated, clean, 0xA4);
         harness
@@ -6184,7 +6445,13 @@ mod tests {
         assert_no_delivery(&mut harness.receiver).await;
         let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
         assert_eq!(stats.incoming_dropped_revoked, 0);
-        assert_eq!(stats.incoming_dropped_attribution_overflow, 1);
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .incoming_dropped_attribution_overflow_for_test(),
+            1
+        );
 
         let revoked_sender = test_keypair();
         let revoked_machine = MachineKeypair::generate().expect("revoked sender machine");
@@ -6205,7 +6472,13 @@ mod tests {
             stats.incoming_dropped_revoked, 1,
             "a sender with a revoked machine stays refused after attacker overflow"
         );
-        assert_eq!(stats.incoming_dropped_attribution_overflow, 1);
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .incoming_dropped_attribution_overflow_for_test(),
+            1
+        );
     }
 
     /// A DM that the revocation check refuses does not take an attribution
@@ -6336,14 +6609,15 @@ mod tests {
             let cache = harness.pipeline.authenticated_machine_bindings.read().await;
             assert!(cache
                 .machines_accepted_for(&stranger_a.agent_id())
-                .contains(&machine_a.machine_id()));
+                .is_empty());
             assert!(
                 cache
                     .machines_accepted_for(&stranger_b.agent_id())
-                    .is_empty(),
-                "the second stranger must not take a pair once the stranger budget is full"
+                    .contains(&machine_b.machine_id()),
+                "a later stranger evicts the least-recent stranger pair"
             );
             assert!(cache.attribution_stranger_overflows() >= 1);
+            assert_eq!(cache.attribution_stranger_pairs_len(), 1);
         }
 
         let contact_a = MachineKeypair::generate().expect("contact machine A");
@@ -6371,6 +6645,271 @@ mod tests {
             .machines_accepted_for(&contact.agent_id());
         assert!(accepted.contains(&contact_a.machine_id()));
         assert!(accepted.contains(&contact_b.machine_id()));
+    }
+
+    /// Throwaway announcements fill the stranger LRU. A later stranger still
+    /// has a slot, so revoking that machine refuses an unattested clean claim.
+    /// A contact recorded first is still attributed.
+    #[tokio::test]
+    async fn issue1659_announcements_do_not_switch_off_later_stranger_protection() {
+        let later = test_keypair();
+        let mut harness = make_inbox_harness(&later, None, None).await;
+        harness
+            .pipeline
+            .contacts
+            .write()
+            .await
+            .remove(&later.agent_id());
+        let contact = AgentId([0xC4; 32]);
+        let contact_machine = MachineId([0xC4; 32]);
+        let bindings = Arc::clone(&harness.pipeline.authenticated_machine_bindings);
+        {
+            let mut cache = bindings.write().await;
+            cache.set_stranger_pair_limit_for_test(2);
+            cache.set_relationship_peer(contact, true);
+            cache.record(contact, contact_machine, 1);
+        }
+        let early_a = AgentId([0x11; 32]);
+        let early_b = AgentId([0x22; 32]);
+        record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            early_a,
+            MachineId([0x11; 32]),
+            2,
+            None,
+        )
+        .await;
+        record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            early_b,
+            MachineId([0x22; 32]),
+            3,
+            None,
+        )
+        .await;
+        let machine_r = MachineKeypair::generate().expect("revoked machine");
+        let machine_c = MachineKeypair::generate().expect("clean machine");
+        record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            later.agent_id(),
+            machine_r.machine_id(),
+            10,
+            None,
+        )
+        .await;
+        record_authenticated_machine_binding_with_expiry(
+            &bindings,
+            later.agent_id(),
+            machine_c.machine_id(),
+            11,
+            None,
+        )
+        .await;
+        {
+            let cache = bindings.read().await;
+            let accepted = cache.machines_accepted_for(&later.agent_id());
+            assert!(accepted.contains(&machine_r.machine_id()));
+            assert!(accepted.contains(&machine_c.machine_id()));
+            assert!(cache.machines_accepted_for(&early_a).is_empty());
+            assert!(cache
+                .machines_accepted_for(&contact)
+                .contains(&contact_machine));
+        }
+        insert_machine_revocation(&harness, &machine_r).await;
+        let unattested = payload_message(&harness, &later, machine_c.machine_id(), 0xE1);
+        harness
+            .pipeline
+            .handle_incoming(unattested, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked
+                >= 1,
+            "the later stranger stays protected after the announcement flood"
+        );
+    }
+
+    /// An undecryptable attested DM moves no attribution slot.
+    #[tokio::test]
+    async fn issue1659_undecryptable_dm_does_not_take_an_attribution_slot() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let wrong_kem = AgentKemKeypair::generate().expect("wrong kem");
+        let created_at = now_unix_ms();
+        let body = EnvelopeBuilder::build_payload_body(
+            &[0xE2; 16],
+            sender.agent_id().as_bytes(),
+            harness.recipient_agent_id.as_bytes(),
+            created_at,
+            b"not for this recipient".to_vec(),
+            None,
+            &wrong_kem.public_bytes,
+        )
+        .expect("build body");
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_V1,
+            request_id: [0xE2; 16],
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine.machine_id().as_bytes(),
+            recipient_agent_id: *harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms: created_at,
+            expires_at_unix_ms: created_at + 60_000,
+            body,
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
+        attestation.sign(&machine).expect("attest");
+        envelope.origin_attestation = Some(attestation);
+        let message = wrap_in_pubsub(&harness, &sender, &envelope);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        let cache = harness.pipeline.authenticated_machine_bindings.read().await;
+        assert!(
+            cache.machines_accepted_for(&sender.agent_id()).is_empty(),
+            "decryption failure must not take an attribution slot"
+        );
+        assert_eq!(
+            cache
+                .peek(&sender.agent_id())
+                .map(|binding| binding.machine_id),
+            Some(machine.machine_id()),
+            "the retained binding still moves so a later grant check can see it"
+        );
+    }
+
+    /// An unsolicited attested ACK, and a blocked attested ACK, take no slot.
+    #[tokio::test]
+    async fn issue1659_unsolicited_or_blocked_ack_takes_no_attribution_slot() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("machine");
+        let harness = make_inbox_harness(&sender, None, None).await;
+        let unsolicited = attested_ack_message(&harness, &sender, &machine, 0xE3);
+        harness
+            .pipeline
+            .handle_incoming(unsolicited, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert!(harness
+            .pipeline
+            .authenticated_machine_bindings
+            .read()
+            .await
+            .machines_accepted_for(&sender.agent_id())
+            .is_empty());
+
+        harness
+            .pipeline
+            .contacts
+            .write()
+            .await
+            .set_trust(&sender.agent_id(), TrustLevel::Blocked);
+        let request_id = [0xE4; 16];
+        let _waiter = harness.pipeline.inflight.register(
+            request_id,
+            sender.agent_id(),
+            Some(machine.machine_id()),
+        );
+        let blocked = attested_ack_message(&harness, &sender, &machine, 0xE4);
+        harness
+            .pipeline
+            .handle_incoming(blocked, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert!(
+            harness
+                .pipeline
+                .authenticated_machine_bindings
+                .read()
+                .await
+                .machines_accepted_for(&sender.agent_id())
+                .is_empty(),
+            "a blocked ACK must not take an attribution slot"
+        );
+    }
+
+    /// A legitimate A→B move with a live `Dm` grant is delivered as Accept.
+    /// The grant reads the binding after it moves. The harness gate starts off.
+    #[tokio::test]
+    async fn issue1659_share_grant_sees_machine_after_move() {
+        let sender = test_keypair();
+        let machine_a = MachineKeypair::generate().expect("machine A");
+        let machine_b = MachineKeypair::generate().expect("machine B");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        harness
+            .pipeline
+            .contacts
+            .write()
+            .await
+            .remove(&sender.agent_id());
+        let bindings = Arc::clone(&harness.pipeline.authenticated_machine_bindings);
+        record_authenticated_machine_binding(
+            &bindings,
+            sender.agent_id(),
+            machine_a.machine_id(),
+            1,
+        )
+        .await;
+
+        let owner = crate::identity::UserKeypair::generate().expect("owner");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+            .max(2);
+        let store = Arc::new(crate::share_grant::ShareGrantStore::in_memory(
+            harness.recipient_agent_id,
+            Some(owner.user_id()),
+        ));
+        let grant = crate::share_grant::ShareGrant::sign(
+            &owner,
+            [0x71; 32],
+            crate::share_grant::Grantee::Agent(sender.agent_id()),
+            vec![harness.recipient_agent_id],
+            vec![crate::share_grant::ShareCap::Dm],
+            now.saturating_sub(1),
+            now.saturating_add(3_600),
+        )
+        .expect("sign grant");
+        store.accept(grant, now).await.expect("store grant");
+        let owner_trust =
+            crate::owner_trust::OwnerTrust::new(Some(owner.user_id()), Arc::clone(&bindings));
+        owner_trust.install_share_grant_store(store);
+        harness.pipeline.share_grant_gate = Some(crate::share_grant::ShareGrantDmGate::new(
+            owner_trust,
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+        ));
+
+        let message = attested_payload_message_at(
+            &harness,
+            &sender,
+            &machine_b,
+            0xE5,
+            now_unix_ms().saturating_add(5_000),
+        );
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("the granted move must be delivered")
+            .expect("delivery stream closed");
+        assert_eq!(delivered.machine_id, machine_b.machine_id());
+        assert_eq!(
+            delivered.trust_decision,
+            Some(TrustDecision::Accept),
+            "the Dm grant must see machine B, not the stale binding A"
+        );
     }
 
     /// An unattested ACK from a sender with a revoked machine must not
@@ -6444,7 +6983,13 @@ mod tests {
         let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
         assert_eq!(stats.incoming_trust_rejected, 1);
         assert_eq!(stats.incoming_dropped_revoked, 0);
-        assert_eq!(stats.incoming_dropped_attribution_overflow, 0);
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .incoming_dropped_attribution_overflow_for_test(),
+            0
+        );
     }
 
     /// #213 REPLAY: an attestation captured from DM-1 (request R1) is
@@ -6816,6 +7361,124 @@ mod tests {
             .contains(&machine_a));
     }
 
+    /// The production caps are 8, 65,536 and 4,096. Filling the stranger LRU
+    /// with announcements leaves a later stranger protected and a contact in
+    /// place.
+    #[test]
+    fn issue1659_real_caps_keep_a_later_stranger_after_announcements() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        assert_eq!(cache.attribution_per_agent, ACCEPTED_MACHINES_PER_AGENT);
+        assert_eq!(ACCEPTED_MACHINES_PER_AGENT, 8);
+        assert_eq!(cache.attribution_pairs, ACCEPTED_MACHINE_PAIR_CAPACITY);
+        assert_eq!(ACCEPTED_MACHINE_PAIR_CAPACITY, 65_536);
+        assert_eq!(
+            cache.attribution_stranger_pairs,
+            ACCEPTED_MACHINE_STRANGER_PAIRS
+        );
+        assert_eq!(ACCEPTED_MACHINE_STRANGER_PAIRS, 4_096);
+
+        let contact = AgentId([0xC0; 32]);
+        let contact_machine = MachineId([0xC0; 32]);
+        cache.set_relationship_peer(contact, true);
+        cache.record(contact, contact_machine, 1);
+
+        let capped = AgentId([0xCA; 32]);
+        cache.set_relationship_peer(capped, true);
+        for i in 0..8u8 {
+            cache.record(capped, MachineId([i; 32]), u64::from(i) + 1);
+        }
+        let ninth = MachineId([0xFF; 32]);
+        cache.record(capped, ninth, 100);
+        assert_eq!(cache.machines_accepted_for(&capped).len(), 8);
+        assert!(!cache.machines_accepted_for(&capped).contains(&ninth));
+        assert!(cache.attribution_requires_attestation(&capped));
+
+        for i in 0..ACCEPTED_MACHINE_STRANGER_PAIRS {
+            let index = u32::try_from(i).unwrap_or(u32::MAX);
+            let mut agent = [0xA1; 32];
+            let mut machine = [0xB1; 32];
+            agent[..4].copy_from_slice(&index.to_le_bytes());
+            machine[..4].copy_from_slice(&index.to_le_bytes());
+            cache.record_announcement(AgentId(agent), MachineId(machine), 1, None, None);
+        }
+        assert_eq!(
+            cache.attribution_stranger_pairs_len(),
+            ACCEPTED_MACHINE_STRANGER_PAIRS
+        );
+        assert!(cache
+            .machines_accepted_for(&contact)
+            .contains(&contact_machine));
+
+        let later = AgentId([0xD2; 32]);
+        let machine_r_kp = MachineKeypair::generate().expect("machine R");
+        let machine_r = machine_r_kp.machine_id();
+        let machine_c = MachineId([0xD3; 32]);
+        cache.record_announcement(later, machine_r, 2, None, None);
+        assert!(cache.machines_accepted_for(&later).contains(&machine_r));
+        assert_eq!(
+            cache.attribution_stranger_pairs_len(),
+            ACCEPTED_MACHINE_STRANGER_PAIRS
+        );
+        let mut first = [0xA1; 32];
+        first[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(cache.machines_accepted_for(&AgentId(first)).is_empty());
+        assert!(cache
+            .machines_accepted_for(&contact)
+            .contains(&contact_machine));
+
+        let now = now_unix_ms() / 1000;
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::Machine(machine_r),
+            machine_r_kp.public_key(),
+            machine_r_kp.secret_key(),
+            now,
+            Some("revoked".to_string()),
+        )
+        .expect("sign machine revocation");
+        let mut revoked = RevocationSet::new();
+        revoked
+            .verify_and_insert(record, None)
+            .expect("insert machine revocation");
+        let accepted = cache.machines_accepted_for(&later);
+        assert_eq!(
+            sender_unattested_attribution(
+                &revoked,
+                &later,
+                Some(machine_r),
+                machine_c,
+                &[],
+                &accepted,
+                false,
+            ),
+            UnattestedAttribution::Revoked,
+            "a later stranger is still protected after the announcement flood"
+        );
+    }
+
+    /// Downgrading a contact moves its pairs into the stranger LRU. A later
+    /// stranger can evict them. A contact that stays Trusted cannot.
+    #[test]
+    fn issue1659_contact_downgrade_returns_pairs_to_the_stranger_pool() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        cache.set_stranger_pair_limit_for_test(1);
+        let former = AgentId([0x11; 32]);
+        let kept = AgentId([0x22; 32]);
+        let former_machine = MachineId([0x01; 32]);
+        let kept_machine = MachineId([0x02; 32]);
+        cache.set_relationship_peer(former, true);
+        cache.set_relationship_peer(kept, true);
+        cache.record(former, former_machine, 1);
+        cache.record(kept, kept_machine, 1);
+        assert_eq!(cache.attribution_stranger_pairs_len(), 0);
+
+        cache.set_relationship_peer(former, false);
+        assert_eq!(cache.attribution_stranger_pairs_len(), 1);
+        cache.record_announcement(AgentId([0x33; 32]), MachineId([0x03; 32]), 2, None, None);
+        assert!(cache.machines_accepted_for(&former).is_empty());
+        assert!(cache.machines_accepted_for(&kept).contains(&kept_machine));
+        assert_eq!(cache.attribution_stranger_pairs_len(), 1);
+    }
+
     /// A process restart is a new empty cache. The live cache still attributes
     /// the revoked machine. The restarted cache does not, so the same
     /// unattested claim is accepted. Contacts and tombstones are separate
@@ -6827,7 +7490,7 @@ mod tests {
         let machine_kp = MachineKeypair::generate().expect("machine keygen");
         let machine_a = machine_kp.machine_id();
         let mut live = AuthenticatedMachineBindingCache::default();
-        live.note_relationship_peer(agent);
+        live.set_relationship_peer(agent, true);
         live.record(agent, machine_a, 1);
         live.record(agent, machine_b, 2);
         let now = now_unix_ms() / 1000;

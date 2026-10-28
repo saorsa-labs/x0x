@@ -17,6 +17,22 @@ use crate as x0x;
 use super::super::state::AppState;
 use super::super::{not_found, parse_agent_id_hex};
 use crate::contacts::{IdentityType, TrustLevel};
+use crate::dm_inbox::set_attribution_relationship;
+
+async fn sync_contact_relationship(state: &Arc<AppState>, agent_id: x0x::identity::AgentId) {
+    let relationship = {
+        let store = state.contacts.read().await;
+        store.get(&agent_id).is_some_and(|contact| {
+            matches!(contact.trust_level, TrustLevel::Trusted | TrustLevel::Known)
+        })
+    };
+    set_attribution_relationship(
+        &state.agent.authenticated_machine_bindings(),
+        agent_id,
+        relationship,
+    )
+    .await;
+}
 
 /// POST /contacts request body.
 #[derive(Debug, Deserialize)]
@@ -117,6 +133,7 @@ pub(in crate::server) async fn add_contact(
     };
 
     state.contacts.write().await.add(contact);
+    sync_contact_relationship(&state, agent_id).await;
 
     (
         StatusCode::CREATED,
@@ -168,6 +185,9 @@ pub(in crate::server) async fn update_contact(
         store.set_identity_type(&agent_id, identity_type);
     }
 
+    drop(store);
+    sync_contact_relationship(&state, agent_id).await;
+
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
 
@@ -188,6 +208,7 @@ pub(in crate::server) async fn delete_contact(
 
     let removed = state.contacts.write().await.remove(&agent_id);
     if removed.is_some() {
+        sync_contact_relationship(&state, agent_id).await;
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
         not_found("contact not found")
@@ -224,6 +245,7 @@ pub(in crate::server) async fn quick_trust(
         .write()
         .await
         .set_trust(&agent_id, trust_level);
+    sync_contact_relationship(&state, agent_id).await;
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
@@ -246,6 +268,8 @@ pub(in crate::server) async fn revoke_contact(
 
     let mut store = state.contacts.write().await;
     store.revoke(&agent_id, &req.reason);
+    drop(store);
+    sync_contact_relationship(&state, agent_id).await;
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
 

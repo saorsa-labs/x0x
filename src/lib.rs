@@ -3823,8 +3823,13 @@ async fn apply_legacy_revocation_records(
                     if let Some(entry) = discovery_cache.write().await.remove(agent_id) {
                         machine_cache.write().await.remove(&entry.machine_id);
                     }
-                    let mut cs = contact_store.write().await;
-                    cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
+                    {
+                        let mut cs = contact_store.write().await;
+                        cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
+                    }
+                    owner_trust
+                        .set_attribution_relationship(*agent_id, false)
+                        .await;
                     tracing::info!(
                         agent = %hex::encode(agent_id.as_bytes()),
                         "evicted revoked agent (received via gossip)"
@@ -14923,12 +14928,10 @@ impl Agent {
                         Some(contacts::TrustLevel::Trusted | contacts::TrustLevel::Known)
                     )
                 };
-                if relationship {
-                    authenticated_machine_bindings
-                        .write()
-                        .await
-                        .note_relationship_peer(announcement.agent_id);
-                }
+                authenticated_machine_bindings
+                    .write()
+                    .await
+                    .set_relationship_peer(announcement.agent_id, relationship);
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,
@@ -18210,6 +18213,12 @@ impl Agent {
                     let mut cs = self.contact_store.write().await;
                     cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
                 }
+                dm_inbox::set_attribution_relationship(
+                    &self.authenticated_machine_bindings,
+                    *agent_id,
+                    false,
+                )
+                .await;
                 tracing::info!(
                     agent = %hex::encode(agent_id.as_bytes()),
                     "evicted revoked agent from discovery cache"
@@ -26589,6 +26598,10 @@ fn spawn_relay_dm_listener(
 
             match disposition {
                 peer_relay::RelayDisposition::DeliverLocally => {
+                    // #1659 does not run on this path. The injected frame
+                    // uses the envelope's claimed machine. Relay delivery is
+                    // off unless `[peer_relay] enabled = true`. See
+                    // docs/design/adr-0021-mechanics.md.
                     let sender_machine_id = relayed.inner.sender_machine_id;
                     let sender_peer_id = ant_quic::PeerId(sender_machine_id);
                     let inner_wire = match postcard::to_allocvec(&relayed.inner) {

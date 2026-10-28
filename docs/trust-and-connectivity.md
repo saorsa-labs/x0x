@@ -318,20 +318,23 @@ unverified. The connector records a dialed machine only when an authority
 store confirms it. An unconfirmed connection can carry the current send as an
 unverified hint, but never creates a binding.
 
-Once an agent has any machine revocation, an unattested DM or ACK on the
-inbox topic or the compatibility bus requires an origin attestation
-(#1659; David, 28 Oct 2026). That is a deliberate partial override of ADR
-0021's accept-with-binding-fallback policy for those agents only. The
-relay `DeliverLocally` path does not apply it. The caps (8 machines per
-agent, 65,536 pairs, of which agents that are not Trusted or Known
-contacts share 4,096, and 4,096 named overflowed agents), the rule that
-a machine past the cap is not recorded, and the restart residual are in
+When this receiver can attribute a revoked machine to an agent, an
+unattested DM or ACK on the inbox topic or the compatibility bus requires
+an origin attestation (#1659; David, 28 Oct 2026). That is a deliberate
+partial override of ADR 0021's accept-with-binding-fallback policy for
+those linked agents only. The relay `DeliverLocally` path does not apply
+it. The caps (8 machines per agent, 65,536 pairs, a stranger LRU of
+4,096 that does not evict Trusted or Known contacts, and 4,096 named
+overflowed agents), the rule that a machine past the per-agent cap is not
+recorded, and the restart residual are in
 [ADR-0021 mechanics](design/adr-0021-mechanics.md). Overflow does not
 refuse an unattested DM by itself. An unattested DM for an unrecorded
 machine can still be accepted. An agent-key compromise is not stopped by
 this check: the holder can mint a fresh machine and a valid attestation.
 A binding tombstone blocks only the named pair. Containing the
-compromised agent key requires an agent revocation.
+compromised agent key requires an agent revocation. A tombstone that
+names a revoked machine keeps refusing that legacy agent's unattested
+DMs while the revocation record is held.
 
 Behaviour to know:
 

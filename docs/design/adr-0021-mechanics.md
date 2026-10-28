@@ -66,13 +66,14 @@ attestation names A, which EP3 rejects.
 David approved this receiver rule on 28 Oct 2026 at 02:08 GMT. The wire
 format is unchanged.
 
-Once an agent has any machine revocation, the DM inbox requires the
-sender's origin (device) attestation and refuses an unattested DM from
-an older pre-#213 peer. That is a deliberate partial override of ADR
-0021's accept-with-binding-fallback transition policy, and it applies
-only to those agents. A sender with no machine revocation keeps that
-policy. The check runs before the body match, so an unattested ACK from
-such a sender is refused the same way.
+When this receiver can attribute a revoked machine to an agent, the DM
+inbox requires that sender's origin (device) attestation and refuses an
+unattested DM from an older pre-#213 peer. That is a deliberate partial
+override of ADR 0021's accept-with-binding-fallback transition policy,
+and it applies only when the link is known here. A sender this receiver
+cannot link to a revoked machine keeps that policy. The check runs before
+the body match, so an unattested ACK from such a sender is refused the
+same way.
 
 `InboxPipeline::handle_incoming` is the check. The per-agent inbox topic
 and the compatibility gossip bus both use that function.
@@ -80,29 +81,31 @@ and the compatibility gossip bus both use that function.
 The inbox attributes these machines to the sender:
 
 - every verified machine the authenticated-binding cache has accepted for
-  the sender. The cache records a machine only after that DM's attestation
-  verifies and the revocation, pairing, and trust checks admit the DM. A
-  refused DM does not take a slot. The set includes the retained binding,
-  a machine a later binding replaced, and a verified machine that lost
-  timestamp selection. LRU eviction drops the retained entry and does not
-  drop this set. One agent can record 8 machines. The cache holds 65,536
-  pairs. Agents that are not Trusted or Known contacts share 4,096 of
-  those pairs, so one sender's throwaway peers cannot fill the cache.
-  Trusted and Known contacts still record until the 65,536 pair cap.
-  4,096 overflowed agents can be named. A machine that does not fit is
-  not recorded. Overflow does not refuse an unattested DM or ACK by
-  itself. A revocation of an unrecorded machine is not attributed, and
-  an unattested DM that claims a clean machine can still be accepted.
-  That loss of attribution is a residual. A valid attestation is still
-  accepted. The set is process memory. It lasts until process restart.
-  The daemon does not persist the set. Rebuilding a replaced machine
-  from disk would need a new stored format, which this rule does not add.
-  When the stranger budget or the name list fills, the cache emits a
-  rate-limited warning that includes the overflow counts. Operators read
-  that warning. `incoming_dropped_attribution_overflow` on
-  `GET /diagnostics/dm` counts a different event: an unattested DM refused
-  because an already-attributed machine is revoked and the sender's set
-  has also overflowed. It does not mean a machine past the cap was refused.
+  the sender. An identity announcement records its machine when that
+  announcement is accepted. A DM records its machine only after decryption
+  succeeds. An ACK records its machine only when the trust check admits it
+  and a local waiter matches. A refused DM, an undecryptable DM, and an
+  unsolicited ACK do not take a slot. The set includes the retained
+  binding, a machine a later binding replaced, and a verified machine that
+  lost timestamp selection. Evicting a retained binding does not drop this
+  set. One agent can record 8 machines. A ninth machine for that agent is
+  not recorded. The cache holds 65,536 pairs. Agents that are not Trusted
+  or Known contacts share a bounded LRU of 4,096 pairs. A new stranger
+  pair evicts the least-recently used stranger pair. That evicted machine
+  is no longer attributed. A stranger insert does not evict a Trusted or
+  Known contact. Downgrading or removing the contact moves its pairs into
+  the stranger pool. 4,096 overflowed agents can be named. Overflow does
+  not refuse an unattested DM or ACK by itself. A revocation of an
+  unrecorded machine is not attributed, and an unattested DM that claims a
+  clean machine can still be accepted. That loss of attribution is a
+  residual. A valid attestation is still accepted. The set is process
+  memory. It lasts until process restart, including a self-update restart.
+  The daemon does not persist the set. Rebuilding a replaced machine from
+  disk would need a new stored format, which this rule does not add. When
+  the stranger pool evicts or the name list fills, the cache emits a
+  rate-limited warning on a monotonic clock. An unattested refusal that
+  also finds an overflowed set is an internal counter and the same kind of
+  warning. It is not a field of `GET /diagnostics/dm`.
 - a machine on the sender's contact
 - a machine named by a binding tombstone for that agent (indexed by agent)
 - the machine the envelope claims
@@ -129,10 +132,16 @@ tombstones, the claimed machine, and a retained binding that has been
 rebuilt in this process still count. Those records already persist.
 The accepted-machine history does not.
 
-Cap residual. A machine past the per-agent cap of 8, or past the stranger
-budget, is not in the accepted set. Revoking that machine does not make
-an unattested DM fail. An unattested DM that claims a clean machine this
-receiver still attributes can be accepted.
+Cap residual. A machine past the per-agent cap of 8 is not in the
+accepted set. Revoking that machine does not make an unattested DM fail.
+An unattested DM that claims a clean machine this receiver still
+attributes can be accepted. A stranger pair the LRU evicted is the same
+kind of gap for that one machine. The next verified announcement or
+decrypted DM from that stranger can take a slot again.
+
+Tombstone residual. A binding tombstone that names a revoked machine
+keeps refusing that agent's unattested DMs for as long as the revocation
+record is held. Decommissioning the machine does not clear the refusal.
 
 An attacker who holds the agent key can mint a fresh machine and a
 valid attestation. This check does not stop that DM. A binding tombstone

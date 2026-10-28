@@ -3583,12 +3583,12 @@ reaper counters:
 ### `GET /diagnostics/dm`
 
 `stats.incoming_dropped_revoked` counts DMs dropped because the sender's
-agent or an attributed machine is revoked. `stats.incoming_dropped_attribution_overflow`
-counts the same kind of unattested refusal when that sender's attribution
-set has also overflowed. Overflow alone does not increment it. A machine
-past the per-agent cap is not recorded, and a revocation of that machine
-does not move either counter. Stranger-budget exhaustion is a rate-limited
-daemon warning, not a new field on this object.
+agent or an attributed machine is revoked. An unattested refusal where the
+attribution set has also overflowed is not a field of this object. The
+daemon counts it internally and emits a rate-limited warning. Stranger-budget
+eviction is the same kind of warning. A machine past the per-agent cap is
+not recorded, and a revocation of that machine does not move
+`incoming_dropped_revoked`.
 
 `x0x diagnostics dm [--agent <64-hex-agent-id>]` adds `per_peer_digest` (schema 2)
 to the existing DM diagnostics. Optional `?agent=<64-hex-agent-id>` selects exactly

@@ -995,6 +995,15 @@ pub(in crate::server) async fn import_agent_card(
         store.add(contact);
         (eff, ignored)
     };
+    crate::dm_inbox::set_attribution_relationship(
+        &state.agent.authenticated_machine_bindings(),
+        agent_id,
+        matches!(
+            effective_trust,
+            x0x::contacts::TrustLevel::Trusted | x0x::contacts::TrustLevel::Known
+        ),
+    )
+    .await;
 
     // Also populate the identity discovery cache so connect_to_agent / send_direct
     // can find this agent without waiting for gossip announcements.
