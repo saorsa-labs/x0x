@@ -109,12 +109,15 @@ The inbox attributes these machines to the sender:
   that is not pinned. A revoked machine is pinned in the protected
   share, up to 2 per agent. In the stranger share the same per-agent
   limit applies, and the share also caps pins at 2,048 pairs. The cap
-  is half the stranger share. The pins are the oldest pairs that are
-  still inside the per-agent limit. A revoked stranger pair past that
-  cap is not a pin. Eviction can drop it. Eviction does not drop a pin
-  to make room. When the pin cap is full, a new unattested DM or ACK
-  from a stranger is refused and counted. A contact and a protected
-  non-contact are not that stranger. The pin uses the revocation probe
+  is half the stranger share. A revoked pair becomes a pin when the cap
+  and the per-agent limit both have room. The inbox never evicts a
+  revoked pin to make room. A revoked stranger pair that was dropped, or
+  that could not be pinned, is not a pin. When the pin cap is full, an
+  unattested DM or ACK is refused only from an agent whose revoked pair
+  was actually dropped or could not be pinned, and only that refusal is
+  counted. A sender this receiver cannot link to a revoked machine keeps
+  ADR 0021 policy, including while the pin cap is full. A contact and a
+  protected non-contact are not that stranger. The pin uses the revocation probe
   `x0xd` installs. A confirmed revocation counts toward that pin. An
   unknown answer, including a busy revocation lock, does not evict that
   pair and does not count as a confirmed newer revocation. A move into
@@ -129,10 +132,12 @@ The inbox attributes these machines to the sender:
   A stranger flood that evicts a clean stranger pair, or a revoked pair
   past the pin cap, is a residual. Relationship epochs remember 8,192
   agents. Each standing write takes the next value from a process-wide
-  clock. Eviction does not reuse a generation. A missing epoch reads as
-  the current clock. That value is 0 only before any standing write. A
-  resolve that read an earlier value cannot match after a later write,
-  including a write that eviction then forgot. A further agent evicts
+  clock. Eviction does not reuse a generation. A missing epoch reads a
+  stored high-water mark of evicted epochs, not the live clock. That
+  mark is 0 until an epoch is evicted. A resolve that read an earlier
+  value cannot match after a later write, including a write that
+  eviction then forgot. A further standing write that does not evict an
+  epoch does not move the mark. A further agent evicts
   the oldest stranger epoch, then the oldest protected epoch, and a
   contact epoch only when no other epoch remains. Evicting an epoch
   does not drop a machine attribution. Promoting an agent into the
@@ -160,9 +165,10 @@ The inbox attributes these machines to the sender:
   later admitted machine is recorded again. 4,096 overflowed agents can
   be named. Overflow does not refuse an unattested DM or ACK by itself.
   A revocation of an unrecorded machine is not attributed. An unattested
-  DM or ACK that claims a different, clean machine can still be accepted,
-  unless the sender is a stranger and the stranger pin cap is full. That
-  full-cap refusal is fail-closed and is counted. The other loss of
+  DM or ACK that claims a different, clean machine can still be accepted.
+  A full stranger pin cap refuses that sender only when a revoked pair
+  for them was actually dropped or could not be pinned. Only that
+  refusal is counted. The other loss of
   attribution is a residual. A valid attestation is still accepted. The
   set is process memory. It lasts until process restart, including a
   self-update restart. The daemon does not persist the set. Rebuilding
@@ -173,8 +179,9 @@ The inbox attributes these machines to the sender:
   warning for a different sender. A sender past those 256 shares one
   interval while every remembered interval is still open. A slot whose
   interval has expired is reused by a new sender. An unattested refusal
-  that finds an overflowed set, or that finds a full stranger pin cap,
-  increments `incoming_dropped_revoked` and an internal counter, and
+  that finds an overflowed set, or that finds a sender whose revoked
+  pair was dropped or could not be pinned while the stranger pin cap is
+  full, increments `incoming_dropped_revoked` and an internal counter, and
   emits the same kind of warning. The internal counter is not a field
   of `GET /diagnostics/dm`.
 - a machine on the sender's contact
@@ -187,8 +194,11 @@ resolved machine is revoked. A machine-revocation record still expires
 under the existing revocation TTL, and this refusal ends with that record.
 
 A contact or protected non-contact with none of those machines revoked
-keeps the absent-attestation path above. A stranger keeps that path until
-the stranger revocation pin cap is full. Attribution overflow does not by
+keeps the absent-attestation path above. A stranger keeps that path when
+this receiver cannot link them to a revoked machine, including when the
+stranger revocation pin cap is full. The cap refuses a stranger only
+when a revoked pair for that agent was dropped or could not be pinned.
+Attribution overflow does not by
 itself change a contact or protected sender. A machine revocation for some
 other device does not change that sender's path. A
 cold receiver that cannot attribute the revoked machine to the sender

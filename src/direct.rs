@@ -1058,11 +1058,14 @@ impl DirectMessaging {
     }
 
     /// Record an unattested DM dropped because attribution overflowed for a
-    /// sender that already holds a machine revocation.
+    /// sender that already holds a machine revocation, or because the
+    /// stranger pin cap is full and that sender's revoked pair was dropped
+    /// or could not be pinned.
     ///
     /// The caller also increments `incoming_dropped_revoked`. This count
     /// stays off `GET /diagnostics/dm`. The inbox emits a rate-limited
-    /// warning for the same drop.
+    /// warning for the same drop. The pin-cap warning does not claim that
+    /// a revoked machine is still attributed.
     pub(crate) fn record_incoming_dropped_attribution_overflow(&self) {
         self.diagnostics
             .incoming_dropped_attribution_overflow
