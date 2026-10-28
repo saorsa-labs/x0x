@@ -1733,7 +1733,8 @@ mod daemon_tests {
         (info, event)
     }
 
-    /// #1633 (the 25 Oct close call was withdrawn on 27 Oct), ADR 0110
+    /// #1633 (the 25 Oct close call lived under a day, 27 Oct 23:42 UTC
+    /// to 28 Oct 00:18 UTC), ADR 0110
     /// §3 L228 — survivor convergence, not a transport ACK, proves
     /// delivery. A GSS removal aimed at a seat this author's roster shows
     /// with no KEM key seals no share to it, and the keyless survivor
@@ -1775,11 +1776,6 @@ mod daemon_tests {
         assert!(
             seat_becomes(&state, &key, survivor.as_bytes(), RecipientDelivery::Sent).await,
             "the carrier's acceptance is Sent, not delivery: an ACK closes no seat (ADR 0110 §3)"
-        );
-        assert_eq!(
-            shares_to(&state, &survivor_hex),
-            0,
-            "no share can be sealed to a seat with no KEM key"
         );
         // Force another round: the obligation stays open while the
         // survivor is keyless. The round's head ask returns the keyless
@@ -1867,10 +1863,10 @@ mod daemon_tests {
         );
 
         // This row's state machine has no survivor node, so the report is
-        // fed at the entry point the catch-up answer reaches: it is the
-        // answer a survivor serves once the sealed share installs — the
-        // share-proof — and only it converges the seat. The real install
-        // path is proven by the owner-recovery and crypto-exclusion
+        // fed at the catch-up entry point: the share-proof of the sealed
+        // share (the served shape is pinned by the crypto-exclusion
+        // tests), and only it converges the seat. The real install path
+        // is proven by the owner-recovery and crypto-exclusion
         // two-node tests.
         super::super::note_catchup_head(
             &state,
@@ -1909,7 +1905,8 @@ mod daemon_tests {
         Ok(())
     }
 
-    /// #1633 restart (the 25 Oct close call was withdrawn on 27 Oct): the
+    /// #1633 restart (the 25 Oct close call lived under a day, 27 Oct
+    /// 23:42 UTC to 28 Oct 00:18 UTC): the
     /// restarted author keeps the §3 obligation. It holds no close record,
     /// and none is re-derived: the resumed round sends the saved event and
     /// the carrier takes it, but ADR 0110 §3 L228 — survivor convergence,
@@ -1970,15 +1967,20 @@ mod daemon_tests {
         super::super::zero_restart_wait_for_test(&mut restarted);
         super::super::load_persisted_obligations(&restarted).await;
         {
-            let mut inner = restarted.revocation_evictions.inner.lock().await;
+            let inner = restarted.revocation_evictions.inner.lock().await;
             assert!(
                 inner.removals.contains_key(&key),
                 "the saved event's delivery resumes"
             );
-            inner
-                .head_rounds
-                .insert(stable, HeadRound::new(&result_head, Instant::now()));
+            assert!(
+                !inner.head_rounds.contains_key(&stable),
+                "no round is inserted by hand: the worker opens it"
+            );
         }
+        // The restarted worker opens the head round itself: the pass
+        // reads the open store row and the loaded group's head, which is
+        // the result head.
+        super::super::revocation_eviction_pass(&restarted).await;
         drive(&restarted).await;
         assert!(
             seat_becomes(
@@ -1995,8 +1997,11 @@ mod daemon_tests {
             0,
             "no share can be sealed to a seat with no KEM key"
         );
-        // The resumed round's head ask returns the keyless disclaimer; it
-        // converges nothing on the restarted author either.
+        // The keyless disclaimer — the survivor claims no head while
+        // keyless (#1627, David's ruling, 28 Oct 02:09 GMT) — fed here
+        // at the catch-up entry point (the served shape is pinned by
+        // the crypto-exclusion tests); it converges nothing on the
+        // restarted author either.
         super::super::note_catchup_head(
             &restarted,
             std::slice::from_ref(&group_id),
@@ -2046,9 +2051,9 @@ mod daemon_tests {
             "the restarted author's round sealed the share once the seat had a key"
         );
 
-        // The report a survivor serves once the sealed share installs —
-        // the share-proof, fed at the catch-up entry point as above — is
-        // the only thing that converges the seat and ends the row.
+        // The share-proof report of the keyed recovery, fed at the
+        // catch-up entry point as above, is the only thing that
+        // converges the seat and ends the row.
         super::super::note_catchup_head(
             &restarted,
             std::slice::from_ref(&group_id),

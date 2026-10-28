@@ -5770,7 +5770,8 @@ mod restart_tests {
     /// sealed to it. ADR 0110 §3 L228 holds: survivor convergence, not a
     /// transport ACK, proves delivery. The carrier takes the frame each
     /// round, but that closes no seat — the close call of 25 Oct (an
-    /// author-side skip record) was withdrawn on 27 Oct — and a keyless
+    /// author-side skip record) lived under a day, 27 Oct 23:42 UTC to
+    /// 28 Oct 00:18 UTC — and a keyless
     /// survivor claims no head while it is keyless (#1627, 28 Oct 02:09
     /// GMT), so it converges no author's row: the obligation stays open.
     /// The KEM key is local data, not in the roster root (#1578), so the

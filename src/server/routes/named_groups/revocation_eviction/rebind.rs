@@ -2579,14 +2579,19 @@ mod daemon_tests {
 
     /// #1633: a committed rebind of a GSS group aimed at a survivor whose
     /// roster seat carries no KEM public key (#1578). The Engineer call of
-    /// 25 Oct, to close such a row from the author's own record, was
-    /// withdrawn on 27 Oct. ADR 0110 §3 L228 governs: survivor
+    /// 25 Oct, to close such a row from the author's own record, lived
+    /// under a day (27 Oct 23:42 UTC to 28 Oct 00:18 UTC). ADR 0110 §3
+    /// L228 governs: survivor
     /// convergence, not a transport ACK, proves delivery. While the seat
     /// is keyless, the survivor claims no head in its catch-up answers
     /// (#1627, David's ruling, 28 Oct 02:09 GMT), so a keyless disclaimer
     /// converges nothing and the carrier's acceptance of the frame holds
-    /// the row at `Sent`. The row ends only when the seat takes a KEM key
-    /// and the survivor reports the result head.
+    /// the row at `Sent`. The row ends only when the survivor reports
+    /// the result head; the keyed re-join is the named recovery,
+    /// modelled here (the rebind frame carries no key material, and this
+    /// row's convergence never reads a seat's KEM key) — the real
+    /// install path is proven by the owner-recovery and crypto-exclusion
+    /// two-node tests.
     #[tokio::test]
     async fn a_keyless_seat_stays_pending_until_a_head_report_converges_it() -> Result<()> {
         let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
@@ -2725,7 +2730,9 @@ mod daemon_tests {
                 .expect("the survivor's seat")
                 .kem_public_key_b64 = Some(BASE64.encode(&kem.public_bytes));
         }
-        // The report a keyed survivor then serves — the share-proof.
+        // The share-proof report of the keyed recovery, fed at the
+        // catch-up entry point (the served shape is pinned by the
+        // crypto-exclusion tests).
         super::super::note_catchup_head(
             &state,
             std::slice::from_ref(&group_id),
