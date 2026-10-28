@@ -9725,6 +9725,167 @@ mod tests {
         Ok(())
     }
 
+    /// #1645 round 5 (Codex P1), ADR 0109 §3: a failed swap puts the
+    /// original's snapshot back, but the Home-Suite restore fails. The swap
+    /// keeps its transaction journals and refuses roster writes. A metadata
+    /// save of the same group is refused, and it does not discard the
+    /// swap's journals, so a restart replays the staged pair. Before the
+    /// fix the save's rebind cleanup deleted both journals, and the restart
+    /// paired the staged record with the original's tree. Inert.
+    #[tokio::test]
+    async fn a_refused_metadata_save_keeps_a_failed_swaps_journals() -> anyhow::Result<()> {
+        use super::super::{set_save_fault, SaveFault};
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?.user_id();
+        let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, original_tree, staged, staged_tree) =
+            staged_tree_fixture_with(&state, "e2", Some(owner)).await?;
+        let stable = original.stable_group_id().to_string();
+        state.group_recovery.inner.lock().await.swap_rollback_stop =
+            Some(SwapRollbackStop::SidecarRestoreFails);
+        let fault = set_save_fault(&state, SaveFault::NamedNotReplacedAfterSnapshot);
+        assert!(swap_if_seated(&state, &stable).await);
+        drop(fault);
+        assert_eq!(
+            open_journal(&state, &stable).await.map(|j| j.phase),
+            Some(ReseatPhase::Swapping),
+            "the swap stays recoverable"
+        );
+        let journal = super::super::treekem_journal_path(&state.treekem_dir, &key);
+        let hsjournal = super::super::treekem_home_suite_journal_path(&state.treekem_dir, &key);
+        assert!(tokio::fs::try_exists(&journal).await?, "TreeKEM journal");
+        assert!(
+            tokio::fs::try_exists(&hsjournal).await?,
+            "Home-Suite journal"
+        );
+
+        // A metadata save of the same group: refused, journals kept.
+        let mut next = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("the live record"))?;
+        // A changed name and a later revision. Not sealed: the owner axis
+        // needs certificate evidence to seal.
+        next.name = "metadata save during a failed swap".to_string();
+        next.state_revision += 1;
+        next.recompute_state_hash();
+        assert!(
+            super::super::persist_named_group_info(&state, &key, next)
+                .await
+                .is_err(),
+            "the metadata save is refused"
+        );
+        assert!(
+            tokio::fs::try_exists(&journal).await?,
+            "the TreeKEM journal stays"
+        );
+        assert!(
+            tokio::fs::try_exists(&hsjournal).await?,
+            "the Home-Suite journal stays"
+        );
+
+        let restarted = restart_at(state, dir.path()).await?;
+        assert!(
+            holds_a_matching_pair(
+                &restarted,
+                &key,
+                &original,
+                &original_tree,
+                &staged,
+                &staged_tree,
+            )
+            .await?,
+            "the restart replays the staged pair"
+        );
+        assert_eq!(
+            open_journal(&restarted, &stable).await.map(|j| j.phase),
+            Some(ReseatPhase::Swapping),
+            "the swap resumes from its phase"
+        );
+        Ok(())
+    }
+
+    /// #1645 round 5 (audit R1), ADR 0109 §3: a failed swap puts the
+    /// original's snapshot back, but the Home-Suite restore fails. The swap
+    /// keeps its transaction journals and refuses roster writes. A local
+    /// delete of the same group is refused before its journal removal, so
+    /// the group and both journals stay, and a restart replays the staged
+    /// pair. Before the fix the delete removed both journals first, then
+    /// its absence persist was refused, and the restart lost the staged
+    /// pair. Inert.
+    #[tokio::test]
+    async fn a_refused_delete_keeps_a_failed_swaps_journals() -> anyhow::Result<()> {
+        use super::super::{set_save_fault, SaveFault};
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x5E; 32])?.user_id();
+        let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, original, original_tree, staged, staged_tree) =
+            staged_tree_fixture_with(&state, "d9", Some(owner)).await?;
+        let stable = original.stable_group_id().to_string();
+        state.group_recovery.inner.lock().await.swap_rollback_stop =
+            Some(SwapRollbackStop::SidecarRestoreFails);
+        let fault = set_save_fault(&state, SaveFault::NamedNotReplacedAfterSnapshot);
+        assert!(swap_if_seated(&state, &stable).await);
+        drop(fault);
+        assert_eq!(
+            open_journal(&state, &stable).await.map(|j| j.phase),
+            Some(ReseatPhase::Swapping),
+            "the swap stays recoverable"
+        );
+        let journal = super::super::treekem_journal_path(&state.treekem_dir, &key);
+        let hsjournal = super::super::treekem_home_suite_journal_path(&state.treekem_dir, &key);
+        assert!(tokio::fs::try_exists(&journal).await?, "TreeKEM journal");
+        assert!(
+            tokio::fs::try_exists(&hsjournal).await?,
+            "Home-Suite journal"
+        );
+
+        // A local delete of the same group: refused, journals kept.
+        assert!(
+            !super::super::drop_local_named_group_state(
+                &state,
+                &key,
+                Some(stable.as_str()),
+                "test delete during failed swap",
+            )
+            .await,
+            "the delete is refused"
+        );
+        assert!(
+            tokio::fs::try_exists(&journal).await?,
+            "the TreeKEM journal stays"
+        );
+        assert!(
+            tokio::fs::try_exists(&hsjournal).await?,
+            "the Home-Suite journal stays"
+        );
+        assert!(
+            state.named_groups.read().await.contains_key(&key),
+            "the group stays in the roster"
+        );
+
+        let restarted = restart_at(state, dir.path()).await?;
+        assert!(
+            holds_a_matching_pair(
+                &restarted,
+                &key,
+                &original,
+                &original_tree,
+                &staged,
+                &staged_tree,
+            )
+            .await?,
+            "the restart replays the staged pair"
+        );
+        assert_eq!(
+            open_journal(&restarted, &stable).await.map(|j| j.phase),
+            Some(ReseatPhase::Swapping),
+            "the swap resumes from its phase"
+        );
+        Ok(())
+    }
+
     /// #1645 (round 4 audit), ADR 0109 §3: the swap's tree write fails
     /// past its commit point and the snapshot restore fails too. Until the
     /// files are back, every other whole-roster write is refused, so the

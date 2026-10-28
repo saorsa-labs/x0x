@@ -6422,6 +6422,9 @@ async fn persist_named_groups_quarantine_clear_gated_unlocked<F>(
 where
     F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
 {
+    // #1645 (round 5 review): as in `persist_named_group_info_inner`, a
+    // failed re-seat swap refuses this write before anything is staged.
+    group_recovery::refuse_roster_write_during_failed_swap(state, None).await?;
     let before = {
         let groups = state.named_groups.read().await;
         groups.clone()
@@ -6452,9 +6455,12 @@ where
     } else {
         RebindOutcome::NotApplicable
     };
+    // #1645 (round 5 review): a cleanup below discards only the journals
+    // this call wrote (`Rebound`), never journals another transaction left.
+    let journals_ours = rebind_group_id.filter(|_| matches!(prejournaled, RebindOutcome::Rebound));
     let outcome = save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await;
     if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
-        if let Some(group_id) = rebind_group_id {
+        if let Some(group_id) = journals_ours {
             discard_rebind_journal(state, group_id).await;
         }
     }
@@ -6470,7 +6476,7 @@ where
             state
                 .named_groups_requires_durability_confirmation
                 .store(true, Ordering::Release);
-        } else if let Some(group_id) = rebind_group_id {
+        } else if let Some(group_id) = journals_ours {
             discard_rebind_journal(state, group_id).await;
         }
         return outcome;
@@ -6506,7 +6512,7 @@ where
                 save_named_groups_checked_unlocked(state).await,
                 Ok(AtomicWriteOutcome::Durable)
             ) {
-                if let Some(group_id) = rebind_group_id {
+                if let Some(group_id) = journals_ours {
                     discard_rebind_journal(state, group_id).await;
                 }
             }
@@ -7195,6 +7201,12 @@ async fn persist_named_group_info_inner(
             outcome => return outcome,
         }
     }
+    // #1645 (round 5 review): refuse here, before anything is staged. A
+    // failed re-seat swap keeps its transaction journals, and the rollback
+    // paths below discard this group's journals. A pin is set only under
+    // the persistence lock held here, so no pin can appear later in this
+    // transaction.
+    group_recovery::refuse_roster_write_during_failed_swap(state, None).await?;
     // #1103: both the all-clean SEAL and MemberAdded's mandate/gap-adoption
     // arms replace a record whose fork marker was cleared on a clone. Route
     // every such replacement through the same candidate gate as manual clear.
@@ -7230,17 +7242,21 @@ async fn persist_named_group_info_inner(
     // the NEW sidecar on disk with no journal to explain it.
     let pre_sidecar_bytes = tokio::fs::read(&state.home_suite_groups_path).await.ok();
     // #457 r5b/r5c rollback — PRE-DURABLE only (the named save failed or
-    // the journal preparation failed): discard both journals, restore the
-    // in-memory map, the stub marker, AND the on-disk sidecar to its
-    // pre-transaction bytes.
+    // the journal preparation failed): discard both journals when this
+    // transaction wrote them (#1645 round 5: never journals another
+    // transaction left), restore the in-memory map, the stub marker, AND
+    // the on-disk sidecar to its pre-transaction bytes.
     async fn rollback_pre_durable(
         state: &AppState,
         group_id: &str,
+        journals_ours: bool,
         snapshot: &HashMap<String, x0x::groups::GroupInfo>,
         confirmed_stub: bool,
         pre_sidecar_bytes: &Option<Vec<u8>>,
     ) {
-        discard_rebind_journal(state, group_id).await;
+        if journals_ours {
+            discard_rebind_journal(state, group_id).await;
+        }
         *state.named_groups.write().await = snapshot.clone();
         if confirmed_stub {
             state
@@ -7278,6 +7294,8 @@ async fn persist_named_group_info_inner(
     };
     // Journal-first (TreeKEM-plane groups only; NotApplicable otherwise).
     let prejournaled = prepare_rebind_journal_locked(state, group_id).await;
+    // A failed preparation already discarded what it wrote.
+    let journals_ours = matches!(prejournaled, RebindOutcome::Rebound);
     match prejournaled {
         RebindOutcome::NotApplicable => {}
         RebindOutcome::Rebound => {}
@@ -7285,6 +7303,7 @@ async fn persist_named_group_info_inner(
             rollback_pre_durable(
                 state,
                 group_id,
+                journals_ours,
                 &snapshot,
                 confirmed_stub,
                 &pre_sidecar_bytes,
@@ -7300,6 +7319,7 @@ async fn persist_named_group_info_inner(
         rollback_pre_durable(
             state,
             group_id,
+            journals_ours,
             &snapshot,
             confirmed_stub,
             &pre_sidecar_bytes,
@@ -7416,6 +7436,11 @@ async fn prepare_rebind_journal_for_groups(
         Ok(None) => return RebindOutcome::NotApplicable,
         Err(e) => return RebindOutcome::Failed(e),
     };
+    // #1645 (round 5 review): set once this call's `.hsjournal` is in
+    // place. Before that, a failure discards nothing: any journal on disk
+    // belongs to another transaction (a failed re-seat swap keeps its
+    // journals for the startup replay).
+    let mut journals_ours = false;
     let journalled = async {
         // #451 seam: the two-file split encode, stub-excluded — THIS
         // group's post-mutation entry is the confirmed state being
@@ -7456,6 +7481,7 @@ async fn prepare_rebind_journal_for_groups(
         write_home_suite_sidecar_journal(&state.treekem_dir, &tx, &home_suite_json)
             .await
             .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))?;
+        journals_ours = true;
         let journal = TreeKemNamedPersistJournal {
             version: TREEKEM_NAMED_JOURNAL_VERSION,
             group_id_hex: group_id.to_string(),
@@ -7491,7 +7517,9 @@ async fn prepare_rebind_journal_for_groups(
     match journalled {
         Ok(()) => RebindOutcome::Rebound,
         Err(e) => {
-            discard_rebind_journal(state, group_id).await;
+            if journals_ours {
+                discard_rebind_journal(state, group_id).await;
+            }
             RebindOutcome::Failed(e)
         }
     }
@@ -14820,6 +14848,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 drop(mls_groups);
             }
             if removed_self {
+                // #1645 (round 5 audit): the removal persist below is refused
+                // while a re-seat swap has failed. Refuse before the teardown
+                // removes this group's tree and journals.
+                if group_recovery::refuse_roster_write_during_failed_swap(state, None)
+                    .await
+                    .is_err()
+                {
+                    return ApplyMetadataResult::REJECTED;
+                }
                 // ADR 0107 (r5, G5): this node no longer serves the group's
                 // join artifacts — retire them before the group leaves the
                 // roster.
@@ -15296,6 +15333,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let banned_self = agent_id == local_agent_hex;
             if banned_self {
+                // #1645 (round 5 audit): as for `member_removed_self`, refuse
+                // before the teardown while a re-seat swap has failed.
+                if group_recovery::refuse_roster_write_during_failed_swap(state, None)
+                    .await
+                    .is_err()
+                {
+                    return banned_reject("failed_reseat_swap", &resolved_group_key);
+                }
                 // #531 I4a: teardown has BEGUN. This is not an accept — the
                 // persist below can still reject, so nothing durable is claimed
                 // here. The durable outcome is logged after persistence only.
@@ -24464,6 +24509,18 @@ async fn drop_local_named_group_state(
     // path.PARENT(), so passing the dir itself synced its parent).
     {
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        // #1645 (round 5 review): the absence persist below is refused
+        // while a re-seat swap has failed. Refuse before the journal
+        // removals, so the swap keeps the journals its restart replays.
+        if let Err(e) = group_recovery::refuse_roster_write_during_failed_swap(state, None).await {
+            tracing::error!(
+                group_id = %LogHexId::group(id),
+                reason = %reason,
+                error = %e,
+                "#1645: delete refused before its journal removal — nothing changed"
+            );
+            return false;
+        }
         // #457 r10 item 10.1 — a TreeKEM-dir fsync failure in the
         // PRE-COMMIT phase FAILS the delete BEFORE any destructive step
         // (the group, its journals, and its snapshot all remain; the
@@ -40871,10 +40928,12 @@ async fn encode_named_groups_store_for_state(
 }
 
 /// [`encode_named_groups_store_for_state`]. Every whole-roster write
-/// encodes here, so this is where a write waits for a failed re-seat swap
-/// whose files are not yet a matching pair
-/// ([`group_recovery::refuse_roster_write_during_failed_swap`]). `allow`
-/// is the key of the swap's own retry.
+/// encodes here, so this is the backstop where a write waits for a failed
+/// re-seat swap whose files are not yet a matching pair
+/// ([`group_recovery::refuse_roster_write_during_failed_swap`]). A write
+/// that stages or removes journals first refuses earlier, before it
+/// touches them (#1645 round 5). `allow` is the key of the swap's own
+/// retry.
 async fn encode_named_groups_store_allowing(
     state: &AppState,
     groups: &HashMap<String, x0x::groups::GroupInfo>,
