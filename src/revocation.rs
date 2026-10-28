@@ -501,6 +501,12 @@ pub struct RevocationSet {
     /// independent; never TTL-swept. Both maps feed
     /// [`Self::is_binding_revoked`].
     bundle_retired_epochs: HashMap<(AgentId, MachineId), u64>,
+    /// Ad-hoc binding tombstones indexed by agent (#1659). Kept in step
+    /// with `binding_epochs` keys.
+    binding_machines_by_agent: HashMap<AgentId, HashSet<MachineId>>,
+    /// Bundle-retired tombstones indexed by agent (#1659). Kept in step
+    /// with `bundle_retired_epochs` keys.
+    bundle_machines_by_agent: HashMap<AgentId, HashSet<MachineId>>,
     /// ADR-0070 revoked share grants, keyed by `(grant_id, owner)`, valued
     /// by the latest signed `grant_expiry`. Not swept by the 90-day TTL (a
     /// grant can outlive it); collected once the grant itself is dead
@@ -1047,21 +1053,47 @@ impl RevocationSet {
         self.revoked_machines.contains(id)
     }
 
+    fn note_binding_machine(&mut self, agent: AgentId, machine: MachineId) {
+        self.binding_machines_by_agent
+            .entry(agent)
+            .or_default()
+            .insert(machine);
+    }
+
+    fn note_bundle_machine(&mut self, agent: AgentId, machine: MachineId) {
+        self.bundle_machines_by_agent
+            .entry(agent)
+            .or_default()
+            .insert(machine);
+    }
+
+    fn forget_binding_machine(&mut self, agent: &AgentId, machine: &MachineId) {
+        let Some(machines) = self.binding_machines_by_agent.get_mut(agent) else {
+            return;
+        };
+        machines.remove(machine);
+        if machines.is_empty() {
+            self.binding_machines_by_agent.remove(agent);
+        }
+    }
+
     /// Machines named by a binding tombstone for `agent`.
     ///
     /// The list is the union of ad-hoc binding records and bundle-retired
-    /// pairings. Callers use it to attribute a machine revocation to an
-    /// agent (#1659). It does not itself mean the machine is revoked.
+    /// pairings, read from the per-agent index. Callers use it to attribute
+    /// a machine revocation to an agent (#1659). It does not itself mean
+    /// the machine is revoked.
     #[must_use]
     pub(crate) fn binding_tombstone_machines(&self, agent: &AgentId) -> Vec<MachineId> {
         let mut machines = Vec::new();
-        for &(id, machine) in self
-            .binding_epochs
-            .keys()
-            .chain(self.bundle_retired_epochs.keys())
-        {
-            if &id == agent && !machines.contains(&machine) {
-                machines.push(machine);
+        if let Some(set) = self.binding_machines_by_agent.get(agent) {
+            machines.extend(set.iter().copied());
+        }
+        if let Some(set) = self.bundle_machines_by_agent.get(agent) {
+            for machine in set {
+                if !machines.contains(machine) {
+                    machines.push(*machine);
+                }
             }
         }
         machines
@@ -1119,10 +1151,22 @@ impl RevocationSet {
         let mut changed = false;
         for binding in bindings {
             let key = (binding.agent, binding.machine);
-            let entry = self.bundle_retired_epochs.entry(key).or_insert(0);
-            if *entry < binding.move_epoch {
-                *entry = binding.move_epoch;
-                changed = true;
+            match self.bundle_retired_epochs.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let epoch = binding.move_epoch;
+                    slot.insert(epoch);
+                    self.note_bundle_machine(binding.agent, binding.machine);
+                    if epoch > 0 {
+                        changed = true;
+                    }
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let epoch = slot.get_mut();
+                    if *epoch < binding.move_epoch {
+                        *epoch = binding.move_epoch;
+                        changed = true;
+                    }
+                }
             }
         }
         if changed {
@@ -1236,6 +1280,7 @@ impl RevocationSet {
     /// `tombstones` (recomputed from the bundles that remain held).
     pub(crate) fn reset_bundle_retired(&mut self, tombstones: &[AgentMachineBinding]) {
         self.bundle_retired_epochs.clear();
+        self.bundle_machines_by_agent.clear();
         self.union_bundle_retired(tombstones);
         self.change_generation = self.change_generation.saturating_add(1);
         self.notify_change();
@@ -1265,6 +1310,7 @@ impl RevocationSet {
         self.revoked_agents.clear();
         self.revoked_machines.clear();
         self.binding_epochs.clear();
+        self.binding_machines_by_agent.clear();
         self.revoked_share_grants.clear();
         let remaining: Vec<PersistedRevocation> = self
             .records_by_hash
@@ -1329,6 +1375,7 @@ impl RevocationSet {
                     RevokedSubject::AgentMachineBinding(binding) => {
                         self.binding_epochs
                             .remove(&(binding.agent, binding.machine));
+                        self.forget_binding_machine(&binding.agent, &binding.machine);
                     }
                     // Drop the key only when the LATEST expiry recorded for
                     // it is past the horizon — a longer-lived record for the
@@ -1376,8 +1423,16 @@ impl RevocationSet {
                 // Keep the highest epoch per pairing — the grow-only
                 // tombstone set orders placement records (§9 P).
                 let key = (binding.agent, binding.machine);
-                let entry = self.binding_epochs.entry(key).or_insert(0);
-                *entry = (*entry).max(binding.move_epoch);
+                match self.binding_epochs.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(binding.move_epoch);
+                        self.note_binding_machine(binding.agent, binding.machine);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        let epoch = slot.get_mut();
+                        *epoch = (*epoch).max(binding.move_epoch);
+                    }
+                }
             }
             RevokedSubject::ShareGrant(grant) => {
                 let entry = self
@@ -1626,8 +1681,16 @@ impl RevocationSet {
         self.absorb_quarantine(&other);
         for ((agent, machine), epoch) in other.binding_epochs {
             let key = (agent, machine);
-            let entry = self.binding_epochs.entry(key).or_insert(0);
-            *entry = (*entry).max(epoch);
+            match self.binding_epochs.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(epoch);
+                    self.note_binding_machine(agent, machine);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let current = slot.get_mut();
+                    *current = (*current).max(epoch);
+                }
+            }
         }
         for (hash, persisted) in other.records_by_hash {
             self.records_by_hash.entry(hash).or_insert(persisted);
@@ -3816,6 +3879,11 @@ mod tests {
         let mut set = RevocationSet::new();
         assert!(set.verify_and_insert(record.clone(), Some(&cert)).unwrap());
         assert!(set.is_binding_revoked(&binding.agent, &machine));
+        assert_eq!(
+            set.binding_tombstone_machines(&binding.agent),
+            vec![machine],
+            "an inserted binding tombstone must be indexed by agent"
+        );
         assert_eq!(set.max_revoked_binding_epoch(&binding.agent), Some(3));
         assert!(
             set.all_records().is_empty(),
@@ -3829,6 +3897,12 @@ mod tests {
         let mut merged = RevocationSet::new();
         merged.merge_v2(loaded);
         assert!(merged.is_binding_revoked(&binding.agent, &machine));
+        assert!(
+            merged
+                .binding_tombstone_machines(&binding.agent)
+                .contains(&machine),
+            "merge_v2 must keep the per-agent tombstone index"
+        );
 
         // Permanence: a sweep far past any TTL keeps the tombstone.
         let expired = set.expire_records_older_than(60, 10_000_000);
@@ -3851,6 +3925,23 @@ mod tests {
         assert!(set2.binding_records().is_empty());
         assert!(set2.expire_records_older_than(0, u64::MAX) == 0);
         assert!(set2.is_binding_revoked(&binding.agent, &machine));
+        let mut indexed = set2.binding_tombstone_machines(&binding.agent);
+        indexed.sort_by_key(|id| id.0);
+        assert_eq!(
+            indexed,
+            vec![machine, crate::identity::MachineId([8u8; 32])],
+            "bundle tombstones must be indexed by agent"
+        );
+        set2.reset_bundle_retired(&[AgentMachineBinding {
+            agent: binding.agent,
+            machine: crate::identity::MachineId([9u8; 32]),
+            move_epoch: 4,
+        }]);
+        assert_eq!(
+            set2.binding_tombstone_machines(&binding.agent),
+            vec![crate::identity::MachineId([9u8; 32])],
+            "resetting bundle tombstones must drop machines the index still named"
+        );
     }
 
     /// HS-A review fixture gap (seam check 2026-08-30, concern 2 / MINOR-4):

@@ -66,29 +66,47 @@ attestation names A, which EP3 rejects.
 David approved this receiver rule on 28 Oct 2026 at 02:08 GMT. The wire
 format is unchanged.
 
-Once any machine the inbox attributes to the sender is revoked,
-`InboxPipeline::handle_incoming` refuses an unattested DM. The per-agent
-inbox topic and the compatibility gossip bus both use that function.
+Once an agent has any machine revocation, the DM inbox requires the
+sender's origin (device) attestation and refuses an unattested DM from
+an older pre-#213 peer. That is a deliberate partial override of ADR
+0021's accept-with-binding-fallback transition policy, and it applies
+only to those agents. A sender with no machine revocation keeps that
+policy. The check runs before the body match, so an unattested ACK from
+such a sender is refused the same way.
+
+`InboxPipeline::handle_incoming` is the check. The per-agent inbox topic
+and the compatibility gossip bus both use that function.
 
 The inbox attributes these machines to the sender:
 
-- every machine the authenticated-binding cache has accepted for the sender.
-  That includes the retained binding and any machine a later binding replaced.
-  LRU eviction drops the retained entry and does not drop this set. The set
-  is process memory. A restart drops it with the cache.
+- every verified machine the authenticated-binding cache has accepted for
+  the sender. That includes the retained binding, a machine a later
+  binding replaced, and a verified machine that lost timestamp selection.
+  LRU eviction drops the retained entry and does not drop this set. The
+  set is capped at 8 machines per agent and 65,536 pairs per cache. An
+  agent whose next machine does not fit fails closed for unattested DMs.
+  If the cache cannot name another such agent, every unattested DM fails
+  closed. A valid attestation is still accepted. The set is process
+  memory. A restart drops it with the cache.
 - a machine on the sender's contact
-- a machine named by a binding tombstone for that agent
+- a machine named by a binding tombstone for that agent (indexed by agent)
 - the machine the envelope claims
 
 An older pre-#213 peer of that sender is refused the same way. A valid
 origin attestation is still accepted. EP3 still drops an attested DM whose
-resolved machine is revoked.
+resolved machine is revoked. A machine-revocation record still expires
+under the existing revocation TTL, and this refusal ends with that record.
 
 A sender with none of those machines revoked keeps the absent-attestation
-path above. A machine revocation for some other device does not change that
-sender's path. A cold receiver that cannot attribute the revoked machine to
-the sender still follows the ADR 0021 claim fallback. That is the remaining
-strip residual.
+path above, unless attribution overflow has already failed that sender
+closed. A machine revocation for some other device does not change that
+sender's path. A cold receiver that cannot attribute the revoked machine
+to the sender still follows the ADR 0021 claim fallback. That fallback is
+the remaining strip residual: an unattested envelope whose origin
+attestation was removed, claiming a machine this receiver cannot attribute.
+The relay `DeliverLocally` path (`RelayDisposition::DeliverLocally` in
+`src/lib.rs`) takes the envelope's claimed machine and does not apply this
+refusal. Relay delivery is off unless `[peer_relay] enabled = true`.
 
 ---
 

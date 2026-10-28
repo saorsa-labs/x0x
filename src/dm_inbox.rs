@@ -130,6 +130,15 @@ impl DirectAckHedge for LiveDirectAckHedge {
 const DURABLE_TYPED_COMPLETION_TIMEOUT: Duration = Duration::from_secs(20);
 
 const AUTHENTICATED_MACHINE_BINDING_CAPACITY: usize = 65_536;
+/// #1659: verified machines remembered for one agent. One more marks that
+/// agent fail-closed for unattested DMs and does not grow the set.
+const ACCEPTED_MACHINES_PER_AGENT: usize = 8;
+/// #1659: (agent, machine) pairs in one cache. A further pair marks that
+/// agent fail-closed and does not evict another agent's pairs.
+const ACCEPTED_MACHINE_PAIR_CAPACITY: usize = 65_536;
+/// #1659: agents named as fail-closed. The next agent that does not fit
+/// saturates the cache: every unattested DM then fails closed.
+const ACCEPTED_MACHINE_OVERFLOW_AGENTS: usize = 4_096;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AuthenticatedMachineBinding {
@@ -156,17 +165,28 @@ pub(crate) struct AuthenticatedMachineBinding {
 /// writer `record_authenticated_machine_binding`.
 ///
 /// `accepted_machines` is the #1659 attribution memory. It records every
-/// machine this cache has accepted for an agent. A later binding replaces
-/// the retained machine and leaves the earlier machine in that set. LRU
-/// eviction drops the retained entry and does not drop the set. The set is
-/// process memory, like the cache itself.
+/// verified machine for an agent, including one that lost timestamp
+/// selection and one that a later binding replaced. LRU eviction drops the
+/// retained entry and does not drop the set. The set is capped per agent
+/// and overall. An agent whose next machine does not fit is fail-closed
+/// for unattested DMs. Saturation fail-closes every unattested DM. A
+/// restart drops the set with the cache.
 #[derive(Debug)]
 pub struct AuthenticatedMachineBindingCache {
     entries: std::collections::HashMap<AgentId, AuthenticatedMachineBinding>,
     by_machine: std::collections::BTreeSet<([u8; 32], [u8; 32])>,
     /// Machines accepted for each agent, including machines a later binding
-    /// replaced (#1659). Not removed by LRU eviction.
+    /// replaced (#1659). Not removed by LRU eviction. Bounded.
     accepted_machines: std::collections::HashMap<AgentId, std::collections::HashSet<MachineId>>,
+    /// Agents whose verified history did not fit. Unattested DMs fail closed.
+    overflowed_agents: std::collections::HashSet<AgentId>,
+    attribution_pairs_len: usize,
+    attribution_per_agent: usize,
+    attribution_pairs: usize,
+    attribution_overflow_agents: usize,
+    /// Set when another fail-closed agent could not be named. Every
+    /// unattested DM then fails closed, so a dropped machine cannot pass.
+    attribution_saturated: bool,
     capacity: usize,
     recency: std::collections::BTreeSet<(std::time::Instant, u64, [u8; 32])>,
     clock: u64,
@@ -180,6 +200,12 @@ impl Default for AuthenticatedMachineBindingCache {
             entries: std::collections::HashMap::new(),
             by_machine: Default::default(),
             accepted_machines: std::collections::HashMap::new(),
+            overflowed_agents: std::collections::HashSet::new(),
+            attribution_pairs_len: 0,
+            attribution_per_agent: ACCEPTED_MACHINES_PER_AGENT,
+            attribution_pairs: ACCEPTED_MACHINE_PAIR_CAPACITY,
+            attribution_overflow_agents: ACCEPTED_MACHINE_OVERFLOW_AGENTS,
+            attribution_saturated: false,
             recency: std::collections::BTreeSet::new(),
             capacity: AUTHENTICATED_MACHINE_BINDING_CAPACITY,
             clock: 0,
@@ -204,11 +230,42 @@ impl AuthenticatedMachineBindingCache {
             entries: std::collections::HashMap::new(),
             by_machine: Default::default(),
             accepted_machines: std::collections::HashMap::new(),
+            overflowed_agents: std::collections::HashSet::new(),
+            attribution_pairs_len: 0,
+            attribution_per_agent: ACCEPTED_MACHINES_PER_AGENT,
+            attribution_pairs: ACCEPTED_MACHINE_PAIR_CAPACITY,
+            attribution_overflow_agents: ACCEPTED_MACHINE_OVERFLOW_AGENTS,
+            attribution_saturated: false,
             recency: std::collections::BTreeSet::new(),
             capacity: capacity.max(1),
             clock: 0,
             change_notify: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_attribution_limits(
+        mut self,
+        per_agent: usize,
+        pairs: usize,
+        overflow_agents: usize,
+    ) -> Self {
+        self.set_attribution_limits_for_test(per_agent, pairs, overflow_agents);
+        self
+    }
+
+    /// Lower the #1659 caps. Call this before any `record`. Limits below 1
+    /// become 1.
+    #[cfg(test)]
+    pub(crate) fn set_attribution_limits_for_test(
+        &mut self,
+        per_agent: usize,
+        pairs: usize,
+        overflow_agents: usize,
+    ) {
+        self.attribution_per_agent = per_agent.max(1);
+        self.attribution_pairs = pairs.max(1);
+        self.attribution_overflow_agents = overflow_agents.max(1);
     }
 
     /// Machines this cache has accepted for `agent_id`.
@@ -223,11 +280,52 @@ impl AuthenticatedMachineBindingCache {
             .unwrap_or_default()
     }
 
+    /// Whether an unattested DM from `agent_id` must be refused because this
+    /// cache could not keep every verified machine.
+    pub(crate) fn attribution_requires_attestation(&self, agent_id: &AgentId) -> bool {
+        self.attribution_saturated || self.overflowed_agents.contains(agent_id)
+    }
+
     fn remember_accepted_machine(&mut self, agent_id: AgentId, machine_id: MachineId) {
+        if self.attribution_saturated || self.overflowed_agents.contains(&agent_id) {
+            return;
+        }
+        if self
+            .accepted_machines
+            .get(&agent_id)
+            .is_some_and(|machines| machines.contains(&machine_id))
+        {
+            return;
+        }
+        let agent_len = self
+            .accepted_machines
+            .get(&agent_id)
+            .map(|machines| machines.len())
+            .unwrap_or(0);
+        if agent_len >= self.attribution_per_agent
+            || self.attribution_pairs_len >= self.attribution_pairs
+        {
+            self.mark_attribution_overflow(agent_id);
+            return;
+        }
         self.accepted_machines
             .entry(agent_id)
             .or_default()
             .insert(machine_id);
+        self.attribution_pairs_len += 1;
+    }
+
+    fn mark_attribution_overflow(&mut self, agent_id: AgentId) {
+        if self.attribution_saturated || self.overflowed_agents.contains(&agent_id) {
+            return;
+        }
+        if self.overflowed_agents.len() >= self.attribution_overflow_agents {
+            // The new agent cannot be named. Fail closed for every
+            // unattested DM so the unnamed machine cannot pass later.
+            self.attribution_saturated = true;
+            return;
+        }
+        self.overflowed_agents.insert(agent_id);
     }
 
     /// Wake `notify` on every future retained-machine / expiry / clear /
@@ -358,6 +456,10 @@ impl AuthenticatedMachineBindingCache {
                 existing.announced_at = announced_at;
                 existing.cert_not_after = cert_not_after;
                 existing.cert_digest = cert_digest;
+            } else {
+                // Verified, and older than the retained binding. The retained
+                // machine stays. #1659 still attributes this machine.
+                self.remember_accepted_machine(agent_id, machine_id);
             }
             self.entries.insert(agent_id, existing);
             self.recency.insert((tick.0, tick.1, agent_id.0));
@@ -422,6 +524,9 @@ impl AuthenticatedMachineBindingCache {
         self.entries.clear();
         self.by_machine.clear();
         self.accepted_machines.clear();
+        self.overflowed_agents.clear();
+        self.attribution_pairs_len = 0;
+        self.attribution_saturated = false;
         self.recency.clear();
         if had_state {
             self.notify_changed();
@@ -1521,11 +1626,13 @@ impl InboxPipeline {
         retained: Option<MachineId>,
         claimed: MachineId,
     ) -> bool {
-        let accepted_machines = self
-            .authenticated_machine_bindings
-            .read()
-            .await
-            .machines_accepted_for(&agent);
+        let (accepted_machines, attribution_incomplete) = {
+            let cache = self.authenticated_machine_bindings.read().await;
+            (
+                cache.machines_accepted_for(&agent),
+                cache.attribution_requires_attestation(&agent),
+            )
+        };
         let contact_machines: Vec<MachineId> = self
             .contacts
             .read()
@@ -1542,6 +1649,7 @@ impl InboxPipeline {
             claimed,
             &contact_machines,
             &accepted_machines,
+            attribution_incomplete,
         )
     }
 
@@ -1708,12 +1816,9 @@ impl InboxPipeline {
         //
         // #1659 (David, 28 Oct 2026): once any machine the inbox attributes
         // to this sender is revoked, an absent attestation is a refusal.
-        // The authenticated-binding cache keeps every machine it has
-        // accepted, so a later attestation that replaces the retained
-        // binding does not drop that requirement. Both subscription loops
-        // (inbox topic and compatibility bus) call this function. A valid
-        // attestation still takes the Ok(Some) arm. A sender with no known
-        // machine revocation keeps this path.
+        // The cache records every verified machine that fits, including one
+        // that lost timestamp selection. An agent whose history overflowed
+        // fails closed. A valid attestation still takes the Ok(Some) arm.
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let claimed_machine_id = MachineId(envelope.sender_machine_id);
         //
@@ -2898,7 +3003,13 @@ fn sender_has_known_machine_revocation(
     claimed: MachineId,
     contact_machines: &[MachineId],
     accepted_machines: &[MachineId],
+    attribution_incomplete: bool,
 ) -> bool {
+    // A machine that did not fit in the attribution cap is unknown here.
+    // Refuse the unattested DM. A valid attestation still takes the other arm.
+    if attribution_incomplete {
+        return true;
+    }
     if revoked.is_machine_revoked(&claimed) {
         return true;
     }
@@ -3308,8 +3419,40 @@ mod tests {
         machine: &MachineKeypair,
         request_byte: u8,
     ) -> PubSubMessage {
-        let mut envelope =
-            craft_unsigned_payload_envelope(harness, sender, machine.machine_id(), request_byte);
+        attested_payload_message_at(harness, sender, machine, request_byte, now_unix_ms())
+    }
+
+    /// Same as [`attested_payload_message`], with an explicit `created_at`.
+    /// The binding cache orders updates by `created_at / 1000`.
+    fn attested_payload_message_at(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        machine: &MachineKeypair,
+        request_byte: u8,
+        created_at_unix_ms: u64,
+    ) -> PubSubMessage {
+        let body = EnvelopeBuilder::build_payload_body(
+            &[request_byte; 16],
+            sender.agent_id().as_bytes(),
+            harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms,
+            b"security regression payload".to_vec(),
+            None,
+            &harness.recipient_kem.public_bytes,
+        )
+        .expect("build payload body");
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_V1,
+            request_id: [request_byte; 16],
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine.machine_id().as_bytes(),
+            recipient_agent_id: *harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms,
+            expires_at_unix_ms: created_at_unix_ms + 60_000,
+            body,
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
         sign_envelope_with_agent(&mut envelope, sender);
         let mut attestation =
             DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
@@ -5506,6 +5649,225 @@ mod tests {
         assert_no_delivery(&mut harness.receiver).await;
     }
 
+    /// #1659: binding B at time t2 is retained before a valid A attestation
+    /// at t1 arrives. A must still be attributed. Revoking A then refuses an
+    /// unattested DM that claims B. There is no contact and no tombstone.
+    #[tokio::test]
+    async fn issue1659_older_attestation_attributes_when_newer_binding_arrived_first() {
+        let sender = test_keypair();
+        let machine_a = MachineKeypair::generate().expect("machine A keygen");
+        let machine_b = MachineKeypair::generate().expect("machine B keygen");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let now = now_unix_ms();
+        let newer_at = now.saturating_sub(2_000);
+        let older_at = now.saturating_sub(8_000);
+
+        let attested_b = attested_payload_message_at(&harness, &sender, &machine_b, 0x85, newer_at);
+        harness
+            .pipeline
+            .handle_incoming(attested_b, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        let delivered_b = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("the newer attested DM from B must be delivered")
+            .expect("delivery stream closed");
+        assert_eq!(delivered_b.machine_id, machine_b.machine_id());
+
+        let attested_a = attested_payload_message_at(&harness, &sender, &machine_a, 0x86, older_at);
+        harness
+            .pipeline
+            .handle_incoming(attested_a, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        let delivered_a = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("the older attested DM from A must still be delivered")
+            .expect("delivery stream closed");
+        assert_eq!(delivered_a.machine_id, machine_a.machine_id());
+        assert_eq!(
+            authenticated_machine_binding_for_testing(
+                &harness.pipeline.authenticated_machine_bindings,
+                &sender.agent_id(),
+            )
+            .await,
+            Some(machine_b.machine_id()),
+            "the older attestation must not roll the retained binding back to A"
+        );
+
+        insert_machine_revocation(&harness, &machine_a).await;
+        let unattested_b = payload_message(&harness, &sender, machine_b.machine_id(), 0x87);
+        harness
+            .pipeline
+            .handle_incoming(unattested_b, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            1,
+            "revoking A must refuse an unattested DM that claims B"
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+    }
+
+    /// #1659: a real binding tombstone attributes revoked machine A. The
+    /// sender has no contact and no retained binding. An unattested DM that
+    /// claims clean machine B is refused.
+    #[tokio::test]
+    async fn issue1659_binding_tombstone_attributes_revoked_machine() {
+        let owner = crate::identity::UserKeypair::generate().expect("owner keygen");
+        let sender = test_keypair();
+        let machine_a = MachineKeypair::generate().expect("machine A keygen");
+        let claim_b = MachineId([0xB4; 32]);
+        let cert = crate::identity::AgentCertificate::issue(&owner, &sender).expect("cert");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let binding = crate::revocation::AgentMachineBinding {
+            agent: sender.agent_id(),
+            machine: machine_a.machine_id(),
+            move_epoch: 1,
+        };
+        let record = crate::revocation::RevocationRecord::sign(
+            crate::revocation::RevokedSubject::AgentMachineBinding(binding),
+            owner.public_key(),
+            owner.secret_key(),
+            now_unix_ms() / 1000,
+            Some("retired pairing".to_string()),
+        )
+        .expect("sign binding tombstone");
+        assert!(harness
+            .pipeline
+            .revocation_set
+            .write()
+            .await
+            .verify_and_insert(record, Some(&cert))
+            .expect("insert binding tombstone"));
+        insert_machine_revocation(&harness, &machine_a).await;
+        assert!(
+            harness
+                .pipeline
+                .revocation_set
+                .read()
+                .await
+                .binding_tombstone_machines(&sender.agent_id())
+                .contains(&machine_a.machine_id()),
+            "the inserted tombstone must name A"
+        );
+        assert!(harness
+            .pipeline
+            .contacts
+            .read()
+            .await
+            .machines(&sender.agent_id())
+            .is_empty());
+
+        let message = payload_message(&harness, &sender, claim_b, 0x91);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            1,
+            "a tombstone for revoked A must refuse an unattested claim of B"
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+    }
+
+    /// A claim that disagrees with the retained binding stays
+    /// `incoming_trust_rejected`. It is not counted as a revocation drop.
+    #[tokio::test]
+    async fn binding_claim_mismatch_is_trust_rejected() {
+        let sender = test_keypair();
+        let bound = MachineId([0xA1; 32]);
+        let claimed = MachineId([0xB2; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(bound), None).await;
+        let message = payload_message(&harness, &sender, claimed, 0x93);
+        harness
+            .pipeline
+            .handle_incoming(message, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        let stats = harness.pipeline.dm.diagnostics_snapshot().stats;
+        assert_eq!(stats.incoming_trust_rejected, 1);
+        assert_eq!(stats.incoming_dropped_revoked, 0);
+    }
+
+    /// #1659: the per-agent cap is full, and no machine is revoked. An
+    /// unattested DM is still refused. A valid attestation was accepted.
+    #[tokio::test]
+    async fn issue1659_attribution_overflow_refuses_unattested_dm() {
+        let sender = test_keypair();
+        let machine_a = MachineKeypair::generate().expect("machine A keygen");
+        let machine_b = MachineKeypair::generate().expect("machine B keygen");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        harness
+            .pipeline
+            .authenticated_machine_bindings
+            .write()
+            .await
+            .set_attribution_limits_for_test(1, 64, 8);
+
+        let attested_a = attested_payload_message(&harness, &sender, &machine_a, 0x94);
+        harness
+            .pipeline
+            .handle_incoming(attested_a, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("the first attested DM must be delivered")
+            .expect("delivery stream closed");
+        assert_eq!(delivered.machine_id, machine_a.machine_id());
+
+        let attested_b = attested_payload_message_at(
+            &harness,
+            &sender,
+            &machine_b,
+            0x95,
+            now_unix_ms().saturating_add(1_000),
+        );
+        harness
+            .pipeline
+            .handle_incoming(attested_b, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        let delivered_b = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("a valid attestation still delivers after the cap")
+            .expect("delivery stream closed");
+        assert_eq!(delivered_b.machine_id, machine_b.machine_id());
+        assert!(
+            harness
+                .pipeline
+                .authenticated_machine_bindings
+                .read()
+                .await
+                .attribution_requires_attestation(&sender.agent_id()),
+            "the second machine must fail-close unattested DMs"
+        );
+
+        let unattested = payload_message(&harness, &sender, machine_b.machine_id(), 0x96);
+        harness
+            .pipeline
+            .handle_incoming(unattested, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            1
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+    }
+
     /// #213 REPLAY: an attestation captured from DM-1 (request R1) is
     /// re-presented inside DM-2 (request R2) — the attacker re-signs the
     /// envelope with the (stolen) agent key but cannot mint a fresh machine
@@ -5771,6 +6133,103 @@ mod tests {
             bindings.agents_on_machine(MachineId([0x01; 32]), 16),
             vec![agent_a]
         );
+    }
+
+    /// #1659: LRU eviction drops the retained entry and keeps attribution.
+    #[test]
+    fn accepted_machine_attribution_survives_lru_eviction() {
+        let mut bindings = AuthenticatedMachineBindingCache::with_capacity(1);
+        let agent = AgentId([0xA1; 32]);
+        let replaced = MachineId([0x11; 32]);
+        let current = MachineId([0x22; 32]);
+        bindings.record(agent, replaced, 1);
+        bindings.record(agent, current, 2);
+        bindings.record(AgentId([0xB2; 32]), MachineId([0x33; 32]), 3);
+
+        assert!(bindings.peek(&agent).is_none());
+        let machines = bindings.machines_accepted_for(&agent);
+        assert!(machines.contains(&replaced));
+        assert!(machines.contains(&current));
+    }
+
+    /// A verified machine that loses timestamp selection is still attributed.
+    /// `record_announcement` is the announced-binding writer. `record` is the
+    /// DM attestation writer. Both share `upsert_binding`.
+    #[test]
+    fn older_verified_machine_stays_attributed_when_newer_binding_wins() {
+        let mut bindings = AuthenticatedMachineBindingCache::default();
+        let agent = AgentId([0xA5; 32]);
+        let newer = MachineId([0xB6; 32]);
+        let older = MachineId([0xC7; 32]);
+        bindings.record(agent, newer, 200);
+        bindings.record_announcement(agent, older, 100, None, None);
+        assert_eq!(
+            bindings.peek(&agent).map(|binding| binding.machine_id),
+            Some(newer)
+        );
+        let machines = bindings.machines_accepted_for(&agent);
+        assert!(machines.contains(&older));
+        assert!(machines.contains(&newer));
+    }
+
+    /// The pair cap refuses one more agent and does not drop a stored pair.
+    #[test]
+    fn accepted_machine_pair_cap_fails_closed_without_dropping_others() {
+        let mut bindings =
+            AuthenticatedMachineBindingCache::with_capacity(8).with_attribution_limits(8, 2, 4);
+        let agent_a = AgentId([0xA1; 32]);
+        let agent_b = AgentId([0xB2; 32]);
+        let agent_c = AgentId([0xC3; 32]);
+        let machine_a = MachineId([0x01; 32]);
+        let machine_b = MachineId([0x02; 32]);
+        bindings.record(agent_a, machine_a, 1);
+        bindings.record(agent_b, machine_b, 1);
+        bindings.record(agent_c, MachineId([0x03; 32]), 1);
+
+        assert!(bindings
+            .machines_accepted_for(&agent_a)
+            .contains(&machine_a));
+        assert!(bindings
+            .machines_accepted_for(&agent_b)
+            .contains(&machine_b));
+        assert!(bindings.machines_accepted_for(&agent_c).is_empty());
+        assert!(!bindings.attribution_requires_attestation(&agent_a));
+        assert!(bindings.attribution_requires_attestation(&agent_c));
+        assert!(!bindings.attribution_requires_attestation(&AgentId([0xD4; 32])));
+    }
+
+    /// One agent cannot grow its set past the per-agent cap.
+    #[test]
+    fn accepted_machine_per_agent_cap_fails_closed() {
+        let mut bindings =
+            AuthenticatedMachineBindingCache::default().with_attribution_limits(2, 100, 10);
+        let agent = AgentId([0x11; 32]);
+        bindings.record(agent, MachineId([1; 32]), 10);
+        bindings.record(agent, MachineId([2; 32]), 20);
+        bindings.record(agent, MachineId([3; 32]), 30);
+        assert_eq!(bindings.machines_accepted_for(&agent).len(), 2);
+        assert!(bindings.attribution_requires_attestation(&agent));
+        assert!(!bindings.attribution_requires_attestation(&AgentId([0x22; 32])));
+    }
+
+    /// When the fail-closed name list is full, every unattested sender fails
+    /// closed. Stored pairs stay.
+    #[test]
+    fn accepted_machine_overflow_saturation_fails_closed_for_every_agent() {
+        let mut bindings =
+            AuthenticatedMachineBindingCache::with_capacity(8).with_attribution_limits(1, 1, 1);
+        let agent_a = AgentId([0xA1; 32]);
+        let machine_a = MachineId([1; 32]);
+        bindings.record(agent_a, machine_a, 1);
+        assert!(!bindings.attribution_requires_attestation(&agent_a));
+        bindings.record(AgentId([0xB2; 32]), MachineId([2; 32]), 1);
+        assert!(bindings.attribution_requires_attestation(&AgentId([0xB2; 32])));
+        assert!(!bindings.attribution_requires_attestation(&agent_a));
+        bindings.record(AgentId([0xC3; 32]), MachineId([3; 32]), 1);
+        assert!(bindings.attribution_requires_attestation(&agent_a));
+        assert!(bindings
+            .machines_accepted_for(&agent_a)
+            .contains(&machine_a));
     }
 
     /// A DM whose originating MACHINE is revoked (but whose agent-id is clean)
