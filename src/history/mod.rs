@@ -59,7 +59,13 @@ where
             return Ok(f());
         }
     }
-    tokio::task::spawn_blocking(f).await
+    // Same set as the harness wrappers: this spawn is admitted and its
+    // finish is counted. A build without `tokio_unstable` has no counters.
+    #[cfg(all(test, tokio_unstable))]
+    let join = crate::server::counted_spawn_blocking(f);
+    #[cfg(not(all(test, tokio_unstable)))]
+    let join = tokio::task::spawn_blocking(f);
+    join.await
 }
 
 /// Default whole-database byte budget: 1 GiB (ADR-0023 §6).

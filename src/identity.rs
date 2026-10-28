@@ -980,6 +980,23 @@ impl Identity {
             renewals: std::sync::OnceLock::new(),
         }
     }
+    /// Create an Identity that holds an owner-issued agent certificate but
+    /// not the owner's user key: a certificate-only device. Only test
+    /// builds create one (W3-H, #1572): production loads `agent.cert` only
+    /// beside the user key.
+    pub(crate) fn new_with_certificate(
+        machine_keypair: MachineKeypair,
+        agent_keypair: AgentKeypair,
+        agent_certificate: AgentCertificate,
+    ) -> Self {
+        Self {
+            machine_keypair,
+            agent_keypair,
+            user_keypair: None,
+            agent_certificate: Some(agent_certificate),
+            renewals: std::sync::OnceLock::new(),
+        }
+    }
     /// Generate a new Identity with fresh machine and agent keypairs.
     ///
     /// User keys are not auto-generated — creating a human identity
@@ -1010,6 +1027,15 @@ impl Identity {
     #[must_use]
     pub fn user_id(&self) -> Option<UserId> {
         self.user_keypair.as_ref().map(|kp| kp.user_id())
+    }
+    /// The user ID an identity announce discloses: the user key's, else
+    /// the issuer of this agent's certificate (a certificate-only device,
+    /// see [`Self::new_with_certificate`]).
+    pub(crate) fn disclosed_user_id(&self) -> Option<UserId> {
+        self.user_id().or_else(|| {
+            self.agent_certificate()
+                .and_then(|cert| cert.user_id().ok())
+        })
     }
     /// Get a reference to the machine keypair.
     #[inline]

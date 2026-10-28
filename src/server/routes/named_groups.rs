@@ -5767,18 +5767,6 @@ async fn classify_refused_joiner_fork_chain(
     if commit.verify_structure().is_err() {
         return false;
     }
-    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
-    // this same mandate; if it produced a successor, the lineage gate
-    // above is still empty and the marker was handled there — never
-    // record the owner's own anchored chain as fork evidence.
-    if let (Some(owner_id), Some(mandate)) = (
-        current.policy.admission.owner_certified_user_id(),
-        owner_mandate,
-    ) {
-        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
-            return false;
-        }
-    }
     let base = x0x::groups::state_commit::AlternateChainBase {
         group_id: current.stable_group_id(),
         base_revision: current.state_revision,
@@ -5833,6 +5821,21 @@ async fn classify_refused_joiner_fork_chain(
             "joiner served chain is owner-anchored to this exact terminal — stale-base gap, not fork evidence"
         );
         return true;
+    }
+    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
+    // this same mandate; if it produced a successor, the lineage check at
+    // the top of this fn is still empty and the marker was handled there —
+    // never record the owner's own anchored chain as fork evidence. This check
+    // sits AFTER the v2 gap branch: an owner seal of a stale-base joiner
+    // carries both the mandate and the v2 terminal binding, and it must
+    // still arm the ADR 0109 gap gate (H-S3-c).
+    if let (Some(owner_id), Some(mandate)) = (
+        current.policy.admission.owner_certified_user_id(),
+        owner_mandate,
+    ) {
+        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
+            return false;
+        }
     }
     if served_chain_owner_v1_only {
         // A genuine v1 signature authenticates the parent, but cannot
@@ -47212,6 +47215,7 @@ pub(in crate::server) mod tests {
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
+    mod issue1649_reseat_mandate_receive;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
