@@ -2419,6 +2419,7 @@ pub async fn serve_with_options(
                 if !routes::named_groups::dispatch_treekem_catchup_message(
                     &catchup_state,
                     &msg.sender,
+                    &msg.machine_id,
                     msg.verified,
                     &msg.payload,
                 )

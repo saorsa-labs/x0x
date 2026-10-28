@@ -7206,6 +7206,7 @@ async fn forking_catchup_responder_adopts_nothing_under_anchored_gap() -> Result
     handle_treekem_catchup_response(
         &joiner_state,
         &b_kp.agent_id(),
+        &clean_sender_machine(),
         true,
         TreeKemCatchupResponse {
             message_type: "treekem_catchup_response".to_string(),
@@ -7374,6 +7375,7 @@ async fn forking_catchup_policy_page_leaves_group_state_untouched() -> Result<()
     handle_treekem_catchup_response(
         &joiner_state,
         &b_kp.agent_id(),
+        &clean_sender_machine(),
         true,
         TreeKemCatchupResponse {
             message_type: "treekem_catchup_response".to_string(),
@@ -7645,6 +7647,7 @@ async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()
         handle_treekem_catchup_response(
             &joiner_state,
             &authority,
+            &clean_sender_machine(),
             true,
             TreeKemCatchupResponse {
                 message_type: "treekem_catchup_response".to_string(),
@@ -7689,6 +7692,7 @@ async fn honest_multicommit_gap_converges_page_by_page_under_gate() -> Result<()
     handle_treekem_catchup_response(
         &joiner_state,
         &authority,
+        &clean_sender_machine(),
         true,
         TreeKemCatchupResponse {
             message_type: "treekem_catchup_response".to_string(),
@@ -7862,6 +7866,7 @@ async fn stale_record_in_one_group_does_not_block_another() -> Result<()> {
     handle_treekem_catchup_response(
         &joiner_state,
         &stage.authority.agent.agent_id(),
+        &clean_sender_machine(),
         true,
         TreeKemCatchupResponse {
             message_type: "treekem_catchup_response".to_string(),

@@ -58,7 +58,13 @@ async fn a_slow_page_send_does_not_hold_the_catchup_listener() -> Result<()> {
     })?;
     let step = tokio::time::timeout(
         STEP,
-        dispatch_treekem_catchup_message(&state, &requester, true, &request),
+        dispatch_treekem_catchup_message(
+            &state,
+            &requester,
+            &clean_sender_machine(),
+            true,
+            &request,
+        ),
     )
     .await;
     assert!(
@@ -86,7 +92,13 @@ async fn a_slow_page_send_does_not_hold_the_catchup_listener() -> Result<()> {
     })?;
     let next = tokio::time::timeout(
         STEP,
-        dispatch_treekem_catchup_message(&state, &requester, true, &response),
+        dispatch_treekem_catchup_message(
+            &state,
+            &requester,
+            &clean_sender_machine(),
+            true,
+            &response,
+        ),
     )
     .await;
     assert_eq!(
