@@ -12,8 +12,8 @@
 //! gate; the case checks the gate before the window. X's rename (r+1′)
 //! then reaches J only. Each red arm keeps its `_red_` name and expects
 //! GREEN (the ADR 0109 behaviour). A failure is RED only when J shows the
-//! row's main observation (`CAUSE_C`); a missing prerequisite or any other
-//! failure is INFRA.
+//! row's main observation, or leaves containment before the keyed swap
+//! (`CAUSE_C`); a missing prerequisite or any other failure is INFRA.
 
 use super::*;
 
@@ -209,6 +209,7 @@ const C_LABELS: &[&str] = &["O", "A", "X", "J"];
 const FINAL_C: &str = "j_reseat_required_then_promoted_admin_reseats_it_with_the_owner_offline";
 const CAUSE_C: &str = "the row's main observation: after the advance J stays on X's fork r+1′ \
                        with its gap gate armed and no typed re-seat state (H-S3-c: no marker); \
+                       or J leaves containment before the keyed swap (ADR 0109 §3); \
                        `observed` lists each failing candidate step";
 /// H-S3-c: "Advance 30 min".
 const GATE_WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -627,28 +628,44 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     let (reseat_code, answer) = sim
         .api("A", Method::POST, &path, Some(reseat_body(&j_removal)))
         .await?;
-    // Contained until the swap: J is never Active below A's re-seat head.
+    // Contained until the keyed swap (ADR 0109 §3): every sample is checked.
+    let base_membership = j_status.as_ref().and_then(|st| st.membership.clone());
     let mut early_active = None;
     let mut seen = Observations::default();
     let waited = sim
         .until("J is re-seated", RESEAT_BOUND, async |s: &Sim| {
-            let Some(a) = seen.observe(view_now(s, "A", &group)).await else {
-                return true;
-            };
             let Some(jv) = seen.observe(try_view_now(s, "J", &group)).await else {
                 return true;
             };
             let Some(st) = seen.observe(status_now(s, "J", &group)).await else {
                 return true;
             };
+            let Some(again) = seen.observe(try_view_now(s, "J", &group)).await else {
+                return true;
+            };
+            // A is read after J, so a swapped J never meets an older A head.
+            let Some(a) = seen.observe(view_now(s, "A", &group)).await else {
+                return true;
+            };
+            if !same_record(jv.as_ref(), again.as_ref()) {
+                return false; // J moved between its reads: no consistent sample.
+            }
             let membership = st.as_ref().and_then(|st| st.membership.as_deref());
-            if membership == Some("active") && a.state_revision > j_removal.state_revision {
-                if let Some(v) = jv.as_ref().filter(|v| v.state_hash != a.state_hash) {
-                    early_active.get_or_insert_with(|| v.describe());
+            let sample = (jv.as_ref(), membership);
+            let base = (&j1, base_membership.as_deref());
+            match staging(sample, &a, base, j_removal.state_revision) {
+                Staging::Swapped => true,
+                Staging::Contained => false,
+                Staging::Breach => {
+                    early_active.get_or_insert_with(|| {
+                        let j = jv
+                            .as_ref()
+                            .map_or_else(|| "no record".into(), View::describe);
+                        format!("J {j} membership {membership:?}; A {}", a.describe())
+                    });
+                    false
                 }
             }
-            caught_up(jv.as_ref(), &a, membership)
-                && jv.as_ref().is_some_and(|v| v.gap_refusal.is_none())
         })
         .await;
     if let Err(error) = waited {
@@ -704,7 +721,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             "member_added_carries_no_owner_mandate",
             adds > 0 && !owner_mandate,
         ),
-        ("j_not_active_before_the_swap", early_active.is_none()),
+        ("j_contained_until_the_keyed_swap", early_active.is_none()),
         (
             "j_active_with_keys_at_a_head_and_epoch",
             caught_up(j2.as_ref(), &head, membership.as_deref()),
@@ -733,20 +750,76 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         .map(|(n, _)| *n)
         .collect();
     receipt.note(format!(
-        "sub-checks {checks:?}; ref_kind={kind:?}; early_active={early_active:?}"
+        "sub-checks {checks:?}; ref_kind={kind:?}; J membership after the advance \
+         {base_membership:?}; early_active={early_active:?}"
     ));
-    if !failing.is_empty() {
-        let observed = format!(
-            "failing {failing:?}; J after the advance {}; states {states:?}; reseat {reseat_code}; \
-             A {}; J {j2_text}",
-            j1.describe(),
-            head.describe()
-        );
-        // RED only with the row's own baseline; any other failure is INFRA.
-        receipt.cause(CAUSE_C, Some(observed), baseline, at(sim));
-    }
-    receipt.finish(FINAL_C, failing.is_empty(), at(sim));
+    let observed = format!(
+        "failing {failing:?}; J after the advance {}; states {states:?}; reseat {reseat_code}; \
+         A {}; J {j2_text}",
+        j1.describe(),
+        head.describe()
+    );
+    let red = baseline || early_active.is_some();
+    conclude(receipt, &failing, observed, red, at(sim));
     Ok(())
+}
+
+/// One staging sample of J's live record, from A's re-seat call on.
+#[derive(Debug, PartialEq)]
+enum Staging {
+    Contained,
+    Swapped,
+    Breach,
+}
+
+/// ADR 0109 §3: until the keyed swap, J's live record stays as it was
+/// after the advance (`base`: same hash, gate armed, same marker presence,
+/// same membership label). The swap is J Active with keys at A's head past
+/// A's removal of J (`removal`), with the gate retired. Any other sample is
+/// a breach: for example J Active while A is still at the removal
+/// revision, or Active at A's new hash before J has keys.
+fn staging(
+    (j, membership): (Option<&View>, Option<&str>),
+    a: &View,
+    (base, base_membership): (&View, Option<&str>),
+    removal: u64,
+) -> Staging {
+    let retired = j.is_some_and(|v| v.gap_refusal.is_none());
+    if a.state_revision > removal && caught_up(j, a, membership) && retired {
+        return Staging::Swapped;
+    }
+    let contained = j.is_some_and(|v| {
+        v.state_hash == base.state_hash
+            && v.gap_refusal.is_some()
+            && v.marker.is_some() == base.marker.is_some()
+    }) && membership == base_membership;
+    match contained {
+        true => Staging::Contained,
+        false => Staging::Breach,
+    }
+}
+
+/// Two reads of one node's record agree on the fields [`staging`] reads.
+fn same_record(one: Option<&View>, two: Option<&View>) -> bool {
+    match (one, two) {
+        (Some(x), Some(y)) => {
+            x.state_hash == y.state_hash
+                && x.epoch == y.epoch
+                && x.gap_refusal == y.gap_refusal
+                && x.marker.is_some() == y.marker.is_some()
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// RED only with the row's main observation or a staging breach (`red`);
+/// any other failure is INFRA.
+fn conclude(receipt: &mut Receipt, failing: &[&str], observed: String, red: bool, at_us: u128) {
+    if !failing.is_empty() {
+        receipt.cause(CAUSE_C, Some(observed), red, at_us);
+    }
+    receipt.finish(FINAL_C, failing.is_empty(), at_us);
 }
 
 #[derive(Clone, Copy)]
@@ -832,4 +905,107 @@ fn w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node() -> Result<()> {
 fn w3h_1356_red_s3_c2_reseat_retires_marker_and_gap() -> Result<()> {
     let case = "w3h_1356_red_s3_c2_reseat_retires_marker_and_gap";
     super::super::block_on_paused(expect(case, 0x1356_0107, Row::C2))
+}
+
+/// A record for the staging tests: J's fork is r+1′ (11), A removes J at
+/// r+3 (13) and re-seats it at r+4 (14).
+fn rec(state_revision: u64, hash: &str, gate: bool, epoch: Option<u64>) -> View {
+    View {
+        state_revision,
+        roster_revision: state_revision,
+        state_hash: hash.to_string(),
+        owner_axis: true,
+        active: Vec::new(),
+        marker: None,
+        fork_evidence: false,
+        gap_refusal: gate.then(|| "owner_attested_stale_base_gap".to_string()),
+        base_revision: None,
+        epoch,
+    }
+}
+
+/// A receipt whose prerequisites all hold.
+fn prepared() -> Receipt {
+    let mut receipt = Receipt::new("w3h_staging", 1);
+    receipt.setup_done(1);
+    receipt.evidence("j_gap_gate_armed", true, "", 2);
+    receipt.request_delivered("o_reached_j", true, "", 3);
+    receipt
+}
+
+/// The row's verdict over staging samples `(J, J's membership, A)`, with
+/// every other check passing, as the row's loop and [`conclude`] run.
+fn staged_verdict(samples: &[(View, &str, View)]) -> Option<Verdict> {
+    let base = rec(11, "fork", true, Some(1));
+    let breach = samples
+        .iter()
+        .map(|(j, m, a)| staging((Some(j), Some(m)), a, (&base, Some("pending")), 13))
+        .take_while(|sample| *sample != Staging::Swapped)
+        .any(|sample| sample == Staging::Breach);
+    let failing: &[&str] = if breach {
+        &["j_contained_until_the_keyed_swap"]
+    } else {
+        &[]
+    };
+    let mut receipt = prepared();
+    conclude(&mut receipt, failing, String::new(), breach, 4);
+    receipt.verdict()
+}
+
+/// Mutation proof for the staging check (ADR 0109 §3): the real order
+/// (contained, then the keyed swap at A's r+4 head) is GREEN; activation
+/// forced early at any point in staging is RED.
+#[test]
+fn w3h_1356_staging_containment_mutation_proof() {
+    let fork = |m| {
+        (
+            rec(11, "fork", true, Some(1)),
+            m,
+            rec(13, "removal", false, Some(4)),
+        )
+    };
+    let at_head = |m| {
+        (
+            rec(11, "fork", true, Some(1)),
+            m,
+            rec(14, "head", false, Some(5)),
+        )
+    };
+    let swap = (
+        rec(14, "head", false, Some(5)),
+        "active",
+        rec(14, "head", false, Some(5)),
+    );
+    let real = [fork("pending"), at_head("pending"), swap.clone()];
+    assert_eq!(staged_verdict(&real), Some(Verdict::Green));
+    let removal = rec(13, "removal", false, Some(4));
+    let early = [
+        fork("active"),
+        (removal.clone(), "active", removal),
+        (
+            rec(14, "head", false, None),
+            "active",
+            rec(14, "head", false, Some(5)),
+        ),
+        at_head("active"),
+    ];
+    for sample in early {
+        let verdict = staged_verdict(&[sample.clone(), swap.clone()]);
+        assert_eq!(verdict, Some(Verdict::Red), "{sample:?}");
+    }
+    // After the swap, staging is over.
+    assert_eq!(
+        staged_verdict(&[swap, fork("active")]),
+        Some(Verdict::Green)
+    );
+    // Any other failure without the main observation stays INFRA.
+    let mut receipt = prepared();
+    conclude(
+        &mut receipt,
+        &["a_reseat_head_at_r_plus_4"],
+        String::new(),
+        false,
+        4,
+    );
+    assert_eq!(receipt.verdict(), Some(Verdict::Infra));
 }
