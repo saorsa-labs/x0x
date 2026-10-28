@@ -164,6 +164,43 @@ macro_rules! arm_flush_regression_tests {
             }
 
             #[test]
+            fn arm_producers_only_started_failure_retries_before_the_hold() {
+                // Issue #1595: the same bounded retry budget covers the
+                // arm-and-flush path. A started failure caused only by
+                // unfinished producers restores and classifies FlushFailed
+                // on every attempt; the first budget failures write no
+                // hold, so the exit-75 restart retries the release, and the
+                // spent budget finally holds it.
+                let mut carried: Option<Vec<u8>> = None;
+                for attempt in 1..=(shutdown_flush::PRODUCER_DRAIN_RETRIES + 1) {
+                    let (dir, _, request, state, cli, backup) = swapped_cli_fixture();
+                    let root = dir.path().canonicalize().unwrap();
+                    if let Some(prior) = &carried {
+                        std::fs::write(root.join(shutdown_flush::RETRY_RECORD), prior).unwrap();
+                    }
+                    let owner = shutdown_flush::register(root.clone(), Arc::new(
+                        |deadline, stopped| {
+                            deadline.commit_stop(stopped)?;
+                            Err(io::Error::other(shutdown_flush::PRODUCERS_UNFINISHED))
+                        },
+                    ))
+                    .unwrap();
+                    let failure =
+                        arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
+                    owner.join_workers();
+                    assert!(matches!(failure, ArmFailure::FlushFailed(_)));
+                    assert_eq!(std::fs::read(&cli).unwrap(), b"previous cli");
+                    assert!(!backup.exists(), "the fresh backup is consumed by the restore");
+                    assert_eq!(
+                        root.join(shutdown_flush::HOLD_RECORD).exists(),
+                        attempt > shutdown_flush::PRODUCER_DRAIN_RETRIES,
+                        "attempt {attempt}"
+                    );
+                    carried = Some(std::fs::read(root.join(shutdown_flush::RETRY_RECORD)).unwrap());
+                }
+            }
+
+            #[test]
             fn arm_started_failure_from_a_refused_symlink_holds_and_restores() {
                 // Issue #1595 item 1: a flush failure forced by a symlink
                 // under the data root is a started failure — the daemon

@@ -1001,12 +1001,7 @@ pub(super) fn new_delivery(
         Arc::clone(&bytes),
         true,
     );
-    let gss_epoch = ce::decode_frame(&bytes)
-        .ok()
-        .and_then(|frame| match frame.body.crypto {
-            ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } => Some(next_secret_epoch),
-            ce::CryptoExclusionCryptoV1::TreeKem { .. } => None,
-        });
+    let gss_epoch = frame_gss_epoch(&bytes);
     let gss_shares_pending = resumed && gss_epoch.is_some();
     ce_state.deliveries.insert(
         key.clone(),
@@ -1090,6 +1085,34 @@ pub(super) fn saved_frame_heads(bytes: &[u8]) -> Option<(String, String, u64)> {
         frame.body.commit.state_hash,
         frame.body.next_revision,
     ))
+}
+
+/// The rotated secret epoch a saved GSS frame commits to (`None` for a
+/// TreeKEM frame, which carries its own key material).
+pub(super) fn frame_gss_epoch(bytes: &[u8]) -> Option<u64> {
+    ce::decode_frame(bytes)
+        .ok()
+        .and_then(|frame| match frame.body.crypto {
+            ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } => Some(next_secret_epoch),
+            ce::CryptoExclusionCryptoV1::TreeKem { .. } => None,
+        })
+}
+
+/// #1574 item 3: whether a saved GSS frame the chain superseded still
+/// needs its delivery at restart. The live round rule in
+/// `drive_deliveries` keeps a delivery while the rotated secret is still
+/// the current committed one, because a GSS survivor installs the frame
+/// only with its sealed share, and the crash may have lost the shares
+/// before any survivor converged (#1508 review P1). The restart
+/// classification must not end that delivery earlier than the live rule
+/// would: without a delivery the row would complete on the chain proof
+/// alone, with no round ever re-sealing the share. `gss_epoch` is the
+/// frame's rotated epoch ([`frame_gss_epoch`]).
+pub(super) fn superseded_gss_delivery_kept(info: &GroupInfo, gss_epoch: Option<u64>) -> bool {
+    let Some(epoch) = gss_epoch else {
+        return false;
+    };
+    info.secret_epoch == epoch && ce::committed_secret_epoch(info) == epoch
 }
 
 // ─── Delivery ──────────────────────────────────────────────────────────────
@@ -1482,6 +1505,12 @@ pub(in crate::server) async fn serve_catchup(
         );
         match tokio::time::timeout(CE_EXCHANGE_TIMEOUT, exchange).await {
             Ok(Ok(_)) => {}
+            // The in-process stand-in reports an admitted exchange with its
+            // marker error (test builds only), as the live delivery path
+            // does ([`spawn_send`]); without this arm no local test can
+            // reach the catch-up share step below (#1576).
+            #[cfg(test)]
+            Ok(Err(error)) if error.to_string().contains(x0x::dm::PINNED_STANDIN_ADMITTED) => {}
             Ok(Err(error)) => {
                 tracing::debug!(%error, "ADR 0110 S4: crypto-only exclusion catch-up send refused or failed");
                 return;
@@ -2527,6 +2556,43 @@ mod tests {
             classify_saved_frame(&info, "p", "r"),
             SavedFrameState::Superseded
         );
+    }
+
+    /// #1574 item 3: the restart rule for a superseded GSS frame mirrors
+    /// the live round rule — the delivery survives while the rotated
+    /// secret is still the current committed one, and a later rekey (or a
+    /// TreeKEM frame with no rotated secret) ends it.
+    #[test]
+    fn a_superseded_gss_frame_keeps_its_delivery_while_its_secret_is_current() {
+        let mut info = info_with_log("c", &[("p", "r"), ("r", "c")]);
+        for retained in info.commit_log.iter_mut() {
+            retained.commit.security_binding = Some(ce::gss_binding(2));
+        }
+        info.security_binding = Some(ce::gss_binding(2));
+        info.secret_epoch = 2;
+        assert!(superseded_gss_delivery_kept(&info, Some(2)));
+        // A rekey moved the committed epoch past the frame's rotation.
+        info.commit_log
+            .last_mut()
+            .expect("head commit")
+            .commit
+            .security_binding = Some(ce::gss_binding(3));
+        info.security_binding = Some(ce::gss_binding(3));
+        info.secret_epoch = 3;
+        assert!(!superseded_gss_delivery_kept(&info, Some(2)));
+        // A TreeKEM frame carries no rotated secret epoch.
+        assert!(!superseded_gss_delivery_kept(&info, None));
+        // The committed epoch is the frame's again, but a sealed share of
+        // a newer epoch already raised the local one: the live rule needs
+        // both to agree, so the delivery is not current.
+        info.commit_log
+            .last_mut()
+            .expect("head commit")
+            .commit
+            .security_binding = Some(ce::gss_binding(2));
+        info.security_binding = Some(ce::gss_binding(2));
+        info.secret_epoch = 5;
+        assert!(!superseded_gss_delivery_kept(&info, Some(2)));
     }
 
     #[test]
@@ -3896,6 +3962,76 @@ mod daemon_tests {
         Ok(())
     }
 
+    /// #1576: a restored crypto-exclusion delivery keeps a head round
+    /// through its open row. The `reconcile_and_retain` delivering set
+    /// holds the row `committed_delivery_pending` on the pass after the
+    /// restart — the chain alone would complete it (the rotation excluded
+    /// the leaver) — and the open row keeps the group's §2 head round,
+    /// which the restored frame's resends wait for. No dedicated restart
+    /// test proved this before.
+    #[tokio::test]
+    async fn a_restored_exclusion_delivery_keeps_the_head_round_through_its_open_row() -> Result<()>
+    {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+
+        // The process restarts: the groups and the `.evs` load again.
+        let restarted =
+            ng::tests::secure_endpoint_test_state_at(fx.dir.path(), Arc::clone(&fx.state.agent))
+                .await?;
+        super::super::load_persisted_obligations(&restarted).await;
+        {
+            let inner = restarted.revocation_evictions.inner.lock().await;
+            assert!(inner.ce.delivering().contains(&key), "the delivery resumes");
+        }
+
+        // The pass after the restart: the delivering set keeps the row
+        // open, and the open row keeps the group's head round.
+        super::super::revocation_eviction_pass(&restarted).await;
+        {
+            let inner = restarted.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.store.get(&key).map(|row| row.phase),
+                Some(Phase::CommittedDeliveryPending),
+                "the delivering set holds the row open"
+            );
+            assert!(
+                inner.head_rounds.contains_key(&fx.stable),
+                "the open row keeps the group's head round"
+            );
+        }
+
+        // The negative control: without the delivery the same pass
+        // completes the row from the chain, and the group's round goes.
+        restarted.revocation_evictions.inner.lock().await.ce = CeState::default();
+        super::super::revocation_eviction_pass(&restarted).await;
+        let inner = restarted.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).map(|row| row.phase),
+            Some(Phase::Complete),
+            "no delivering set: the chain completes the row"
+        );
+        assert!(
+            !inner.head_rounds.contains_key(&fx.stable),
+            "no open row: no head round"
+        );
+        Ok(())
+    }
+
     /// Apply the fixture's leave, run the real worker until the GSS
     /// exclusion commits, end delivery and run one more pass, so the row
     /// completes from the chain. Returns the group as it was after the
@@ -4719,6 +4855,111 @@ mod daemon_tests {
         assert_eq!(
             ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
             None
+        );
+        Ok(())
+    }
+
+    /// #1576: the catch-up GSS share step of [`serve_catchup`]. An admin
+    /// that serves a held GSS exclusion frame to a catch-up requester
+    /// also seals its current secret to that requester (#1508 review P1:
+    /// the frame alone moves the requester's epoch without the secret).
+    /// No test reached the step: an offline admin's frame send fails
+    /// first — the in-process stand-in reports an admitted exchange with
+    /// its marker error — so only the network path covered it.
+    #[tokio::test]
+    async fn a_gss_exclusion_catchup_serves_the_frame_and_seals_the_share() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let committed = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        let new_secret = committed.shared_secret.clone().context("new secret")?;
+
+        // A survivor behind the exclusion: it took the leave, and then
+        // asks the committer for a catch-up from that revision.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let ng::NamedGroupMetadataEvent::MemberRemoved { revision, .. } = &fx.leave else {
+            anyhow::bail!("the fixture's leave is a MemberRemoved");
+        };
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        advertise_crypto_exclusion(&fx.state, survivor);
+
+        let before = shares_for(&fx.state, &survivor_hex).len();
+        serve_catchup(
+            &fx.state,
+            &survivor,
+            std::slice::from_ref(&fx.stable),
+            *revision,
+        )
+        .await;
+        let sealed = shares_for(&fx.state, &survivor_hex);
+        anyhow::ensure!(
+            sealed.len() > before,
+            "the serving admin seals a share to the catch-up requester"
+        );
+
+        // The sealed share is the current secret: the served frame, which
+        // waits for it, installs with it and moves the survivor to the
+        // new head and secret.
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare
+        );
+        let _ = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            sealed.last().cloned().context("the sealed share")?,
+            admin,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the catch-up share installs the served frame"
+        );
+        let held = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(held.state_hash, committed.state_hash);
+        assert_eq!(held.secret_epoch, committed.secret_epoch);
+        assert_eq!(
+            held.shared_secret.as_deref(),
+            Some(new_secret.as_slice()),
+            "the catch-up share carries the current secret"
         );
         Ok(())
     }
