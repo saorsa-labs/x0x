@@ -2,14 +2,35 @@
 //! The complete inventory issuer and host coordinator remain separate gates.
 #![allow(dead_code)]
 
+mod child;
+mod filesystem;
 #[path = "../journal.rs"]
 mod journal;
+#[path = "../probe.rs"]
+mod probe;
+const ENABLED: bool = false;
+impl Clock {
+    fn now() -> io::Result<Self> {
+        let clock = probe::ProbeClock::now()?;
+        Ok(Self {
+            boot: clock.boot_id,
+            ms: clock.monotonic_ms,
+        })
+    }
+}
 
+pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
+    child::candidate_boot(version)
+}
+pub(crate) fn candidate_boot_for_fixture(version: &str) -> io::Result<()> {
+    child::candidate_boot_owned(version)
+}
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use std::path::PathBuf;
-use std::{io, path::Path};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 const TRIAL_MS: u64 = 660_000;
 const READY_MS: u64 = 120_000;
