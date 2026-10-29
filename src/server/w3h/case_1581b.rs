@@ -103,6 +103,9 @@ const CAUSE_NO_RECOVERY: &str = "the held eager frames were released at the retr
 const CAUSE_DATA_PLANE: &str = "the survivors reached H with the expected signer, but the data \
                                 plane did not follow: C did not decrypt the new traffic, or B \
                                 still could";
+const CAUSE_SECOND_ROTATION: &str = "the exclusion was not exactly one rotation: a survivor moved \
+                                     past e0 + 1, or a rekey repeated or diverged, after the \
+                                     first exclusion";
 
 /// `label`'s view of `group`; `None` when it holds no record of it.
 #[derive(Debug, Clone)]
@@ -753,11 +756,18 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
         Some(at) => at,
         None => {
             // The held delivery never reached A: the arm's own cause, not
-            // INFRA.
+            // INFRA. The trigger did reach its other targets, which is the
+            // delivery fact the receipt needs.
+            let d_holds = sim
+                .at_instant(
+                    "read D's revocations after the floor",
+                    holds_revocation(sim, "D", &b_hex),
+                )
+                .await??;
             receipt.request_delivered(
-                "holders_hold_b_and_frames_reached_a",
-                false,
-                "A's .evs row for B never appeared after the floor".to_string(),
+                "holders_hold_b_revocation",
+                d_holds,
+                format!("D holds B's revocation record: {d_holds}"),
                 at(sim),
             );
             receipt.cause(
@@ -855,10 +865,16 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
             .iter()
             .filter(|(write, _)| {
                 use crate::network::sim::LaneClass;
-                matches!(
-                    write.lane.class,
-                    LaneClass::Direct | LaneClass::RelayedDm | LaneClass::PubSub | LaneClass::Bulk
-                )
+                // Only writes the hold delayed: sent before the floor, on a
+                // lane the hold covers (stream writes pass undelayed).
+                write.at < floor
+                    && matches!(
+                        write.lane.class,
+                        LaneClass::Direct
+                            | LaneClass::RelayedDm
+                            | LaneClass::PubSub
+                            | LaneClass::Bulk
+                    )
             })
             .count();
     }
@@ -879,7 +895,13 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
 
     let passed = h_once && data_plane && signed_by_a && in_bound;
     if !passed {
-        let (cause, ok, observed) = if h_once && !signed_by_a {
+        let (cause, ok, observed) = if !h_once && reached_after.is_some() {
+            (
+                CAUSE_SECOND_ROTATION,
+                true,
+                format!("H at {reached_after:?}; {}", describe_all(&end)),
+            )
+        } else if h_once && !signed_by_a {
             (CAUSE_SIBLING_SIGNED, true, describe_all(&end))
         } else if h_once && signed_by_a && in_bound && !data_plane {
             (
@@ -948,16 +970,7 @@ async fn loss_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> Resu
     })
     .await?;
     let mid = views(sim, &survivors, &group, &b).await?;
-    receipt.evidence(
-        "no_premature_sibling_at_half_w",
-        all_at(&mid, e0)
-            && mid.iter().all(|(_, seen)| {
-                seen.as_ref()
-                    .is_some_and(|seen| seen.lists_b && !seen.quarantined)
-            }),
-        format!("at W/2: {}", describe_all(&mid)),
-        at(sim),
-    );
+    receipt.note(format!("at W/2: {}", describe_all(&mid)));
 
     // The rank-1 fallback: D may start at T_obs + W; H within W plus the
     // completion bound from t = 0. The first epoch move is at or after W.
@@ -1045,7 +1058,13 @@ async fn loss_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> Resu
 
     let passed = h_once && data_plane && signed_by_d && in_bound && not_early && mid_quiet;
     if !passed {
-        let (cause, ok, observed) = if h_once && !signed_by_d {
+        let (cause, ok, observed) = if !h_once && first_move.is_some() {
+            (
+                CAUSE_SECOND_ROTATION,
+                true,
+                format!("first epoch move {first_move:?}; {}", describe_all(&end)),
+            )
+        } else if h_once && !signed_by_d {
             (CAUSE_NOT_SIGNED_BY_D, true, describe_all(&end))
         } else if h_once && signed_by_d && in_bound && !data_plane {
             (

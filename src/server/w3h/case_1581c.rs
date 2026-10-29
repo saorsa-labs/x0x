@@ -124,6 +124,9 @@ const CAUSE_NO_COMMIT: &str = "D's fallback never committed the exclusion while 
 const CAUSE_DATA_PLANE: &str = "A completed the learned exclusion with D's signer, but the data \
                                 plane did not follow: A or C did not decrypt the new traffic, \
                                 or B still could";
+const CAUSE_SECOND_ROTATION: &str = "the exclusion was not exactly one rotation: a survivor moved \
+                                     past e0 + 1, or D's and C's heads moved again, after D's \
+                                     commit";
 
 /// The first wait before a retry of a typed `retry: true` 424 reply; it
 /// doubles per retry, up to [`RETRY_CAP`]. Virtual time.
@@ -922,6 +925,9 @@ async fn scenario(
         ),
         at(sim),
     );
+    let mut a_authored = false;
+    let mut sealed_early: Option<Duration> = None;
+    let mut typed_observed = false;
     hold.set(true);
     sim.fabric()
         .mark("fault: every application frame toward A dropped (stale-head hold)");
@@ -942,17 +948,25 @@ async fn scenario(
     )
     .await?;
     let stale = view_now(sim, "A", &group, &b).await?;
-    receipt.evidence(
-        "a_runs_on_the_stale_head_loaded_from_disk",
-        stale.epoch == Some(e0) && stale.state_revision == r0,
-        format!(
-            "read {} us after the restart (hold still set): A {}; frames dropped toward A: {}",
-            sim.fabric().now().saturating_sub(restart_at).as_micros(),
-            stale.describe(),
-            hold.dropped()
-        ),
-        at(sim),
-    );
+    let stale_ok = stale.epoch == Some(e0) && stale.state_revision == r0;
+    // A seal inside the hold would already show here: the watch starts at
+    // this read, not only after the release.
+    if stale.epoch.is_some_and(|epoch| epoch > e0) {
+        a_authored |= stale.head_committed_by.as_deref() == Some(a_hex.as_str());
+        sealed_early.get_or_insert(sim.fabric().now().saturating_sub(restart_at));
+    }
+    // A first typed sample during the hold, so a quick clear after the
+    // release cannot hide the state.
+    if let Ok(Some(row)) = s4_row(sim, "A", &group, &b_hex).await {
+        typed_observed |= row["waiting"]["cause"].as_str() == Some("waiting_for_head_sync");
+    }
+    receipt.note(format!(
+        "read {} us after the restart (hold still set; stale head loaded {stale_ok}): A {}; \
+         frames dropped toward A: {}",
+        sim.fabric().now().saturating_sub(restart_at).as_micros(),
+        stale.describe(),
+        hold.dropped()
+    ));
 
     // The no-sync arm's gated window: through `sync_wait - 1 s` the
     // typed `waiting_for_head_sync` is shown (polled from the first
@@ -964,8 +978,7 @@ async fn scenario(
     // not asserted.
     let mut typed_detail = String::new();
     let mut window_quiet = false;
-    let mut typed_observed = false;
-    let mut sealed_early: Option<Duration> = None;
+    let mut unchanged_at_window = false;
     if no_sync_past_wait {
         let mut typed_seen_at: Option<Duration> = None;
         let window = sync_wait.saturating_sub(Duration::from_secs(1));
@@ -1012,6 +1025,7 @@ async fn scenario(
             hold.dropped()
         );
         typed_observed = typed_seen_at.is_some();
+        unchanged_at_window = unchanged;
         window_quiet = typed_seen_at.is_some() && sealed_early.is_none() && unchanged;
         receipt.note(format!(
             "inside the pre-wait window (quiet {window_quiet}): {typed_detail}"
@@ -1109,8 +1123,8 @@ async fn scenario(
     // "No fallback before sync", watched continuously on the resume arm
     // too: A authoring an exclusion commit at any point (a stale-head
     // seal that fork resolution might later paper over) is seen here,
-    // not only in the end read.
-    let mut a_authored = false;
+    // not only in the end read. The watch began at the stale-head read,
+    // inside the hold.
     let waited = sim
         .until(
             "A completes the learned exclusion",
@@ -1199,11 +1213,11 @@ async fn scenario(
         ));
     }
     receipt.request_delivered(
-        "d_remove_b_queued_typed_then_committed",
-        queued_typed && excluded(&h1, e0, leaves0) && signed_by_d,
+        "d_remove_b_request_answered",
+        rm_status.is_success(),
         format!(
-            "D's remove of B: first {rm_status} {rm_body}; D's commit signed on every survivor: \
-             {signed_by_d}"
+            "D's remove of B answered {rm_status} ({rm_retries} typed 424 retries); the typed \
+             queue names A: {queued_typed}; D's commit signed on every survivor: {signed_by_d}"
         ),
         at(sim),
     );
@@ -1214,6 +1228,7 @@ async fn scenario(
         queued_typed
             && excluded(&h1, e0, leaves0)
             && signed_by_d
+            && stale_ok
             && typed_observed
             && completed
             && h_once
@@ -1237,11 +1252,16 @@ async fn scenario(
                 CAUSE_STALE_SEAL,
                 true,
                 format!(
-                    "A left the stale head {sealed_early:?} after the restart, before the sync                      wait; {typed_detail}"
+                    "A left the stale head {sealed_early:?} after the restart, before the sync \
+                     wait ended; {typed_detail}"
                 ),
             )
+        } else if no_sync_past_wait && !unchanged_at_window {
+            (CAUSE_SECOND_ROTATION, true, typed_detail.clone())
         } else if (!still_signed_by_d || a_authored) && !no_sync_past_wait {
             (CAUSE_STALE_SEAL, true, describe_all(&end))
+        } else if !h_once && !no_sync_past_wait {
+            (CAUSE_SECOND_ROTATION, true, describe_all(&end))
         } else if completed
             && h_once
             && still_signed_by_d
@@ -1254,7 +1274,7 @@ async fn scenario(
                 true,
                 format!("{}; {}; {}", a_after.1, c_after.1, b_after.1),
             )
-        } else if !completed && h_once && !no_sync_past_wait {
+        } else if !completed && !no_sync_past_wait {
             (
                 CAUSE_NO_COMPLETION,
                 true,
@@ -1368,10 +1388,10 @@ fn w3h_1581c_control_restart_stale_head_resume() -> Result<()> {
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-fn w3h_1581c_red_restart_stale_head_no_sync_past_wait() -> Result<()> {
+fn w3h_1581c_red_restart_stale_head_no_sync_no_early_seal() -> Result<()> {
     super::block_on_paused(async move {
         expect_green(
-            "w3h_1581c_red_restart_stale_head_no_sync_past_wait",
+            "w3h_1581c_red_restart_stale_head_no_sync_no_early_seal",
             0x1581_0005,
             LABELS,
             true,
