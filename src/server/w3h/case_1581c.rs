@@ -1309,7 +1309,7 @@ async fn scenario(
                 ),
             )
         } else if no_sync_past_wait && !unchanged_at_window {
-            (CAUSE_SECOND_ROTATION, true, typed_detail.clone())
+            (CAUSE_SECOND_ROTATION, strict_red, typed_detail.clone())
         } else if (!still_signed_by_d || a_authored) && !no_sync_past_wait {
             (CAUSE_STALE_SEAL, true, describe_all(&end))
         } else if !h_once && !no_sync_past_wait {
