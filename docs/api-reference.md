@@ -1567,8 +1567,8 @@ token. A session token is refused before the body is read.
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
 | POST | `/groups/discover/subscribe` | `x0x group discover-subscribe` | **Phase C.2**: subscribe to a tag/name/id shard |
 | DELETE | `/groups/discover/subscribe/:kind/:shard` | `x0x group discover-unsubscribe` | **Phase C.2**: unsubscribe from a shard |
-| GET | `/groups/discover` | `x0x group discover` | **Phase C.2**: list locally known discoverable groups |
-| GET | `/groups/cards/:id` | `x0x group card <group_id>` | Fetch a single group card |
+| GET | `/groups/discover` | `x0x group discover` | **Phase C.2**: list locally known discoverable groups. While a group's durable store write is held back (#1570), its last committed card is listed; with none cached, the group is not listed until the write lands |
+| GET | `/groups/cards/:id` | `x0x group card <group_id>` | Fetch a single group card. While the group's durable store write is held back (#1570), the cached card of its last committed form is served; with none cached, the route answers `not_found` until the write lands |
 | POST | `/groups/cards/import` | `x0x group card-import` | Import a group card into local cache |
 | POST | `/groups/:id/secure/encrypt` | `x0x group secure-encrypt <group_id>` | Encrypt content with the group's shared secret (member-only) |
 | POST | `/groups/:id/secure/decrypt` | `x0x group secure-decrypt <group_id>` | Decrypt content with the group's shared secret (member-only, epoch must match) |

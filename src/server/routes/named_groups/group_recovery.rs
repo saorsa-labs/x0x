@@ -1971,7 +1971,11 @@ async fn resave_legacy(state: &AppState) -> LegacyWrite {
 ///   written to the legacy views, and only once that is durable is the
 ///   authoritative record dropped from the sidecar.
 /// - A placeholder write that was not durable is written again.
-async fn ensure_placeholders(state: &AppState) {
+///
+/// The pass also retries the sidecar write of every held-back group
+/// (#1570) and, after a durable resave, publishes the card of each group
+/// whose hold ended in the pass.
+pub(super) async fn ensure_placeholders(state: &AppState) {
     let bodies: Vec<(String, GroupRecoveryV1)> = {
         let inner = state.group_recovery.inner.lock().await;
         inner
@@ -1985,6 +1989,15 @@ async fn ensure_placeholders(state: &AppState) {
             .collect()
     };
     let registered = placeheld_snapshot(state);
+    // #1570: the groups held back when this pass starts. If this pass
+    // lands their record durably — by retrying the sidecar write or by
+    // un-placeholding the group — the hold ends, and the pass publishes
+    // the group's card from the then-committed record.
+    let held_back_before: Vec<String> = registered
+        .iter()
+        .filter(|(_, entry)| entry.authoritative_failed)
+        .map(|(stable, _)| stable.clone())
+        .collect();
     if bodies.is_empty() && registered.is_empty() {
         return;
     }
@@ -2097,6 +2110,17 @@ async fn ensure_placeholders(state: &AppState) {
                 }
             }
         });
+        // #1570: a hold that ended in this pass kept the card routes on
+        // the group's last committed form. That form is durable now, so
+        // the card cache and the discovery shards are refreshed from the
+        // live record, as any state change would refresh them.
+        for stable in held_back_before {
+            if !is_held_back(state, &stable) {
+                if let Some((key, _)) = live.get(&stable) {
+                    super::maybe_publish_group_card_after_state_change(state, key).await;
+                }
+            }
+        }
         for stable in unplacehold {
             // The real record is durable in the legacy views. A group that
             // was placeheld again meanwhile keeps its authoritative record.

@@ -3039,7 +3039,8 @@ async fn publish_group_card_to_discovery_inner(
         // #1570: a held-back group's live record is ahead of its durable
         // form, so no card is signed or published from it — not by the
         // republish worker, a create fan-out or a state-change hook. The
-        // next pass after the group commits publishes it.
+        // worker pass that clears the hold publishes the then-committed
+        // record; a later republish pass covers it too.
         if group_recovery::is_held_back(state, info.stable_group_id()) {
             return None;
         }

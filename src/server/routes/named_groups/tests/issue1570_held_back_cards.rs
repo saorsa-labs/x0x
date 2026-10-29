@@ -253,5 +253,35 @@ async fn local_card_routes_sign_no_card_from_a_held_back_group() -> Result<()> {
             .any(|c| c["name"].as_str() == Some("renamed while held back")),
         "the shard cache holds no uncommitted card either"
     );
+
+    // Part 5: the hold clears. The sidecar path is writable again, so the
+    // recovery worker's pass lands the authoritative write and commits the
+    // rename; the pass then publishes the group's card from the
+    // now-committed record, so card-by-id and discovery serve the rename.
+    tokio::fs::remove_dir_all(&sidecar).await?;
+    group_recovery::ensure_placeholders(&state).await;
+    assert!(
+        !group_recovery::is_held_back(&state, &stable),
+        "the worker's pass cleared the hold"
+    );
+    let (status, body) = card_body(&state, &stable).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["name"].as_str(),
+        Some("renamed while held back"),
+        "#1570: card-by-id serves the commit that cleared the hold"
+    );
+    let (status, body) = discover_body(&state).await?;
+    assert_eq!(status, StatusCode::OK);
+    let cards = body["groups"].as_array().cloned().unwrap_or_default();
+    let served = cards
+        .iter()
+        .find(|c| c["group_id"].as_str() == Some(stable.as_str()))
+        .ok_or_else(|| anyhow::anyhow!("the renamed card stays listed"))?;
+    assert_eq!(
+        served["name"].as_str(),
+        Some("renamed while held back"),
+        "#1570: discovery serves the committed rename after the hold clears"
+    );
     Ok(())
 }
