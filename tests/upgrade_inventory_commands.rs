@@ -16,6 +16,30 @@ macro_rules! inventory_commands_regression_tests {
                 arguments.iter().map(|argument| (*argument).to_owned()).collect()
             }
 
+            fn assert_redacted(value: &impl std::fmt::Debug, label: &str) {
+                let expected = format!("{label}(<redacted>)");
+                assert_eq!(format!("{value:?}"), expected);
+                assert_eq!(format!("{value:#?}"), expected);
+                assert_eq!(format!("{:?}", Some(value)), format!("Some({expected})"));
+                assert_eq!(format!("{:#?}", [value]), format!("[\n    {expected},\n]"));
+            }
+
+            #[test]
+            fn literal_command_debug_redacts_executable_and_arguments() {
+                let args = argv(&[INSTALL, "--token", "command-secret"]);
+                let command = parse_command(Path::new(INSTALL), &args, Path::new(INSTALL)).unwrap();
+                assert_eq!(command.argv, args);
+                assert_redacted(&command, "LiteralCommand");
+            }
+
+            #[test]
+            fn source_command_debug_redacts_property_and_nested_command() {
+                let source = format!("[Service]\nExecStart={INSTALL} --token source-secret\n");
+                let commands = parse_source("owned.service", source.as_bytes(), Path::new(INSTALL)).unwrap();
+                assert_eq!(commands[0].command.argv[2], "source-secret");
+                assert_redacted(&commands[0], "SourceCommand");
+            }
+
             #[test]
             fn inventory_commands_keep_direct_literal_arguments() {
                 let expected = argv(&[INSTALL, "--name", "owned team", "", "a\"b"]);
