@@ -6,7 +6,8 @@
 //! rank-1 fallback after W); A restarts with the window expired and its
 //! head stale, and the case holds every application frame toward A —
 //! the row's delayed head catch-up — before it releases them. With S4
-//! merged (#1357) both arms expect the ADR behaviour (GREEN): A never
+//! merged (#1357) the resume arm expects the ADR behaviour (GREEN)
+//! and the no-sync arm expects RED on `main` (see below): A never
 //! seals from the stale head, its public S4 row exposes the typed
 //! `waiting_for_head_sync` (D64) while the head is unsynced — also past
 //! the restart sync wait, when catch-up stays unavailable — and the
@@ -38,7 +39,9 @@
 //!   releases, which is the same observable contract, and the hold
 //!   releases 500 ms after A's restart.
 //!
-//! The second arm asserts ADR 0110 §2 (L227), per David's 29 Oct 2026
+//! The second arm asserts ADR 0110 §2 (L193: failure to progress
+//! with an available holder is a defect) with §3's L227 retain rule,
+//! per David's 29 Oct 2026
 //! 00:15/00:40 GMT rulings: with the head catch-up unavailable past
 //! the restart sync wait, A keeps the typed `waiting_for_head_sync`,
 //! seals nothing (inside the wait and past it), and the later release
@@ -980,10 +983,10 @@ async fn scenario(
     // typed `waiting_for_head_sync` is shown (polled from the first
     // passes after the restart, while the boot head gate holds) and
     // nothing seals — A keeps the stale head and D/C keep D's commit.
-    // What main does past the wait under the total blackout (the
-    // `HeadRound::synced` wait branch treats the elapsed sync wait alone
-    // as a usable local head; see the module doc) is recorded below,
-    // not asserted.
+    // Past the wait, the same blackout held, the typed wait and the
+    // no-seal state are asserted (see the module doc): main violates
+    // the claim via the `HeadRound::synced` wait branch, which is the
+    // arm's expected RED.
     let mut typed_detail = String::new();
     let mut window_quiet = false;
     let mut unchanged_at_window = false;
@@ -1039,7 +1042,8 @@ async fn scenario(
         receipt.note(format!(
             "inside the pre-wait window (quiet {window_quiet}): {typed_detail}"
         ));
-        // ADR 0110 §2 (L227), asserted per the 29 Oct rulings: past the
+        // ADR 0110 §2 (L193) with §3's L227 retain rule, asserted per
+        // the 29 Oct rulings: past the
         // sync wait, under the blackout, A keeps the typed wait and has
         // sealed nothing.
         let read_at = restart_at
@@ -1141,9 +1145,8 @@ async fn scenario(
     }
 
     // The resume: A catches up to D's commit and its row completes from
-    // the learned exclusion — no second rotation. On the no-sync arm
-    // this is recorded, not gated (past the sync wait main's behaviour
-    // is the design question the module doc names).
+    // the learned exclusion — no second rotation. Both arms gate this;
+    // on main the no-sync arm fails it through the stale-head seal.
     let converge_bound = sync_wait.saturating_add(timing.completion_bound);
     let mut converged = false;
     // "No fallback before sync", watched continuously on the resume arm
@@ -1227,9 +1230,11 @@ async fn scenario(
         c_after.1,
         b_after.1
     ));
+    // An answer arrived (any status): a refusal is a product answer,
+    // judged in `passed` and the causes below, not a delivery failure.
     receipt.request_delivered(
         "d_remove_b_request_answered",
-        true,
+        rm_body.is_object(),
         format!(
             "D's remove of B answered {rm_status} ({rm_retries} typed 424 retries); the typed \
              queue names A: {queued_typed}; D's commit signed on every survivor: {signed_by_d}"
@@ -1267,11 +1272,16 @@ async fn scenario(
             && data_plane
     };
     if !passed {
+        // On the no-sync arm only the stale-head seal is the expected
+        // RED; any other failure keeps ok=false (INFRA), so the gate's
+        // --expect=RED pin cannot be satisfied by an unrelated
+        // regression while the stale-seal fix waits on #1627.
+        let strict_red = !no_sync_past_wait;
         let (cause, ok, observed) = if !queued_typed || !excluded(&h1, e0, leaves0) || !signed_by_d
         {
             (
                 CAUSE_NO_COMMIT,
-                true,
+                strict_red,
                 format!(
                     "D's remove {rm_status} {rm_body}; at D's commit: {}",
                     describe_all(&h1)
@@ -1280,7 +1290,7 @@ async fn scenario(
         } else if !d_not_early {
             (
                 CAUSE_EARLY_FALLBACK,
-                true,
+                strict_red,
                 format!("D's first epoch move {d_first_move:?} after t=0; W is {w:?}"),
             )
         } else if !stale_ok && !no_sync_past_wait {
@@ -1294,8 +1304,8 @@ async fn scenario(
                 CAUSE_STALE_SEAL,
                 true,
                 format!(
-                    "A left the stale head {sealed_early:?} after the restart, before the sync \
-                     wait ended; {typed_detail}"
+                    "A left the stale head {sealed_early:?} after the restart (caught at or \
+                     past the sync-wait read); {typed_detail}"
                 ),
             )
         } else if no_sync_past_wait && !unchanged_at_window {
@@ -1325,7 +1335,7 @@ async fn scenario(
         } else {
             (
                 CAUSE_NO_TYPED_STATE,
-                !typed_observed,
+                strict_red && !typed_observed,
                 format!("A's row {final_row:?}; {typed_detail}"),
             )
         };

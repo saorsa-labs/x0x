@@ -699,6 +699,13 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
     // created, stays).
     let read_at = floor.saturating_sub(READ_MARGIN);
     let left = read_at.saturating_sub(sim.fabric().now());
+    // The read must land before the floor; if awaiting the holders
+    // already spent the margin, the arm's premise broke (INFRA).
+    ensure!(
+        left > Duration::ZERO,
+        "the holders wait consumed the pre-floor margin ({} us left to the floor read)",
+        left.as_micros()
+    );
     sim.within(
         "wait to just before the retry floor",
         left + secs(2),
@@ -708,6 +715,12 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
     )
     .await?;
     let pre_read = sim.fabric().now();
+    ensure!(
+        pre_read < floor,
+        "the pre-floor read landed at {} us, at or after the floor {} us",
+        pre_read.as_micros(),
+        floor.as_micros()
+    );
     let pre_holds = sim
         .at_instant(
             "read A's revocations before the floor",
@@ -717,7 +730,7 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
     let pre_t_obs = persisted_t_obs(sim, "A", b.as_bytes())?;
     receipt.evidence(
         "a_observed_nothing_before_the_retry_floor",
-        !pre_holds && pre_t_obs.is_none(),
+        pre_read < floor && !pre_holds && pre_t_obs.is_none(),
         format!(
             "read at {} us (floor {} us): A holds B's revocation {pre_holds}, A's .evs T_obs \
              {pre_t_obs:?}; {}",
@@ -764,6 +777,11 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
                     holds_revocation(sim, "D", &b_hex),
                 )
                 .await??;
+            let others = views(sim, &survivors, &group, &b).await?;
+            let stalled = others.iter().all(|(_, seen)| {
+                seen.as_ref()
+                    .is_some_and(|seen| seen.lists_b && seen.epoch == Some(e0))
+            });
             receipt.request_delivered(
                 "holders_hold_b_revocation",
                 d_holds,
@@ -772,8 +790,11 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
             );
             receipt.cause(
                 CAUSE_NO_RECOVERY,
-                Some("A's .evs row for B never appeared after the floor".to_string()),
-                true,
+                Some(format!(
+                    "A's .evs row for B never appeared after the floor; {}",
+                    describe_all(&others)
+                )),
+                stalled,
                 at(sim),
             );
             receipt.finish(FINAL_CONTROL, false, at(sim));
