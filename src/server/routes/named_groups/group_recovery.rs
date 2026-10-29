@@ -2214,8 +2214,7 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
             // it), so those entries complete and go; the owed-card loop
             // below publishes their cards. A group armed again meanwhile
             // or frozen for a staged re-seat keeps its entry.
-            placeheld
-                .retain(|stable, entry| !(entry.unplacehold_pending && !frozen.contains(stable)));
+            placeheld.retain(|stable, entry| !entry.unplacehold_pending || frozen.contains(stable));
         });
         for stable in unplacehold {
             // The real record is durable in the legacy views. A group that
