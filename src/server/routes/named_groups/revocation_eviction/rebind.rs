@@ -2569,10 +2569,51 @@ mod tests {
             "g",
             &survivor,
             &installed,
-            Some(SenderSeat { keyed: false }),
+            Some(SenderSeat { key: None }),
         );
         assert!(round(&mut rebind).is_empty());
         assert!(!rebind.deliveries.contains_key(&key));
+    }
+
+    /// #1660: a rebind row closes a seat only through a live, D60-clean
+    /// sender. A report from a refused sender — the gate holds no seat —
+    /// converges nothing: the delivery stays and the next round sends the
+    /// frame again.
+    #[test]
+    fn a_report_from_a_refused_sender_closes_no_rebind_seat() {
+        let survivor = [5; 32];
+        let key = ("g".to_string(), "r".to_string());
+        let mut rebind = RebindState::default();
+        rebind.deliveries.insert(
+            key.clone(),
+            delivery_to(&[(survivor, RecipientDelivery::Due)]),
+        );
+        let active = BTreeSet::from([survivor]);
+        let round = |rebind: &mut RebindState| {
+            let snapshot = rebind.deliveries[&key].recipients.clone();
+            let (updates, _) = plan_round(&snapshot, &active, |_| Some(Some(true)));
+            install_round(rebind, &key, updates)
+        };
+        let &[(_, attempt)] = round(&mut rebind).as_slice() else {
+            panic!("one send starts");
+        };
+        assert!(complete_send(
+            &mut rebind,
+            &key,
+            &survivor,
+            attempt,
+            RecipientDelivery::Sent
+        ));
+        // A head report of a later head on the chain through "r" from a
+        // sender the D60 gate refuses: no convergence evidence.
+        let installed = BTreeSet::from(["r".to_string(), "r2".to_string()]);
+        note_survivor_head(&mut rebind, "g", &survivor, &installed, None);
+        assert_eq!(
+            round(&mut rebind).len(),
+            1,
+            "a refused sender's report ends no delivery"
+        );
+        assert!(rebind.deliveries.contains_key(&key));
     }
 
     /// A round drops recipients that left the roster, withholds a D60

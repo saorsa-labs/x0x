@@ -116,6 +116,11 @@ struct CommitDelivery {
     /// restored delivery keeps it: the sealed shares were not durable, the
     /// secret is, in the persisted group (#1508 review).
     reshare_epoch: Option<u64>,
+    /// #1660: per recipient, the KEM public key (b64) a sealed share of
+    /// this row's epoch went to. A report closes the seat only when the
+    /// key the sender's seat carries now is the key a share went to
+    /// ([`report_may_close`]).
+    share_went_to: BTreeMap<[u8; 32], String>,
 }
 
 /// A GSS share that arrived before the recovery that makes its sender an
@@ -273,9 +278,10 @@ impl OrcState {
 /// delivery of `stable_group_id` when its result is one of them.
 /// `sender_seat` is the sender's live-roster facts at this moment
 /// (#1660): every row requires a live, D60-clean sender, and a GSS
-/// recovery (`reshare_epoch`) additionally requires a keyed seat — its
-/// rounds seal the rotated secret, so the report must prove the sealed
-/// share like any GSS row's.
+/// recovery (`reshare_epoch`) additionally requires that a sealed share
+/// went to the key the sender's seat carries now — its rounds seal the
+/// rotated secret, so the report must prove the sealed share like any
+/// GSS row's.
 pub(super) fn note_survivor_head(
     orc: &mut OrcState,
     stable_group_id: &str,
@@ -286,7 +292,11 @@ pub(super) fn note_survivor_head(
     let Some(delivery) = orc.deliveries.get_mut(stable_group_id) else {
         return;
     };
-    if !report_may_close(sender_seat, delivery.reshare_epoch.is_some()) {
+    if !report_may_close(
+        sender_seat,
+        delivery.reshare_epoch.is_some(),
+        delivery.share_went_to.get(sender).map(String::as_str),
+    ) {
         return;
     }
     note_converged(
@@ -295,6 +305,23 @@ pub(super) fn note_survivor_head(
         sender,
         installed,
     );
+}
+
+/// #1660 ([`super::crypto_exclusion::note_share_went_to`]): keep, on the
+/// GSS commit delivery of `stable_group_id` at `epoch`, the key a sealed
+/// share of that epoch's secret went to for `recipient`.
+pub(super) fn note_share_went_to(
+    orc: &mut OrcState,
+    stable_group_id: &str,
+    epoch: u64,
+    recipient: &[u8; 32],
+    kem: &str,
+) {
+    if let Some(delivery) = orc.deliveries.get_mut(stable_group_id) {
+        if delivery.reshare_epoch == Some(epoch) {
+            delivery.share_went_to.insert(*recipient, kem.to_string());
+        }
+    }
 }
 
 impl OrcState {
@@ -534,6 +561,7 @@ async fn ensure_restored(state: &AppState) {
                 resumed: true,
                 removed,
                 reshare_epoch,
+                share_went_to: BTreeMap::new(),
             });
     }
 }
@@ -1575,6 +1603,7 @@ async fn finish_commit(
                 resumed: false,
                 removed: removed_ids,
                 reshare_epoch,
+                share_went_to: BTreeMap::new(),
             },
         );
     }
@@ -1735,8 +1764,12 @@ async fn drive_deliveries(state: &Arc<AppState>) {
 /// class-K delivery with a fresh epoch-bound admission per write. Nothing
 /// is sealed when the group's secret epoch is not `epoch`: old key
 /// material is never sent after an epoch change. A survivor without a
-/// roster KEM key cannot get a share; it is logged and skipped.
-fn seal_gss_share(state: &Arc<AppState>, info: &GroupInfo, recipient: &[u8; 32], epoch: u64) {
+/// roster KEM key cannot get a share; it is logged and skipped. #1660: a
+/// successful seal is recorded ([`super::crypto_exclusion::note_share_went_to`])
+/// before the share's send task leaves, so a later report from the seat
+/// closes the row only after a share went to the key the seat carries
+/// then.
+async fn seal_gss_share(state: &Arc<AppState>, info: &GroupInfo, recipient: &[u8; 32], epoch: u64) {
     use super::super as ng;
     if info.secret_epoch != epoch {
         return;
@@ -1761,6 +1794,7 @@ fn seal_gss_share(state: &Arc<AppState>, info: &GroupInfo, recipient: &[u8; 32],
     };
     match ng::build_secure_share_event(stable, &recipient_hex, kem, &actor, &secret, epoch) {
         Ok(event) => {
+            super::crypto_exclusion::note_share_went_to(state, stable, epoch, recipient, kem).await;
             ng::spawn_secure_share_delivery(state, &event);
         }
         Err(_) => tracing::warn!(
@@ -1811,7 +1845,7 @@ fn spawn_commit_send(
                 !info.withdrawn && info.fork_quarantine.is_none() && info.state_hash == result_head
             });
         if let Some(info) = info {
-            seal_gss_share(&task_state, &info, agent.as_bytes(), epoch);
+            seal_gss_share(&task_state, &info, agent.as_bytes(), epoch).await;
         }
     });
 }
@@ -1895,7 +1929,7 @@ pub(in crate::server) async fn serve_catchup(
             info.caller_role(&local_hex)
                 .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
         }) {
-            seal_gss_share(state, &info, requester.as_bytes(), info.secret_epoch);
+            seal_gss_share(state, &info, requester.as_bytes(), info.secret_epoch).await;
         }
     }
 }
@@ -3749,6 +3783,7 @@ mod tests {
             resumed: false,
             removed: BTreeSet::new(),
             reshare_epoch: None,
+            share_went_to: BTreeMap::new(),
         }
     }
 
@@ -3817,17 +3852,20 @@ mod tests {
             "g",
             &survivor,
             &installed,
-            Some(SenderSeat { keyed: false }),
+            Some(SenderSeat { key: None }),
         );
         orc.install_commit_round("g", "head-1", Vec::new());
         assert!(!orc.deliveries.contains_key("g"));
     }
 
     /// #1660 (ADR 0110 §3): a head report closes a seat only through a
-    /// live, D60-clean, and — for a GSS recovery, whose rounds seal the
-    /// rotated secret — keyed seat.
+    /// live, D60-clean seat and — for a GSS recovery, whose rounds seal
+    /// the rotated secret — only when a sealed share went to the key the
+    /// seat carries now. A keyed seat whose share was not sealed yet
+    /// (#1660's mid-send order: the key arrives, the report lands before
+    /// the next round) closes nothing.
     #[test]
-    fn a_report_closes_a_recovery_seat_only_through_a_live_keyed_gss_seat() {
+    fn a_report_closes_a_recovery_seat_only_after_its_share_went_to_its_key() {
         let survivor = [7u8; 32];
         let installed: BTreeSet<String> = ["head-1".to_string()].into_iter().collect();
         let mut orc = OrcState::default();
@@ -3848,18 +3886,67 @@ mod tests {
             "g",
             &survivor,
             &installed,
-            Some(SenderSeat { keyed: false }),
+            Some(SenderSeat { key: None }),
         );
         assert_eq!(seat(&orc), RecipientDelivery::Sent);
-        // The keyed seat's report — the share-proof — converges it.
+        // A keyed seat whose share was not sealed to that key yet — the
+        // key arrived and the report landed before the next round —
+        // closes nothing: no share went to the seat's current key.
         note_survivor_head(
             &mut orc,
             "g",
             &survivor,
             &installed,
-            Some(SenderSeat { keyed: true }),
+            Some(SenderSeat {
+                key: Some("key-now".to_string()),
+            }),
+        );
+        assert_eq!(seat(&orc), RecipientDelivery::Sent);
+        // The share went to the seat's current key — the round's record —
+        // and only the report after that converges it.
+        note_share_went_to(&mut orc, "g", 4, &survivor, "key-now");
+        note_survivor_head(
+            &mut orc,
+            "g",
+            &survivor,
+            &installed,
+            Some(SenderSeat {
+                key: Some("key-now".to_string()),
+            }),
         );
         assert_eq!(seat(&orc), RecipientDelivery::Converged);
+    }
+
+    /// #1660 (ADR 0110 §3): a non-GSS recovery row — `reshare_epoch` is
+    /// `None` — seals no shares in its rounds, so `went_to` gates nothing.
+    /// A report from a live, D60-clean seat converges it with no key, and
+    /// with a key no share ever went to.
+    #[test]
+    fn a_report_closes_a_non_gss_recovery_seat_without_a_share() {
+        let survivor = [7u8; 32];
+        let installed: BTreeSet<String> = ["head-1".to_string()].into_iter().collect();
+        let seat = |orc: &OrcState| orc.deliveries["g"].recipients[&survivor];
+        for sender_seat in [
+            SenderSeat { key: None },
+            SenderSeat {
+                key: Some("key-never-sealed".to_string()),
+            },
+        ] {
+            let mut orc = OrcState::default();
+            let mut delivery = commit_delivery("head-1", survivor);
+            // `commit_delivery` leaves `reshare_epoch` None: the row seals
+            // no shares.
+            delivery
+                .recipients
+                .insert(survivor, RecipientDelivery::Sent);
+            orc.deliveries.insert("g".into(), delivery);
+            note_survivor_head(&mut orc, "g", &survivor, &installed, Some(sender_seat));
+            assert_eq!(
+                seat(&orc),
+                RecipientDelivery::Converged,
+                "went_to gates nothing when the row seals no shares"
+            );
+        }
     }
 
     fn mandate_delivery(mandate_id: &str, promoted: [u8; 32]) -> MandateDelivery {

@@ -859,22 +859,30 @@ pub(in crate::server) async fn seal_probe_for_test(
 /// §2: the catch-up response handler calls this for each verified,
 /// applied, non-truncated page that carries the responder's saved head
 /// (`responder_state_hash`). The handler checked the sender when the
-/// answer arrived; #1660 (ADR 0110 §3: no mid-send exception) makes the
+/// answer arrived. #1660 (ADR 0110 §3: no mid-send exception) makes the
 /// delivery completion step re-check the live roster before it closes a
-/// seat as delivered — the handler's checks ran before the page applied,
-/// and a removal or revocation can land inside that window. A sender that
-/// is no longer an Active member, or that D60 refuses, closes no seat; a
-/// GSS row's report closes a seat only through a keyed one. The report
-/// itself is still a verified, applied page, so it keeps counting for the
-/// §2 head round (chain agreement); only the seat-closing is gated. §3:
-/// the same answer is the sender's survivor convergence evidence for the
-/// S4 deliveries of the group
-/// ([`crypto_exclusion::note_survivor_head`]). An absent field is the
-/// #1578 keyless disclaimer (David's ruling, 28 Oct 02:09 GMT): no head
-/// is convergence evidence, and the sender's answer counts for the ask
-/// cadence only ([`note_head_disclaimed`]). Its unresolved head evidence
-/// persists: a keyless reply does not prove the head the sender reported
-/// reached the local chain (ADR 0110 §2).
+/// seat as delivered. The handler's checks ran before the page applied,
+/// and a removal or revocation can land inside that window.
+///
+/// A sender that is no longer an Active member, or that D60 refuses,
+/// closes no seat. A GSS row's report closes a seat only when a sealed
+/// share went to the key the sender's seat carries now. The report
+/// itself is still a verified, applied page, so it keeps counting for
+/// the §2 head round (chain agreement). Only the seat-closing is gated.
+///
+/// §3: the same answer is the sender's survivor convergence evidence
+/// for the S4 deliveries of the group
+/// ([`crypto_exclusion::note_survivor_head`]).
+///
+/// An absent field is the #1578 keyless disclaimer (David's ruling,
+/// 28 Oct 02:09 GMT) only from a keyless survivor
+/// ([`hashless_answer_is_a_keyless_disclaimer`], Engineer ruling (2),
+/// 28 Oct 23:34 GMT). No head is convergence evidence. That sender's
+/// answer counts for the ask cadence only ([`note_head_disclaimed`]).
+/// Its unresolved head evidence persists: a keyless reply does not
+/// prove the head the sender reported reached the local chain
+/// (ADR 0110 §2). Every other sender's hash-less answer is exactly
+/// main's reply — ignored, so the ask cadence still counts the sender.
 pub(in crate::server) async fn note_catchup_head(
     state: &AppState,
     group_ids: &[String],
@@ -896,7 +904,7 @@ pub(in crate::server) async fn note_catchup_head(
                     .active_members()
                     .find(|member| member.agent_id == sender_hex)
                     .map(|member| crypto_exclusion::SenderSeat {
-                        keyed: member.kem_public_key_b64.is_some(),
+                        key: member.kem_public_key_b64.clone(),
                     });
                 (
                     info.stable_group_id().to_string(),
@@ -918,7 +926,7 @@ pub(in crate::server) async fn note_catchup_head(
     // #1660: D60 entitlement is not fixed at commit — the completion step
     // re-runs the revocation verdict on the sender before any seat closes.
     // A disclaimed answer closes no seat, so it needs no verdict.
-    let sender_seat = if classified.is_some() {
+    let mut sender_seat = if classified.is_some() {
         match seat {
             Some(seat) if crypto_exclusion::write_allowed(state, &sender).await => Some(seat),
             _ => None,
@@ -949,6 +957,29 @@ pub(in crate::server) async fn note_catchup_head(
         return;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
+    // #1660 (Claude review): the seat facts and the verdict above were
+    // read before this lock. A removal or revocation that lands in that
+    // gap must still refuse. The re-checks take the seam form: `try_*`
+    // locks that refuse on contention — a retryable withhold, like every
+    // egress seam. A changed KEM key needs no re-check: the share record
+    // matches only the key a share went to, so a stale key closes
+    // nothing.
+    if sender_seat.is_some() {
+        let roster_refused = match state.named_groups.try_read() {
+            Ok(groups) => !group_ids.iter().any(|id| {
+                crate::server::resolve_group_entry_locked(&groups, id).is_some_and(|(_, info)| {
+                    info.active_members()
+                        .any(|member| member.agent_id == sender_hex)
+                })
+            }),
+            Err(_) => true,
+        };
+        if !crypto_exclusion::write_allowed_at_seam(state, &x0x::identity::AgentId(sender))
+            || roster_refused
+        {
+            sender_seat = None;
+        }
+    }
     // §3: the answer is also the sender's convergence evidence for the
     // S4 deliveries of this group whose result it holds.
     crypto_exclusion::note_survivor_head(
@@ -7394,6 +7425,85 @@ pub(super) mod tests {
         assert!(
             group_head_synced(&state, &group_id).await,
             "the survivor's own on-chain report resolves its entry"
+        );
+        Ok(())
+    }
+
+    /// #1660 (Claude review): a report the completion step refuses still
+    /// counts for the §2 head round. The sender was removed mid-send, so
+    /// its report closes no delivery seat. But the report itself is a
+    /// verified, applied page, so the round counts it: it confirms the
+    /// local head and clears the sender's conflicting evidence. Only the
+    /// seat-closing is gated.
+    #[tokio::test]
+    async fn a_refused_senders_report_still_counts_for_the_head_round() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "c9".repeat(16);
+        let survivor = [9; 32];
+        let survivor_hex = hex::encode(survivor);
+        let mut info = GroupInfo::new(
+            "refused-head-round".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.secret_epoch = 4;
+        info.shared_secret = Some(vec![7; 32]);
+        info.security_binding = Some("gss:epoch=4".to_string());
+        info.add_member(survivor_hex.clone(), GroupRole::Member, None, None);
+        // Removed mid-send: the completion step refuses the sender.
+        info.members_v2
+            .get_mut(&survivor_hex)
+            .expect("the sender's seat")
+            .state = GroupMemberState::Removed;
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::from([survivor]),
+                },
+            );
+        note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            Some(&info.state_hash),
+        )
+        .await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let round = inner.head_rounds.get(&stable).expect("the round");
+        assert!(
+            round.confirmed,
+            "the refused sender's report still confirms the local head (§2)"
+        );
+        assert!(
+            !round.conflicting.contains(&survivor),
+            "the refused sender's on-chain report clears its conflicting entry (§2)"
+        );
+        assert!(
+            inner
+                .head_round_asks
+                .values()
+                .any(|asks| asks.answered.contains(&survivor)),
+            "the refused sender answered: the round does not re-ask it every 2 s"
         );
         Ok(())
     }
