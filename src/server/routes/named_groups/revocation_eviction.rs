@@ -546,8 +546,8 @@ fn note_head_report(
 /// reported, and its exclusion frames travel separately, so the
 /// conflicting report persists until the holder itself reports a head
 /// on the local chain — possible again once its seat is keyed (the
-/// documented leave-and-re-join recovery; David's 02:25
-/// key-republication ruling is a follow-up) — or it is no longer a
+/// documented leave-and-re-join recovery, or the #1663 key
+/// republication, David's 02:25 GMT ruling) — or it is no longer a
 /// holder (ADR 0110 §2, the rule applied to head-sync retries on 22
 /// Oct). Until then removals, bans and seals wait at
 /// `waiting_for_head_sync`: expiry alone cannot authorize a known stale
@@ -4882,8 +4882,9 @@ pub(super) mod tests {
     /// resolution: becoming keyless does not invalidate the head the
     /// holder reported (its exclusion frames travel separately), so the
     /// conflicting report persists until the holder itself reports a
-    /// head on the local chain — possible again once its seat is keyed,
-    /// the documented leave-and-re-join recovery — or it is no longer a
+    /// head on the local chain — possible again once its seat is keyed
+    /// (the leave-and-re-join recovery, or the #1663 key republication)
+    /// — or it is no longer a
     /// holder (ADR 0110 §2). The rc3 code erased the entry on the
     /// disclaimer; this test fails if that comes back.
     #[test]

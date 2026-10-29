@@ -12,6 +12,8 @@ mod fair_admission;
 mod group_recovery;
 mod gss_share_hold;
 pub(in crate::server) use gss_share_hold::GssShareHolds;
+mod key_republish;
+pub(in crate::server) use key_republish::republish_outstanding_keyless_seats;
 mod revocation_eviction;
 pub(in crate::server) use revocation_eviction::rebind::rebind_member_certificate;
 mod seat_cert_fetch;
@@ -13489,6 +13491,7 @@ pub(in crate::server) fn set_join_request_created(
                 added_by: None,
                 removed_by: None,
                 kem_public_key_b64: Some(kem_b64),
+                kem_key_sequence: None,
                 treekem_key_package_b64: treekem_key_package_b64.clone(),
                 treekem_key_package_hash: None,
                 certificate: None,
@@ -21430,6 +21433,7 @@ fn invite_join_group_info(
                         added_by: None,
                         removed_by: None,
                         kem_public_key_b64: None,
+                        kem_key_sequence: None,
                         treekem_key_package_b64: None,
                         treekem_key_package_hash: snap.treekem_key_package_hash,
                         certificate: None,
@@ -22923,6 +22927,7 @@ pub(super) async fn join_group_via_invite_inner(
                         added_by: None,
                         removed_by: None,
                         kem_public_key_b64: Some(kem_b64.clone()),
+                        kem_key_sequence: None,
                         treekem_key_package_b64: None,
                         treekem_key_package_hash: None,
                         certificate: None,
@@ -40335,6 +40340,7 @@ fn build_listener_request_candidate_for_restart(
                         added_by: None,
                         removed_by: None,
                         kem_public_key_b64: Some(kem_b64),
+                        kem_key_sequence: None,
                         treekem_key_package_b64: treekem_key_package_b64.clone(),
                         certificate_digest: None,
                         treekem_key_package_hash: None,
@@ -54386,6 +54392,7 @@ pub(in crate::server) mod tests {
                 added_by: None,
                 removed_by: None,
                 kem_public_key_b64: Some("joiner-kem".to_string()),
+                kem_key_sequence: None,
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
                 certificate: None,

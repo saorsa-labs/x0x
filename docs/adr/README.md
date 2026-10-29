@@ -301,7 +301,8 @@ the exact merged head of PR #1586.
 | 8 | `group_terminal_attest_v1` | Issues and verifies admin terminal attestations, answers `group_attest_request`, consumes re-seat authorisations | ADR 0109 §5 (accepted 2026-10-20) |
 | 9 | `group_reseat_mandate_v1` | Verifies and applies promoted-admin `ReseatMandateV1` commits | ADR 0109 §3a (accepted 2026-10-20) |
 | 10 | `gui_show_v1` | Understands remote GUI show typed direct messages | ADR 0083 slice 3 (lowest free bit on 2026-10-23) |
-| 11–63 | unallocated | Must not be advertised until allocated | — |
+| 11 | `key_republish_v1` | Verifies and seats signed `MemberKeyRepublishV1` (`X0XKR1`) key republications on an Active seat | #1663 (David's ruling, 28 Oct 2026 02:25 GMT; lowest free bit) |
+| 12–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Rejected
 

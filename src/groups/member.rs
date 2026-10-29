@@ -164,6 +164,13 @@ pub struct GroupMember {
     /// Phase D.2).
     #[serde(default)]
     pub kem_public_key_b64: Option<String>,
+    /// #1663: the highest `key_sequence` of a verified `MemberKeyRepublishV1`
+    /// installed on this seat — the monotonic counter that refuses replays
+    /// and stale keys. Local data like the key itself: the roster root and
+    /// the state hash do not hash it, and a row that never republished (a
+    /// join-keyed or keyless seat) counts as `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem_key_sequence: Option<u64>,
     /// Base64 TreeKEM KeyPackage used to bind this roster entry to its ratchet
     /// tree leaf. Required for verified TreeKEM removals; absent for legacy GSS
     /// members and old pre-Phase-3 rosters.
@@ -217,6 +224,7 @@ impl GroupMember {
             added_by: None,
             removed_by: None,
             kem_public_key_b64: None,
+            kem_key_sequence: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,
@@ -240,6 +248,7 @@ impl GroupMember {
             added_by: None,
             removed_by: None,
             kem_public_key_b64: None,
+            kem_key_sequence: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,
@@ -267,6 +276,7 @@ impl GroupMember {
             added_by,
             removed_by: None,
             kem_public_key_b64: None,
+            kem_key_sequence: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,

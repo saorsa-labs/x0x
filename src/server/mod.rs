@@ -2527,6 +2527,18 @@ pub async fn serve_with_options(
         }));
     }
 
+    // #1663: a member of an encrypted GSS group whose own seat carries no
+    // KEM key republishes the key at boot. The keyless-install hook covers
+    // the live discovery; this pass covers a node that restarted into the
+    // keyless state (the hold and the head disclaimer persist across a
+    // restart until the seat is keyed again).
+    {
+        let republish_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            routes::named_groups::republish_outstanding_keyless_seats(&republish_state).await;
+        }));
+    }
+
     // ADR 0110 S4: revocation eviction, designated first.
     bg_tasks.push(tokio::spawn(
         routes::named_groups::run_revocation_eviction_worker(Arc::clone(&state)),

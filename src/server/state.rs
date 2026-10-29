@@ -1589,6 +1589,12 @@ pub(super) struct NamedGroupTestRecorders {
     /// under its publication permit (`gss_encrypt_after_hold_probe`).
     pub(super) gss_encrypt_hold_pause:
         StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// #1663: tests that pin the #1578 keyless state machine (the hold,
+    /// the head disclaimer and the open S4 row while the seat stays
+    /// keyless) set this, so the automatic key republish — the keyless
+    /// install's own trigger — stays off and the state lasts. Production
+    /// leaves it false: a real keyless survivor republishes at once.
+    pub(super) key_republish_suppressed: std::sync::atomic::AtomicBool,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }

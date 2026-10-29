@@ -2194,10 +2194,9 @@ async fn install_gss(
     // Such a survivor installs the frame keyless instead: the head moves
     // to the verified result, the old secret (which the excluded member
     // holds) is dropped, and the share hold stays until a share of this
-    // epoch installs — through the existing share path once the seat
-    // re-joins with a verified KEM binding (the only exit today: no wire
-    // event seats a key on an already-Active seat; a key-republication
-    // message is David's 02:25 ruling, a separate follow-up).
+    // epoch installs — through the existing share path once the seat is
+    // keyed again (the leave-and-re-join exit, or the #1663 key
+    // republication the hook below sends: David's 02:25 GMT ruling).
     // The install is local fact only (Engineer ruling, 27 Oct 22:10 GMT:
     // it never proves delivery, and an ACK closes no seat): while it
     // lasts this node claims no head in its catch-up answers (David's
@@ -2293,9 +2292,29 @@ async fn install_gss(
     );
     // An intermediate head holds no secret of this epoch: its hold stays
     // until the later secret installs ([`ng::gss_share_hold::holds`]). So
-    // does the #1578 keyless install, until a share of this epoch arrives.
+    // does the #1578 keyless install, until a share of this epoch arrives
+    // — or until the #1663 key republication keys the seat again.
     if !superseded && !awaiting_share {
         ng::gss_share_hold::release_exclusions(state, group_key, next_secret_epoch).await;
+    }
+    // #1663: this node just learned its own seat can not take a share.
+    // Republish the daemon's live KEM key on the seat so the next delivery
+    // round can seal the share. Detached: the republish takes the group's
+    // write lock, which this install still holds. Tests that pin the
+    // keyless state machine suppress it (`key_republish_suppressed`).
+    #[cfg(test)]
+    let republish_suppressed = state
+        .named_group_test_recorders
+        .key_republish_suppressed
+        .load(std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(test))]
+    let republish_suppressed = false;
+    if awaiting_share && !republish_suppressed {
+        let republish_state = std::sync::Arc::clone(state);
+        let republish_group = group_key.to_string();
+        let _spawned = state.spawn_detached(async move {
+            ng::key_republish::republish_own_key(&republish_state, &republish_group).await;
+        });
     }
     state.agent.s4_revocation_intake().request_reconcile();
     ReceiveOutcome::Applied
@@ -4916,6 +4935,10 @@ mod daemon_tests {
     async fn a_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless() -> Result<()> {
         use anyhow::Context as _;
         let fx = gss_leave_fixture_build(None, false).await?;
+        fx.replica
+            .named_group_test_recorders
+            .key_republish_suppressed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
         fx.state
             .named_group_test_recorders
@@ -5073,14 +5096,15 @@ mod daemon_tests {
         }
 
         // The recovery path, ADR 0024 item 7: the keyless install never
-        // completes the removal for the author. Only when the seat
-        // re-joins with a verified KEM binding (no wire event seats a
-        // key on an already-Active seat — David's 02:25 ruling puts a
-        // key-republication message on a separate follow-up — so the
-        // test seats the key as the /secure/reseal endpoint test does)
-        // can the author's own S4 delivery spawn seal the current
+        // completes the removal for the author. Only when the seat is
+        // keyed again (this test suppresses the automatic #1663 key
+        // republish to pin the keyless state machine itself — the
+        // pre-#1663 behavior a peer without bit 11 still sees — and
+        // seats the key as the /secure/reseal endpoint test does) can
+        // the author's own S4 delivery spawn seal the current
         // secret, and only the installed share — whose report is then
-        // the result head — converges the row.
+        // the result head — converges the row. The #1663 test above
+        // drives the real republication through the wire frame.
         fx.state
             .named_groups
             .write()
@@ -5146,6 +5170,280 @@ mod daemon_tests {
                 inner.store.get(&key).map(|row| row.phase),
                 Some(Phase::Complete),
                 "the obligation completes only after the seat is keyed and the share is sealed"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1663 (David's ruling, 28 Oct 2026 02:25 GMT): a keyless GSS
+    /// survivor republishes a fresh KEM key on its own Active seat, the
+    /// author verifies and seats it through the real ingest, the next
+    /// delivery round seals the share to that seat, and the republication
+    /// ends the keyless hold and the head disclaimer. A replay of the same
+    /// frame and a wrong-signer frame are refused with their typed
+    /// reasons.
+    #[tokio::test]
+    async fn a_keyless_survivor_republishes_its_kem_key_and_the_seal_follows() -> Result<()> {
+        use anyhow::Context as _;
+        use base64::Engine as _;
+        use x0x::groups::key_republish as kr;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let decoded = ce::decode_frame(&frame).context("frame")?;
+        let result_head = decoded.body.commit.state_hash.clone();
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        // The survivor takes the leave, then installs the frame keyless
+        // (the #1578 premises: head moved, secret dropped, no seal).
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        {
+            let installed = fx
+                .replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .cloned()
+                .context("group")?;
+            assert_eq!(
+                installed.state_hash, result_head,
+                "the keyless install moved the head"
+            );
+            assert!(installed.shared_secret.is_none());
+        }
+        assert!(
+            shares_for(&fx.state, &survivor_hex).is_empty(),
+            "no share can be sealed while the author's copy seats no key"
+        );
+
+        // The keyless install's own #1663 trigger: the survivor's daemon
+        // republishes its live KEM key on its own seat (detached — wait
+        // for it to land). The own-seat install ends the keyless hold —
+        // the node holds no secret, so the no-secret refusal answers its
+        // sends until the share installs — and the keyed seat serves its
+        // saved head again, so head sync no longer stalls.
+        let mut own_seated = false;
+        for _ in 0..250 {
+            own_seated = fx
+                .replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .and_then(|info| info.members_v2.get(&survivor_hex))
+                .is_some_and(|seat| seat.kem_public_key_b64.is_some())
+                && ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id) == 0;
+            if own_seated {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            own_seated,
+            "the keyless install triggered the republication of the own seat"
+        );
+        {
+            let own_view = fx
+                .replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .cloned()
+                .context("the survivor's group")?;
+            let seat = own_view
+                .members_v2
+                .get(&survivor_hex)
+                .context("the survivor's own seat")?;
+            assert_eq!(seat.kem_key_sequence, Some(1), "the first republication");
+            assert!(
+                own_view.shared_secret.is_none(),
+                "no share arrived yet: the survivor still holds no secret"
+            );
+        }
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the republication ends the keyless 409 hold (David's approval, 28 Oct 08:59 GMT)"
+        );
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            0
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
+            "the release wrote the file away"
+        );
+        let served = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
+        assert_eq!(
+            served.as_deref(),
+            Some(result_head.as_str()),
+            "the keyed seat serves its saved head again — head sync no longer stalls"
+        );
+
+        // The wire side: the frame the survivor's daemon builds reaches a
+        // peer (the author) through the real ingest, which verifies and
+        // seats the key on the peer's copy of the seat. The sequence
+        // advanced past the survivor's own install (1), so this is 2 —
+        // the author's copy never seated a republication.
+        let own = ng::key_republish::build_own_republish(&fx.replica, &fx.group_id)
+            .await
+            .context("the survivor builds its next republication")?;
+        assert_eq!(
+            own.key_sequence, 2,
+            "the seat's counter advanced past its own install"
+        );
+        assert_eq!(
+            ng::key_republish::receive(&fx.state, survivor, &own.payload).await,
+            ng::key_republish::RepublishOutcome::Installed,
+            "the author verifies and seats the republished key"
+        );
+        {
+            let author = fx
+                .state
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .cloned()
+                .context("the author's group")?;
+            let seat = author
+                .members_v2
+                .get(&survivor_hex)
+                .context("the survivor's seat")?;
+            assert_eq!(
+                seat.kem_public_key_b64.as_deref(),
+                Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(&fx.replica.agent_kem_keypair.public_bytes)
+                        .as_str()
+                ),
+                "the seated key is the survivor's live ML-KEM public key"
+            );
+            assert_eq!(seat.kem_key_sequence, Some(2));
+        }
+
+        // Replays and stale keys are refused: the same sequence never
+        // seats twice.
+        assert_eq!(
+            ng::key_republish::receive(&fx.state, survivor, &own.payload).await,
+            ng::key_republish::RepublishOutcome::Refused(kr::MemberKeyRepublishRefusal::StaleKey),
+            "a replayed republication is refused"
+        );
+        // A wrong signer: the body names the survivor, another key signed
+        // it. The signature does not verify, so nothing seats.
+        let stranger = x0x::identity::AgentKeypair::generate()?;
+        let stranger_b64 = |key: &x0x::identity::AgentKeypair| {
+            base64::engine::general_purpose::STANDARD.encode(key.public_key().as_bytes())
+        };
+        let mut forged = kr::MemberKeyRepublishBodyV1 {
+            stable_group_id: fx.stable.clone(),
+            actor: *stranger.agent_id().as_bytes(),
+            agent_public_key_b64: stranger_b64(&stranger),
+            kem_public_key_b64: own.kem_public_key_b64.clone(),
+            key_sequence: 1,
+        };
+        let signed = kr::sign(forged.clone(), &stranger)?;
+        forged.actor = *survivor.as_bytes();
+        let mut wrong_signer = signed;
+        wrong_signer.body = forged;
+        let wrong_signer_payload = kr::encode_frame(&wrong_signer)?;
+        assert_eq!(
+            ng::key_republish::receive(&fx.state, survivor, &wrong_signer_payload).await,
+            ng::key_republish::RepublishOutcome::Refused(
+                kr::MemberKeyRepublishRefusal::BadSignature
+            ),
+            "a frame another key signed for the survivor is refused"
+        );
+        let stranger_frame = kr::sign(
+            kr::MemberKeyRepublishBodyV1 {
+                stable_group_id: fx.stable.clone(),
+                actor: *stranger.agent_id().as_bytes(),
+                agent_public_key_b64: stranger_b64(&stranger),
+                kem_public_key_b64: own.kem_public_key_b64.clone(),
+                key_sequence: 1,
+            },
+            &stranger,
+        )?;
+        let stranger_payload = kr::encode_frame(&stranger_frame)?;
+        assert_eq!(
+            ng::key_republish::receive(&fx.state, stranger.agent_id(), &stranger_payload).await,
+            ng::key_republish::RepublishOutcome::Refused(
+                kr::MemberKeyRepublishRefusal::ActorIneligible
+            ),
+            "a member the roster does not seat is refused"
+        );
+
+        // The next delivery round seals the share to the keyed seat and
+        // the share installs through the existing path; only the
+        // share-proof report completes the author's row (ADR 0024 item 7).
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        let share = shares_for(&fx.state, &survivor_hex)
+            .pop()
+            .context("the author's spawn sealed the share to the republished key")?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, share, admin, true, None).await;
+        assert!(
+            took.accepted,
+            "the share sealed to the republished key installs: {took:?}"
+        );
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
+        assert_eq!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Converged),
+            "the survivor's head report converges the seat"
+        );
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&fx.state, &key, &survivor).await;
+        super::super::revocation_eviction_pass(&fx.state).await;
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner.ce.delivering().contains(&key),
+                "the confirmed share ends the delivery"
+            );
+            assert_eq!(
+                inner.store.get(&key).map(|row| row.phase),
+                Some(Phase::Complete),
+                "the obligation completes after the republication keyed the seat"
             );
         }
         Ok(())
@@ -5429,6 +5727,10 @@ mod daemon_tests {
     async fn a_divergent_seat_view_keyless_install_keeps_the_authors_row_open() -> Result<()> {
         use anyhow::Context as _;
         let fx = gss_leave_fixture_views(None, true, false).await?;
+        fx.replica
+            .named_group_test_recorders
+            .key_republish_suppressed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
         fx.state
             .named_group_test_recorders
@@ -5606,6 +5908,10 @@ mod daemon_tests {
     async fn a_keyless_gss_install_survives_a_restart() -> Result<()> {
         use anyhow::Context as _;
         let fx = gss_leave_fixture_build(None, false).await?;
+        fx.replica
+            .named_group_test_recorders
+            .key_republish_suppressed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let applied = ng::apply_named_group_metadata_event(
             &fx.state,
             fx.leave.clone(),

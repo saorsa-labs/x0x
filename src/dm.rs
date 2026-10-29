@@ -109,6 +109,10 @@ impl CapabilityRegistry {
     /// gives bits 4–9 to ADR 0110 and ADR 0109. Bit 4 is
     /// `eviction_handoff_v1`.
     pub const GUI_SHOW_V1: u64 = 1 << 10;
+    /// #1663: verifies and seats signed `MemberKeyRepublishV1` (`X0XKR1`)
+    /// — a member's republication of a fresh KEM key on its own
+    /// already-Active seat. Bit 11.
+    pub const KEY_REPUBLISH_V1: u64 = 1 << 11;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
@@ -124,7 +128,8 @@ impl CapabilityRegistry {
                 | Self::GROUP_RESEAT_MANDATE_V1
                 | Self::CERTIFICATE_REBIND_V1
                 | Self::OWNER_RECOVERY_V1
-                | Self::GUI_SHOW_V1,
+                | Self::GUI_SHOW_V1
+                | Self::KEY_REPUBLISH_V1,
         }
     }
 
@@ -158,6 +163,8 @@ impl CapabilityRegistry {
             || payload.starts_with(crate::gui::remote::ACTIVITY_PREFIX)
         {
             Some((Self::GUI_SHOW_V1, "gui_show_v1"))
+        } else if payload.starts_with(crate::groups::key_republish::KEY_REPUBLISH_PREFIX) {
+            Some((Self::KEY_REPUBLISH_V1, "key_republish_v1"))
         } else {
             None
         }
