@@ -2722,11 +2722,14 @@ fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadata
 
 fn named_group_member_values(info: &x0x::groups::GroupInfo) -> Vec<serde_json::Value> {
     // Include active + banned (banned members still appear in the roster for
-    // audit / admin view). Removed members are dropped.
+    // audit / admin view). Removed members are dropped. #1578 rc9: the
+    // join's own-key marker row holds no admission state, so it is not a
+    // member — the listing and the count stay exactly main's (no public
+    // API change).
     let mut members: Vec<&x0x::groups::GroupMember> = info
         .members_v2
         .values()
-        .filter(|m| !m.is_removed())
+        .filter(|m| !m.is_removed() && !join_seat_key_marker_only(info, &m.agent_id))
         .collect();
     members.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     members
@@ -2746,7 +2749,11 @@ fn named_group_member_values(info: &x0x::groups::GroupInfo) -> Vec<serde_json::V
 
 #[allow(dead_code)]
 fn named_group_member_values_all(info: &x0x::groups::GroupInfo) -> Vec<serde_json::Value> {
-    let mut members: Vec<&x0x::groups::GroupMember> = info.members_v2.values().collect();
+    let mut members: Vec<&x0x::groups::GroupMember> = info
+        .members_v2
+        .values()
+        .filter(|m| !join_seat_key_marker_only(info, &m.agent_id))
+        .collect();
     members.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     members
         .into_iter()
@@ -18622,6 +18629,15 @@ pub(in crate::server) async fn clear_group_quarantine(
 /// clear and the ADR 0107 re-arm keep working for an encrypted GSS
 /// join whose attempt expired.
 fn join_seat_key_marker_only(info: &x0x::groups::GroupInfo, joiner_hex: &str) -> bool {
+    // A Pending row with a live join request is a real seat marker (the
+    // request/approve path seats the requester on the authority's copy),
+    // not the join's key carrier.
+    if info.join_requests.values().any(|req| {
+        req.requester_agent_id.eq_ignore_ascii_case(joiner_hex)
+            && req.status == x0x::groups::JoinRequestStatus::Pending
+    }) {
+        return false;
+    }
     matches!(
         info.members_v2.get(joiner_hex),
         Some(member)
