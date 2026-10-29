@@ -6719,8 +6719,17 @@ pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState
         // uncommitted admission or removal. Drop both guards before the
         // direct-connection and gossip awaits below.
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-        let groups = state.named_groups.read().await;
-        let mut entries: Vec<_> = groups.iter().collect();
+        // #1699: every group's roster from the live map, whatever the
+        // caller's scope, with a staged re-seat record in place of its
+        // contained original (as when the staged join ran in the live map).
+        // The staging copy is taken first: no path holds both guards.
+        let staged = state.named_groups.staging_read().await.clone();
+        let groups = state.named_groups.live_read().await;
+        let mut entries: Vec<_> = groups
+            .iter()
+            .filter(|(key, _)| !staged.contains_key(*key))
+            .chain(staged.iter())
+            .collect();
         // Aliases may retain an older view. The exact stable-id key wins;
         // otherwise take the highest revision deterministically. A winning
         // withdrawn record clears its preference rather than reviving an
@@ -12181,19 +12190,26 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
     }
     // #1275: the response's events are applied and persisted, so the apply
     // runs shielded; awaiting it keeps the responses in arrival order.
+    // #1699: a staged re-seat join's catch-up applies to its staged tree.
+    let group_id = response.group_id.clone();
     let apply_state = Arc::clone(state);
     let sender = *sender;
     let sender_machine = *machine_id;
     state
         .run_shielded(Box::pin(async move {
-            handle_treekem_catchup_response(
-                &apply_state,
-                &sender,
-                &sender_machine,
-                verified,
-                response,
-            )
-            .await;
+            let stagings = &apply_state.reseat_stagings;
+            stagings
+                .run_in_staging_of(
+                    &group_id,
+                    handle_treekem_catchup_response(
+                        &apply_state,
+                        &sender,
+                        &sender_machine,
+                        verified,
+                        response,
+                    ),
+                )
+                .await;
         }))
         .await
         .is_some()
@@ -18040,17 +18056,26 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     envelope_bytes: Option<Vec<u8>>,
 ) -> Option<ApplyMetadataResult> {
     let apply_state = Arc::clone(state);
+    // #1699: an event of a group under re-seat applies to its staged
+    // record (ADR 0109 §3 step 2); the contained live record keeps its
+    // post-advance state until the swap.
+    let group_id = named_group_metadata_event_group_id(&event).to_string();
     // Boxed: the apply future is large; keep it off this caller's frame.
     state
         .run_shielded(Box::pin(async move {
-            apply_named_group_metadata_event(
-                &apply_state,
-                event,
-                sender,
-                verified,
-                envelope_bytes.as_deref(),
-            )
-            .await
+            let stagings = &apply_state.reseat_stagings;
+            stagings
+                .run_in_staging_of(
+                    &group_id,
+                    apply_named_group_metadata_event(
+                        &apply_state,
+                        event,
+                        sender,
+                        verified,
+                        envelope_bytes.as_deref(),
+                    ),
+                )
+                .await
         }))
         .await
 }
@@ -18971,7 +18996,18 @@ pub(in crate::server) async fn local_join_membership_state(
         return "active";
     }
     let stable = info.stable_group_id().to_string();
-    if expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some() {
+    // #1699: outside the scope of an open re-seat staging, the attempt
+    // under this key is the staged join's, not the contained original's
+    // (ADR 0109 §3 step 2: the live record keeps its membership label).
+    let staged_join = !crate::server::reseat_scope::in_any_reseat_scope()
+        && (state.reseat_stagings.scope_for(&stable).is_some()
+            || state
+                .reseat_stagings
+                .scope_for(&info.mls_group_id)
+                .is_some());
+    if !staged_join
+        && expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some()
+    {
         return "pending_authority_commit";
     }
     match info.members_v2.get(local_agent_hex) {
@@ -41776,20 +41812,28 @@ async fn encode_named_groups_store_excluding_pending_stubs(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     always_include: Option<&str>,
 ) -> std::io::Result<(String, String)> {
-    let durable_view = {
-        let pending = state
-            .pending_join_stubs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (!pending.is_empty()).then(|| {
-            let mut durable_view = groups.clone();
-            durable_view.retain(|key, _| {
-                Some(key.as_str()) == always_include || !pending.contains(key.as_str())
-            });
-            durable_view
-        })
-    };
+    let has_pending = !state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty();
+    let durable_view =
+        has_pending.then(|| without_pending_join_stubs(state, groups.clone(), always_include));
     encode_named_groups_store_for_state(state, durable_view.as_ref().unwrap_or(groups)).await
+}
+
+/// `groups` without unconfirmed join stubs, except `always_include`.
+fn without_pending_join_stubs(
+    state: &AppState,
+    mut groups: HashMap<String, x0x::groups::GroupInfo>,
+    always_include: Option<&str>,
+) -> HashMap<String, x0x::groups::GroupInfo> {
+    let pending = state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    groups.retain(|key, _| Some(key.as_str()) == always_include || !pending.contains(key.as_str()));
+    groups
 }
 
 /// The production store encoder: ADR 0109 §4's S3 placeholder transaction
@@ -41815,6 +41859,18 @@ async fn encode_named_groups_store_allowing(
     allow: Option<&str>,
 ) -> std::io::Result<(String, String)> {
     group_recovery::refuse_roster_write_during_failed_swap(state, allow).await?;
+    // #1699: a write from inside a re-seat scope (ADR 0109 §3 step 2)
+    // changed the staging slot, which never reaches disk. The disk view is
+    // the live map, without unconfirmed join stubs; the open journal's
+    // overlay keeps the original of the group under re-seat.
+    let live_view;
+    let groups = if crate::server::reseat_scope::in_any_reseat_scope() {
+        let live = state.named_groups.live_read().await.clone();
+        live_view = without_pending_join_stubs(state, live, None);
+        &live_view
+    } else {
+        groups
+    };
     // Stack budget (see `migrate_unsplit_home_suite_store_if_needed`): the
     // S3 sidecar writer future lives on the heap, not in every save path.
     match Box::pin(group_recovery::legacy_store_view(state, groups)).await {
@@ -44390,8 +44446,9 @@ where
         // A NEWER attempt owns the key.
         return false;
     }
-    // The slot is claimed (registry lock held): spawn and register.
-    let handle = tokio::spawn(task);
+    // The slot is claimed (registry lock held): spawn and register. A
+    // staged re-seat join's attempt task stays in its scope (#1699).
+    let handle = tokio::spawn(crate::server::reseat_scope::inherit_reseat_scope(task));
     #[cfg(test)]
     if let Ok(mut ledger) = ATTEMPT_TASK_HANDLES_FOR_TEST.lock() {
         ledger.push((attempt_id.to_string(), handle.abort_handle()));
@@ -46447,11 +46504,27 @@ pub(in crate::server) async fn dispatch_join_result_message(
         // so they run shielded: an abort of this listener cannot cut them
         // off. The listener awaits each, so they still apply in order.
         // `false` (shutdown refused it, or it panicked) stops the listener.
+        // #1699: the result of a staged re-seat join seats its staged
+        // record. A fetch request (below) is served from the live record.
+        let group_id = match &msg {
+            JoinResultMessage::Result { event, .. } => {
+                named_group_metadata_event_group_id(event).to_string()
+            }
+            JoinResultMessage::Refused { receipt } => receipt.group_id.clone(),
+            JoinResultMessage::Pending { notice } => notice.group_id.clone(),
+            JoinResultMessage::FetchRequest { group_id, .. } => group_id.clone(),
+        };
         let apply_state = Arc::clone(state);
         let sender = *sender;
         return state
             .run_shielded(Box::pin(async move {
-                handle_join_result_message(&apply_state, &sender, verified, msg).await;
+                let stagings = &apply_state.reseat_stagings;
+                stagings
+                    .run_in_staging_of(
+                        &group_id,
+                        handle_join_result_message(&apply_state, &sender, verified, msg),
+                    )
+                    .await;
             }))
             .await
             .is_some();
@@ -49073,6 +49146,62 @@ pub(in crate::server) type WelcomeFetchWaiter =
 pub(in crate::server) mod tests {
     use super::*;
 
+    /// #1699 part 1 (ZCode on #1703): a roster save from inside a re-seat
+    /// scope encodes the live map without unconfirmed join stubs, never
+    /// the staging slot it changed; outside a scope the encoder takes the
+    /// map it is given. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_save_inside_a_reseat_scope_encodes_the_live_map_without_pending_stubs(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let creator = state.agent.agent_id();
+        let record = |name: &str, key: &str| {
+            x0x::groups::GroupInfo::new(name.to_string(), String::new(), creator, key.to_string())
+        };
+        let (live_key, stub_key, staged_key) = ("a1".repeat(16), "b2".repeat(16), "c3".repeat(16));
+        let live = record("live", &live_key);
+        let staged = record("staged", &staged_key);
+        {
+            let mut groups = state.named_groups.live_write().await;
+            groups.clear();
+            groups.insert(live_key.clone(), live.clone());
+            groups.insert(stub_key.clone(), record("stub", &stub_key));
+        }
+        state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stub_key.clone());
+        let expected = encode_named_groups_store(&HashMap::from([(live_key.clone(), live)]))?;
+        let scope = state
+            .reseat_stagings
+            .open(&staged_key, staged.stable_group_id());
+        let encoded = crate::server::reseat_scope::in_reseat_scope(scope, async {
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(staged_key.clone(), staged.clone());
+            let groups = state.named_groups.read().await;
+            encode_named_groups_store_allowing(&state, &groups, None).await
+        })
+        .await?;
+        assert_eq!(encoded, expected, "the live map, without the stub");
+        assert!(state
+            .named_groups
+            .live_read()
+            .await
+            .get(&staged_key)
+            .is_none());
+        let given = HashMap::from([(staged_key.clone(), staged)]);
+        assert_eq!(
+            encode_named_groups_store_allowing(&state, &given, None).await?,
+            encode_named_groups_store(&given)?,
+            "outside a scope: the given map"
+        );
+        Ok(())
+    }
+
     /// ADR 0108 §8 (#1575): the notice currently staged for one
     /// `(group, member, attempt)`, as `(cause, signer_agent_id, detail)`.
     pub(in crate::server) fn staged_join_pending_notice(
@@ -49984,7 +50113,7 @@ pub(in crate::server) mod tests {
             task_list_state_dir: data_dir.join("task-lists"),
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
-            named_groups: RwLock::new(named_groups),
+            named_groups: crate::server::reseat_scope::ScopedGroupMap::new(named_groups),
             gss_publication_gate: Arc::new(RwLock::new(())),
             group_roster_gossip_lock: Mutex::new(BTreeMap::new()),
             named_groups_path,
@@ -50024,7 +50153,7 @@ pub(in crate::server) mod tests {
                     .unwrap_or_default(),
             ),
             profile_path: data_dir.join("profile.json"),
-            mls_groups: RwLock::new(HashMap::new()),
+            mls_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             mls_groups_path: data_dir.join("mls_groups.bin"),
             pending_join_results: RwLock::new(HashMap::new()),
             pending_join_refusals: StdMutex::new(HashMap::new()),
@@ -50089,7 +50218,8 @@ pub(in crate::server) mod tests {
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
-            treekem_groups: RwLock::new(HashMap::new()),
+            reseat_stagings: Default::default(),
+            treekem_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             treekem_dir,
             revocation_evictions: S4Runtime::default(),
             group_recovery: S3Runtime::default(),
