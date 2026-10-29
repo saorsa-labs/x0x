@@ -301,7 +301,8 @@ the exact merged head of PR #1586.
 | 8 | `group_terminal_attest_v1` | Issues and verifies admin terminal attestations, answers `group_attest_request`, consumes re-seat authorisations | ADR 0109 §5 (accepted 2026-10-20) |
 | 9 | `group_reseat_mandate_v1` | Verifies and applies promoted-admin `ReseatMandateV1` commits | ADR 0109 §3a (accepted 2026-10-20) |
 | 10 | `gui_show_v1` | Understands remote GUI show typed direct messages | ADR 0083 slice 3 (lowest free bit on 2026-10-23) |
-| 11–63 | unallocated | Must not be advertised until allocated | — |
+| 11 | `join_pending_notice_v1` | Serves and understands `JoinPendingNotice` on the join-result poll | ADR 0108 §8 (accepted 2026-10-05; wire half ruled by David 2026-10-25, D-ruling 05:14 GMT; next free bit in acceptance order) |
+| 12–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Rejected
 
