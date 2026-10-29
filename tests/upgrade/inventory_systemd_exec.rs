@@ -19,33 +19,28 @@ fn changed(index: usize, value: Value) -> String {
 fn legacy_preserves_every_field_and_marks_missing_flag_evidence() {
     let reply = parse(LEGACY, "ExecStart").unwrap();
     assert_eq!(reply.property, "ExecStart");
-    assert_eq!(
-        reply.commands,
-        vec![ExecutionCommand {
-            executable: "/opt/x0x/x0xd".into(),
-            argv: vec![
-                "custom argv0".into(),
-                "--name".into(),
-                "alice".into(),
-                "".into()
-            ],
-            flags: ExecutionFlags::LegacyIgnoreFailure(true),
-            start_realtime_usec: 11,
-            start_monotonic_usec: 12,
-            exit_realtime_usec: 21,
-            exit_monotonic_usec: 22,
-            pid: 42,
-            code: -1,
-            status: 9,
-        }]
-    );
-    assert_eq!(
+    assert_eq!(reply.commands.len(), 1);
+    let command = &reply.commands[0];
+    assert_eq!(command.executable, "/opt/x0x/x0xd");
+    assert_eq!(command.argv, ["custom argv0", "--name", "alice", ""]);
+    assert!(matches!(
+        command.flags,
+        ExecutionFlags::LegacyIgnoreFailure(true)
+    ));
+    assert_eq!(command.start_realtime_usec, 11);
+    assert_eq!(command.start_monotonic_usec, 12);
+    assert_eq!(command.exit_realtime_usec, 21);
+    assert_eq!(command.exit_monotonic_usec, 22);
+    assert_eq!(command.pid, 42);
+    assert_eq!(command.code, -1);
+    assert_eq!(command.status, 9);
+    assert!(matches!(
         parse(&LEGACY.replace("true", "false"), "ExecStop")
             .unwrap()
             .commands[0]
             .flags,
         ExecutionFlags::LegacyIgnoreFailure(false)
-    );
+    ));
 }
 
 #[test]
@@ -53,32 +48,28 @@ fn extended_retains_helpers_expansions_unknown_flags_and_zero_status() {
     let reply = parse(EXTENDED, "ExecStartPreEx").unwrap();
     assert_eq!(reply.property, "ExecStartPreEx");
     assert_eq!(reply.commands.len(), 2);
-    assert_eq!(
-        reply.commands[0],
-        ExecutionCommand {
-            executable: "/usr/bin/helper".into(),
-            argv: vec![
-                "helper".into(),
-                "$ARG".into(),
-                "%i".into(),
-                "two words".into()
-            ],
-            flags: ExecutionFlags::Extended(vec![
-                "ignore-failure".into(),
-                "no-env-expand".into(),
-                "future-option".into()
-            ]),
-            start_realtime_usec: 31,
-            start_monotonic_usec: 32,
-            exit_realtime_usec: 41,
-            exit_monotonic_usec: 42,
-            pid: 99,
-            code: 1,
-            status: -9,
-        }
-    );
+    let command = &reply.commands[0];
+    assert_eq!(command.executable, "/usr/bin/helper");
+    assert_eq!(command.argv, ["helper", "$ARG", "%i", "two words"]);
+    assert!(matches!(command.flags, ExecutionFlags::Extended(_)));
+    if let ExecutionFlags::Extended(flags) = &command.flags {
+        assert_eq!(
+            flags.as_slice(),
+            ["ignore-failure", "no-env-expand", "future-option"]
+        );
+    }
+    assert_eq!(command.start_realtime_usec, 31);
+    assert_eq!(command.start_monotonic_usec, 32);
+    assert_eq!(command.exit_realtime_usec, 41);
+    assert_eq!(command.exit_monotonic_usec, 42);
+    assert_eq!(command.pid, 99);
+    assert_eq!(command.code, 1);
+    assert_eq!(command.status, -9);
     assert_eq!(reply.commands[1].executable, "x0xd");
-    assert_eq!(reply.commands[1].flags, ExecutionFlags::Extended(vec![]));
+    assert!(matches!(
+        reply.commands[1].flags,
+        ExecutionFlags::Extended(ref flags) if flags.is_empty()
+    ));
     assert_eq!(reply.commands[1].pid, 0);
     assert_eq!(reply.commands[1].start_realtime_usec, 0);
     let escaped = changed(1, json!(["héllo", "a\nb", "quote\"slash\\", ""]));
@@ -104,7 +95,17 @@ fn retains_repeated_commands_and_all_seven_property_pairs() {
     ] {
         let result = parse(&value.to_string(), name).unwrap();
         assert_eq!(result.commands.len(), 2);
-        assert_eq!(result.commands[0], result.commands[1]);
+        let (first, second) = (&result.commands[0], &result.commands[1]);
+        assert_eq!(first.executable, second.executable);
+        assert_eq!(first.argv, second.argv);
+        assert_eq!(first.flags, second.flags);
+        assert_eq!(first.start_realtime_usec, second.start_realtime_usec);
+        assert_eq!(first.start_monotonic_usec, second.start_monotonic_usec);
+        assert_eq!(first.exit_realtime_usec, second.exit_realtime_usec);
+        assert_eq!(first.exit_monotonic_usec, second.exit_monotonic_usec);
+        assert_eq!(first.pid, second.pid);
+        assert_eq!(first.code, second.code);
+        assert_eq!(first.status, second.status);
         assert!(parse(EXTENDED, &format!("{name}Ex")).is_ok());
     }
 }
@@ -158,6 +159,16 @@ fn refuses_nonobject_duplicate_missing_extra_and_concatenated_envelopes() {
     }
     assert!(parse(&format!("{LEGACY}\n{LEGACY}"), "ExecStart").is_err());
     assert!(parse_property("ExecStart", &[0xff]).is_err());
+    assert_eq!(
+        parse(&format!(" \t\r\n{LEGACY}"), "ExecStart")
+            .unwrap()
+            .commands[0]
+            .executable,
+        "/opt/x0x/x0xd"
+    );
+    for prefix in ['\u{000b}', '\u{000c}'] {
+        assert!(parse(&format!("{prefix}{LEGACY}"), "ExecStart").is_err());
+    }
 }
 
 #[test]
@@ -205,13 +216,17 @@ fn refuses_nul_and_empty_path_argv_or_flag_without_returning_partial_data() {
 #[test]
 fn exact_integer_ranges_preserve_status_without_rounding_or_wrapping() {
     for index in 3..7 {
-        assert_eq!(
-            parse(&changed(index, json!(u64::MAX)), "ExecStartEx")
-                .unwrap()
-                .commands
-                .len(),
-            2
-        );
+        let command = &parse(&changed(index, json!(u64::MAX)), "ExecStartEx")
+            .unwrap()
+            .commands[0];
+        let stored = match index {
+            3 => command.start_realtime_usec,
+            4 => command.start_monotonic_usec,
+            5 => command.exit_realtime_usec,
+            6 => command.exit_monotonic_usec,
+            _ => unreachable!("time fields occupy indexes 3 through 6"),
+        };
+        assert_eq!(stored, u64::MAX);
         for value in [json!(-1), json!(1.25), json!("1")] {
             assert!(parse(&changed(index, value), "ExecStartEx").is_err());
         }
@@ -228,7 +243,15 @@ fn exact_integer_ranges_preserve_status_without_rounding_or_wrapping() {
     }
     for index in [8, 9] {
         for value in [i32::MIN, i32::MAX] {
-            assert!(parse(&changed(index, json!(value)), "ExecStartEx").is_ok());
+            let command = &parse(&changed(index, json!(value)), "ExecStartEx")
+                .unwrap()
+                .commands[0];
+            let stored = if index == 8 {
+                command.code
+            } else {
+                command.status
+            };
+            assert_eq!(stored, value);
         }
         for value in [i64::from(i32::MIN) - 1, i64::from(i32::MAX) + 1] {
             assert!(parse(&changed(index, json!(value)), "ExecStartEx").is_err());
@@ -264,4 +287,57 @@ fn enforces_input_command_argument_and_flag_capacity_at_boundaries() {
     );
     value["data"].as_array_mut().unwrap().push(row);
     assert!(parse(&value.to_string(), "ExecStart").is_err());
+}
+
+#[test]
+fn legacy_debug_redacts_fields_in_leaf_and_nested_formats() {
+    let reply = parse(LEGACY, "ExecStart").unwrap();
+    let command = &reply.commands[0];
+    assert_eq!(command.executable, "/opt/x0x/x0xd");
+    assert_eq!(command.argv[2], "alice");
+    assert_eq!(command.pid, 42);
+    for rendered in [
+        format!("{:?}", command.flags),
+        format!("{:#?}", command.flags),
+        format!("{command:?}"),
+        format!("{command:#?}"),
+        format!("{:?}", reply.commands),
+        format!("{:#?}", reply.commands),
+        format!("{reply:?}"),
+        format!("{reply:#?}"),
+    ] {
+        assert!(!rendered.contains("/opt/x0x"));
+        assert!(!rendered.contains("alice"));
+        assert!(!rendered.contains("custom argv0"));
+        assert!(!rendered.contains("42"));
+        assert!(rendered.contains("<redacted>"));
+    }
+}
+
+#[test]
+fn extended_debug_redacts_fields_in_leaf_and_nested_formats() {
+    let reply = parse(EXTENDED, "ExecStartEx").unwrap();
+    let command = &reply.commands[0];
+    assert_eq!(command.executable, "/usr/bin/helper");
+    assert_eq!(command.argv[1], "$ARG");
+    assert!(matches!(command.flags, ExecutionFlags::Extended(_)));
+    if let ExecutionFlags::Extended(flags) = &command.flags {
+        assert_eq!(flags[2], "future-option");
+    }
+    for rendered in [
+        format!("{:?}", command.flags),
+        format!("{:#?}", command.flags),
+        format!("{command:?}"),
+        format!("{command:#?}"),
+        format!("{:?}", reply.commands),
+        format!("{:#?}", reply.commands),
+        format!("{reply:?}"),
+        format!("{reply:#?}"),
+    ] {
+        assert!(!rendered.contains("/usr/bin/helper"));
+        assert!(!rendered.contains("$ARG"));
+        assert!(!rendered.contains("future-option"));
+        assert!(!rendered.contains("two words"));
+        assert!(rendered.contains("<redacted>"));
+    }
 }

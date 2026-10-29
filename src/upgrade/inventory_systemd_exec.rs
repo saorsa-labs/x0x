@@ -3,11 +3,14 @@
 //! This decodes `busctl --json=short get-property` for the seven Service Exec
 //! properties and their Ex forms (systemd v255). It does not read the bus, run
 //! commands, expand arguments, resolve executable identity or establish launch
-//! authority. Empty output proves no configured-job absence. Callers must bind
-//! the supplied property to the queried manager, unit and interface separately.
+//! authority. An empty property grants no absence or complete-host authority.
+//! Callers must bind the supplied property to the queried manager, unit and
+//! interface separately.
+#![cfg(unix)]
 #![allow(dead_code)]
 
 use serde::{de::DeserializeOwned, Deserialize};
+use std::fmt;
 use std::io;
 
 const MAX_BYTES: usize = 1_048_576;
@@ -26,7 +29,7 @@ const PROPERTIES: [&str; 7] = [
     "ExecStopPost",
 ];
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(crate) enum ExecutionFlags {
     /// The legacy property omits all flags other than ignore-failure. It must
     /// never be interpreted as evidence that other launch flags are absent.
@@ -36,7 +39,7 @@ pub(crate) enum ExecutionFlags {
     Extended(Vec<String>),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(crate) struct ExecutionCommand {
     pub(crate) executable: String,
     pub(crate) argv: Vec<String>,
@@ -50,10 +53,29 @@ pub(crate) struct ExecutionCommand {
     pub(crate) status: i32,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(crate) struct ExecutionProperty {
     pub(crate) property: String,
     pub(crate) commands: Vec<ExecutionCommand>,
+}
+
+// Executable paths, argv and launch flags are host-private inventory.
+impl fmt::Debug for ExecutionFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExecutionFlags(<redacted>)")
+    }
+}
+
+impl fmt::Debug for ExecutionCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExecutionCommand(<redacted>)")
+    }
+}
+
+impl fmt::Debug for ExecutionProperty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExecutionProperty(<redacted>)")
+    }
 }
 
 #[derive(Deserialize)]
@@ -80,7 +102,9 @@ pub(crate) fn parse_property(property: &str, bytes: &[u8]) -> io::Result<Executi
     if !PROPERTIES.contains(&base) {
         return Err(refusal("unsupported execution property"));
     }
-    if bytes.len() > MAX_BYTES || bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+    if bytes.len() > MAX_BYTES
+        || bytes.iter().find(|byte| !b" \t\r\n".contains(byte)) != Some(&b'{')
+    {
         return Err(refusal("execution reply is oversized or not an object"));
     }
     let commands = if extended {
