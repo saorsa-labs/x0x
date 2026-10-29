@@ -3590,15 +3590,19 @@ for one of these reasons:
 - the sender's attribution set overflowed and a revoked machine is also
   attributed to that sender
 - the stranger revocation pin cap is full (2,048 pinned pairs, half of
-  the 4,096 stranger share) and this sender's revoked pair was actually
-  dropped or could not be pinned
+  the 4,096 stranger share; a smaller share uses half of that share)
+  and this sender still has a revoked pair that was dropped or could
+  not be pinned
 
 An overflowed attribution set does not by itself refuse an unattested
 message. When the stranger pin cap is full, refuse unattested traffic
-only from an agent whose revoked pair was actually dropped or could not
-be pinned, and count only those refusals in `incoming_dropped_revoked`.
-Never evict a revoked pin. A sender this receiver cannot link to a
-revoked machine keeps its normal policy. A Trusted or Known contact, and
+only from an agent who still has a revoked pair that was dropped or
+could not be pinned, and count only those refusals in
+`incoming_dropped_revoked`. Those records are capped at the stranger
+share. A clean answer or a restart drops them. An open pin cap does not
+refuse. Never evict a revoked pin. Eviction pins a revoked pair when
+the cap and the per-agent limit both have room. A sender this receiver
+cannot link to a revoked machine keeps its normal policy. A Trusted or Known contact, and
 a protected non-contact, are not refused for the pin cap. An internal
 counter for the overflow and dropped-pair refusals stays off this
 response. The daemon emits a rate-limited warning for them, one

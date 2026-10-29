@@ -108,14 +108,22 @@ The inbox attributes these machines to the sender:
   non-contact share evicts the least-recently used pair in that share
   that is not pinned. A revoked machine is pinned in the protected
   share, up to 2 per agent. In the stranger share the same per-agent
-  limit applies, and the share also caps pins at 2,048 pairs. The cap
-  is half the stranger share. A revoked pair becomes a pin when the cap
-  and the per-agent limit both have room. The inbox never evicts a
-  revoked pin to make room. A revoked stranger pair that was dropped, or
-  that could not be pinned, is not a pin. When the pin cap is full, an
-  unattested DM or ACK is refused only from an agent whose revoked pair
-  was actually dropped or could not be pinned, and only that refusal is
-  counted. A sender this receiver cannot link to a revoked machine keeps
+  limit applies. The production pin cap is 2,048 pairs, half of the
+  4,096 stranger share. A smaller stranger share uses half of that share.
+  A revoked pair becomes a pin when the cap and the per-agent limit both
+  have room, including when eviction reaches a pair that was recorded
+  clean and revoked later. Eviction does not drop that pair while both
+  limits have room. A later revoked pair does not replace a pin this
+  cache already holds. The inbox never evicts a revoked pin to make room.
+  Leaving the stranger share releases that agent's pins. A revoked
+  stranger pair that was dropped, or that could not be pinned, is not a
+  pin. Those records are capped at the stranger share size. One agent
+  remembers at most 8 of them. The oldest record is forgotten when a new
+  one does not fit. Forgetting a record is a residual. A clean probe
+  answer for a remembered machine removes it. When the pin cap is full,
+  an unattested DM or ACK is refused only from an agent who still has
+  such a record, and only that refusal is counted. An open pin cap does
+  not refuse that agent. A sender this receiver cannot link to a revoked machine keeps
   ADR 0021 policy, including while the pin cap is full. A contact and a
   protected non-contact are not that stranger. The pin uses the revocation probe
   `x0xd` installs. A confirmed revocation counts toward that pin. An
@@ -207,10 +215,12 @@ strip residual: an unattested envelope whose origin attestation was
 removed, claiming a machine this receiver cannot attribute.
 
 Restart residual. A machine known only through the in-memory accepted
-set is not attributed after a restart. The revocation record for that
-machine can still be stored. An unattested DM that claims a different,
-clean machine is accepted again, because the inbox can no longer
-attribute the revoked machine to the sender. Contacts, binding
+set is not attributed after a restart. The stranger pins and the
+dropped-pair records are the same process memory. A restart drops them
+too. The revocation record for that machine can still be stored. An
+unattested DM that claims a different, clean machine is accepted again,
+because the inbox can no longer attribute the revoked machine to the
+sender and it no longer holds the dropped-pair record. Contacts, binding
 tombstones, the claimed machine, and a retained binding that has been
 rebuilt in this process still count. Those records already persist.
 The accepted-machine history does not.

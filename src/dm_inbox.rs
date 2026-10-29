@@ -140,20 +140,27 @@ const ACCEPTED_MACHINE_PAIR_CAPACITY: usize = 65_536;
 /// pair evicts the least-recently used stranger pair that is not pinned.
 /// A revoked machine is pinned, up to 2 per agent. The share also caps
 /// those pins at [`STRANGER_REVOKED_PIN_CAP`], so a flood of self-issued
-/// revocations cannot pin every slot. A revoked pair that does not fit
-/// that cap can be dropped. A pin is never evicted to make room. A clean
-/// stranger pair can still be evicted. That loss is a residual. An unknown
-/// revocation answer is not evicted. It does not evict a contact pair or a
-/// protected non-contact pair. This share stays reserved when the other
-/// shares are full.
+/// revocations cannot pin every slot. Eviction pins a revoked pair that
+/// is not yet a pin when the cap and the per-agent limit both have room,
+/// including a pair recorded clean and revoked later. A later revoked
+/// pair does not replace a pin already held. A pin is never evicted to
+/// make room. Leaving the stranger share releases that agent's pins.
+/// A revoked pair that does not fit is remembered, up to this share's
+/// size and 8 machines for one agent. The oldest of those records is
+/// forgotten. A clean stranger pair can still be evicted. Those losses
+/// are residuals. An unknown revocation answer is not evicted. It does
+/// not evict a contact pair or a protected non-contact pair. This share
+/// stays reserved when the other shares are full.
 const ACCEPTED_MACHINE_STRANGER_PAIRS: usize = 4_096;
 /// Confirmed revoked pairs that stay pinned in the stranger share.
-/// Half of [`ACCEPTED_MACHINE_STRANGER_PAIRS`]. A revoked pair is pinned
-/// when this cap and the per-agent limit both have room. The inbox never
-/// evicts a pin. When the cap is full, an unattested DM or ACK is refused
-/// only for an agent whose revoked pair was dropped or could not be pinned.
-/// A sender with no such pair keeps ADR 0021 policy. A contact or a
-/// protected non-contact is not refused for the cap.
+/// Half of [`ACCEPTED_MACHINE_STRANGER_PAIRS`]. A smaller stranger share
+/// uses half of that share. A revoked pair is pinned when this cap and
+/// the per-agent limit both have room. The inbox never evicts a pin.
+/// When the cap is full, an unattested DM or ACK is refused only for an
+/// agent who still has a dropped or unpinned revoked pair. A sender with
+/// no such record keeps ADR 0021 policy. A contact or a protected
+/// non-contact is not refused for the cap. The pins and those records
+/// are process memory. A restart drops them.
 const STRANGER_REVOKED_PIN_CAP: usize = ACCEPTED_MACHINE_STRANGER_PAIRS / 2;
 /// Protected non-contact share of [`ACCEPTED_MACHINE_PAIR_CAPACITY`].
 /// A member of a group whose admission needs an invite or approval, or a
@@ -368,8 +375,11 @@ pub(crate) fn probe_view(
 /// share evicts the least-recently used pair in that share. It does not
 /// evict a contact pair. The stranger share stays reserved when the other
 /// shares are full. A stranger flood that evicts a clean stranger pair, or
-/// a revoked pair past the share pin cap, is a residual. A revoked stranger
-/// pin stays, up to 2 per agent and up to half the stranger share.
+/// a revoked pair past the share pin cap, or a dropped-pair record past
+/// the stranger share, is a residual. A revoked stranger pin stays, up to
+/// 2 per agent and up to half the stranger share. Eviction pins a revoked
+/// pair when both limits have room. Dropped-pair records are capped at
+/// the stranger share, at most 8 machines for one agent.
 /// Standing is chosen again on every record and on every contact
 /// change. Dropping or downgrading a contact keeps protection that still
 /// comes from a qualifying group or a grant. One agent can record 8
@@ -389,8 +399,12 @@ pub(crate) fn probe_view(
 /// are pinned, up to 2 per agent, when the revocation probe confirms the
 /// revocation. A stranger agent's revoked machines use the same per-agent
 /// limit and a share cap of half the stranger share. A pin is never
-/// evicted. A revoked pair that does not fit the pin cap can be dropped,
-/// and that agent is refused only while the cap stays full. Contact
+/// evicted. Eviction pins a revoked pair when both limits have room.
+/// A later revoked pair does not replace a pin. Leaving the stranger
+/// share releases that agent's pins. A revoked pair that does not fit
+/// is remembered only up to the stranger share size, and that agent is
+/// refused only while the cap stays full and the record remains. A
+/// restart drops the pins and those records. Contact
 /// promotion and demotion keep the 2 newest revoked machines that fit.
 /// An unknown answer does not evict
 /// that pair and does not count as a confirmed revocation. Unknown pairs
@@ -448,11 +462,21 @@ pub struct AuthenticatedMachineBindingCache {
     stranger_clock: u64,
     /// Revoked stranger pairs that stay. Eviction does not remove one.
     stranger_revoked_pins: std::collections::HashSet<([u8; 32], [u8; 32])>,
-    /// Revoked pairs that were dropped or could not be pinned.
-    /// Key is `(agent, machine)`. A clean answer removes the entry.
-    revoked_unpinned_pairs: std::collections::HashSet<([u8; 32], [u8; 32])>,
-    /// Agents with at least one entry in [`Self::revoked_unpinned_pairs`].
-    revoked_unpinned_agents: std::collections::HashSet<AgentId>,
+    /// Pins grouped by agent. At most [`PINNED_REVOKED_MACHINES_PER_AGENT`].
+    /// A count does not scan [`Self::stranger_revoked_pins`].
+    stranger_pins_by_agent:
+        std::collections::HashMap<AgentId, std::collections::HashSet<MachineId>>,
+    /// Oldest-first records of revoked pairs that were dropped or could not
+    /// be pinned. Capped at the stranger share size.
+    revoked_unpinned_order: std::collections::BTreeSet<(u64, [u8; 32], [u8; 32])>,
+    /// `(agent, machine)` to its order clock. Removal is one lookup.
+    revoked_unpinned_index: std::collections::HashMap<([u8; 32], [u8; 32]), u64>,
+    /// Machines in [`Self::revoked_unpinned_index`], grouped by agent.
+    /// At most [`ACCEPTED_MACHINES_PER_AGENT`] per agent. An empty set is
+    /// removed. The refusal check does not scan the whole index.
+    revoked_unpinned_by_agent:
+        std::collections::HashMap<AgentId, std::collections::HashSet<MachineId>>,
+    revoked_unpinned_clock: u64,
     /// Accept order for every share, including contacts. Demotion and
     /// promotion use it so the newest revoked pairs stay.
     pair_recency: std::collections::HashMap<([u8; 32], [u8; 32]), u64>,
@@ -500,8 +524,11 @@ impl Default for AuthenticatedMachineBindingCache {
             stranger_index: std::collections::HashMap::new(),
             stranger_clock: 0,
             stranger_revoked_pins: std::collections::HashSet::new(),
-            revoked_unpinned_pairs: std::collections::HashSet::new(),
-            revoked_unpinned_agents: std::collections::HashSet::new(),
+            stranger_pins_by_agent: std::collections::HashMap::new(),
+            revoked_unpinned_order: std::collections::BTreeSet::new(),
+            revoked_unpinned_index: std::collections::HashMap::new(),
+            revoked_unpinned_by_agent: std::collections::HashMap::new(),
+            revoked_unpinned_clock: 0,
             pair_recency: std::collections::HashMap::new(),
             pair_recency_clock: 0,
             protected_order: std::collections::BTreeSet::new(),
@@ -557,8 +584,11 @@ impl AuthenticatedMachineBindingCache {
             stranger_index: std::collections::HashMap::new(),
             stranger_clock: 0,
             stranger_revoked_pins: std::collections::HashSet::new(),
-            revoked_unpinned_pairs: std::collections::HashSet::new(),
-            revoked_unpinned_agents: std::collections::HashSet::new(),
+            stranger_pins_by_agent: std::collections::HashMap::new(),
+            revoked_unpinned_order: std::collections::BTreeSet::new(),
+            revoked_unpinned_index: std::collections::HashMap::new(),
+            revoked_unpinned_by_agent: std::collections::HashMap::new(),
+            revoked_unpinned_clock: 0,
             pair_recency: std::collections::HashMap::new(),
             pair_recency_clock: 0,
             protected_order: std::collections::BTreeSet::new(),
@@ -870,11 +900,6 @@ impl AuthenticatedMachineBindingCache {
                 .iter()
                 .map(|(_, _, machine)| MachineId(*machine)),
         );
-        probe_ids.extend(
-            self.revoked_unpinned_pairs
-                .iter()
-                .map(|(_, machine)| MachineId(*machine)),
-        );
         let snapshot = self.snapshot_revocations(probe_ids);
         self.release_clean_stranger_pins(&snapshot);
         machines.sort_by_key(|machine| {
@@ -1023,6 +1048,8 @@ impl AuthenticatedMachineBindingCache {
                     self.attribution_stranger_pairs_len.saturating_sub(1);
             }
         }
+        self.release_agent_stranger_pins(agent_id);
+        self.clear_revoked_unpinned_agent(agent_id);
     }
 
     fn forget_protected(&mut self, agent_id: AgentId) {
@@ -1094,6 +1121,24 @@ impl AuthenticatedMachineBindingCache {
     #[cfg(test)]
     pub(crate) fn attribution_stranger_pairs_len(&self) -> usize {
         self.attribution_stranger_pairs_len
+    }
+
+    /// Dropped or unpinned revoked pairs still remembered.
+    #[cfg(test)]
+    pub(crate) fn revoked_unpinned_len(&self) -> usize {
+        self.revoked_unpinned_index.len()
+    }
+
+    /// True when this agent still has a dropped or unpinned revoked pair.
+    #[cfg(test)]
+    pub(crate) fn revoked_unpinned_contains(&self, agent_id: AgentId) -> bool {
+        self.revoked_unpinned_by_agent.contains_key(&agent_id)
+    }
+
+    /// Apply a clean probe answer to this agent's dropped-pair records.
+    #[cfg(test)]
+    pub(crate) fn refresh_unpinned_agent_for_test(&mut self, agent_id: AgentId) {
+        self.refresh_unpinned_agent(agent_id);
     }
 
     /// Install the group-member and grant-party check. Replaces any
@@ -1277,19 +1322,17 @@ impl AuthenticatedMachineBindingCache {
     ///
     /// The revocation probe is read once into `snapshot` when the caller did
     /// not already take one. A pin is never evicted. An unknown answer is
-    /// not evicted. A revoked pair that is not a pin can be evicted, and
-    /// that agent is remembered so a full pin cap can refuse them.
+    /// not evicted. A revoked pair is pinned when the share cap and the
+    /// per-agent limit both have room, and is then skipped. A revoked pair
+    /// that still does not fit is dropped, and that agent is remembered so
+    /// a full pin cap can refuse them. The snapshot covers the stranger
+    /// share only.
     fn evict_lru_stranger(&mut self) -> bool {
-        let mut machines: Vec<MachineId> = self
+        let machines: Vec<MachineId> = self
             .stranger_order
             .iter()
             .map(|(_, _, machine)| MachineId(*machine))
             .collect();
-        machines.extend(
-            self.revoked_unpinned_pairs
-                .iter()
-                .map(|(_, machine)| MachineId(*machine)),
-        );
         let snapshot = self.snapshot_revocations(machines);
         self.evict_lru_stranger_with(&snapshot)
     }
@@ -1299,35 +1342,38 @@ impl AuthenticatedMachineBindingCache {
         snapshot: &std::collections::HashMap<MachineId, RevocationPin>,
     ) -> bool {
         self.release_clean_stranger_pins(snapshot);
-        let Some((_, agent, machine)) =
-            self.stranger_order
-                .iter()
+        let order: Vec<(u64, [u8; 32], [u8; 32])> = self.stranger_order.iter().copied().collect();
+        for (_, agent, machine) in order {
+            if self.stranger_revoked_pins.contains(&(agent, machine)) {
+                continue;
+            }
+            let agent_id = AgentId(agent);
+            let machine_id = MachineId(machine);
+            match snapshot
+                .get(&machine_id)
                 .copied()
-                .find(|(_, agent, machine)| {
-                    if self.stranger_revoked_pins.contains(&(*agent, *machine)) {
-                        return false;
+                .unwrap_or(RevocationPin::Unknown)
+            {
+                RevocationPin::Clean => {
+                    self.drop_accepted_pair(agent_id, machine_id);
+                    self.attribution_stranger_overflows =
+                        self.attribution_stranger_overflows.saturating_add(1);
+                    return true;
+                }
+                RevocationPin::Unknown => continue,
+                RevocationPin::Revoked => {
+                    if self.try_pin_revoked_stranger(agent_id, machine_id) {
+                        continue;
                     }
-                    match snapshot
-                        .get(&MachineId(*machine))
-                        .copied()
-                        .unwrap_or(RevocationPin::Unknown)
-                    {
-                        RevocationPin::Clean => true,
-                        RevocationPin::Unknown => false,
-                        RevocationPin::Revoked => true,
-                    }
-                })
-        else {
-            return false;
-        };
-        let agent_id = AgentId(agent);
-        let machine_id = MachineId(machine);
-        if snapshot.get(&machine_id).copied() == Some(RevocationPin::Revoked) {
-            self.mark_revoked_unpinned(agent_id, machine_id);
+                    self.mark_revoked_unpinned(agent_id, machine_id);
+                    self.drop_accepted_pair(agent_id, machine_id);
+                    self.attribution_stranger_overflows =
+                        self.attribution_stranger_overflows.saturating_add(1);
+                    return true;
+                }
+            }
         }
-        self.drop_accepted_pair(agent_id, machine_id);
-        self.attribution_stranger_overflows = self.attribution_stranger_overflows.saturating_add(1);
-        true
+        false
     }
 
     fn touch_protected(&mut self, agent_id: AgentId, machine_id: MachineId) {
@@ -1405,7 +1451,7 @@ impl AuthenticatedMachineBindingCache {
     /// Full pin cap, and this agent has a revoked pair that was dropped or
     /// could not be pinned. An agent with no such pair is not refused.
     fn stranger_pin_cap_refuses_unattested(&self, agent_id: AgentId) -> bool {
-        self.stranger_pin_cap_full() && self.revoked_unpinned_agents.contains(&agent_id)
+        self.stranger_pin_cap_full() && self.revoked_unpinned_by_agent.contains_key(&agent_id)
     }
 
     /// A clean pair can be evicted. An unknown pair cannot. A confirmed
@@ -1478,15 +1524,18 @@ impl AuthenticatedMachineBindingCache {
                 snapshot.get(&MachineId(*machine)).copied() == Some(RevocationPin::Clean)
             })
             .collect();
-        for key in expired_pins {
-            self.stranger_revoked_pins.remove(&key);
+        for (agent, machine) in expired_pins {
+            self.release_stranger_pin(AgentId(agent), MachineId(machine));
         }
         let expired_unpinned: Vec<([u8; 32], [u8; 32])> = self
-            .revoked_unpinned_pairs
-            .iter()
+            .stranger_index
+            .keys()
             .copied()
-            .filter(|(_, machine)| {
+            .filter(|(agent, machine)| {
                 snapshot.get(&MachineId(*machine)).copied() == Some(RevocationPin::Clean)
+                    && self
+                        .revoked_unpinned_index
+                        .contains_key(&(*agent, *machine))
             })
             .collect();
         for (agent, machine) in expired_unpinned {
@@ -1494,87 +1543,163 @@ impl AuthenticatedMachineBindingCache {
         }
     }
 
+    fn unpinned_record_cap(&self) -> usize {
+        self.attribution_stranger_pairs.max(1)
+    }
+
     fn mark_revoked_unpinned(&mut self, agent_id: AgentId, machine_id: MachineId) {
-        self.revoked_unpinned_pairs
-            .insert((agent_id.0, machine_id.0));
-        self.revoked_unpinned_agents.insert(agent_id);
+        let key = (agent_id.0, machine_id.0);
+        if self.revoked_unpinned_index.contains_key(&key) {
+            return;
+        }
+        if self
+            .revoked_unpinned_by_agent
+            .get(&agent_id)
+            .is_some_and(|machines| machines.len() >= ACCEPTED_MACHINES_PER_AGENT)
+        {
+            return;
+        }
+        let cap = self.unpinned_record_cap();
+        while self.revoked_unpinned_index.len() >= cap {
+            if !self.forget_oldest_unpinned() {
+                return;
+            }
+        }
+        self.revoked_unpinned_clock = self.revoked_unpinned_clock.saturating_add(1);
+        let seq = self.revoked_unpinned_clock;
+        self.revoked_unpinned_order.insert((seq, key.0, key.1));
+        self.revoked_unpinned_index.insert(key, seq);
+        self.revoked_unpinned_by_agent
+            .entry(agent_id)
+            .or_default()
+            .insert(machine_id);
+    }
+
+    fn forget_oldest_unpinned(&mut self) -> bool {
+        let Some(&(seq, agent, machine)) = self.revoked_unpinned_order.iter().next() else {
+            return false;
+        };
+        self.remove_unpinned_entry(AgentId(agent), MachineId(machine), seq);
+        true
     }
 
     fn clear_revoked_unpinned_machine(&mut self, agent_id: AgentId, machine_id: MachineId) {
-        self.revoked_unpinned_pairs
-            .remove(&(agent_id.0, machine_id.0));
-        if !self
-            .revoked_unpinned_pairs
-            .iter()
-            .any(|(agent, _)| *agent == agent_id.0)
-        {
-            self.revoked_unpinned_agents.remove(&agent_id);
+        let key = (agent_id.0, machine_id.0);
+        let Some(seq) = self.revoked_unpinned_index.get(&key).copied() else {
+            return;
+        };
+        self.remove_unpinned_entry(agent_id, machine_id, seq);
+    }
+
+    fn remove_unpinned_entry(&mut self, agent_id: AgentId, machine_id: MachineId, seq: u64) {
+        let key = (agent_id.0, machine_id.0);
+        self.revoked_unpinned_index.remove(&key);
+        self.revoked_unpinned_order.remove(&(seq, key.0, key.1));
+        if let Some(machines) = self.revoked_unpinned_by_agent.get_mut(&agent_id) {
+            machines.remove(&machine_id);
+            if machines.is_empty() {
+                self.revoked_unpinned_by_agent.remove(&agent_id);
+            }
         }
     }
 
-    /// Pin a confirmed revoked stranger pair. An existing pin stays. A newer
-    /// revoked machine of the same agent can replace that agent's oldest pin.
-    /// Another agent's pin is never removed to make room. A pair that does
-    /// not fit is remembered on the agent.
+    fn clear_revoked_unpinned_agent(&mut self, agent_id: AgentId) {
+        let Some(machines) = self.revoked_unpinned_by_agent.get(&agent_id).cloned() else {
+            return;
+        };
+        for machine in machines {
+            self.clear_revoked_unpinned_machine(agent_id, machine);
+        }
+    }
+
+    /// Apply a clean probe answer for this agent's remembered machines.
+    /// A missing probe is not a clean answer. At most 8 machines are read.
+    fn refresh_unpinned_agent(&mut self, agent_id: AgentId) {
+        if self.revoked_machine_probe.is_none() {
+            return;
+        }
+        let Some(machines) = self.revoked_unpinned_by_agent.get(&agent_id).cloned() else {
+            return;
+        };
+        let clean: Vec<MachineId> = machines
+            .into_iter()
+            .filter(|machine| self.revocation_pin(machine) == RevocationPin::Clean)
+            .collect();
+        for machine in clean {
+            self.clear_revoked_unpinned_machine(agent_id, machine);
+        }
+    }
+
+    fn release_stranger_pin(&mut self, agent_id: AgentId, machine_id: MachineId) {
+        let key = (agent_id.0, machine_id.0);
+        if !self.stranger_revoked_pins.remove(&key) {
+            return;
+        }
+        if let Some(pins) = self.stranger_pins_by_agent.get_mut(&agent_id) {
+            pins.remove(&machine_id);
+            if pins.is_empty() {
+                self.stranger_pins_by_agent.remove(&agent_id);
+            }
+        }
+    }
+
+    fn release_agent_stranger_pins(&mut self, agent_id: AgentId) {
+        let Some(pins) = self.stranger_pins_by_agent.remove(&agent_id) else {
+            return;
+        };
+        for machine in pins {
+            self.stranger_revoked_pins.remove(&(agent_id.0, machine.0));
+        }
+    }
+
+    /// Pin when the share cap and the per-agent limit both have room.
+    /// An existing pin stays. A later revoked pair does not replace one.
+    /// Another agent's pin is never removed. A pair that does not fit is
+    /// remembered on the agent.
     fn note_stranger_revocation(
         &mut self,
         agent_id: AgentId,
         machine_id: MachineId,
         pin: RevocationPin,
     ) {
-        let key = (agent_id.0, machine_id.0);
         match pin {
             RevocationPin::Clean => {
-                self.stranger_revoked_pins.remove(&key);
+                self.release_stranger_pin(agent_id, machine_id);
                 self.clear_revoked_unpinned_machine(agent_id, machine_id);
             }
             RevocationPin::Unknown => {}
             RevocationPin::Revoked => {
-                if self.stranger_revoked_pins.contains(&key) {
-                    self.clear_revoked_unpinned_machine(agent_id, machine_id);
-                    return;
+                if !self.try_pin_revoked_stranger(agent_id, machine_id) {
+                    self.mark_revoked_unpinned(agent_id, machine_id);
                 }
-                self.pin_revoked_stranger(agent_id, machine_id);
             }
         }
     }
 
-    fn pin_revoked_stranger(&mut self, agent_id: AgentId, machine_id: MachineId) {
+    /// Returns true when `machine_id` is a pin after this call.
+    fn try_pin_revoked_stranger(&mut self, agent_id: AgentId, machine_id: MachineId) -> bool {
         let key = (agent_id.0, machine_id.0);
-        let owned: Vec<[u8; 32]> = self
-            .stranger_revoked_pins
-            .iter()
-            .filter(|(agent, _)| *agent == agent_id.0)
-            .map(|(_, machine)| *machine)
-            .collect();
-        if owned.len() >= PINNED_REVOKED_MACHINES_PER_AGENT {
-            let Some(oldest) = owned.iter().copied().min_by_key(|machine| {
-                self.pair_recency
-                    .get(&(agent_id.0, *machine))
-                    .copied()
-                    .unwrap_or(0)
-            }) else {
-                self.mark_revoked_unpinned(agent_id, machine_id);
-                return;
-            };
-            let newest = self.pair_recency.get(&key).copied().unwrap_or(0);
-            let oldest_at = self
-                .pair_recency
-                .get(&(agent_id.0, oldest))
-                .copied()
-                .unwrap_or(0);
-            if newest <= oldest_at {
-                self.mark_revoked_unpinned(agent_id, machine_id);
-                return;
-            }
-            self.stranger_revoked_pins.remove(&(agent_id.0, oldest));
+        if self.stranger_revoked_pins.contains(&key) {
+            self.clear_revoked_unpinned_machine(agent_id, machine_id);
+            return true;
         }
-        if self.stranger_revoked_pins.len() >= self.stranger_pin_cap() {
-            self.mark_revoked_unpinned(agent_id, machine_id);
-            return;
+        let owned = self
+            .stranger_pins_by_agent
+            .get(&agent_id)
+            .map(|pins| pins.len())
+            .unwrap_or(0);
+        if owned >= PINNED_REVOKED_MACHINES_PER_AGENT
+            || self.stranger_revoked_pins.len() >= self.stranger_pin_cap()
+        {
+            return false;
         }
         self.stranger_revoked_pins.insert(key);
+        self.stranger_pins_by_agent
+            .entry(agent_id)
+            .or_default()
+            .insert(machine_id);
         self.clear_revoked_unpinned_machine(agent_id, machine_id);
+        true
     }
 
     fn revocation_pin(&self, machine_id: &MachineId) -> RevocationPin {
@@ -1890,8 +2015,11 @@ impl AuthenticatedMachineBindingCache {
         self.stranger_index.clear();
         self.stranger_clock = 0;
         self.stranger_revoked_pins.clear();
-        self.revoked_unpinned_pairs.clear();
-        self.revoked_unpinned_agents.clear();
+        self.stranger_pins_by_agent.clear();
+        self.revoked_unpinned_order.clear();
+        self.revoked_unpinned_index.clear();
+        self.revoked_unpinned_by_agent.clear();
+        self.revoked_unpinned_clock = 0;
         self.pair_recency.clear();
         self.pair_recency_clock = 0;
         self.protected_order.clear();
@@ -3210,6 +3338,14 @@ impl InboxPipeline {
         retained: Option<MachineId>,
         claimed: MachineId,
     ) -> UnattestedAttribution {
+        let refresh = {
+            let cache = self.authenticated_machine_bindings.read().await;
+            cache.stranger_pin_cap_full() && cache.revoked_unpinned_by_agent.contains_key(&agent)
+        };
+        if refresh {
+            let mut cache = self.authenticated_machine_bindings.write().await;
+            cache.refresh_unpinned_agent(agent);
+        }
         let (
             accepted_machines,
             attribution_overflowed,
@@ -10342,6 +10478,184 @@ mod tests {
         );
     }
 
+    /// Seen while clean, revoked later, then a stranger flood. The pair
+    /// must be pinned when eviction reaches it and the pin cap still has
+    /// room. It must not be dropped first.
+    #[test]
+    fn issue1659_late_revocation_stays_pinned_while_the_cap_has_room() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        cache.set_stranger_pair_limit_for_test(4);
+        let victim = AgentId([0x21; 32]);
+        let revoked = MachineId([0x11; 32]);
+        let clean = MachineId([0x12; 32]);
+        let revoked_now = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&revoked_now);
+        cache.install_revoked_machine_probe(move |machine| {
+            if machine == revoked {
+                Some(flag.load(std::sync::atomic::Ordering::SeqCst))
+            } else {
+                Some(false)
+            }
+        });
+        cache.record(victim, revoked, 1);
+        cache.record(victim, clean, 2);
+        revoked_now.store(true, std::sync::atomic::Ordering::SeqCst);
+        for offset in 0..8u8 {
+            cache.record(
+                AgentId([0x30 + offset; 32]),
+                MachineId([0x40 + offset; 32]),
+                10 + u64::from(offset),
+            );
+        }
+        assert!(
+            cache.machines_accepted_for(&victim).contains(&revoked),
+            "a pair seen clean and revoked later stays while the pin cap has room"
+        );
+        assert!(
+            !cache.stranger_pin_cap_refuses_unattested(victim),
+            "a late revocation that fit the pin cap is not a dropped pair"
+        );
+        assert!(
+            !cache.stranger_pin_cap_full(),
+            "one late pin must leave a cap of two open"
+        );
+    }
+
+    /// Dropped-pair records stay within the stranger share. The oldest
+    /// record is forgotten. A later dropped agent is still refused while
+    /// the pin cap is full.
+    #[test]
+    fn issue1659_revoked_unpinned_records_stay_within_the_stranger_share() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        cache.set_stranger_pair_limit_for_test(2);
+        cache.install_revoked_machine_probe(|_| Some(true));
+        let pinned = AgentId([0x01; 32]);
+        cache.record(pinned, MachineId([0x01; 32]), 1);
+        let mut dropped = Vec::new();
+        for index in 0..6u8 {
+            let agent = AgentId([0x50 + index; 32]);
+            cache.record(agent, MachineId([0x80 + index; 32]), 10 + u64::from(index));
+            dropped.push(agent);
+        }
+        assert!(cache.stranger_pin_cap_full());
+        assert!(
+            cache
+                .machines_accepted_for(&pinned)
+                .contains(&MachineId([0x01; 32])),
+            "the pin stays while later revoked pairs are dropped"
+        );
+        assert!(
+            !cache.stranger_pin_cap_refuses_unattested(dropped[0]),
+            "an unpinned record past the stranger share is forgotten"
+        );
+        assert!(!cache.stranger_pin_cap_refuses_unattested(dropped[3]));
+        assert!(cache.stranger_pin_cap_refuses_unattested(dropped[4]));
+        assert!(cache.stranger_pin_cap_refuses_unattested(dropped[5]));
+        assert!(cache.revoked_unpinned_len() <= 2);
+    }
+
+    /// Promoting an agent out of the stranger share releases that agent's
+    /// pin. A clean pair that no longer fits is dropped, not left accepted
+    /// outside every share.
+    #[test]
+    fn issue1659_leaving_the_stranger_share_releases_the_pin() {
+        let mut cache = AuthenticatedMachineBindingCache::default();
+        cache.set_stranger_pair_limit_for_test(2);
+        cache.set_protected_pair_limit_for_test(0);
+        let agent = AgentId([0x21; 32]);
+        let machine = MachineId([0x11; 32]);
+        let revoked_now = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = std::sync::Arc::clone(&revoked_now);
+        cache.install_revoked_machine_probe(move |_| {
+            Some(flag.load(std::sync::atomic::Ordering::SeqCst))
+        });
+        cache.record(agent, machine, 1);
+        assert!(
+            cache.stranger_pin_cap_full(),
+            "one revoked pair fills a pin cap of one"
+        );
+        revoked_now.store(false, std::sync::atomic::Ordering::SeqCst);
+        cache.set_standing(agent, AttributionStanding::Protected);
+        assert!(
+            cache.machines_accepted_for(&agent).is_empty(),
+            "a clean pair that does not fit the protected share is dropped"
+        );
+        assert!(
+            !cache.stranger_pin_cap_full(),
+            "leaving the stranger share releases the pin"
+        );
+        assert_eq!(cache.attribution_protected_pairs_len, 0);
+        assert_eq!(cache.attribution_stranger_pairs_len(), 0);
+    }
+
+    /// A clean probe answer removes the agent from the refused set while the
+    /// pin cap stays full. Freeing the cap stops the refusal and leaves the
+    /// dropped-pair record in place.
+    #[test]
+    fn issue1659_clean_answer_and_a_free_cap_leave_the_refused_set() {
+        let mut clean_cache = AuthenticatedMachineBindingCache::default();
+        clean_cache.set_stranger_pair_limit_for_test(2);
+        let pinned_agent = AgentId([0x11; 32]);
+        let pinned_machine = MachineId([0xA1; 32]);
+        let dropped_agent = AgentId([0x22; 32]);
+        let dropped_machine = MachineId([0xA2; 32]);
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let mode_probe = std::sync::Arc::clone(&mode);
+        clean_cache.install_revoked_machine_probe(move |machine| {
+            match mode_probe.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => Some(machine == pinned_machine || machine == dropped_machine),
+                _ => Some(machine == pinned_machine),
+            }
+        });
+        clean_cache.record(pinned_agent, pinned_machine, 1);
+        clean_cache.record(dropped_agent, dropped_machine, 2);
+        clean_cache.record(AgentId([0x33; 32]), MachineId([0x33; 32]), 3);
+        assert!(clean_cache.stranger_pin_cap_refuses_unattested(dropped_agent));
+        mode.store(1, std::sync::atomic::Ordering::SeqCst);
+        clean_cache.refresh_unpinned_agent_for_test(dropped_agent);
+        assert!(
+            clean_cache.stranger_pin_cap_full(),
+            "a clean answer does not have to free the pin cap"
+        );
+        assert!(
+            !clean_cache.revoked_unpinned_contains(dropped_agent),
+            "a clean answer removes the dropped-pair record"
+        );
+        assert!(
+            !clean_cache.stranger_pin_cap_refuses_unattested(dropped_agent),
+            "a clean answer leaves the refused set while the cap is full"
+        );
+
+        let mut open_cache = AuthenticatedMachineBindingCache::default();
+        open_cache.set_stranger_pair_limit_for_test(2);
+        let open_mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let open_probe = std::sync::Arc::clone(&open_mode);
+        open_cache.install_revoked_machine_probe(move |machine| {
+            match open_probe.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => Some(machine == pinned_machine || machine == dropped_machine),
+                _ => Some(false),
+            }
+        });
+        open_cache.record(pinned_agent, pinned_machine, 1);
+        open_cache.record(dropped_agent, dropped_machine, 2);
+        open_cache.record(AgentId([0x33; 32]), MachineId([0x33; 32]), 3);
+        assert!(open_cache.stranger_pin_cap_refuses_unattested(dropped_agent));
+        open_mode.store(1, std::sync::atomic::Ordering::SeqCst);
+        open_cache.record(AgentId([0x44; 32]), MachineId([0x44; 32]), 4);
+        assert!(
+            !open_cache.stranger_pin_cap_full(),
+            "a clean pin is released and the cap opens"
+        );
+        assert!(
+            open_cache.revoked_unpinned_contains(dropped_agent),
+            "opening the cap does not delete the dropped-pair record"
+        );
+        assert!(
+            !open_cache.stranger_pin_cap_refuses_unattested(dropped_agent),
+            "an open pin cap does not refuse a remembered dropped pair"
+        );
+    }
+
     /// Demotion keeps the newest revoked pairs. Contact recency is the
     /// accept order, not HashSet order.
     #[test]
@@ -10414,8 +10728,10 @@ mod tests {
 
     /// When the stranger pin cap is full, an unlinked stranger DM is still
     /// accepted. A stranger whose revoked pair was dropped is refused and
-    /// counted. A Trusted contact is still accepted. The same gate covers
-    /// an unattested ACK.
+    /// counted, and that sender's unattested ACK leaves a registered waiter
+    /// pending. An unattested ACK from an unlinked stranger completes its
+    /// waiter. A Trusted contact who has a revoked pair that could not be
+    /// pinned is still accepted.
     #[tokio::test]
     async fn issue1659_full_stranger_pin_cap_refuses_unattested_stranger() {
         let contact = test_keypair();
@@ -10485,6 +10801,18 @@ mod tests {
             0,
             "an unlinked stranger must not move incoming_dropped_revoked"
         );
+        {
+            let mut cache = harness
+                .pipeline
+                .authenticated_machine_bindings
+                .write()
+                .await;
+            cache.record(dropped.agent_id(), MachineId([0xEE; 32]), 40);
+            assert!(
+                cache.stranger_pin_cap_refuses_unattested(dropped.agent_id()),
+                "a clean retained machine must not clear the dropped revoked pair"
+            );
+        }
         let dropped_message = payload_message(&harness, &dropped, MachineId([0xEE; 32]), 0xE2);
         harness
             .pipeline
@@ -10513,11 +10841,23 @@ mod tests {
             1,
             "the refusal also increments the internal overflow counter"
         );
+        let mut dropped_waiter = harness.pipeline.inflight.register(
+            [0xE3; 16],
+            dropped.agent_id(),
+            Some(MachineId([0xEE; 32])),
+        );
         let dropped_ack = unattested_ack_message(&harness, &dropped, MachineId([0xEE; 32]), 0xE3);
         harness
             .pipeline
             .handle_incoming(dropped_ack, false, crate::dm::DmAckIngress::Subscription)
             .await;
+        assert!(
+            matches!(
+                dropped_waiter.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "a full-cap ACK from the dropped pair must leave the waiter pending"
+        );
         assert_eq!(
             harness
                 .pipeline
@@ -10528,7 +10868,64 @@ mod tests {
             2,
             "an unattested ACK from the dropped pair is counted the same way"
         );
-        let contact_message = payload_message(&harness, &contact, MachineId([0xC1; 32]), 0xE4);
+        let mut unlinked_waiter = harness.pipeline.inflight.register(
+            [0xE5; 16],
+            unlinked.agent_id(),
+            Some(MachineId([0xE5; 32])),
+        );
+        let unlinked_ack = unattested_ack_message(&harness, &unlinked, MachineId([0xE5; 32]), 0xE5);
+        harness
+            .pipeline
+            .handle_incoming(unlinked_ack, false, crate::dm::DmAckIngress::Subscription)
+            .await;
+        assert!(
+            unlinked_waiter.try_recv().is_ok(),
+            "an unattested ACK from an unlinked stranger completes its waiter while the cap is full"
+        );
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            2,
+            "an unlinked stranger ACK must not move incoming_dropped_revoked"
+        );
+        let contact_revoked = MachineId([0xC0; 32]);
+        let contact_claim = MachineId([0xC1; 32]);
+        {
+            let mut cache = harness
+                .pipeline
+                .authenticated_machine_bindings
+                .write()
+                .await;
+            cache.install_revoked_machine_probe(move |machine| {
+                Some(
+                    machine == pinned_machine
+                        || machine == dropped_machine
+                        || machine == contact_revoked,
+                )
+            });
+            cache.record(contact.agent_id(), contact_revoked, 50);
+            cache.record(contact.agent_id(), contact_claim, 51);
+            assert!(
+                cache.stranger_pin_cap_full(),
+                "the contact's revoked pair must not open the pin cap"
+            );
+            assert!(
+                cache.revoked_unpinned_contains(contact.agent_id()),
+                "the trusted contact has a revoked pair that could not be pinned"
+            );
+            assert_eq!(
+                cache
+                    .peek(&contact.agent_id())
+                    .map(|binding| binding.machine_id),
+                Some(contact_claim),
+                "the contact DM claims the retained clean machine"
+            );
+        }
+        let contact_message = payload_message(&harness, &contact, contact_claim, 0xE4);
         harness
             .pipeline
             .handle_incoming(
@@ -10542,6 +10939,16 @@ mod tests {
             .expect("a contact unattested DM is still accepted")
             .expect("delivery stream closed");
         assert_eq!(delivered.sender, contact.agent_id());
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_dropped_revoked,
+            2,
+            "a trusted contact with a revoked pair is not refused for the pin cap"
+        );
     }
 
     /// A DM whose originating MACHINE is revoked (but whose agent-id is clean)

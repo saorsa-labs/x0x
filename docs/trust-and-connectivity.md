@@ -336,10 +336,19 @@ count as a confirmed revocation. A revoked pair in the protected share
 stays pinned, up to 2 machines for that agent. A revoked stranger pair
 stays pinned on the same per-agent limit, and only up to 2,048 pins in
 the stranger share. The inbox never evicts a revoked pin to make room.
-When that pin cap is full, an unattested DM or ACK is refused only from
-an agent whose revoked pair was actually dropped or could not be pinned,
-and only those refusals increment `incoming_dropped_revoked`. A sender
-this receiver cannot link to a revoked machine keeps its normal policy.
+Eviction pins a revoked stranger pair when that cap and the per-agent
+limit both have room, including a pair that was recorded clean and
+revoked later. A later revoked pair does not replace a pin already
+held. Leaving the stranger share releases that agent's pins. Pairs that
+were dropped or could not be pinned are remembered only up to the
+stranger share size, at most 8 machines for one agent. The oldest
+record is forgotten. That loss, the pins, and those records are process
+memory and are dropped on restart. When the pin cap is full, an
+unattested DM or ACK is refused only from an agent who still has such a
+record, and only those refusals increment `incoming_dropped_revoked`.
+A clean probe answer removes the record. An open pin cap does not
+refuse that agent. A sender this receiver cannot link to a revoked
+machine keeps its normal policy.
 Overflow does not refuse an unattested DM or ACK by itself. When the
 daemon does refuse because a revoked machine is also attributed, the
 drop increments `incoming_dropped_revoked`. An unattested DM or ACK that
