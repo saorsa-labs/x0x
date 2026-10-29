@@ -957,28 +957,38 @@ pub(in crate::server) async fn note_catchup_head(
         return;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
-    // #1660 (Claude review): the seat facts and the verdict above were
-    // read before this lock. A removal or revocation that lands in that
-    // gap must still refuse. The re-checks take the seam form: `try_*`
-    // locks that refuse on contention — a retryable withhold, like every
-    // egress seam. A changed KEM key needs no re-check: the share record
-    // matches only the key a share went to, so a stale key closes
-    // nothing.
+    // #1660 (Claude review; Codex P2): the seat facts and the verdict
+    // above were read before this lock. A removal, revocation or re-key
+    // that lands in that gap must still refuse. The seat is re-read here
+    // in full — Active membership and the KEM key it carries now — and
+    // the record matches only that fresh key, so a share sealed to a key
+    // the seat no longer carries closes nothing. The re-checks take the
+    // seam form: `try_*` locks that refuse on contention — a retryable
+    // withhold, like every egress seam.
     if sender_seat.is_some() {
-        let roster_refused = match state.named_groups.try_read() {
-            Ok(groups) => !group_ids.iter().any(|id| {
-                crate::server::resolve_group_entry_locked(&groups, id).is_some_and(|(_, info)| {
+        let fresh_seat = match state.named_groups.try_read() {
+            Ok(groups) => group_ids.iter().find_map(|id| {
+                crate::server::resolve_group_entry_locked(&groups, id).and_then(|(_, info)| {
                     info.active_members()
-                        .any(|member| member.agent_id == sender_hex)
+                        .find(|member| member.agent_id == sender_hex)
+                        .map(|member| crypto_exclusion::SenderSeat {
+                            key: member.kem_public_key_b64.clone(),
+                        })
                 })
             }),
-            Err(_) => true,
+            Err(_) => None,
         };
-        if !crypto_exclusion::write_allowed_at_seam(state, &x0x::identity::AgentId(sender))
-            || roster_refused
-        {
-            sender_seat = None;
-        }
+        sender_seat = match fresh_seat {
+            Some(seat)
+                if crypto_exclusion::write_allowed_at_seam(
+                    state,
+                    &x0x::identity::AgentId(sender),
+                ) =>
+            {
+                Some(seat)
+            }
+            _ => None,
+        };
     }
     // §3: the answer is also the sender's convergence evidence for the
     // S4 deliveries of this group whose result it holds.
