@@ -131,6 +131,15 @@ fn limited(answers: &[String], first: Option<&str>) -> bool {
         && rest.iter().all(|answer| answer == "refused rate_limited")
 }
 
+/// The `requesters` list of A's `GET /groups/:id/recovery` body. A failed
+/// read (`Null`) or a body without the list is no observation: the row
+/// stops as INFRA. An empty list is a valid observation.
+fn requester_rows(route: &Value) -> Result<&Vec<Value>> {
+    route["requesters"]
+        .as_array()
+        .ok_or_else(|| anyhow!("A's recovery route has no `requesters` list: {route}"))
+}
+
 /// How many times each answer occurs.
 fn count(answers: &[String]) -> BTreeMap<&str, usize> {
     let mut tally = BTreeMap::new();
@@ -202,21 +211,18 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let route = sim
         .at_instant("read A's recovery", recovery_route(sim, "A", &group))
         .await??;
+    let rows = requester_rows(&route)?;
     let entries = |hex: &str| {
-        route["requesters"].as_array().map_or(0, |rows| {
-            rows.iter()
-                .filter(|row| {
-                    row["requester"]
-                        .as_str()
-                        .is_some_and(|id| id.eq_ignore_ascii_case(hex))
-                })
-                .count()
-        })
+        rows.iter()
+            .filter(|row| {
+                row["requester"]
+                    .as_str()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(hex))
+            })
+            .count()
     };
     let (m1_entries, e_entries) = (entries(&m1_hex), entries(&e_hex));
-    let listed_attested = route["requesters"]
-        .as_array()
-        .is_some_and(|rows| rows.iter().any(|row| row["answer"] == "attested"));
+    let listed_attested = rows.iter().any(|row| row["answer"] == "attested");
     let any_attested = m1
         .seen
         .iter()
@@ -280,6 +286,18 @@ async fn run(case: &str, seed: u64) -> Receipt {
     }
     receipt.emit();
     receipt
+}
+
+/// A failed or malformed recovery read is INFRA, never an empty list.
+#[test]
+fn w3h_1356_d7_recovery_read_must_list_requesters() {
+    assert!(requester_rows(&Value::Null).is_err(), "a failed GET");
+    assert!(requester_rows(&json!({})).is_err(), "no list");
+    assert!(
+        requester_rows(&json!({"requesters": 3})).is_err(),
+        "not a list"
+    );
+    assert!(requester_rows(&json!({"requesters": []})).is_ok_and(|rows| rows.is_empty()));
 }
 
 /// H-S3-d7 (D83): control, GREEN with ADR 0109 S3.
