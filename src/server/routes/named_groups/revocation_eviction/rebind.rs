@@ -398,9 +398,6 @@ enum CommitError {
     Persist(String),
 }
 
-/// Seal, check, persist and schedule delivery of one rebind. The caller
-/// holds `group_key`'s membership lock and read `info` under it.
-///
 /// Whether `next`'s head is the installed roster head of `group_key`.
 /// #1574 item 1: `persist_named_group_info` also returns
 /// `ReplacedNotDurable` from its durability preflight, where an earlier
@@ -410,6 +407,11 @@ enum CommitError {
 /// commit sites below treat `ReplacedNotDurable` as committed only after
 /// this check. The read holds `named_groups_persistence_lock`, so it sees
 /// only installed or restored roster state.
+///
+/// Known open gap (#1574): the preflight early return itself is not
+/// fixed here. `named_groups.rs` is fenced to the slice that owns it
+/// (#1627 and the card-routes run). Until that slice changes the
+/// preflight, this caller-side check is the guard for it.
 async fn roster_head_installed(state: &AppState, group_key: &str, next: &GroupInfo) -> bool {
     let _committed = state.named_groups_persistence_lock.lock().await;
     state
@@ -420,6 +422,9 @@ async fn roster_head_installed(state: &AppState, group_key: &str, next: &GroupIn
         .is_some_and(|info| info.state_hash == next.state_hash)
 }
 
+/// Seal, check, persist and schedule delivery of one rebind. The caller
+/// holds `group_key`'s membership lock and read `info` under it.
+///
 /// §2: every local rebind seal, the self-rebind route's, the admin's and
 /// a held one's, passes [`super::group_head_synced`] here first, just
 /// before the seal and under the membership lock. A replica with no
@@ -1435,14 +1440,26 @@ async fn drive_held(state: &Arc<AppState>) {
 /// End the seat agent's `waiting_for_admin_rebind` once a rebind or a
 /// removal for its seat landed.
 async fn prune_admin_waits(state: &AppState) {
-    let seats: HashMap<EvictionKey, Option<String>> = {
-        let groups = state.named_groups.read().await;
+    let keys: Vec<EvictionKey> = {
         let inner = state.revocation_evictions.inner.lock().await;
         inner
             .rebind
             .admin_waits
             .keys()
             .chain(inner.rebind.renewals.keys())
+            .cloned()
+            .collect()
+    };
+    // #1574 item 5: the retains below end an admin wait ("the seat's
+    // committed digest moved") or drop a held renewal ("the seat left")
+    // on this read, so it reads committed roster state only (the pattern
+    // of `committed_group_by_stable`, #1620): a rebind or removal
+    // candidate mid-write must not end either. Lock order: persistence,
+    // then `named_groups` (the pass's snapshot order), no S4 lock held.
+    let seats: HashMap<EvictionKey, Option<String>> = {
+        let _committed = state.named_groups_persistence_lock.lock().await;
+        let groups = state.named_groups.read().await;
+        keys.into_iter()
             .map(|key| {
                 let digest = groups
                     .values()
@@ -1450,7 +1467,7 @@ async fn prune_admin_waits(state: &AppState) {
                     .and_then(|info| info.members_v2.get(&hex::encode(key.target)))
                     .filter(|member| member.state == GroupMemberState::Active)
                     .and_then(cr::committed_digest);
-                (key.clone(), digest)
+                (key, digest)
             })
             .collect()
     };
@@ -2879,6 +2896,136 @@ mod daemon_tests {
         );
         Ok(())
     }
+
+    /// #1574 item 5 (the review follow-up): `prune_admin_waits` ends the
+    /// seat agent's admin wait ("the seat's committed digest moved") or
+    /// drops its held renewal ("the seat left") on a roster read, so the
+    /// read must hold `named_groups_persistence_lock`:
+    /// `persist_named_group_info` shows its candidate in the map before
+    /// the write and restores the map when the write fails. Before the
+    /// fix the prune read a mid-write rebind candidate and ended the
+    /// wait on roster state that rolled back.
+    #[tokio::test]
+    async fn an_admin_wait_prune_waits_out_a_roster_candidate_that_rolls_back() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let seat = AgentId([0x7B; 32]);
+        let seat_hex = hex::encode(seat.as_bytes());
+        let group_id = "ca".repeat(16);
+        let mut info = GroupInfo::new(
+            "s4".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.add_member(
+            seat_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(state.agent.agent_id().as_bytes())),
+            None,
+        );
+        // The seat's committed digest is the wait's `old_digest`.
+        info.members_v2
+            .get_mut(&seat_hex)
+            .context("the seat's roster entry")?
+            .certificate_digest = Some("old-digest".to_string());
+        info.recompute_state_hash();
+        let key = EvictionKey::new(info.stable_group_id(), *seat.as_bytes());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.rebind.admin_waits.insert(
+                key.clone(),
+                AdminRebindWait {
+                    designated: None,
+                    old_digest: "old-digest".to_string(),
+                    renewal_digest: "new-digest".to_string(),
+                    since_unix_ms: 0,
+                    certificate: AgentCertificate::issue_with_expiry(
+                        &x0x::identity::UserKeypair::generate().context("owner")?,
+                        &x0x::identity::AgentKeypair::generate().context("agent")?,
+                        Some(10),
+                    )
+                    .context("certificate")?,
+                    next_at: Instant::now(),
+                },
+            );
+        }
+        // The mid-write window: a rebind candidate is in the map while
+        // the persistence lock is held — exactly what a failing
+        // `persist_named_group_info` restores.
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate
+            .members_v2
+            .get_mut(&seat_hex)
+            .context("the candidate's roster entry")?
+            .certificate_digest = Some("new-digest".to_string());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate.clone());
+        let driven = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { prune_admin_waits(&state).await })
+        };
+        for _ in 0..30 {
+            if driven.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .admin_waits
+                .contains_key(&key),
+            "the prune must block on the persistence lock, not read the mid-write candidate"
+        );
+        // The write failed: the map is restored under the same lock hold.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        drop(guard);
+        driven.await?;
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .admin_waits
+                .contains_key(&key),
+            "the committed roster keeps the wait"
+        );
+        // The refusal is narrow: a rebind that really lands still ends
+        // the wait.
+        state.named_groups.write().await.insert(group_id, candidate);
+        prune_admin_waits(&state).await;
+        assert!(
+            !state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .admin_waits
+                .contains_key(&key),
+            "a landed rebind still ends the wait"
+        );
+        Ok(())
+    }
 }
 
 /// #1508 review (Codex P1 F2 and F3): a received frame survives a
@@ -3338,6 +3485,33 @@ pub(super) mod restart_tests {
                 .await;
         assert_eq!(on_disk.len(), 1, "the frame stays durable for the retry");
         assert_eq!(on_disk[0].result_head, result_head);
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1574 item 1, the other arm: a received rebind still applies a
+    /// `ReplacedNotDurable` that staged its candidate (the #1508 r6
+    /// rule). The installed check refuses only the preflight outcome that
+    /// stages nothing.
+    #[tokio::test]
+    async fn a_received_rebind_still_applies_a_staged_replaced_not_durable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes, result_head) = fixture.frame()?;
+        let _fault = super::super::super::set_save_fault(
+            &receiver,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        let outcome = receive(&receiver, fixture.admin.agent_id(), &bytes).await;
+        assert_eq!(outcome, ReceiveOutcome::Applied, "the install is live");
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&result_head),
+            "the non-durable install is live"
+        );
         receiver.agent.shutdown().await;
         Ok(())
     }
@@ -3983,6 +4157,105 @@ pub(super) mod restart_tests {
             info.state_hash,
             "the roster keeps the parent head"
         );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1574 item 1, the other arm: a `ReplacedNotDurable` that did stage
+    /// its candidate still commits. The installed check must not
+    /// over-refuse the non-durable install the #1508 r6 rule keeps.
+    #[tokio::test]
+    async fn an_admin_rebind_still_commits_a_staged_replaced_not_durable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = UserKeypair::generate()?;
+        let seat = AgentKeypair::generate()?;
+        let seat_id = seat.agent_id();
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the fresh test state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let info = certified_group(&owner, state.agent.identity().agent_keypair(), &[&seat])?;
+        hold_persisted(&state, &info).await?;
+        let group_key = info.stable_group_id().to_string();
+        let seat_hex = hex::encode(seat_id.as_bytes());
+        let old_digest = info
+            .members_v2
+            .get(&seat_hex)
+            .and_then(cr::committed_digest)
+            .context("the seat's committed digest")?;
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            seat_id,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            now_unix_ms(),
+        ));
+        let key = EvictionKey::new(group_key.clone(), *seat_id.as_bytes());
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, &seat, Some(now_unix_ms() / 1000 + 6000))?;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
+                group_key.clone(),
+                HeadRound::new(&info.state_hash, Instant::now()),
+            );
+            inner.store.intake(
+                &key,
+                x0x::groups::eviction::EvictionTrigger::CertificateExpiry {
+                    certificate_digest: old_digest.clone(),
+                    not_after: now_unix_ms() / 1000,
+                },
+                None,
+                now_unix_ms(),
+                [0; 16],
+            );
+            inner.rebind.renewals.insert(key.clone(), renewal);
+        }
+        let _fault = super::super::super::set_save_fault(
+            &state,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        assert!(try_admin_rebind(&state, &key, &group_key).await);
+        let rebound = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .cloned()
+            .context("group")?;
+        assert_ne!(
+            rebound.state_hash, info.state_hash,
+            "the non-durable install is live"
+        );
+        assert_ne!(
+            rebound
+                .members_v2
+                .get(&seat_hex)
+                .and_then(cr::committed_digest),
+            Some(old_digest),
+            "the rebind committed"
+        );
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert!(
+            !inner.rebind.renewals.contains_key(&key),
+            "the consumed renewal is dropped"
+        );
+        assert!(
+            inner
+                .rebind
+                .deliveries
+                .keys()
+                .any(|(stable, _)| *stable == group_key),
+            "the delivery is scheduled"
+        );
+        drop(inner);
         state.agent.shutdown().await;
         Ok(())
     }
