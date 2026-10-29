@@ -425,16 +425,32 @@ pub(crate) async fn find_home(
     }
 }
 
-/// A group that matches the full Home policy for `owner` whether or not the
-/// Home metadata was stamped — the crash-recovery predicate (review fix 3:
-/// a crash between create and stamp must adopt the created group, not mint
-/// a second one).
+/// Crash-recovery predicate (review fix 3, #1687).
+///
+/// True when the policy is exactly [`home_policy`] for `owner` and the
+/// creator is the sole active member. The recovery scan also requires that
+/// this agent is that creator, and that Home metadata is not stamped yet.
+/// A crash between create and stamp then adopts that group instead of
+/// minting a second Home.
+///
+/// Policy equality is not enough. A shared group can use the same five
+/// axes. Accepting it here makes recovery stamp Home metadata and seal a
+/// commit that is never published. The other members keep the previous
+/// head and later refuse the owner's next commit.
 #[must_use]
 pub(in crate::server) fn is_home_candidate(
     info: &crate::groups::GroupInfo,
     owner: &crate::identity::UserId,
 ) -> bool {
-    is_home_policy(&info.policy, owner)
+    if !is_home_policy(&info.policy, owner) {
+        return false;
+    }
+    let creator_hex = hex::encode(info.creator.as_bytes());
+    let mut active = info.active_members();
+    match (active.next(), active.next()) {
+        (Some(member), None) => member.agent_id == creator_hex,
+        _ => false,
+    }
 }
 
 /// Read + verify the marker (review fix 3): PARSED (never a bare
@@ -936,6 +952,7 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
     }
     let owner = user_kp.user_id();
     let owner_hex = hex::encode(owner.as_bytes());
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let marker_path = state.data_dir.join(HOME_MARKER_FILE);
 
     // 1) Trusted Home already present (the marker is only advisory — the
@@ -1007,10 +1024,12 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
         return ProvisionStep::Done;
     }
 
-    // 2) Crash recovery (review fix 3): a group matching the FULL Home
-    //    policy exists but was never stamped (crash between create and
-    //    stamp, or a failed stamp/persist). Adopt the OLDEST such group —
-    //    complete its metadata + seal instead of minting a duplicate.
+    // 2) Crash recovery (review fix 3, #1687): adopt the OLDEST unstamped
+    //    group this agent created as its own Home (crash between create and
+    //    stamp, or a failed stamp/persist). `is_home_candidate` rejects a
+    //    shared group that only matches Home policy. The creator check
+    //    rejects a sole-member group this agent did not create. Either
+    //    group would otherwise be stamped and sealed without publication.
     let candidate: Option<String> = {
         // #487: same durability rule + TOCTOU recheck as find_home — the
         // pending-set snapshot is re-verified after the groups read
@@ -1031,6 +1050,7 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
                     !pending_before.iter().any(|p| p == id.as_str())
                         && info.home.is_none()
                         && is_home_candidate(info, &owner)
+                        && hex::encode(info.creator.as_bytes()) == local_hex
                 })
                 .map(|(id, info)| (id.clone(), info.created_at))
                 .collect();
@@ -2044,6 +2064,76 @@ pub(in crate::server::routes) mod tests {
             "adopted the crashed-create group, not a new one"
         );
         assert!(info.home.is_some(), "metadata stamped + sealed");
+        Ok(())
+    }
+
+    /// WHY (#1687): a shared group with Home policy is not this agent's
+    /// Home. Crash recovery must not adopt it, and must not seal a commit
+    /// the other members never receive.
+    #[tokio::test]
+    async fn shared_home_shaped_group_is_not_adopted_or_sealed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x87; 32]).await?;
+        let owner = owner_of(&state);
+        let req = CreateGroupRequest {
+            name: "shared".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: Some(home_policy(&owner)),
+        };
+        let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let shared_id: String = body["group_id"].as_str().unwrap_or_default().to_string();
+        assert!(!shared_id.is_empty());
+
+        let peer = crate::identity::AgentKeypair::generate()?;
+        let peer_hex = hex::encode(peer.agent_id().as_bytes());
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&shared_id).expect("created group");
+            assert!(
+                is_home_candidate(info, &owner),
+                "sole-member Home-shaped group is still a recovery candidate"
+            );
+            info.add_member(peer_hex, crate::groups::GroupRole::Member, None, None);
+            assert!(
+                !is_home_candidate(info, &owner),
+                "a shared Home-shaped group is not a Home candidate"
+            );
+        }
+        let (revision, hash, log_len) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&shared_id).expect("shared group");
+            assert!(info.home.is_none());
+            (
+                info.state_revision,
+                info.state_hash.clone(),
+                info.commit_log.len(),
+            )
+        };
+
+        provision_home(&state).await;
+
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&shared_id).expect("shared group remains");
+        assert!(info.home.is_none(), "shared group was not stamped as Home");
+        assert_eq!(info.state_revision, revision, "no unpublished seal");
+        assert_eq!(info.state_hash, hash, "no unpublished seal");
+        assert_eq!(info.commit_log.len(), log_len, "no unpublished seal");
+        drop(groups);
+
+        let (home_id, home) = find_home(&state, &owner)
+            .await
+            .expect("a real Home is provisioned");
+        assert_ne!(
+            home_id, shared_id,
+            "recovery must not adopt the shared group"
+        );
+        assert!(home.home.is_some());
+        let marker = read_verified_marker(&state, &hex::encode(owner.as_bytes())).await;
+        assert!(marker.is_none_or(|m| m.group_id != shared_id));
         Ok(())
     }
 
