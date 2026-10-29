@@ -41696,7 +41696,15 @@ fn split_named_groups_for_store(
     for (id, info) in groups {
         if is_home_suite_group_entry(info) {
             home_suite.insert(id.clone(), info.clone());
-            legacy.insert(id.clone(), legacy_safe_placeholder(info));
+            let mut placeholder = legacy_safe_placeholder(info);
+            // #1569, ADR 0109 §4: an S3 placeholder keeps its all-Removed
+            // roster in both files (an exception to the empty roster of
+            // `legacy_safe_placeholder`). An empty roster seats the creator
+            // as an Active admin on a released load.
+            if x0x::groups::recovery::is_s3_placeholder(info) {
+                placeholder.members_v2 = info.members_v2.clone();
+            }
+            legacy.insert(id.clone(), placeholder);
         } else {
             legacy.insert(id.clone(), info.clone());
         }
@@ -49386,6 +49394,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1569_owner_certified_placeholder;
     mod issue1570_held_back_rebind;
     mod issue1570_held_back_tombstone;
     mod issue1577_revoked_catchup_request;
