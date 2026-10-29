@@ -290,7 +290,9 @@ impl BootRecords {
         ]
         .into_iter()
         .filter_map(|(name, record)| match record {
-            RecordRead::Refused(reason) => Some(format!("{name}: {reason}")),
+            // Parser errors can quote credentials from a malformed record.
+            // Name the fixed record, but do not expose its refusal text.
+            RecordRead::Refused(_) => Some(format!("{name}: record refused (details redacted)")),
             _ => None,
         })
         .collect();
@@ -1072,5 +1074,83 @@ mod debug_tests {
         };
         assert_no_credentials(&records);
         assert_redacted(&records.boot, "RecordRead");
+    }
+}
+
+#[cfg(test)]
+mod refusal_diagnostics_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn refusal_diagnostics_omit_all_record_reasons() {
+        let records = BootRecords {
+            journal: RecordRead::Refused("journal-argument-secret".into()),
+            handoff: RecordRead::Refused("handoff-environment-secret".into()),
+            boot: RecordRead::Refused("boot-credential-secret".into()),
+        };
+        let diagnostic = records.diagnostic().expect("refusal diagnostic");
+        for name in [JOURNAL_FILE_NAME, HANDOFF_FILE_NAME, BOOT_FILE_NAME] {
+            assert!(diagnostic.contains(name));
+        }
+        assert!(!diagnostic.contains("secret"));
+        assert!(diagnostic.contains("records preserved"));
+        assert!(records.blocks_apply());
+        assert!(records.configured_start_allowed());
+        assert!(!records.may_apply());
+        assert!(!records.may_recover());
+    }
+
+    #[test]
+    fn refusal_diagnostics_redact_real_parser_failure_without_rewriting_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(BOOT_FILE_NAME);
+        let value = json!({
+            "schema_version": SCHEMA_VERSION, "record_kind": "boot",
+            "attempt": "record-parser-secret", "transaction_id": "tx",
+            "generation": 1, "instance_id": "alice", "pid": 23,
+            "process_start": 1, "boot_id": "boot-a",
+            "started_at_ns": 1, "deadline_ns": 2
+        });
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let records = read_boot_records(dir.path());
+        match &records.boot {
+            RecordRead::Refused(reason) => assert!(reason.contains("record-parser-secret")),
+            _ => panic!("fixture must reach the real parser refusal"),
+        }
+        let diagnostic = records.diagnostic().unwrap();
+        assert!(!diagnostic.contains("record-parser-secret"));
+        assert!(diagnostic.contains(BOOT_FILE_NAME));
+        assert!(records.blocks_apply());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn refusal_diagnostics_keep_missing_and_valid_boot_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = read_boot_records(dir.path());
+        assert!(empty.diagnostic().is_none());
+        assert!(!empty.blocks_apply());
+        let value = json!({
+            "schema_version": SCHEMA_VERSION, "record_kind": "boot",
+            "attempt": 1, "transaction_id": "tx", "generation": 1,
+            "instance_id": "alice", "pid": 23, "process_start": 1,
+            "boot_id": "boot-a", "started_at_ns": 1, "deadline_ns": 2
+        });
+        let path = dir.path().join(BOOT_FILE_NAME);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let records = read_boot_records(dir.path());
+        assert!(matches!(records.boot, RecordRead::Boot(_)));
+        assert!(records.blocks_apply());
+        assert!(records.configured_start_allowed());
+        assert!(!records.may_apply());
+        assert!(!records.may_recover());
+        assert!(records
+            .diagnostic()
+            .unwrap()
+            .contains("M2 recovery is not active"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }
