@@ -2310,7 +2310,35 @@ async fn startup_with_witness(group_id: &str) -> Result<(LeaveFixture, x0x::iden
         add_fixed_admin(info, admin_id, witness_hex);
     }
     mark_leaver_removed(&fixture).await;
+    join_fixture_detached_tasks(&fixture.state).await;
     Ok((fixture, witness))
+}
+
+/// Wait for every detached task that the fixture started.
+///
+/// The S4 pass in [`mark_leaver_removed`] starts a detached head ask to
+/// the witness. That ask calls `request_treekem_catchup_page`, as the
+/// startup sends do. The ask records a helper call only if it reads
+/// `catchup_page_force_ok` as set, so its count depends on when the
+/// runtime first polls it. If that poll comes after the test sets the
+/// flag, the startup send-bound tests see one helper call more than the
+/// startup sends (CI job 123010651244). The ask finishes here, before
+/// any test can set the flag, so the test counts only its own sends.
+async fn join_fixture_detached_tasks(state: &AppState) {
+    let tasks = std::mem::take(
+        state
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .expect("detached admission is open in the fixture"),
+    );
+    for task in tasks {
+        tokio::time::timeout(std::time::Duration::from_secs(30), task)
+            .await
+            .expect("a fixture detached task finishes")
+            .expect("a fixture detached task does not panic");
+    }
 }
 
 /// Startup must not seal on a timer, an empty page, or a hash that is not
