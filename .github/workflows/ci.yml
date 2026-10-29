@@ -800,6 +800,8 @@ jobs:
           --expect w3h_1357_red_s4_idle_revocation_one_admin=GREEN
           --require w3h_1357_control_s4_self_leave_crypto_only
           --expect w3h_1357_control_s4_self_leave_crypto_only=GREEN
+          --require w3h_1357_control_s4_self_leave_lost_join_copy
+          --expect w3h_1357_control_s4_self_leave_lost_join_copy=GREEN
           --require w3h_1357_red_s4_fallback_rank_manual
           --expect w3h_1357_red_s4_fallback_rank_manual=GREEN
           --require w3h_1357_control_s4_manual_remove_without_obligation
