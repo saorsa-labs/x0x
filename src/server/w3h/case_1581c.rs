@@ -38,17 +38,17 @@
 //!   releases, which is the same observable contract, and the hold
 //!   releases 500 ms after A's restart.
 //!
-//! The second arm covers the row's "No fallback before sync": inside
-//! the restart sync wait the typed state is shown and nothing seals.
-//! What main does past the wait under a total blackout — the same
-//! `HeadRound::synced` wait branch, now on the restarted A, treats 13 s
-//! of silence from holders it asked as a usable local head, so A seals
-//! its stale head at about the sync wait — is recorded in the receipt
-//! notes, not asserted: ADR 0110 §2 (L227) says a head that cannot be
-//! established retains `waiting_for_head_sync` and forbids the sibling,
-//! D73 as implemented ends discovery at the wait. Resolving that
-//! tension needs a change in `revocation_eviction.rs`, which open PRs
-//! fence; the remainder is named in #1581.
+//! The second arm asserts ADR 0110 §2 (L227), per David's 29 Oct 2026
+//! 00:15/00:40 GMT rulings: with the head catch-up unavailable past
+//! the restart sync wait, A keeps the typed `waiting_for_head_sync`,
+//! seals nothing (inside the wait and past it), and the later release
+//! still converges on D's single exclusion with no second rotation and
+//! a coherent data plane. `main` violates the claim — the same
+//! `HeadRound::synced` wait branch treats 13 s of silence from holders
+//! it asked as a usable local head, so A seals its stale head at about
+//! the sync wait with a divergent key — so the arm is wired as an
+//! expected RED with `CAUSE_STALE_SEAL`; it turns GREEN when the
+//! production fix (which follows fenced #1627 under #1581) lands.
 //!
 //! Before t = 0 the ordinary `private_secure` (TreeKEM) group is
 //! settled (every node at A's state revision r0 and epoch e0, four
@@ -69,16 +69,15 @@
 //!   ([`SETTLE`] later every survivor is still at e0 + 1, signed by
 //!   D). A seal by A, or any epoch past e0 + 1, fails with
 //!   [`CAUSE_STALE_SEAL`].
-//! - `red_restart_stale_head_no_sync_no_early_seal`: the hold stays past
-//!   the restart sync wait. Inside the window (read through 12 s) A's
-//!   row exposes the typed `waiting_for_head_sync`, A's epoch is still
-//!   e0 at the stale revision, and D's and C's revisions are unchanged
-//!   since D's commit: the expired window alone authorizes nothing on
-//!   an unrefreshed head before the sync wait ends. What A then does at
-//!   the wait (see above) is recorded, and the release and the data
-//!   plane are recorded with it. A missing typed state fails with
-//!   [`CAUSE_NO_TYPED_STATE`]; an early seal fails with
-//!   [`CAUSE_STALE_SEAL`].
+//! - `red_restart_stale_head_no_sync_past_wait`: the hold stays past
+//!   the restart sync wait. A's row keeps the typed
+//!   `waiting_for_head_sync` (watched from the first passes inside the
+//!   hold through a fixed read past the wait), A's epoch stays e0 at
+//!   the stale revision, D's and C's revisions stay at D's commit, and
+//!   after the release A converges on D's exclusion with no second
+//!   rotation and a coherent data plane. RED on `main` (the stale-head
+//!   seal, [`CAUSE_STALE_SEAL`]); GREEN with the ADR 0110 §2 fix. A
+//!   missing typed state fails with [`CAUSE_NO_TYPED_STATE`].
 
 #![cfg(test)]
 
@@ -110,8 +109,7 @@ const STALE_READ_AT: Duration = Duration::from_millis(250);
 const PROBE: &[u8] = b"w3h-1581c probe";
 
 const FINAL_RESUME: &str = "a_resumes_on_the_learned_exclusion_without_a_second_rotation";
-const FINAL_NO_SYNC: &str =
-    "a_shows_the_typed_head_sync_wait_and_seals_nothing_before_the_sync_wait";
+const FINAL_NO_SYNC: &str = "a_keeps_the_typed_head_sync_wait_past_the_sync_wait_and_seals_nothing";
 const CAUSE_STALE_SEAL: &str = "A sealed from the stale head: after its restart A's epoch moved \
                                 without a synced head, or a second rotation followed D's commit";
 const CAUSE_NO_TYPED_STATE: &str = "no typed waiting_for_head_sync: A's public S4 row exposed no \
@@ -989,6 +987,7 @@ async fn scenario(
     let mut typed_detail = String::new();
     let mut window_quiet = false;
     let mut unchanged_at_window = false;
+    let mut retained_past_wait = false;
     if no_sync_past_wait {
         let mut typed_seen_at: Option<Duration> = None;
         let window = sync_wait.saturating_sub(Duration::from_secs(1));
@@ -1040,8 +1039,9 @@ async fn scenario(
         receipt.note(format!(
             "inside the pre-wait window (quiet {window_quiet}): {typed_detail}"
         ));
-        // Record (not assert) what main does past the sync wait under
-        // the blackout, and A's own seal state at that instant.
+        // ADR 0110 §2 (L227), asserted per the 29 Oct rulings: past the
+        // sync wait, under the blackout, A keeps the typed wait and has
+        // sealed nothing.
         let read_at = restart_at
             .saturating_add(sync_wait)
             .saturating_add(PAST_WAIT);
@@ -1057,6 +1057,21 @@ async fn scenario(
             )
             .await??;
         let a_past = view_now(sim, "A", &group, &b).await?;
+        if a_past.epoch.is_some_and(|epoch| epoch != e0) || a_past.state_revision != r0 {
+            sealed_early.get_or_insert(sim.fabric().now().saturating_sub(restart_at));
+            a_authored |= a_past.head_committed_by.as_deref() == Some(a_hex.as_str());
+        }
+        let past_cause = row
+            .as_ref()
+            .and_then(|row| row["waiting"]["cause"].as_str());
+        let past_phase_open = row
+            .as_ref()
+            .is_some_and(|row| row["phase"].as_str() != Some("complete"));
+        retained_past_wait = past_cause == Some("waiting_for_head_sync")
+            && a_past.epoch == Some(e0)
+            && a_past.state_revision == r0
+            && past_phase_open
+            && sealed_early.is_none();
         let probe = match sim.state("A") {
             Ok(state) => {
                 crate::server::routes::named_groups::s4_seal_probe_for_test(&state, &group, &b_hex)
@@ -1065,8 +1080,9 @@ async fn scenario(
             Err(error) => format!("{error:#}"),
         };
         receipt.note(format!(
-            "past the sync wait under the total blackout (recorded, not asserted — see the module \
-             doc): A {}; row {row:?}; seal probe: {probe}",
+            "past the sync wait under the total blackout (asserted; see the module doc): \
+             waiting cause {past_cause:?}; A {}; row phase open {past_phase_open}; sealed early \
+             {sealed_early:?}; seal probe: {probe}",
             a_past.describe()
         ));
     }
@@ -1203,25 +1219,14 @@ async fn scenario(
     };
     let data_plane = a_after.0 && c_after.0 && !b_after.0;
 
-    if no_sync_past_wait {
-        receipt.note(format!(
-            "after the release (recorded, not asserted): converged {converged}; A's row \
-             {final_row:?}; {}; A decrypt: {}; C decrypt: {}; B decrypt: {}",
-            describe_all(&end),
-            a_after.1,
-            c_after.1,
-            b_after.1
-        ));
-    } else {
-        receipt.note(format!(
-            "A completed the learned exclusion: row {final_row:?}; A authored an exclusion \
-             commit itself: {a_authored}; {}; {}; {}; {}",
-            describe_all(&end),
-            a_after.1,
-            c_after.1,
-            b_after.1
-        ));
-    }
+    receipt.note(format!(
+        "after the release: converged {converged}; A's row {final_row:?}; A authored an \
+         exclusion commit itself: {a_authored}; {}; A decrypt: {}; C decrypt: {}; B decrypt: {}",
+        describe_all(&end),
+        a_after.1,
+        c_after.1,
+        b_after.1
+    ));
     receipt.request_delivered(
         "d_remove_b_request_answered",
         true,
@@ -1240,6 +1245,12 @@ async fn scenario(
             && window_expired
             && d_not_early
             && window_quiet
+            && retained_past_wait
+            && completed
+            && h_once
+            && still_signed_by_d
+            && !a_authored
+            && data_plane
     } else {
         queued_typed
             && excluded(&h1, e0, leaves0)
@@ -1359,16 +1370,17 @@ async fn run(case: &str, seed: u64, labels: &[&str], no_sync_past_wait: bool) ->
     receipt
 }
 
-async fn expect_green(
+async fn expect(
     case: &str,
     seed: u64,
     labels: &[&str],
     no_sync_past_wait: bool,
+    want: Verdict,
 ) -> Result<()> {
     let receipt = run(case, seed, labels, no_sync_past_wait).await;
     ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "{case}: expected Green, got {:?}",
+        receipt.verdict() == Some(want),
+        "{case}: expected {want:?}, got {:?}",
         receipt.verdict()
     );
     Ok(())
@@ -1393,21 +1405,23 @@ const LABELS: &[&str] = &["A", "D", "B", "C"];
 )]
 fn w3h_1581c_control_restart_stale_head_resume() -> Result<()> {
     super::block_on_paused(async move {
-        expect_green(
+        expect(
             "w3h_1581c_control_restart_stale_head_resume",
             0x1581_0004,
             LABELS,
             false,
+            Verdict::Green,
         )
         .await
     })
 }
 
-/// ADR 0110 `s4_restart_stale_head`, the row's second run, its
-/// "no fallback before sync" leg: with the head catch-up unavailable,
-/// A shows the typed `waiting_for_head_sync` and seals nothing through
-/// the restart sync wait. What main does past the wait (it seals the
-/// stale head; see the module doc) is recorded, not asserted.
+/// ADR 0110 `s4_restart_stale_head`, the row's second run: with the
+/// head catch-up unavailable past the restart sync wait, A keeps the
+/// typed `waiting_for_head_sync` and seals nothing (David's 29 Oct
+/// 00:15/00:40 GMT rulings). RED on `main`, which seals the stale head
+/// at the wait; GREEN once the `HeadRound::synced` fix (following
+/// fenced #1627 under #1581) lands.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -1419,13 +1433,16 @@ fn w3h_1581c_control_restart_stale_head_resume() -> Result<()> {
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-fn w3h_1581c_red_restart_stale_head_no_sync_no_early_seal() -> Result<()> {
+fn w3h_1581c_red_restart_stale_head_no_sync_past_wait() -> Result<()> {
     super::block_on_paused(async move {
-        expect_green(
-            "w3h_1581c_red_restart_stale_head_no_sync_no_early_seal",
+        expect(
+            "w3h_1581c_red_restart_stale_head_no_sync_past_wait",
             0x1581_0005,
             LABELS,
             true,
+            // RED on main (CAUSE_STALE_SEAL, the stale-head seal at the
+            // sync wait); GREEN with the ADR 0110 §2 fix.
+            Verdict::Red,
         )
         .await
     })
