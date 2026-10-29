@@ -836,6 +836,8 @@ jobs:
           --expect w3h_1356_red_s3_aligned_stale_joiner_catches_up=GREEN
           --require w3h_1356_control_s3_attestation_touches_only_the_subject
           --expect w3h_1356_control_s3_attestation_touches_only_the_subject=GREEN
+          --require w3h_1356_control_s3_d7_request_flood_rate_limited
+          --expect w3h_1356_control_s3_d7_request_flood_rate_limited=GREEN
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
           --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
           --require w3h_1356_control_s3_forked_node_not_auto_recovered
