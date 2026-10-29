@@ -995,6 +995,7 @@ pub(in crate::server) async fn import_agent_card(
         store.add(contact);
         (eff, ignored)
     };
+    super::contacts::sync_contact_relationship(&state, agent_id).await;
 
     // Also populate the identity discovery cache so connect_to_agent / send_direct
     // can find this agent without waiting for gossip announcements.

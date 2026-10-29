@@ -61,6 +61,193 @@ revoked origin A fails even when the envelope claims unrevoked B: claiming B
 requires B's machine signature (unforgeable), and carrying A's valid
 attestation names A, which EP3 rejects.
 
+### Absent attestation after a machine revocation (#1659)
+
+David approved this receiver rule on 28 Oct 2026 at 02:08 GMT (D283).
+The wire format is unchanged.
+
+When this receiver can attribute a revoked machine to an agent, the DM
+inbox requires that sender's origin (device) attestation and refuses an
+unattested DM from an older pre-#213 peer. The same rule covers an
+unattested ACK on the DM lane. An ACK is delivery evidence. It must not
+be accepted from a device this receiver would refuse a DM from. The
+trigger is the same for both: only once the agent has a machine
+revocation. That is a deliberate partial override of ADR 0021's
+accept-with-binding-fallback transition policy, and it applies only when
+the link is known here. A sender this receiver cannot link to a revoked
+machine keeps that policy. The check runs before the body match.
+
+`InboxPipeline::handle_incoming` is the check. The per-agent inbox topic
+and the compatibility gossip bus both use that function.
+
+The inbox attributes these machines to the sender:
+
+- every verified machine the authenticated-binding cache has accepted for
+  the sender. An identity announcement records its machine when that
+  announcement is accepted. A DM records its machine only after decryption
+  succeeds. An ACK records its machine only when the trust check admits it
+  and a local waiter matches. An undecryptable DM does not take a slot.
+  A later admitted DM or ACK through the retained binding left by that
+  undecryptable DM does take a slot. A refused DM and an unsolicited ACK
+  do not take a slot. The set includes the retained
+  binding, a machine a later binding replaced, and a verified machine that
+  lost timestamp selection. Evicting a retained binding does not drop this
+  set. One agent can record 8 machines. A ninth machine for that agent is
+  not recorded. The cache holds 65,536 pairs in three shares. Trusted
+  or Known contacts use the remainder, 45,056 pairs. Protected
+  non-contacts use 16,384 pairs. A protected non-contact is a member of
+  a group whose admission needs an invite or approval (invite-only,
+  request-access, or owner-certified), or a verified grant party, and
+  is not a Trusted or Known contact. A received grant's party is its
+  verified grantor and its grantee. An agent that is only listed in the
+  grant is not a party. The grantor is verified when the peer's
+  certificate names the grant owner and is not expired. OpenJoin
+  membership does not protect a peer. Strangers, including OpenJoin
+  co-members, share a bounded LRU of 4,096 pairs. That share stays
+  reserved when the other shares are full. A new pair past a
+  non-contact share evicts the least-recently used pair in that share
+  that is not pinned. A revoked machine is pinned in the protected
+  share, up to 2 per agent. In the stranger share the same per-agent
+  limit applies. The production pin cap is 2,048 pairs, half of the
+  4,096 stranger share. A smaller stranger share uses half of that share.
+  A revoked pair becomes a pin when the cap and the per-agent limit both
+  have room, including when eviction reaches a pair that was recorded
+  clean and revoked later. Eviction does not drop that pair while both
+  limits have room. A later revoked pair does not replace a pin this
+  cache already holds. The inbox never evicts a revoked pin to make room.
+  Leaving the stranger share releases that agent's pins. A revoked
+  stranger pair that was dropped, or that could not be pinned, is not a
+  pin. Those records are capped at the stranger share size. One agent
+  remembers at most 8 of them. The oldest record is forgotten when a new
+  one does not fit. Forgetting a record is a residual. A clean probe
+  answer for a remembered machine removes it. When the pin cap is full,
+  an unattested DM or ACK is refused only from an agent who still has
+  such a record, and only that refusal is counted. An open pin cap does
+  not refuse that agent. A sender this receiver cannot link to a revoked machine keeps
+  ADR 0021 policy, including while the pin cap is full. A contact and a
+  protected non-contact are not that stranger. The pin uses the revocation probe
+  `x0xd` installs. A confirmed revocation counts toward that pin. An
+  unknown answer, including a busy revocation lock, does not evict that
+  pair and does not count as a confirmed newer revocation. A move into
+  the protected share is refused when the revoked and unknown pairs do
+  not fit. Those pairs stay in the share they already use. The protected
+  share does not grow past 16,384. A protected peer is removed when its
+  last accepted machine is gone and its relationship epoch is gone. A
+  library embedder without that probe does not pin. Losing a pinned pair
+  would drop the attestation requirement, so that eviction is not a
+  residual. That evicted machine is no longer attributed. A stranger
+  insert does not evict a contact pair or a protected non-contact pair.
+  A stranger flood that evicts a clean stranger pair, or a revoked pair
+  past the pin cap, is a residual. Relationship epochs remember 8,192
+  agents. Each standing write takes the next value from a process-wide
+  clock. Eviction does not reuse a generation. A missing epoch reads a
+  stored high-water mark of evicted epochs, not the live clock. That
+  mark is 0 until an epoch is evicted. A resolve that read an earlier
+  value cannot match after a later write, including a write that
+  eviction then forgot. A further standing write that does not evict an
+  epoch does not move the mark. A further agent evicts
+  the oldest stranger epoch, then the oldest protected epoch, and a
+  contact epoch only when no other epoch remains. Evicting an epoch
+  does not drop a machine attribution. Promoting an agent into the
+  contact share drops that agent's clean pairs which do not fit the
+  contact remainder. It keeps the 2 newest revoked machines for that
+  agent. An unknown revocation answer stays only while it fits the
+  remainder. Unknown pairs that do not fit are dropped, so they do not
+  fill the global pair cap and refuse a later stranger. Demotion into
+  the stranger share does not push that share past 4,096. Pairs that
+  do not fit, after eviction of pairs that are not pins, are dropped.
+  A revoked pin is not evicted to make that room. Standing is chosen
+  again on every record and on every contact change. Deleting or
+  downgrading a contact keeps protection that still comes from a
+  qualifying group or a grant. A quarantine reblock clears that
+  protection too and moves the agent's pairs into the stranger share.
+  That move can evict a clean stranger pair or a revoked pair past the
+  pin cap. It is a residual until the next record. A library embedder
+  that does not run the `x0xd` probe gets contact-only protection.
+  Records already in the cache when the probe is installed are
+  classified again. A group membership change does not reclassify pairs
+  by itself. The next announcement, DM, contact change, or process
+  start applies the new standing. The contact bit is read while the
+  relationship epoch stays the same. A newer epoch discards that
+  contact snapshot. After an eviction frees one of an agent's slots, a
+  later admitted machine is recorded again. 4,096 overflowed agents can
+  be named. Overflow does not refuse an unattested DM or ACK by itself.
+  A revocation of an unrecorded machine is not attributed. An unattested
+  DM or ACK that claims a different, clean machine can still be accepted.
+  A full stranger pin cap refuses that sender only when a revoked pair
+  for them was actually dropped or could not be pinned. Only that
+  refusal is counted. The other loss of
+  attribution is a residual. A valid attestation is still accepted. The
+  set is process memory. It lasts until process restart, including a
+  self-update restart. The daemon does not persist the set. Rebuilding
+  a replaced machine from disk would need a new stored format, which
+  this rule does not add. When the stranger pool evicts or the name list
+  fills, the cache emits a rate-limited warning on a monotonic clock,
+  one sender at a time, for 256 senders. One sender cannot suppress the
+  warning for a different sender. A sender past those 256 shares one
+  interval while every remembered interval is still open. A slot whose
+  interval has expired is reused by a new sender. An unattested refusal
+  that finds an overflowed set, or that finds a sender whose revoked
+  pair was dropped or could not be pinned while the stranger pin cap is
+  full, increments `incoming_dropped_revoked` and an internal counter, and
+  emits the same kind of warning. The internal counter is not a field
+  of `GET /diagnostics/dm`.
+- a machine on the sender's contact
+- a machine named by a binding tombstone for that agent (indexed by agent)
+- the machine the envelope claims
+
+An older pre-#213 peer of that sender is refused the same way. A valid
+origin attestation is still accepted. EP3 still drops an attested DM whose
+resolved machine is revoked. A machine-revocation record still expires
+under the existing revocation TTL, and this refusal ends with that record.
+
+A contact or protected non-contact with none of those machines revoked
+keeps the absent-attestation path above. A stranger keeps that path when
+this receiver cannot link them to a revoked machine, including when the
+stranger revocation pin cap is full. The cap refuses a stranger only
+when a revoked pair for that agent was dropped or could not be pinned.
+Attribution overflow does not by
+itself change a contact or protected sender. A machine revocation for some
+other device does not change that sender's path. A
+cold receiver that cannot attribute the revoked machine to the sender
+still follows the ADR 0021 claim fallback. That fallback is the remaining
+strip residual: an unattested envelope whose origin attestation was
+removed, claiming a machine this receiver cannot attribute.
+
+Restart residual. A machine known only through the in-memory accepted
+set is not attributed after a restart. The stranger pins and the
+dropped-pair records are the same process memory. A restart drops them
+too. The revocation record for that machine can still be stored. An
+unattested DM that claims a different, clean machine is accepted again,
+because the inbox can no longer attribute the revoked machine to the
+sender and it no longer holds the dropped-pair record. Contacts, binding
+tombstones, the claimed machine, and a retained binding that has been
+rebuilt in this process still count. Those records already persist.
+The accepted-machine history does not.
+
+Cap residual. A machine past the per-agent cap of 8 is not in the
+accepted set. Revoking that machine does not make an unattested DM that
+claims a different, clean machine fail. An unattested DM that claims a
+clean machine this receiver still attributes can be accepted. A stranger
+pair the LRU evicted is the same kind of gap for that one machine. The
+next verified announcement or decrypted DM from that stranger can take a
+slot again. An agent that passed the cap records again after a stranger
+eviction frees one of its slots.
+
+Tombstone residual. A binding tombstone that names a revoked machine
+keeps refusing that agent's unattested DMs for as long as the revocation
+record is held. Decommissioning the machine does not clear the refusal.
+
+An attacker who holds the agent key can mint a fresh machine and a
+valid attestation. This check does not stop that DM. A binding tombstone
+blocks only the named agent-and-machine pair. The attacker can still
+attest from another machine. Containing an agent-key compromise requires
+an agent revocation.
+
+The relay `DeliverLocally` path (`RelayDisposition::DeliverLocally` in
+`src/lib.rs`) takes the envelope's claimed machine and does not apply this
+refusal. Relay delivery is off unless `[peer_relay] enabled = true`.
+
 ---
 
 ### Portable-agent move policy (A → B)

@@ -3823,8 +3823,13 @@ async fn apply_legacy_revocation_records(
                     if let Some(entry) = discovery_cache.write().await.remove(agent_id) {
                         machine_cache.write().await.remove(&entry.machine_id);
                     }
-                    let mut cs = contact_store.write().await;
-                    cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
+                    {
+                        let mut cs = contact_store.write().await;
+                        cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
+                    }
+                    owner_trust
+                        .set_attribution_relationship(*agent_id, false)
+                        .await;
                     tracing::info!(
                         agent = %hex::encode(agent_id.as_bytes()),
                         "evicted revoked agent (received via gossip)"
@@ -13985,6 +13990,7 @@ impl Agent {
                 revoked: std::sync::Arc::clone(&self.revocation_set),
                 moves: std::sync::Arc::clone(&self.move_state),
                 contacts: std::sync::Arc::clone(&self.contact_store),
+                authenticated: self.authenticated_machine_bindings(),
                 identity_dir: self.identity_dir.clone(),
                 evidence: std::sync::Arc::clone(self.peer_evidence()),
                 local_user: self.user_id(),
@@ -14914,6 +14920,16 @@ impl Agent {
                         announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
                     );
                 }
+                // Probe before the bindings write lock. The contact bit is
+                // re-read if a concurrent resolve wins the epoch. The
+                // contacts lock is not held while groups and grants are scanned.
+                dm_inbox::with_contact_standing(
+                    &authenticated_machine_bindings,
+                    &contact_store,
+                    announcement.agent_id,
+                    |_| (),
+                )
+                .await;
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,
@@ -18195,6 +18211,12 @@ impl Agent {
                     let mut cs = self.contact_store.write().await;
                     cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
                 }
+                dm_inbox::set_attribution_relationship(
+                    &self.authenticated_machine_bindings,
+                    *agent_id,
+                    false,
+                )
+                .await;
                 tracing::info!(
                     agent = %hex::encode(agent_id.as_bytes()),
                     "evicted revoked agent from discovery cache"
@@ -26574,6 +26596,10 @@ fn spawn_relay_dm_listener(
 
             match disposition {
                 peer_relay::RelayDisposition::DeliverLocally => {
+                    // #1659 does not run on this path. The injected frame
+                    // uses the envelope's claimed machine. Relay delivery is
+                    // off unless `[peer_relay] enabled = true`. See
+                    // docs/design/adr-0021-mechanics.md.
                     let sender_machine_id = relayed.inner.sender_machine_id;
                     let sender_peer_id = ant_quic::PeerId(sender_machine_id);
                     let inner_wire = match postcard::to_allocvec(&relayed.inner) {

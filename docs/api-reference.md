@@ -3599,6 +3599,40 @@ reaper counters:
 
 ### `GET /diagnostics/dm`
 
+`stats.incoming_dropped_revoked` counts every DM or ACK the inbox drops
+for one of these reasons:
+
+- the sender's agent is revoked
+- a machine this cache still attributes to that sender is revoked
+- the sender's attribution set overflowed and a revoked machine is also
+  attributed to that sender
+- the stranger revocation pin cap is full (2,048 pinned pairs, half of
+  the 4,096 stranger share; a smaller share uses half of that share)
+  and this sender still has a revoked pair that was dropped or could
+  not be pinned
+
+An overflowed attribution set does not by itself refuse an unattested
+message. When the stranger pin cap is full, refuse unattested traffic
+only from an agent who still has a revoked pair that was dropped or
+could not be pinned, and count only those refusals in
+`incoming_dropped_revoked`. Those records are capped at the stranger
+share. A clean answer or a restart drops them. An open pin cap does not
+refuse. Never evict a revoked pin. Eviction pins a revoked pair when
+the cap and the per-agent limit both have room. A sender this receiver
+cannot link to a revoked machine keeps its normal policy. A Trusted or Known contact, and
+a protected non-contact, are not refused for the pin cap. An internal
+counter for the overflow and dropped-pair refusals stays off this
+response. The daemon emits a rate-limited warning for them, one
+remembered sender at a time, for 256 senders. A further sender shares one
+interval while every remembered interval is still open. A slot whose
+interval has expired is reused. One remembered sender cannot suppress the
+warning for a different remembered sender. Stranger-budget eviction is
+the same kind of warning. A machine past the per-agent cap is not
+recorded. A revocation of that unrecorded machine does not move
+`incoming_dropped_revoked` for an unattested DM or ACK that claims a
+different, clean machine, unless that sender's revoked pair was dropped
+or could not be pinned while the pin cap is full.
+
 `x0x diagnostics dm [--agent <64-hex-agent-id>]` adds `per_peer_digest` (schema 2)
 to the existing DM diagnostics. Optional `?agent=<64-hex-agent-id>` selects exactly
 one agent in that object; malformed IDs return HTTP 400 (CLI validation also
