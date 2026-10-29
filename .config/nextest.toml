@@ -116,6 +116,16 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # and gossip propagation on macOS
 slow-timeout = { period = "60s", terminate-after = 10 }
 
+# ADR 0109 H-S3-c/c2 (#1689): the same two rows as the `w3h` overrides
+# above. A GREEN run does the full 30-minute virtual advance and re-seat.
+# On 27ac757 the Test Suite killed both at the 600 s limit (CI run
+# 40864998747); one local run takes 180-260 s. These two rows alone get
+# 15 minutes here too, and start first.
+[[profile.default.overrides]]
+filter = 'test(/(^|::)w3h_1356_red_s3_c2?_(promoted_admin_reseats_owner_axis_node|reseat_retires_marker_and_gap)$/)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+priority = 60
+
 # Tests that create multiple QUIC endpoints on localhost must not run
 # concurrently on macOS — ant-quic's dual-stack socket handling causes
 # intermittent connection failures and hangs when many endpoints share
