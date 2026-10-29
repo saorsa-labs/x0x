@@ -30,6 +30,7 @@ mod gui_show_remote;
 pub mod health_verdict;
 mod instance_lock;
 mod legacy_store_migration;
+pub(crate) mod reseat_scope;
 mod rider_auth;
 mod routes;
 mod sse;
@@ -1256,7 +1257,7 @@ pub async fn serve_with_options(
         task_list_state_dir: config.data_dir.join("task-lists"),
         crdt_subscriptions_persistence_lock: Mutex::new(()),
         crdt_handle_locks: RwLock::new(HashMap::new()),
-        named_groups: RwLock::new(named_groups),
+        named_groups: reseat_scope::ScopedGroupMap::new(named_groups),
         gss_publication_gate: Arc::new(RwLock::new(())),
         group_roster_gossip_lock: Mutex::new(std::collections::BTreeMap::new()),
         named_groups_path,
@@ -1290,7 +1291,7 @@ pub async fn serve_with_options(
         delegation_ids: RwLock::new(std::collections::HashMap::new()),
         agent_kem_keypair: Arc::clone(&agent_kem_keypair),
         contacts,
-        mls_groups: RwLock::new(mls_groups),
+        mls_groups: reseat_scope::ScopedGroupMap::new(mls_groups),
         profile: RwLock::new(profile),
         profile_path,
         mls_groups_path,
@@ -1358,7 +1359,7 @@ pub async fn serve_with_options(
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
-        treekem_groups: RwLock::new(treekem_groups),
+        treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),
         treekem_dir,
         revocation_evictions: routes::named_groups::S4Runtime::default(),
         group_recovery: routes::named_groups::S3Runtime::awaiting_restore(),

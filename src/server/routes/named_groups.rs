@@ -41776,20 +41776,28 @@ async fn encode_named_groups_store_excluding_pending_stubs(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     always_include: Option<&str>,
 ) -> std::io::Result<(String, String)> {
-    let durable_view = {
-        let pending = state
-            .pending_join_stubs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (!pending.is_empty()).then(|| {
-            let mut durable_view = groups.clone();
-            durable_view.retain(|key, _| {
-                Some(key.as_str()) == always_include || !pending.contains(key.as_str())
-            });
-            durable_view
-        })
-    };
+    let has_pending = !state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty();
+    let durable_view =
+        has_pending.then(|| without_pending_join_stubs(state, groups.clone(), always_include));
     encode_named_groups_store_for_state(state, durable_view.as_ref().unwrap_or(groups)).await
+}
+
+/// `groups` without unconfirmed join stubs, except `always_include`.
+fn without_pending_join_stubs(
+    state: &AppState,
+    mut groups: HashMap<String, x0x::groups::GroupInfo>,
+    always_include: Option<&str>,
+) -> HashMap<String, x0x::groups::GroupInfo> {
+    let pending = state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    groups.retain(|key, _| Some(key.as_str()) == always_include || !pending.contains(key.as_str()));
+    groups
 }
 
 /// The production store encoder: ADR 0109 §4's S3 placeholder transaction
@@ -41815,6 +41823,18 @@ async fn encode_named_groups_store_allowing(
     allow: Option<&str>,
 ) -> std::io::Result<(String, String)> {
     group_recovery::refuse_roster_write_during_failed_swap(state, allow).await?;
+    // #1699: a write from inside a re-seat scope (ADR 0109 §3 step 2)
+    // changed the staging slot, which never reaches disk. The disk view is
+    // the live map, without unconfirmed join stubs; the open journal's
+    // overlay keeps the original of the group under re-seat.
+    let live_view;
+    let groups = if crate::server::reseat_scope::in_any_reseat_scope() {
+        let live = state.named_groups.live_read().await.clone();
+        live_view = without_pending_join_stubs(state, live, None);
+        &live_view
+    } else {
+        groups
+    };
     // Stack budget (see `migrate_unsplit_home_suite_store_if_needed`): the
     // S3 sidecar writer future lives on the heap, not in every save path.
     match Box::pin(group_recovery::legacy_store_view(state, groups)).await {
@@ -49984,7 +50004,7 @@ pub(in crate::server) mod tests {
             task_list_state_dir: data_dir.join("task-lists"),
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
-            named_groups: RwLock::new(named_groups),
+            named_groups: crate::server::reseat_scope::ScopedGroupMap::new(named_groups),
             gss_publication_gate: Arc::new(RwLock::new(())),
             group_roster_gossip_lock: Mutex::new(BTreeMap::new()),
             named_groups_path,
@@ -50024,7 +50044,7 @@ pub(in crate::server) mod tests {
                     .unwrap_or_default(),
             ),
             profile_path: data_dir.join("profile.json"),
-            mls_groups: RwLock::new(HashMap::new()),
+            mls_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             mls_groups_path: data_dir.join("mls_groups.bin"),
             pending_join_results: RwLock::new(HashMap::new()),
             pending_join_refusals: StdMutex::new(HashMap::new()),
@@ -50089,7 +50109,7 @@ pub(in crate::server) mod tests {
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
-            treekem_groups: RwLock::new(HashMap::new()),
+            treekem_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             treekem_dir,
             revocation_evictions: S4Runtime::default(),
             group_recovery: S3Runtime::default(),
