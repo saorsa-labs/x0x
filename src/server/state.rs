@@ -1287,6 +1287,9 @@ pub(super) struct AppState {
     /// disk IO). Snapshots persist under [`Self::treekem_dir`].
     pub(super) treekem_groups:
         super::reseat_scope::ScopedGroupMap<Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>>,
+    /// ADR 0109 §3 step 2 (#1699): the open re-seat stagings, whose staged
+    /// joins use the staging slot of the three group maps.
+    pub(super) reseat_stagings: super::reseat_scope::ReseatStagings,
     /// Directory holding `<group_id>.snap` snapshots and `<group_id>.journal`
     /// TreeKEM persistence journals (mode 0600).
     pub(super) treekem_dir: PathBuf,
@@ -1476,7 +1479,8 @@ impl AppState {
         let tasks = guard.as_mut()?;
         // Reap finished tasks so the registry holds only live ones.
         tasks.retain(|task| !task.is_finished());
-        let handle = tokio::spawn(task);
+        // #1699: a step that a staged re-seat join spawns stays in its scope.
+        let handle = tokio::spawn(super::reseat_scope::inherit_reseat_scope(task));
         let abort = handle.abort_handle();
         tasks.push(handle);
         Some(abort)
@@ -1506,7 +1510,10 @@ impl AppState {
             return false;
         };
         tasks.retain(|task| !task.is_finished());
-        tasks.push(tokio::spawn(task));
+        // #1699: an apply that a staged re-seat join spawns stays in its scope.
+        tasks.push(tokio::spawn(super::reseat_scope::inherit_reseat_scope(
+            task,
+        )));
         true
     }
 

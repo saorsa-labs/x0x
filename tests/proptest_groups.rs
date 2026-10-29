@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used)]
 
 use proptest::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use x0x::groups::state_commit::{validate_apply, validate_apply_terminal};
 use x0x::groups::{
     card::AgentCard, compute_policy_hash, compute_public_meta_hash, compute_roster_root,
@@ -761,6 +761,7 @@ fn apply_withdrawn_flag_commit(
         current_revision: info.state_revision,
         current_withdrawn: info.withdrawn,
         members_v2: &info.members_v2,
+        join_seat_marker_agents: BTreeSet::new(),
         group_id: info.stable_group_id(),
     };
     if !info.withdrawn && commit.withdrawn {
@@ -1015,6 +1016,7 @@ fn apply_gossip_commit(
         current_revision: info.state_revision,
         current_withdrawn: info.withdrawn,
         members_v2: &info.members_v2,
+        join_seat_marker_agents: BTreeSet::new(),
         group_id: info.stable_group_id(),
     };
     let validation = if terminal {

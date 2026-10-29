@@ -1312,9 +1312,20 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     group_id: String,
     events: Vec<NamedGroupMetadataEvent>,
     truncated: bool,
-    /// Saved membership head of the responder. Absent on a KeyPackage reply
-    /// and on an old peer. A startup self-leave seal trusts this only when
-    /// it equals the local head after the page is applied.
+    /// Saved membership head of the responder. Absent on a KeyPackage
+    /// reply, on an old peer, and on a keyless GSS survivor of an
+    /// encrypted group (#1578, David's ruling 28 Oct 02:09 GMT and
+    /// Engineer ruling 28 Oct 09:35 GMT: while the policy is
+    /// `MlsEncrypted`, the secrets are GSS-delivered, it holds no secret
+    /// of its saved head's epoch, and its own roster seat carries no KEM
+    /// key, it claims no head). Every other responder — a SignedPublic
+    /// member, an encrypted-group joiner still waiting for its welcome
+    /// share, and a superseded intermediate install whose seat still
+    /// carries the KEM key — serves exactly main's value. A present
+    /// value is the responder's saved head, except that a responder
+    /// that does not know the group serves an empty string (main's
+    /// answer). A startup self-leave seal trusts this only when it
+    /// equals the local head after the page is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
 }
@@ -2937,13 +2948,25 @@ fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadata
     true
 }
 
-fn named_group_member_values(info: &x0x::groups::GroupInfo) -> Vec<serde_json::Value> {
+fn named_group_member_values(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+) -> Vec<serde_json::Value> {
     // Include active + banned (banned members still appear in the roster for
-    // audit / admin view). Removed members are dropped.
+    // audit / admin view). Removed members are dropped. #1578 rc9: the
+    // join's own-key marker row holds no admission state, so it is not a
+    // member — the listing and the count stay exactly main's (no public
+    // API change). #1578 rc11 (Claude item 6): the filter is scoped to
+    // the LOCAL agent's row — the only row the local join path ever
+    // marks — so no remote row of the same shape can be hidden.
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let mut members: Vec<&x0x::groups::GroupMember> = info
         .members_v2
         .values()
-        .filter(|m| !m.is_removed())
+        .filter(|m| {
+            !m.is_removed()
+                && (m.agent_id != local_agent_hex || !join_seat_key_marker_only(info, &m.agent_id))
+        })
         .collect();
     members.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     members
@@ -2962,8 +2985,20 @@ fn named_group_member_values(info: &x0x::groups::GroupInfo) -> Vec<serde_json::V
 }
 
 #[allow(dead_code)]
-fn named_group_member_values_all(info: &x0x::groups::GroupInfo) -> Vec<serde_json::Value> {
-    let mut members: Vec<&x0x::groups::GroupMember> = info.members_v2.values().collect();
+fn named_group_member_values_all(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+) -> Vec<serde_json::Value> {
+    // #1578 rc11 (Claude item 6): scoped to the local agent's row, as
+    // [`named_group_member_values`].
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut members: Vec<&x0x::groups::GroupMember> = info
+        .members_v2
+        .values()
+        .filter(|m| {
+            !(m.agent_id == local_agent_hex && join_seat_key_marker_only(info, &m.agent_id))
+        })
+        .collect();
     members.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     members
         .into_iter()
@@ -6604,6 +6639,7 @@ where
         current_revision: current.state_revision,
         current_withdrawn: current.withdrawn,
         members_v2: &current.members_v2,
+        join_seat_marker_agents: current.join_seat_key_marker_agents(),
         group_id: current.stable_group_id(),
     };
     x0x::groups::state_commit::validate_apply(&ctx, commit, action_kind)?;
@@ -6627,6 +6663,7 @@ where
         current_revision: current.state_revision,
         current_withdrawn: current.withdrawn,
         members_v2: &current.members_v2,
+        join_seat_marker_agents: current.join_seat_key_marker_agents(),
         group_id: current.stable_group_id(),
     };
     x0x::groups::state_commit::validate_apply_terminal(&ctx, commit, action_kind)?;
@@ -6734,8 +6771,17 @@ pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState
         // uncommitted admission or removal. Drop both guards before the
         // direct-connection and gossip awaits below.
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-        let groups = state.named_groups.read().await;
-        let mut entries: Vec<_> = groups.iter().collect();
+        // #1699: every group's roster from the live map, whatever the
+        // caller's scope, with a staged re-seat record in place of its
+        // contained original (as when the staged join ran in the live map).
+        // The staging copy is taken first: no path holds both guards.
+        let staged = state.named_groups.staging_read().await.clone();
+        let groups = state.named_groups.live_read().await;
+        let mut entries: Vec<_> = groups
+            .iter()
+            .filter(|(key, _)| !staged.contains_key(*key))
+            .chain(staged.iter())
+            .collect();
         // Aliases may retain an older view. The exact stable-id key wins;
         // otherwise take the highest revision deterministically. A winning
         // withdrawn record clears its preference rather than reviving an
@@ -12196,19 +12242,26 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
     }
     // #1275: the response's events are applied and persisted, so the apply
     // runs shielded; awaiting it keeps the responses in arrival order.
+    // #1699: a staged re-seat join's catch-up applies to its staged tree.
+    let group_id = response.group_id.clone();
     let apply_state = Arc::clone(state);
     let sender = *sender;
     let sender_machine = *machine_id;
     state
         .run_shielded(Box::pin(async move {
-            handle_treekem_catchup_response(
-                &apply_state,
-                &sender,
-                &sender_machine,
-                verified,
-                response,
-            )
-            .await;
+            let stagings = &apply_state.reseat_stagings;
+            stagings
+                .run_in_staging_of(
+                    &group_id,
+                    handle_treekem_catchup_response(
+                        &apply_state,
+                        &sender,
+                        &sender_machine,
+                        verified,
+                        response,
+                    ),
+                )
+                .await;
         }))
         .await
         .is_some()
@@ -12279,7 +12332,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     if sender_hex != request.requester_agent_id {
         return;
     }
-    let (authorized, log_keys, saved_head) = {
+    let (authorized, log_keys, held_group) = {
         let groups = state.named_groups.read().await;
         if let Some((key, info)) = groups.get_key_value(&request.group_id).or_else(|| {
             groups
@@ -12296,13 +12349,24 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             ];
             keys.sort();
             keys.dedup();
-            (
-                info.has_active_member(&sender_hex),
-                keys,
+            // #1578 review: the head claim needs only these values;
+            // cloning the whole GroupInfo per catch-up request is waste.
+            // The plane, confidentiality and seat checks read the saved
+            // state: the keyless marker of the ruling below is a fact of
+            // an encrypted group on the GSS plane (a SignedPublic group
+            // holds no secret and no seat KEM key by design, and so does
+            // a TreeKEM joiner), and it lives in the group state, not in
+            // a sidecar file.
+            let claim = (
+                info.secure_plane == x0x::mls::SecureGroupPlane::Gss,
+                info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted,
                 info.state_hash.clone(),
-            )
+                info.shared_secret.is_some(),
+                revocation_eviction::crypto_exclusion::own_seat_cannot_take_a_share(state, info),
+            );
+            (info.has_active_member(&sender_hex), keys, Some(claim))
         } else {
-            (false, vec![request.group_id.clone()], String::new())
+            (false, vec![request.group_id.clone()], None)
         }
     };
     let target_of_cached_add = {
@@ -12325,6 +12389,32 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "rejecting unauthorized TreeKEM catch-up request");
         return;
     }
+    // #1578 (David's ruling, 28 Oct 02:09 GMT; Engineer ruling, 28 Oct
+    // 09:35 GMT): the responder's saved head is its survivor-convergence
+    // evidence for this group's S4 deliveries. A keyless GSS survivor of
+    // an encrypted group — the group's secrets are GSS-delivered, it
+    // installed a verified exclusion without the secret, and its own
+    // roster seat carries no KEM key — claims no head while that state
+    // lasts; the local install never converges an author's delivery row.
+    // The inputs were copied under the groups read lock; the derivation
+    // itself runs only after the request is authorized. Every other
+    // responder — a SignedPublic member, an encrypted-group joiner still
+    // waiting for its welcome share, a superseded intermediate head, a
+    // member of any other plane, and a group this responder does not
+    // know included — keeps main's answer: the saved head, present and
+    // empty for the unknown group.
+    let saved_head = match &held_group {
+        Some((gss_plane, encrypted, saved_head, has_secret, own_seat_keyless)) => {
+            gss_share_hold::reported_head(
+                *gss_plane,
+                *encrypted,
+                saved_head,
+                *has_secret,
+                *own_seat_keyless,
+            )
+        }
+        None => Some(String::new()),
+    };
     // ADR 0110 §4: crypto-only exclusions in the requested range go to a
     // capable requester on their own gated carrier, never in this page.
     if authorized {
@@ -12406,7 +12496,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         group_id: request.group_id.clone(),
         events,
         truncated,
-        responder_state_hash: Some(saved_head),
+        responder_state_hash: saved_head,
     };
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
@@ -13997,7 +14087,9 @@ async fn park_gss_removal_for_share(
 /// see it. After the replay, a removal leaves the list only when this node
 /// holds a secret of its epoch or a later one. One that still waits, or
 /// that the apply refuses (a sibling commit moved the head), stays held
-/// (#1533 rc13): the old secret is still in use.
+/// (#1533 rc13): the old secret is still in use. #1578: a share that
+/// installs with no removal parked still prunes the exclusion holds it
+/// ends (the keyless install of a crypto-only frame waits for no replay).
 async fn replay_parked_gss_removals(state: &Arc<AppState>, group_key: &str) {
     gss_share_hold::ensure_loaded(state).await;
     let parked = state
@@ -14008,6 +14100,20 @@ async fn replay_parked_gss_removals(state: &Arc<AppState>, group_key: &str) {
         .cloned()
         .unwrap_or_default();
     if parked.is_empty() {
+        // The parked replay is for removals; a share can still end an
+        // exclusion hold, so the file follows memory, as the tail below
+        // makes it.
+        if gss_share_hold::holds_exclusions(state, group_key) {
+            let pruned = state
+                .named_groups
+                .read()
+                .await
+                .get(group_key)
+                .is_some_and(|info| gss_share_hold::prune_exclusions(state, group_key, info));
+            if pruned {
+                gss_share_hold::persist_logged(state, group_key).await;
+            }
+        }
         return;
     }
     for entry in parked {
@@ -14083,8 +14189,16 @@ async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
         let member_seated = {
             let groups = state.named_groups.read().await;
             groups.get(group_key).is_some_and(|info| {
-                role_update_target(&entry.event)
-                    .is_some_and(|member| info.members_v2.contains_key(member))
+                role_update_target(&entry.event).is_some_and(|member| {
+                    // #1578 rc11 (Claude blocking 1): the join's
+                    // key-only marker row is not a landing. A drain
+                    // that treats it as one replays the update against
+                    // the stub (refused, or re-parked with a fresh
+                    // parked_at) instead of keeping the entry with its
+                    // ORIGINAL parked_at until the member truly lands
+                    // or the TTL expires.
+                    info.members_v2.contains_key(member) && !join_seat_key_marker_only(info, member)
+                })
             })
         };
         if !member_seated {
@@ -15525,6 +15639,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 action_kind,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
+                    // #1578 rc11 (audit): the join's key-only marker row
+                    // is not a seat. Main holds no row for the
+                    // pre-admission joiner (remove_member is a no-op
+                    // there); converting the marker to a Removed row
+                    // would feed the downstream removed-seat logic a
+                    // seat main never has.
+                    if next.join_seat_key_marker_only(&agent_id) {
+                        next.members_v2.remove(&agent_id);
+                    }
                     next.remove_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
@@ -15945,13 +16068,24 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !actor_authorized {
                 return ApplyMetadataResult::REJECTED;
             }
-            let Some(target) = info.members_v2.get(&agent_id).cloned() else {
+            let Some(target) = info
+                .members_v2
+                .get(&agent_id)
+                // #1578 rc11 (Claude blocking 1): the join's key-only
+                // marker row is not a seat. Treating it as one applied
+                // the role update against the joiner's pre-admission
+                // stub instead of parking it, so the joiner's own view
+                // lost its new role with no error.
+                .filter(|_| !join_seat_key_marker_only(&info, &agent_id))
+                .cloned()
+            else {
                 // #876 (issue item 3): the member's own MemberAdded has
                 // not reached this roster yet (its join blob can lag
-                // behind the control-blob staging budget). Never drop the
-                // signed role update silently — park it and replay once
-                // the member lands. The apply result stays REJECTED so
-                // ordering semantics are unchanged.
+                // behind the control-blob staging budget) — or the only
+                // row is the join's key-only marker (#1578 rc11). Never
+                // drop the signed role update silently — park it and
+                // replay once the member lands. The apply result stays
+                // REJECTED so ordering semantics are unchanged.
                 park_role_update_for_late_member(
                     state,
                     &resolved_group_key,
@@ -16044,6 +16178,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
+                    // #1578 rc11 (audit): the join's key-only marker row
+                    // is not a seat. Main holds no row, so ban_member
+                    // inserts its Guest-role Banned entry there; keeping
+                    // the marker's Member role would bind a different
+                    // roster root than main's shape.
+                    if next.join_seat_key_marker_only(&agent_id) {
+                        next.members_v2.remove(&agent_id);
+                    }
                     next.ban_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
@@ -16228,10 +16370,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     if next.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-                        if let Some(member) = next.members_v2.get_mut(&agent_id) {
-                            member.state = x0x::groups::GroupMemberState::Removed;
-                            member.updated_at = commit.committed_at;
-                            member.removed_by = None;
+                        // #1578 rc11 (audit): the join's key-only marker
+                        // row is not a seat — main holds no row to flip.
+                        if !next.join_seat_key_marker_only(&agent_id) {
+                            if let Some(member) = next.members_v2.get_mut(&agent_id) {
+                                member.state = x0x::groups::GroupMemberState::Removed;
+                                member.updated_at = commit.committed_at;
+                                member.removed_by = None;
+                            }
                         }
                     } else {
                         next.unban_member(&agent_id);
@@ -18055,17 +18201,26 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     envelope_bytes: Option<Vec<u8>>,
 ) -> Option<ApplyMetadataResult> {
     let apply_state = Arc::clone(state);
+    // #1699: an event of a group under re-seat applies to its staged
+    // record (ADR 0109 §3 step 2); the contained live record keeps its
+    // post-advance state until the swap.
+    let group_id = named_group_metadata_event_group_id(&event).to_string();
     // Boxed: the apply future is large; keep it off this caller's frame.
     state
         .run_shielded(Box::pin(async move {
-            apply_named_group_metadata_event(
-                &apply_state,
-                event,
-                sender,
-                verified,
-                envelope_bytes.as_deref(),
-            )
-            .await
+            let stagings = &apply_state.reseat_stagings;
+            stagings
+                .run_in_staging_of(
+                    &group_id,
+                    apply_named_group_metadata_event(
+                        &apply_state,
+                        event,
+                        sender,
+                        verified,
+                        envelope_bytes.as_deref(),
+                    ),
+                )
+                .await
         }))
         .await
 }
@@ -18478,7 +18633,7 @@ pub(in crate::server) async fn list_named_groups(
         // records, not live groups — never list them.
         .filter(|info| !info.withdrawn)
         .map(|info| {
-            let member_count = named_group_member_values(info).len();
+            let member_count = named_group_member_values(&state, info).len();
             serde_json::json!({
                 "group_id": info.mls_group_id,
                 "name": info.name,
@@ -18692,7 +18847,7 @@ pub(in crate::server) async fn get_named_group(
     // #447: an operator reading the group is a natural moment to sweep
     // retained owner-cert-pending joins whose evidence may have landed.
     retry_pending_owner_cert_joins(&state, Some(&id)).await;
-    let members = named_group_member_values(&info);
+    let members = named_group_member_values(&state, &info);
     // ADR 0110 (D64): the S4 obligations and their typed waits.
     let s4_status = revocation_eviction::group_status_json(&state, &info).await;
     // ADR 0109 §8: the additive `recovery` object (absent when S3 holds no
@@ -18977,6 +19132,21 @@ pub(in crate::server) async fn clear_group_quarantine(
 /// authority's own roster lists us; `pending_authority_commit` means we hold
 /// a join stub and an expected-inviter pin but our own roster seat never
 /// landed — the limbo state that used to read as `already_joined: true`.
+/// #1578 rc8: the join seats the joiner's own published KEM key on a
+/// Pending row of its own stub (rc7). The row carries no admission
+/// state — only the key — so every join-state check treats it as
+/// absent: [`local_join_membership_state`] reports `not_member`, and
+/// [`classify_not_member_join_row`] sees no roster entry, so the #1148
+/// clear and the ADR 0107 re-arm keep working for an encrypted GSS
+/// join whose attempt expired.
+fn join_seat_key_marker_only(info: &x0x::groups::GroupInfo, joiner_hex: &str) -> bool {
+    // #1578 rc11: the predicate itself lives on GroupInfo
+    // (`crate::groups::GroupInfo::join_seat_key_marker_only`) so the
+    // lib-layer seat checks share this one definition; this alias keeps
+    // the server call sites.
+    info.join_seat_key_marker_only(joiner_hex)
+}
+
 pub(in crate::server) async fn local_join_membership_state(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
@@ -18986,12 +19156,31 @@ pub(in crate::server) async fn local_join_membership_state(
         return "active";
     }
     let stable = info.stable_group_id().to_string();
-    if expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some() {
+    // #1699: outside the scope of an open re-seat staging, the attempt
+    // under this key is the staged join's, not the contained original's
+    // (ADR 0109 §3 step 2: the live record keeps its membership label).
+    let staged_join = !crate::server::reseat_scope::in_any_reseat_scope()
+        && (state.reseat_stagings.scope_for(&stable).is_some()
+            || state
+                .reseat_stagings
+                .scope_for(&info.mls_group_id)
+                .is_some());
+    if !staged_join
+        && expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some()
+    {
         return "pending_authority_commit";
     }
     match info.members_v2.get(local_agent_hex) {
         Some(member) if member.is_active() => "active",
-        Some(member) if member.state == x0x::groups::GroupMemberState::Pending => "pending",
+        // #1578 rc8: the join's own-key marker row holds no admission
+        // state, so it reads as `not_member` (see
+        // [`join_seat_key_marker_only`]).
+        Some(member)
+            if member.state == x0x::groups::GroupMemberState::Pending
+                && !join_seat_key_marker_only(info, local_agent_hex) =>
+        {
+            "pending"
+        }
         _ => "not_member",
     }
 }
@@ -19026,7 +19215,7 @@ pub(in crate::server) async fn get_named_group_members(
     if let Err(resp) = admission {
         return resp;
     }
-    let members = named_group_member_values(info);
+    let members = named_group_member_values(&state, info);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -20927,10 +21116,13 @@ pub(in crate::server) async fn ingest_public_message(
                     info.members_v2.clone(),
                     info.stable_group_id().to_string(),
                     info.withdrawn,
+                    // #1578 rc11 (audit): the join's key-only marker
+                    // rows are not member seats for the ingest gate.
+                    info.join_seat_key_marker_agents(),
                 )
             })
     };
-    let Some((policy, members, stable_id, withdrawn)) = snapshot else {
+    let Some((policy, members, stable_id, withdrawn, join_seat_marker_agents)) = snapshot else {
         // Unknown group — count under the stable id we were given as the
         // logging key. Useful for spotting messages that arrived before the
         // local daemon learned about the group.
@@ -20939,13 +21131,14 @@ pub(in crate::server) async fn ingest_public_message(
     };
     if withdrawn {
         state.groups_diagnostics.record_other_drop(&stable_id);
-        tracing::debug!(group_id = %group_id_for_log, "E: dropped public message for withdrawn group");
+        tracing::debug!(group_id = %LogHexId::group(group_id_for_log), "E: dropped public message for withdrawn group");
         return;
     }
     let ctx = x0x::groups::PublicIngestContext {
         group_id: &stable_id,
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents,
     };
     // Review r5: pass the receiver's ADR-0018 revocation view so a
     // rider message from a revoked sub-agent is rejected at ingest —
@@ -22141,7 +22334,10 @@ fn classify_not_member_join_row(
         return NotMemberJoinRow::Quarantined;
     }
     let never_seated = lineage.is_some_and(|l| l.seated_at_revision.is_none());
-    let no_roster_entry = !info.members_v2.contains_key(joiner_hex);
+    // #1578 rc8: the join's own-key marker row is transparent here —
+    // it holds no admission state, only the joiner's published key.
+    let no_roster_entry =
+        !info.members_v2.contains_key(joiner_hex) || join_seat_key_marker_only(info, joiner_hex);
     if never_seated && no_roster_entry && !info.withdrawn {
         NotMemberJoinRow::UnseatedJoinRemnant
     } else if lineage.is_none() && no_roster_entry && !info.withdrawn {
@@ -23177,6 +23373,48 @@ pub(super) async fn join_group_via_invite_inner(
                     "failed to sign the join announcement",
                 );
             };
+            // #1578 rc7/rc8: the joiner's own copy of its own seat
+            // records exactly the key the signed MemberJoined carries —
+            // a binding-signature failure drops the key from the event,
+            // and the row must not claim a key the authority never saw.
+            // Without the row every invite-joined member's own view
+            // stays keyless for ever, so the receiver-side keyless
+            // predicate (own seat cannot take a share) matched every
+            // joiner, not the seat that genuinely lost its key data.
+            // The marker row is Pending and key-only; the join-state
+            // checks treat it as absent
+            // ([`join_seat_key_marker_only`]), and `add_member` never
+            // clears the key when the authority's MemberAdded seats the
+            // row.
+            if let NamedGroupMetadataEvent::MemberJoined {
+                kem_public_key_b64: Some(kem_b64),
+                member_agent_id,
+                ts_ms,
+                ..
+            } = &member_joined_resend.event
+            {
+                let at_secs = ts_ms / 1000;
+                info.members_v2
+                    .entry(member_agent_id.clone())
+                    .and_modify(|m| m.kem_public_key_b64 = Some(kem_b64.clone()))
+                    .or_insert_with(|| x0x::groups::GroupMember {
+                        agent_id: member_agent_id.clone(),
+                        user_id: None,
+                        role: x0x::groups::GroupRole::Member,
+                        state: x0x::groups::GroupMemberState::Pending,
+                        display_name: None,
+                        joined_at: at_secs,
+                        updated_at: at_secs,
+                        added_by: None,
+                        removed_by: None,
+                        kem_public_key_b64: Some(kem_b64.clone()),
+                        treekem_key_package_b64: None,
+                        treekem_key_package_hash: None,
+                        certificate: None,
+                        certificate_missing_since_ms: None,
+                        certificate_digest: None,
+                    });
+            }
             // named_groups.json only becomes durable when the member's
             // own `MemberAdded` is observed in the chain (the apply path
             // persists at that point). Exception: when the invite's
@@ -23882,7 +24120,7 @@ pub(in crate::server) async fn add_named_group_member(
         };
         let metadata_topic = next.metadata_topic.clone();
         let event_group_id = next.stable_group_id().to_string();
-        let members = named_group_member_values(&next);
+        let members = named_group_member_values(&state, &next);
         let bootstrap_group = next.clone();
         // ADR 0030 §5: a SignedPublic add owes the new member the committed
         // snapshot. Record that debt durably in the same step as the roster
@@ -24285,7 +24523,7 @@ async fn add_treekem_named_group_member(
     }
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
-    let members = named_group_member_values(&next);
+    let members = named_group_member_values(&state, &next);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -24499,7 +24737,7 @@ pub(in crate::server) async fn remove_named_group_member(
             }
         };
         let metadata_topic = next.metadata_topic.clone();
-        let members = named_group_member_values(&next);
+        let members = named_group_member_values(&state, &next);
         let delivery_roster = next.clone();
         drop(named_groups);
         let event = NamedGroupMetadataEvent::MemberRemoved {
@@ -27939,19 +28177,19 @@ async fn rekey_treekem_self_leaves(state: &Arc<AppState>, group_id: &str) {
     }
     let membership_lock = group_membership_lock(state, &group_key).await;
     let _membership_guard = membership_lock.lock().await;
-    // ADR 0110 §4 (D75): this daemon is the committing admin, and every
-    // admin seat is revoked, so it stops sealing. A new rekey epoch would
-    // reach the revoked admins' leaves. A commit already on the local chain
+    // ADR 0110 §4 (D75) and #1578: group ciphertext is withheld here
+    // either because this committing admin's every admin seat is revoked
+    // (a new rekey epoch would reach the revoked admins' leaves) or
+    // because this node installed a verified exclusion keyless and still
+    // waits for its sealed share. A commit already on the local chain
     // is still published by the resume path: survivors need that link to
     // follow the chain the owner-recovery commit extends (§4b(1)).
-    if group_ciphertext_withheld(state, &group_key, None)
-        .await
-        .is_some()
-    {
+    if let Some(hold) = group_ciphertext_withheld(state, &group_key, None).await {
         if self_leave_rekey_log_once(&format!("s4:{group_key}")) {
             tracing::info!(
                 group_id = %LogHexId::group(&group_key),
-                "self-leave TreeKEM rekey deferred: no eligible admin remains (ADR 0110 §4)"
+                reason = %hold.reason(),
+                "self-leave TreeKEM rekey deferred: group ciphertext is withheld (ADR 0110 §4, #1578)"
             );
         }
         return;
@@ -28436,8 +28674,8 @@ async fn remove_treekem_named_group_member(
             "group_id": id,
             "removed_member": agent_id_hex,
             "epoch": treekem_epoch,
-            "member_count": named_group_member_values(&next).len(),
-            "members": named_group_member_values(&next),
+            "member_count": named_group_member_values(&state, &next).len(),
+            "members": named_group_member_values(&state, &next),
         })),
     )
 }
@@ -31434,7 +31672,13 @@ pub(in crate::server) async fn update_member_role(
     };
 
     // P0-7: target must exist in members_v2 (active, banned, or removed — NOT absent).
-    let target_entry = info.members_v2.get(&agent_id_hex).cloned();
+    // #1578 rc11 (audit): the join's key-only marker row is not a seat —
+    // the target reads as absent (404), exactly main's roster.
+    let target_entry = info
+        .members_v2
+        .get(&agent_id_hex)
+        .filter(|_| !join_seat_key_marker_only(info, &agent_id_hex))
+        .cloned();
     let Some(target_entry) = target_entry else {
         return (
             StatusCode::NOT_FOUND,
@@ -34639,26 +34883,31 @@ pub(in crate::server) async fn secure_group_encrypt(
         .await;
     }
 
-    let Some(key) = info.secure_message_key() else {
-        return api_error(
-            StatusCode::FAILED_DEPENDENCY,
-            "no shared secret available — await welcome or ask admin to re-share",
-        );
-    };
+    // #1508 rc16 (Codex P1): the share hold is checked on the snapshot
+    // the key came from. A share that installs after this read ends the
+    // hold, but this send still uses the old key, which the removed
+    // member holds. #1578 (David's approval, 28 Oct 08:59 GMT): the hold
+    // gates the endpoint before the key-presence refusal — a survivor
+    // that installed the exclusion keyless holds no secret at all, and
+    // its refusal is the typed 409, not the no-secret 424.
+    let key = info.secure_message_key();
     let epoch = info.secret_epoch;
     let group_id_clone = info.stable_group_id().to_string();
-    // #1508 rc16 (Codex P1): the share hold is checked on the snapshot the
-    // key came from. A share that installs after this read ends the hold,
-    // but this send still uses the old key, which the removed member holds.
-    let key_held = crate::server::resolve_group_entry_locked(&groups, &id)
+    let hold_open = crate::server::resolve_group_entry_locked(&groups, &id)
         .is_some_and(|(group_key, info)| pending_gss_removal_withholds(&state, group_key, info));
     drop(groups);
-    if key_held {
+    if hold_open {
         return api_error(
             StatusCode::CONFLICT,
             GroupCiphertextHold::PendingGssRemoval.reason(),
         );
     }
+    let Some(key) = key else {
+        return api_error(
+            StatusCode::FAILED_DEPENDENCY,
+            "no shared secret available — await welcome or ask admin to re-share",
+        );
+    };
     gss_encrypt_after_key_probe(&state).await;
     // #1508 rc18 (Codex P1): a verified GSS removal, ban or crypto-only
     // exclusion parks under this gate held exclusively
@@ -35025,7 +35274,14 @@ pub(in crate::server) async fn secure_group_reseal(
     // KEM key) is rejected with a distinct 409 + reason so it stays
     // machine-separable from an absent recipient (404) and from the
     // withdrawn-group 409 (which carries no reason).
-    let Some(recipient_member) = info.members_v2.get(&req.recipient) else {
+    let Some(recipient_member) = info
+        .members_v2
+        .get(&req.recipient)
+        // #1578 rc11 (audit): the join's key-only marker row is not a
+        // member seat — the recipient reads as absent (404), exactly
+        // main's roster.
+        .filter(|_| !join_seat_key_marker_only(info, &req.recipient))
+    else {
         return not_found("recipient is not a member");
     };
     if !recipient_member.is_active() {
@@ -44437,8 +44693,9 @@ where
         // A NEWER attempt owns the key.
         return false;
     }
-    // The slot is claimed (registry lock held): spawn and register.
-    let handle = tokio::spawn(task);
+    // The slot is claimed (registry lock held): spawn and register. A
+    // staged re-seat join's attempt task stays in its scope (#1699).
+    let handle = tokio::spawn(crate::server::reseat_scope::inherit_reseat_scope(task));
     #[cfg(test)]
     if let Ok(mut ledger) = ATTEMPT_TASK_HANDLES_FOR_TEST.lock() {
         ledger.push((attempt_id.to_string(), handle.abort_handle()));
@@ -46494,11 +46751,27 @@ pub(in crate::server) async fn dispatch_join_result_message(
         // so they run shielded: an abort of this listener cannot cut them
         // off. The listener awaits each, so they still apply in order.
         // `false` (shutdown refused it, or it panicked) stops the listener.
+        // #1699: the result of a staged re-seat join seats its staged
+        // record. A fetch request (below) is served from the live record.
+        let group_id = match &msg {
+            JoinResultMessage::Result { event, .. } => {
+                named_group_metadata_event_group_id(event).to_string()
+            }
+            JoinResultMessage::Refused { receipt } => receipt.group_id.clone(),
+            JoinResultMessage::Pending { notice } => notice.group_id.clone(),
+            JoinResultMessage::FetchRequest { group_id, .. } => group_id.clone(),
+        };
         let apply_state = Arc::clone(state);
         let sender = *sender;
         return state
             .run_shielded(Box::pin(async move {
-                handle_join_result_message(&apply_state, &sender, verified, msg).await;
+                let stagings = &apply_state.reseat_stagings;
+                stagings
+                    .run_in_staging_of(
+                        &group_id,
+                        handle_join_result_message(&apply_state, &sender, verified, msg),
+                    )
+                    .await;
             }))
             .await
             .is_some();
@@ -49120,6 +49393,62 @@ pub(in crate::server) type WelcomeFetchWaiter =
 pub(in crate::server) mod tests {
     use super::*;
 
+    /// #1699 part 1 (ZCode on #1703): a roster save from inside a re-seat
+    /// scope encodes the live map without unconfirmed join stubs, never
+    /// the staging slot it changed; outside a scope the encoder takes the
+    /// map it is given. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_save_inside_a_reseat_scope_encodes_the_live_map_without_pending_stubs(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let creator = state.agent.agent_id();
+        let record = |name: &str, key: &str| {
+            x0x::groups::GroupInfo::new(name.to_string(), String::new(), creator, key.to_string())
+        };
+        let (live_key, stub_key, staged_key) = ("a1".repeat(16), "b2".repeat(16), "c3".repeat(16));
+        let live = record("live", &live_key);
+        let staged = record("staged", &staged_key);
+        {
+            let mut groups = state.named_groups.live_write().await;
+            groups.clear();
+            groups.insert(live_key.clone(), live.clone());
+            groups.insert(stub_key.clone(), record("stub", &stub_key));
+        }
+        state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stub_key.clone());
+        let expected = encode_named_groups_store(&HashMap::from([(live_key.clone(), live)]))?;
+        let scope = state
+            .reseat_stagings
+            .open(&staged_key, staged.stable_group_id());
+        let encoded = crate::server::reseat_scope::in_reseat_scope(scope, async {
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(staged_key.clone(), staged.clone());
+            let groups = state.named_groups.read().await;
+            encode_named_groups_store_allowing(&state, &groups, None).await
+        })
+        .await?;
+        assert_eq!(encoded, expected, "the live map, without the stub");
+        assert!(state
+            .named_groups
+            .live_read()
+            .await
+            .get(&staged_key)
+            .is_none());
+        let given = HashMap::from([(staged_key.clone(), staged)]);
+        assert_eq!(
+            encode_named_groups_store_allowing(&state, &given, None).await?,
+            encode_named_groups_store(&given)?,
+            "outside a scope: the given map"
+        );
+        Ok(())
+    }
+
     /// ADR 0108 §8 (#1575): the notice currently staged for one
     /// `(group, member, attempt)`, as `(cause, signer_agent_id, detail)`.
     pub(in crate::server) fn staged_join_pending_notice(
@@ -50137,6 +50466,7 @@ pub(in crate::server) mod tests {
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
+            reseat_stagings: Default::default(),
             treekem_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             treekem_dir,
             revocation_evictions: S4Runtime::default(),
@@ -55726,6 +56056,182 @@ pub(in crate::server) mod tests {
             assert!(
                 lot.get(group_id).is_none_or(|list| list.is_empty()),
                 "#876: the parking lot drained after the replay"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1578 rc11 (Claude blocking 1): the role update that arrives
+    /// while the target holds ONLY the join's key-only marker row
+    /// (rc7) must park and replay after `MemberAdded` — exactly what
+    /// main does for a member with no row at all. rc10 read the
+    /// marker row as a seat, applied the update against the
+    /// pre-admission stub (the evidence check refused it) and never
+    /// parked it, so the joiner's own view lost its new role with no
+    /// error. RED at rc10 703a0ef, GREEN here (see
+    /// `~/x0x-zcode/evidence/1578/rc11/`).
+    #[tokio::test]
+    async fn rc11_role_update_parks_when_only_the_join_marker_row_exists() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "rc11-role-update-join-marker";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        // The map-key/stable-id mismatch shape, as the #876 template.
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "rc11-stable-role-marker".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        let foreign = "44".repeat(32);
+        // The joiner's own stub row (rc7): Pending, the published KEM
+        // key, and no admission state and no live join request — so it
+        // is exactly the key-only marker.
+        info.members_v2.insert(
+            foreign.clone(),
+            x0x::groups::GroupMember {
+                agent_id: foreign.clone(),
+                user_id: None,
+                role: x0x::groups::GroupRole::Member,
+                state: x0x::groups::GroupMemberState::Pending,
+                display_name: None,
+                joined_at: 0,
+                updated_at: 0,
+                added_by: None,
+                removed_by: None,
+                kem_public_key_b64: Some("joiner-kem".to_string()),
+                treekem_key_package_b64: None,
+                treekem_key_package_hash: None,
+                certificate: None,
+                certificate_missing_since_ms: None,
+                certificate_digest: None,
+            },
+        );
+        assert!(join_seat_key_marker_only(&info, &foreign));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        // The owner's chain, exactly as the #876 template seals it:
+        // MemberAdded seats `foreign`, RoleUpdated promotes them.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            foreign.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let revision_add = seated.roster_revision;
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        seated.prev_state_hash = Some(parent.state_hash.clone());
+        seated.state_hash = commit_add.state_hash.clone();
+        seated.state_revision = commit_add.revision;
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_add,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add),
+            reseat_mandate: None,
+        };
+
+        let mut adminified = seated.clone();
+        adminified.roster_revision = adminified.roster_revision.saturating_add(1);
+        adminified.set_member_role(&foreign, x0x::groups::GroupRole::Admin);
+        let revision_role = adminified.roster_revision;
+        let commit_role = sign_metadata_terminality_commit(&seated, &adminified, &state, 3_000);
+        let role_update = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_role,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(commit_role),
+        };
+
+        // 1) The role update arrives FIRST: the target's only row is
+        //    the key-only marker — not a seat — so the apply parks it.
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_update.clone(),
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted, "the member has not landed yet");
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                lot.get(group_id).map(Vec::len),
+                Some(1),
+                "#1578 rc11: the marker-only row parks the role update, it is not a seat"
+            );
+        }
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(group_id).expect("group retained");
+            let row = &stored.members_v2[&foreign];
+            assert!(
+                row.state == x0x::groups::GroupMemberState::Pending
+                    && row.role == x0x::groups::GroupRole::Member,
+                "#1578 rc11: nothing was written onto the marker row"
+            );
+        }
+
+        // 2) The MemberAdded lands: accepted, the marker is replaced by
+        //    the real seat, and the parked role update replays.
+        let applied_add = apply_named_group_metadata_event(
+            &state,
+            member_added,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(applied_add.accepted, "the member lands: {applied_add:?}");
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(group_id).expect("group retained");
+            assert!(stored.has_active_member(&foreign));
+            assert_eq!(
+                stored.members_v2[&foreign].role,
+                x0x::groups::GroupRole::Admin,
+                "#1578 rc11: the parked role update replayed onto the landed seat"
+            );
+        }
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                lot.get(group_id).is_none_or(|list| list.is_empty()),
+                "#1578 rc11: the parking lot drained after the replay"
             );
         }
         Ok(())

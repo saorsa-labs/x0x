@@ -68,7 +68,7 @@ impl DaemonFixture {
     /// Start a daemon and keep its stderr in the data dir.
     ///
     /// `sigterm_exits_within_bounded_deadline` reads that log on failure. Other
-    /// tests keep the null stderr of [`start`].
+    /// tests keep the null stderr of [`Self::start`].
     pub async fn start_retaining_child_stderr(prefix: &str) -> Self {
         Self::start_inner(prefix, "", true).await
     }

@@ -1892,3 +1892,51 @@ async fn concurrent_same_invite_while_pending_keeps_single_attempt() -> Result<(
     let _ = (stable, joiner_hex);
     Ok(())
 }
+
+/// #1578 rc8: the join seats the joiner's own published KEM key on a
+/// Pending row of its own stub. The row is transparent to the join-state
+/// checks — the stuck-join re-arm (#1148 / ADR 0107) keeps working for
+/// an encrypted GSS join whose attempt expired: with the marker row the
+/// classifier sees exactly the shape it sees with no row at all, and
+/// only a Pending row that carries admission state is a real seat.
+#[test]
+fn the_join_seat_key_marker_row_is_transparent_to_the_join_state_checks() {
+    let (mut info, joiner) = lineage_free_row();
+    let without_row = classify_not_member_join_row(&info, &joiner);
+    info.members_v2.insert(
+        joiner.clone(),
+        x0x::groups::GroupMember {
+            agent_id: joiner.clone(),
+            user_id: None,
+            role: x0x::groups::GroupRole::Member,
+            state: x0x::groups::GroupMemberState::Pending,
+            display_name: None,
+            joined_at: 0,
+            updated_at: 0,
+            added_by: None,
+            removed_by: None,
+            kem_public_key_b64: Some("joiner-kem".to_string()),
+            treekem_key_package_b64: None,
+            treekem_key_package_hash: None,
+            certificate: None,
+            certificate_missing_since_ms: None,
+            certificate_digest: None,
+        },
+    );
+    assert!(join_seat_key_marker_only(&info, &joiner));
+    assert_eq!(
+        classify_not_member_join_row(&info, &joiner),
+        without_row,
+        "the key-only marker row must classify exactly as no row"
+    );
+    let mut seated = info.clone();
+    seated
+        .members_v2
+        .get_mut(&joiner)
+        .expect("the marker row")
+        .certificate_digest = Some("digest".to_string());
+    assert!(
+        !join_seat_key_marker_only(&seated, &joiner),
+        "a row with admission state is a real seat, not the marker"
+    );
+}
