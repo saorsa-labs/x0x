@@ -373,3 +373,59 @@ async fn a_held_back_roster_is_not_published_by_another_refresh() -> Result<()> 
     assert_eq!(agents, before, "the hint stays at the durable roster");
     Ok(())
 }
+
+/// ZCode on 8ac7036f (#1570): a remote discovery Pull must not get a card
+/// signed from a held-back group's live record, which is ahead of its
+/// durable form. RED (before the fix): `respond_to_pull` signed from the
+/// live map with no held-back check. GREEN: the record is not offered
+/// while held back, so the Pull falls back to a cached card.
+#[tokio::test]
+async fn a_discovery_pull_signs_no_card_from_a_held_back_group() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0x78, 0x79).await?;
+    let state = &fixture.state;
+    let group_id = fixture.group_id.clone();
+    let seeded = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("fixture group"))?;
+    let outcome = persist_named_group_info(state, &group_id, seeded).await;
+    assert!(matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+    let durable = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("seeded group"))?;
+    let stable = durable.stable_group_id().to_string();
+    group_recovery::begin_placehold(state, &group_id, &durable);
+    let outcome = save_named_groups_checked(state).await;
+    assert!(matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+    {
+        let groups = state.named_groups.read().await;
+        assert!(pull_card_record(state, &groups, &stable).is_some());
+    }
+
+    let sidecar = state
+        .data_dir
+        .join(s3::GROUP_RECOVERY_DIR)
+        .join(s3::sidecar_file_name(&stable));
+    tokio::fs::remove_file(&sidecar).await?;
+    tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+    let mut renamed = durable.clone();
+    renamed.name = "renamed while held back".to_string();
+    renamed.roster_revision = renamed.roster_revision.saturating_add(1);
+    let outcome = persist_named_group_info(state, &group_id, renamed).await;
+    assert!(
+        !matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "the rename is held back: {outcome:?}"
+    );
+    assert!(group_recovery::is_held_back(state, &stable));
+    let groups = state.named_groups.read().await;
+    assert!(pull_card_record(state, &groups, &stable).is_none());
+    assert!(pull_card_record(state, &groups, &group_id).is_none());
+    Ok(())
+}

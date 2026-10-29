@@ -3485,6 +3485,23 @@ async fn emit_shard_digest(state: &AppState, kind: x0x::groups::ShardKind, shard
 }
 
 /// Re-publish our own signed cards for groups listed in a Pull request.
+/// The local record a discovery Pull may sign a fresh card from. Pull
+/// requests use the stable `group_id`, so it resolves by either the local
+/// routing key or the D.3 stable id. #1570 (ZCode on 8ac7036f): a held-back
+/// group's live record is ahead of its durable form, so no card is signed
+/// from it; the Pull falls back to a cached card, as for a group this node
+/// does not own.
+pub(super) fn pull_card_record<'a>(
+    state: &AppState,
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    gid: &str,
+) -> Option<&'a x0x::groups::GroupInfo> {
+    groups
+        .get(gid)
+        .or_else(|| groups.values().find(|info| info.stable_group_id() == gid))
+        .filter(|info| !group_recovery::is_held_back(state, info.stable_group_id()))
+}
+
 async fn respond_to_pull(
     state: &AppState,
     kind: x0x::groups::ShardKind,
@@ -3497,14 +3514,8 @@ async fn respond_to_pull(
     for gid in group_ids {
         // We only re-publish cards for groups we *own* / manage locally,
         // not arbitrary cards from our cache (relays may re-publish cached
-        // blobs but cannot re-sign them). Pull requests use stable `group_id`,
-        // so resolve by either the local routing key or the D.3 stable id.
-        let owned_info = groups.get(gid.as_str()).or_else(|| {
-            groups
-                .values()
-                .find(|info| info.stable_group_id() == gid.as_str())
-        });
-        if let Some(info) = owned_info {
+        // blobs but cannot re-sign them).
+        if let Some(info) = pull_card_record(state, &groups, gid) {
             if !x0x::groups::may_publish_to_public_shards(info.policy.discoverability) {
                 continue;
             }
