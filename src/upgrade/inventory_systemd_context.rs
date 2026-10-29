@@ -6,6 +6,7 @@
 //! Empty strings, special working-directory spellings and unresolved paths
 //! remain literal evidence. Boolean properties are the manager's projection,
 //! not proof of which setting was explicitly configured. No I/O or caller here.
+#![cfg(unix)]
 #![allow(dead_code)]
 
 use serde::{de::DeserializeOwned, Deserialize};

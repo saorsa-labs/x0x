@@ -38,7 +38,11 @@ pub(crate) mod staging_selection;
 pub mod verification_probe;
 
 #[cfg(unix)]
+mod inventory_argv;
+#[cfg(unix)]
 mod inventory_commands;
+#[cfg(unix)]
+mod inventory_roots;
 
 use std::fs::{File, OpenOptions};
 use std::io::Read;

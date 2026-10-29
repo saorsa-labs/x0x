@@ -443,3 +443,118 @@ async fn conflicting_causal_replay_installs_fork_evidence_without_reacquiring_gs
         "fork evidence reached durable roster"
     );
 }
+
+// #1570 (ZCode on d1be57f1), ADR 0109 §4: a causal replay of a placeheld
+// group whose sidecar cannot be written is held back. The roster file is
+// Durable (the other groups are saved), but the group's legacy entry keeps
+// its last committed form, so the approval is not on disk. RED (before the
+// fix): the replay took the Durable outcome, dropped the queue receipt and
+// ran the post-effects, so a crash lost the approval. GREEN: memory rolls
+// back, the receipt stays, and a later replay applies it once the sidecar
+// is writable again.
+#[tokio::test]
+async fn held_back_causal_replay_keeps_its_queue_receipt() {
+    use x0x::groups::recovery as s3;
+    let (state, _dir) = secure_endpoint_test_state().await.expect("secure state");
+    let requester = AgentKeypair::generate().expect("requester keypair");
+    let requester_hex = hex::encode(requester.agent_id().as_bytes());
+    let group_id = "c3e1".repeat(8);
+    let request_id = install_group_with_pending_request(&state, &group_id, &requester_hex).await;
+    queue_real_approval(
+        &state,
+        &group_id,
+        &request_id,
+        &requester_hex,
+        now_millis_u64(),
+    )
+    .await;
+    assert_eq!(
+        state
+            .causal_approval_queue
+            .read()
+            .await
+            .get(&group_id)
+            .map(VecDeque::len),
+        Some(1)
+    );
+
+    // Placehold the group: its authoritative record is durable in the
+    // sidecar and its placeholder is in the legacy views.
+    let durable = state.named_groups.read().await[&group_id].clone();
+    let stable = durable.stable_group_id().to_string();
+    group_recovery::begin_placehold(&state, &group_id, &durable);
+    assert_eq!(
+        save_named_groups_checked(&state)
+            .await
+            .expect("placehold save"),
+        AtomicWriteOutcome::Durable
+    );
+    assert!(!group_recovery::is_held_back(&state, &stable));
+
+    // The sidecar cannot be written: a non-empty directory holds its name.
+    let sidecar = state
+        .data_dir
+        .join(s3::GROUP_RECOVERY_DIR)
+        .join(s3::sidecar_file_name(&stable));
+    tokio::fs::remove_file(&sidecar)
+        .await
+        .expect("remove sidecar");
+    tokio::fs::create_dir_all(sidecar.join("blocked"))
+        .await
+        .expect("block sidecar");
+
+    let mut cleared_quarantine = std::collections::BTreeSet::new();
+    replay_pending_causal_approvals(&state, &group_id, &mut cleared_quarantine).await;
+    assert!(group_recovery::is_held_back(&state, &stable));
+    assert_eq!(
+        state
+            .causal_approval_queue
+            .read()
+            .await
+            .get(&group_id)
+            .map(VecDeque::len),
+        Some(1),
+        "#1570: a held-back replay keeps its queue receipt"
+    );
+    assert_eq!(
+        state.named_groups.read().await[&group_id].join_requests[&request_id].status,
+        x0x::groups::JoinRequestStatus::Pending,
+        "#1570: memory rolls back to the record before the replay"
+    );
+    assert!(
+        !state.named_groups.read().await[&group_id].has_active_member(&requester_hex),
+        "#1570: the requester is not seated by a change that is not on disk"
+    );
+    let on_disk: HashMap<String, GroupInfo> = serde_json::from_slice(
+        &tokio::fs::read(&state.named_groups_path)
+            .await
+            .expect("read roster"),
+    )
+    .expect("decode roster");
+    assert!(
+        s3::is_s3_placeholder(&on_disk[&group_id]),
+        "the legacy entry keeps its committed placeholder"
+    );
+
+    // The sidecar is writable again: the next replay applies the approval
+    // and drops the receipt.
+    tokio::fs::remove_dir_all(&sidecar)
+        .await
+        .expect("unblock sidecar");
+    replay_pending_causal_approvals(&state, &group_id, &mut cleared_quarantine).await;
+    assert!(!group_recovery::is_held_back(&state, &stable));
+    assert_eq!(
+        state.named_groups.read().await[&group_id].join_requests[&request_id].status,
+        x0x::groups::JoinRequestStatus::Approved,
+        "the approval applies once its authoritative record is durable"
+    );
+    assert!(
+        state
+            .causal_approval_queue
+            .read()
+            .await
+            .get(&group_id)
+            .is_none_or(VecDeque::is_empty),
+        "the receipt is dropped only after the durable apply"
+    );
+}

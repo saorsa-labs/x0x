@@ -3,12 +3,15 @@
 //! This decodes `busctl --json=short get-property` for the seven Service Exec
 //! properties and their Ex forms (systemd v255). It does not read the bus, run
 //! commands, expand arguments, resolve executable identity or establish launch
-//! authority. Empty output proves no configured-job absence. Callers must bind
-//! the supplied property to the queried manager, unit and interface separately.
+//! authority. An empty property grants no absence or complete-host authority.
+//! Callers must bind the supplied property to the queried manager, unit and
+//! interface separately.
+#![cfg(unix)]
 #![allow(dead_code)]
 
 use serde::{de::DeserializeOwned, Deserialize};
-use std::{fmt, io};
+use std::fmt;
+use std::io;
 
 const MAX_BYTES: usize = 1_048_576;
 const MAX_COMMANDS: usize = 4096;
@@ -56,8 +59,7 @@ pub(crate) struct ExecutionProperty {
     pub(crate) commands: Vec<ExecutionCommand>,
 }
 
-// Supplied arguments, environment values, paths and future flags can contain
-// secrets. Redact both leaf values and containers so nested Debug is safe.
+// Executable paths, argv and launch flags are host-private inventory.
 impl fmt::Debug for ExecutionFlags {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ExecutionFlags(<redacted>)")
@@ -100,7 +102,9 @@ pub(crate) fn parse_property(property: &str, bytes: &[u8]) -> io::Result<Executi
     if !PROPERTIES.contains(&base) {
         return Err(refusal("unsupported execution property"));
     }
-    if bytes.len() > MAX_BYTES || bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+    if bytes.len() > MAX_BYTES
+        || bytes.iter().find(|byte| !b" \t\r\n".contains(byte)) != Some(&b'{')
+    {
         return Err(refusal("execution reply is oversized or not an object"));
     }
     let commands = if extended {

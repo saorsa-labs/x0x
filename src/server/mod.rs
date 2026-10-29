@@ -13,6 +13,7 @@ mod acl_admin;
 pub use acl_admin::AclReloadTrigger;
 mod api_watchdog;
 pub(crate) use api_watchdog::ApiWatchdogConfig;
+pub(crate) mod attribution_probe;
 mod auth;
 pub(crate) use auth::SESSION_TOKEN_TTL;
 pub mod config;
@@ -29,6 +30,7 @@ mod gui_show_remote;
 pub mod health_verdict;
 mod instance_lock;
 mod legacy_store_migration;
+pub(crate) mod reseat_scope;
 mod rider_auth;
 mod routes;
 mod sse;
@@ -40,6 +42,8 @@ pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
 // `#![cfg(test)]` inside the module).
 mod w3h;
+#[cfg(all(test, tokio_unstable))]
+pub(crate) use w3h::counted_spawn_blocking;
 mod ws;
 
 #[cfg(test)]
@@ -1253,9 +1257,9 @@ pub async fn serve_with_options(
         task_list_state_dir: config.data_dir.join("task-lists"),
         crdt_subscriptions_persistence_lock: Mutex::new(()),
         crdt_handle_locks: RwLock::new(HashMap::new()),
-        named_groups: RwLock::new(named_groups),
+        named_groups: reseat_scope::ScopedGroupMap::new(named_groups),
         gss_publication_gate: Arc::new(RwLock::new(())),
-        group_roster_gossip_lock: Mutex::new(()),
+        group_roster_gossip_lock: Mutex::new(std::collections::BTreeMap::new()),
         named_groups_path,
         home_suite_groups_path,
         named_groups_persistence_lock: Mutex::new(()),
@@ -1287,7 +1291,7 @@ pub async fn serve_with_options(
         delegation_ids: RwLock::new(std::collections::HashMap::new()),
         agent_kem_keypair: Arc::clone(&agent_kem_keypair),
         contacts,
-        mls_groups: RwLock::new(mls_groups),
+        mls_groups: reseat_scope::ScopedGroupMap::new(mls_groups),
         profile: RwLock::new(profile),
         profile_path,
         mls_groups_path,
@@ -1330,6 +1334,7 @@ pub async fn serve_with_options(
         home_provisioning_deferred: std::sync::atomic::AtomicBool::new(false),
         pending_join_refusals: StdMutex::new(HashMap::new()),
         pending_join_notices: StdMutex::new(HashMap::new()),
+        join_pending_notice_sign_limiter: StdMutex::new(Default::default()),
         pending_join_attempts: StdMutex::new(HashMap::new()),
         last_join_outcomes: StdMutex::new(HashMap::new()),
         join_refusal_sign_limiter: StdMutex::new(Default::default()),
@@ -1354,7 +1359,7 @@ pub async fn serve_with_options(
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
-        treekem_groups: RwLock::new(treekem_groups),
+        treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),
         treekem_dir,
         revocation_evictions: routes::named_groups::S4Runtime::default(),
         group_recovery: routes::named_groups::S3Runtime::awaiting_restore(),
@@ -1674,6 +1679,85 @@ pub async fn serve_with_options(
             primary,
         )
         .await);
+    }
+
+    let grants = agent.owner_trust.share_grant_store();
+    let revoked_for_probe = std::sync::Arc::clone(&agent.revocation_set);
+    let discovery_for_probe = std::sync::Arc::clone(&agent.identity_discovery_cache);
+    let evidence_for_probe = std::sync::Arc::clone(agent.peer_evidence());
+    let groups_for_probe = std::sync::Arc::downgrade(&state);
+    crate::dm_inbox::install_attribution_relationship_probe(
+        &agent.authenticated_machine_bindings(),
+        crate::dm_inbox::AttributionRelationshipProbe::from_answer(move |peer| {
+            let upgraded = groups_for_probe.upgrade();
+            let groups = upgraded
+                .as_ref()
+                .and_then(|state| state.named_groups.try_read().ok());
+            let local = upgraded
+                .as_ref()
+                .map(|state| state.agent.agent_id())
+                .unwrap_or(x0x::identity::AgentId([0; 32]));
+            let discovery = match discovery_for_probe.try_read() {
+                Ok(cache) => Some(
+                    cache
+                        .get(&peer)
+                        .and_then(|found| found.agent_certificate.clone()),
+                ),
+                Err(_) => None,
+            };
+            let revoked = revoked_for_probe.try_read().ok();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or(0);
+            attribution_probe::answer(attribution_probe::AttributionProbeInput {
+                groups: groups.as_deref(),
+                local,
+                peer,
+                grants: grants.as_deref(),
+                revoked: revoked.as_deref(),
+                discovery_cert: discovery.as_ref().map(|cert| cert.as_ref()),
+                evidence: Some(evidence_for_probe.as_ref()),
+                now_secs: now,
+            })
+        }),
+    )
+    .await;
+    let revoked_for_pin = std::sync::Arc::clone(&agent.revocation_set);
+    agent
+        .authenticated_machine_bindings()
+        .write()
+        .await
+        .install_revoked_machine_probe(move |machine| match revoked_for_pin.try_read() {
+            Ok(set) => Some(set.is_machine_revoked(&machine)),
+            // Unknown: do not evict the pair, and do not count it as revoked.
+            Err(_) => None,
+        });
+    let known_agents = agent
+        .authenticated_machine_bindings()
+        .read()
+        .await
+        .attribution_agents();
+    if !known_agents.is_empty() {
+        let protected: std::collections::HashSet<crate::identity::AgentId> = {
+            let contacts = state.contacts.read().await;
+            known_agents
+                .iter()
+                .copied()
+                .filter(|peer| {
+                    contacts.get(peer).is_some_and(|contact| {
+                        matches!(
+                            contact.trust_level,
+                            crate::contacts::TrustLevel::Trusted
+                                | crate::contacts::TrustLevel::Known
+                        )
+                    })
+                })
+                .collect()
+        };
+        let bindings = agent.authenticated_machine_bindings();
+        let mut cache = bindings.write().await;
+        cache.reclassify_attribution(|peer| protected.contains(&peer));
     }
 
     // ADR-0041 Tier-1: bridge the sync service to live daemon state and

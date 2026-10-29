@@ -12,10 +12,15 @@
 //! [`Sim::until`] / [`Sim::api`]. With `--cfg tokio_unstable` (the W3-H
 //! job) a blocking hold keeps auto-advance inhibited for the whole
 //! scenario, and the barrier steps one millisecond only when the scheduler
-//! is idle and that hold is the only blocking task. The step reads the
-//! blocking-pool metrics, which exist only with that cfg. Without them the
-//! hold turns off tokio's freeze-during-`spawn_blocking` rule and virtual
-//! time runs at CPU speed (#1245). A build without the cfg keeps the clock
+//! is idle and that hold is the only blocking task. A closure that has
+//! already returned does not count: Tokio marks the pool thread idle only
+//! after it wakes the runtime, and waiting for that mark stalls the wall
+//! clock (#1662). The excuse records the admission count the finish hook
+//! already checked. A later admission moves the live count, so the clock
+//! stays still for the new task. The step reads the blocking-pool metrics,
+//! which exist only with that cfg. Without them the hold turns off tokio's
+//! freeze-during-`spawn_blocking` rule and virtual time runs at CPU speed
+//! (#1245). A build without the cfg keeps the clock
 //! gate: it stays closed outside a barrier, and an open barrier lets paused
 //! tokio auto-advance, which still freezes while a `spawn_blocking` task
 //! runs. A step while a pool thread is still in flight lands at a different
@@ -66,6 +71,8 @@ mod case_1357;
 mod case_1427;
 mod case_1471;
 mod case_1581;
+mod case_1581b;
+mod case_1581c;
 mod case_811;
 mod case_818;
 mod case_969;
@@ -208,6 +215,34 @@ fn task_id_bits(id: tokio::task::Id) -> u64 {
     id.to_string().parse().unwrap_or(0)
 }
 
+// One W3-H runtime uses two blocking threads: the clock hold and one
+// worker. A control that needs two workers at once raises the cap for
+// that call.
+#[cfg(tokio_unstable)]
+thread_local! {
+    static BLOCKING_THREAD_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
+}
+
+#[cfg(tokio_unstable)]
+struct BlockingThreadCapGuard(usize);
+
+#[cfg(tokio_unstable)]
+impl Drop for BlockingThreadCapGuard {
+    fn drop(&mut self) {
+        BLOCKING_THREAD_CAP.with(|cap| cap.set(self.0));
+    }
+}
+
+#[cfg(tokio_unstable)]
+fn push_blocking_thread_cap(cap: usize) -> BlockingThreadCapGuard {
+    BLOCKING_THREAD_CAP.with(|cell| BlockingThreadCapGuard(cell.replace(cap)))
+}
+
+#[cfg(tokio_unstable)]
+fn blocking_thread_cap() -> usize {
+    BLOCKING_THREAD_CAP.with(|cap| cap.get())
+}
+
 /// Paused current-thread runtime for one W3-H test. Under `tokio_unstable`
 /// every spawn records a lineage key before the task runs. A lookup miss
 /// fails the test after the future finishes.
@@ -239,7 +274,7 @@ where
         // spawn order. A wider pool lets the OS choose which completion
         // wakes first, and that order moves `offline@` and same-instant
         // stream direction between reruns (#1245).
-        builder.max_blocking_threads(2);
+        builder.max_blocking_threads(blocking_thread_cap());
         builder.on_thread_park(note_runtime_parked);
         builder.on_thread_unpark(note_runtime_unparked);
         builder.disable_lifo_slot();
@@ -248,6 +283,12 @@ where
         ));
     }
     lineage::install(&mut builder);
+    // A pool thread from the previous runtime on this test thread can
+    // already hold that runtime's idle slot. Replacing the slot keeps its
+    // later stamp or generation write off this runtime (#1662).
+    #[cfg(tokio_unstable)]
+    retire_idle_slot();
+    #[cfg(not(tokio_unstable))]
     clear_idle_wait();
     let runtime = builder.build().expect("w3h runtime");
     #[cfg(tokio_unstable)]
@@ -258,6 +299,8 @@ where
     });
     #[cfg(not(tokio_unstable))]
     let result = runtime.block_on(future);
+    #[cfg(tokio_unstable)]
+    with_idle_slot(unbind_runtime);
     clear_idle_wait();
     ensure_lineage_recorded();
     result
@@ -268,26 +311,47 @@ where
 /// defined.
 fn clear_idle_wait() {
     #[cfg(tokio_unstable)]
-    IDLE_WAIT.with(|slot| {
-        // Epoch, ready, and the waker move together. A recheck thread that
-        // publishes `ready` holds this same mutex, so it cannot store `true`
-        // for an epoch this clear has already ended.
-        let mut waker = slot
-            .waker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        slot.epoch.fetch_add(1, Ordering::AcqRel);
-        slot.recheck_epoch.store(0, Ordering::Release);
-        slot.ready.store(false, Ordering::Release);
-        slot.parked.store(false, Ordering::Release);
-        *waker = None;
-        drop(waker);
-        slot.force_pool_busy.store(false, Ordering::Release);
-        *slot
-            .hooks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = RecheckHooks::empty();
-    });
+    with_idle_slot(|slot| clear_slot(slot));
+}
+
+/// Drop a waker and a wind-down stamp left on `slot`.
+#[cfg(tokio_unstable)]
+fn clear_slot(slot: &IdleWait) {
+    // Epoch, ready, and the waker move together. A recheck thread that
+    // publishes `ready` holds this same mutex, so it cannot store `true`
+    // for an epoch this clear has already ended.
+    let mut waker = slot
+        .waker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    slot.epoch.fetch_add(1, Ordering::AcqRel);
+    slot.recheck_epoch.store(0, Ordering::Release);
+    slot.ready.store(false, Ordering::Release);
+    slot.parked.store(false, Ordering::Release);
+    *waker = None;
+    drop(waker);
+    slot.force_pool_busy.store(false, Ordering::Release);
+    clear_wind_down(slot);
+    // `IdlePokeGuard` calls this while `block_on` is still running, and
+    // `block_on_paused` calls it again before the runtime is dropped.
+    // Zeroing the counters, or clearing the excuse, drops a publish. It
+    // does not arm one, so a later task has nothing to inherit (#1662).
+    slot.blocking_admissions.store(0, Ordering::Release);
+    slot.blocking_finished.store(0, Ordering::Release);
+    slot.counted_tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    slot.pool_samples.store(0, Ordering::Release);
+    slot.drop_gate_on_publish.store(false, Ordering::Release);
+    *slot
+        .hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = RecheckHooks::empty();
+    *slot
+        .finish_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 #[cfg(tokio_unstable)]
@@ -302,6 +366,9 @@ mod lineage {
         /// so a reused id does not keep the previous key. The child counter
         /// is not reused: a later spawn at the same site takes the next index.
         by_task: BTreeMap<u64, u64>,
+        /// Ids `on_task_spawn` saw. A terminate that is not in this set is a
+        /// blocking task: that hook does not run for `spawn_blocking`.
+        async_spawned: std::collections::BTreeSet<u64>,
     }
 
     impl Table {
@@ -309,6 +376,7 @@ mod lineage {
             Self {
                 next_child: BTreeMap::new(),
                 by_task: BTreeMap::new(),
+                async_spawned: std::collections::BTreeSet::new(),
             }
         }
     }
@@ -335,7 +403,14 @@ mod lineage {
     static HOOKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     pub(super) fn reset() {
-        *lock() = Table::empty();
+        let mut table = lock();
+        table.next_child.clear();
+        table.by_task.clear();
+        // Leave `async_spawned`. Reset runs while another test in this
+        // process can still have an async task in flight, and clearing the
+        // set makes that task's terminate look like `spawn_blocking`.
+        // Task ids are not reused, so the set does not alias a later task.
+        drop(table);
         MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
         HOOKS.store(false, std::sync::atomic::Ordering::Relaxed);
         TERMINATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -411,6 +486,7 @@ mod lineage {
         *counter = counter.saturating_add(1);
         let key = stream_key(parent_key, site, *counter);
         table.by_task.insert(child, key);
+        table.async_spawned.insert(child);
     }
 
     fn note_terminate(meta: &tokio::runtime::TaskMeta<'_>) {
@@ -419,7 +495,18 @@ mod lineage {
         if child == 0 {
             return;
         }
-        lock().by_task.remove(&child);
+        let async_task = {
+            let mut table = lock();
+            table.by_task.remove(&child);
+            table.async_spawned.remove(&child)
+        };
+        if async_task {
+            return;
+        }
+        // The closure has returned. Tokio marks the pool thread idle only
+        // after this hook returns. The clock hold is not scenario work
+        // (#1662).
+        super::on_blocking_task_finished(child);
     }
 
     /// FNV-1a of [`std::panic::Location::file`], line, and column.
@@ -711,6 +798,10 @@ impl AutoAdvanceHold {
             );
             holds.set(holds.get() + 1);
         });
+        let hold_id = task_id_bits(task.id());
+        with_idle_slot(|slot| {
+            slot.clock_hold_task.store(hold_id, Ordering::Release);
+        });
         Self { release, task }
     }
 }
@@ -727,9 +818,9 @@ thread_local! {
 impl Drop for AutoAdvanceHold {
     fn drop(&mut self) {
         AUTO_ADVANCE_HOLDS.with(|holds| holds.set(holds.get().saturating_sub(1)));
+        // The terminate hook clears `clock_hold_task`. Clearing it here
+        // races that hook, and the hold's completion looks like scenario work.
         let _ = self.release.send(());
-        // Detach. Joining here would wait on the pool from a runtime thread.
-        // `JoinHandle::abort` does not stop a blocking task that has started.
     }
 }
 
@@ -753,6 +844,38 @@ struct IdleWait {
     /// without a runtime wake. That is the window the recheck thread
     /// closes. The flag is on this slot, so one test cannot change another.
     force_pool_busy: AtomicBool,
+    /// Task id of [`AutoAdvanceHold`] on this runtime, or 0. The terminate
+    /// hook runs on a pool thread, so this is not a thread-local cell.
+    clock_hold_task: AtomicU64,
+    /// Task id of a blocking closure that has returned and whose pool
+    /// thread has not gone idle, or 0. The id is not the excuse. A later
+    /// admission voids it (#1662).
+    blocking_unsettled_task: AtomicU64,
+    /// [`blocking_admissions`] when `blocking_unsettled_task` was published.
+    /// The excuse holds only while the live count is still this value.
+    blocking_unsettled_admissions: AtomicU64,
+    /// Tasks admitted through [`counted_spawn_blocking`]. The count moves
+    /// on the spawner, before Tokio queues the task. [`AutoAdvanceHold`],
+    /// raw `spawn_blocking`, and `tokio::fs` do not increment this (#1662).
+    blocking_admissions: AtomicU64,
+    /// Finishes of the same tasks as [`blocking_admissions`]. The finish
+    /// hook ignores every other task id.
+    blocking_finished: AtomicU64,
+    /// Task ids in that set. Inserted at the start of the counted closure,
+    /// removed when that closure's finish hook runs.
+    counted_tasks: Mutex<std::collections::BTreeSet<u64>>,
+    /// Times [`pool_busy`] ran. Clock controls wait for a sample instead of
+    /// a fixed wall slice.
+    pool_samples: AtomicU64,
+    /// Test gate held across the idle-mark gap. One runtime cannot take
+    /// another's.
+    finish_gate: Mutex<Option<BlockingFinishGate>>,
+    /// When set, publishing a blocking completion drops `finish_gate` the
+    /// way the barrier does when it ends. The hook must already own the
+    /// gate, or the coordinator never sees `entered`.
+    drop_gate_on_publish: AtomicBool,
+    /// Id of the runtime bound in [`bind_runtime`], if any.
+    runtime_id: Mutex<Option<tokio::runtime::Id>>,
     /// Gates the recheck thread hits. Same scope as `force_pool_busy`.
     hooks: Mutex<RecheckHooks>,
     /// Loopback datagram that wakes the reactor without waking `block_on`.
@@ -760,17 +883,46 @@ struct IdleWait {
 }
 
 #[cfg(tokio_unstable)]
-thread_local! {
-    static IDLE_WAIT: Arc<IdleWait> = Arc::new(IdleWait {
+fn new_idle_wait() -> Arc<IdleWait> {
+    Arc::new(IdleWait {
         waker: Mutex::new(None),
         ready: AtomicBool::new(false),
         parked: AtomicBool::new(false),
         epoch: AtomicU64::new(1),
         recheck_epoch: AtomicU64::new(0),
         force_pool_busy: AtomicBool::new(false),
+        clock_hold_task: AtomicU64::new(0),
+        blocking_unsettled_task: AtomicU64::new(0),
+        blocking_unsettled_admissions: AtomicU64::new(0),
+        blocking_admissions: AtomicU64::new(0),
+        blocking_finished: AtomicU64::new(0),
+        counted_tasks: Mutex::new(std::collections::BTreeSet::new()),
+        pool_samples: AtomicU64::new(0),
+        finish_gate: Mutex::new(None),
+        drop_gate_on_publish: AtomicBool::new(false),
+        runtime_id: Mutex::new(None),
         hooks: Mutex::new(RecheckHooks::empty()),
         poke: Mutex::new(None),
-    });
+    })
+}
+
+#[cfg(tokio_unstable)]
+thread_local! {
+    static IDLE_WAIT: std::cell::RefCell<Arc<IdleWait>> = std::cell::RefCell::new(new_idle_wait());
+}
+
+#[cfg(tokio_unstable)]
+fn with_idle_slot<R>(f: impl FnOnce(&Arc<IdleWait>) -> R) -> R {
+    IDLE_WAIT.with(|slot| f(&slot.borrow()))
+}
+
+/// Install a fresh slot and clear the previous one. A leftover pool thread
+/// keeps the previous `Arc` and cannot write this runtime's stamp.
+#[cfg(tokio_unstable)]
+fn retire_idle_slot() {
+    let old = IDLE_WAIT.with(|slot| slot.replace(new_idle_wait()));
+    unbind_runtime(&old);
+    clear_slot(&old);
 }
 
 /// Wakes the current-thread reactor. Sending does not set the `block_on`
@@ -789,6 +941,7 @@ struct IdlePokeGuard;
 #[cfg(tokio_unstable)]
 impl Drop for IdlePokeGuard {
     fn drop(&mut self) {
+        with_idle_slot(unbind_runtime);
         clear_idle_wait();
         drop_idle_poke();
     }
@@ -807,18 +960,19 @@ fn install_idle_poke() {
     sender.set_nonblocking(true).expect("W3-H idle poke socket");
     sender.connect(addr).expect("W3-H idle poke socket");
     let receiver = tokio::net::UdpSocket::from_std(receiver).expect("W3-H idle poke socket");
-    IDLE_WAIT.with(|slot| {
+    with_idle_slot(|slot| {
         *slot
             .poke
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(IdlePoke { sender, receiver });
+        bind_runtime(slot);
     });
 }
 
 #[cfg(tokio_unstable)]
 fn drop_idle_poke() {
-    IDLE_WAIT.with(|slot| {
+    with_idle_slot(|slot| {
         *slot
             .poke
             .lock()
@@ -867,25 +1021,331 @@ fn set_force_pool_busy(slot: &IdleWait, busy: bool) {
     slot.force_pool_busy.store(busy, Ordering::Release);
 }
 
+/// Holds the pool thread after a blocking closure returns and before Tokio
+/// marks that thread idle. The case releases it. Absent, the hook returns.
+#[cfg(tokio_unstable)]
+struct BlockingFinishGate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+/// Pool threads find the runtime that spawned them. One test cannot wake
+/// another's parked clock.
+#[cfg(tokio_unstable)]
+static RUNTIMES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<tokio::runtime::Id, Arc<IdleWait>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(tokio_unstable)]
+fn bind_runtime(slot: &Arc<IdleWait>) {
+    let id = tokio::runtime::Handle::current().id();
+    *slot
+        .runtime_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id);
+    RUNTIMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(id, Arc::clone(slot));
+}
+
+#[cfg(tokio_unstable)]
+fn unbind_runtime(slot: &Arc<IdleWait>) {
+    let id = slot
+        .runtime_id
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(id) = id {
+        let mut runtimes = RUNTIMES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = match runtimes.get(&id) {
+            Some(existing) => Arc::ptr_eq(existing, slot),
+            None => false,
+        };
+        if remove {
+            runtimes.remove(&id);
+        }
+    }
+    slot.clock_hold_task.store(0, Ordering::Release);
+}
+
+#[cfg(tokio_unstable)]
+fn install_blocking_finish_gate(
+    slot: &IdleWait,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *slot
+        .finish_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(BlockingFinishGate { entered, release });
+}
+
+/// The next blocking completion drops the slot gate while publishing.
+/// Simulates the barrier ending in that window (#1662).
+#[cfg(tokio_unstable)]
+fn arm_drop_finish_gate_on_publish(slot: &IdleWait) {
+    slot.drop_gate_on_publish.store(true, Ordering::Release);
+}
+
+#[cfg(tokio_unstable)]
+fn take_finish_gate(slot: &IdleWait) -> Option<BlockingFinishGate> {
+    slot.finish_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// A `spawn_blocking` closure has returned. The pool thread is not idle yet.
+/// That lag is not scenario work: the paused clock may step once no other
+/// counted task is outstanding (#1662). A test gate can hold the thread
+/// in the gap. The stored excuse is the admission count this function has
+/// already loaded. It does not read that counter again.
+#[cfg(tokio_unstable)]
+fn on_blocking_task_finished(task_id: u64) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let slot = RUNTIMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&handle.id())
+        .cloned();
+    let Some(slot) = slot else {
+        return;
+    };
+    if task_id != 0 && slot.clock_hold_task.load(Ordering::Acquire) == task_id {
+        slot.clock_hold_task.store(0, Ordering::Release);
+        return;
+    }
+    // Outside the counted set. Raw `spawn_blocking` and `tokio::fs` move
+    // neither counter, and this finish does not publish.
+    if !take_counted_blocking_task(&slot, task_id) {
+        return;
+    }
+    // Own the gate before publishing. The publish path drops a gate still
+    // in the slot: the barrier can end on this wake, and the ordering
+    // control does the same. A drop of the slot gate must not lose `entered`.
+    let gate = take_finish_gate(&slot);
+    slot.blocking_finished.fetch_add(1, Ordering::AcqRel);
+    let spawned = slot.blocking_admissions.load(Ordering::Acquire);
+    let finished = slot.blocking_finished.load(Ordering::Acquire);
+    let queued = handle.metrics().blocking_queue_depth();
+    if task_id != 0 && queued == 0 && spawned == finished {
+        // The load is done. A test can admit the next task before the store.
+        hold_before_wind_down_publish(&slot);
+        publish_wind_down(&slot, task_id, spawned);
+    } else {
+        // Another counted task is still queued or running, or this id
+        // cannot arm an excuse. Leave the clock frozen.
+        clear_wind_down(&slot);
+    }
+    if slot.drop_gate_on_publish.swap(false, Ordering::AcqRel) {
+        let _ = take_finish_gate(&slot);
+    }
+    let epoch = slot.epoch.load(Ordering::Acquire);
+    wake_park_hook(&slot, epoch);
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv();
+    }
+    // After the store. A spawn here is already outside the recorded count.
+    hold_after_finish_check(&slot);
+    hold_after_admission_check(&slot);
+}
+
+/// One counted blocking spawn. Called on the spawner before Tokio queues
+/// the task, so the count has moved before the task can start (#1662).
+/// [`AutoAdvanceHold`] stays on `tokio::task::spawn_blocking` and is not
+/// counted. No bound runtime means this process is not inside a W3-H barrier.
+#[cfg(tokio_unstable)]
+pub(crate) fn note_blocking_admission() {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    note_blocking_admission_for(&handle);
+}
+
+#[cfg(tokio_unstable)]
+fn note_blocking_admission_for(handle: &tokio::runtime::Handle) {
+    let slot = RUNTIMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&handle.id())
+        .cloned();
+    if let Some(slot) = slot {
+        slot.blocking_admissions.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Scenario `spawn_blocking`. The admission is recorded before the task
+/// is queued, and the closure registers its id before the body runs.
+#[cfg(tokio_unstable)]
+fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    counted_spawn_blocking(f)
+}
+
+/// `Handle::spawn_blocking` for a thread that is not inside the runtime.
+/// The coordinator in the clock controls uses this.
+#[cfg(tokio_unstable)]
+fn spawn_blocking_on<F, R>(handle: &tokio::runtime::Handle, f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    note_blocking_admission_for(handle);
+    handle.spawn_blocking(counted_body(f))
+}
+
+/// One counted blocking spawn. The admission moves before Tokio queues the
+/// task. The closure records its task id before the body, so the finish
+/// hook counts this task and no other (#1662).
+#[cfg(tokio_unstable)]
+pub(crate) fn counted_spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    note_blocking_admission();
+    tokio::task::spawn_blocking(counted_body(f))
+}
+
+#[cfg(tokio_unstable)]
+fn counted_body<F, R>(f: F) -> impl FnOnce() -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    move || {
+        register_counted_blocking_task();
+        f()
+    }
+}
+
+/// Remember the running task so its finish moves [`IdleWait::blocking_finished`].
+#[cfg(tokio_unstable)]
+fn register_counted_blocking_task() {
+    let task_id = task_id_bits_of_current();
+    if task_id == 0 {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let slot = RUNTIMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&handle.id())
+        .cloned();
+    if let Some(slot) = slot {
+        slot.counted_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task_id);
+    }
+}
+
+/// `true` when `task_id` was admitted through [`counted_spawn_blocking`].
+#[cfg(tokio_unstable)]
+fn take_counted_blocking_task(slot: &IdleWait, task_id: u64) -> bool {
+    slot.counted_tasks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&task_id)
+}
+
+#[cfg(tokio_unstable)]
+fn clear_wind_down(slot: &IdleWait) {
+    slot.blocking_unsettled_task.store(0, Ordering::Release);
+    slot.blocking_unsettled_admissions
+        .store(0, Ordering::Release);
+}
+
+/// Busy pool threads besides the clock hold.
+#[cfg(tokio_unstable)]
+fn blocking_extra(handle: &tokio::runtime::Handle) -> u64 {
+    let metrics = handle.metrics();
+    let busy = metrics
+        .num_blocking_threads()
+        .saturating_sub(metrics.num_idle_blocking_threads());
+    u64::try_from(busy.saturating_sub(1)).unwrap_or(u64::MAX)
+}
+
+/// Record `checked` for `task_id`. `checked` is the admission count the
+/// finish hook already compared with the finish count. This function does
+/// not read [`IdleWait::blocking_admissions`] again: a task counted after
+/// that comparison must stay outside the stored excuse (#1662). A task id
+/// of 0 stores nothing, so the clock waits for the idle mark.
+#[cfg(tokio_unstable)]
+fn publish_wind_down(slot: &IdleWait, task_id: u64, checked: u64) {
+    if task_id == 0 {
+        return;
+    }
+    // The task id is stored after the count. A reader that sees a non-zero
+    // id also sees this count. `checked` is the value the finish hook
+    // compared; a later admission is not part of it.
+    slot.blocking_unsettled_admissions
+        .store(checked, Ordering::Release);
+    slot.blocking_unsettled_task
+        .store(task_id, Ordering::Release);
+}
+
 /// True when a blocking task besides [`AutoAdvanceHold`] is running or
 /// queued. The hold keeps one pool thread for the whole scenario. Any
 /// further running or queued `spawn_blocking` task freezes the clock.
 /// Stepping 1 ms on each wake while that task runs spends a different
 /// number of virtual milliseconds on each rerun (#1245).
 ///
+/// A closure that has already returned can still be counted busy: Tokio
+/// marks the pool thread idle only after it wakes the runtime. That lag
+/// is not a running task, and waiting for the idle mark stalls the wall
+/// clock (#1662). The excuse covers that one thread only while
+/// `blocking_admissions` is still the count stored at publish. The next
+/// counted spawn moves the count before the task starts.
+///
 /// `force_pool_busy` on the idle slot is a test seam. When it is set, this
 /// function stays true so a case can mark the pool idle without a runtime
-/// wake. That is the window the recheck thread closes.
+/// wake. That is the window the recheck thread closes. The flag does not
+/// clear the excuse, so a case can hide the idle transition and then admit
+/// another task.
 #[cfg(tokio_unstable)]
 fn pool_busy(handle: &tokio::runtime::Handle, slot: &IdleWait) -> bool {
+    slot.pool_samples.fetch_add(1, Ordering::Release);
     if slot.force_pool_busy.load(Ordering::Acquire) {
         return true;
     }
-    let metrics = handle.metrics();
-    let busy = metrics
-        .num_blocking_threads()
-        .saturating_sub(metrics.num_idle_blocking_threads());
-    metrics.blocking_queue_depth() > 0 || busy > 1
+    let queued = handle.metrics().blocking_queue_depth();
+    // The hold keeps one pool thread for the scenario.
+    let extra = blocking_extra(handle);
+    if queued > 0 {
+        // A task is visible in the queue. Drop the excuse so an uncounted
+        // spawn cannot inherit it once the queue drains.
+        clear_wind_down(slot);
+        return true;
+    }
+    if extra == 0 {
+        // The pool thread has absorbed the completion.
+        clear_wind_down(slot);
+        return false;
+    }
+    // `extra > 0` and the queue is empty. Excuse the publishing thread
+    // only when no counted task has been admitted since publish. One
+    // extra thread is that publisher. Any further busy thread is other
+    // work.
+    let unsettled = slot.blocking_unsettled_task.load(Ordering::Acquire);
+    let recorded = slot.blocking_unsettled_admissions.load(Ordering::Acquire);
+    let admitted = slot.blocking_admissions.load(Ordering::Acquire);
+    if unsettled != 0 && admitted == recorded {
+        return extra > 1;
+    }
+    true
 }
 
 /// The current-thread runtime has one worker. A queued task is not the
@@ -926,6 +1386,15 @@ struct RecheckHooks {
     before_publish: Option<RecheckGate>,
     /// Holds the runtime in `after_unpark` while `parked` is still true.
     unpark_gap: Option<RecheckGate>,
+    /// Holds the finish hook after its queue check, so a case can queue
+    /// the next blocking task in that window (#1662).
+    after_finish_check: Option<RecheckGate>,
+    /// Holds the finish hook after the admission snapshot. A spawn here
+    /// is past every check in the hook (#1662).
+    after_admission_check: Option<RecheckGate>,
+    /// Holds the finish hook after it has loaded the admission count and
+    /// before it stores that count (#1662).
+    before_wind_down_publish: Option<RecheckGate>,
     finished: Option<std::sync::mpsc::Sender<()>>,
 }
 
@@ -936,8 +1405,89 @@ impl RecheckHooks {
             disarm: None,
             before_publish: None,
             unpark_gap: None,
+            after_finish_check: None,
+            after_admission_check: None,
+            before_wind_down_publish: None,
             finished: None,
         }
+    }
+}
+
+#[cfg(tokio_unstable)]
+fn install_after_finish_check_gate(
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    idle_slot()
+        .hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .after_finish_check = Some(RecheckGate { entered, release });
+}
+
+#[cfg(tokio_unstable)]
+fn hold_after_finish_check(slot: &IdleWait) {
+    let gate = slot
+        .hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .after_finish_check
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv();
+    }
+}
+
+#[cfg(tokio_unstable)]
+fn install_after_admission_check_gate(
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    idle_slot()
+        .hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .after_admission_check = Some(RecheckGate { entered, release });
+}
+
+#[cfg(tokio_unstable)]
+fn hold_after_admission_check(slot: &IdleWait) {
+    let gate = slot
+        .hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .after_admission_check
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv();
+    }
+}
+
+#[cfg(tokio_unstable)]
+fn install_before_wind_down_publish_gate(
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    idle_slot()
+        .hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .before_wind_down_publish = Some(RecheckGate { entered, release });
+}
+
+#[cfg(tokio_unstable)]
+fn hold_before_wind_down_publish(slot: &IdleWait) {
+    let gate = slot
+        .hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .before_wind_down_publish
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv();
     }
 }
 
@@ -1083,7 +1633,7 @@ impl Drop for UnspawnedClaim {
 
 #[cfg(tokio_unstable)]
 fn idle_slot() -> Arc<IdleWait> {
-    IDLE_WAIT.with(Arc::clone)
+    with_idle_slot(Arc::clone)
 }
 
 /// Publish `ready` for `epoch` only. The waker mutex is the same one
@@ -1200,14 +1750,14 @@ fn arm_idle_recheck(slot: Arc<IdleWait>, handle: tokio::runtime::Handle) {
 
 #[cfg(tokio_unstable)]
 fn note_runtime_parked() {
-    let slot = IDLE_WAIT.with(Arc::clone);
+    let slot = idle_slot();
     slot.parked.store(true, Ordering::Release);
     note_idle_park();
 }
 
 #[cfg(tokio_unstable)]
 fn note_runtime_unparked() {
-    let slot = IDLE_WAIT.with(Arc::clone);
+    let slot = idle_slot();
     // The driver has returned and `parked` is still true. A case can hold
     // that gap. Clearing `parked` is the end of it.
     hold_unpark_gap(&slot);
@@ -1236,7 +1786,7 @@ fn hold_unpark_gap(slot: &IdleWait) {
 /// no waker, so this returns without reading metrics.
 #[cfg(tokio_unstable)]
 fn note_idle_park() {
-    let slot = IDLE_WAIT.with(Arc::clone);
+    let slot = idle_slot();
     if !idle_waker_waiting(&slot) {
         return;
     }
@@ -1270,7 +1820,7 @@ impl std::future::Future for IdlePulse {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
-        IDLE_WAIT.with(|slot| {
+        with_idle_slot(|slot| {
             // Same mutex as `publish_ready`. The ready bit and the waker
             // change together, so a wake cannot land between them.
             let mut waker = slot
@@ -1306,7 +1856,7 @@ impl Drop for EndIdleWait {
 async fn drive_paused<F: std::future::Future>(fut: F) -> F::Output {
     tokio::pin!(fut);
     let _end = EndIdleWait;
-    IDLE_WAIT.with(|slot| {
+    with_idle_slot(|slot| {
         let _waker = slot
             .waker
             .lock()
@@ -1318,7 +1868,7 @@ async fn drive_paused<F: std::future::Future>(fut: F) -> F::Output {
             biased;
             output = &mut fut => return output,
             _ = IdlePulse => {
-                let busy = IDLE_WAIT.with(|slot| {
+                let busy = with_idle_slot(|slot| {
                     pool_busy(&tokio::runtime::Handle::current(), slot)
                 });
                 if busy || scheduler_has_queued_tasks() {

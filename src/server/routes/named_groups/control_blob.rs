@@ -2338,6 +2338,7 @@ mod tests {
                     polls: Vec::new(),
                     tasks: Vec::new(),
                     listener_token: None,
+                    held_pending_notice: None,
                 },
             );
         record_expected_join_result_inviter(&state, key.clone(), source.clone());
