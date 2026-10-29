@@ -729,6 +729,9 @@ pub fn apply_to_parent(
         current_revision: parent.state_revision,
         current_withdrawn: parent.withdrawn,
         members_v2: &parent.members_v2,
+        // #1578 rc11 (Claude blocking 1, audit): the join's key-only
+        // marker row is not a seat for the authority check either.
+        join_seat_marker_agents: parent.join_seat_key_marker_agents(),
         group_id: parent.stable_group_id(),
     };
     state_commit::validate_apply(&ctx, &commit, signer.action_kind())

@@ -39,6 +39,7 @@ fn apply_context(info: &GroupInfo) -> ApplyContext<'_> {
         current_revision: info.state_revision,
         current_withdrawn: info.withdrawn,
         members_v2: &info.members_v2,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
         group_id: info.stable_group_id(),
     }
 }

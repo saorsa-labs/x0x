@@ -585,9 +585,13 @@ fn note_head_disclaimed(
 /// roster does not seat — is exactly main's reply: ignored, so the ask
 /// cadence still counts the sender and asks it again. The seat's KEM
 /// key is local data, not in the roster root, so this node's view of
-/// the sender's seat can differ from the sender's own; the receiver
-/// has only its local view, and every divergence falls back on main's
-/// ignored reply — the sound side.
+/// the sender's seat can differ from the sender's own; a divergence
+/// changes only the ask cadence: a view that lacks a key the sender
+/// holds counts that sender's hash-less reply as answered and re-asks
+/// it less (never more), and a view that seats a key the sender lacks
+/// keeps main's ignored reply. No evidence rule changes either way
+/// (the conflicting/confirmed sets are untouched by this predicate's
+/// path).
 fn hashless_answer_is_a_keyless_disclaimer(info: &GroupInfo, sender: [u8; 32]) -> bool {
     info.secure_plane == x0x::mls::SecureGroupPlane::Gss
         && info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
@@ -853,11 +857,12 @@ pub(in crate::server) async fn seal_probe_for_test(
 }
 
 /// §2: the catch-up response handler calls this for each verified,
-/// applied, non-truncated page that carries the responder's saved head
-/// (`responder_state_hash`). The sender is an active, unrevoked member;
-/// the handler checked that. §3: the same answer is the sender's survivor
-/// convergence evidence for the S4 deliveries of the group
-/// ([`crypto_exclusion::note_survivor_head`]). An absent field is the
+/// applied, non-truncated catch-up page, with or without the
+/// responder's saved head (`responder_state_hash`). The sender is an
+/// active, unrevoked member; the handler checked that. §3: the same
+/// answer is the sender's survivor convergence evidence for the S4
+/// deliveries of the group ([`crypto_exclusion::note_survivor_head`]).
+/// An absent field is the
 /// #1578 keyless disclaimer (David's ruling, 28 Oct 02:09 GMT) only
 /// from a keyless survivor
 /// ([`hashless_answer_is_a_keyless_disclaimer`], Engineer ruling (2),
@@ -1235,10 +1240,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             .map_or(Duration::ZERO, |budget| budget.elapsed(now));
         let active_admins = active_admins_of(info);
         let target_hex = hex::encode(key.target);
-        let target_seated = info
-            .members_v2
-            .get(&target_hex)
-            .is_some_and(|member| is_seated(member.state));
+        let target_seated = seat_target(info, &target_hex);
         // §5 memory-only durability: every trigger S4 derives today is
         // durable elsewhere (the revocation store, the verified chain or a
         // committed certificate), so a memory-only sidecar does not hold
@@ -1475,7 +1477,12 @@ fn revocation_seats(groups: &[(String, GroupInfo)], leaves: &RetainedLeaves) -> 
                 .unwrap_or_default();
             hasher.update(&target);
             hasher.update(&[
-                u8::from(is_seated(member.state)),
+                // #1578 rc11 (audit): the join's key-only marker row
+                // hashes as an unseated entry — exactly main's roster,
+                // which holds no row for the pre-admission joiner.
+                u8::from(
+                    is_seated(member.state) && !info.join_seat_key_marker_only(&member.agent_id),
+                ),
                 match leaves.tracks(stable, &target) {
                     Some(true) => 1,
                     Some(false) => 0,
@@ -1678,6 +1685,18 @@ fn is_seated(state: GroupMemberState) -> bool {
     matches!(state, GroupMemberState::Active | GroupMemberState::Pending)
 }
 
+/// #1578 rc11 (Claude blocking 1, audit): the seat gate for a named
+/// target. The join's key-only marker row
+/// (`GroupInfo::join_seat_key_marker_only`) is not a seat — the
+/// pre-admission joiner is unseated, exactly main's roster, where it
+/// holds no row before its `MemberAdded` lands.
+fn seat_target(info: &GroupInfo, agent_hex: &str) -> bool {
+    info.members_v2
+        .get(agent_hex)
+        .is_some_and(|member| is_seated(member.state))
+        && !info.join_seat_key_marker_only(agent_hex)
+}
+
 fn owner_certified(info: &GroupInfo) -> bool {
     matches!(
         info.policy.admission,
@@ -1714,7 +1733,10 @@ fn derive_triggers(
             // read as an absent leaf (§3, #1508 review P1).
             let retained_leaf = leaves.tracks(stable, &target).unwrap_or(false)
                 || leaves.undecided(stable, &target);
-            let seated = is_seated(member.state);
+            // #1578 rc11 (audit): the join's key-only marker row does
+            // not open work — the pre-admission joiner holds no seat.
+            let seated =
+                is_seated(member.state) && !info.join_seat_key_marker_only(&member.agent_id);
             let incarnation = ce::seat_incarnation(info, &member.agent_id);
             // §1: an Agent-subject revocation creates work where the target
             // has a seat or a retained cryptographic leaf.
@@ -1922,7 +1944,7 @@ fn reconcile_completion(
         }
         let target_hex = hex::encode(key.target);
         let member = info.members_v2.get(&target_hex);
-        let seated = member.is_some_and(|member| is_seated(member.state));
+        let seated = seat_target(info, &target_hex);
         let stable = key.stable_group_id.as_str();
         if seated {
             // §1a/D135: an expiry-only row ends when the committed
@@ -2259,8 +2281,14 @@ async fn prepared_removal_recheck(
         let info = groups.get(group_key);
         (
             info.map(|info| info.state_hash.clone()),
-            info.and_then(|info| info.members_v2.get(&hex::encode(key.target)))
-                .cloned(),
+            // #1578 rc11 (audit): the join's key-only marker row reads
+            // as no seat, exactly main's roster.
+            info.and_then(|info| {
+                info.members_v2
+                    .get(&hex::encode(key.target))
+                    .filter(|member| !info.join_seat_key_marker_only(&member.agent_id))
+                    .cloned()
+            }),
         )
     };
     // A rebind that changed the seat's certificate cancels the removal
@@ -2361,7 +2389,11 @@ async fn seal_request_gate(
         let seated: Vec<String> = info
             .members_v2
             .values()
-            .filter(|member| is_seated(member.state))
+            // #1578 rc11 (audit): the join's key-only marker row is
+            // not a seated target.
+            .filter(|member| {
+                is_seated(member.state) && !info.join_seat_key_marker_only(&member.agent_id)
+            })
             .map(|member| member.agent_id.clone())
             .collect();
         (info.stable_group_id().to_string(), seated)
@@ -3356,10 +3388,7 @@ pub(in crate::server) fn s4_eviction_seal_tolerates(info: &GroupInfo, failed: &[
 
 fn eviction_seal_tolerates(scope: &EvictionSealScope, info: &GroupInfo, failed: &[String]) -> bool {
     scope.stable_group_id == info.stable_group_id()
-        && !info
-            .members_v2
-            .get(&scope.target_hex)
-            .is_some_and(|member| is_seated(member.state))
+        && !seat_target(info, &scope.target_hex)
         && !failed.is_empty()
         && failed
             .iter()
@@ -3436,8 +3465,11 @@ pub(in crate::server) async fn s4_exclusion_cancelled_under_lock(
         let info = groups.get(group_key)?;
         (
             info.stable_group_id().to_string(),
+            // #1578 rc11 (audit): the join's key-only marker row reads
+            // as no seat, exactly main's roster.
             info.members_v2
                 .get(&hex::encode(target.as_bytes()))
+                .filter(|member| !info.join_seat_key_marker_only(&member.agent_id))
                 .cloned(),
         )
     };
@@ -3606,10 +3638,7 @@ async fn drive_queued_bans(state: &Arc<AppState>) {
             // A TreeKEM ban of a target with no leaf cannot run through
             // the existing route; it applies once the target is seated
             // again (a rejoin), so retry slowly while it is not.
-            let seated = info
-                .members_v2
-                .get(&target_hex)
-                .is_some_and(|member| is_seated(member.state));
+            let seated = seat_target(info, &target_hex);
             let retry = if seated {
                 S4_COMMIT_RETRY
             } else {
@@ -7393,6 +7422,144 @@ pub(super) mod tests {
         assert!(
             answered(keyless),
             "the keyless survivor answered: the round does not re-ask it every 2 s"
+        );
+        Ok(())
+    }
+
+    /// #1578 rc11 (Claude non-blocking 3): the plane check of
+    /// [`hashless_answer_is_a_keyless_disclaimer`] pinned. A TreeKEM
+    /// group holds no GSS secret and seats no KEM key by design, so
+    /// its keyless Active member is not a keyless survivor: the
+    /// hash-less answer stays main's ignored reply, and the ask
+    /// cadence keeps counting the sender. Delete the
+    /// `secure_plane == Gss` check and this test fails: the predicate
+    /// matches, `note_catchup_head` records the sender answered, and
+    /// it is never asked again.
+    #[tokio::test]
+    async fn rc11_a_treekem_plane_keyless_seat_is_not_a_keyless_survivor() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "d5".repeat(16);
+        let keyless = [10; 32];
+        let mut info = GroupInfo::new(
+            "rc11-treekem-plane".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.policy.confidentiality = x0x::groups::GroupConfidentiality::MlsEncrypted;
+        info.add_member(hex::encode(keyless), GroupRole::Member, None, None);
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &hex::encode(keyless),
+            None,
+        )
+        .await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let answered = |sender: [u8; 32]| {
+            inner
+                .head_round_asks
+                .values()
+                .any(|asks| asks.answered.contains(&sender))
+        };
+        assert!(
+            !answered(keyless),
+            "a TreeKEM keyless seat's hash-less reply is main's ignored reply: it is asked again"
+        );
+        Ok(())
+    }
+
+    /// #1578 rc11 (Claude non-blocking 3): the confidentiality check of
+    /// [`hashless_answer_is_a_keyless_disclaimer`] pinned. A
+    /// SignedPublic group is GSS-plane and seats no KEM key by design,
+    /// so its keyless Active member is not a keyless survivor: the
+    /// hash-less answer stays main's ignored reply, and the ask
+    /// cadence keeps counting the sender (rc4 pinned the same gate on
+    /// the claim side). Delete the `policy.confidentiality ==
+    /// MlsEncrypted` check and this test fails: the predicate matches,
+    /// `note_catchup_head` records the sender answered, and it is
+    /// never asked again.
+    #[tokio::test]
+    async fn rc11_a_signed_public_group_keyless_seat_is_not_a_keyless_survivor(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "d6".repeat(16);
+        let keyless = [11; 32];
+        let mut info = GroupInfo::new(
+            "rc11-signed-public".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+        info.add_member(hex::encode(keyless), GroupRole::Member, None, None);
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &hex::encode(keyless),
+            None,
+        )
+        .await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let answered = |sender: [u8; 32]| {
+            inner
+                .head_round_asks
+                .values()
+                .any(|asks| asks.answered.contains(&sender))
+        };
+        assert!(
+            !answered(keyless),
+            "a SignedPublic member's hash-less reply is main's ignored reply: it is asked again"
         );
         Ok(())
     }

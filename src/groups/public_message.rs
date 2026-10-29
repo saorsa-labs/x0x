@@ -882,6 +882,11 @@ pub struct PublicIngestContext<'a> {
     pub group_id: &'a str,
     pub policy: &'a GroupPolicy,
     pub members_v2: &'a BTreeMap<String, GroupMember>,
+    /// #1578 rc11 (audit): agents whose only roster row is the local
+    /// join's key-only marker (`GroupInfo::join_seat_key_marker_only`)
+    /// — not member seats for the delegator gate, exactly main's
+    /// roster. Empty when the caller holds no marker rows.
+    pub join_seat_marker_agents: BTreeSet<String>,
 }
 
 /// Validate a public-group message against the current group view.
@@ -1008,10 +1013,13 @@ fn validate_public_message_inner(
             )));
         }
         // The delegator must be a current member: a removed delegator's
-        // grants auto-expire with their membership (ADR-0040).
-        if !ctx
-            .members_v2
-            .contains_key(&hex::encode(sd.delegation.from_agent.as_bytes()))
+        // grants auto-expire with their membership (ADR-0040). #1578
+        // rc11 (audit): the join's key-only marker row is not a seat —
+        // the pre-admission joiner is not a member, exactly main's
+        // roster.
+        let delegator_hex = hex::encode(sd.delegation.from_agent.as_bytes());
+        if !ctx.members_v2.contains_key(&delegator_hex)
+            || ctx.join_seat_marker_agents.contains(&delegator_hex)
         {
             return Err(IngestError::InvalidDelegationEnvelope(
                 "delegator is not a member of this group".into(),
@@ -1266,6 +1274,7 @@ mod tests {
             group_id: "g-different",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
@@ -1284,6 +1293,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
@@ -1302,6 +1312,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
@@ -1321,6 +1332,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         validate_public_message(&ctx, &msg).unwrap();
     }
@@ -1335,6 +1347,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         let err = validate_public_message(&ctx, &msg).unwrap_err();
         assert!(matches!(err, IngestError::WritePolicyViolation { .. }));
@@ -1417,6 +1430,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg),
@@ -1429,6 +1443,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         validate_public_message(&ctx, &msg).unwrap();
     }
@@ -1475,6 +1490,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg),
@@ -1536,6 +1552,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         // …but ingest must reject the unauthenticated provenance.
         assert!(matches!(
@@ -1638,6 +1655,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
@@ -1656,6 +1674,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         validate_public_message(&ctx, &msg).unwrap();
     }
@@ -1673,6 +1692,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
@@ -1692,6 +1712,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
@@ -1711,6 +1732,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         validate_public_message(&ctx, &msg).unwrap();
     }
@@ -1727,6 +1749,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         validate_public_message(&ctx, &msg).unwrap();
     }
@@ -1912,6 +1935,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
@@ -1949,6 +1973,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         // Thread structural checks run BEFORE signature verification.
         // ThreadParentWithoutRoot fires as a cheap early reject; the
@@ -1987,6 +2012,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         // Must succeed — the parent not being locally known is fine (ADR-0028).
         validate_public_message(&ctx, &msg).unwrap();
@@ -2035,6 +2061,7 @@ mod tests {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
         // Self-reference check is reachable only for messages whose signature
         // would fail anyway (BLAKE3 fixed-point property). Tampering thread_root
@@ -2166,6 +2193,7 @@ mod tests {
             group_id: "g1",
             policy: &open_policy(),
             members_v2: &BTreeMap::new(),
+            join_seat_marker_agents: BTreeSet::new(),
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg),
@@ -2204,6 +2232,7 @@ mod tests {
             group_id: "g1",
             policy: &open_policy(),
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
         };
 
         let sd = crate::delegation::sign_delegation(

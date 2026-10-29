@@ -1807,7 +1807,7 @@ every wait. A wait always names its cause; it does not stop silently.
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
-| `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold has no time limit. A secret of the held epoch, or a later one, ends it. |
+| `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold lasts until the seat is keyed again — a sealed share of the held epoch (or a later one) installs, or the key republication of #1663 seats the seat's KEM key again. It has no timer of its own. |
 
 The same hold refuses group ciphertext on the paths that make no HTTP
 response of their own, and each refusal carries the same reason text: a
@@ -1831,14 +1831,19 @@ epoch; every other responder — a `signed_public` member, an
 `mls_encrypted` joiner still waiting for its welcome share, and a
 superseded intermediate head included — serves the field exactly as
 before); and the author's removal obligation stays open — a keyless
-install never proves delivery. The state ends when the seat leaves and
-re-joins with a verified KEM binding — no wire event seats a KEM key on
-an already-Active seat — and a holder then seals the current secret to it
-and the sealed share installs: the S4 delivery's own re-seal (its author
-resends each round until the seat can take the share) or the next
-rotation do this on their own; `POST /groups/:id/secure/reseal` only
-builds the envelope, which must still be delivered and installed. The
-installed share of the held epoch, or a later one, ends the hold.
+install never proves delivery. The state ends when the seat is keyed
+again. One exit: the seat leaves and re-joins with a verified KEM
+binding — no wire event today seats a KEM key on an already-Active
+seat — and a holder then seals the current secret to it and the sealed
+share installs; the S4 delivery's own re-seal (its author resends each
+round until the seat can take the share) or the next rotation do this
+on their own, and `POST /groups/:id/secure/reseal` only builds the
+envelope, which must still be delivered and installed. The second exit
+is the key republication planned in #1663 (David's 28 Oct 02:25 GMT
+ruling): it seats the seat's KEM key again without a leave and
+re-join, and the re-sealed share then ends the hold. Until one of the
+two keys the seat again, the hold lasts: an installed share of the
+held epoch, or a later one, or the #1663 republication, ends it.
 
 **Wire and capabilities.** The daemon advertises three more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`

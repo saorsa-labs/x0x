@@ -2448,7 +2448,11 @@ async fn remember_reseat_bases(
             .filter(|((group, _), _)| *group == stable)
             .map(|((_, subject), bases)| {
                 (
-                    info.members_v2.contains_key(subject),
+                    // #1578 rc11 (audit): the join's key-only marker
+                    // row is not a seat — the subject stays a stranger,
+                    // exactly main's roster.
+                    info.members_v2.contains_key(subject)
+                        && !info.join_seat_key_marker_only(subject),
                     bases.at,
                     subject.clone(),
                 )
@@ -5119,7 +5123,13 @@ pub(super) async fn verify_reseat_mandate_on_receive(
         if !s3::signer_is_active_admin(parent, &mandate.fields.signer) {
             return Err("signer_not_admin");
         }
-        let seated_role = next.members_v2.get(subject_hex).map(|seat| seat.role);
+        // #1578 rc11 (audit): the join's key-only marker row is not a
+        // seat — the subject reads as unseated, exactly main's roster.
+        let seated_role = next
+            .members_v2
+            .get(subject_hex)
+            .filter(|_| !next.join_seat_key_marker_only(subject_hex))
+            .map(|seat| seat.role);
         if seated_role != Some(mandate.fields.role) {
             return Err("role_raised");
         }
@@ -5147,9 +5157,12 @@ pub(super) async fn verify_reseat_mandate_on_receive(
         )
         .is_ok()
     });
+    // #1578 rc11 (audit): the join's key-only marker row is not a seat
+    // — the subject reads as unseated (Guest), exactly main's roster.
     let seated_role = next
         .members_v2
         .get(subject_hex)
+        .filter(|_| !next.join_seat_key_marker_only(subject_hex))
         .map_or(x0x::groups::GroupRole::Guest, |seat| seat.role);
     let check = x0x::groups::recovery::ReseatMandateCheck {
         parent,

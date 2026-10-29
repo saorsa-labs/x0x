@@ -42,7 +42,7 @@ use ant_quic::crypto::raw_public_keys::pqc::{
 };
 use ant_quic::MlDsaPublicKey;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Domain-separation tag for `GroupStateCommit::state_hash` computation.
 pub const STATE_COMMIT_DOMAIN: &[u8] = b"x0x.group.state-commit.v1";
@@ -834,6 +834,15 @@ pub struct ApplyContext<'a> {
     pub current_withdrawn: bool,
     /// Map used to look up the signer's current role (active-only).
     pub members_v2: &'a BTreeMap<String, GroupMember>,
+    /// #1578 rc11 (Claude blocking 1, audit): agents whose only roster
+    /// row is the local join's key-only marker
+    /// (`GroupInfo::join_seat_key_marker_only`). The authority check
+    /// counts them as absent — exactly main's roster, where the joiner
+    /// holds no row before its `MemberAdded` lands — so a
+    /// pre-admission joiner is never the sole member-in-being and can
+    /// not authorize a terminal withdrawal. Empty when the caller
+    /// holds no marker rows.
+    pub join_seat_marker_agents: BTreeSet<String>,
     pub group_id: &'a str,
 }
 
@@ -882,7 +891,11 @@ fn validate_apply_with_terminal_mode(
 
     // 6. authority
     let signer_role = active_signer_role(ctx.members_v2, &commit.committed_by);
-    let signer_is_sole_member = super::sole_member_in_being(ctx.members_v2, &commit.committed_by);
+    let signer_is_sole_member = super::sole_member_in_being_excluding_join_markers(
+        ctx.members_v2,
+        &commit.committed_by,
+        &ctx.join_seat_marker_agents,
+    );
 
     // A live -> withdrawn transition is a terminal admin act. Already-withdrawn
     // carry-forward commits are intentionally left to the ordinary action-kind
@@ -1738,6 +1751,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
         let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
@@ -1770,6 +1784,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
         let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
@@ -1806,6 +1821,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
         let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
@@ -1842,6 +1858,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
         validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap();
@@ -1875,6 +1892,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
 
@@ -1917,6 +1935,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
 
@@ -1955,6 +1974,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
 
@@ -2012,6 +2032,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
 
@@ -2058,6 +2079,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
 
@@ -2098,6 +2120,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
 
@@ -2131,6 +2154,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
 
@@ -2169,6 +2193,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
 
@@ -2204,6 +2229,7 @@ mod tests {
             current_revision: 2,
             current_withdrawn: true,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g1",
         };
         let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
@@ -2235,6 +2261,7 @@ mod tests {
             current_revision: 1,
             current_withdrawn: false,
             members_v2: &members,
+            join_seat_marker_agents: BTreeSet::new(),
             group_id: "g-right",
         };
         let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
