@@ -6,6 +6,7 @@
 //! variables, environment-file contents, PAM and generated values still matter.
 //! Callers must bind each reply to its manager, unit, interface and property.
 //! An empty list is data only, not evidence that no job or other source exists.
+#![cfg(unix)]
 #![allow(dead_code)] // Dormant until the complete inventory producer is integrated.
 
 use serde::{de::DeserializeOwned, Deserialize};

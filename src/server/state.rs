@@ -37,6 +37,12 @@ use super::routes::{
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
 
+/// The gossip roster hint last published per group, by stable ID: the
+/// group's metadata topic and active members, or `None` for a withdrawn
+/// group ([`AppState::group_roster_gossip_lock`]).
+pub(super) type GossipRosterHints =
+    BTreeMap<String, Option<(String, String, Vec<x0x::identity::AgentId>)>>;
+
 fn validate_instance_name_grammar(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.len() > 64 {
         anyhow::bail!("instance name must be 1-64 characters");
@@ -905,7 +911,9 @@ pub(super) struct AppState {
     /// transactions. Writers hold it through durability or rollback.
     pub(super) gss_publication_gate: Arc<RwLock<()>>,
     /// Orders roster snapshots sent to gossip after committed mutations.
-    pub(super) group_roster_gossip_lock: Mutex<()>,
+    /// It holds the roster last published for each group (by stable ID;
+    /// `None` = withdrawn), which a held-back group keeps (#1570).
+    pub(super) group_roster_gossip_lock: Mutex<GossipRosterHints>,
     pub(super) named_groups_path: PathBuf,
     /// Issue #451: disk location of the Home-Suite sidecar
     /// (`home-suite-groups.json`) — the AUTHORITATIVE durable state for
@@ -1117,12 +1125,17 @@ pub(super) struct AppState {
     pub(super) pending_join_refusals: StdMutex<HashMap<String, PendingJoinRefusal>>,
     /// ADR 0108 §8 (#1575): member-side staged join pending notices, keyed
     /// `(group_id, member_agent_id, attempt_id)` like the staged refusals.
-    /// Unsigned typed local state for held join attempts: the signed wire
-    /// `JoinPendingNotice` and its `Pending` serving arm wait on David's
-    /// ruling (#1575), so nothing here is served to a joiner. Memory-only,
-    /// TTL-swept at the join staging lifetime.
+    /// Typed local state for held join attempts; the signed wire body
+    /// materializes lazily at the first capable serve (§8) under
+    /// `join_pending_notice_sign_limiter`. Memory-only, TTL-swept at the
+    /// join staging lifetime.
     pub(super) pending_join_notices:
         StdMutex<HashMap<String, crate::server::routes::named_groups::PendingJoinNotice>>,
+    /// ADR 0108 §8: the notice lazy-signing limiter — the #477 limiter
+    /// shape (per-(group, member) tokens + a global bucket) with the same
+    /// values as the refusals while §8 Q3 stays open with David.
+    pub(super) join_pending_notice_sign_limiter:
+        StdMutex<crate::server::routes::named_groups::JoinRefusalSignLimiter>,
     /// #477: joiner-side pending-join attempt registry, keyed
     /// `join_result_key` — the attempt id, the pinned inviter, and the
     /// poll task handle, so a typed refusal / timeout / seat can

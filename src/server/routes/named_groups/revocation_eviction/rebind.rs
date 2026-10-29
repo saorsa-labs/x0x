@@ -3198,8 +3198,12 @@ pub(super) mod restart_tests {
     /// newest write's, and no more. A signer can seal many distinct
     /// valid frames at one revision; without the bound they fill the
     /// per-group cap and the oldest frames leave — the catch-up window
-    /// below the head. Four distinct frames are written at one revision:
-    /// the first two and the newest stay, the third leaves.
+    /// below the head. The two places go to the revision's newest two
+    /// file-only frames, not the first two in file order (#1669): an
+    /// old crash leftover leaves before a newer frame still waiting to
+    /// install. Four distinct frames are written at one revision: the
+    /// newest two and the write's stay, the first — the oldest in file
+    /// order — leaves.
     #[tokio::test]
     async fn a_revision_keeps_two_file_only_frames_and_the_newest() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -3256,8 +3260,8 @@ pub(super) mod restart_tests {
                 on_disk[1].result_head.as_str(),
                 on_disk[2].result_head.as_str()
             ),
-            (h1.as_str(), h2.as_str(), h4.as_str()),
-            "the first two and the newest stay"
+            (h2.as_str(), h3.as_str(), h4.as_str()),
+            "the newest two and the write's stay; the oldest leaves"
         );
         receiver.agent.shutdown().await;
         Ok(())

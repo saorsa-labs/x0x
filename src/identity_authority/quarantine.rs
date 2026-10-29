@@ -369,6 +369,8 @@ pub(crate) struct TickInputs {
     pub(crate) revoked: std::sync::Arc<tokio::sync::RwLock<RevocationSet>>,
     pub(crate) moves: std::sync::Arc<tokio::sync::RwLock<MoveState>>,
     pub(crate) contacts: std::sync::Arc<tokio::sync::RwLock<ContactStore>>,
+    /// Authenticated bindings. A reblock clears attribution protection.
+    pub(crate) authenticated: crate::dm_inbox::AuthenticatedMachineBindings,
     /// The revocation stores' directory (`None` uses the default, as the
     /// identity listener does).
     pub(crate) identity_dir: Option<PathBuf>,
@@ -445,12 +447,7 @@ pub(crate) async fn run_once(inputs: &TickInputs, now: u64) -> bool {
         }
         pending
     };
-    if !reblock.is_empty() {
-        let mut contacts = inputs.contacts.write().await;
-        for agent in &reblock {
-            contacts.set_trust(agent, TrustLevel::Blocked);
-        }
-    }
+    apply_reblock(&inputs.contacts, &inputs.authenticated, &reblock).await;
     for agent in &evict {
         let removed = inputs.discovery.write().await.remove(agent);
         if let Some(entry) = removed {
@@ -458,6 +455,29 @@ pub(crate) async fn run_once(inputs: &TickInputs, now: u64) -> bool {
         }
     }
     pending
+}
+
+/// Block each confirmed agent again and clear attribution protection.
+///
+/// The next record re-evaluates group and grant protection. This clear is
+/// the immediate effect of a reblock, before that record arrives.
+pub(crate) async fn apply_reblock(
+    contacts: &std::sync::Arc<tokio::sync::RwLock<ContactStore>>,
+    authenticated: &crate::dm_inbox::AuthenticatedMachineBindings,
+    reblock: &[AgentId],
+) {
+    if reblock.is_empty() {
+        return;
+    }
+    {
+        let mut contacts = contacts.write().await;
+        for agent in reblock {
+            contacts.set_trust(agent, TrustLevel::Blocked);
+        }
+    }
+    for agent in reblock {
+        crate::dm_inbox::set_attribution_relationship(authenticated, *agent, false).await;
+    }
 }
 
 /// Persist the stores a tick restored items into, as the identity
@@ -861,6 +881,44 @@ mod tests {
         assert_eq!(
             tokio::fs::read(&path).await.expect("still there"),
             b"X0Q2 from a newer build"
+        );
+    }
+
+    /// A confirmed reblock clears contact protection before the next record.
+    /// A stranger can then evict the pair. `run_once` applies this helper.
+    #[tokio::test]
+    async fn reblock_clears_attribution_before_a_stranger_flood() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = AgentId([0x71; 32]);
+        let machine = crate::identity::MachineId([0x72; 32]);
+        let contacts = std::sync::Arc::new(tokio::sync::RwLock::new(ContactStore::new(
+            dir.path().join("contacts.json"),
+        )));
+        let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        {
+            let mut cache = bindings.write().await;
+            cache.set_stranger_pair_limit_for_test(1);
+            cache.set_relationship_peer(agent, true);
+        }
+        crate::dm_inbox::record_authenticated_machine_binding(&bindings, agent, machine, 1).await;
+        super::apply_reblock(&contacts, &bindings, &[agent]).await;
+        assert_eq!(
+            contacts.read().await.trust_level(&agent),
+            TrustLevel::Blocked
+        );
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &bindings,
+            AgentId([0x73; 32]),
+            crate::identity::MachineId([0x73; 32]),
+            2,
+        )
+        .await;
+        let cache = bindings.read().await;
+        assert!(
+            cache.machines_accepted_for(&agent).is_empty(),
+            "reblock moves the pair into the stranger share and the flood evicts it"
         );
     }
 }
