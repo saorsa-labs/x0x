@@ -43,7 +43,8 @@ use x0x::identity::AgentId;
 
 use super::crypto_exclusion::{
     all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
-    next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
+    next_attempt, note_converged, report_may_close, write_allowed, HeadRule, RecipientDelivery,
+    RoundUpdate, SenderSeat,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
 use super::mandate_store::{self, PendingOrcV1};
@@ -270,20 +271,30 @@ impl OrcState {
 /// §3 survivor convergence ([`super::crypto_exclusion::note_survivor_head`]):
 /// `sender` holds each head in `installed`, so it converged in the commit
 /// delivery of `stable_group_id` when its result is one of them.
+/// `sender_seat` is the sender's live-roster facts at this moment
+/// (#1660): every row requires a live, D60-clean sender, and a GSS
+/// recovery (`reshare_epoch`) additionally requires a keyed seat — its
+/// rounds seal the rotated secret, so the report must prove the sealed
+/// share like any GSS row's.
 pub(super) fn note_survivor_head(
     orc: &mut OrcState,
     stable_group_id: &str,
     sender: &[u8; 32],
     installed: &BTreeSet<String>,
+    sender_seat: Option<SenderSeat>,
 ) {
-    if let Some(delivery) = orc.deliveries.get_mut(stable_group_id) {
-        note_converged(
-            &mut delivery.recipients,
-            &delivery.result_head,
-            sender,
-            installed,
-        );
+    let Some(delivery) = orc.deliveries.get_mut(stable_group_id) else {
+        return;
+    };
+    if !report_may_close(sender_seat, delivery.reshare_epoch.is_some()) {
+        return;
     }
+    note_converged(
+        &mut delivery.recipients,
+        &delivery.result_head,
+        sender,
+        installed,
+    );
 }
 
 impl OrcState {
@@ -3801,9 +3812,54 @@ mod tests {
             resent,
             RecipientDelivery::Sent
         ));
-        note_survivor_head(&mut orc, "g", &survivor, &installed);
+        note_survivor_head(
+            &mut orc,
+            "g",
+            &survivor,
+            &installed,
+            Some(SenderSeat { keyed: false }),
+        );
         orc.install_commit_round("g", "head-1", Vec::new());
         assert!(!orc.deliveries.contains_key("g"));
+    }
+
+    /// #1660 (ADR 0110 §3): a head report closes a seat only through a
+    /// live, D60-clean, and — for a GSS recovery, whose rounds seal the
+    /// rotated secret — keyed seat.
+    #[test]
+    fn a_report_closes_a_recovery_seat_only_through_a_live_keyed_gss_seat() {
+        let survivor = [7u8; 32];
+        let installed: BTreeSet<String> = ["head-1".to_string()].into_iter().collect();
+        let mut orc = OrcState::default();
+        let mut delivery = commit_delivery("head-1", survivor);
+        delivery.reshare_epoch = Some(4);
+        delivery
+            .recipients
+            .insert(survivor, RecipientDelivery::Sent);
+        orc.deliveries.insert("g".into(), delivery);
+        let seat = |orc: &OrcState| orc.deliveries["g"].recipients[&survivor];
+        // A member removed mid-send has no live seat: the report closes
+        // nothing.
+        note_survivor_head(&mut orc, "g", &survivor, &installed, None);
+        assert_eq!(seat(&orc), RecipientDelivery::Sent);
+        // A live but keyless seat cannot have taken its sealed share.
+        note_survivor_head(
+            &mut orc,
+            "g",
+            &survivor,
+            &installed,
+            Some(SenderSeat { keyed: false }),
+        );
+        assert_eq!(seat(&orc), RecipientDelivery::Sent);
+        // The keyed seat's report — the share-proof — converges it.
+        note_survivor_head(
+            &mut orc,
+            "g",
+            &survivor,
+            &installed,
+            Some(SenderSeat { keyed: true }),
+        );
+        assert_eq!(seat(&orc), RecipientDelivery::Converged);
     }
 
     fn mandate_delivery(mandate_id: &str, promoted: [u8; 32]) -> MandateDelivery {

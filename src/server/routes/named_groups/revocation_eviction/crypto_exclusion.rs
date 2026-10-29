@@ -445,6 +445,37 @@ pub(super) fn note_converged(
     }
 }
 
+/// #1660 (ADR 0110 §3): the live-roster facts of a head report's sender,
+/// re-read by the delivery completion step before it closes a seat as
+/// delivered. `None` — the sender is no longer an Active member of the
+/// live roster, or D60 refuses it (a revoked agent, machine or binding):
+/// its report is not a survivor's, so it closes no seat. A member removed
+/// or revoked mid-send keeps the seat it had: the round drops a removed
+/// seat and withholds a revoked one, and neither is closed as delivered
+/// (§3 has no mid-send exception; entitlement is not fixed at commit,
+/// D60). `keyed` — the sender's seat carries a KEM public key on the
+/// live roster, the only seat a GSS share could be sealed to: a GSS
+/// row's report proves its share only through a keyed seat, and a seat
+/// whose KEM key arrives mid-send stays open, takes the share the next
+/// round seals, and closes only on a report after that.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SenderSeat {
+    pub(super) keyed: bool,
+}
+
+/// #1660: whether a report from `seat` may close a seat of a delivery
+/// whose rounds seal GSS shares (`shares`: the row's `gss_epoch`). Every
+/// row requires a live, D60-clean sender; a GSS row additionally requires
+/// a keyed seat, because its report must prove the sealed share reached
+/// the seat, not only that the frame installed (ADR 0110 §3, #1578: a
+/// keyless install proves no delivery).
+pub(super) fn report_may_close(seat: Option<SenderSeat>, shares: bool) -> bool {
+    match seat {
+        Some(seat) => !shares || seat.keyed,
+        None => false,
+    }
+}
+
 /// §3 survivor convergence for the S4 deliveries of one group. The
 /// catch-up response handler reports each verified, applied answer
 /// through [`super::note_catchup_head`]; that answer names the
@@ -452,14 +483,21 @@ pub(super) fn note_converged(
 /// the local chain. It is the convergence evidence for the crypto-only
 /// exclusion, saved-removal, certificate-rebind and owner-recovery commit
 /// deliveries of `stable_group_id` whose result the responder holds.
+/// `sender_seat` is the sender's live-roster facts at this moment
+/// (#1660): a report closes a seat only while its sender is still a
+/// live, D60-clean survivor, and a GSS row's report only through a keyed
+/// seat.
 pub(super) fn note_survivor_head(
     inner: &mut super::S4Inner,
     stable_group_id: &str,
     sender: &[u8; 32],
     installed: &BTreeSet<String>,
+    sender_seat: Option<SenderSeat>,
 ) {
     for (key, delivery) in &mut inner.ce.deliveries {
-        if key.stable_group_id == stable_group_id {
+        if key.stable_group_id == stable_group_id
+            && report_may_close(sender_seat, delivery.gss_epoch.is_some())
+        {
             note_converged(
                 &mut delivery.recipients,
                 &delivery.result_head,
@@ -473,9 +511,22 @@ pub(super) fn note_survivor_head(
         stable_group_id,
         sender,
         installed,
+        sender_seat,
     );
-    super::rebind::note_survivor_head(&mut inner.rebind, stable_group_id, sender, installed);
-    super::owner_recovery::note_survivor_head(&mut inner.orc, stable_group_id, sender, installed);
+    super::rebind::note_survivor_head(
+        &mut inner.rebind,
+        stable_group_id,
+        sender,
+        installed,
+        sender_seat,
+    );
+    super::owner_recovery::note_survivor_head(
+        &mut inner.orc,
+        stable_group_id,
+        sender,
+        installed,
+        sender_seat,
+    );
 }
 
 /// Ask each of `peers` for a catch-up page of `group_id`, on the existing
@@ -6130,13 +6181,30 @@ mod daemon_tests {
         let member = joiner.agent.agent_id();
         let member_hex = hex::encode(member.as_bytes());
         let group_id = "d2".repeat(16);
-        let info = x0x::groups::GroupInfo::new(
+        let mut info = x0x::groups::GroupInfo::new(
             "waiting-joiner".into(),
             String::new(),
             admin,
             group_id.clone(),
         );
         assert_eq!(info.secure_plane, x0x::mls::SecureGroupPlane::Gss);
+        // The sender of the report below is a live member of the author's
+        // roster (#1660): production's response handler refuses a
+        // non-member's answer before it reaches `note_catchup_head`, and
+        // the completion step re-checks the seat the same way. The seat
+        // arrives with the KEM key its `MemberJoined` published, as the
+        // comment below records.
+        info.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        let member_kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        info.set_member_kem_public_key(
+            &member_hex,
+            base64::engine::general_purpose::STANDARD.encode(&member_kem.public_bytes),
+        );
         let stable = info.stable_group_id().to_string();
         state
             .named_groups
@@ -7109,6 +7177,314 @@ mod daemon_tests {
             .get(&fx.group_id)
             .map(|info| (info.state_hash.clone(), info.secret_epoch));
         assert_eq!(unchanged, Some((parent.state_hash.clone(), 0)));
+        Ok(())
+    }
+
+    // ─── #1660: the completion step re-checks the live roster ──────────
+
+    /// #1660 fixture: one author node with one GSS crypto-exclusion
+    /// delivery whose only seat is `Sent` (a send the round planned while
+    /// the sender was eligible), plus helpers to change the live roster
+    /// mid-send and to feed a head report at the entry point the response
+    /// handler uses.
+    struct SeatReportFixture {
+        state: Arc<AppState>,
+        group_id: String,
+        key: EvictionKey,
+        survivor: AgentId,
+        survivor_hex: String,
+        result_head: String,
+    }
+
+    impl SeatReportFixture {
+        /// The sender's seat state in the delivery row.
+        async fn seat(&self) -> Option<RecipientDelivery> {
+            self.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .get(&self.key)
+                .and_then(|delivery| delivery.recipients.get(self.survivor.as_bytes()).copied())
+        }
+
+        /// Whether the delivery row is still open.
+        async fn row_open(&self) -> bool {
+            self.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .contains_key(&self.key)
+        }
+
+        /// Feed the sender's catch-up answer at the entry point the
+        /// response handler calls.
+        async fn feed_report(&self, reported: Option<&str>) {
+            super::super::note_catchup_head(
+                &self.state,
+                std::slice::from_ref(&self.group_id),
+                &self.survivor_hex,
+                reported,
+            )
+            .await;
+        }
+
+        /// The mid-send removal: the seat left the live roster while the
+        /// answer was on the wire; the removal's own commit has not
+        /// chained yet, so the result head is still this node's head.
+        async fn remove_sender_mid_send(&self) {
+            let mut groups = self.state.named_groups.write().await;
+            let stored = groups.get_mut(&self.group_id).expect("the author's group");
+            stored
+                .members_v2
+                .get_mut(&self.survivor_hex)
+                .expect("the sender's seat")
+                .state = x0x::groups::GroupMemberState::Removed;
+        }
+
+        /// Seat a KEM public key on the sender's roster seat (the keyed
+        /// re-join of the #1578 recovery).
+        async fn key_sender_seat(&self, kem_b64: String) {
+            let mut groups = self.state.named_groups.write().await;
+            let stored = groups.get_mut(&self.group_id).expect("the author's group");
+            stored.set_member_kem_public_key(&self.survivor_hex, kem_b64);
+        }
+
+        /// How many sealed shares were scheduled to the sender.
+        async fn shares_to_sender(&self) -> usize {
+            self.state
+                .named_group_test_recorders
+                .secure_share_scheduled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|(_, recipient, _)| recipient == &self.survivor_hex)
+                .count()
+        }
+
+        /// Run one delivery round now (no resend-interval wait).
+        async fn round_now(&self) {
+            self.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .get_mut(&self.key)
+                .expect("the delivery row")
+                .next_at = tokio::time::Instant::now();
+            drive_deliveries(&self.state).await;
+        }
+    }
+
+    /// Build the #1660 fixture: an `MlsEncrypted` group whose rotated
+    /// secret (epoch 2) the author holds, and a GSS frame delivery at
+    /// that epoch whose result is the current head. The survivor starts
+    /// `keyed` or keyless.
+    async fn seat_report_fixture(keyed: bool) -> Result<SeatReportFixture> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let survivor = AgentId([0x66; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let group_id = "b6".repeat(16);
+        let mut info = GroupInfo::new("b5".into(), String::new(), admin, group_id.clone());
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        info.add_member(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        if keyed {
+            let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+            info.set_member_kem_public_key(
+                &survivor_hex,
+                base64::engine::general_purpose::STANDARD.encode(&kem.public_bytes),
+            );
+        }
+        info.secret_epoch = 2;
+        info.shared_secret = Some(vec![11u8; 32]);
+        info.recompute_state_hash();
+        let key = EvictionKey::new(info.stable_group_id().to_string(), [0x5e; 32]);
+        let result_head = info.state_hash.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .deliveries
+            .insert(
+                key.clone(),
+                CeDelivery {
+                    bytes: Arc::new(b"X0XCE1\0#1660".to_vec()),
+                    result_head: result_head.clone(),
+                    next_revision: 2,
+                    resumed: false,
+                    gss_shares_pending: false,
+                    gss_epoch: Some(2),
+                    recipients: BTreeMap::from([(*survivor.as_bytes(), RecipientDelivery::Sent)]),
+                    next_at: tokio::time::Instant::now(),
+                },
+            );
+        advertise_crypto_exclusion(&state, survivor);
+        Ok(SeatReportFixture {
+            state,
+            group_id,
+            key,
+            survivor,
+            survivor_hex,
+            result_head,
+        })
+    }
+
+    /// #1660 (ADR 0110 §3, no mid-send exception): a member removed
+    /// mid-send never has its seat closed as delivered. The round planned
+    /// the send while the sender was a survivor; the removal landed on
+    /// the live roster before the sender's head report arrived. The
+    /// completion step re-checks the roster at the report: a report from
+    /// a seat that is no longer Active is not a survivor's convergence
+    /// evidence, so it closes no seat. The round later drops the seat the
+    /// ordinary way; the delivery never records it as delivered.
+    #[tokio::test]
+    async fn a_report_from_a_member_removed_mid_send_closes_no_seat() -> Result<()> {
+        let fx = seat_report_fixture(true).await?;
+        fx.remove_sender_mid_send().await;
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Sent),
+            "a removed member's report closes no seat as delivered (#1660, ADR 0110 §3)"
+        );
+        assert!(fx.row_open().await, "the delivery row stays open");
+        Ok(())
+    }
+
+    /// #1660 (ADR 0110 §3 with D60, no mid-send exception): a member
+    /// revoked mid-send never has its seat closed as delivered. The
+    /// sender's machine is revoked after the round planned the send;
+    /// D60's entitlement is not fixed at commit, so the completion step
+    /// re-runs the revocation verdict on the sender before any seat
+    /// closes, and the report of a revoked device closes nothing.
+    #[tokio::test]
+    async fn a_report_from_a_member_revoked_mid_send_closes_no_seat() -> Result<()> {
+        let fx = seat_report_fixture(true).await?;
+        // The sender's advertised machine (a real keypair, so its
+        // revocation record verifies), revoked after the send began. The
+        // advert replaces the fixture's with a strictly later timestamp:
+        // the store refuses a same-millisecond insert as a replay.
+        let machine = x0x::identity::MachineKeypair::generate()?;
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: x0x::dm::CapabilityRegistry::current().version,
+            bits: x0x::dm::CapabilityRegistry::current().bits,
+        };
+        assert!(
+            fx.state.agent.capability_store().insert(
+                fx.survivor,
+                machine.machine_id(),
+                capabilities,
+                x0x::dm_capability::now_unix_ms().saturating_add(1_000),
+            ),
+            "verified advert with a real machine binding"
+        );
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Machine(machine.machine_id()),
+            machine.public_key(),
+            machine.secret_key(),
+            x0x::groups::owner_cert::restore_clock_now(),
+            Some("#1660 mid-send revocation".to_string()),
+        )?;
+        fx.state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)?;
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Sent),
+            "a revoked member's report closes no seat as delivered (#1660, D60)"
+        );
+        assert!(fx.row_open().await, "the delivery row stays open");
+        Ok(())
+    }
+
+    /// #1660 (ADR 0110 §3, the issue's litmus): a seat whose KEM key
+    /// arrives mid-send stays open and gets its share. The sender holds
+    /// and reports the delivery's result head while its roster seat here
+    /// carries no KEM key (the seat's key is local data; another member's
+    /// view of it can differ, #1578). A GSS row's report proves delivery
+    /// only through a keyed seat — a keyless one cannot have taken its
+    /// sealed share — so the report closes nothing. Once the key arrives,
+    /// the still-open row's next round seals the share to the seat, and
+    /// only a report after that converges it and ends the row.
+    #[tokio::test]
+    async fn a_keyless_seats_report_closes_no_seat_and_a_late_key_gets_its_share() -> Result<()> {
+        let fx = seat_report_fixture(false).await?;
+        // The report names the result head from a seat this roster sees
+        // keyless: the strongest report shape, and it still closes nothing.
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Sent),
+            "a keyless seat's report closes no seat: it proves no share (#1660)"
+        );
+        assert!(fx.row_open().await, "the delivery row stays open");
+        assert_eq!(
+            fx.shares_to_sender().await,
+            0,
+            "no share was sealed while the seat had no key"
+        );
+        // The KEM key arrives mid-send: the keyed re-join. The next round
+        // seals the rotated secret to the seat — the seat gets its share —
+        // and the seat stays open until a report after that.
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        fx.key_sender_seat(base64::engine::general_purpose::STANDARD.encode(&kem.public_bytes))
+            .await;
+        fx.round_now().await;
+        assert_eq!(
+            fx.shares_to_sender().await,
+            1,
+            "the round sealed the share to the keyed seat: it gets its share"
+        );
+        // The round's send completes as Sent (the carrier's acceptance).
+        let mut settled = false;
+        for _ in 0..250 {
+            if fx.seat().await == Some(RecipientDelivery::Sent) {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(settled, "the round's send completed as Sent");
+        assert_ne!(
+            fx.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the share alone closes no seat: only a report does (ADR 0110 §3)"
+        );
+        // The post-key report — the share-proof of a keyed survivor —
+        // converges the seat, and the next round completes the row.
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the keyed seat's report converges the seat"
+        );
+        fx.round_now().await;
+        assert!(!fx.row_open().await, "the converged row completes");
         Ok(())
     }
 }

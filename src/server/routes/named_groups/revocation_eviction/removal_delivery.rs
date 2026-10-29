@@ -598,14 +598,21 @@ pub(super) async fn drive(state: &Arc<AppState>) {
 /// §3 survivor convergence ([`crypto_exclusion::note_survivor_head`]):
 /// `sender` holds each head in `installed`, so it converged in each
 /// removal delivery of `stable_group_id` whose result is one of them.
+/// `sender_seat` is the sender's live-roster facts at this moment
+/// (#1660): a report closes a seat only while its sender is still a
+/// live, D60-clean survivor, and a GSS removal's report only through a
+/// keyed seat.
 pub(super) fn note_survivor_head(
     removals: &mut HashMap<EvictionKey, RemovalDelivery>,
     stable_group_id: &str,
     sender: &[u8; 32],
     installed: &std::collections::BTreeSet<String>,
+    sender_seat: Option<crypto_exclusion::SenderSeat>,
 ) {
     for (key, delivery) in removals.iter_mut() {
-        if key.stable_group_id == stable_group_id {
+        if key.stable_group_id == stable_group_id
+            && crypto_exclusion::report_may_close(sender_seat, delivery.gss_epoch.is_some())
+        {
             crypto_exclusion::note_converged(
                 &mut delivery.recipients,
                 &delivery.result_head,
@@ -1491,6 +1498,9 @@ mod daemon_tests {
                     &stable,
                     survivor.as_bytes(),
                     &installed,
+                    // The #1660 gate: a live, D60-clean, keyed seat — the
+                    // GSS row's share-proof shape.
+                    Some(crypto_exclusion::SenderSeat { keyed: true }),
                 );
                 if let Some(delivery) = inner.removals.get_mut(&key) {
                     delivery.next_at = Instant::now();

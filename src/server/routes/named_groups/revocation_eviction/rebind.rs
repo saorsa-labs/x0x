@@ -60,6 +60,7 @@ use x0x::logging::LogHexId;
 use super::crypto_exclusion::{
     all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
     next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
+    SenderSeat,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
 
@@ -1563,13 +1564,20 @@ fn install_round(
 
 /// §3 survivor convergence ([`super::crypto_exclusion::note_survivor_head`]):
 /// `sender` holds each head in `installed`, so it converged in each rebind
-/// delivery of `stable_group_id` whose result is one of them.
+/// delivery of `stable_group_id` whose result is one of them. `sender_seat`
+/// is the sender's live-roster facts at this moment (#1660): a rebind
+/// frame carries no key material, so only the live-survivor half of the
+/// gate applies — a member removed or revoked mid-send closes no seat.
 pub(super) fn note_survivor_head(
     rebind: &mut RebindState,
     stable_group_id: &str,
     sender: &[u8; 32],
     installed: &BTreeSet<String>,
+    sender_seat: Option<SenderSeat>,
 ) {
+    if sender_seat.is_none() {
+        return;
+    }
     for ((stable, result_head), delivery) in &mut rebind.deliveries {
         if stable == stable_group_id {
             note_converged(&mut delivery.recipients, result_head, sender, installed);
@@ -2553,9 +2561,16 @@ mod tests {
             RecipientDelivery::Sent
         ));
         // A head report of a later head on the chain through "r" is the
-        // recipient's convergence evidence: the delivery ends.
+        // recipient's convergence evidence: the delivery ends. The seat is
+        // live and D60-clean (#1660 gate; a rebind row ignores `keyed`).
         let installed = BTreeSet::from(["r".to_string(), "r2".to_string()]);
-        note_survivor_head(&mut rebind, "g", &survivor, &installed);
+        note_survivor_head(
+            &mut rebind,
+            "g",
+            &survivor,
+            &installed,
+            Some(SenderSeat { keyed: false }),
+        );
         assert!(round(&mut rebind).is_empty());
         assert!(!rebind.deliveries.contains_key(&key));
     }

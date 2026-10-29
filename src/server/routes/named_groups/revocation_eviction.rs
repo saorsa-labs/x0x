@@ -857,22 +857,24 @@ pub(in crate::server) async fn seal_probe_for_test(
 }
 
 /// §2: the catch-up response handler calls this for each verified,
-/// applied, non-truncated catch-up page, with or without the
-/// responder's saved head (`responder_state_hash`). The sender is an
-/// active, unrevoked member; the handler checked that. §3: the same
-/// answer is the sender's survivor convergence evidence for the S4
-/// deliveries of the group ([`crypto_exclusion::note_survivor_head`]).
-/// An absent field is the
-/// #1578 keyless disclaimer (David's ruling, 28 Oct 02:09 GMT) only
-/// from a keyless survivor
-/// ([`hashless_answer_is_a_keyless_disclaimer`], Engineer ruling (2),
-/// 28 Oct 23:34 GMT): no head is convergence evidence, and that
-/// sender's answer counts for the ask cadence only
-/// ([`note_head_disclaimed`]); its unresolved head evidence persists,
-/// because a keyless reply does not prove the head the sender reported
-/// reached the local chain (ADR 0110 §2). Every other sender's
-/// hash-less answer is exactly main's reply: ignored, so the ask
-/// cadence still counts the sender.
+/// applied, non-truncated page that carries the responder's saved head
+/// (`responder_state_hash`). The handler checked the sender when the
+/// answer arrived; #1660 (ADR 0110 §3: no mid-send exception) makes the
+/// delivery completion step re-check the live roster before it closes a
+/// seat as delivered — the handler's checks ran before the page applied,
+/// and a removal or revocation can land inside that window. A sender that
+/// is no longer an Active member, or that D60 refuses, closes no seat; a
+/// GSS row's report closes a seat only through a keyed one. The report
+/// itself is still a verified, applied page, so it keeps counting for the
+/// §2 head round (chain agreement); only the seat-closing is gated. §3:
+/// the same answer is the sender's survivor convergence evidence for the
+/// S4 deliveries of the group
+/// ([`crypto_exclusion::note_survivor_head`]). An absent field is the
+/// #1578 keyless disclaimer (David's ruling, 28 Oct 02:09 GMT): no head
+/// is convergence evidence, and the sender's answer counts for the ask
+/// cadence only ([`note_head_disclaimed`]). Its unresolved head evidence
+/// persists: a keyless reply does not prove the head the sender reported
+/// reached the local chain (ADR 0110 §2).
 pub(in crate::server) async fn note_catchup_head(
     state: &AppState,
     group_ids: &[String],
@@ -887,6 +889,15 @@ pub(in crate::server) async fn note_catchup_head(
         let groups = state.named_groups.read().await;
         group_ids.iter().find_map(|id| {
             crate::server::resolve_group_entry_locked(&groups, id).map(|(_, info)| {
+                // #1660: the sender's seat on the live roster, the one
+                // this answer is judged against. `None` when the sender
+                // is no Active member any more.
+                let seat = info
+                    .active_members()
+                    .find(|member| member.agent_id == sender_hex)
+                    .map(|member| crypto_exclusion::SenderSeat {
+                        keyed: member.kem_public_key_b64.is_some(),
+                    });
                 (
                     info.stable_group_id().to_string(),
                     info.state_hash.clone(),
@@ -896,14 +907,26 @@ pub(in crate::server) async fn note_catchup_head(
                             installed_heads(info, reported),
                         )
                     }),
-                    reported.is_none() && hashless_answer_is_a_keyless_disclaimer(info, sender),
+                    seat,
                 )
             })
         })
     };
-    let Some((stable, head, classified, keyless_disclaimer)) = current else {
+    let Some((stable, head, classified, seat)) = current else {
         return;
     };
+    // #1660: D60 entitlement is not fixed at commit — the completion step
+    // re-runs the revocation verdict on the sender before any seat closes.
+    // A disclaimed answer closes no seat, so it needs no verdict.
+    let sender_seat = if classified.is_some() {
+        match seat {
+            Some(seat) if crypto_exclusion::write_allowed(state, &sender).await => Some(seat),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut inner = state.revocation_evictions.inner.lock().await;
     let Some((report, installed)) = classified else {
         if !keyless_disclaimer {
             // Not a keyless survivor: main's reply. An old peer's or any
@@ -928,7 +951,13 @@ pub(in crate::server) async fn note_catchup_head(
     let mut inner = state.revocation_evictions.inner.lock().await;
     // §3: the answer is also the sender's convergence evidence for the
     // S4 deliveries of this group whose result it holds.
-    crypto_exclusion::note_survivor_head(&mut inner, &stable, &sender, &installed);
+    crypto_exclusion::note_survivor_head(
+        &mut inner,
+        &stable,
+        sender.as_bytes(),
+        &installed,
+        sender_seat,
+    );
     // Only groups with S4 work keep a round (the worker pass creates it).
     if !inner.head_rounds.contains_key(&stable) {
         return;
