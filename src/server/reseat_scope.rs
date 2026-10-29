@@ -16,6 +16,11 @@
 //! [`inherit_reseat_scope`], and inbound handlers enter the scope through
 //! [`ReseatStagings`].
 //!
+//! The scope selects the slot for the whole map, not for one group: a task
+//! in the scope that reads another group reads the slot too. A whole-node
+//! worker (a walk over every group) that a staged join's step can start
+//! must therefore run in [`outside_reseat_scope`]; every current one does.
+//!
 //! `live_*` and `staging_*` ignore the scope. Every whole-roster encode
 //! uses the live map, so the staging slot never reaches disk. No path holds
 //! a live guard and a staging guard at the same time; the swap moves a

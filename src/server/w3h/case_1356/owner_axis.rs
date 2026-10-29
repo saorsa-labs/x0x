@@ -696,11 +696,16 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         return Ok(());
     }
 
-    // The advance: J's recovery states, sampled each poll.
+    // The advance: J's recovery states, sampled each poll. A failed read
+    // stops the window and the row is INFRA.
     let mut states: Vec<String> = Vec::new();
+    let mut seen = Observations::default();
     let waited = sim
         .until("the gate window", GATE_WINDOW, async |s: &Sim| {
-            if let Ok(Some(st)) = status_now(s, "J", &group).await {
+            let Some(j_status) = seen.observe(status_now(s, "J", &group)).await else {
+                return true;
+            };
+            if let Some(st) = j_status {
                 let text = format!("{:?}{{{:?}}}", st.recovery_state(), st.recovery_cause());
                 if states.last() != Some(&text) {
                     states.push(text);
@@ -712,6 +717,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     if let Err(error) = waited {
         ensure!(expired(&error), error);
     }
+    seen.verify("the gate window")?;
     let j_status = status(sim, "J", &group).await?;
     let j1 = view(sim, "J", &group).await?;
     o_to_j_held.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1203,6 +1209,16 @@ fn w3h_1356_staging_containment_mutation_proof() {
     let real = [fork("pending"), at_head("pending"), swap.clone()];
     assert_eq!(staged_verdict(&real), Some(Verdict::Green));
     let removal = rec(13, "removal", false, Some(4));
+    // J's base record with one field of the containment check mutated.
+    let marked = View {
+        marker: Some(Marker {
+            revision: 11,
+            no_anchor: false,
+            classification: None,
+            committed_by: "o".to_string(),
+        }),
+        ..rec(11, "fork", true, Some(1))
+    };
     let early = [
         fork("active"),
         (removal.clone(), "active", removal),
@@ -1212,6 +1228,26 @@ fn w3h_1356_staging_containment_mutation_proof() {
             rec(14, "head", false, Some(5)),
         ),
         at_head("active"),
+        // The swap shape with the gate still armed is not the swap.
+        (
+            rec(14, "head", true, Some(5)),
+            "active",
+            rec(14, "head", false, Some(5)),
+        ),
+        // The gate retired in staging.
+        (
+            rec(11, "fork", false, Some(1)),
+            "pending",
+            rec(14, "head", false, Some(5)),
+        ),
+        // The marker presence flipped in staging.
+        (marked, "pending", rec(14, "head", false, Some(5))),
+        // J moved off its base hash in staging.
+        (
+            rec(12, "other", true, Some(1)),
+            "pending",
+            rec(14, "head", false, Some(5)),
+        ),
     ];
     for sample in early {
         let verdict = staged_verdict(&[sample.clone(), swap.clone()]);

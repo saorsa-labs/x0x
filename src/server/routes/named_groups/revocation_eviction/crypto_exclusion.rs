@@ -751,16 +751,7 @@ pub(in crate::server) async fn commit_locked(
         epoch = next_epoch,
         "ADR 0110 S4: crypto-only exclusion committed"
     );
-    let task_state = Arc::clone(state);
-    let card_key = group_key.to_string();
-    // #1699: the delivery worker walks every group's live record, also
-    // when a staged re-seat join's apply committed this exclusion.
-    let _spawned = state.spawn_detached(crate::server::reseat_scope::outside_reseat_scope(
-        async move {
-            ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
-            drive_deliveries(&task_state).await;
-        },
-    ));
+    spawn_post_commit_round(state, group_key);
     SelfLeaveRekeyStep::Committed
 }
 
@@ -928,9 +919,18 @@ pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_k
         secret_epoch = next_secret_epoch,
         "ADR 0110 S4: GSS crypto-only exclusion committed"
     );
+    spawn_post_commit_round(state, group_key);
+}
+
+/// After a committed crypto-only exclusion (TreeKEM or GSS), publish the
+/// group card of `group_key` and run one delivery round, in a detached
+/// task. #1699: the delivery worker walks every group's live record, also
+/// when a staged re-seat join's apply committed this exclusion, so the
+/// task runs outside any re-seat scope.
+fn spawn_post_commit_round(state: &Arc<AppState>, group_key: &str) {
+    use super::super as ng;
     let task_state = Arc::clone(state);
     let card_key = group_key.to_string();
-    // #1699: as above, the worker sees every group's live record.
     let _spawned = state.spawn_detached(crate::server::reseat_scope::outside_reseat_scope(
         async move {
             ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
@@ -3520,6 +3520,103 @@ mod daemon_tests {
             "with the evidence the survivor installs the exclusion"
         );
         assert_eq!(head_of(&replica, &group_id).await, Some(result_head));
+        Ok(())
+    }
+
+    /// #1699 (#1689 review P3): both commit paths (`commit_locked` and
+    /// `commit_gss`) start their detached card and delivery round through
+    /// [`spawn_post_commit_round`]. A staged re-seat join's apply can commit
+    /// an exclusion, so that round must run outside the caller's re-seat
+    /// scope and judge the delivery by the live record. Here the live
+    /// original is contained (fork-quarantined) and the staged copy is not.
+    /// The round, started inside the open staging, must see the live marker
+    /// and move the row to the fork set. In the scope it would see the
+    /// staged copy, find no recipient left and drop the row. Inert: an
+    /// offline agent.
+    #[tokio::test]
+    async fn the_post_commit_round_started_in_a_reseat_scope_sees_the_live_map() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let group_id = "cd".repeat(16);
+        let mut staged = GroupInfo::new("ce-reseat".into(), String::new(), admin, group_id.clone());
+        staged.recompute_state_hash();
+        let stable = staged.stable_group_id().to_string();
+        let mut live = staged.clone();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 1,
+            state_hash: "sibling".into(),
+            committed_by: String::new(),
+            observed_at_ms: 0,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: live.terminal_commit_header(),
+                conflicting_commit: live.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        state
+            .named_groups
+            .live_write()
+            .await
+            .insert(group_id.clone(), live);
+        state
+            .named_groups
+            .staging_write()
+            .await
+            .insert(group_id.clone(), staged.clone());
+        let key = EvictionKey::new(stable.clone(), [0x79; 32]);
+        new_delivery(
+            &mut state.revocation_evictions.inner.lock().await.ce,
+            &key,
+            &staged.state_hash,
+            staged.state_revision.saturating_add(1),
+            Arc::new(Vec::new()),
+            Vec::new(),
+            false,
+        );
+
+        let scope = state.reseat_stagings.open(&group_id, &stable);
+        crate::server::reseat_scope::in_reseat_scope(scope, async {
+            assert!(crate::server::reseat_scope::in_any_reseat_scope());
+            assert!(
+                state
+                    .named_groups
+                    .read()
+                    .await
+                    .get(&group_id)
+                    .is_some_and(|info| info.fork_quarantine.is_none()),
+                "the caller sees the staged copy"
+            );
+            spawn_post_commit_round(&state, &group_id);
+        })
+        .await;
+        for _ in 0..500 {
+            if !state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .contains_key(&key)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.reseat_stagings.scope_for(&group_id).is_some(),
+            "the staging stayed open while the round ran"
+        );
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert!(
+            !inner.ce.deliveries.contains_key(&key),
+            "the round ran and ended the delivery"
+        );
+        assert!(
+            inner.ce.fork.contains(&key),
+            "the round judged the delivery by the live, contained original"
+        );
         Ok(())
     }
 

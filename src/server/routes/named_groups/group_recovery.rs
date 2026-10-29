@@ -6003,11 +6003,17 @@ async fn open_staging(state: &Arc<AppState>, group_key: &str, info: &GroupInfo) 
 /// live map. Returns whether a staging was open.
 async fn discard_staging(state: &AppState, key: &str, stable: &str) -> bool {
     let closed = state.reseat_stagings.close(key);
-    state
-        .named_groups
-        .staging_write()
-        .await
-        .retain(|staged_key, info| staged_key != key && info.stable_group_id() != stable);
+    {
+        // #1689 review: `refresh_group_rosters_for_gossip` reads the slot
+        // under this lock. Empty it under the same lock, so a refresh that
+        // races a rollback never publishes the abandoned staged roster.
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        state
+            .named_groups
+            .staging_write()
+            .await
+            .retain(|staged_key, info| staged_key != key && info.stable_group_id() != stable);
+    }
     state.treekem_groups.staging_write().await.remove(key);
     state.mls_groups.staging_write().await.remove(key);
     if closed {
@@ -6328,6 +6334,12 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
     let Some((key, source)) = seated else {
         return false;
     };
+    // The slot is opened at the original's key ([`open_staging`]), and the
+    // promote and discard below assume that the staged key is that key.
+    debug_assert_eq!(
+        key, journal.live_key,
+        "the staged key is the journalled live key"
+    );
     let expected = journal.record_digest;
     // §3 step 3 (#1533 review): `Swapping` lifts the legacy overlay and the
     // marker hold, then one durable roster write puts the staged record in
