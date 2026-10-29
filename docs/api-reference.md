@@ -1972,7 +1972,24 @@ record these frames.
 
 **Sidecar.** S3 state lives in `<data_dir>/group-recovery/<stable_group_id>.grecov`
 (header `X0GRCV1\0`, postcard body). `named_groups.json` and
-`home-suite-groups.json` do not change format.
+`home-suite-groups.json` do not change format. The body holds the ADR 0109 §4
+fields (`generation`, `rebuilt_from`, `served_chain`, `active_ata`,
+`queued_terminal`, `authoritative_record`, `reseat_journal`,
+`staging_record`, `issued_reseats`, `retired`) and, after them, two more:
+
+- `attestation_conflict`: a verified ATA whose sequence diverges from
+  `active_ata` (§2 "Conflict"). While it is kept, catch-up stops at the
+  common prefix, no ATA arms, and the node shows
+  `reseat_required {attestation_conflict}`. A re-seat swap clears it.
+- `authoritative_binding`: the exact `before` and `after` heads (state
+  revision, state hash, marker identity) of the transition that wrote
+  `authoritative_record`, and the earlier authoritative record when the
+  legacy view already held a placeholder (§4 "Transactions"). Load
+  reconciliation uses it to choose which record replaces the legacy
+  placeholder (§4 "Crash reconciliation at load").
+
+The ADR 0085 rule 6 fixture is `tests/fixtures/group_recovery_v1.bin`
+(provenance beside it), with every field set.
 
 ### Certificate rebind (ADR 0110 §4a)
 
