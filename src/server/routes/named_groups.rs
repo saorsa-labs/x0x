@@ -18614,6 +18614,28 @@ pub(in crate::server) async fn clear_group_quarantine(
 /// authority's own roster lists us; `pending_authority_commit` means we hold
 /// a join stub and an expected-inviter pin but our own roster seat never
 /// landed — the limbo state that used to read as `already_joined: true`.
+/// #1578 rc8: the join seats the joiner's own published KEM key on a
+/// Pending row of its own stub (rc7). The row carries no admission
+/// state — only the key — so every join-state check treats it as
+/// absent: [`local_join_membership_state`] reports `not_member`, and
+/// [`classify_not_member_join_row`] sees no roster entry, so the #1148
+/// clear and the ADR 0107 re-arm keep working for an encrypted GSS
+/// join whose attempt expired.
+fn join_seat_key_marker_only(info: &x0x::groups::GroupInfo, joiner_hex: &str) -> bool {
+    matches!(
+        info.members_v2.get(joiner_hex),
+        Some(member)
+            if member.state == x0x::groups::GroupMemberState::Pending
+                && member.kem_public_key_b64.is_some()
+                && member.certificate.is_none()
+                && member.certificate_digest.is_none()
+                && member.treekem_key_package_b64.is_none()
+                && member.treekem_key_package_hash.is_none()
+                && member.added_by.is_none()
+                && member.removed_by.is_none()
+    )
+}
+
 pub(in crate::server) async fn local_join_membership_state(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
@@ -18628,7 +18650,15 @@ pub(in crate::server) async fn local_join_membership_state(
     }
     match info.members_v2.get(local_agent_hex) {
         Some(member) if member.is_active() => "active",
-        Some(member) if member.state == x0x::groups::GroupMemberState::Pending => "pending",
+        // #1578 rc8: the join's own-key marker row holds no admission
+        // state, so it reads as `not_member` (see
+        // [`join_seat_key_marker_only`]).
+        Some(member)
+            if member.state == x0x::groups::GroupMemberState::Pending
+                && !join_seat_key_marker_only(info, local_agent_hex) =>
+        {
+            "pending"
+        }
         _ => "not_member",
     }
 }
@@ -21778,7 +21808,10 @@ fn classify_not_member_join_row(
         return NotMemberJoinRow::Quarantined;
     }
     let never_seated = lineage.is_some_and(|l| l.seated_at_revision.is_none());
-    let no_roster_entry = !info.members_v2.contains_key(joiner_hex);
+    // #1578 rc8: the join's own-key marker row is transparent here —
+    // it holds no admission state, only the joiner's published key.
+    let no_roster_entry =
+        !info.members_v2.contains_key(joiner_hex) || join_seat_key_marker_only(info, joiner_hex);
     if never_seated && no_roster_entry && !info.withdrawn {
         NotMemberJoinRow::UnseatedJoinRemnant
     } else if lineage.is_none() && no_roster_entry && !info.withdrawn {
@@ -22770,42 +22803,6 @@ pub(super) async fn join_group_via_invite_inner(
                         policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
                     }))
                 .then(|| state.agent_kem_keypair.as_ref());
-                // #1578 rc7: the joiner's own copy of its own seat
-                // records the key it publishes — the roster root does
-                // not hash it, and `add_member` never clears it when
-                // the authority's MemberAdded upgrades the row to
-                // Active. Without this, every invite-joined member's
-                // own view stays keyless for ever, so the receiver-side
-                // keyless predicate (own seat cannot take a share)
-                // matched every joiner, not the seat that genuinely
-                // lost its key data.
-                if let Some(kp) = joiner_kem {
-                    let kem_b64 = BASE64.encode(&kp.public_bytes);
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or_default();
-                    info.members_v2
-                        .entry(joiner_hex.clone())
-                        .and_modify(|m| m.kem_public_key_b64 = Some(kem_b64.clone()))
-                        .or_insert_with(|| x0x::groups::GroupMember {
-                            agent_id: joiner_hex.clone(),
-                            user_id: None,
-                            role: x0x::groups::GroupRole::Member,
-                            state: x0x::groups::GroupMemberState::Pending,
-                            display_name: None,
-                            joined_at: now_secs,
-                            updated_at: now_secs,
-                            added_by: None,
-                            removed_by: None,
-                            kem_public_key_b64: Some(kem_b64),
-                            treekem_key_package_b64: None,
-                            treekem_key_package_hash: None,
-                            certificate: None,
-                            certificate_missing_since_ms: None,
-                            certificate_digest: None,
-                        });
-                }
                 build_signed_member_joined_resend(
                     &info,
                     &joiner_hex,
@@ -22828,6 +22825,48 @@ pub(super) async fn join_group_via_invite_inner(
                     "failed to sign the join announcement",
                 );
             };
+            // #1578 rc7/rc8: the joiner's own copy of its own seat
+            // records exactly the key the signed MemberJoined carries —
+            // a binding-signature failure drops the key from the event,
+            // and the row must not claim a key the authority never saw.
+            // Without the row every invite-joined member's own view
+            // stays keyless for ever, so the receiver-side keyless
+            // predicate (own seat cannot take a share) matched every
+            // joiner, not the seat that genuinely lost its key data.
+            // The marker row is Pending and key-only; the join-state
+            // checks treat it as absent
+            // ([`join_seat_key_marker_only`]), and `add_member` never
+            // clears the key when the authority's MemberAdded seats the
+            // row.
+            if let NamedGroupMetadataEvent::MemberJoined {
+                kem_public_key_b64: Some(kem_b64),
+                member_agent_id,
+                ts_ms,
+                ..
+            } = &member_joined_resend.event
+            {
+                let at_secs = ts_ms / 1000;
+                info.members_v2
+                    .entry(member_agent_id.clone())
+                    .and_modify(|m| m.kem_public_key_b64 = Some(kem_b64.clone()))
+                    .or_insert_with(|| x0x::groups::GroupMember {
+                        agent_id: member_agent_id.clone(),
+                        user_id: None,
+                        role: x0x::groups::GroupRole::Member,
+                        state: x0x::groups::GroupMemberState::Pending,
+                        display_name: None,
+                        joined_at: at_secs,
+                        updated_at: at_secs,
+                        added_by: None,
+                        removed_by: None,
+                        kem_public_key_b64: Some(kem_b64.clone()),
+                        treekem_key_package_b64: None,
+                        treekem_key_package_hash: None,
+                        certificate: None,
+                        certificate_missing_since_ms: None,
+                        certificate_digest: None,
+                    });
+            }
             // named_groups.json only becomes durable when the member's
             // own `MemberAdded` is observed in the chain (the apply path
             // persists at that point). Exception: when the invite's
