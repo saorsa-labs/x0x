@@ -895,7 +895,11 @@ async fn control_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> R
 
     let passed = h_once && data_plane && signed_by_a && in_bound;
     if !passed {
-        let (cause, ok, observed) = if !h_once && reached_after.is_some() {
+        let moved_off_e0 = end.iter().any(|(_, seen)| {
+            seen.as_ref()
+                .is_some_and(|seen| seen.epoch.is_some_and(|epoch| epoch > e0))
+        });
+        let (cause, ok, observed) = if !h_once && moved_off_e0 {
             (
                 CAUSE_SECOND_ROTATION,
                 true,
@@ -1058,7 +1062,13 @@ async fn loss_arm(sim: &mut Sim, receipt: &mut Receipt, labels: &[&str]) -> Resu
 
     let passed = h_once && data_plane && signed_by_d && in_bound && not_early && mid_quiet;
     if !passed {
-        let (cause, ok, observed) = if !h_once && first_move.is_some() {
+        let (cause, ok, observed) = if !mid_quiet {
+            (
+                CAUSE_EARLY_SIBLING,
+                true,
+                format!("at W/2: {}", describe_all(&mid)),
+            )
+        } else if !h_once && first_move.is_some() {
             (
                 CAUSE_SECOND_ROTATION,
                 true,

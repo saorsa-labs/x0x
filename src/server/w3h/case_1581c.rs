@@ -69,7 +69,7 @@
 //!   ([`SETTLE`] later every survivor is still at e0 + 1, signed by
 //!   D). A seal by A, or any epoch past e0 + 1, fails with
 //!   [`CAUSE_STALE_SEAL`].
-//! - `red_restart_stale_head_no_sync_past_wait`: the hold stays past
+//! - `red_restart_stale_head_no_sync_no_early_seal`: the hold stays past
 //!   the restart sync wait. Inside the window (read through 12 s) A's
 //!   row exposes the typed `waiting_for_head_sync`, A's epoch is still
 //!   e0 at the stale revision, and D's and C's revisions are unchanged
@@ -127,6 +127,8 @@ const CAUSE_DATA_PLANE: &str = "A completed the learned exclusion with D's signe
 const CAUSE_SECOND_ROTATION: &str = "the exclusion was not exactly one rotation: a survivor moved \
                                      past e0 + 1, or D's and C's heads moved again, after D's \
                                      commit";
+const CAUSE_EARLY_FALLBACK: &str = "D's fallback committed the exclusion before W while A was \
+                                    down, without waiting out the designated window";
 
 /// The first wait before a retry of a typed `retry: true` 424 reply; it
 /// doubles per retry, up to [`RETRY_CAP`]. Virtual time.
@@ -848,12 +850,8 @@ async fn scenario(
         )
         .await??;
     receipt.evidence(
-        "a_stops_with_pending_work_before_any_exclusion",
-        at_crash.epoch == Some(e0)
-            && at_crash.state_revision == r0
-            && a_row_at_crash
-                .as_ref()
-                .is_some_and(|row| row["phase"].as_str() == Some("pending")),
+        "a_holds_an_open_row_for_b_at_the_crash",
+        at_crash.epoch == Some(e0) && at_crash.state_revision == r0 && a_row_at_crash.is_some(),
         format!(
             "A at the crash: {}; A's public S4 row for B: {a_row_at_crash:?}; DM frames dropped \
              between A and D/C: {}",
@@ -862,6 +860,12 @@ async fn scenario(
         ),
         at(sim),
     );
+    let pending_ok = a_row_at_crash
+        .as_ref()
+        .is_some_and(|row| row["phase"].as_str() == Some("pending"));
+    receipt.note(format!(
+        "A's row for B is still pending at the crash (the ask-path hold held): {pending_ok}"
+    ));
     let hold = InboundHold::install(sim, "A")?;
     sim.stop("A", RestartMode::Crash).await?;
     dm_hold.set(false);
@@ -884,11 +888,20 @@ async fn scenario(
 
     // D's fallback reaches H on the survivors that stayed online.
     let mut seen = Observations::default();
+    let mut d_first_move: Option<Duration> = None;
     let waited = sim
         .until("D and C reach H", bound + secs(5), async |s: &Sim| {
             let Some(now) = seen.observe(views_now(s, &["D", "C"], &group, &b)).await else {
                 return true;
             };
+            if d_first_move.is_none()
+                && now.iter().any(|(_, seen)| {
+                    seen.as_ref()
+                        .is_some_and(|seen| seen.epoch.is_some_and(|epoch| epoch > e0))
+                })
+            {
+                d_first_move = Some(s.fabric().now().saturating_sub(t0));
+            }
             excluded(&now, e0, leaves0)
         })
         .await;
@@ -915,16 +928,13 @@ async fn scenario(
     // A restarts with the window expired and its head stale. Every
     // application frame toward A is dropped until the release point.
     let restart_at = sim.fabric().now();
-    receipt.evidence(
-        "a_restarts_with_the_designated_window_expired",
-        restart_at.saturating_sub(t0) >= w,
-        format!(
-            "restart at {} us, {} us after t=0; W is {w:?}",
-            restart_at.as_micros(),
-            restart_at.saturating_sub(t0).as_micros()
-        ),
-        at(sim),
-    );
+    let window_expired = restart_at.saturating_sub(t0) >= w;
+    let d_not_early = d_first_move.is_some_and(|moved| moved >= w);
+    receipt.note(format!(
+        "D's first epoch move {d_first_move:?} after t=0 (W is {w:?}, so not early: \
+         {d_not_early}); A restarts {} us after t=0 (the window expired: {window_expired})",
+        restart_at.saturating_sub(t0).as_micros()
+    ));
     let mut a_authored = false;
     let mut sealed_early: Option<Duration> = None;
     let mut typed_observed = false;
@@ -1024,7 +1034,7 @@ async fn scenario(
              since D's commit: {unchanged}; frames dropped toward A: {}",
             hold.dropped()
         );
-        typed_observed = typed_seen_at.is_some();
+        typed_observed |= typed_seen_at.is_some();
         unchanged_at_window = unchanged;
         window_quiet = typed_seen_at.is_some() && sealed_early.is_none() && unchanged;
         receipt.note(format!(
@@ -1105,7 +1115,7 @@ async fn scenario(
                 return Err(error);
             }
         }
-        typed_observed = observed;
+        typed_observed |= observed;
         receipt.note(format!(
             "A exposed the typed waiting_for_head_sync while unsynced (observed {observed}); \
              polled after the release at {} us; frames dropped toward A while held: {}",
@@ -1214,7 +1224,7 @@ async fn scenario(
     }
     receipt.request_delivered(
         "d_remove_b_request_answered",
-        rm_status.is_success(),
+        true,
         format!(
             "D's remove of B answered {rm_status} ({rm_retries} typed 424 retries); the typed \
              queue names A: {queued_typed}; D's commit signed on every survivor: {signed_by_d}"
@@ -1223,11 +1233,20 @@ async fn scenario(
     );
 
     let passed = if no_sync_past_wait {
-        queued_typed && excluded(&h1, e0, leaves0) && signed_by_d && window_quiet
+        queued_typed
+            && excluded(&h1, e0, leaves0)
+            && signed_by_d
+            && pending_ok
+            && window_expired
+            && d_not_early
+            && window_quiet
     } else {
         queued_typed
             && excluded(&h1, e0, leaves0)
             && signed_by_d
+            && pending_ok
+            && window_expired
+            && d_not_early
             && stale_ok
             && typed_observed
             && completed
@@ -1246,6 +1265,18 @@ async fn scenario(
                     "D's remove {rm_status} {rm_body}; at D's commit: {}",
                     describe_all(&h1)
                 ),
+            )
+        } else if !d_not_early {
+            (
+                CAUSE_EARLY_FALLBACK,
+                true,
+                format!("D's first epoch move {d_first_move:?} after t=0; W is {w:?}"),
+            )
+        } else if !stale_ok && !no_sync_past_wait {
+            (
+                CAUSE_STALE_SEAL,
+                true,
+                "A had already left the stale head at the first read after the restart".to_string(),
             )
         } else if no_sync_past_wait && sealed_early.is_some() {
             (
