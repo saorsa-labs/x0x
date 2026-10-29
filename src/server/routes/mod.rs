@@ -8,7 +8,7 @@
 mod acl;
 pub(super) mod calls;
 pub(super) mod connect;
-mod contacts;
+pub(in crate::server) mod contacts;
 mod direct;
 mod discovery;
 mod exec;
@@ -18,7 +18,7 @@ mod groups;
 pub(super) mod gui_show;
 pub(in crate::server) mod history;
 pub mod home;
-mod identity;
+pub(in crate::server) mod identity;
 mod key_move;
 mod machines;
 mod messaging;
