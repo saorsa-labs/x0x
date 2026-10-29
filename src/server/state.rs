@@ -37,6 +37,12 @@ use super::routes::{
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
 
+/// The gossip roster hint last published per group, by stable ID: the
+/// group's metadata topic and active members, or `None` for a withdrawn
+/// group ([`AppState::group_roster_gossip_lock`]).
+pub(super) type GossipRosterHints =
+    BTreeMap<String, Option<(String, String, Vec<x0x::identity::AgentId>)>>;
+
 fn validate_instance_name_grammar(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.len() > 64 {
         anyhow::bail!("instance name must be 1-64 characters");
@@ -905,7 +911,9 @@ pub(super) struct AppState {
     /// transactions. Writers hold it through durability or rollback.
     pub(super) gss_publication_gate: Arc<RwLock<()>>,
     /// Orders roster snapshots sent to gossip after committed mutations.
-    pub(super) group_roster_gossip_lock: Mutex<()>,
+    /// It holds the roster last published for each group (by stable ID;
+    /// `None` = withdrawn), which a held-back group keeps (#1570).
+    pub(super) group_roster_gossip_lock: Mutex<GossipRosterHints>,
     pub(super) named_groups_path: PathBuf,
     /// Issue #451: disk location of the Home-Suite sidecar
     /// (`home-suite-groups.json`) — the AUTHORITATIVE durable state for

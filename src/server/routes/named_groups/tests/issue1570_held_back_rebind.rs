@@ -302,3 +302,74 @@ async fn treekem_writer_commits_other_placeheld_groups_legacy_form() -> Result<(
     );
     Ok(())
 }
+
+/// ZCode on fa096d0f (#1570): a held-back group's live roster is ahead of
+/// its durable form, so no caller's gossip refresh may publish it. RED
+/// (before the fix): only `persist_named_group_info` skipped the refresh;
+/// any other caller published the live roster, here a withdrawal made in
+/// memory only, which dropped the group's hint. GREEN: every refresh keeps the hint last published for
+/// the group until it commits.
+#[tokio::test]
+async fn a_held_back_roster_is_not_published_by_another_refresh() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0x76, 0x77).await?;
+    let state = &fixture.state;
+    let group_id = fixture.group_id.clone();
+    let seeded = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("fixture group"))?;
+    let outcome = persist_named_group_info(state, &group_id, seeded).await;
+    assert!(matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+    let durable = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("seeded group"))?;
+    let stable = durable.stable_group_id().to_string();
+    let members = |info: &x0x::groups::GroupInfo| {
+        let mut ids: Vec<String> = info.active_members().map(|m| m.agent_id.clone()).collect();
+        ids.sort();
+        ids
+    };
+    let before = members(&durable);
+    assert!(!before.is_empty());
+    group_recovery::begin_placehold(state, &group_id, &durable);
+    let outcome = save_named_groups_checked(state).await;
+    assert!(matches!(outcome, Ok(AtomicWriteOutcome::Durable)));
+    refresh_group_rosters_for_gossip(state).await;
+
+    let sidecar = state
+        .data_dir
+        .join(s3::GROUP_RECOVERY_DIR)
+        .join(s3::sidecar_file_name(&stable));
+    tokio::fs::remove_file(&sidecar).await?;
+    tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+    // Withdrawn in memory only: its live roster would publish no hint.
+    let mut changed = durable.clone();
+    changed.withdrawn = true;
+    changed.roster_revision = changed.roster_revision.saturating_add(1);
+    let outcome = persist_named_group_info(state, &group_id, changed).await;
+    assert!(
+        !matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "the change is held back: {outcome:?}"
+    );
+    assert!(group_recovery::is_held_back(state, &stable));
+
+    // Another caller's refresh, as after a different group's durable save.
+    refresh_group_rosters_for_gossip(state).await;
+    let published = state.group_roster_gossip_lock.lock().await;
+    let (_, _, agents) = published
+        .get(&stable)
+        .cloned()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("the group keeps a published hint"))?;
+    let mut agents: Vec<String> = agents.iter().map(|a| hex::encode(a.as_bytes())).collect();
+    agents.sort();
+    assert_eq!(agents, before, "the hint stays at the durable roster");
+    Ok(())
+}

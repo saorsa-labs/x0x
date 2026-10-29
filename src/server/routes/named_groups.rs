@@ -6701,7 +6701,7 @@ pub(in crate::server) async fn store_named_group_info(
 /// Snapshot the committed roster without retaining a group lock across the
 /// direct-connection and gossip awaits.
 pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState) {
-    let _refresh_guard = state.group_roster_gossip_lock.lock().await;
+    let mut published = state.group_roster_gossip_lock.lock().await;
     let rosters = {
         // The map write can precede an awaited disk save and be rolled back.
         // Serialize this snapshot with that transaction so SG never sees an
@@ -6741,6 +6741,16 @@ pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState
             });
             by_group.insert(group.stable_group_id().to_string(), roster);
         }
+        // #1570 (ZCode on fa096d0f): a held-back group's live record is
+        // ahead of its durable form, so any caller's refresh publishes the
+        // hint last published for it, not its live roster. The first
+        // refresh after the group commits publishes the new roster.
+        for (stable, roster) in &mut by_group {
+            if group_recovery::is_held_back(state, stable) {
+                *roster = published.get(stable).cloned().flatten();
+            }
+        }
+        published.clone_from(&by_group);
         by_group.into_values().flatten().collect()
     };
     state.agent.replace_group_rosters_for_gossip(rosters).await;
@@ -49930,7 +49940,7 @@ pub(in crate::server) mod tests {
             crdt_handle_locks: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),
             gss_publication_gate: Arc::new(RwLock::new(())),
-            group_roster_gossip_lock: Mutex::new(()),
+            group_roster_gossip_lock: Mutex::new(BTreeMap::new()),
             named_groups_path,
             home_suite_groups_path,
             named_groups_persistence_lock: Mutex::new(()),
