@@ -301,6 +301,13 @@ struct Placeheld {
     /// hold starts; the worker pass clears it with a publish, whichever
     /// save ended the hold.
     card_owed: bool,
+    /// #1570 (Engineer ruling, 29 Oct 2026): the worker pass un-placeheld
+    /// the group, so its legacy entry is the real record again, but no
+    /// Durable legacy write has landed that record yet. Until one does,
+    /// the group stays held back for the card routes
+    /// ([`is_card_held_back`]) and its owed card survives here: the entry
+    /// leaves only with a Durable write, never with the flag.
+    unplacehold_pending: bool,
     /// Load reconciliation kept a placeholder that matches neither end of
     /// its binding: the live record is that placeholder, inert, and no
     /// authoritative write runs for it.
@@ -1312,6 +1319,16 @@ pub(super) async fn legacy_store_view(
     let frozen = staging_frozen_groups(state).await;
     let mut view: Option<HashMap<String, GroupInfo>> = None;
     for (stable, entry) in placeheld {
+        // #1570 (Engineer ruling, 29 Oct 2026): the pass un-placeheld the
+        // group, so the view holds its real record — no placeholder, no
+        // authoritative write (the sidecar is retired once that write is
+        // Durable). Until it is, the group stays held back for the card
+        // routes ([`is_card_held_back`]). A staged re-seat keeps its
+        // frozen placeholder semantics.
+        if entry.unplacehold_pending && !frozen.contains(&stable) {
+            record_encode_outcome(state, &stable, false, None);
+            continue;
+        }
         // A group absent from the view, lost or frozen has no
         // authoritative write in this encode, so nothing of it is held back.
         let Some(canonical) = placeheld_key(groups, &stable, &entry).cloned() else {
@@ -1634,6 +1651,23 @@ pub(super) fn is_held_back(state: &AppState, stable: &str) -> bool {
     })
 }
 
+/// #1570 (Engineer ruling, 29 Oct 2026): the card routes and card
+/// publishing may act only on `stable`'s committed record. Two states put
+/// a group here: its authoritative write failed ([`is_held_back`]), and
+/// its un-placeholdering write has not landed — in both, the live record
+/// is ahead of the durable form, so no card is signed or published from
+/// it. Roster mutations and save outcomes use the narrower
+/// [`is_held_back`] and keep their pre-#1570 behaviour for a pending
+/// un-placeholdering: its view already holds the real record, so a
+/// Durable save of a change to it commits that change.
+pub(super) fn is_card_held_back(state: &AppState, stable: &str) -> bool {
+    with_placeheld(state, |placeheld| {
+        placeheld
+            .get(stable)
+            .is_some_and(|entry| entry.authoritative_failed || entry.unplacehold_pending)
+    })
+}
+
 /// #1570 rc4, the one commit check for a roster mutation from `before`
 /// to `after`, run after its encode ([`legacy_store_view`]) and before its
 /// legacy write: some group that the mutation touches (a key added,
@@ -1749,16 +1783,20 @@ async fn needs_placeholder(state: &AppState, info: &GroupInfo, body: &GroupRecov
 pub(super) fn begin_placehold(state: &AppState, key: &str, info: &GroupInfo) {
     let stable = info.stable_group_id().to_string();
     with_placeheld(state, |placeheld| {
-        placeheld.entry(stable).or_insert_with(|| Placeheld {
+        let entry = placeheld.entry(stable).or_insert_with(|| Placeheld {
             key: key.to_string(),
             committed: LegacyForm::real(info),
             encoded: None,
             durable_digest: None,
             authoritative_failed: false,
             card_owed: false,
+            unplacehold_pending: false,
             lost: false,
             legacy_pending: true,
         });
+        // A new arming re-claims the placeholder: an un-placeholdering
+        // whose write never landed is superseded.
+        entry.unplacehold_pending = false;
     });
 }
 
@@ -1785,8 +1823,12 @@ impl LegacyWrite {
 /// `ReplacedNotDurable` the record stays contained (the placeholder is on
 /// disk, the group stays placeheld) and the worker writes again. On
 /// `Dropped` nothing is published and the candidate is dropped: the group
-/// is no longer placeheld and the sidecar's arming (the ATA and the
-/// authoritative record) is rolled back. Returns whether it is published.
+/// no longer needs the placeholder and the sidecar's arming (the ATA and
+/// the authoritative record) is rolled back. #1570 (29 Oct 2026): the
+/// entry stays, so an owed card survives it; the worker pass decides
+/// whether the group still needs the placeholder and, if not, un-placeholds
+/// it — held back for the card routes until the real record's write lands.
+/// Returns whether it is published.
 async fn finish_arm(
     state: &AppState,
     stable: &str,
@@ -1807,12 +1849,18 @@ async fn finish_arm(
             false
         }
         LegacyWrite::Dropped => {
-            with_placeheld(state, |placeheld| placeheld.remove(stable));
-            // #1533 r11: a reply can record a conflict against the armed
-            // ATA, or replace it, while the legacy write runs. Only this
-            // arming's ATA is withdrawn, and never under a conflict: the
-            // conflict keeps its ATA, or its bound is lost.
+            // #1570 (Engineer ruling, 29 Oct 2026): the entry stays, so an
+            // owed card survives it. The next worker pass decides with the
+            // full sidecar state: a group that still needs the placeholder
+            // (a recorded conflict, another arming) stays placeheld;
+            // otherwise the pass un-placeholds it, keeps it held back for
+            // the card routes until its write lands, and publishes the
+            // owed card.
             let _ = update_sidecar(state, stable, |body| {
+                // #1533 r11: a reply can record a conflict against the armed
+                // ATA, or replace it, while the legacy write runs. Only this
+                // arming's ATA is withdrawn, and never under a conflict: the
+                // conflict keeps its ATA, or its bound is lost.
                 if body.attestation_conflict.is_none() && body.active_ata.as_ref() == Some(armed) {
                     body.active_ata = None;
                 }
@@ -1978,8 +2026,10 @@ async fn resave_legacy(state: &AppState) -> LegacyWrite {
 ///   placeheld (`lost`), and the node shows
 ///   `readmission_required {local_state_lost}` (§4 rebuild table).
 /// - A group that no longer needs it is un-placeheld: the real record is
-///   written to the legacy views, and only once that is durable is the
-///   authoritative record dropped from the sidecar.
+///   written to the legacy views, and only once that is durable are the
+///   authoritative record dropped from the sidecar and the entry itself
+///   removed — until then the group stays held back for the card routes
+///   (#1570, 29 Oct 2026 ruling) and its owed card survives on the entry.
 /// - A placeholder write that was not durable is written again.
 ///
 /// The pass also retries the sidecar write of every held-back group
@@ -2068,6 +2118,7 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
                                 durable_digest,
                                 authoritative_failed: false,
                                 card_owed: false,
+                                unplacehold_pending: false,
                                 lost,
                                 legacy_pending: true,
                             },
@@ -2075,7 +2126,16 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
                     });
                     resave = true;
                 }
-                Some(entry) => resave |= entry.legacy_pending,
+                Some(entry) => {
+                    // The group needs the placeholder again: an
+                    // un-placeholdering that never landed is superseded.
+                    with_placeheld(state, |placeheld| {
+                        if let Some(entry) = placeheld.get_mut(stable) {
+                            entry.unplacehold_pending = false;
+                        }
+                    });
+                    resave |= entry.legacy_pending;
+                }
             }
             if lost {
                 set_view(
@@ -2102,9 +2162,22 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
         }
     }
     if !unplacehold.is_empty() {
+        // #1570 (Engineer ruling, 29 Oct 2026): the entry stays, its
+        // un-placeholdering pending, until this pass's write makes the
+        // real record Durable. Until then the group stays held back for
+        // the card routes and its owed card survives on the entry — the
+        // flag is never lost with the entry. A group with no entry (only
+        // a sidecar authoritative record) keeps the pre-#1570 behaviour:
+        // nothing of it was ever held back.
         with_placeheld(state, |placeheld| {
             for stable in &unplacehold {
-                placeheld.remove(stable);
+                if let Some(entry) = placeheld.get_mut(stable) {
+                    entry.unplacehold_pending = true;
+                    entry.authoritative_failed = false;
+                    entry.card_owed = true;
+                    entry.legacy_pending = true;
+                    entry.encoded = None;
+                }
             }
         });
         resave = true;
@@ -2124,6 +2197,13 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
                     entry.legacy_pending = false;
                 }
             }
+            // #1570: the write landed the real record of every group
+            // whose un-placeholdering is pending (this pass's view held
+            // it), so those entries complete and go; the owed-card loop
+            // below publishes their cards. A group armed again meanwhile
+            // or frozen for a staged re-seat keeps its entry.
+            placeheld
+                .retain(|stable, entry| !(entry.unplacehold_pending && !frozen.contains(stable)));
         });
         for stable in unplacehold {
             // The real record is durable in the legacy views. A group that
@@ -2142,35 +2222,40 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
     // the owed card is refreshed and published from the live record, as
     // a state change would refresh it. The check and the clear are one
     // step under the placeheld map, so a hold that starts again keeps
-    // its own owed flag. Detached: the publish's gossip egress must not
-    // stall the tick.
+    // its own owed flag. A group whose un-placeholdering write has not
+    // landed keeps its flag on the entry, and a group missing from the
+    // live map keeps its flag too: the flag is never lost without its
+    // publish. Detached: the publish's gossip egress must not stall the
+    // tick.
     for stable in owed_cards {
+        let Some((key, _)) = live.get(&stable) else {
+            continue;
+        };
         let publish_now = with_placeheld(state, |placeheld| match placeheld.get_mut(&stable) {
-            Some(entry) if !entry.authoritative_failed => {
+            Some(entry) if !entry.authoritative_failed && !entry.unplacehold_pending => {
                 entry.card_owed = false;
                 true
             }
-            // A new hold started; its own owed flag stays set.
+            // A new hold started, or the un-placeholdering write has not
+            // landed; its own owed flag stays set.
             Some(_) => false,
-            // Un-placeheld in this pass: the real record is committed
-            // only by this pass's own write, so an owed card waits for
-            // that write to land.
+            // Un-placeheld by this pass's Durable write above; the same
+            // write committed the real record, so the card is published
+            // from it.
             None => write == Some(LegacyWrite::Durable),
         });
         if !publish_now {
             continue;
         }
-        if let Some((key, _)) = live.get(&stable) {
-            let state_for_card = Arc::clone(state);
-            let key_for_card = key.clone();
-            state.spawn_detached(async move {
-                super::maybe_publish_group_card_after_state_change(
-                    state_for_card.as_ref(),
-                    &key_for_card,
-                )
-                .await;
-            });
-        }
+        let state_for_card = Arc::clone(state);
+        let key_for_card = key.clone();
+        state.spawn_detached(async move {
+            super::maybe_publish_group_card_after_state_change(
+                state_for_card.as_ref(),
+                &key_for_card,
+            )
+            .await;
+        });
     }
 }
 
@@ -13032,7 +13117,15 @@ mod tests {
         state.named_groups_save_fault.store(1, Ordering::SeqCst);
         assert!(!arm_in_place(&state, &key, &info, ata).await);
         state.named_groups_save_fault.store(0, Ordering::SeqCst);
-        assert!(!is_placeheld(&state, &stable), "the candidate is dropped");
+        // #1570 (29 Oct 2026 ruling): a dropped arming keeps the entry —
+        // the candidate is dropped, but any owed card survives. The
+        // worker pass then decides the un-placeholdering with the full
+        // sidecar state and holds the card routes back until its write
+        // lands the real record.
+        assert!(
+            is_placeheld(&state, &stable),
+            "the candidate is dropped; the entry stays"
+        );
         let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
         assert!(body.active_ata.is_none());
         assert!(body.authoritative_record.is_none());
@@ -13041,6 +13134,22 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
         assert!(!s3::is_s3_placeholder(&legacy));
         assert!(legacy.has_active_member(&local));
+        // The worker pass lands the real record and completes the
+        // un-placeholdering.
+        ensure_placeholders(&state).await;
+        assert!(!is_placeheld(&state, &stable));
+        // Await the pass's detached card publishes so the test leaks
+        // no task.
+        let pending: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in pending {
+            let _ = task.await;
+        }
         Ok(())
     }
 

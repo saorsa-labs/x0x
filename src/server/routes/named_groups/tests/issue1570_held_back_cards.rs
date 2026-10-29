@@ -8,7 +8,11 @@
 //! group and card-by-id answers the `not_found` shape; with a cached card,
 //! both routes serve the card of the last durable form. The state-change
 //! hook's cache refresh and the discovery publish sign from the same live
-//! map, so both are held to the same rule.
+//! map, so both are held to the same rule. Parts 8–9 pin the 29 Oct 2026
+//! rulings: a group whose un-placeholdering write has not landed stays
+//! held back for the card routes and its owed card is published once a
+//! Durable write lands, and `POST /groups/:id/state/seal` keeps main's
+//! behaviour (the reseal may itself end the hold and succeed).
 //! Local temp state only: no network config, sockets or bootstrap.
 
 use super::*;
@@ -39,6 +43,24 @@ async fn card_body(
     let resp = get_group_card(State(state.clone()), Path(id.to_string()))
         .await
         .into_response();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    Ok((status, serde_json::from_slice(&bytes)?))
+}
+
+/// Drive `POST /groups/:id/state/seal` as the durable local owner and
+/// collect its status and JSON body.
+async fn seal_body(
+    state: &std::sync::Arc<crate::server::AppState>,
+    id: &str,
+) -> anyhow::Result<(axum::http::StatusCode, serde_json::Value)> {
+    let resp = seal_group_state(
+        State(state.clone()),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(id.to_string()),
+    )
+    .await
+    .into_response();
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
     Ok((status, serde_json::from_slice(&bytes)?))
@@ -409,7 +431,14 @@ async fn local_card_routes_sign_no_card_from_a_held_back_group() -> Result<()> {
     drain_detached_cards(&state).await;
     assert!(
         !group_recovery::is_held_back(&state, &stable),
-        "the pass still un-placeheld the group"
+        "the pass ended the sidecar hold"
+    );
+    // 29 Oct 2026 ruling: the un-placeholdering write has not landed, so
+    // the group stays held back for the card routes — the entry (and its
+    // owed flag) survives the pass.
+    assert!(
+        group_recovery::is_card_held_back(&state, &stable),
+        "#1570: a group whose un-placeholdering write has not landed stays held back for the card routes"
     );
     let (status, body) = card_body(&state, &stable).await?;
     assert_eq!(status, StatusCode::OK);
@@ -425,6 +454,164 @@ async fn local_card_routes_sign_no_card_from_a_held_back_group() -> Result<()> {
             published.map(|card| card.name.as_str()),
             Some("renamed thrice while held back"),
             "#1570: the shard cache holds no uncommitted card either"
+        );
+    }
+
+    // Part 8: the same state with the cached card evicted. The live
+    // fallback must refuse to sign the uncommitted record (card-by-id
+    // answers the not-found shape), and once ANY durable write lands the
+    // real record, the next pass publishes the owed card that survived
+    // on the entry. Red on main for the first half (the fallback signed
+    // the rename); red at c4a788f5 for the second (the owed flag died
+    // with the removed entry, so no later pass published).
+    {
+        let mut cache = state.group_card_cache.write().await;
+        cache.remove(&key);
+        cache.remove(&stable);
+    }
+    let (status, _) = card_body(&state, &stable).await?;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "#1570: no card is signed from a record whose un-placeholdering write has not landed"
+    );
+    // The legacy file is writable again; group B's durable save lands
+    // group A's real record in its own encode, but the entry (and the
+    // owed flag) stays until the worker pass.
+    tokio::fs::remove_dir_all(&legacy).await?;
+    let mut b_changed = state
+        .named_groups
+        .read()
+        .await
+        .get(&b_key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("group B for part 8"))?;
+    b_changed.roster_revision = b_changed.roster_revision.saturating_add(1);
+    b_changed.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    let outcome = persist_named_group_info(&state, &b_key, b_changed).await;
+    assert!(
+        matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "group B's part-8 save must be durable: {outcome:?}"
+    );
+    group_recovery::ensure_placeholders(&state).await;
+    drain_detached_cards(&state).await;
+    assert!(!group_recovery::is_held_back(&state, &stable));
+    assert!(
+        !group_recovery::is_card_held_back(&state, &stable),
+        "the un-placeholdering completed with the durable write"
+    );
+    let (status, body) = card_body(&state, &stable).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["name"].as_str(),
+        Some("renamed thrice while held back"),
+        "#1570: the owed card is published once a durable write lands"
+    );
+    {
+        let directory = state.directory_cache.read().await;
+        let published = directory
+            .get(&stable)
+            .ok_or_else(|| anyhow::anyhow!("the owed card was published"))?;
+        assert_eq!(
+            published.name, "renamed thrice while held back",
+            "#1570: the publish put the committed card in the shard cache"
+        );
+    }
+
+    // Part 9 (Engineer ruling, 29 Oct 19:56): `POST /groups/:id/state/seal`
+    // keeps main's behaviour on a held-back group. While the sidecar is
+    // unwritable the seal answers the existing 500 "seal failed" (its own
+    // persist cannot land); once the sidecar is writable the same seal's
+    // encode retries the sidecar, ends the hold itself, and succeeds. Red
+    // at c4a788f5: the publish gate refused the reseal outright, so the
+    // second seal also answered 500 and published nothing. The held-back
+    // change bumps the revision only (no rename), so the published card
+    // supersedes the previous one in the same shards and the shard cache
+    // can be asserted on the revision it committed.
+    let current = state
+        .named_groups
+        .read()
+        .await
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("group A after part 8"))?;
+    group_recovery::begin_placehold(&state, &key, &current);
+    let outcome = save_named_groups_checked(&state).await;
+    assert!(
+        matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "part-9 re-placehold save must be durable: {outcome:?}"
+    );
+    tokio::fs::remove_file(&sidecar).await?;
+    tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+    let mut bumped = current.clone();
+    bumped.roster_revision = bumped.roster_revision.saturating_add(1);
+    bumped.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    let outcome = persist_named_group_info(&state, &key, bumped).await;
+    assert!(
+        !matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "the fourth change is held back: {outcome:?}"
+    );
+    assert!(group_recovery::is_held_back(&state, &stable));
+    let published_before = {
+        let directory = state.directory_cache.read().await;
+        directory
+            .get(&stable)
+            .map(|card| card.revision)
+            .ok_or_else(|| anyhow::anyhow!("part-8 card in the shard cache"))?
+    };
+    let (status, body) = seal_body(&state, &key).await?;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "seal on a held-back group whose sidecar still cannot be written answers the existing 500"
+    );
+    assert_eq!(body["error"].as_str(), Some("seal failed"));
+    {
+        let directory = state.directory_cache.read().await;
+        assert_eq!(
+            directory.get(&stable).map(|card| card.revision),
+            Some(published_before),
+            "#1570: the failed seal published nothing"
+        );
+    }
+    // The sidecar is writable again: the seal's own persist retries it,
+    // ends the hold, commits the reseal and publishes the card.
+    tokio::fs::remove_dir_all(&sidecar).await?;
+    let (status, body) = seal_body(&state, &key).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "#1570: a seal whose persist lands ends the hold itself and succeeds, as on main"
+    );
+    assert_eq!(body["ok"].as_bool(), Some(true));
+    assert!(
+        body["commit"].is_object(),
+        "the seal returns its commit: {}",
+        body["commit"]
+    );
+    assert!(
+        !group_recovery::is_held_back(&state, &stable),
+        "the seal's encode ended the hold"
+    );
+    let committed_revision = state
+        .named_groups
+        .read()
+        .await
+        .get(&key)
+        .map(|info| info.state_revision)
+        .ok_or_else(|| anyhow::anyhow!("group A after the seal"))?;
+    assert!(
+        committed_revision > published_before,
+        "the seal committed a new revision: {committed_revision} > {published_before}"
+    );
+    {
+        let directory = state.directory_cache.read().await;
+        let published = directory
+            .get(&stable)
+            .ok_or_else(|| anyhow::anyhow!("the reseal published its card"))?;
+        assert_eq!(
+            published.revision, committed_revision,
+            "#1570: the reseal published the card of the record it committed"
         );
     }
     Ok(())
