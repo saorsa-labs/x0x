@@ -5920,7 +5920,14 @@ async fn consume_reseat(
         mode: owner_pin.as_ref().map(|_| "home".to_string()),
         expected_owner_user_id: owner_pin,
     };
-    let response = super::join_group_via_invite_inner(Arc::clone(state), request, true)
+    // §3 step 2 (#1699): the staged join, and every step that it spawns,
+    // runs in the staging slot. The live record stays contained.
+    let response = state
+        .reseat_stagings
+        .run_in_staging_of(
+            group_key,
+            super::join_group_via_invite_inner(Arc::clone(state), request, true),
+        )
         .await
         .into_response();
     if !response.status().is_success() {
@@ -5935,8 +5942,7 @@ async fn consume_reseat(
 }
 
 /// §3 steps 1 and 2 under the membership lock: write the journal
-/// (`Prepared`), move the original record out of the live map, then mark
-/// the journal `Staging`. Each step is durable before the next starts.
+/// (`Prepared`), open the staging slot, then mark the journal `Staging`. Each step is durable before the next starts.
 /// On `Err` the caller rolls back with [`rollback_reseat`], which keeps the
 /// journal until the original record is durable again.
 async fn prepare_reseat(
@@ -5953,9 +5959,7 @@ async fn prepare_reseat(
     {
         return Err("journal_not_durable");
     }
-    if !move_live_record_aside(state, group_key, info).await {
-        return Err("live_record_not_moved");
-    }
+    open_staging(state, group_key, info).await;
     let mut marked = false;
     let marked_ref = &mut marked;
     let durable = update_sidecar(state, &stable, move |body| {
@@ -5972,45 +5976,83 @@ async fn prepare_reseat(
     }
 }
 
-/// Move the contained live record aside: the same teardown a self-removal
-/// runs, so the staged join starts from no local record. The record and its
-/// tree are already durable in the journal, and the open journal keeps the
-/// original in every legacy file ([`reseat_overlay`]), so the roster write
-/// below changes only the live map.
-///
-/// The roster write runs FIRST. Nothing else is touched until it is
-/// durable, so a failed write leaves the live record and its tree in place
-/// (the TreeKEM files are never removed here) (a `NotReplaced` write rolls the map back;
-/// a `ReplacedNotDurable` one leaves the journal as the only copy, and the
-/// rollback restores from it).
-async fn move_live_record_aside(state: &Arc<AppState>, group_key: &str, info: &GroupInfo) -> bool {
-    let key = group_key.to_string();
-    let durable = matches!(
-        super::persist_named_groups_mutation(state, move |groups| groups.remove(&key).is_some())
-            .await,
-        Ok(super::AtomicWriteOutcome::Durable)
-    );
-    if !durable {
-        return false;
-    }
+/// §3 step 2 (#1699): open an empty staging slot for the staged join. The
+/// contained original stays in the live map, with its tree, marker, gate
+/// and membership, until the swap; the serving paths, the API and the
+/// probes keep seeing it. The staged join runs in the scope
+/// ([`ReseatStagings`](crate::server::reseat_scope::ReseatStagings)), so
+/// it starts from no local record. The open journal keeps the original in
+/// every legacy file ([`reseat_overlay`]) and its tree in the snapshot
+/// file (#1567, `reseat_snapshot_cover`).
+async fn open_staging(state: &Arc<AppState>, group_key: &str, info: &GroupInfo) {
+    let stable = info.stable_group_id().to_string();
+    discard_staging(state, group_key, &stable).await;
     let aliases = super::join_artifact_group_aliases(state, group_key).await;
     super::retire_local_group_join_artifacts(state, &aliases).await;
     state.group_card_cache.write().await.remove(group_key);
-    state.mls_groups.write().await.remove(group_key);
-    // The TreeKEM files stay (#1533 review): with the legacy overlay they
-    // keep the original record and its tree paired on disk until the
-    // swap (#1567: the staged join's persists keep the original's tree,
-    // or no snapshot file when it had none, `reseat_snapshot_cover`;
-    // `swap_staged_tree` writes the staged one).
-    // Startup loads them only at restore, and the rollback rewrites them
-    // from the journal copy.
-    state.treekem_groups.write().await.remove(group_key);
-    super::save_mls_groups(state).await;
     let mut cache_aliases = aliases;
     cache_aliases.insert(group_key.to_string());
-    cache_aliases.insert(info.stable_group_id().to_string());
+    cache_aliases.insert(stable.clone());
     let _ = super::prune_treekem_cache_groups(state, &cache_aliases, "adr0109_reseat").await;
-    true
+    state.reseat_stagings.open(group_key, &stable);
+}
+
+/// Close the re-seat staging of `key` and empty its slot in the three
+/// group maps. A task of the staged join that still runs then uses the
+/// live map. Returns whether a staging was open.
+async fn discard_staging(state: &AppState, key: &str, stable: &str) -> bool {
+    let closed = state.reseat_stagings.close(key);
+    state
+        .named_groups
+        .staging_write()
+        .await
+        .retain(|staged_key, info| staged_key != key && info.stable_group_id() != stable);
+    state.treekem_groups.staging_write().await.remove(key);
+    state.mls_groups.staging_write().await.remove(key);
+    if closed {
+        // The staged stub's key is the original's: it is not a pending
+        // join stub of the live map.
+        state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+    }
+    closed
+}
+
+/// §3 step 3 (#1699): after the staged pair is durable, its tree and MLS
+/// state replace the original's in the live map. `named` also copies the
+/// staged record (the tree write put it in the live map already when the
+/// group has a tree). The slot keeps its copy, so a retried swap finds the
+/// pair again; it is emptied when the journal closes ([`swap_if_seated`]).
+async fn promote_staging(state: &AppState, key: &str, named: bool) {
+    if named {
+        let staged = state.named_groups.staging_read().await.get(key).cloned();
+        if let Some(staged) = staged {
+            state
+                .named_groups
+                .live_write()
+                .await
+                .insert(key.to_string(), staged);
+        }
+    }
+    let tree = state.treekem_groups.staging_read().await.get(key).cloned();
+    if let Some(tree) = tree {
+        state
+            .treekem_groups
+            .live_write()
+            .await
+            .insert(key.to_string(), tree);
+    }
+    let mls = state.mls_groups.staging_write().await.remove(key);
+    if let Some(mls) = mls {
+        state
+            .mls_groups
+            .live_write()
+            .await
+            .insert(key.to_string(), mls);
+    }
 }
 
 /// Put the journalled original record back durably, then close the journal;
@@ -6018,11 +6060,12 @@ async fn move_live_record_aside(state: &Arc<AppState>, group_key: &str, info: &G
 /// journal stays open, and the worker retries, until the original record
 /// is durable again: only a durable rollback (or a durable swap) closes it.
 ///
-/// - `Prepared`: the staged join never started, so a record under the
-///   journal's key is the original (its move aside failed). It is written
-///   again so that it is durable, with its tree untouched.
-/// - otherwise, or with no record under the key: any staging stub goes,
-///   and the record and its tree are restored from the journal.
+/// - The staging slot is emptied and closed first (#1699).
+/// - `Prepared`, or a live record that is the journalled original: the
+///   original never left the live map. It is written again so that it is
+///   durable, with its tree untouched.
+/// - otherwise, or with no record under the key: the record and its tree
+///   are restored from the journal.
 ///
 /// `expected` is the `record_digest` of the journal that the caller
 /// decided to roll back. The journal is read again under the membership
@@ -6044,11 +6087,20 @@ async fn rollback_reseat(state: &Arc<AppState>, stable: &str, expected: [u8; 32]
         return;
     };
     let key = journal.live_key.clone();
-    let still_live = if journal.phase == ReseatPhase::Prepared {
-        state.named_groups.read().await.get(&key).cloned()
-    } else {
-        None
-    };
+    // #1699: the staged record goes; the original never left the live map
+    // in this process. After a restart (no staging) the live record is the
+    // original too, unless a failed swap's journals replayed the staged
+    // pair, which the journal copy then replaces.
+    discard_staging(state, &key, stable).await;
+    let still_live = state
+        .named_groups
+        .live_read()
+        .await
+        .get(&key)
+        .cloned()
+        .filter(|live| {
+            journal.phase == ReseatPhase::Prepared || is_journalled_original(live, &journal)
+        });
     let (restored, revision) = match still_live {
         Some(original) => {
             let revision = original.state_revision;
@@ -6164,9 +6216,57 @@ async fn restore_record_from_journal(
     }
 }
 
+/// Where the swap finds the staged pair (#1699).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedSource {
+    /// The staging slot of the staged join in this process.
+    Staging,
+    /// The live map: after a restart the seal journals of a `Swapping`
+    /// journal replayed the staged pair there (#1645), and the swap
+    /// retries forward.
+    Replayed,
+}
+
+impl StagedSource {
+    async fn of<'a, V>(
+        self,
+        map: &'a crate::server::reseat_scope::ScopedGroupMap<V>,
+    ) -> tokio::sync::RwLockReadGuard<'a, HashMap<String, V>> {
+        match self {
+            Self::Staging => map.staging_read().await,
+            Self::Replayed => map.live_read().await,
+        }
+    }
+}
+
+/// The staged record whose stable id is `stable`, with its map key and
+/// where it is (#1699): the staging slot while a staging is open, else a
+/// live record of a `Swapping` journal that is not the original.
+async fn staged_record_for(
+    state: &AppState,
+    stable: &str,
+    journal: &ReseatJournalV1,
+) -> Option<(String, GroupInfo, StagedSource)> {
+    let find = |groups: &HashMap<String, GroupInfo>| {
+        groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == stable)
+            .map(|(key, info)| (key.clone(), info.clone()))
+    };
+    if state.reseat_stagings.scope_for(&journal.live_key).is_some() {
+        let groups = state.named_groups.staging_read().await;
+        return find(&groups).map(|(key, info)| (key, info, StagedSource::Staging));
+    }
+    if journal.phase != ReseatPhase::Swapping {
+        return None;
+    }
+    let groups = state.named_groups.live_read().await;
+    find(&groups).map(|(key, info)| (key, info, StagedSource::Replayed))
+}
+
 /// The live record whose stable id is `stable`, with its map key.
 async fn live_record_for(state: &AppState, stable: &str) -> Option<(String, GroupInfo)> {
-    let groups = state.named_groups.read().await;
+    let groups = state.named_groups.live_read().await;
     groups
         .iter()
         .find(|(_, info)| info.stable_group_id() == stable)
@@ -6212,18 +6312,18 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
         return true;
     };
     let journal = &journal;
-    let live = live_record_for(state, stable).await;
+    let staged = staged_record_for(state, stable, journal).await;
     let local = local_hex(state);
-    let seated_key = match live.as_ref() {
-        Some((key, info)) if !is_journalled_original(info, journal) => {
-            let has_tree = state.treekem_groups.read().await.contains_key(key);
+    let seated = match staged.as_ref() {
+        Some((key, info, source)) if !is_journalled_original(info, journal) => {
+            let has_tree = source.of(&state.treekem_groups).await.contains_key(key);
             journal
                 .staged_result_ready(info, &local, has_tree)
-                .then(|| key.clone())
+                .then(|| (key.clone(), *source))
         }
         _ => None,
     };
-    let Some(key) = seated_key else {
+    let Some((key, source)) = seated else {
         return false;
     };
     let expected = journal.record_digest;
@@ -6232,7 +6332,7 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
     // the legacy files without the original's marker before the journal
     // closes. A crash before that write loads the original, which rolls
     // back.
-    if !swap_staged_tree(state, stable, journal, &key).await {
+    if !swap_staged_tree(state, stable, journal, &key, source).await {
         return true;
     }
     if !lift_staging_marker(state, stable, journal).await {
@@ -6263,6 +6363,8 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
     })
     .await
     {
+        // The journal is closed: the staged pair is the live one now.
+        discard_staging(state, &key, stable).await;
         let mut inner = state.group_recovery.inner.lock().await;
         inner.subjects.remove(stable);
         inner.staging_live.remove(stable);
@@ -6487,9 +6589,10 @@ async fn swap_staged_tree(
     stable: &str,
     journal: &ReseatJournalV1,
     key: &str,
+    source: StagedSource,
 ) -> bool {
     let expected = journal.record_digest;
-    let tree = state.treekem_groups.read().await.get(key).cloned();
+    let tree = source.of(&state.treekem_groups).await.get(key).cloned();
     // Lock order as every TreeKEM persist: the group, then the store.
     let guard = match tree.as_ref() {
         Some(tree) => Some(tree.lock().await),
@@ -6547,9 +6650,12 @@ async fn swap_staged_tree(
         }
     }
     let Some(guard) = guard else {
+        // No tree: the roster write of [`lift_staging_marker`] makes the
+        // swapped-in record durable.
+        promote_staging(state, key, true).await;
         return true;
     };
-    let Some(info) = state.named_groups.read().await.get(key).cloned() else {
+    let Some(info) = source.of(&state.named_groups).await.get(key).cloned() else {
         // No write ran: the files are as they were.
         if let Some(before) = before {
             end_or_pin_rollback(state, stable, key, expected, before).await;
@@ -6564,6 +6670,9 @@ async fn swap_staged_tree(
         Err(error) if !super::self_leave_persist_left_epoch_installed(&error) => error,
         _ => {
             set_failed_swap(state, key, None).await;
+            // The tree write put the staged record in the live map; its
+            // tree follows under the same locks.
+            promote_staging(state, key, false).await;
             return true;
         }
     };
@@ -8908,11 +9017,14 @@ mod tests {
             .map(|subject| subject.view.clone())
     }
 
-    /// Codex P1 (#1533 round 1): a failed roster write while moving the
-    /// live record aside must not lose the original record or close the
-    /// journal. Before the fix the move deleted the tree and its
-    /// persistence first, and the caller then cleared the journal without
-    /// restoring anything.
+    /// Codex P1 (#1533 round 1): a re-seat preparation that stops after
+    /// its journal must not lose the original record or close the journal
+    /// before the rollback is durable. #1699: the preparation writes no
+    /// roster (the original stays live; `open_staging` only opens the
+    /// staging slot), so the failure is the step after the slot opens: the
+    /// `Staging` mark. The journal stays `Prepared`, the staging is open,
+    /// and the rollback's re-persist of the original meets the roster
+    /// fault.
     #[tokio::test]
     async fn failed_reseat_preparation_keeps_the_journal_until_rollback_is_durable(
     ) -> anyhow::Result<()> {
@@ -8932,8 +9044,23 @@ mod tests {
                 .insert(stable.clone());
             state.named_groups_save_fault.store(fault, Ordering::SeqCst);
             let digest = journal.record_digest;
-            let prepared = prepare_reseat(&state, &key, &info, journal).await;
-            assert_eq!(prepared, Err("live_record_not_moved"), "fault {fault}");
+            // `prepare_reseat` up to its failed `Staging` mark: the
+            // `Prepared` journal, then the open staging slot.
+            assert!(
+                update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await
+            );
+            open_staging(&state, &key, &info).await;
+            assert!(state.reseat_stagings.scope_for(&key).is_some());
+            assert_eq!(
+                state
+                    .named_groups
+                    .live_read()
+                    .await
+                    .get(&key)
+                    .map(|record| record.state_hash.clone()),
+                Some(info.state_hash.clone()),
+                "fault {fault}: the original stays live"
+            );
             let open = open_journal(&state, &stable).await;
             assert!(
                 open.as_ref()
@@ -8942,10 +9069,14 @@ mod tests {
             );
             // The rollback cannot be durable while the fault holds: the
             // journal stays and the worker retries.
-            rollback_reseat(&state, &stable, digest, "live_record_not_moved").await;
+            rollback_reseat(&state, &stable, digest, "journal_not_durable").await;
             assert!(
                 open_journal(&state, &stable).await.is_some(),
                 "fault {fault}"
+            );
+            assert!(
+                state.reseat_stagings.scope_for(&key).is_none(),
+                "fault {fault}: the rollback closes the staging first"
             );
             state.named_groups_save_fault.store(0, Ordering::SeqCst);
             state
@@ -8962,11 +9093,11 @@ mod tests {
                 open_journal(&state, &stable).await.is_none(),
                 "fault {fault}"
             );
-            let live = state.named_groups.read().await.get(&key).cloned();
+            let live = state.named_groups.live_read().await.get(&key).cloned();
             assert_eq!(
                 live.as_ref().map(|record| record.state_hash.clone()),
                 Some(info.state_hash.clone()),
-                "fault {fault}: the original record is live again"
+                "fault {fault}: the original record is live"
             );
             assert!(on_disk_keys(&state).await?.contains(&key), "fault {fault}");
             assert!(matches!(
@@ -8988,6 +9119,20 @@ mod tests {
     /// Codex P1 (#1533 round 1): crash at each re-seat phase. Only a staged
     /// result bound to the journal swaps; the original forked record (live
     /// because the crash came before its move aside) never does.
+    /// The live record of `key` is gone, durably (a crash of an older
+    /// binary that moved the original aside before its staged join).
+    async fn drop_live_record(state: &AppState, key: &str) -> bool {
+        let key = key.to_string();
+        state.treekem_groups.live_write().await.remove(&key);
+        matches!(
+            super::super::persist_named_groups_mutation(state, move |groups| {
+                groups.remove(&key).is_some()
+            })
+            .await,
+            Ok(super::super::AtomicWriteOutcome::Durable)
+        )
+    }
+
     #[tokio::test]
     async fn reseat_resume_at_each_phase_never_swaps_the_original() -> anyhow::Result<()> {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
@@ -9022,7 +9167,7 @@ mod tests {
         let (key, info, journal) = reseat_fixture(&state).await?;
         let stable = info.stable_group_id().to_string();
         assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
-        assert!(move_live_record_aside(&state, &key, &info).await);
+        assert!(drop_live_record(&state, &key).await);
         // #1533 review: the open journal keeps the original on disk.
         assert!(on_disk_keys(&state).await?.contains(&key));
         resume_journals(&state).await;
@@ -9068,9 +9213,10 @@ mod tests {
         staged.name = "staged".to_string();
         staged.seal_commit(keypair, 2_000)?;
         let staged_key = staged.mls_group_id.clone();
+        state.reseat_stagings.open(&staged_key, &stable);
         state
             .named_groups
-            .write()
+            .staging_write()
             .await
             .insert(staged_key.clone(), staged.clone());
         resume_journals(&state).await;
@@ -9088,7 +9234,7 @@ mod tests {
         let stable = info.stable_group_id().to_string();
         journal.phase = ReseatPhase::Staging;
         assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
-        assert!(move_live_record_aside(&state, &key, &info).await);
+        assert!(drop_live_record(&state, &key).await);
         resume_journals(&state).await;
         assert!(open_journal(&state, &stable).await.is_none());
         assert!(on_disk_keys(&state).await?.contains(&key));
@@ -9133,27 +9279,37 @@ mod tests {
         journal.live_record = serde_json::to_vec(&info)?;
         journal.phase = ReseatPhase::Staging;
         assert!(update_sidecar(&state, &stable, |body| body.reseat_journal = Some(journal)).await);
+        // #1699: the staged join writes in its staging slot.
+        state.reseat_stagings.open(&key, &stable);
         let (write_key, record) = (key.clone(), staged);
-        let outcome = super::super::persist_named_groups_mutation(&state, move |groups| {
-            groups.insert(write_key, record);
-            true
-        })
+        let outcome = in_staging(
+            &state,
+            &key,
+            super::super::persist_named_groups_mutation(&state, move |groups| {
+                groups.insert(write_key, record);
+                true
+            }),
+        )
         .await?;
         assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
         let staged = state
             .named_groups
-            .read()
+            .staging_read()
             .await
             .get(&key)
             .cloned()
-            .expect("the staged record is live");
+            .expect("the staged record is in the staging slot");
         assert_eq!(staged.fork_quarantine, info.fork_quarantine);
         assert!(super::super::reject_fork_quarantined(&state, &key, &staged).is_some());
-        assert!(
-            super::super::reject_fork_quarantine_installed_before_effect(&state, &key, None)
-                .await
-                .is_some()
-        );
+        // The before-effect re-check of a step of the staged join reads
+        // the staging slot.
+        assert!(in_staging(
+            &state,
+            &key,
+            super::super::reject_fork_quarantine_installed_before_effect(&state, &key, None),
+        )
+        .await
+        .is_some());
         assert!(contained(&state, &staged).await);
         Ok(())
     }
@@ -9174,11 +9330,23 @@ mod tests {
         }
     }
 
+    /// Run `fut` as a step of the staged join of `key` (#1699, ADR 0109 §3
+    /// step 2): in its open staging, as `consume_reseat` and the inbound
+    /// handlers run it. Its map writes land in the staging slot.
+    async fn in_staging<F: std::future::Future>(state: &AppState, key: &str, fut: F) -> F::Output {
+        assert!(
+            state.reseat_stagings.scope_for(key).is_some(),
+            "the staging of {key} is open"
+        );
+        state.reseat_stagings.run_in_staging_of(key, fut).await
+    }
+
     /// A contained original (marker set, live and durable), its re-seat
-    /// prepared through the production path (journal, move aside,
+    /// prepared through the production path (journal, open staging,
     /// `Staging`), and the staged join's seated record written by an
-    /// ordinary roster write with no marker of its own. Returns the key,
-    /// the original, its marker and the staged record as written.
+    /// ordinary roster write, in the staging, with no marker of its own.
+    /// The original stays live (#1699). Returns the key, the original, its
+    /// marker and the staged record as written.
     async fn staged_reseat(
         state: &Arc<AppState>,
     ) -> anyhow::Result<(String, GroupInfo, x0x::groups::ForkQuarantine, GroupInfo)> {
@@ -9210,12 +9378,36 @@ mod tests {
         staged.fork_quarantine = None;
         staged.seal_commit(keypair, 2_000)?;
         let (write_key, record) = (key.clone(), staged.clone());
-        let outcome = super::super::persist_named_groups_mutation(state, move |groups| {
-            groups.insert(write_key, record);
-            true
-        })
+        let outcome = in_staging(
+            state,
+            &key,
+            super::super::persist_named_groups_mutation(state, move |groups| {
+                groups.insert(write_key, record);
+                true
+            }),
+        )
         .await?;
         assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
+        assert_eq!(
+            state
+                .named_groups
+                .live_read()
+                .await
+                .get(&key)
+                .map(|record| record.state_hash.clone()),
+            Some(info.state_hash.clone()),
+            "the original stays live"
+        );
+        assert_eq!(
+            state
+                .named_groups
+                .staging_read()
+                .await
+                .get(&key)
+                .map(|record| record.state_hash.clone()),
+            Some(staged.state_hash.clone()),
+            "the staged record is in the staging slot"
+        );
         Ok((key, info, marker, staged))
     }
 
@@ -9232,40 +9424,69 @@ mod tests {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
         let (key, _, marker, staged) = staged_reseat(&state).await?;
         let stable = staged.stable_group_id().to_string();
+        // #1699: the staged record is in the staging slot; the live map
+        // keeps the contained original until the swap.
+        let staged_marker = |state: Arc<AppState>, key: String| async move {
+            state
+                .named_groups
+                .staging_read()
+                .await
+                .get(&key)
+                .and_then(|record| record.fork_quarantine.clone())
+        };
         let live_marker = |state: Arc<AppState>, key: String| async move {
             state
                 .named_groups
-                .read()
+                .live_read()
                 .await
                 .get(&key)
                 .and_then(|record| record.fork_quarantine.clone())
         };
         assert_eq!(
-            live_marker(Arc::clone(&state), key.clone()).await,
+            staged_marker(Arc::clone(&state), key.clone()).await,
             Some(marker.clone()),
             "the staged record holds the original's marker"
+        );
+        assert_eq!(
+            live_marker(Arc::clone(&state), key.clone()).await,
+            Some(marker.clone()),
+            "the original stays live and contained"
         );
         assert_eq!(
             crate::server::delegations::fork_quarantine_marker(&state, &stable).await,
             Some(marker.clone())
         );
-        let live = state.named_groups.read().await.get(&key).cloned();
-        assert!(contained(&state, &live.expect("the staged record is live")).await);
+        let in_slot = state.named_groups.staging_read().await.get(&key).cloned();
+        assert!(contained(&state, &in_slot.expect("the staged record is in the slot")).await);
         // A clear before the swap (the manual clear, a mandate or adoption
-        // clear, the S3 retirement) all pass the one clear gate: held.
-        let clear_key = key.clone();
-        let _ = super::super::persist_named_groups_quarantine_clear_gated(&state, move |groups| {
-            groups
-                .get_mut(&clear_key)
-                .map(|record| record.fork_quarantine = None)
-                .is_some()
-        })
-        .await;
-        assert_eq!(
-            live_marker(Arc::clone(&state), key.clone()).await,
-            Some(marker.clone()),
-            "no clear lifts the marker before the swap"
-        );
+        // clear, the S3 retirement) all pass the one clear gate: held, on
+        // the staged record (a step of the staged join) and on the live
+        // original.
+        for staged_step in [true, false] {
+            let clear_key = key.clone();
+            let clear =
+                super::super::persist_named_groups_quarantine_clear_gated(&state, move |groups| {
+                    groups
+                        .get_mut(&clear_key)
+                        .map(|record| record.fork_quarantine = None)
+                        .is_some()
+                });
+            let _ = if staged_step {
+                in_staging(&state, &key, clear).await
+            } else {
+                clear.await
+            };
+            assert_eq!(
+                staged_marker(Arc::clone(&state), key.clone()).await,
+                Some(marker.clone()),
+                "staged step {staged_step}: no clear lifts the staged marker before the swap"
+            );
+            assert_eq!(
+                live_marker(Arc::clone(&state), key.clone()).await,
+                Some(marker.clone()),
+                "staged step {staged_step}: no clear lifts the live marker before the swap"
+            );
+        }
         // The swap's roster write is not durable: marker and journal stay.
         state.named_groups_save_fault.store(3, Ordering::SeqCst);
         swap_now_if_seated(&state, &stable).await;
@@ -9277,10 +9498,22 @@ mod tests {
         );
         assert!(open_journal(&state, &stable).await.is_some());
         // A durable swap lifts it, on disk and in memory, and closes the
-        // journal.
+        // journal and the staging.
         swap_now_if_seated(&state, &stable).await;
         assert!(open_journal(&state, &stable).await.is_none());
         assert_eq!(live_marker(Arc::clone(&state), key.clone()).await, None);
+        assert_eq!(
+            state
+                .named_groups
+                .live_read()
+                .await
+                .get(&key)
+                .map(|record| record.state_hash.clone()),
+            Some(staged.state_hash.clone()),
+            "the staged record is live"
+        );
+        assert!(state.named_groups.staging_read().await.is_empty());
+        assert!(state.reseat_stagings.scope_for(&key).is_none());
         let on_disk = legacy_entry(&state.named_groups_path, &key)
             .await?
             .expect("the swapped-in record is on disk");
@@ -9309,15 +9542,22 @@ mod tests {
             let state = Arc::clone(&state);
             let key = key.clone();
             async move {
-                let outcome = super::super::persist_named_groups_mutation(&state, move |groups| {
-                    groups.get_mut(&key).is_some_and(|record| {
-                        record.policy.confidentiality =
-                            x0x::groups::GroupConfidentiality::MlsEncrypted;
-                        record.secure_plane = x0x::mls::SecureGroupPlane::Gss;
-                        record.shared_secret = secret;
-                        true
-                    })
-                })
+                // The staged join's `MemberAdded` and `SecureShareDelivered`
+                // applies: steps of the staged join, in its staging.
+                let write_key = key.clone();
+                let outcome = in_staging(
+                    &state,
+                    &key,
+                    super::super::persist_named_groups_mutation(&state, move |groups| {
+                        groups.get_mut(&write_key).is_some_and(|record| {
+                            record.policy.confidentiality =
+                                x0x::groups::GroupConfidentiality::MlsEncrypted;
+                            record.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+                            record.shared_secret = secret;
+                            true
+                        })
+                    }),
+                )
                 .await?;
                 anyhow::ensure!(outcome == super::super::AtomicWriteOutcome::Durable);
                 anyhow::Ok(())
@@ -9329,16 +9569,15 @@ mod tests {
             assert!(!swap_if_seated(&state, &stable).await);
         }
         assert!(open_journal(&state, &stable).await.is_some());
-        assert_eq!(
-            state
-                .named_groups
-                .read()
-                .await
-                .get(&key)
-                .and_then(|record| record.fork_quarantine.clone()),
-            Some(marker),
-            "the staged record keeps the original's containment"
-        );
+        let in_slot = state.named_groups.staging_read().await.get(&key).cloned();
+        let live = state.named_groups.live_read().await.get(&key).cloned();
+        for (map, record) in [("staging slot", in_slot), ("live map", live)] {
+            assert_eq!(
+                record.and_then(|record| record.fork_quarantine),
+                Some(marker.clone()),
+                "{map}: the original's containment stays"
+            );
+        }
         // The delayed share arrives: the next tick swaps.
         set_secret(Some(vec![7; 32])).await?;
         assert!(swap_if_seated(&state, &stable).await);
@@ -9377,7 +9616,9 @@ mod tests {
                 .is_some_and(|open| open.phase == journal.phase),
             "the swap waits for the rollback"
         );
-        // The rollback restores the original under the lock, then ends.
+        // The rollback discards the staging (#1699) and restores the
+        // original under the lock, then ends.
+        assert!(discard_staging(&state, &key, &stable).await);
         assert!(restore_record_from_journal(&state, &stable, &key, &original, &journal).await);
         drop(rollback_guard);
         swap.await?;
@@ -9513,27 +9754,38 @@ mod tests {
             .await
         );
         // The stub install, then the Welcome install of a `next` with no
-        // marker.
+        // marker, in the open staging (#1699).
+        state.reseat_stagings.open(&key, original.stable_group_id());
         let (write_key, record) = (key.clone(), staged.clone());
-        let outcome = super::super::persist_named_groups_mutation(&state, move |groups| {
-            groups.insert(write_key, record);
-            true
-        })
-        .await?;
-        assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
-        super::super::persist_treekem_and_named_groups_atomic_with_info(
-            &state, &key, staged, &tree,
+        let outcome = in_staging(
+            &state,
+            &key,
+            super::super::persist_named_groups_mutation(&state, move |groups| {
+                groups.insert(write_key, record);
+                true
+            }),
         )
         .await?;
-        let live = state
+        assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
+        in_staging(
+            &state,
+            &key,
+            super::super::persist_treekem_and_named_groups_atomic_with_info(
+                &state, &key, staged, &tree,
+            ),
+        )
+        .await?;
+        let in_slot = state
             .named_groups
-            .read()
+            .staging_read()
             .await
             .get(&key)
             .cloned()
-            .expect("the staged record is live");
-        assert_eq!(live.fork_quarantine, Some(marker));
-        assert!(held_join_state(&state, &live).await.is_none());
+            .expect("the staged record is in the staging slot");
+        assert_eq!(in_slot.fork_quarantine, Some(marker));
+        assert!(in_staging(&state, &key, held_join_state(&state, &in_slot))
+            .await
+            .is_none());
         Ok(())
     }
 
@@ -9541,7 +9793,9 @@ mod tests {
     /// (epoch 0), and an open `Staging` journal that holds both. Then the
     /// staged join's Welcome install under the same key: a new record (one
     /// commit later) and a different tree at the same epoch, so the startup
-    /// re-bind (#457) would pair it with the original record. Returns the
+    /// re-bind (#457) would pair it with the original record. The Welcome
+    /// install runs in the open staging; the original and its tree stay
+    /// live (#1699). Returns the
     /// key, the original record, the original tree bytes, the staged
     /// record and the staged tree bytes.
     async fn staged_tree_fixture(
@@ -9594,6 +9848,10 @@ mod tests {
         )
         .await?;
         let original_bytes = original_tree.to_snapshot_bytes()?;
+        state.treekem_groups.live_write().await.insert(
+            key.clone(),
+            Arc::new(tokio::sync::Mutex::new(original_tree)),
+        );
         assert!(open_staging_journal_for_test(state, &key, &original).await?);
         let journal_tree = original_bytes.clone();
         assert!(
@@ -9604,27 +9862,54 @@ mod tests {
             })
             .await
         );
-        // The move aside, then the staged join's Welcome install.
-        state.treekem_groups.write().await.remove(&key);
-        let aside = key.clone();
-        super::super::persist_named_groups_mutation(state, move |groups| {
-            groups.remove(&aside).is_some()
+        // #1699: the staging opens (the original and its tree stay live),
+        // then the staged join's Welcome install runs in it.
+        open_staging(state, &key, &original).await;
+        let staged_bytes = staged_tree.to_snapshot_bytes()?;
+        in_staging(state, &key, async {
+            super::super::persist_treekem_and_named_groups_atomic_with_info(
+                state,
+                &key,
+                staged.clone(),
+                &staged_tree,
+            )
+            .await?;
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(staged_tree)));
+            anyhow::Ok(())
         })
         .await?;
-        super::super::persist_treekem_and_named_groups_atomic_with_info(
-            state,
-            &key,
-            staged.clone(),
-            &staged_tree,
-        )
-        .await?;
-        let staged_bytes = staged_tree.to_snapshot_bytes()?;
-        state
-            .treekem_groups
-            .write()
-            .await
-            .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(staged_tree)));
+        assert_live_original_and_staged(state, &key, &original, &staged).await;
         Ok((key, original, original_bytes, staged, staged_bytes))
+    }
+
+    /// The memory layout of a staged re-seat before its swap (#1699): the
+    /// live map holds `original` (with its tree when it has one), the
+    /// staging slot holds `staged` and its tree.
+    async fn assert_live_original_and_staged(
+        state: &AppState,
+        key: &str,
+        original: &GroupInfo,
+        staged: &GroupInfo,
+    ) {
+        let hash = |record: Option<&GroupInfo>| record.map(|record| record.state_hash.clone());
+        assert_eq!(
+            hash(state.named_groups.live_read().await.get(key)),
+            Some(original.state_hash.clone()),
+            "the original stays live"
+        );
+        assert_eq!(
+            hash(state.named_groups.staging_read().await.get(key)),
+            Some(staged.state_hash.clone()),
+            "the staged record is in the staging slot"
+        );
+        assert!(
+            state.treekem_groups.staging_read().await.contains_key(key),
+            "the staged tree is in the staging slot"
+        );
     }
 
     /// The envelope in `<key>.snap` on disk.
@@ -9683,7 +9968,7 @@ mod tests {
             .await
             .and_then(|body| body.reseat_journal)
             .ok_or_else(|| anyhow::anyhow!("open journal"))?;
-        assert!(swap_staged_tree(&state, &stable, &journal, &key).await);
+        assert!(swap_staged_tree(&state, &stable, &journal, &key, StagedSource::Staging).await);
         let envelope = snapshot_on_disk(&state, &key).await?;
         assert_eq!(
             (envelope.state_revision, &envelope.state_hash),
@@ -10494,9 +10779,10 @@ mod tests {
 
     /// #1567 fixture: a contained TreeKEM original with no tree and no
     /// snapshot file (the #871 gate-only, pre-Welcome joiner), durable, and
-    /// an open `Staging` journal with no `live_tree`. Then the move aside,
-    /// the staged join's stub install and its Welcome install under the
-    /// same key: a new record (one commit later) and its tree. Returns the
+    /// an open `Staging` journal with no `live_tree`. Then the open staging
+    /// and, in it, the staged join's stub install and its Welcome install
+    /// under the same key: a new record (one commit later) and its tree.
+    /// The original stays live (#1699). Returns the
     /// key, the original record, the staged record and the staged tree
     /// bytes.
     async fn treeless_staged_fixture(
@@ -10529,31 +10815,37 @@ mod tests {
         assert_eq!(outcome, super::super::AtomicWriteOutcome::Durable);
         assert!(!snapshot_exists(state, &key).await?);
         assert!(open_staging_journal_for_test(state, &key, &original).await?);
-        // The move aside, then the staged join's stub and Welcome installs.
-        let aside = key.clone();
-        super::super::persist_named_groups_mutation(state, move |groups| {
-            groups.remove(&aside).is_some()
-        })
-        .await?;
-        let (write_key, record) = (key.clone(), staged.clone());
-        super::super::persist_named_groups_mutation(state, move |groups| {
-            groups.insert(write_key, record);
-            true
-        })
-        .await?;
-        super::super::persist_treekem_and_named_groups_atomic_with_info(
-            state,
-            &key,
-            staged.clone(),
-            &staged_tree,
-        )
-        .await?;
+        // #1699: the staging opens (the original stays live), then the
+        // staged join's stub and Welcome installs run in it.
+        open_staging(state, &key, &original).await;
         let staged_bytes = staged_tree.to_snapshot_bytes()?;
-        state
-            .treekem_groups
-            .write()
-            .await
-            .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(staged_tree)));
+        in_staging(state, &key, async {
+            let (write_key, record) = (key.clone(), staged.clone());
+            super::super::persist_named_groups_mutation(state, move |groups| {
+                groups.insert(write_key, record);
+                true
+            })
+            .await?;
+            super::super::persist_treekem_and_named_groups_atomic_with_info(
+                state,
+                &key,
+                staged.clone(),
+                &staged_tree,
+            )
+            .await?;
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(staged_tree)));
+            anyhow::Ok(())
+        })
+        .await?;
+        assert_live_original_and_staged(state, &key, &original, &staged).await;
+        assert!(
+            !state.treekem_groups.live_read().await.contains_key(&key),
+            "the original has no tree"
+        );
         Ok((key, original, staged, staged_bytes))
     }
 
@@ -10725,7 +11017,12 @@ mod tests {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
         let (key, original, original_tree, staged, _) = staged_tree_fixture(&state).await?;
         let next = staged_metadata_commit(&state, &staged)?;
-        super::super::persist_named_group_info(&state, &key, next).await?;
+        in_staging(
+            &state,
+            &key,
+            super::super::persist_named_group_info(&state, &key, next),
+        )
+        .await?;
         let envelope = snapshot_on_disk(&state, &key).await?;
         assert_eq!(envelope.state_hash, original.state_hash);
         assert!(
@@ -10736,7 +11033,12 @@ mod tests {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
         let (key, _, staged, _) = treeless_staged_fixture(&state).await?;
         let next = staged_metadata_commit(&state, &staged)?;
-        super::super::persist_named_group_info(&state, &key, next).await?;
+        in_staging(
+            &state,
+            &key,
+            super::super::persist_named_group_info(&state, &key, next),
+        )
+        .await?;
         assert!(
             !snapshot_exists(&state, &key).await?,
             "Absent: no snapshot file"
@@ -10755,7 +11057,7 @@ mod tests {
         let staged_tree = |state: Arc<AppState>, key: String| async move {
             state
                 .treekem_groups
-                .read()
+                .staging_read()
                 .await
                 .get(&key)
                 .cloned()
@@ -10764,7 +11066,10 @@ mod tests {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
         let (key, original, original_tree, _, _) = staged_tree_fixture(&state).await?;
         let tree = staged_tree(Arc::clone(&state), key.clone()).await?;
-        super::super::persist_treekem_snapshot_bound(&state, &key, &*tree.lock().await).await?;
+        in_staging(&state, &key, async {
+            super::super::persist_treekem_snapshot_bound(&state, &key, &*tree.lock().await).await
+        })
+        .await?;
         let envelope = snapshot_on_disk(&state, &key).await?;
         assert_eq!(envelope.state_hash, original.state_hash);
         assert!(
@@ -10775,7 +11080,10 @@ mod tests {
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
         let (key, _, _, _) = treeless_staged_fixture(&state).await?;
         let tree = staged_tree(Arc::clone(&state), key.clone()).await?;
-        super::super::persist_treekem_snapshot_bound(&state, &key, &*tree.lock().await).await?;
+        in_staging(&state, &key, async {
+            super::super::persist_treekem_snapshot_bound(&state, &key, &*tree.lock().await).await
+        })
+        .await?;
         assert!(
             !snapshot_exists(&state, &key).await?,
             "Absent: no snapshot file"
@@ -10792,31 +11100,44 @@ mod tests {
     async fn a_treeless_staged_persist_keeps_the_atomic_outcomes() -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
         let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
-        let (key, _, staged, _) = treeless_staged_fixture(&state).await?;
+        let (key, original, staged, _) = treeless_staged_fixture(&state).await?;
         let tree = state
             .treekem_groups
-            .read()
+            .staging_read()
             .await
             .get(&key)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("staged tree"))?;
         let next = staged_metadata_commit(&state, &staged)?;
+        // #1699: the staged record is in the staging slot; the live map
+        // keeps the original whatever the staged persist does.
         let live_hash = |state: Arc<AppState>, key: String| async move {
             state
                 .named_groups
-                .read()
+                .staging_read()
+                .await
+                .get(&key)
+                .map(|info| info.state_hash.clone())
+        };
+        let original_hash = |state: Arc<AppState>, key: String| async move {
+            state
+                .named_groups
+                .live_read()
                 .await
                 .get(&key)
                 .map(|info| info.state_hash.clone())
         };
 
         state.named_groups_save_fault.store(1, Ordering::SeqCst);
-        let refused = super::super::persist_treekem_and_named_groups_atomic_with_info(
-            &state,
-            &key,
-            next.clone(),
-            &*tree.lock().await,
-        )
+        let refused = in_staging(&state, &key, async {
+            super::super::persist_treekem_and_named_groups_atomic_with_info(
+                &state,
+                &key,
+                next.clone(),
+                &*tree.lock().await,
+            )
+            .await
+        })
         .await;
         assert!(refused.is_err());
         assert!(!super::super::self_leave_persist_left_epoch_installed(
@@ -10831,12 +11152,15 @@ mod tests {
         );
 
         state.named_groups_save_fault.store(3, Ordering::SeqCst);
-        let installed = super::super::persist_treekem_and_named_groups_atomic_with_info(
-            &state,
-            &key,
-            next.clone(),
-            &*tree.lock().await,
-        )
+        let installed = in_staging(&state, &key, async {
+            super::super::persist_treekem_and_named_groups_atomic_with_info(
+                &state,
+                &key,
+                next.clone(),
+                &*tree.lock().await,
+            )
+            .await
+        })
         .await;
         state.named_groups_save_fault.store(0, Ordering::SeqCst);
         assert!(super::super::self_leave_persist_left_epoch_installed(
@@ -10848,6 +11172,11 @@ mod tests {
         assert_eq!(
             live_hash(Arc::clone(&state), key.clone()).await,
             Some(next.state_hash.clone())
+        );
+        assert_eq!(
+            original_hash(Arc::clone(&state), key.clone()).await,
+            Some(original.state_hash.clone()),
+            "the original stays live"
         );
         assert!(!snapshot_exists(&state, &key).await?);
         Ok(())
