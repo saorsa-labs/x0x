@@ -6358,6 +6358,129 @@ async fn stale_base_treekem_sibling_terminal_with_genuine_owner_attestation_quar
     Ok(())
 }
 
+/// WHY (ADR 0109 H-S3-c): the owner seals a stale-base OwnerCertified
+/// TreeKEM joiner with BOTH its owner mandate and its v2 terminal
+/// attestation. The classifier returned at the mandate check before the
+/// v2 gap branch, so the joiner recorded no `AnchoredGapRefusal` and its
+/// #846 gap gate never armed; a later fork from a removed admin then met
+/// no gate. The owner-mandated seal must arm the gate and must still
+/// install no fork evidence.
+#[tokio::test]
+async fn stale_base_treekem_owner_mandated_seal_arms_gap_gate() -> Result<()> {
+    let mut stage = issue458_stage(0xAA, false).await?;
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
+    let authority_kp =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let authority_hex = hex::encode(authority_kp.agent_id().as_bytes());
+    // The mandate anchor derives the owner key from a committed roster
+    // certificate, as on a real OwnerCertified roster.
+    stage
+        .base_info
+        .members_v2
+        .get_mut(&authority_hex)
+        .expect("authority seated in the base")
+        .certificate = Some(issue_joiner_cert(&owner_kp, &authority_kp)?);
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    let (stub, _b_kp, link, genuine) = two_admin_treekem_stub(&stage).await?;
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    let joiner_epoch = Some(1);
+    let attestation = HeadAttestation::sign_for_terminal(
+        stub.stable_group_id(),
+        &genuine,
+        &stage.joiner_hex,
+        joiner_epoch,
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let joiner_kp = AgentKeypair::from_bytes(&stage.joiner_key_bytes.0, &stage.joiner_key_bytes.1)?;
+    let joiner_cert = issue_joiner_cert(&owner_kp, &joiner_kp)?;
+    let mandate = x0x::groups::OwnerMandate::sign(
+        stub.stable_group_id(),
+        genuine.revision,
+        genuine.prev_state_hash.as_deref().unwrap_or_default(),
+        &genuine.roster_root,
+        &genuine.policy_hash,
+        &genuine.public_meta_hash,
+        1,
+        &stage.joiner_hex,
+        "invite-secret-hash",
+        &x0x::groups::owner_cert::certificate_digest_hex(&joiner_cert),
+        &genuine.committed_by,
+        now_millis_u64(),
+        &owner_kp,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let owner_id = stub
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .expect("owner-certified policy");
+    assert!(
+        mandate_anchors_commit_under_trusted_owner(&stub, owner_id, &mandate, &genuine),
+        "precondition: the owner mandate anchors the seal"
+    );
+
+    let chain = [link.clone()];
+    let anchored = served_chain_owner_anchored(
+        &stub,
+        &genuine,
+        &chain,
+        &stage.joiner_hex,
+        Some(&joiner_cert),
+        Some(&attestation),
+        Some(&mandate),
+        joiner_epoch,
+    );
+    let v1_only = served_chain_owner_v1_only(
+        &stub,
+        &genuine,
+        &chain,
+        &stage.joiner_hex,
+        Some(&joiner_cert),
+        Some(&attestation),
+        Some(&mandate),
+        joiner_epoch,
+    );
+    assert!(anchored, "precondition: v2 binds this exact terminal");
+    assert!(!v1_only, "a v2 binding is not v1-only");
+    assert!(
+        classify_refused_joiner_fork_chain(
+            &joiner_state,
+            &stage.group_id,
+            &stub,
+            &genuine,
+            &chain,
+            Some(&mandate),
+            anchored,
+            v1_only,
+            false,
+        )
+        .await,
+        "an owner-mandated v2 seal is a stale-base gap"
+    );
+    let groups = joiner_state.named_groups.read().await;
+    let info = groups.get(&stage.group_id).expect("stub retained");
+    assert!(!info.is_fork_quarantined(), "the owner seal is not a fork");
+    assert!(info
+        .invite_lineage
+        .as_ref()
+        .is_some_and(|lineage| lineage.fork_evidence.is_none()));
+    let record = armed_anchored_gap_sequence(info).expect("the gap gate is armed");
+    assert_eq!(record.reason, "owner_attested_stale_base_gap");
+    assert_eq!(record.terminal_revision, genuine.revision);
+    assert_eq!(record.terminal_state_hash, genuine.state_hash);
+    assert_eq!(
+        record.attested_chain_hashes,
+        vec![link.commit.state_hash.clone(), genuine.state_hash.clone()]
+    );
+    Ok(())
+}
+
 /// WHY #842 (Rule 9): the authority's certificate caches can miss a
 /// joiner whose announce has not propagated (the R12 Home blocker — 100
 /// rejections across the whole 120 s window). The join event now carries

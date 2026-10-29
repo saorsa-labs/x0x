@@ -5767,18 +5767,6 @@ async fn classify_refused_joiner_fork_chain(
     if commit.verify_structure().is_err() {
         return false;
     }
-    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
-    // this same mandate; if it produced a successor, the lineage gate
-    // above is still empty and the marker was handled there — never
-    // record the owner's own anchored chain as fork evidence.
-    if let (Some(owner_id), Some(mandate)) = (
-        current.policy.admission.owner_certified_user_id(),
-        owner_mandate,
-    ) {
-        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
-            return false;
-        }
-    }
     let base = x0x::groups::state_commit::AlternateChainBase {
         group_id: current.stable_group_id(),
         base_revision: current.state_revision,
@@ -5833,6 +5821,21 @@ async fn classify_refused_joiner_fork_chain(
             "joiner served chain is owner-anchored to this exact terminal — stale-base gap, not fork evidence"
         );
         return true;
+    }
+    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
+    // this same mandate; if it produced a successor, the lineage check at
+    // the top of this fn is still empty and the marker was handled there —
+    // never record the owner's own anchored chain as fork evidence. This check
+    // sits AFTER the v2 gap branch: an owner seal of a stale-base joiner
+    // carries both the mandate and the v2 terminal binding, and it must
+    // still arm the ADR 0109 gap gate (H-S3-c).
+    if let (Some(owner_id), Some(mandate)) = (
+        current.policy.admission.owner_certified_user_id(),
+        owner_mandate,
+    ) {
+        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
+            return false;
+        }
     }
     if served_chain_owner_v1_only {
         // A genuine v1 signature authenticates the parent, but cannot
@@ -6689,6 +6692,9 @@ async fn persist_named_groups_quarantine_clear_gated_unlocked<F>(
 where
     F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
 {
+    // #1645 (round 5 review): as in `persist_named_group_info_inner`, a
+    // failed re-seat swap refuses this write before anything is staged.
+    group_recovery::refuse_roster_write_during_failed_swap(state, None).await?;
     let before = {
         let groups = state.named_groups.read().await;
         groups.clone()
@@ -6719,9 +6725,12 @@ where
     } else {
         RebindOutcome::NotApplicable
     };
+    // #1645 (round 5 review): a cleanup below discards only the journals
+    // this call wrote (`Rebound`), never journals another transaction left.
+    let journals_ours = rebind_group_id.filter(|_| matches!(prejournaled, RebindOutcome::Rebound));
     let outcome = save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await;
     if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
-        if let Some(group_id) = rebind_group_id {
+        if let Some(group_id) = journals_ours {
             discard_rebind_journal(state, group_id).await;
         }
     }
@@ -6737,7 +6746,7 @@ where
             state
                 .named_groups_requires_durability_confirmation
                 .store(true, Ordering::Release);
-        } else if let Some(group_id) = rebind_group_id {
+        } else if let Some(group_id) = journals_ours {
             discard_rebind_journal(state, group_id).await;
         }
         return outcome;
@@ -6773,7 +6782,7 @@ where
                 save_named_groups_checked_unlocked(state).await,
                 Ok(AtomicWriteOutcome::Durable)
             ) {
-                if let Some(group_id) = rebind_group_id {
+                if let Some(group_id) = journals_ours {
                     discard_rebind_journal(state, group_id).await;
                 }
             }
@@ -7206,6 +7215,15 @@ pub(in crate::server) enum SaveFault {
     /// write (the candidate install) is `ReplacedNotDurable` after the
     /// rename and its corrective re-save fails.
     PreflightOkThenReplacedNotDurableAfterWriteThenError = 6,
+    /// #1658: only the TreeKEM atomic persist reads it. The snapshot file
+    /// is written, then the named half fails as `NotReplaced` and the
+    /// journal pair is discarded: the transaction does not commit, but the
+    /// new snapshot is on disk (the failed re-seat swap's tree write).
+    NamedNotReplacedAfterSnapshot = 7,
+    /// #1645: only the TreeKEM atomic persist reads it. The Home-Suite
+    /// sidecar journal is written, then the legacy journal write (the
+    /// commit point) fails: no live file changes.
+    JournalWriteFails = 8,
 }
 
 // #470 — per-instance fault helpers; all `#[cfg(test)]` so no trace in
@@ -7453,6 +7471,12 @@ async fn persist_named_group_info_inner(
             outcome => return outcome,
         }
     }
+    // #1645 (round 5 review): refuse here, before anything is staged. A
+    // failed re-seat swap keeps its transaction journals, and the rollback
+    // paths below discard this group's journals. A pin is set only under
+    // the persistence lock held here, so no pin can appear later in this
+    // transaction.
+    group_recovery::refuse_roster_write_during_failed_swap(state, None).await?;
     // #1103: both the all-clean SEAL and MemberAdded's mandate/gap-adoption
     // arms replace a record whose fork marker was cleared on a clone. Route
     // every such replacement through the same candidate gate as manual clear.
@@ -7488,17 +7512,21 @@ async fn persist_named_group_info_inner(
     // the NEW sidecar on disk with no journal to explain it.
     let pre_sidecar_bytes = tokio::fs::read(&state.home_suite_groups_path).await.ok();
     // #457 r5b/r5c rollback — PRE-DURABLE only (the named save failed or
-    // the journal preparation failed): discard both journals, restore the
-    // in-memory map, the stub marker, AND the on-disk sidecar to its
-    // pre-transaction bytes.
+    // the journal preparation failed): discard both journals when this
+    // transaction wrote them (#1645 round 5: never journals another
+    // transaction left), restore the in-memory map, the stub marker, AND
+    // the on-disk sidecar to its pre-transaction bytes.
     async fn rollback_pre_durable(
         state: &AppState,
         group_id: &str,
+        journals_ours: bool,
         snapshot: &HashMap<String, x0x::groups::GroupInfo>,
         confirmed_stub: bool,
         pre_sidecar_bytes: &Option<Vec<u8>>,
     ) {
-        discard_rebind_journal(state, group_id).await;
+        if journals_ours {
+            discard_rebind_journal(state, group_id).await;
+        }
         *state.named_groups.write().await = snapshot.clone();
         if confirmed_stub {
             state
@@ -7536,6 +7564,8 @@ async fn persist_named_group_info_inner(
     };
     // Journal-first (TreeKEM-plane groups only; NotApplicable otherwise).
     let prejournaled = prepare_rebind_journal_locked(state, group_id).await;
+    // A failed preparation already discarded what it wrote.
+    let journals_ours = matches!(prejournaled, RebindOutcome::Rebound);
     match prejournaled {
         RebindOutcome::NotApplicable => {}
         RebindOutcome::Rebound => {}
@@ -7543,6 +7573,7 @@ async fn persist_named_group_info_inner(
             rollback_pre_durable(
                 state,
                 group_id,
+                journals_ours,
                 &snapshot,
                 confirmed_stub,
                 &pre_sidecar_bytes,
@@ -7558,6 +7589,7 @@ async fn persist_named_group_info_inner(
         rollback_pre_durable(
             state,
             group_id,
+            journals_ours,
             &snapshot,
             confirmed_stub,
             &pre_sidecar_bytes,
@@ -7674,6 +7706,11 @@ async fn prepare_rebind_journal_for_groups(
         Ok(None) => return RebindOutcome::NotApplicable,
         Err(e) => return RebindOutcome::Failed(e),
     };
+    // #1645 (round 5 review): set once this call's `.hsjournal` is in
+    // place. Before that, a failure discards nothing: any journal on disk
+    // belongs to another transaction (a failed re-seat swap keeps its
+    // journals for the startup replay).
+    let mut journals_ours = false;
     let journalled = async {
         // #451 seam: the two-file split encode, stub-excluded — THIS
         // group's post-mutation entry is the confirmed state being
@@ -7714,6 +7751,7 @@ async fn prepare_rebind_journal_for_groups(
         write_home_suite_sidecar_journal(&state.treekem_dir, &tx, &home_suite_json)
             .await
             .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))?;
+        journals_ours = true;
         let journal = TreeKemNamedPersistJournal {
             version: TREEKEM_NAMED_JOURNAL_VERSION,
             group_id_hex: group_id.to_string(),
@@ -7749,7 +7787,9 @@ async fn prepare_rebind_journal_for_groups(
     match journalled {
         Ok(()) => RebindOutcome::Rebound,
         Err(e) => {
-            discard_rebind_journal(state, group_id).await;
+            if journals_ours {
+                discard_rebind_journal(state, group_id).await;
+            }
             RebindOutcome::Failed(e)
         }
     }
@@ -7871,6 +7911,11 @@ async fn rebind_envelope_for(
     };
     if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
         return Ok(None);
+    }
+    // #1567: a staged re-seat's metadata seal keeps the original's TreeKEM
+    // state on disk, as the roster view keeps the original record.
+    if let Some(cover) = reseat_snapshot_cover(state, group_id).await? {
+        return Ok(cover.into_envelope());
     }
     // Arm 1: live group — encode the current snapshot under the new
     // binding. Contention retried briefly, then failed.
@@ -9186,6 +9231,37 @@ fn recovery_seat_may_receive_key_package(
         .is_some_and(|member| member.state == x0x::groups::GroupMemberState::Removed)
 }
 
+/// #1113 / #1567: a Removed seat may take back its KeyPackage bytes from
+/// the member's own signed `MemberJoined`, with no inviter attestation,
+/// when the bytes hash to the KeyPackage hash that the verified roster
+/// commits for the seat. A Welcome joiner needs this: its roster has no
+/// `added_by` for the members seated before it (the v4 invite roster is a
+/// projection without it), so the inviter attestation never verifies
+/// there. The leaf-removal proof of a self-leave reads these bytes.
+fn removed_seat_self_signed_key_package(
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    let NamedGroupMetadataEvent::MemberJoined {
+        member_agent_id,
+        treekem_key_package_b64: Some(kp_b64),
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let seat_commits_bytes = info.members_v2.get(member_agent_id).is_some_and(|member| {
+        member.state == x0x::groups::GroupMemberState::Removed
+            && member
+                .treekem_key_package_hash
+                .as_deref()
+                .is_some_and(|expected| {
+                    blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
+                })
+    });
+    seat_commits_bytes && verify_member_joined_key_package_event(event)
+}
+
 fn verify_authority_attested_member_joined_recovery(
     info: &x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
@@ -10156,18 +10232,8 @@ async fn apply_recovered_member_key_package_locked(
         let Some(info) = groups.get(&storage_key) else {
             return false;
         };
-        let authority_ok = verify_authority_attested_member_joined_recovery(info, event);
-        let removed_member = info.members_v2.get(member_agent_id).filter(|member| {
-            member.state == x0x::groups::GroupMemberState::Removed
-                && member
-                    .treekem_key_package_hash
-                    .as_deref()
-                    .is_some_and(|expected| {
-                        blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
-                    })
-        });
-        if !authority_ok
-            && (removed_member.is_none() || !verify_member_joined_key_package_event(event))
+        if !verify_authority_attested_member_joined_recovery(info, event)
+            && !removed_seat_self_signed_key_package(info, event)
         {
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
@@ -10252,6 +10318,34 @@ pub(in crate::server) async fn s4_seal_probe_for_test(
     target_hex: &str,
 ) -> String {
     revocation_eviction::seal_probe_for_test(state, group_id, target_hex).await
+}
+
+/// W3-H (#1567, test builds only): remove this node's cached copies of
+/// `member_agent_id`'s `MemberJoined` for `group_id`, as when its one
+/// gossip delivery came before this node could apply it. Returns `false`
+/// when the roster already holds the member's KeyPackage bytes (then the
+/// catch-up path is not under test), or when the group is unknown.
+#[cfg(test)]
+pub(in crate::server) async fn forget_member_join_copy_for_test(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+) -> bool {
+    let roster_holds_bytes = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return false;
+        };
+        info.members_v2
+            .get(member_agent_id)
+            .and_then(current_member_treekem_key_package)
+            .is_some()
+    };
+    if roster_holds_bytes {
+        return false;
+    }
+    let _status = prune_treekem_cache_member(state, group_id, member_agent_id, "w3h_1567").await;
+    true
 }
 
 /// W3-H (#1357, test builds only): whether this node can resolve
@@ -12199,10 +12293,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                         }
                     }
                 }
+                // #1567: the same two proofs as the install below. The
+                // member-keyed answer for a self-leaver is checked on its
+                // Removed seat too: on a Welcome joiner the inviter
+                // attestation never verifies, and a refused answer left the
+                // crypto-only exclusion waiting for this evidence for ever.
                 let recovery_event = member_joined_kp_cache_entry(&event)
                     .map(|(_, ev)| ev)
                     .filter(|ev| {
                         verify_authority_attested_member_joined_recovery(&response_info, ev)
+                            || removed_seat_self_signed_key_package(&response_info, ev)
                     });
                 // A survivor may relay a signed removal. The transport sender
                 // is that survivor. The author is the verified commit signer.
@@ -15155,6 +15255,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 drop(mls_groups);
             }
             if removed_self {
+                // #1645 (round 5 audit): the removal persist below is refused
+                // while a re-seat swap has failed. Refuse before the teardown
+                // removes this group's tree and journals.
+                if group_recovery::refuse_roster_write_during_failed_swap(state, None)
+                    .await
+                    .is_err()
+                {
+                    return ApplyMetadataResult::REJECTED;
+                }
                 // ADR 0107 (r5, G5): this node no longer serves the group's
                 // join artifacts — retire them before the group leaves the
                 // roster.
@@ -15631,6 +15740,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let banned_self = agent_id == local_agent_hex;
             if banned_self {
+                // #1645 (round 5 audit): as for `member_removed_self`, refuse
+                // before the teardown while a re-seat swap has failed.
+                if group_recovery::refuse_roster_write_during_failed_swap(state, None)
+                    .await
+                    .is_err()
+                {
+                    return banned_reject("failed_reseat_swap", &resolved_group_key);
+                }
                 // #531 I4a: teardown has BEGUN. This is not an accept — the
                 // persist below can still reject, so nothing durable is claimed
                 // here. The durable outcome is logged after persistence only.
@@ -24419,7 +24536,10 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         if !has_withdrawn_same_stable_group_record(&groups, group_id, stable_group_id) {
             return Ok(false);
         }
-        encode_named_groups_store_for_state(state, &groups)
+        // #1645: a failed re-seat swap of `group_id` does not refuse this
+        // write. It removes the group's tree and journals, so no pair is
+        // left to mix.
+        encode_named_groups_store_allowing(state, &groups, Some(group_id))
             .await
             .map_err(|e| anyhow::anyhow!("withdrawn named groups repair encode: {e}"))?
     };
@@ -24796,6 +24916,18 @@ async fn drop_local_named_group_state(
     // path.PARENT(), so passing the dir itself synced its parent).
     {
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        // #1645 (round 5 review): the absence persist below is refused
+        // while a re-seat swap has failed. Refuse before the journal
+        // removals, so the swap keeps the journals its restart replays.
+        if let Err(e) = group_recovery::refuse_roster_write_during_failed_swap(state, None).await {
+            tracing::error!(
+                group_id = %LogHexId::group(id),
+                reason = %reason,
+                error = %e,
+                "#1645: delete refused before its journal removal — nothing changed"
+            );
+            return false;
+        }
         // #457 r10 item 10.1 — a TreeKEM-dir fsync failure in the
         // PRE-COMMIT phase FAILS the delete BEFORE any destructive step
         // (the group, its journals, and its snapshot all remain; the
@@ -34668,6 +34800,14 @@ fn encode_treekem_snapshot_envelope(
     let snapshot = group
         .to_snapshot_bytes()
         .map_err(|e| anyhow::anyhow!("treekem snapshot encode: {e}"))?;
+    encode_treekem_snapshot_envelope_bytes(info, snapshot)
+}
+
+/// [`encode_treekem_snapshot_envelope`] for snapshot bytes already taken.
+fn encode_treekem_snapshot_envelope_bytes(
+    info: &x0x::groups::GroupInfo,
+    snapshot: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
     let mut bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
     let envelope = TreeKemSnapshotEnvelope {
         version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
@@ -34707,6 +34847,177 @@ fn treekem_snapshot_envelope_matches_info(
     envelope.state_revision == info.state_revision
         && envelope.state_hash == info.state_hash
         && envelope.security_binding == info.security_binding
+}
+
+/// ADR 0109 §3 step 2 (#1567): what `<key>.snap` holds while a re-seat of
+/// that key is staged ([`reseat_snapshot_cover`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ReseatSnapshotCover {
+    /// The original's envelope.
+    Keep(Vec<u8>),
+    /// Nothing: the original had no tree and no snapshot file (the #871
+    /// gate-only, pre-Welcome joiner).
+    Absent,
+}
+
+impl ReseatSnapshotCover {
+    /// The envelope to write, or `None` to write no snapshot file.
+    fn into_envelope(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Keep(envelope) => Some(envelope),
+            Self::Absent => None,
+        }
+    }
+}
+
+/// ADR 0109 §3 step 2 (#1567): the cover for `<group_id_hex>.snap` while a
+/// re-seat of that key is staged, or `None` when no re-seat is staged
+/// there.
+///
+/// The staged join installs its tree under the original's key. The legacy
+/// overlay keeps the original record in the roster files until the swap,
+/// so the snapshot file must keep the original's TreeKEM state too.
+/// Otherwise a restart, or a released binary, finds the original record
+/// beside the staged tree. When the epochs match, the startup re-bind
+/// (#457) then pairs them. The cover is the journalled tree bound to the
+/// journalled record, or else the snapshot file as it is (the original's),
+/// or else no file. The staged tree reaches disk only in the swap
+/// ([`group_recovery`]'s `swap_staged_tree`).
+///
+/// Callers hold `named_groups_persistence_lock`, which the swap also
+/// holds when it ends the cover.
+pub(super) async fn reseat_snapshot_cover(
+    state: &AppState,
+    group_id_hex: &str,
+) -> Result<Option<ReseatSnapshotCover>> {
+    let Some(journal) = group_recovery::staging_journal_for_key(state, group_id_hex).await else {
+        return Ok(None);
+    };
+    if let Some(tree) = journal.live_tree {
+        let original: x0x::groups::GroupInfo = serde_json::from_slice(&journal.live_record)
+            .map_err(|e| anyhow::anyhow!("re-seat journal record decode: {e}"))?;
+        return encode_treekem_snapshot_envelope_bytes(&original, tree)
+            .map(|envelope| Some(ReseatSnapshotCover::Keep(envelope)));
+    }
+    snapshot_file_cover(state, group_id_hex).await.map(Some)
+}
+
+/// `<group_id_hex>.snap` as it is on disk, as a [`ReseatSnapshotCover`]
+/// to put back later.
+pub(super) async fn snapshot_file_cover(
+    state: &AppState,
+    group_id_hex: &str,
+) -> Result<ReseatSnapshotCover> {
+    match tokio::fs::read(treekem_snapshot_path(&state.treekem_dir, group_id_hex)).await {
+        Ok(envelope) => Ok(ReseatSnapshotCover::Keep(envelope)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReseatSnapshotCover::Absent),
+        Err(e) => Err(anyhow::anyhow!(
+            "ADR 0109 S3: the TreeKEM snapshot cannot be read: {e}"
+        )),
+    }
+}
+
+/// #1567: put `cover` back on disk as `<group_id_hex>.snap` (a failed swap
+/// left the staged tree there): write the original's envelope, or remove
+/// the file. Both are durable: the removal syncs the directory, or a power
+/// loss can bring the staged file back, and the next cover read takes it
+/// for the original's.
+pub(super) async fn restore_reseat_snapshot_cover(
+    state: &AppState,
+    group_id_hex: &str,
+    cover: ReseatSnapshotCover,
+) -> Result<()> {
+    match cover {
+        ReseatSnapshotCover::Keep(envelope) => {
+            persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, envelope).await
+        }
+        ReseatSnapshotCover::Absent => {
+            let path = treekem_snapshot_path(&state.treekem_dir, group_id_hex);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow::anyhow!("treekem snapshot remove: {e}")),
+            }
+            sync_parent_dir_for_path(&path)
+                .map_err(|e| anyhow::anyhow!("treekem snapshot remove: directory sync: {e}"))
+        }
+    }
+}
+
+/// #1645 (Codex P1 on #1683): the bytes of both roster stores (the
+/// Home-Suite sidecar, then `named_groups.json`; `None` for a file that is
+/// not there) before the re-seat swap's tree write. That write replaces
+/// the sidecar before its commit point, so a failure after it must put
+/// both files back, as it puts the original's snapshot back.
+pub(super) struct RosterStoresBefore {
+    home_suite: Option<Vec<u8>>,
+    named: Option<Vec<u8>>,
+}
+
+async fn read_if_present(path: &FsPath) -> Result<Option<Vec<u8>>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
+    }
+}
+
+/// Read [`RosterStoresBefore`]. Caller holds
+/// `named_groups_persistence_lock` until any restore.
+pub(super) async fn read_roster_stores(state: &AppState) -> Result<RosterStoresBefore> {
+    Ok(RosterStoresBefore {
+        home_suite: read_if_present(&state.home_suite_groups_path).await?,
+        named: read_if_present(&state.named_groups_path).await?,
+    })
+}
+
+/// Put the Home-Suite sidecar back to `before` (write its bytes, or remove
+/// a file that was not there), durably. Unlike
+/// [`restore_home_suite_sidecar`], the outcome is returned: the re-seat
+/// swap keeps its transaction journals until this is durable. Caller holds
+/// `named_groups_persistence_lock` since [`read_roster_stores`].
+pub(super) async fn restore_home_suite_store(
+    state: &AppState,
+    before: &RosterStoresBefore,
+) -> Result<()> {
+    let path = &state.home_suite_groups_path;
+    match before.home_suite.as_deref() {
+        Some(bytes) => {
+            match write_home_suite_sidecar(state, &String::from_utf8_lossy(bytes)).await {
+                Ok(AtomicWriteOutcome::Durable) => Ok(()),
+                Ok(outcome) => Err(anyhow::anyhow!("Home-Suite sidecar restore: {outcome:?}")),
+                Err(e) => Err(anyhow::anyhow!("Home-Suite sidecar restore: {e}")),
+            }
+        }
+        None => {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(anyhow::anyhow!("Home-Suite sidecar remove: {e}")),
+            }
+            sync_parent_dir_for_path(path)
+                .map_err(|e| anyhow::anyhow!("Home-Suite sidecar remove: directory sync: {e}"))
+        }
+    }
+}
+
+/// Put `named_groups.json` back to `before`, durably. A file that was not
+/// there stays as it is: every roster save writes it. Caller holds
+/// `named_groups_persistence_lock` since [`read_roster_stores`].
+pub(super) async fn restore_named_store(
+    state: &AppState,
+    before: &RosterStoresBefore,
+) -> Result<()> {
+    let Some(named) = before.named.as_deref() else {
+        return Ok(());
+    };
+    match write_named_groups_json_atomic(&state.named_groups_path, &String::from_utf8_lossy(named))
+        .await
+    {
+        Ok(AtomicWriteOutcome::Durable) => Ok(()),
+        Ok(outcome) => Err(anyhow::anyhow!("named groups restore: {outcome:?}")),
+        Err(e) => Err(anyhow::anyhow!("named groups restore: {e}")),
+    }
 }
 
 async fn persist_treekem_snapshot_bytes(
@@ -34790,6 +35101,15 @@ pub(super) async fn persist_treekem_snapshot_bound(
         "withdrawn_snapshot_persist",
     )
     .await?;
+    // #1567: while a re-seat is staged here, the file keeps the original's
+    // state. A retained journal then needs no refresh: its envelope is the
+    // same cover.
+    if let Some(cover) = reseat_snapshot_cover(state, group_id_hex).await? {
+        if let Some(envelope) = cover.into_envelope() {
+            persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, envelope).await?;
+        }
+        return Ok(());
+    }
     let bytes = encode_treekem_snapshot_envelope(&info, group)?;
     persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, bytes).await?;
     ensure_treekem_persistence_allowed_locked(
@@ -34905,7 +35225,35 @@ async fn refresh_retained_treekem_journal_snapshot(
 /// the caller reports as failed and rolls back. Discarding it only when the
 /// named write did not land keeps the #457 rule "never discard a journal
 /// whose named half is durable" (the caller then aligns the live group).
-async fn discard_seal_journal_pair(state: &AppState, group_id_hex: &str) {
+/// [`discard_seal_journal_pair`] unless the caller keeps the pair
+/// ([`persist_treekem_and_named_groups_atomic_locked`]'s `keep_journals`).
+async fn discard_unless_kept(state: &AppState, group_id_hex: &str, keep: bool) {
+    if !keep {
+        discard_seal_journal_pair(state, group_id_hex).await;
+    }
+}
+
+/// #1645: [`discard_seal_journal_pair`], checked. The legacy journal (the
+/// commit point) is removed durably: a removal that fails, or whose
+/// directory sync fails, is an error, because a restart can still replay
+/// the pair. An orphan `.hsjournal` is discarded at startup, so its
+/// removal is best effort.
+pub(super) async fn discard_seal_journal_pair_durable(
+    state: &AppState,
+    group_id_hex: &str,
+) -> Result<()> {
+    let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
+    match tokio::fs::remove_file(&journal_path).await {
+        Ok(()) => sync_parent_dir_for_path(&journal_path)
+            .map_err(|e| anyhow::anyhow!("TreeKEM journal remove: directory sync: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("TreeKEM journal remove: {e}")),
+    }
+    remove_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex).await;
+    Ok(())
+}
+
+pub(super) async fn discard_seal_journal_pair(state: &AppState, group_id_hex: &str) {
     let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
     if let Err(e) = tokio::fs::remove_file(&journal_path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -34937,6 +35285,58 @@ impl std::fmt::Display for EpochInstalledPersistError {
 
 impl std::error::Error for EpochInstalledPersistError {}
 
+/// #1645 (Codex P1, round 4): the atomic persist stopped before its commit
+/// point (the legacy TreeKEM journal). No live file (sidecar, snapshot,
+/// `named_groups.json`) changed and no journal replays the transaction,
+/// so the files on disk are the files from before the call. The marker is
+/// the signal, not the error text. It shows the wrapped error's text, so
+/// callers that read the text see no change.
+#[derive(Debug)]
+struct BeforeCommitPersistError(anyhow::Error);
+
+impl std::fmt::Display for BeforeCommitPersistError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for BeforeCommitPersistError {}
+
+fn before_commit(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(BeforeCommitPersistError(error))
+}
+
+/// Whether `error` is from an atomic persist that stopped before its commit
+/// point ([`BeforeCommitPersistError`]).
+pub(super) fn persist_stopped_before_commit(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BeforeCommitPersistError>().is_some()
+}
+
+/// #1645 (round 4 review): the atomic persist found the group withdrawn
+/// and its repair ran: the rosters hold the withdrawn record, and the
+/// group's snapshot and journals are removed. The marker is the signal.
+/// It shows the wrapped error's text.
+#[derive(Debug)]
+struct WithdrawnPersistError(anyhow::Error);
+
+impl std::fmt::Display for WithdrawnPersistError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for WithdrawnPersistError {}
+
+fn withdrew(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(WithdrawnPersistError(error))
+}
+
+/// Whether `error` is from an atomic persist whose withdrawn repair ran
+/// ([`WithdrawnPersistError`]).
+pub(super) fn persist_withdrew_group(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<WithdrawnPersistError>().is_some()
+}
+
 async fn persist_treekem_and_named_groups_atomic_with_info(
     state: &AppState,
     group_id_hex: &str,
@@ -34948,6 +35348,26 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     // the same marker).
     state.group_recovery.hold_reseat_marker(&mut info);
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    persist_treekem_and_named_groups_atomic_locked(state, group_id_hex, info, group, false).await
+}
+
+/// [`persist_treekem_and_named_groups_atomic_with_info`] for a caller that
+/// already holds `named_groups_persistence_lock` (the ADR 0109 re-seat
+/// swap, #1567).
+///
+/// With `keep_journals`, a write that fails after the commit point keeps
+/// the journal pair (#1645, Codex P1 on #1683): a restart then replays this
+/// transaction, so the files are a matching pair until the caller has put
+/// the previous files back and discards the pair itself
+/// ([`discard_seal_journal_pair_durable`]), or until a retry commits. A
+/// withdrawn group's pair is always discarded.
+async fn persist_treekem_and_named_groups_atomic_locked(
+    state: &AppState,
+    group_id_hex: &str,
+    info: x0x::groups::GroupInfo,
+    group: &x0x::mls::TreeKemMlsGroup,
+    keep_journals: bool,
+) -> anyhow::Result<()> {
     let stable_group_id = info.stable_group_id().to_string();
     #[cfg(test)]
     maybe_force_post_crypto_withdrawn_group_for_test(state, group_id_hex, Some(&stable_group_id))
@@ -34960,7 +35380,9 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     )
     .await?
     {
-        anyhow::bail!("refusing to persist key material for withdrawn group");
+        return Err(withdrew(anyhow::anyhow!(
+            "refusing to persist key material for withdrawn group"
+        )));
     }
     // Issue #451 + review r2: the durable trio (sidecar / snapshot /
     // named_groups.json) must only change AFTER their repair payloads are
@@ -35035,11 +35457,11 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
                      fork-quarantine marker changed between authorization and the \
                      persist lock"
                 );
-                anyhow::bail!(
+                return Err(before_commit(anyhow::anyhow!(
                     "fork_quarantined: the group's fork-quarantine marker changed \
                      between authorization and the persist lock; re-read the group \
                      and retry (see docs/runbooks for the manual clear)"
-                );
+                )));
             }
         }
         let mut next_groups = groups.clone();
@@ -35069,9 +35491,13 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         // containment cannot have moved under it, so the results agree.
         enforce_containment_invariant(&mut next_groups, &groups);
         // #451 (merged main): the two-file split encoder.
-        encode_named_groups_store_for_state(state, &next_groups)
-            .await
-            .map_err(|e| anyhow::anyhow!("named groups encode: {e}"))?
+        encode_named_groups_store_allowing(
+            state,
+            &next_groups,
+            keep_journals.then_some(group_id_hex),
+        )
+        .await
+        .map_err(|e| before_commit(anyhow::anyhow!("named groups encode: {e}")))?
     };
 
     #[cfg(test)]
@@ -35082,7 +35508,28 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     )
     .await;
 
-    let snapshot_envelope = encode_treekem_snapshot_envelope(&info, group)?;
+    // #1567: a staged re-seat keeps the original's tree in the snapshot and
+    // in the journal (which a released binary replays), as the roster view
+    // above keeps the original record. An original with no snapshot file
+    // keeps none: only the roster half is written.
+    let snapshot_envelope = match reseat_snapshot_cover(state, group_id_hex)
+        .await
+        .map_err(before_commit)?
+    {
+        Some(ReseatSnapshotCover::Keep(envelope)) => envelope,
+        Some(ReseatSnapshotCover::Absent) => {
+            return persist_named_half_without_snapshot_locked(
+                state,
+                group_id_hex,
+                &stable_group_id,
+                info,
+                &named_groups_json,
+                &home_suite_json,
+            )
+            .await;
+        }
+        None => encode_treekem_snapshot_envelope(&info, group).map_err(before_commit)?,
+    };
     // 1) Repair payloads first: the legacy journal (old binaries replay it
     //    into snapshot + named_groups.json), then the sidecar journal.
     let journal = TreeKemNamedPersistJournal {
@@ -35092,7 +35539,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         snapshot_envelope: snapshot_envelope.clone(),
     };
     let journal_bytes = postcard::to_stdvec(&journal)
-        .map_err(|e| anyhow::anyhow!("TreeKEM journal encode: {e}"))?;
+        .map_err(|e| before_commit(anyhow::anyhow!("TreeKEM journal encode: {e}")))?;
     let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
     // Review r3, item 1: durable + crash-atomic (temp → file fsync →
     // rename → dir fsync) so a power loss can never leave a torn journal
@@ -35113,7 +35560,14 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         },
         &home_suite_json,
     )
-    .await?;
+    .await
+    .map_err(before_commit)?;
+    #[cfg(test)]
+    if state.named_groups_save_fault.load(Ordering::SeqCst) == SaveFault::JournalWriteFails as u8 {
+        return Err(before_commit(anyhow::anyhow!(
+            "TreeKEM journal write: test fault"
+        )));
+    }
     match x0x::storage::write_private_bytes_durable_typed(&journal_path, journal_bytes).await {
         Ok(()) => {}
         Err(e) if e.crossed_rename() => {
@@ -35129,7 +35583,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
                 "#1187: TreeKEM seal journal is in place but its directory fsync failed; completing the transaction (a restart would replay it)"
             );
         }
-        Err(e) => return Err(anyhow::anyhow!("TreeKEM journal write: {e}")),
+        Err(e) => return Err(before_commit(anyhow::anyhow!("TreeKEM journal write: {e}"))),
     }
     // 2) Live files, each now repairable from the journals above.
     // #1187: past the commit point, a failure that does NOT durably commit
@@ -35138,12 +35592,12 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     let sidecar_outcome = match write_home_suite_sidecar(state, &home_suite_json).await {
         Ok(outcome) => outcome,
         Err(e) => {
-            discard_seal_journal_pair(state, group_id_hex).await;
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             return Err(anyhow::anyhow!("Home-Suite sidecar write: {e}"));
         }
     };
     if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
-        discard_seal_journal_pair(state, group_id_hex).await;
+        discard_unless_kept(state, group_id_hex, keep_journals).await;
         anyhow::bail!("Home-Suite sidecar replacement did not occur");
     }
     match persist_treekem_snapshot_bytes_typed(&state.treekem_dir, group_id_hex, snapshot_envelope)
@@ -35164,7 +35618,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
             );
         }
         Err(e) => {
-            discard_seal_journal_pair(state, group_id_hex).await;
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             return Err(anyhow::anyhow!("treekem snapshot write: {e}"));
         }
     }
@@ -35178,13 +35632,25 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     {
         Ok(true) => {
             discard_seal_journal_pair(state, group_id_hex).await;
-            anyhow::bail!("refusing to persist key material for withdrawn group");
+            return Err(withdrew(anyhow::anyhow!(
+                "refusing to persist key material for withdrawn group"
+            )));
         }
         Ok(false) => {}
         Err(e) => {
-            discard_seal_journal_pair(state, group_id_hex).await;
+            // #1645: the repair did not run, so the group still has key
+            // material, and the sidecar and snapshot above are on disk. The
+            // re-seat swap keeps the pair that replays them.
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             return Err(e);
         }
+    }
+    #[cfg(test)]
+    if state.named_groups_save_fault.load(Ordering::SeqCst)
+        == SaveFault::NamedNotReplacedAfterSnapshot as u8
+    {
+        discard_unless_kept(state, group_id_hex, keep_journals).await;
+        anyhow::bail!("named groups replacement did not occur");
     }
     let outcome = write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
         .await
@@ -35222,7 +35688,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         AtomicWriteOutcome::NotReplaced => {
             // #1187: the named half did not land, so the journal must not
             // replay this transaction at restart (the caller rolls back).
-            discard_seal_journal_pair(state, group_id_hex).await;
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             anyhow::bail!("named groups replacement did not occur");
         }
     }
@@ -35249,6 +35715,61 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         .remove(group_id_hex);
     // #451 (merged main): the sidecar journal completes with the legacy one.
     remove_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex).await;
+    Ok(())
+}
+
+/// #1567: [`persist_treekem_and_named_groups_atomic_locked`] while a
+/// re-seat of a tree-less original is staged under `group_id_hex`
+/// ([`ReseatSnapshotCover::Absent`]). The snapshot file stays absent, so
+/// no TreeKEM journal is written: the checked roster save (sidecar, then
+/// `named_groups.json`) is the whole transaction. The outcomes are those
+/// of the atomic persist's named write. Caller holds
+/// `named_groups_persistence_lock`.
+async fn persist_named_half_without_snapshot_locked(
+    state: &AppState,
+    group_id_hex: &str,
+    stable_group_id: &str,
+    info: x0x::groups::GroupInfo,
+    named_groups_json: &str,
+    home_suite_json: &str,
+) -> anyhow::Result<()> {
+    if repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
+        state,
+        group_id_hex,
+        Some(stable_group_id),
+        "withdrawn_atomic_persist_late",
+    )
+    .await?
+    {
+        anyhow::bail!("refusing to persist key material for withdrawn group");
+    }
+    let outcome = save_named_groups_store_checked(state, named_groups_json, home_suite_json)
+        .await
+        .map_err(|e| anyhow::anyhow!("named groups write: {e}"))?;
+    let durable = match outcome {
+        AtomicWriteOutcome::Durable => true,
+        AtomicWriteOutcome::ReplacedNotDurable => false,
+        AtomicWriteOutcome::NotReplaced => anyhow::bail!("named groups replacement did not occur"),
+    };
+    state
+        .named_groups_requires_durability_confirmation
+        .store(!durable, Ordering::Release);
+    // #732 r8: the install converges, as the atomic persist's does.
+    {
+        let mut groups = state.named_groups.write().await;
+        let before = groups.clone();
+        groups.insert(group_id_hex.to_string(), info);
+        enforce_containment_invariant(&mut groups, &before);
+    }
+    if !durable {
+        return Err(anyhow::Error::new(EpochInstalledPersistError)
+            .context("named groups replacement was not directory-durable"));
+    }
+    state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(group_id_hex);
     Ok(())
 }
 
@@ -40815,6 +41336,22 @@ async fn encode_named_groups_store_for_state(
     state: &AppState,
     groups: &HashMap<String, x0x::groups::GroupInfo>,
 ) -> std::io::Result<(String, String)> {
+    encode_named_groups_store_allowing(state, groups, None).await
+}
+
+/// [`encode_named_groups_store_for_state`]. Every whole-roster write
+/// encodes here, so this is the backstop where a write waits for a failed
+/// re-seat swap whose files are not yet a matching pair
+/// ([`group_recovery::refuse_roster_write_during_failed_swap`]). A write
+/// that stages or removes journals first refuses earlier, before it
+/// touches them (#1645 round 5). `allow` is the key of the swap's own
+/// retry.
+async fn encode_named_groups_store_allowing(
+    state: &AppState,
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    allow: Option<&str>,
+) -> std::io::Result<(String, String)> {
+    group_recovery::refuse_roster_write_during_failed_swap(state, allow).await?;
     // Stack budget (see `migrate_unsplit_home_suite_store_if_needed`): the
     // S3 sidecar writer future lives on the heap, not in every save path.
     match Box::pin(group_recovery::legacy_store_view(state, groups)).await? {
@@ -65515,6 +66052,106 @@ pub(in crate::server) mod tests {
                 .await
                 .is_some(),
             "recovery depends on historical commit authority, not current role"
+        );
+        Ok(())
+    }
+
+    /// #1567: a Welcome joiner's roster has no `added_by` for the members
+    /// seated before it, so the inviter attestation never verifies there.
+    /// After such a member self-leaves, the member-keyed catch-up answer
+    /// must still install its own signed KeyPackage on the Removed seat
+    /// when the bytes match the committed hash; with any other committed
+    /// hash nothing installs. Before the fix the answer was always refused
+    /// and the crypto-only exclusion waited for this evidence for ever.
+    #[tokio::test]
+    async fn catchup_installs_self_signed_key_package_on_removed_seat_without_added_by(
+    ) -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0xa5, 0xa6).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        let committed_hash = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group exists");
+            let seat = info.members_v2.get_mut(&member_hex).expect("seat exists");
+            // The Welcome joiner's view: no inviter on the seat, and the
+            // member has left.
+            seat.added_by = None;
+            seat.state = x0x::groups::GroupMemberState::Removed;
+            seat.treekem_key_package_hash
+                .clone()
+                .expect("the roster commits the package hash")
+        };
+        let courier = x0x::identity::AgentKeypair::generate()?;
+        insert_active_member_without_kp(
+            state,
+            &group_id,
+            &hex::encode(courier.agent_id().as_bytes()),
+            &inviter_hex,
+        )
+        .await;
+        let response = TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: fixture.stable_group_id.clone(),
+            events: vec![fixture.event.clone()],
+            truncated: false,
+            responder_state_hash: None,
+        };
+
+        // Negative control: the roster commits other bytes for the seat.
+        {
+            let mut groups = state.named_groups.write().await;
+            let seat = groups
+                .get_mut(&group_id)
+                .and_then(|info| info.members_v2.get_mut(&member_hex))
+                .expect("seat exists");
+            seat.treekem_key_package_hash = Some("00".repeat(32));
+        }
+        handle_treekem_catchup_response(
+            state,
+            &courier.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response.clone(),
+        )
+        .await;
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "bytes that the roster does not commit never install"
+        );
+
+        {
+            let mut groups = state.named_groups.write().await;
+            let seat = groups
+                .get_mut(&group_id)
+                .and_then(|info| info.members_v2.get_mut(&member_hex))
+                .expect("seat exists");
+            seat.treekem_key_package_hash = Some(committed_hash);
+        }
+        handle_treekem_catchup_response(
+            state,
+            &courier.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response,
+        )
+        .await;
+        let installed = member_treekem_kp(state, &group_id, &member_hex).await;
+        let NamedGroupMetadataEvent::MemberJoined {
+            treekem_key_package_b64: Some(expected),
+            ..
+        } = &fixture.event
+        else {
+            panic!("fixture event is a package-bearing MemberJoined");
+        };
+        assert_eq!(
+            installed.as_deref(),
+            Some(expected.as_str()),
+            "the Removed seat takes back its own signed, committed KeyPackage"
         );
         Ok(())
     }

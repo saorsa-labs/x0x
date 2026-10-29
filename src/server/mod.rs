@@ -41,6 +41,8 @@ pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
 // `#![cfg(test)]` inside the module).
 mod w3h;
+#[cfg(all(test, tokio_unstable))]
+pub(crate) use w3h::counted_spawn_blocking;
 mod ws;
 
 #[cfg(test)]
