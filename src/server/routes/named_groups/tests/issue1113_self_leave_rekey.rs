@@ -2320,8 +2320,9 @@ async fn startup_with_witness(group_id: &str) -> Result<(LeaveFixture, x0x::iden
 /// The S4 pass in [`mark_leaver_removed`] starts a detached head ask to
 /// the witness. That ask calls `request_treekem_catchup_page`, as the
 /// startup sends do. The ask records a helper call only if its first
-/// poll reads `catchup_page_force_ok` as set. The helper reads the flag
-/// once, at its top. When that first poll comes after the test sets the
+/// poll reads `catchup_page_force_ok` as set. That read happens once,
+/// after the helper's test-seam park (a no-op unless a test arms the
+/// seam). When that first poll comes after the test sets the
 /// flag, the startup send-bound tests see one helper call more than the
 /// startup sends (#1671; CI jobs 123010651244 and 122529831168). One
 /// take of the registry is not enough: a task that one round joins can
