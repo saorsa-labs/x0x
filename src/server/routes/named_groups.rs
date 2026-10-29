@@ -49093,6 +49093,59 @@ pub(in crate::server) type WelcomeFetchWaiter =
 pub(in crate::server) mod tests {
     use super::*;
 
+    /// #1699 part 1 (ZCode on #1703): a roster save from inside a re-seat
+    /// scope encodes the live map without unconfirmed join stubs, never
+    /// the staging slot it changed; outside a scope the encoder takes the
+    /// map it is given. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_save_inside_a_reseat_scope_encodes_the_live_map_without_pending_stubs(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let creator = state.agent.agent_id();
+        let record = |name: &str, key: &str| {
+            x0x::groups::GroupInfo::new(name.to_string(), String::new(), creator, key.to_string())
+        };
+        let (live_key, stub_key, staged_key) = ("a1".repeat(16), "b2".repeat(16), "c3".repeat(16));
+        let live = record("live", &live_key);
+        let staged = record("staged", &staged_key);
+        {
+            let mut groups = state.named_groups.live_write().await;
+            groups.clear();
+            groups.insert(live_key.clone(), live.clone());
+            groups.insert(stub_key.clone(), record("stub", &stub_key));
+        }
+        state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stub_key.clone());
+        let expected = encode_named_groups_store(&HashMap::from([(live_key.clone(), live)]))?;
+        let encoded = crate::server::reseat_scope::in_reseat_scope(staged_key.clone(), async {
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(staged_key.clone(), staged.clone());
+            let groups = state.named_groups.read().await;
+            encode_named_groups_store_allowing(&state, &groups, None).await
+        })
+        .await?;
+        assert_eq!(encoded, expected, "the live map, without the stub");
+        assert!(state
+            .named_groups
+            .live_read()
+            .await
+            .get(&staged_key)
+            .is_none());
+        let given = HashMap::from([(staged_key.clone(), staged)]);
+        assert_eq!(
+            encode_named_groups_store_allowing(&state, &given, None).await?,
+            encode_named_groups_store(&given)?,
+            "outside a scope: the given map"
+        );
+        Ok(())
+    }
+
     /// ADR 0108 §8 (#1575): the notice currently staged for one
     /// `(group, member, attempt)`, as `(cause, signer_agent_id, detail)`.
     pub(in crate::server) fn staged_join_pending_notice(
