@@ -1082,8 +1082,9 @@ async fn load_sidecars(state: &AppState) {
         }
     }
     // A sidecar whose group is not in the live map holds a re-seat journal
-    // (the live record was moved aside): keep it by its file stem, which is
-    // the stable ID for every well-formed ID.
+    // (an older binary moved the live record aside before its staged join;
+    // since #1699 the original stays live): keep it by its file stem, which
+    // is the stable ID for every well-formed ID.
     for (stem, body) in loaded {
         if body.reseat_journal.is_some() {
             inner.sidecars.insert(stem, body);
@@ -6199,8 +6200,9 @@ async fn restore_record_from_journal(
                 }
             }
         }
-        // The key is absent (the original was moved aside and any stub is
-        // gone): insert, since `persist_named_group_info` only replaces.
+        // The key is absent (an older binary moved the original aside, or a
+        // replayed staged pair was removed above): insert, since
+        // `persist_named_group_info` only replaces.
         None => {
             let restore_key = key.to_string();
             let restored = record.clone();
@@ -6283,7 +6285,7 @@ async fn live_record_for(state: &AppState, stable: &str) -> Option<(String, Grou
 /// failed and the next tick retries).
 ///
 /// A `Prepared` journal, or a record that is still the journalled original
-/// (a crash before the move aside became durable), never swaps: the
+/// (the staging slot holds no staged record, #1699), never swaps: the
 /// original forked record can show this node Active with a tree.
 ///
 /// The worker tick calls this, and so do the staged join's return and the
@@ -7125,8 +7127,8 @@ pub(in crate::server) async fn held_join_state(
 }
 
 /// Test only: open a `Staging` re-seat journal for `original` (live key
-/// `key`), signed by this node, as [`prepare_reseat`] leaves it after the
-/// move aside. Returns whether the sidecar write is durable.
+/// `key`), signed by this node, as [`prepare_reseat`] leaves it after it
+/// opens the staging slot. Returns whether the sidecar write is durable.
 #[cfg(test)]
 pub(in crate::server) async fn open_staging_journal_for_test(
     state: &AppState,
@@ -14252,5 +14254,389 @@ mod tests {
         assert!(!check(&[("a", bbr), ("c", "attester_behind")]));
         assert!(!check(&[("m", bbr)]), "a member's refusal never decides");
         assert!(!check(&[("m", bbr), ("b", "pending")]));
+    }
+
+    /// #1699: the `GET /groups/:id` body of `key`, as the owner reads it.
+    async fn get_group_json(
+        state: &Arc<AppState>,
+        key: &str,
+    ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let response = super::super::get_named_group(
+            State(Arc::clone(state)),
+            Path(key.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        Ok((status, serde_json::from_slice(&bytes)?))
+    }
+
+    /// #1699: an unrelated group `H`, live only, with this node Active.
+    async fn unrelated_live_group(state: &AppState) -> anyhow::Result<(String, GroupInfo)> {
+        let mut other = GroupInfo::new(
+            "adr0109-unrelated".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "1699".repeat(16),
+        );
+        other.seal_commit(state.agent.identity().agent_keypair(), 1_500)?;
+        let key = other.mls_group_id.clone();
+        state
+            .named_groups
+            .live_write()
+            .await
+            .insert(key.clone(), other.clone());
+        Ok((key, other))
+    }
+
+    /// #1699 (the Engineer's ruling on ADR 0109 §3 step 2): while the
+    /// staged join runs, the contained original stays in the live map. A
+    /// reader outside the scope (the API, the serving paths, the gates)
+    /// sees the original's head, its marker and its containment, never
+    /// the staged record that is sealed past it. Only the keyed swap
+    /// changes the live record; it then empties the slot and closes the
+    /// staging. Before #1699 the original moved out of the live map when
+    /// the staging opened. Inert: an offline agent.
+    #[tokio::test]
+    async fn the_contained_original_keeps_its_head_marker_and_gate_until_the_keyed_swap(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, marker, staged) = staged_reseat(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert_ne!(staged.state_hash, info.state_hash);
+        assert!(staged.state_revision > info.state_revision);
+        // The staged join is not seated yet: its group key has not come.
+        let mut unseated = staged.clone();
+        unseated.name = "adr0109-staged-unseated".to_string();
+        unseated.policy.confidentiality = x0x::groups::GroupConfidentiality::MlsEncrypted;
+        unseated.shared_secret = None;
+        state
+            .named_groups
+            .staging_write()
+            .await
+            .insert(key.clone(), unseated.clone());
+        let journal = open_journal(&state, &stable)
+            .await
+            .expect("the journal is open");
+        assert!(!journal.staged_result_ready(&unseated, &local_hex(&state), false));
+
+        // Outside the scope: the original, with its head and marker.
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("the original is live");
+        assert_eq!(live.state_hash, info.state_hash);
+        assert_eq!(live.state_revision, info.state_revision);
+        assert_eq!(live.fork_quarantine, Some(marker.clone()));
+        assert!(live.is_fork_quarantined());
+        assert!(contained(&state, &live).await);
+        assert!(super::super::reject_fork_quarantined(&state, &key, &live).is_some());
+        assert!(
+            super::super::reject_fork_quarantine_installed_before_effect(&state, &key, None)
+                .await
+                .is_some(),
+            "the live gate holds"
+        );
+        // Inside the scope: the staged record.
+        let in_slot = in_staging(&state, &key, async {
+            state.named_groups.read().await.get(&key).cloned()
+        })
+        .await;
+        assert_eq!(
+            in_slot.map(|record| record.state_hash),
+            Some(staged.state_hash.clone())
+        );
+
+        // The HTTP read path shows the original.
+        let (status, body) = get_group_json(&state, &key).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["name"], serde_json::json!(info.name), "{body}");
+        assert_eq!(
+            body["policy"]["confidentiality"],
+            serde_json::to_value(info.policy.confidentiality)?
+        );
+        assert_eq!(body["fork_quarantine"], serde_json::to_value(&marker)?);
+        assert!(
+            open_journal(&state, &stable).await.is_some(),
+            "the read did not swap"
+        );
+        assert_eq!(
+            state
+                .named_groups
+                .live_read()
+                .await
+                .get(&key)
+                .map(|record| record.state_hash.clone()),
+            Some(info.state_hash.clone())
+        );
+
+        // The staged join seats: the keyed swap promotes the staged pair.
+        state
+            .named_groups
+            .staging_write()
+            .await
+            .insert(key.clone(), staged.clone());
+        assert!(swap_if_seated(&state, &stable).await);
+        assert!(open_journal(&state, &stable).await.is_none(), "swapped");
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("the staged record is live");
+        assert_eq!(live.state_hash, staged.state_hash);
+        assert_eq!(live.state_revision, staged.state_revision);
+        assert_eq!(live.fork_quarantine, None);
+        assert!(!state.named_groups.staging_read().await.contains_key(&key));
+        assert!(!state.treekem_groups.staging_read().await.contains_key(&key));
+        assert!(!state.mls_groups.staging_read().await.contains_key(&key));
+        assert!(state.reseat_stagings.scope_for(&key).is_none());
+        assert!(state.reseat_stagings.scope_for(&stable).is_none());
+        Ok(())
+    }
+
+    /// #1699: a rolled-back re-seat empties the staging slot of the three
+    /// group maps, closes the staging (by key and by stable id) and drops
+    /// the staged join's stub from the pending join stubs. The original
+    /// stays live with its head and marker. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_rolled_back_reseat_empties_the_slot_and_keeps_the_original_live(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, marker, _staged) = staged_reseat(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        // The staged join's stub is under the original's key.
+        state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.clone());
+        let digest = open_journal(&state, &stable)
+            .await
+            .expect("the journal is open")
+            .record_digest;
+        rollback_reseat(&state, &stable, digest, "issue1699_test").await;
+        assert!(open_journal(&state, &stable).await.is_none(), "rolled back");
+        let live = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .expect("the original is live");
+        assert_eq!(live.state_hash, info.state_hash);
+        assert_eq!(live.state_revision, info.state_revision);
+        assert_eq!(live.fork_quarantine, Some(marker));
+        assert!(!state.named_groups.staging_read().await.contains_key(&key));
+        assert!(!state.treekem_groups.staging_read().await.contains_key(&key));
+        assert!(!state.mls_groups.staging_read().await.contains_key(&key));
+        assert!(state.reseat_stagings.scope_for(&key).is_none());
+        assert!(state.reseat_stagings.scope_for(&stable).is_none());
+        assert!(!state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&key));
+        assert!(on_disk_keys(&state).await?.contains(&key));
+        Ok(())
+    }
+
+    /// #1699: a roster refresh that a step of the staged join runs (inside
+    /// the scope) publishes every group's roster: the unrelated group `H`
+    /// from the live map and the group under re-seat with its STAGED
+    /// members. Before the fix the refresh read the map that the scope
+    /// selects, the staging slot only, and dropped every other group's
+    /// gossip roster. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_roster_refresh_inside_the_scope_keeps_every_other_groups_roster(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _marker, mut staged) = staged_reseat(&state).await?;
+        let g_stable = info.stable_group_id().to_string();
+        // The staged record has a member that the original does not.
+        let newcomer = x0x::identity::AgentKeypair::generate()?.agent_id();
+        staged.add_member(
+            hex::encode(newcomer.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex(&state)),
+            None,
+        );
+        staged.seal_commit(state.agent.identity().agent_keypair(), 3_000)?;
+        state
+            .named_groups
+            .staging_write()
+            .await
+            .insert(key.clone(), staged.clone());
+        assert!(!info
+            .active_members()
+            .any(|member| member.agent_id == hex::encode(newcomer.as_bytes())));
+        let (_h_key, other) = unrelated_live_group(&state).await?;
+        let h_stable = other.stable_group_id().to_string();
+
+        in_staging(
+            &state,
+            &key,
+            super::super::refresh_group_rosters_for_gossip(&state),
+        )
+        .await;
+
+        let published = state.group_roster_gossip_lock.lock().await.clone();
+        let agents_of = |stable: &str| {
+            published
+                .get(stable)
+                .cloned()
+                .flatten()
+                .map(|(published_stable, topic, agents)| {
+                    let mut agents: Vec<_> =
+                        agents.iter().map(|a| hex::encode(a.as_bytes())).collect();
+                    agents.sort();
+                    (published_stable, topic, agents)
+                })
+        };
+        let sorted = |record: &GroupInfo| {
+            let mut agents: Vec<_> = record
+                .active_members()
+                .map(|member| member.agent_id.clone())
+                .collect();
+            agents.sort();
+            agents
+        };
+        assert_eq!(
+            agents_of(&h_stable),
+            Some((
+                h_stable.clone(),
+                other.metadata_topic.clone(),
+                sorted(&other)
+            )),
+            "H's live roster is published: {published:?}"
+        );
+        assert_eq!(
+            agents_of(&g_stable),
+            Some((
+                g_stable.clone(),
+                staged.metadata_topic.clone(),
+                sorted(&staged)
+            )),
+            "G's staged roster is published: {published:?}"
+        );
+        assert_ne!(sorted(&staged), sorted(&info));
+        Ok(())
+    }
+
+    /// #1699: inside an open re-seat scope, a whole-node worker spawned
+    /// through `outside_reseat_scope` sees the live map (the unrelated
+    /// group `H` and the contained original of `G`), and a plain
+    /// `spawn_detached` task inherits the scope and sees the staging slot
+    /// (the staged record of `G`, no `H`). Before the fix a spawned task
+    /// lost the scope, so a step that the staged join spawned wrote the
+    /// live map. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_whole_node_worker_started_in_the_scope_sees_the_live_map() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, _marker, staged) = staged_reseat(&state).await?;
+        let (h_key, _other) = unrelated_live_group(&state).await?;
+        type Seen = (bool, Option<String>);
+        let probe = |state: Arc<AppState>,
+                     key: String,
+                     h_key: String,
+                     tx: tokio::sync::oneshot::Sender<Seen>| async move {
+            let groups = state.named_groups.read().await;
+            let seen = (
+                groups.contains_key(&h_key),
+                groups.get(&key).map(|record| record.state_hash.clone()),
+            );
+            drop(groups);
+            let _ = tx.send(seen);
+        };
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+        let (step_tx, step_rx) = tokio::sync::oneshot::channel();
+        in_staging(&state, &key, async {
+            assert!(
+                state.spawn_detached(crate::server::reseat_scope::outside_reseat_scope(probe(
+                    Arc::clone(&state),
+                    key.clone(),
+                    h_key.clone(),
+                    worker_tx,
+                )))
+            );
+            assert!(state.spawn_detached(probe(
+                Arc::clone(&state),
+                key.clone(),
+                h_key.clone(),
+                step_tx,
+            )));
+        })
+        .await;
+        let worker = tokio::time::timeout(Duration::from_secs(10), worker_rx).await??;
+        let step = tokio::time::timeout(Duration::from_secs(10), step_rx).await??;
+        assert_eq!(
+            worker,
+            (true, Some(info.state_hash.clone())),
+            "the whole-node worker sees the live map"
+        );
+        assert_eq!(
+            step,
+            (false, Some(staged.state_hash.clone())),
+            "a step that the staged join spawns stays in the staging slot"
+        );
+        Ok(())
+    }
+
+    /// #1699 (#1689 row c): outside the scope of an open re-seat staging,
+    /// the contained original's membership label ignores the staged join's
+    /// attempt, which shares its key; inside the scope the attempt counts.
+    /// Inert (offline agent).
+    #[tokio::test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test pins the seat label itself, not a route's admission"
+    )]
+    async fn the_originals_membership_label_ignores_the_staged_joins_attempt() -> anyhow::Result<()>
+    {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let key = "e7".repeat(16);
+        let record = GroupInfo::new(
+            "contained".to_string(),
+            String::new(),
+            AgentId([7; 32]),
+            key.clone(),
+        );
+        let stable = record.stable_group_id().to_string();
+        super::super::record_expected_join_result_inviter(
+            &state,
+            super::super::join_result_key(&stable, &local),
+            "ab".repeat(32),
+        );
+        let label = || super::super::local_join_membership_state(&state, &record, &local);
+        assert_eq!(
+            label().await,
+            "pending_authority_commit",
+            "no staging: the attempt counts"
+        );
+        let scope = state.reseat_stagings.open(&key, &stable);
+        assert_eq!(
+            label().await,
+            "not_member",
+            "the live original keeps its label"
+        );
+        let inside = crate::server::reseat_scope::in_reseat_scope(scope, label()).await;
+        assert_eq!(
+            inside, "pending_authority_commit",
+            "the staged join sees its attempt"
+        );
+        assert!(state.reseat_stagings.close(&key));
+        assert_eq!(
+            label().await,
+            "pending_authority_commit",
+            "closed: as before"
+        );
+        Ok(())
     }
 }
