@@ -42006,6 +42006,41 @@ const MEMBER_JOINED_RESEND_POLL_INTERVALS: u32 = 3;
 
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
 
+/// #1699: a `std` deadline as a tokio one, for `tokio::time::timeout_at`.
+/// `Instant::into()` keeps the `std` reading, but with paused tokio time
+/// (the W3-H sims) tokio's clock runs ahead of `std`'s by all the advanced
+/// time, so a converted deadline has often passed already: a re-seat's
+/// Welcome stream then ended before its final ack, and the subject was
+/// never keyed. The time left is measured on `std`'s clock and added to
+/// tokio's now. When time is not paused the two clocks agree.
+fn tokio_deadline(deadline: Instant) -> tokio::time::Instant {
+    tokio::time::Instant::now() + deadline.saturating_duration_since(Instant::now())
+}
+
+#[cfg(test)]
+mod tokio_deadline_tests {
+    use super::*;
+
+    /// #1699: after paused time advances past a Welcome's TTL in virtual
+    /// time, a deadline 10 minutes ahead on `std`'s clock must still be
+    /// ahead on tokio's. `into()` puts it in the past, so a `timeout_at`
+    /// on it fires at once; [`tokio_deadline`] keeps the time left.
+    #[tokio::test(start_paused = true)]
+    async fn a_std_deadline_keeps_its_time_left_after_paused_time_advances() {
+        tokio::time::advance(PENDING_WELCOME_TTL * 3).await;
+        let deadline = Instant::now() + PENDING_WELCOME_TTL;
+        let converted: tokio::time::Instant = deadline.into();
+        assert!(converted <= tokio::time::Instant::now());
+        let kept = tokio_deadline(deadline);
+        assert!(kept > tokio::time::Instant::now() + PENDING_WELCOME_TTL / 2);
+        let finished = tokio::time::timeout_at(kept, async {
+            tokio::time::sleep(PENDING_WELCOME_TTL / 2).await;
+        })
+        .await;
+        assert!(finished.is_ok());
+    }
+}
+
 // The TreeKEM join-result poll closes at 120s. All fetch retries and the
 // final receive wait must finish inside that window.
 const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(115);
@@ -45267,7 +45302,7 @@ fn spawn_join_artifact_egress<F>(
             // r5 (lifecycle note section 2.7 item 6): no egress task
             // outlives its artifact's deadline. A timeout drops the body
             // (an unfinished stream resets) and never purges.
-            let _ = tokio::time::timeout_at(deadline.into(), body).await;
+            let _ = tokio::time::timeout_at(tokio_deadline(deadline), body).await;
         }
     });
     // #1274 r3: the drain's completion fence. Only a finished task leaves
@@ -45989,7 +46024,7 @@ pub(super) async fn send_join_artifact(
             .send_direct_pinned_admitted(recipient, payload, &admission, resolve_within)
             .await
     };
-    let outcome = match tokio::time::timeout_at(exchange_deadline.into(), exchange).await {
+    let outcome = match tokio::time::timeout_at(tokio_deadline(exchange_deadline), exchange).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err(format!("{kind} exchange deadline elapsed")),
@@ -48477,7 +48512,7 @@ async fn handle_welcome_fetch_request_via<S, F>(
     let stream_deadline = pending.created_at + PENDING_WELCOME_TTL;
     replace_welcome_stream(state, &welcome_id, async move {
         let _ = tokio::time::timeout_at(
-            stream_deadline.into(),
+            tokio_deadline(stream_deadline),
             stream_welcome_blob_guarded(&stream_state, &recipient, &stream_id, pending, transport),
         )
         .await;
