@@ -216,9 +216,6 @@ const GATE_WINDOW: Duration = Duration::from_secs(30 * 60);
 /// X publishes its r+1′ bytes again after this long with no frame to J.
 /// J's join poll ends about 120 s after the join, so retries fit inside it.
 const FORK_REPUBLISH: Duration = Duration::from_secs(10);
-/// J's join-result poll runs `JOIN_RESULT_POLL_TIMEOUT` (120 s) from the
-/// join; in H-S3-c every O->J write is held until it has closed.
-const JOIN_POLL_CLOSED: Duration = Duration::from_secs(130);
 
 type Key = crate::network::sim::Key;
 type Policy = Box<dyn Fn(Key, Key, Option<[u8; 32]>) -> bool + Send + Sync>;
@@ -420,7 +417,11 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     // X reaches J only, from the partition on: the X~J link and gossip
     // plane stay up, so X's later r+1′ publish has a path to J. Origins are
     // tracked per message, so J relays nothing between X and O or A, and
-    // J (not yet a member) authors no group event.
+    // J (not yet a member) authors no group event. The X~O and X~A links
+    // are also closed (below): a write the hold drops still reports a
+    // send, so with those links open O and A keep X's two roster-preferred
+    // eager slots for the topic, and J (not on X's roster) stays lazy and
+    // gets no r+1′ frame in some runs (#1689 trace).
     let cut_x = move |origin: Key, dst: Key| (origin == x && dst != j) || (dst == x && origin != j);
     let hold = install_hold(sim);
     {
@@ -445,6 +446,11 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             },
         );
     }
+    for other in ["O", "A"] {
+        sim.fabric()
+            .set_partitioned(&sim.peer("X")?, &sim.peer(other)?, true);
+    }
+    sim.fabric().mark("fault: X~O and X~A partitioned");
     let x_hex = sim.agent_hex("X")?;
     let recorded_from = sim
         .state("O")?
@@ -487,7 +493,6 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     // J redeems I; O seals J (r+2) and its join result carries the owner's
     // v2 terminal attestation, which arms J's gap gate.
     let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
-    let join_poll_closes = sim.fabric().now() + JOIN_POLL_CLOSED;
     let join_t = sim.fabric().now();
     let (join_code, join_answer) = redeem(sim, "J", &link, &owner).await?;
     let j_hex = sim.agent_hex("J")?;
@@ -585,14 +590,14 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         .await
         .is_ok();
     let fork_frames = pubsub_delivered(sim, "X", "J", forked_at, b"w3h c X fork")?;
+    let o_to_j_held = Arc::new(std::sync::atomic::AtomicBool::new(!both));
     {
         let (held, held_to_j) = (Arc::clone(&held), Arc::clone(&held_to_j));
-        let seal_ids = Arc::clone(&seal_ids);
-        let fabric = Arc::clone(sim.fabric());
+        let (seal_ids, o_held) = (Arc::clone(&seal_ids), Arc::clone(&o_to_j_held));
         let what = match both {
             true => "X cut; O's r+1 gossip passes to J",
             false => {
-                "X cut; O's r+1 gossip and every O->J write until J's join poll closes held from J"
+                "X cut; O's r+1 gossip and every O->J write held from J until the advance ends"
             }
         };
         set_hold(sim, &hold, what, move |origin, dst, msg| {
@@ -601,14 +606,17 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
                 held_to_j.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             // H-S3-c: no canonical commit reaches J after r+1′. O's r+2
-            // reaches J two more ways than r+1's gossip: J's join poll (a
-            // direct write with no pubsub ID, until the poll closes) and
-            // r+2's own gossip (its recorded IDs). r+2 conflicts with r+1′
-            // and installs a marker (ADR 0109 l.96, correct, but not this
-            // row's premise).
-            let poll_open = origin == o && dst == j && fabric.now() < join_poll_closes;
+            // reaches J more ways than r+1's gossip: r+2's own gossip (its
+            // recorded IDs, from any relay) and O's direct sends. Those are
+            // J's join poll, and O's control blob of r+2 (#1689 trace), whose
+            // dropped chunks O re-sends as encrypted gossip DMs (origin O).
+            // So every write that O originates is held from J until J's read
+            // after the advance. r+2 conflicts with r+1′ and installs a
+            // marker (ADR 0109 l.96, correct, but not this row's premise).
+            let from_o =
+                origin == o && dst == j && o_held.load(std::sync::atomic::Ordering::SeqCst);
             let seal_to_j = dst == j && is_held(&seal_ids, msg);
-            origin == x || dst == x || (!both && (to_j || poll_open || seal_to_j))
+            origin == x || dst == x || (!both && (to_j || from_o || seal_to_j))
         });
     }
     // H-S3-c2: O publishes its recorded r+1 bytes again (a new message ID,
@@ -706,6 +714,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     }
     let j_status = status(sim, "J", &group).await?;
     let j1 = view(sim, "J", &group).await?;
+    o_to_j_held.store(false, std::sync::atomic::Ordering::SeqCst);
     if both {
         // H-S3-c2 prerequisite: canonical r+1 reached J, so J holds both
         // the marker and the gap record before the re-seat. A missing one
