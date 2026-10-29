@@ -1253,9 +1253,21 @@ fn with_placeheld<R>(state: &AppState, f: impl FnOnce(&mut HashMap<String, Place
 /// The S3 placeholder of `info` (§4 "Placeholder"): the #451
 /// `legacy_safe_placeholder` (identity, chain head and containment kept),
 /// with a non-empty, all-Removed roster instead of an empty one.
+///
+/// #1569: an OwnerCertified group keeps its whole policy, so the #451 split
+/// writes this placeholder into `home-suite-groups.json` as well. A
+/// released binary lets the sidecar entry win, so it loads an inert group
+/// even when `named_groups.json` still holds the #451 placeholder (empty
+/// roster) after a crash in the arming save.
 fn s3_placeholder(info: &GroupInfo) -> GroupInfo {
     let mut placeholder = super::legacy_safe_placeholder(info);
     placeholder.members_v2 = s3::placeholder_roster(info);
+    if super::is_home_suite_group_entry(info) {
+        // Only Home-Suite-aware binaries read the sidecar, so the
+        // OwnerCertified variant is safe there; the split still writes the
+        // default policy into `named_groups.json`.
+        placeholder.policy = info.policy.clone();
+    }
     placeholder
 }
 
