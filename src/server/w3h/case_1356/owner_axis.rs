@@ -414,6 +414,8 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         msg.is_some_and(|id| held.lock().map_or(true, |h| h.contains(&id)))
     };
     let capture = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let seal_ids: Arc<Mutex<std::collections::HashSet<[u8; 32]>>> = Arc::default();
+    let seal_capture = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let held_to_j = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // X reaches J only, from the partition on: the X~J link and gossip
     // plane stay up, so X's later r+1′ publish has a path to J. Origins are
@@ -423,6 +425,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     let hold = install_hold(sim);
     {
         let (held, capture) = (Arc::clone(&held), Arc::clone(&capture));
+        let (seal_ids, seal_capture) = (Arc::clone(&seal_ids), Arc::clone(&seal_capture));
         set_hold(
             sim,
             &hold,
@@ -430,6 +433,11 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             move |origin, dst, msg| {
                 if let (Some(id), true, Ok(mut set)) = (msg, origin == o, held.lock()) {
                     if capture.load(std::sync::atomic::Ordering::SeqCst) {
+                        set.insert(id);
+                    }
+                }
+                if let (Some(id), true, Ok(mut set)) = (msg, origin == o, seal_ids.lock()) {
+                    if seal_capture.load(std::sync::atomic::Ordering::SeqCst) {
                         set.insert(id);
                     }
                 }
@@ -472,6 +480,9 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     })
     .await?;
     capture.store(false, std::sync::atomic::Ordering::SeqCst);
+    // H-S3-c: O's r+2 (J's seal) gossip IDs are recorded, not held, during
+    // the join (J's gate arms from it); they are held from J after r+1′.
+    seal_capture.store(!both, std::sync::atomic::Ordering::SeqCst);
 
     // J redeems I; O seals J (r+2) and its join result carries the owner's
     // v2 terminal attestation, which arms J's gap gate.
@@ -491,6 +502,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         .await
         .is_ok();
     let sealed = view(sim, "O", &group).await?;
+    seal_capture.store(false, std::sync::atomic::Ordering::SeqCst);
     let gate = try_view_now(sim, "J", &group).await?;
     let gate_text = gate
         .as_ref()
@@ -575,23 +587,28 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     let fork_frames = pubsub_delivered(sim, "X", "J", forked_at, b"w3h c X fork")?;
     {
         let (held, held_to_j) = (Arc::clone(&held), Arc::clone(&held_to_j));
+        let seal_ids = Arc::clone(&seal_ids);
         let fabric = Arc::clone(sim.fabric());
         let what = match both {
             true => "X cut; O's r+1 gossip passes to J",
-            false => "X cut; O's r+1 gossip and every O->J write until J's join poll closes held from J",
+            false => {
+                "X cut; O's r+1 gossip and every O->J write until J's join poll closes held from J"
+            }
         };
         set_hold(sim, &hold, what, move |origin, dst, msg| {
             let to_j = dst == j && is_held(&held, msg);
             if to_j {
                 held_to_j.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            // H-S3-c: no canonical commit reaches J after r+1′. J's join
-            // poll is a direct write with no pubsub ID, so the ID hold
-            // misses it: O's next join `Result` carries r+2, which
-            // conflicts with r+1′ and installs a marker (ADR 0109 l.96,
-            // correct, but not this row's premise).
+            // H-S3-c: no canonical commit reaches J after r+1′. O's r+2
+            // reaches J two more ways than r+1's gossip: J's join poll (a
+            // direct write with no pubsub ID, until the poll closes) and
+            // r+2's own gossip (its recorded IDs). r+2 conflicts with r+1′
+            // and installs a marker (ADR 0109 l.96, correct, but not this
+            // row's premise).
             let poll_open = origin == o && dst == j && fabric.now() < join_poll_closes;
-            origin == x || dst == x || (!both && (to_j || poll_open))
+            let seal_to_j = dst == j && is_held(&seal_ids, msg);
+            origin == x || dst == x || (!both && (to_j || poll_open || seal_to_j))
         });
     }
     // H-S3-c2: O publishes its recorded r+1 bytes again (a new message ID,
