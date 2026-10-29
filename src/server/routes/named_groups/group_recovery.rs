@@ -2108,11 +2108,15 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
         });
         resave = true;
     }
-    if !resave {
-        return;
-    }
-    let write = resave_legacy(state).await;
-    if write == LegacyWrite::Durable {
+    let write = if resave {
+        Some(resave_legacy(state).await)
+    } else {
+        // Nothing to write this pass. Owed cards can still be due: a
+        // hold that an earlier save ended leaves its card owed until a
+        // pass publishes it (#1570).
+        None
+    };
+    if write == Some(LegacyWrite::Durable) {
         with_placeheld(state, |placeheld| {
             for entry in placeheld.values_mut() {
                 if !entry.authoritative_failed {
@@ -2135,17 +2139,24 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
     // #1570: a hold kept the card routes on the group's last committed
     // form. Whichever save ended the hold, that form is durable now, so
     // the owed card is refreshed and published from the live record, as
-    // a state change would refresh it. Detached: the publish's gossip
-    // egress must not stall the tick.
+    // a state change would refresh it. The check and the clear are one
+    // step under the placeheld map, so a hold that starts again keeps
+    // its own owed flag. Detached: the publish's gossip egress must not
+    // stall the tick.
     for stable in owed_cards {
-        if is_held_back(state, &stable) {
+        let publish_now = with_placeheld(state, |placeheld| match placeheld.get_mut(&stable) {
+            Some(entry) if !entry.authoritative_failed => {
+                entry.card_owed = false;
+                true
+            }
+            // A new hold started; its own owed flag stays set.
+            Some(_) => false,
+            // Un-placeheld in this pass; the record is durable.
+            None => true,
+        });
+        if !publish_now {
             continue;
         }
-        with_placeheld(state, |placeheld| {
-            if let Some(entry) = placeheld.get_mut(&stable) {
-                entry.card_owed = false;
-            }
-        });
         if let Some((key, _)) = live.get(&stable) {
             let state_for_card = Arc::clone(state);
             let key_for_card = key.clone();
