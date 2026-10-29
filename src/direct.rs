@@ -205,6 +205,21 @@ struct TreeKemCatchupRequestPeek {
     group_id: String,
 }
 
+/// The longest group id the transport refusal echoes back. Real ids are
+/// hex hashes (the genesis `group_id` / the MLS group id), far below
+/// this; a longer value is not an id this node asked about, so the
+/// refusal declines and the frame keeps the silent drop — a revoked
+/// device must not be able to make the listener hold request-sized
+/// strings (review round 1, finding 1).
+const TREEKEM_REFUSAL_GROUP_ID_MAX: usize = 128;
+
+/// A group id of the shape the catch-up lane uses: hex, within the echo
+/// bound. Anything else fails closed to the silent drop.
+fn treekem_group_id_echoable(group_id: &str) -> bool {
+    group_id.len() <= TREEKEM_REFUSAL_GROUP_ID_MAX
+        && group_id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// The transport-layer refusal (#1657): when the raw-QUIC revocation or
 /// pairing gate is about to drop a frame, this builds the typed refusal
 /// for it iff it is a TreeKEM catch-up request. Returns the encoded
@@ -216,6 +231,9 @@ pub(crate) fn treekem_catchup_refusal_for(
 ) -> Option<Vec<u8>> {
     let peek = serde_json::from_slice::<TreeKemCatchupRequestPeek>(payload).ok()?;
     if peek.message_type != "treekem_catchup_request" {
+        return None;
+    }
+    if !treekem_group_id_echoable(&peek.group_id) {
         return None;
     }
     let refusal =
@@ -1943,6 +1961,27 @@ mod tests {
             .is_none(),
             "a JSON frame that is not a catch-up request must not get the refusal"
         );
+
+        // Review round 1, finding 1: only an id-shaped group id is echoed.
+        // A non-hex or oversized value declines to the silent drop, so a
+        // revoked device cannot make the listener hold request-sized
+        // strings in the refusal backlog.
+        for group_id in ["not hex!", &"g".repeat(129)] {
+            let oversized = serde_json::json!({
+                "message_type": "treekem_catchup_request",
+                "group_id": group_id,
+            })
+            .to_string();
+            assert!(
+                treekem_catchup_refusal_for(
+                    oversized.as_bytes(),
+                    &requester,
+                    TreeKemCatchupRefusalReason::MachineRevoked
+                )
+                .is_none(),
+                "a group id that is not id-shaped ({group_id:.8}…) must not get the refusal"
+            );
+        }
     }
 
     #[test]
@@ -1993,6 +2032,17 @@ mod tests {
         assert!(
             crate::wire_compat::reject_unknown("TreeKemCatchupRefusal", holding_unknown).is_err(),
             "a refusal holding Unknown must be refused fail-closed"
+        );
+        // Review round 1 (test gap): Unknown never encodes, so it can
+        // never be sent, signed or re-gossiped by this node.
+        assert!(
+            serde_json::to_vec(&TreeKemCatchupRefusal::new(
+                "aa".to_string(),
+                "bb".to_string(),
+                TreeKemCatchupRefusalReason::Unknown
+            ))
+            .is_err(),
+            "a refusal holding Unknown must not be serializable"
         );
     }
 

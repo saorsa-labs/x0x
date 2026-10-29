@@ -19201,7 +19201,13 @@ impl Agent {
             // send would hold every later direct message. They run here,
             // drained alongside the ingress barrier, inside the tracked
             // listener task. One closure builds every send, so all
-            // pushed futures share one type.
+            // pushed futures share one type. Review round 1 also bounds
+            // the backlog: each send is capped in time, the queue in
+            // depth — a revoked device that never grants stream credit
+            // cannot make the listener hold unbounded refusal bytes.
+            const TREEKEM_REFUSAL_SEND_CAP: usize = 16;
+            const TREEKEM_REFUSAL_SEND_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(5);
             let mut refusal_sends = futures::stream::FuturesUnordered::new();
             let send_treekem_refusal = |ant_peer_id: ant_quic::PeerId,
                                         sender: identity::AgentId,
@@ -19210,11 +19216,18 @@ impl Agent {
                                         requester: &'static str| {
                 let network = std::sync::Arc::clone(&network);
                 async move {
-                    if let Err(e) = network
-                        .send_direct(&ant_peer_id, local_agent_id.as_bytes(), &refusal)
-                        .await
-                    {
-                        tracing::warn!(
+                    let send =
+                        network.send_direct(&ant_peer_id, local_agent_id.as_bytes(), &refusal);
+                    match tokio::time::timeout(TREEKEM_REFUSAL_SEND_TIMEOUT, send).await {
+                        Err(_) => tracing::warn!(
+                            target: "x0x::direct",
+                            stage = "recv",
+                            sender_prefix = %network::hex_prefix(&sender.0, 4),
+                            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                            outcome = "treekem_refusal_send_timeout",
+                            "timed out sending the typed TreeKEM catch-up refusal to the {requester} requester"
+                        ),
+                        Ok(Err(e)) => tracing::warn!(
                             target: "x0x::direct",
                             stage = "recv",
                             sender_prefix = %network::hex_prefix(&sender.0, 4),
@@ -19222,7 +19235,8 @@ impl Agent {
                             outcome = "treekem_refusal_send_failed",
                             error = %e,
                             "failed to send the typed TreeKEM catch-up refusal to the {requester} requester"
-                        );
+                        ),
+                        Ok(Ok(())) => {}
                     }
                 }
             };
@@ -19404,13 +19418,23 @@ impl Agent {
                             &sender,
                             direct::TreeKemCatchupRefusalReason::MachineRevoked,
                         ) {
-                            refusal_sends.push(send_treekem_refusal(
-                                ant_peer_id,
-                                sender,
-                                machine_id,
-                                refusal,
-                                "machine-revoked",
-                            ));
+                            if refusal_sends.len() < TREEKEM_REFUSAL_SEND_CAP {
+                                refusal_sends.push(send_treekem_refusal(
+                                    ant_peer_id,
+                                    sender,
+                                    machine_id,
+                                    refusal,
+                                    "machine-revoked",
+                                ));
+                            } else {
+                                tracing::debug!(
+                                    target: "x0x::direct",
+                                    stage = "recv",
+                                    sender_prefix = %network::hex_prefix(&sender.0, 4),
+                                    outcome = "treekem_refusal_backlog_full",
+                                    "typed TreeKEM catch-up refusal dropped: the send backlog is full"
+                                );
+                            }
                         }
                     }
                     continue;
@@ -19452,13 +19476,23 @@ impl Agent {
                             &sender,
                             direct::TreeKemCatchupRefusalReason::BindingRevoked,
                         ) {
-                            refusal_sends.push(send_treekem_refusal(
-                                ant_peer_id,
-                                sender,
-                                machine_id,
-                                refusal,
-                                "binding-revoked",
-                            ));
+                            if refusal_sends.len() < TREEKEM_REFUSAL_SEND_CAP {
+                                refusal_sends.push(send_treekem_refusal(
+                                    ant_peer_id,
+                                    sender,
+                                    machine_id,
+                                    refusal,
+                                    "binding-revoked",
+                                ));
+                            } else {
+                                tracing::debug!(
+                                    target: "x0x::direct",
+                                    stage = "recv",
+                                    sender_prefix = %network::hex_prefix(&sender.0, 4),
+                                    outcome = "treekem_refusal_backlog_full",
+                                    "typed TreeKEM catch-up refusal dropped: the send backlog is full"
+                                );
+                            }
                         }
                     }
                     continue;

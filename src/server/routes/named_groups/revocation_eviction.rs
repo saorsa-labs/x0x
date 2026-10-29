@@ -592,13 +592,15 @@ fn note_head_refused(
 }
 
 /// The asker-side entry point for a received #1657 typed refusal: mark
-/// the refusing peer answered for its group's current head round. See
-/// [`note_head_refused`].
+/// the refusing peer answered for its group's current head round, iff
+/// this node asked that peer this round (review round 1,
+/// forged-refusal hardening). Returns whether the refusal was honored.
+/// See [`note_head_refused`].
 pub(in crate::server) async fn note_catchup_refused_peer(
     state: &AppState,
     group_ids: &[String],
     sender: [u8; 32],
-) {
+) -> bool {
     let stable = {
         let groups = state.named_groups.read().await;
         group_ids.iter().find_map(|id| {
@@ -607,11 +609,22 @@ pub(in crate::server) async fn note_catchup_refused_peer(
         })
     };
     let Some(stable) = stable else {
-        return;
+        return false;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
-    if !inner.head_rounds.contains_key(&stable) {
-        return;
+    let Some(round) = inner.head_rounds.get(&stable) else {
+        return false;
+    };
+    // Only a peer this node asked this round may answer it: an
+    // unsolicited refusal — a peer this node never asked — changes
+    // nothing, so no verified peer can stop a re-ask, warn, or note a
+    // revocation it was not asked about.
+    let asked = inner
+        .head_round_asks
+        .get(&stable)
+        .is_some_and(|asks| asks.started == round.started && asks.last_ask.contains_key(&sender));
+    if !asked {
+        return false;
     }
     let state_inner = &mut *inner;
     note_head_refused(
@@ -620,6 +633,7 @@ pub(in crate::server) async fn note_catchup_refused_peer(
         &stable,
         sender,
     );
+    true
 }
 
 /// #1578 rc10 (Engineer ruling (2), 28 Oct 23:34 GMT; Claude blocking
@@ -7518,9 +7532,12 @@ pub(super) mod tests {
     /// re-ask stops asking it — the reason is kept per group on
     /// `AppState`, and nothing is confirmed or cleared (a refusal is no
     /// head evidence, exactly like the keyless disclaimer). A refusal
-    /// from a sender this node holds revoked, and a refusal whose reason
-    /// this node does not know (#1604 G5), change nothing. The test
-    /// drives the real dispatch arm, so it also pins the wire plug-in.
+    /// from a sender this node holds revoked, a refusal whose reason
+    /// this node does not know (#1604 G5), an unsolicited refusal from
+    /// a peer this node did not ask, an unverified or misaddressed one,
+    /// a refusal during a revocation resync, and one for a group this
+    /// node does not hold, all change nothing. The test drives the real
+    /// dispatch arm, so it also pins the wire plug-in.
     #[tokio::test]
     async fn a_typed_catchup_refusal_stops_that_peers_reask_and_surfaces_the_reason(
     ) -> anyhow::Result<()> {
@@ -7544,22 +7561,30 @@ pub(super) mod tests {
             .write()
             .await
             .insert(group_id.clone(), info.clone());
-        state
-            .revocation_evictions
-            .inner
-            .lock()
-            .await
-            .head_rounds
-            .insert(
+        // The round asked `refuser` (review round 1: only an asked peer's
+        // refusal is honored); `other` is a holder this node did not ask.
+        let round_started = Instant::now();
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
                 stable.clone(),
                 HeadRound {
                     head: info.state_hash.clone(),
-                    started: Instant::now(),
+                    started: round_started,
                     asked: BTreeSet::new(),
                     confirmed: false,
                     conflicting: BTreeSet::new(),
                 },
             );
+            inner.head_round_asks.insert(
+                stable.clone(),
+                RoundAsks {
+                    started: round_started,
+                    last_ask: BTreeMap::from([(refuser, round_started)]),
+                    answered: BTreeSet::new(),
+                },
+            );
+        }
         let requester_hex = hex::encode(state.agent.agent_id().as_bytes());
         async fn dispatch_refusal(
             state: &Arc<AppState>,
@@ -7567,6 +7592,7 @@ pub(super) mod tests {
             requester_hex: &str,
             sender: [u8; 32],
             reason: &str,
+            verified: bool,
         ) -> bool {
             let payload = serde_json::json!({
                 "message_type": "treekem_catchup_refusal",
@@ -7580,7 +7606,7 @@ pub(super) mod tests {
                 state,
                 &x0x::identity::AgentId(sender),
                 &x0x::identity::MachineId([0x16; 32]),
-                true,
+                verified,
                 &payload,
             )
             .await
@@ -7592,7 +7618,8 @@ pub(super) mod tests {
                 &group_id,
                 &requester_hex,
                 refuser,
-                "machine_revoked"
+                "machine_revoked",
+                true
             )
             .await,
             "the dispatch arm reports the refusal consumed, not a shutdown"
@@ -7657,6 +7684,7 @@ pub(super) mod tests {
             &requester_hex,
             revoked_sender.agent_id().0,
             "machine_revoked",
+            true,
         )
         .await;
         {
@@ -7681,14 +7709,16 @@ pub(super) mod tests {
             "a revoked sender's refusal overwrites no note"
         );
 
-        // #1604 G5: a refusal reason this node does not know is refused
-        // before any asker state changes.
+        // Review round 1 (forged-refusal hardening): an unsolicited
+        // refusal — from a clean holder this node did NOT ask — is
+        // ignored: no peer is marked answered and no note is written.
         dispatch_refusal(
             &state,
             &group_id,
             &requester_hex,
             other,
-            "some_future_reason",
+            "machine_revoked",
+            true,
         )
         .await;
         {
@@ -7698,7 +7728,7 @@ pub(super) mod tests {
                     .head_round_asks
                     .values()
                     .any(|asks| asks.answered.contains(&other)),
-                "an unknown refusal reason marks no peer answered"
+                "a peer this node did not ask is not marked answered by its refusal"
             );
         }
         assert_eq!(
@@ -7706,10 +7736,64 @@ pub(super) mod tests {
                 .treekem_catchup_refusals
                 .lock()
                 .expect("refusal notes")
+                .len(),
+            1,
+            "an unsolicited refusal records no note"
+        );
+
+        // An unverified refusal, and one addressed to another requester,
+        // change nothing (review round 1, test gaps).
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &requester_hex,
+            refuser,
+            "binding_revoked",
+            false,
+        )
+        .await;
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &hex::encode([0x0e; 32]),
+            refuser,
+            "binding_revoked",
+            true,
+        )
+        .await;
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
                 .get(&group_id)
                 .expect("the earlier note stands")
-                .peer,
+                .reason,
+            super::super::TreeKemCatchupRefusalReason::MachineRevoked,
+            "an unverified or misaddressed refusal overwrites no note"
+        );
+
+        // #1604 G5: a refusal reason this node does not know is refused
+        // at the dispatch arm, before any asker state changes — sent
+        // here from the asked peer, so only that gate can stop it.
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &requester_hex,
             refuser,
+            "some_future_reason",
+            true,
+        )
+        .await;
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
+                .get(&group_id)
+                .expect("the earlier note stands")
+                .reason,
+            super::super::TreeKemCatchupRefusalReason::MachineRevoked,
             "an unknown refusal reason overwrites no note"
         );
 
@@ -7721,8 +7805,9 @@ pub(super) mod tests {
             &state,
             &"99".repeat(16),
             &requester_hex,
-            other,
+            refuser,
             "machine_revoked",
+            true,
         )
         .await;
         assert_eq!(
@@ -7733,6 +7818,34 @@ pub(super) mod tests {
                 .len(),
             1,
             "a refusal for a group this node does not hold records no note"
+        );
+
+        // A pending revocation resync fails closed: no refusal is
+        // honored while the local revocation set is unverified (the
+        // #1577 fabric's quarantined carrier).
+        *state.agent.revocation_set().write().await =
+            x0x::revocation::RevocationSet::quarantined_carrier(
+                x0x::revocation::REVOCATION_CARRIER_V3,
+            );
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &requester_hex,
+            refuser,
+            "binding_revoked",
+            true,
+        )
+        .await;
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
+                .get(&group_id)
+                .expect("the earlier note stands")
+                .reason,
+            super::super::TreeKemCatchupRefusalReason::MachineRevoked,
+            "a refusal during a revocation resync overwrites no note"
         );
         Ok(())
     }

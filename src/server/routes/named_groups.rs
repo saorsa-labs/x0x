@@ -12326,6 +12326,24 @@ pub(in crate::server) async fn handle_treekem_catchup_refusal(
         }
     }
     let sender_hex = hex::encode(sender.as_bytes());
+    // Review round 1 (forged-refusal hardening): only a refusal from a
+    // peer this node asked this round is honored — it alone can stop the
+    // re-ask, warn, and hold the note. An unsolicited refusal is logged
+    // and ignored.
+    if !revocation_eviction::note_catchup_refused_peer(
+        state,
+        &[refusal.group_id().to_string()],
+        *sender.as_bytes(),
+    )
+    .await
+    {
+        tracing::debug!(
+            group_id = %LogHexId::group(refusal.group_id()),
+            peer = %LogHexId::agent(&sender_hex),
+            "ignoring an unsolicited TreeKEM catch-up refusal from a peer this node did not ask"
+        );
+        return;
+    }
     tracing::warn!(
         group_id = %LogHexId::group(refusal.group_id()),
         peer = %LogHexId::agent(&sender_hex),
@@ -12342,12 +12360,6 @@ pub(in crate::server) async fn handle_treekem_catchup_refusal(
             },
         );
     }
-    revocation_eviction::note_catchup_refused_peer(
-        state,
-        &[refusal.group_id().to_string()],
-        *sender.as_bytes(),
-    )
-    .await;
 }
 
 /// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): send the
@@ -12357,18 +12369,23 @@ pub(in crate::server) async fn handle_treekem_catchup_refusal(
 /// request itself named. It travels on the catch-up DM lane, so its
 /// sender is authenticated exactly like a page (the QUIC ML-DSA-65
 /// handshake on the raw path, the signed envelope on the gossip path).
-/// The payload is recorded for tests before the egress attempt, exactly
-/// as the page serve does — the recorder observes the decision, not the
+/// Review round 1, finding 2: the refusal is MACHINE-bound
+/// (`send_direct_bound_to_machine`) and echoes the authenticated sender
+/// id, so it reaches the revoked device that asked — never a clean
+/// device of the same agent — and never an id the request chose. The
+/// payload is recorded for tests before the egress attempt, exactly as
+/// the page serve does — the recorder observes the decision, not the
 /// transport.
 async fn send_treekem_catchup_refusal(
     state: &Arc<AppState>,
     sender: &AgentId,
+    machine_id: &MachineId,
     request: &TreeKemCatchupRequest,
     reason: TreeKemCatchupRefusalReason,
 ) {
     let refusal = TreeKemCatchupRefusal::new(
         request.group_id.clone(),
-        request.requester_agent_id.clone(),
+        hex::encode(sender.as_bytes()),
         reason,
     );
     let payload = match serde_json::to_vec(&refusal) {
@@ -12384,7 +12401,7 @@ async fn send_treekem_catchup_refusal(
     }
     if let Err(e) = state
         .agent
-        .send_direct_with_config(sender, payload, direct_message_send_config())
+        .send_direct_bound_to_machine(sender, *machine_id, payload, direct_message_send_config())
         .await
     {
         tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %hex::encode(sender.as_bytes()), "failed to send TreeKEM catch-up refusal: {e}");
@@ -12458,11 +12475,15 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             None
         }
     };
-    if let Some(reason) = typed_refusal {
-        send_treekem_catchup_refusal(state, sender, &request, reason).await;
+    // Review round 1, finding 2: a request whose claimed requester is not
+    // the authenticated sender gets no reply at all, so the refusal below
+    // only ever answers a request that named this sender — and echoes the
+    // authenticated `sender_hex`, never the id the request chose.
+    if sender_hex != request.requester_agent_id {
         return;
     }
-    if sender_hex != request.requester_agent_id {
+    if let Some(reason) = typed_refusal {
+        send_treekem_catchup_refusal(state, sender, machine_id, &request, reason).await;
         return;
     }
     let (authorized, log_keys, held_group) = {
