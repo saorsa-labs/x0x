@@ -22770,6 +22770,42 @@ pub(super) async fn join_group_via_invite_inner(
                         policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
                     }))
                 .then(|| state.agent_kem_keypair.as_ref());
+                // #1578 rc7: the joiner's own copy of its own seat
+                // records the key it publishes — the roster root does
+                // not hash it, and `add_member` never clears it when
+                // the authority's MemberAdded upgrades the row to
+                // Active. Without this, every invite-joined member's
+                // own view stays keyless for ever, so the receiver-side
+                // keyless predicate (own seat cannot take a share)
+                // matched every joiner, not the seat that genuinely
+                // lost its key data.
+                if let Some(kp) = joiner_kem {
+                    let kem_b64 = BASE64.encode(&kp.public_bytes);
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or_default();
+                    info.members_v2
+                        .entry(joiner_hex.clone())
+                        .and_modify(|m| m.kem_public_key_b64 = Some(kem_b64.clone()))
+                        .or_insert_with(|| x0x::groups::GroupMember {
+                            agent_id: joiner_hex.clone(),
+                            user_id: None,
+                            role: x0x::groups::GroupRole::Member,
+                            state: x0x::groups::GroupMemberState::Pending,
+                            display_name: None,
+                            joined_at: now_secs,
+                            updated_at: now_secs,
+                            added_by: None,
+                            removed_by: None,
+                            kem_public_key_b64: Some(kem_b64),
+                            treekem_key_package_b64: None,
+                            treekem_key_package_hash: None,
+                            certificate: None,
+                            certificate_missing_since_ms: None,
+                            certificate_digest: None,
+                        });
+                }
                 build_signed_member_joined_resend(
                     &info,
                     &joiner_hex,

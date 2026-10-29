@@ -14,18 +14,20 @@
 //! the roster projection a state commit carries has no KEM field at
 //! all, so one member's view of a seat differs from another's by
 //! design. The inviter seats a joiner's key from its verified
-//! `MemberJoined`; the joiner's OWN copy of its own seat never carries
-//! one — the join stub seats `kem_public_key_b64: None` and no later
-//! event re-seats it. So the receiver side of #1578
-//! (`own_seat_cannot_take_a_share`) needs no injection: C's own view is
-//! keyless from its join. The injection strips the ONE copy that is
-//! keyed — A's, the author side, under A's own `named_groups` write
-//! lock — so `spawn_gss_share_to` then logs `no KEM key on record for a
-//! survivor` and skips the seal, and no share of the rotated secret can
-//! ever reach C. Each daemon keeps its own `agent_kem_keypair`; only
-//! the roster row is stripped, so the sealed chain and every head stay
-//! untouched. This mirrors the local fixture
-//! `gss_leave_fixture_build(None, false)`
+//! `MemberJoined`, and (rc7) the join seats the same key on the
+//! joiner's OWN copy of its own seat — before rc7 the joiner's own view
+//! never carried one, so the receiver-side keyless predicate matched
+//! every joiner. The injection removes the key from BOTH live copies,
+//! under each node's own `named_groups` write lock: on A (the author
+//! side — `spawn_gss_share_to` then logs `no KEM key on record for a
+//! survivor` and skips the seal, so no share of the rotated secret can
+//! ever reach C) and on C itself (the receiver side — the
+//! `own_seat_cannot_take_a_share` predicate). On `main` the red run
+//! finds C's own copy already keyless (the pre-rc7 gap) and skips that
+//! strip; the recorded evidence stage names the shape it saw. Each
+//! daemon keeps its own `agent_kem_keypair`; only the roster row is
+//! stripped, so the sealed chain and every head stay untouched. This
+//! mirrors the local fixture `gss_leave_fixture_build(None, false)`
 //! (`revocation_eviction/crypto_exclusion.rs`), which seats no key on
 //! either side — the mirror of the `set_member_kem_public_key` calls its
 //! recovery half uses.
@@ -462,11 +464,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let c_hex = sim.agent_hex("C")?;
 
     // The precondition the injection removes: C's seat carries a KEM key
-    // in A's copy (the inviter seated it from C's verified MemberJoined).
-    // C's own copy never carries one — the join stub seats no KEM
-    // material on the joiner's own view and no later event re-seats it —
-    // which supplies the receiver-side half of the #1578 shape with no
-    // injection at all.
+    // in A's copy (the inviter seated it from C's verified MemberJoined)
+    // and in C's own (the join records the key it publishes, #1578 rc7).
+    // On `main` the joiner's own view never carried one — the join stub
+    // seated no KEM material — which is itself the gap rc7 closed; the
+    // evidence stage below records which shape this run sees.
     let what = "C's seat carries a KEM key on A";
     let mut seen = Observations::default();
     sim.until(what, SETUP, async |s: &Sim| {
@@ -479,18 +481,6 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     })
     .await?;
     seen.verify(what)?;
-    let c_own_copy_keyed = sim
-        .within(
-            "read C's own copy of its seat",
-            secs(5),
-            seat_kem(sim, "C", &group, &c_hex),
-        )
-        .await??;
-    ensure!(
-        !c_own_copy_keyed,
-        "C's own copy of its seat carries a KEM key; the #1578 receiver \
-         side is not the natural joiner state"
-    );
 
     // Pre-leave data plane: A's ciphertext opens on C, so C holds the
     // epoch-e0 secret before anything rotates it.
@@ -547,7 +537,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     receipt.evidence(
         "c_seat_carried_a_kem_key_before_the_injection",
         true,
-        "waited until A's copy seated the key; C's own copy never carries one".to_string(),
+        "waited until A's copy seated the key; rc7 seats the joiner's own copy at join".to_string(),
         at(sim),
     );
     receipt.evidence(
@@ -558,11 +548,32 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     );
     ensure!(c_before, "C could not decrypt at e0 before the leave");
 
-    // The injection (A's copy only; see the module notes). C's own copy
-    // is keyless by daemon reality, asserted above.
+    // The injection (see the module notes). A's copy: the inviter's
+    // record, stripped unconditionally. C's own copy: keyed by the join
+    // (rc7) and stripped here; on `main` it never carried the key, so
+    // the strip is skipped and the natural gap is recorded instead.
+    let c_own_key_seated = sim
+        .within(
+            "read C's own copy of its seat",
+            secs(5),
+            seat_kem(sim, "C", &group, &c_hex),
+        )
+        .await??;
+    receipt.note(if c_own_key_seated {
+        "the join seated the joiner's own key in its own view (rc7); the \
+         injection strips it there"
+            .to_string()
+    } else {
+        "the joiner's own view never carried the key (the pre-rc7 gap; \
+         main) — the strip is skipped and the natural gap is the shape"
+            .to_string()
+    });
+    if c_own_key_seated {
+        strip_seat_kem(sim, "C", &group, &c_hex).await?;
+    }
     strip_seat_kem(sim, "A", &group, &c_hex).await?;
     sim.fabric()
-        .mark("fault: C's roster seat carries no KEM key (A's copy stripped; C's own never carried one; #1578 shape)");
+        .mark("fault: C's roster seat carries no KEM key (A's copy and C's own; #1578 shape)");
     let (c_keyless, a_keyless) = sim
         .within(
             "read both copies of C's seat",
@@ -753,12 +764,12 @@ async fn run(case: &str, seed: u64) -> Receipt {
     let mut receipt = Receipt::new(case, seed);
     receipt.note(
         "The #1578 injection removes the survivor seat's KEM public key from the live roster \
-         map of A (the author: no share can be sealed to the seat). The receiver's own view \
-         never carries the key — the join stub seats none and the roster projection has no \
-         KEM field — so the keyless-install predicate reads C's natural joiner state. The \
-         key is local data, not in the roster root, so the chain and every head are \
-         untouched; each daemon keeps its own agent_kem_keypair. This mirrors \
-         gss_leave_fixture_build(None, false) in the local fixture.",
+         maps of A (the author: no share can be sealed to the seat) and C (the receiver: the \
+         keyless-install predicate). The join seats the joiner's own key in its own view \
+         (rc7); a run that finds C's own copy already keyless (pre-rc7, main) skips that \
+         strip and records the gap. The key is local data, not in the roster root, so the \
+         chain and every head are untouched; each daemon keeps its own agent_kem_keypair. \
+         This mirrors gss_leave_fixture_build(None, false) in the local fixture.",
     );
     match Sim::start(case, seed, &["A", "B", "C"]).await {
         Ok(mut sim) => {
