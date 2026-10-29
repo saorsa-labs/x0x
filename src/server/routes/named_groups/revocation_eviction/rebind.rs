@@ -467,14 +467,17 @@ async fn commit_locked(
             // #1574 item 1: treating this arm as committed is enough for
             // the drops below. The persist keeps the candidate in the map
             // on this outcome (it rolls back only `NotReplaced` and hard
-            // errors), so this process never sees the install revert, and
-            // the dropped `admin_waits`/`renewals`/`held` entries describe
-            // a roster the map already shows. A power loss before a
-            // confirming save is the one revert; it loses that memory-only
-            // state whether or not it was dropped, the frame is durable
-            // here already (the `write_planned` above), and the reverted
-            // roster re-derives the seat's expiry trigger, so the pass
-            // re-opens the work instead of resting on the dropped state.
+            // errors), so this process never sees the install revert.
+            // A power loss before a confirming save is the one revert.
+            // It erases the memory-only `admin_waits`/`renewals`/`held`
+            // entries whether or not they were dropped. The durable frame
+            // above is chain evidence, not a re-drive: a restart restores
+            // an authored frame only at the loaded head. The recovery is
+            // re-derivation. The reverted roster re-opens the seat's
+            // expiry trigger, and the hand-off or self-rebind path seals
+            // a fresh frame against the same parent. The first frame was
+            // never sent (the §5 egress guard held it), so the fresh one
+            // cannot equivocate with it.
             tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: certificate rebind persisted without a durability confirmation");
             Ok(())
         }
@@ -1558,13 +1561,13 @@ async fn drive_deliveries(state: &Arc<AppState>) {
         let mut inner = state.revocation_evictions.inner.lock().await;
         // #1574 item 6: a delivery past `CRB_DELIVERY_TTL` ends with no
         // convergence accounting, and that evidence is enough: the frame
-        // carries no key material (§4a), so nothing must be re-sealed, and
-        // the durable catch-up log (`rebind.log`, served by
-        // `serve_catchup`) still serves the exact bytes to a survivor that
-        // asks. The seat's row then completes from the committed roster
-        // through the pass; if a power loss reverts the roster first, the
-        // reverted roster re-derives the seat's expiry trigger, so the
-        // work re-opens.
+        // carries no key material (§4a), so nothing must be re-sealed,
+        // and while the frame stays within the catch-up log's per-group
+        // bound, `rebind.log` (served by `serve_catchup`) still serves
+        // the exact bytes to a survivor that asks. The seat's row then
+        // completes from the committed roster through the pass. If a
+        // power loss reverts the roster first, the reverted roster
+        // re-opens the seat's expiry trigger, so the work re-opens too.
         inner.rebind.deliveries.retain(|_, delivery| {
             now.saturating_duration_since(delivery.started) < CRB_DELIVERY_TTL
         });

@@ -1462,18 +1462,22 @@ async fn finish_commit(
     // #1574 item 1: both non-durable shapes below are treated as
     // committed, and that evidence is enough for the drops after them.
     // `ReplacedNotDurable` keeps the installed candidate in the map (the
-    // persist rolls back only `NotReplaced` and hard errors). The
-    // epoch-installed error is committed state as well: the journal it
-    // leaves is already the commit point, which a restart replays, and
-    // its non-durable roster arm converges memory to the candidate and
-    // sets the same confirmation flag. A power loss before a confirming
-    // save is the one revert; it loses the memory-only `pending` entry
-    // whether or not it was dropped, and the frame is durable here
-    // already (the `write_planned` above). The mandate retire is safe on
-    // a revert too: the owner side still applies to the reverted head
-    // (its parent), so `restore_mandates` keeps it, `drive_mandates`
-    // sends it again, and the member re-commits from the same durable
-    // frame.
+    // persist rolls back only `NotReplaced` and hard errors), so this
+    // process never sees the install revert. The epoch-installed error is
+    // committed state as well: the journal it leaves is already the
+    // commit point, which a restart replays, and its non-durable roster
+    // arm converges memory to the candidate and sets the same
+    // confirmation flag.
+    // A power loss before a confirming save is the one revert. It erases
+    // this node's memory, so the `pending` entry is gone regardless of
+    // the drop above; the durable loss is the mandate retire, and it is
+    // covered: the owner's committed head is still the mandate's parent,
+    // so its durable wait still applies and `drive_mandates` sends the
+    // mandate again. The member re-holds it and commits a fresh frame.
+    // The durable frame above is chain evidence, not a re-drive (a
+    // restart restores an authored frame only at the loaded head), and it
+    // was never sent (the §5 egress guard held it), so the fresh frame
+    // cannot equivocate with it.
     let persisted = match tree.as_ref() {
         Some((guard, _)) => {
             match ng::persist_treekem_and_named_groups_atomic_with_info(
@@ -3236,9 +3240,10 @@ async fn receive_commit(
     // back through the stash, so a power-loss revert re-runs this
     // install and these drops on the durable frame. The epoch-installed
     // arm is committed by the journal it leaves (the commit point a
-    // restart replays). The dropped `pending`/`mandates` waits are
-    // memory-only, and the owner's durable wait still applies to the
-    // reverted head (its parent), so its resend re-arms them.
+    // restart replays). The in-memory `pending`/`mandates` drop retires
+    // no file here, so a restart also re-arms the held sides from the
+    // pending-mandate file while the reverted head is the mandate's
+    // parent; the owner's re-send covers the same recovery.
     let installed = match (guard.as_mut(), &body.crypto) {
         (
             Some(guard),
@@ -4822,17 +4827,18 @@ mod tests {
             .insert(group_id.clone(), info.clone());
         drop(guard);
         driven.await.unwrap();
-        assert!(
-            state
-                .revocation_evictions
-                .inner
-                .lock()
-                .await
-                .orc
-                .mandates
-                .contains_key(&stable),
-            "the committed head is the mandate's parent, so the owner keeps waiting"
+        let inner = state.revocation_evictions.inner.lock().await;
+        let stored = inner
+            .orc
+            .mandates
+            .get(&stable)
+            .expect("the committed head is the mandate's parent, so the owner keeps waiting");
+        assert_ne!(
+            stored.recipients.get(&promoted),
+            Some(&RecipientDelivery::Due),
+            "the committed head's round ran"
         );
+        drop(inner);
         state.agent.shutdown().await;
     }
 
