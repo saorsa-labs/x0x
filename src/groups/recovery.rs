@@ -1970,6 +1970,7 @@ pub fn apply_link_state_only(
         current_revision: current.state_revision,
         current_withdrawn: current.withdrawn,
         members_v2: &current.members_v2,
+        join_seat_marker_agents: current.join_seat_key_marker_agents(),
         group_id: current.stable_group_id(),
     };
     let self_rebind = sc::compute_public_meta_hash(&current.public_meta())

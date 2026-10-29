@@ -850,6 +850,8 @@ jobs:
           --expect w3h_1356_red_s3_t_deferred_until_host_commit=GREEN
           --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
           --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
+          --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
+          --expect w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless=GREEN
           --require w3h_1581_s4_ordinary_admin_revoked
           --expect w3h_1581_s4_ordinary_admin_revoked=GREEN
           --require w3h_1581b_control_dropped_eager_frame_retry_floor

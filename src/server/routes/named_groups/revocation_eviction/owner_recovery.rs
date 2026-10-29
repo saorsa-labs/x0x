@@ -2312,7 +2312,14 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             role,
             ..
         } => {
-            let target = cursor.members_v2.get(agent_id)?;
+            // #1578 rc11 (audit): the join's key-only marker row is not
+            // a seat — the replay stops on it, exactly as the apply
+            // side parks a role update for a member that has not
+            // landed.
+            let target = cursor
+                .members_v2
+                .get(agent_id)
+                .filter(|_| !cursor.join_seat_key_marker_only(agent_id))?;
             if !admin(actor)
                 || target.is_removed()
                 || target.is_banned()
@@ -2524,7 +2531,15 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             ..
         } => {
             let ban = matches!(held.event, Event::MemberBanned { .. });
-            let target = cursor.members_v2.get(agent_id);
+            // #1578 rc11 (audit): the join's key-only marker row reads
+            // as no seat here, and the mutation below drops it first —
+            // ban_member on the marker would keep its Member role on
+            // the Banned row, and the roster root binds the role, so
+            // the reconstructed root would diverge from main's.
+            let target = cursor
+                .members_v2
+                .get(agent_id)
+                .filter(|_| !cursor.join_seat_key_marker_only(agent_id));
             if !admin(actor)
                 || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
                 || target.is_some_and(|member| member.is_banned())
@@ -2539,6 +2554,9 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                 |next| {
                     next.roster_revision =
                         super::super::adopt_roster_revision(next.roster_revision, *revision);
+                    if next.join_seat_key_marker_only(agent_id) {
+                        next.members_v2.remove(agent_id);
+                    }
                     if ban {
                         next.ban_member(agent_id, Some(actor.clone()));
                     } else {
@@ -2558,11 +2576,20 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             secret_epoch: Some(to),
             ..
         } => {
-            let target = cursor.members_v2.get(agent_id)?;
+            // #1578 rc11 (audit): the join's key-only marker row is not
+            // a seat — the replay stops on it, and the mutation drops
+            // it first so the removal sees exactly main's roster.
+            let target = cursor
+                .members_v2
+                .get(agent_id)
+                .filter(|_| !cursor.join_seat_key_marker_only(agent_id))?;
             if !admin(actor) || target.is_removed() || target.is_banned() {
                 return None;
             }
             return gss_rotation_step(cursor, commit, *revision, *to, |next| {
+                if next.join_seat_key_marker_only(agent_id) {
+                    next.members_v2.remove(agent_id);
+                }
                 next.remove_member(agent_id, Some(actor.clone()));
             });
         }
@@ -2584,6 +2611,13 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                 return None;
             }
             return gss_rotation_step(cursor, commit, *revision, *to, |next| {
+                // #1578 rc11 (audit): drop the join's key-only marker
+                // row first — ban_member on it would keep its Member
+                // role on the Banned row, and the roster root binds
+                // the role.
+                if next.join_seat_key_marker_only(agent_id) {
+                    next.members_v2.remove(agent_id);
+                }
                 next.ban_member(agent_id, Some(actor.clone()));
             });
         }

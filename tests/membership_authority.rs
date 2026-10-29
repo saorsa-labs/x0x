@@ -263,6 +263,7 @@ fn gossip_apply(
         current_revision: replica.state_revision,
         current_withdrawn: replica.withdrawn,
         members_v2: &replica.members_v2,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
         group_id: replica.stable_group_id(),
     };
     validate_apply(&ctx, commit, action_kind)?;
@@ -296,6 +297,7 @@ fn apply_group_deleted_event(
         current_revision: replica.state_revision,
         current_withdrawn: replica.withdrawn,
         members_v2: &replica.members_v2,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
         group_id: replica.stable_group_id(),
     };
     validate_apply_terminal(&ctx, commit, ActionKind::AdminOrHigher)

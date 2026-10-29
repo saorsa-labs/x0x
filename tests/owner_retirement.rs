@@ -6,7 +6,7 @@
 //! the same validate → mirror mutation → nonterminal/terminal finalize sequence
 //! exercised here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use x0x::groups::state_commit::{compute_roster_root, validate_apply, validate_apply_terminal};
 use x0x::groups::{
@@ -123,6 +123,7 @@ fn gossip_apply(
         current_revision: replica.state_revision,
         current_withdrawn: replica.withdrawn,
         members_v2: &replica.members_v2,
+        join_seat_marker_agents: BTreeSet::new(),
         group_id: replica.stable_group_id(),
     };
     validate_apply(&ctx, commit, action_kind)?;
@@ -143,6 +144,7 @@ fn gossip_apply_terminal(
         current_revision: replica.state_revision,
         current_withdrawn: replica.withdrawn,
         members_v2: &replica.members_v2,
+        join_seat_marker_agents: BTreeSet::new(),
         group_id: replica.stable_group_id(),
     };
     validate_apply_terminal(&ctx, commit, action_kind)?;
