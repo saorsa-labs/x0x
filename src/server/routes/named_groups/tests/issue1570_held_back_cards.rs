@@ -368,5 +368,64 @@ async fn local_card_routes_sign_no_card_from_a_held_back_group() -> Result<()> {
         Some("renamed again while held back"),
         "#1570: card-by-id serves the commit that group B's save ended"
     );
+
+    // Part 7: the negative control of the same pass. A third hold is
+    // un-placeheld by a pass whose own legacy write fails, so the real
+    // record is NOT committed. No owed card may be published from the
+    // uncommitted rename: the routes keep the last committed card.
+    let current = state
+        .named_groups
+        .read()
+        .await
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("group A after part 6"))?;
+    group_recovery::begin_placehold(&state, &key, &current);
+    let outcome = save_named_groups_checked(&state).await;
+    assert!(
+        matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "second re-placehold save must be durable: {outcome:?}"
+    );
+    tokio::fs::remove_file(&sidecar).await?;
+    tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+    let mut renamed_thrice = current.clone();
+    renamed_thrice.name = "renamed thrice while held back".to_string();
+    renamed_thrice.roster_revision = renamed_thrice.roster_revision.saturating_add(1);
+    renamed_thrice.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    let outcome = persist_named_group_info(&state, &key, renamed_thrice).await;
+    assert!(
+        !matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "the third rename is held back: {outcome:?}"
+    );
+    assert!(group_recovery::is_held_back(&state, &stable));
+    // The sidecar is writable again, but the LEGACY file is not: a
+    // non-empty directory holds its name, so the pass that un-placeholds
+    // the group cannot commit the real record.
+    tokio::fs::remove_dir_all(&sidecar).await?;
+    let legacy = state.data_dir.join("named_groups.json");
+    tokio::fs::remove_file(&legacy).await?;
+    tokio::fs::create_dir_all(legacy.join("blocked")).await?;
+    group_recovery::ensure_placeholders(&state).await;
+    drain_detached_cards(&state).await;
+    assert!(
+        !group_recovery::is_held_back(&state, &stable),
+        "the pass still un-placeheld the group"
+    );
+    let (status, body) = card_body(&state, &stable).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["name"].as_str(),
+        Some("renamed again while held back"),
+        "#1570: a pass whose legacy write failed publishes no uncommitted card"
+    );
+    {
+        let directory = state.directory_cache.read().await;
+        let published = directory.get(&stable);
+        assert_ne!(
+            published.map(|card| card.name.as_str()),
+            Some("renamed thrice while held back"),
+            "#1570: the shard cache holds no uncommitted card either"
+        );
+    }
     Ok(())
 }

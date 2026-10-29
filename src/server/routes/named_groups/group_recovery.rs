@@ -2151,8 +2151,10 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
             }
             // A new hold started; its own owed flag stays set.
             Some(_) => false,
-            // Un-placeheld in this pass; the record is durable.
-            None => true,
+            // Un-placeheld in this pass: the real record is committed
+            // only by this pass's own write, so an owed card waits for
+            // that write to land.
+            None => write == Some(LegacyWrite::Durable),
         });
         if !publish_now {
             continue;
