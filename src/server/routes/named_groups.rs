@@ -34237,26 +34237,31 @@ pub(in crate::server) async fn secure_group_encrypt(
         .await;
     }
 
-    let Some(key) = info.secure_message_key() else {
-        return api_error(
-            StatusCode::FAILED_DEPENDENCY,
-            "no shared secret available — await welcome or ask admin to re-share",
-        );
-    };
+    // #1508 rc16 (Codex P1): the share hold is checked on the snapshot
+    // the key came from. A share that installs after this read ends the
+    // hold, but this send still uses the old key, which the removed
+    // member holds. #1578 (David's approval, 28 Oct 08:59 GMT): the hold
+    // gates the endpoint before the key-presence refusal — a survivor
+    // that installed the exclusion keyless holds no secret at all, and
+    // its refusal is the typed 409, not the no-secret 424.
+    let key = info.secure_message_key();
     let epoch = info.secret_epoch;
     let group_id_clone = info.stable_group_id().to_string();
-    // #1508 rc16 (Codex P1): the share hold is checked on the snapshot the
-    // key came from. A share that installs after this read ends the hold,
-    // but this send still uses the old key, which the removed member holds.
-    let key_held = crate::server::resolve_group_entry_locked(&groups, &id)
+    let hold_open = crate::server::resolve_group_entry_locked(&groups, &id)
         .is_some_and(|(group_key, info)| pending_gss_removal_withholds(&state, group_key, info));
     drop(groups);
-    if key_held {
+    if hold_open {
         return api_error(
             StatusCode::CONFLICT,
             GroupCiphertextHold::PendingGssRemoval.reason(),
         );
     }
+    let Some(key) = key else {
+        return api_error(
+            StatusCode::FAILED_DEPENDENCY,
+            "no shared secret available — await welcome or ask admin to re-share",
+        );
+    };
     gss_encrypt_after_key_probe(&state).await;
     // #1508 rc18 (Codex P1): a verified GSS removal, ban or crypto-only
     // exclusion parks under this gate held exclusively

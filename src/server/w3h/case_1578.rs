@@ -10,16 +10,22 @@
 //! encrypted groups are TreeKEM).
 //!
 //! The #1578 shape and the injection. A seat's KEM public key is local
-//! data: `compute_roster_root` hashes only `id:role:state[:cert]`, so
-//! one member's view of a seat can differ from another's. The injection
-//! removes C's seat key from TWO live roster maps, under each node's own
-//! `named_groups` write lock: on A (the author side — `spawn_gss_share_to`
-//! then logs `no KEM key on record for a survivor` and skips the seal, so
-//! no share of the rotated secret can ever reach C) and on C itself (the
-//! receiver side — the `own_seat_cannot_take_a_share` predicate). Each
-//! daemon keeps its own `agent_kem_keypair`; only the roster row is
-//! stripped, so the sealed chain and every head stay untouched. This
-//! mirrors the local fixture `gss_leave_fixture_build(None, false)`
+//! data: `compute_roster_root` hashes only `id:role:state[:cert]`, and
+//! the roster projection a state commit carries has no KEM field at
+//! all, so one member's view of a seat differs from another's by
+//! design. The inviter seats a joiner's key from its verified
+//! `MemberJoined`; the joiner's OWN copy of its own seat never carries
+//! one — the join stub seats `kem_public_key_b64: None` and no later
+//! event re-seats it. So the receiver side of #1578
+//! (`own_seat_cannot_take_a_share`) needs no injection: C's own view is
+//! keyless from its join. The injection strips the ONE copy that is
+//! keyed — A's, the author side, under A's own `named_groups` write
+//! lock — so `spawn_gss_share_to` then logs `no KEM key on record for a
+//! survivor` and skips the seal, and no share of the rotated secret can
+//! ever reach C. Each daemon keeps its own `agent_kem_keypair`; only
+//! the roster row is stripped, so the sealed chain and every head stay
+//! untouched. This mirrors the local fixture
+//! `gss_leave_fixture_build(None, false)`
 //! (`revocation_eviction/crypto_exclusion.rs`), which seats no key on
 //! either side — the mirror of the `set_member_kem_public_key` calls its
 //! recovery half uses.
@@ -456,21 +462,35 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let c_hex = sim.agent_hex("C")?;
 
     // The precondition the injection removes: C's seat carries a KEM key
-    // in A's copy and in C's own.
-    let what = "C's seat carries a KEM key on A and on C";
+    // in A's copy (the inviter seated it from C's verified MemberJoined).
+    // C's own copy never carries one — the join stub seats no KEM
+    // material on the joiner's own view and no later event re-seats it —
+    // which supplies the receiver-side half of the #1578 shape with no
+    // injection at all.
+    let what = "C's seat carries a KEM key on A";
     let mut seen = Observations::default();
     sim.until(what, SETUP, async |s: &Sim| {
-        for holder in ["A", "C"] {
-            match seen.observe(seat_kem(s, holder, &group, &c_hex)).await {
-                Some(true) => {}
-                Some(false) => return false,
-                None => return true,
-            }
+        match seen.observe(seat_kem(s, "A", &group, &c_hex)).await {
+            Some(true) => {}
+            Some(false) => return false,
+            None => return true,
         }
         true
     })
     .await?;
     seen.verify(what)?;
+    let c_own_copy_keyed = sim
+        .within(
+            "read C's own copy of its seat",
+            secs(5),
+            seat_kem(sim, "C", &group, &c_hex),
+        )
+        .await??;
+    ensure!(
+        !c_own_copy_keyed,
+        "C's own copy of its seat carries a KEM key; the #1578 receiver \
+         side is not the natural joiner state"
+    );
 
     // Pre-leave data plane: A's ciphertext opens on C, so C holds the
     // epoch-e0 secret before anything rotates it.
@@ -527,7 +547,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     receipt.evidence(
         "c_seat_carried_a_kem_key_before_the_injection",
         true,
-        "waited until both A's copy and C's own copy seated the key".to_string(),
+        "waited until A's copy seated the key; C's own copy never carries one".to_string(),
         at(sim),
     );
     receipt.evidence(
@@ -538,11 +558,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     );
     ensure!(c_before, "C could not decrypt at e0 before the leave");
 
-    // The injection (both copies; see the module notes).
-    strip_seat_kem(sim, "C", &group, &c_hex).await?;
+    // The injection (A's copy only; see the module notes). C's own copy
+    // is keyless by daemon reality, asserted above.
     strip_seat_kem(sim, "A", &group, &c_hex).await?;
     sim.fabric()
-        .mark("fault: C's roster seat carries no KEM key (A's copy and C's own; #1578 shape)");
+        .mark("fault: C's roster seat carries no KEM key (A's copy stripped; C's own never carried one; #1578 shape)");
     let (c_keyless, a_keyless) = sim
         .within(
             "read both copies of C's seat",
@@ -733,10 +753,12 @@ async fn run(case: &str, seed: u64) -> Receipt {
     let mut receipt = Receipt::new(case, seed);
     receipt.note(
         "The #1578 injection removes the survivor seat's KEM public key from the live roster \
-         maps of A (the author: no share can be sealed to the seat) and C (the receiver: the \
-         keyless-install predicate). The key is local data, not in the roster root, so the \
-         chain and every head are untouched; each daemon keeps its own agent_kem_keypair. \
-         This mirrors gss_leave_fixture_build(None, false) in the local fixture.",
+         map of A (the author: no share can be sealed to the seat). The receiver's own view \
+         never carries the key — the join stub seats none and the roster projection has no \
+         KEM field — so the keyless-install predicate reads C's natural joiner state. The \
+         key is local data, not in the roster root, so the chain and every head are \
+         untouched; each daemon keeps its own agent_kem_keypair. This mirrors \
+         gss_leave_fixture_build(None, false) in the local fixture.",
     );
     match Sim::start(case, seed, &["A", "B", "C"]).await {
         Ok(mut sim) => {
