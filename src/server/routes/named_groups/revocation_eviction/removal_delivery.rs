@@ -230,15 +230,19 @@ async fn redeliver_secret_shares(
             epoch,
         ) {
             Ok(share) => {
-                crypto_exclusion::note_share_went_to(
-                    state,
-                    info.stable_group_id(),
-                    epoch,
-                    recipient,
-                    kem,
-                )
-                .await;
-                super::super::spawn_secure_share_delivery(state, &share);
+                // #1660 (Claude review): the record claims a share went
+                // out. A refused spawn sealed nothing, so it records
+                // nothing.
+                if super::super::spawn_secure_share_delivery(state, &share) {
+                    crypto_exclusion::note_share_went_to(
+                        state,
+                        info.stable_group_id(),
+                        epoch,
+                        recipient,
+                        kem,
+                    )
+                    .await;
+                }
             }
             Err(_) => tracing::warn!(
                 group_id = %super::super::LogHexId::group(info.stable_group_id()),

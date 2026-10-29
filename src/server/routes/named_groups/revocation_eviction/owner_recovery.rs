@@ -1794,8 +1794,12 @@ async fn seal_gss_share(state: &Arc<AppState>, info: &GroupInfo, recipient: &[u8
     };
     match ng::build_secure_share_event(stable, &recipient_hex, kem, &actor, &secret, epoch) {
         Ok(event) => {
-            super::crypto_exclusion::note_share_went_to(state, stable, epoch, recipient, kem).await;
-            ng::spawn_secure_share_delivery(state, &event);
+            // #1660 (Claude review): the record claims a share went out.
+            // A refused spawn sealed nothing, so it records nothing.
+            if ng::spawn_secure_share_delivery(state, &event) {
+                super::crypto_exclusion::note_share_went_to(state, stable, epoch, recipient, kem)
+                    .await;
+            }
         }
         Err(_) => tracing::warn!(
             group_id = %ng::LogHexId::group(stable),
@@ -3902,8 +3906,44 @@ mod tests {
             }),
         );
         assert_eq!(seat(&orc), RecipientDelivery::Sent);
+        // A share of another epoch is not this row's secret: the record
+        // keeps only the row's reshare epoch.
+        note_share_went_to(&mut orc, "g", 3, &survivor, "key-now");
+        note_survivor_head(
+            &mut orc,
+            "g",
+            &survivor,
+            &installed,
+            Some(SenderSeat {
+                key: Some("key-now".to_string()),
+            }),
+        );
+        assert_eq!(
+            seat(&orc),
+            RecipientDelivery::Sent,
+            "a share of another epoch records nothing for this row"
+        );
+        // A share sealed to a key the seat no longer carries (the rotated
+        // stale key) proves nothing about the key it carries now.
+        note_share_went_to(&mut orc, "g", 4, &survivor, "key-rotated");
+        note_survivor_head(
+            &mut orc,
+            "g",
+            &survivor,
+            &installed,
+            Some(SenderSeat {
+                key: Some("key-now".to_string()),
+            }),
+        );
+        assert_eq!(
+            seat(&orc),
+            RecipientDelivery::Sent,
+            "a share that went to a stale key closes nothing"
+        );
         // The share went to the seat's current key — the round's record —
-        // and only the report after that converges it.
+        // and only the report after that converges it. The record is per
+        // seat: the later seal to the key the seat carries now replaces
+        // the stale one.
         note_share_went_to(&mut orc, "g", 4, &survivor, "key-now");
         note_survivor_head(
             &mut orc,

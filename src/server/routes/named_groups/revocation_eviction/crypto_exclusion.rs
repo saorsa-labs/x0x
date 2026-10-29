@@ -1112,17 +1112,21 @@ async fn spawn_gss_share_to(state: &Arc<AppState>, info: &GroupInfo, recipient_h
         info.secret_epoch,
     ) {
         Ok(event) => {
-            if let Some(recipient) = recipient {
-                note_share_went_to(
-                    state,
-                    info.stable_group_id(),
-                    info.secret_epoch,
-                    &recipient,
-                    kem,
-                )
-                .await;
+            // #1660 (Claude review): the record claims a share went out.
+            // A refused spawn sealed nothing, so it records nothing — no
+            // report may close against it.
+            if ng::spawn_secure_share_delivery(state, &event) {
+                if let Some(recipient) = recipient {
+                    note_share_went_to(
+                        state,
+                        info.stable_group_id(),
+                        info.secret_epoch,
+                        &recipient,
+                        kem,
+                    )
+                    .await;
+                }
             }
-            ng::spawn_secure_share_delivery(state, &event);
         }
         Err(_) => {
             tracing::warn!(recipient = %LogHexId::agent(recipient_hex), "ADR 0110 S4: the GSS share could not be sealed");
@@ -7343,6 +7347,30 @@ mod daemon_tests {
             stored.set_member_kem_public_key(&self.survivor_hex, kem_b64);
         }
 
+        /// Record, as a sealing round does, a share of the row's epoch
+        /// (2, the fixture's) sealed to the KEM key the seat carries now.
+        /// This is the control shape: after it, a live clean sender's
+        /// report converges the seat, so the refusal tests below check
+        /// their own gate and not the share rule.
+        async fn record_share_to_seat_key(&self) {
+            let kem_b64 = {
+                let groups = self.state.named_groups.read().await;
+                groups
+                    .get(&self.group_id)
+                    .and_then(|info| info.members_v2.get(&self.survivor_hex))
+                    .and_then(|member| member.kem_public_key_b64.clone())
+                    .expect("the seat's KEM key")
+            };
+            note_share_went_to(
+                &self.state,
+                &self.key.stable_group_id,
+                2,
+                self.survivor.as_bytes(),
+                &kem_b64,
+            )
+            .await;
+        }
+
         /// How many sealed shares were scheduled to the sender.
         async fn shares_to_sender(&self) -> usize {
             self.state
@@ -7450,7 +7478,19 @@ mod daemon_tests {
     /// ordinary way; the delivery never records it as delivered.
     #[tokio::test]
     async fn a_report_from_a_member_removed_mid_send_closes_no_seat() -> Result<()> {
+        // The control: a share went to the seat's key, and the same
+        // report from the live member converges it. The refusal below
+        // then checks the roster gate, not the share rule.
+        let control = seat_report_fixture(true).await?;
+        control.record_share_to_seat_key().await;
+        control.feed_report(Some(&control.result_head)).await;
+        assert_eq!(
+            control.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the control report converges the seat"
+        );
         let fx = seat_report_fixture(true).await?;
+        fx.record_share_to_seat_key().await;
         fx.remove_sender_mid_send().await;
         fx.feed_report(Some(&fx.result_head)).await;
         assert_eq!(
@@ -7470,7 +7510,18 @@ mod daemon_tests {
     /// closes, and the report of a revoked device closes nothing.
     #[tokio::test]
     async fn a_report_from_a_member_revoked_mid_send_closes_no_seat() -> Result<()> {
+        // The control: a share went to the seat's key, and the same
+        // report from the clean member converges it.
+        let control = seat_report_fixture(true).await?;
+        control.record_share_to_seat_key().await;
+        control.feed_report(Some(&control.result_head)).await;
+        assert_eq!(
+            control.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the control report converges the seat"
+        );
         let fx = seat_report_fixture(true).await?;
+        fx.record_share_to_seat_key().await;
         // The sender's advertised machine (a real keypair, so its
         // revocation record verifies), revoked after the send began. The
         // advert replaces the fixture's with a strictly later timestamp:
@@ -7631,11 +7682,22 @@ mod daemon_tests {
     /// closes no seat — the same gate as a removal, without one.
     #[tokio::test]
     async fn a_report_from_a_seat_demoted_mid_send_closes_no_seat() -> Result<()> {
+        // The control: a share went to the seat's key, and the report
+        // from the live member converges it.
+        let control = seat_report_fixture(true).await?;
+        control.record_share_to_seat_key().await;
+        control.feed_report(Some(&control.result_head)).await;
+        assert_eq!(
+            control.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the control report converges the seat"
+        );
         for state in [
             x0x::groups::GroupMemberState::Pending,
             x0x::groups::GroupMemberState::Banned,
         ] {
             let fx = seat_report_fixture(true).await?;
+            fx.record_share_to_seat_key().await;
             fx.set_sender_seat_state(state).await;
             fx.feed_report(Some(&fx.result_head)).await;
             assert_eq!(
@@ -7656,7 +7718,18 @@ mod daemon_tests {
     /// `write_allowed` path (the machine case is the test above).
     #[tokio::test]
     async fn a_report_from_an_agent_revoked_mid_send_closes_no_seat() -> Result<()> {
+        // The control: a share went to the seat's key, and the same
+        // report from the clean member converges it.
+        let control = seat_report_fixture(true).await?;
+        control.record_share_to_seat_key().await;
+        control.feed_report(Some(&control.result_head)).await;
+        assert_eq!(
+            control.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the control report converges the seat"
+        );
         let fx = seat_report_fixture(true).await?;
+        fx.record_share_to_seat_key().await;
         let record = x0x::revocation::RevocationRecord::sign(
             x0x::revocation::RevokedSubject::Agent(fx.survivor),
             fx.survivor_kp.public_key(),
