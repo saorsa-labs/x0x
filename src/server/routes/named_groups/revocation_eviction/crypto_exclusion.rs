@@ -162,12 +162,13 @@ pub(super) struct CeDelivery {
     /// that secret to the recipient again, and the delivery runs while
     /// that secret is current (#1508 review P1).
     gss_epoch: Option<u64>,
-    /// #1660: per recipient, the KEM public key (b64) a sealed share of
-    /// this row's secret went to. A report closes the seat only when the
-    /// key the sender's seat carries now is the key a share went to
+    /// #1660: per recipient, the record that a sealed share of this row's
+    /// secret went to the recipient's seat key. A report closes the seat
+    /// only when the key the sender's seat carries now is the record's
+    /// key and a head ask went to the seat after the seal
     /// ([`report_may_close`]), so a seat whose key arrives mid-send stays
-    /// open until the next round seals the share to that key.
-    share_went_to: BTreeMap<[u8; 32], String>,
+    /// open until a round seals the share to that key and asks again.
+    share_went_to: BTreeMap<[u8; 32], ShareRecord>,
     recipients: BTreeMap<[u8; 32], RecipientDelivery>,
     next_at: Instant,
 }
@@ -470,24 +471,43 @@ pub(super) struct SenderSeat {
     pub(super) key: Option<String>,
 }
 
+/// #1660: the record that a sealed share of a row's secret went to a
+/// seat's KEM key. `ask_seq_at_seal` is the seat's head-ask count at the
+/// seal (Engineer ruling, 29 Oct 17:12 GMT): a report closes the seat
+/// only after the count moved past it, so only an answer that could
+/// answer an ask sent after the seal closes the seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ShareRecord {
+    /// The KEM public key (b64) the share was sealed to.
+    pub(super) key: String,
+    /// The seat's head-ask count when the share was sealed.
+    pub(super) ask_seq_at_seal: u64,
+}
+
 /// #1660: whether a report from `seat` may close a seat of a delivery
 /// whose rounds seal GSS shares (`shares`: the row's `gss_epoch`).
 ///
 /// Every row requires a live, D60-clean sender. A GSS row additionally
-/// requires `went_to` — the KEM key a sealed share of the row's secret
-/// went to for this seat — to be the key the seat carries now. A report
-/// proves the sealed share reached the seat, not only that the frame
-/// installed (ADR 0110 §3, #1578: a keyless install proves no delivery).
-/// A seat whose KEM key arrives mid-send stays open. It takes the share
-/// the next round seals to that key, and only a report after that closes
-/// it (#1660).
+/// requires both halves of the share proof. `went_to` — the record of a
+/// share sealed for this seat — must carry the key the seat holds now.
+/// And `ask_seq` — this node's head-ask count for the seat now — must be
+/// past the count at the seal, so the answer could answer an ask sent
+/// after the share was sealed (Engineer ruling, 29 Oct 17:12 GMT; ADR
+/// 0110 §3, #1578: a keyless install proves no delivery, and an answer
+/// that raced the share proves nothing about it).
 pub(super) fn report_may_close(
     seat: Option<SenderSeat>,
     shares: bool,
-    went_to: Option<&str>,
+    went_to: Option<&ShareRecord>,
+    ask_seq: Option<u64>,
 ) -> bool {
     match seat {
-        Some(seat) => !shares || seat.key.as_deref().is_some_and(|key| Some(key) == went_to),
+        Some(seat) => {
+            !shares
+                || (ask_seq
+                    .is_some_and(|now| went_to.is_some_and(|record| now > record.ask_seq_at_seal))
+                    && seat.key.as_deref() == went_to.map(|record| record.key.as_str()))
+        }
         None => false,
     }
 }
@@ -510,12 +530,20 @@ pub(super) fn note_survivor_head(
     installed: &BTreeSet<String>,
     sender_seat: Option<SenderSeat>,
 ) {
+    // #1660 (Engineer ruling, 29 Oct 17:12 GMT): the seat's head-ask
+    // count now. A GSS row's report closes its seat only when the count
+    // is past the count at the seal.
+    let ask_seq = inner
+        .head_ask_seq
+        .get(&(stable_group_id.to_string(), *sender))
+        .copied();
     for (key, delivery) in &mut inner.ce.deliveries {
         if key.stable_group_id == stable_group_id
             && report_may_close(
                 sender_seat.clone(),
                 delivery.gss_epoch.is_some(),
-                delivery.share_went_to.get(sender).map(String::as_str),
+                delivery.share_went_to.get(sender),
+                ask_seq,
             )
         {
             note_converged(
@@ -532,6 +560,7 @@ pub(super) fn note_survivor_head(
         sender,
         installed,
         sender_seat.clone(),
+        ask_seq,
     );
     super::rebind::note_survivor_head(
         &mut inner.rebind,
@@ -539,6 +568,7 @@ pub(super) fn note_survivor_head(
         sender,
         installed,
         sender_seat.clone(),
+        ask_seq,
     );
     super::owner_recovery::note_survivor_head(
         &mut inner.orc,
@@ -546,15 +576,17 @@ pub(super) fn note_survivor_head(
         sender,
         installed,
         sender_seat,
+        ask_seq,
     );
 }
 
 /// #1660: record that a sealed share of the group secret `epoch` went to
 /// `recipient`'s seat key `kem`. Every S4 plane that seals a share calls
-/// this under the S4 lock, before the share's send task leaves. Each of
-/// its GSS delivery rows of that group and epoch keeps the key, and a
-/// later report from the seat closes the row only against this record
-/// ([`report_may_close`]).
+/// this after its send task is admitted, while no caller holds the S4
+/// lock (this function takes it). Each of its GSS delivery rows of that
+/// group and epoch keeps the record — the key and the seat's head-ask
+/// count at the seal — and a later report from the seat closes the row
+/// only against this record ([`report_may_close`]).
 pub(super) async fn note_share_went_to(
     state: &AppState,
     stable_group_id: &str,
@@ -563,9 +595,20 @@ pub(super) async fn note_share_went_to(
     kem: &str,
 ) {
     let mut inner = state.revocation_evictions.inner.lock().await;
+    let ask_seq_at_seal = inner
+        .head_ask_seq
+        .get(&(stable_group_id.to_string(), *recipient))
+        .copied()
+        .unwrap_or(0);
     for (key, delivery) in &mut inner.ce.deliveries {
         if key.stable_group_id == stable_group_id && delivery.gss_epoch == Some(epoch) {
-            delivery.share_went_to.insert(*recipient, kem.to_string());
+            delivery.share_went_to.insert(
+                *recipient,
+                ShareRecord {
+                    key: kem.to_string(),
+                    ask_seq_at_seal,
+                },
+            );
         }
     }
     super::removal_delivery::note_share_went_to(
@@ -574,6 +617,7 @@ pub(super) async fn note_share_went_to(
         epoch,
         recipient,
         kem,
+        ask_seq_at_seal,
     );
     super::owner_recovery::note_share_went_to(
         &mut inner.orc,
@@ -581,13 +625,29 @@ pub(super) async fn note_share_went_to(
         epoch,
         recipient,
         kem,
+        ask_seq_at_seal,
     );
 }
 
-/// Ask each of `peers` for a catch-up page of `group_id`, on the existing
-/// request path, detached (an offline peer must not hold the worker).
-/// The answer reports the peer's head ([`note_survivor_head`]).
-pub(super) fn ask_heads(state: &Arc<AppState>, group_id: &str, peers: Vec<AgentId>) {
+/// Ask each of `peers` for a catch-up page of `stable_group_id`, on the
+/// existing request path, detached (an offline peer must not hold the
+/// worker). The answer reports the peer's head ([`note_survivor_head`]).
+/// #1660 (Engineer ruling, 29 Oct 17:12 GMT): each dispatch counts, per
+/// seat, as a head ask. A delivery row's share record keeps the count at
+/// its seal, and a report closes a GSS seat only after the count moved
+/// past that — only answers that could answer an ask sent after the
+/// seal close the seat. No caller holds the S4 lock; this function takes
+/// it.
+pub(super) async fn ask_heads(state: &Arc<AppState>, group_id: &str, peers: Vec<AgentId>) {
+    {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        for peer in &peers {
+            *inner
+                .head_ask_seq
+                .entry((group_id.to_string(), *peer.as_bytes()))
+                .or_insert(0) += 1;
+        }
+    }
     for peer in peers {
         let task_state = Arc::clone(state);
         let group_id = group_id.to_string();
@@ -1470,7 +1530,6 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
             }
             started
         };
-        ask_heads(state, &key.stable_group_id, head_asks);
         for (recipient, attempt) in started {
             // §3 (#1508 review P1): a GSS survivor installs the frame only
             // with its new secret, so every send seals that secret again.
@@ -1489,6 +1548,11 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
                 Arc::clone(&delivery.bytes),
             );
         }
+        // #1660 (Engineer ruling, 29 Oct 17:12 GMT): the asks leave after
+        // this round's shares are sealed and recorded, so their answers
+        // are answers to asks sent after the seal — the only answers the
+        // gate accepts.
+        ask_heads(state, &key.stable_group_id, head_asks).await;
         for agent in refreshes {
             let task_state = Arc::clone(state);
             let _spawned = state.spawn_detached(async move {
@@ -7349,9 +7413,7 @@ mod daemon_tests {
 
         /// Record, as a sealing round does, a share of the row's epoch
         /// (2, the fixture's) sealed to the KEM key the seat carries now.
-        /// This is the control shape: after it, a live clean sender's
-        /// report converges the seat, so the refusal tests below check
-        /// their own gate and not the share rule.
+        /// No head ask has gone out since: the pre-seal-answer shape.
         async fn record_share_to_seat_key(&self) {
             let kem_b64 = {
                 let groups = self.state.named_groups.read().await;
@@ -7369,6 +7431,17 @@ mod daemon_tests {
                 &kem_b64,
             )
             .await;
+        }
+
+        /// Count one head ask to the sender since the seal (the next
+        /// round's ask): the post-seal-answer shape (Engineer ruling,
+        /// 29 Oct 17:12 GMT).
+        async fn record_post_seal_ask(&self) {
+            let mut inner = self.state.revocation_evictions.inner.lock().await;
+            *inner
+                .head_ask_seq
+                .entry((self.key.stable_group_id.clone(), *self.survivor.as_bytes()))
+                .or_insert(0) += 1;
         }
 
         /// How many sealed shares were scheduled to the sender.
@@ -7483,6 +7556,7 @@ mod daemon_tests {
         // then checks the roster gate, not the share rule.
         let control = seat_report_fixture(true).await?;
         control.record_share_to_seat_key().await;
+        control.record_post_seal_ask().await;
         control.feed_report(Some(&control.result_head)).await;
         assert_eq!(
             control.seat().await,
@@ -7491,6 +7565,7 @@ mod daemon_tests {
         );
         let fx = seat_report_fixture(true).await?;
         fx.record_share_to_seat_key().await;
+        fx.record_post_seal_ask().await;
         fx.remove_sender_mid_send().await;
         fx.feed_report(Some(&fx.result_head)).await;
         assert_eq!(
@@ -7514,6 +7589,7 @@ mod daemon_tests {
         // report from the clean member converges it.
         let control = seat_report_fixture(true).await?;
         control.record_share_to_seat_key().await;
+        control.record_post_seal_ask().await;
         control.feed_report(Some(&control.result_head)).await;
         assert_eq!(
             control.seat().await,
@@ -7522,6 +7598,7 @@ mod daemon_tests {
         );
         let fx = seat_report_fixture(true).await?;
         fx.record_share_to_seat_key().await;
+        fx.record_post_seal_ask().await;
         // The sender's advertised machine (a real keypair, so its
         // revocation record verifies), revoked after the send began. The
         // advert replaces the fixture's with a strictly later timestamp:
@@ -7677,6 +7754,39 @@ mod daemon_tests {
         Ok(())
     }
 
+    /// #1660 (Engineer ruling, 29 Oct 17:12 GMT): a delayed answer to a
+    /// head ask sent before the seal arrives after the share was sealed
+    /// and recorded. It closes nothing: no head ask has gone to the seat
+    /// since the seal, so the answer could only answer a pre-seal ask.
+    /// The next round's ask leaves (post-seal), and only an answer after
+    /// that converges the seat.
+    #[tokio::test]
+    async fn an_answer_to_a_pre_seal_ask_closes_no_seat_until_a_post_seal_ask() -> Result<()> {
+        let fx = seat_report_fixture(true).await?;
+        fx.record_share_to_seat_key().await;
+        // The delayed pre-seal answer: the record exists, the key
+        // matches, and the report still closes nothing.
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Sent),
+            "an answer that could only answer a pre-seal ask closes no seat (#1660)"
+        );
+        assert!(fx.row_open().await, "the delivery row stays open");
+        // The next round's ask leaves — after the seal. The fresh answer
+        // converges the seat.
+        fx.record_post_seal_ask().await;
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the answer to a post-seal ask converges the seat"
+        );
+        fx.round_now().await;
+        assert!(!fx.row_open().await, "the converged row completes");
+        Ok(())
+    }
+
     /// #1660 (ADR 0110 §3): a Pending or Banned sender is no Active
     /// member of the live roster, so its report is not a survivor's and
     /// closes no seat — the same gate as a removal, without one.
@@ -7686,6 +7796,7 @@ mod daemon_tests {
         // from the live member converges it.
         let control = seat_report_fixture(true).await?;
         control.record_share_to_seat_key().await;
+        control.record_post_seal_ask().await;
         control.feed_report(Some(&control.result_head)).await;
         assert_eq!(
             control.seat().await,
@@ -7698,6 +7809,7 @@ mod daemon_tests {
         ] {
             let fx = seat_report_fixture(true).await?;
             fx.record_share_to_seat_key().await;
+            fx.record_post_seal_ask().await;
             fx.set_sender_seat_state(state).await;
             fx.feed_report(Some(&fx.result_head)).await;
             assert_eq!(
@@ -7722,6 +7834,7 @@ mod daemon_tests {
         // report from the clean member converges it.
         let control = seat_report_fixture(true).await?;
         control.record_share_to_seat_key().await;
+        control.record_post_seal_ask().await;
         control.feed_report(Some(&control.result_head)).await;
         assert_eq!(
             control.seat().await,
@@ -7730,6 +7843,7 @@ mod daemon_tests {
         );
         let fx = seat_report_fixture(true).await?;
         fx.record_share_to_seat_key().await;
+        fx.record_post_seal_ask().await;
         let record = x0x::revocation::RevocationRecord::sign(
             x0x::revocation::RevokedSubject::Agent(fx.survivor),
             fx.survivor_kp.public_key(),

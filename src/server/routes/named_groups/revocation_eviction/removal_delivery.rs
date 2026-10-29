@@ -80,7 +80,7 @@ pub(super) struct RemovalDelivery {
     /// this row's epoch went to. A report closes the seat only when the
     /// key the sender's seat carries now is the key a share went to
     /// ([`crypto_exclusion::report_may_close`]).
-    share_went_to: BTreeMap<[u8; 32], String>,
+    share_went_to: BTreeMap<[u8; 32], crypto_exclusion::ShareRecord>,
     /// The next round seals the share too. A live delivery's first round
     /// does not: the route published the shares with the event.
     share_due: bool,
@@ -595,7 +595,6 @@ pub(super) async fn drive(state: &Arc<AppState>) {
             }
             (started, reshare_epoch)
         };
-        crypto_exclusion::ask_heads(state, &key.stable_group_id, head_asks);
         if let Some(epoch) = reshare_epoch {
             // The removal is still on the chain at its epoch: each survivor
             // written to this round gets the epoch's secret again (#1573).
@@ -613,6 +612,10 @@ pub(super) async fn drive(state: &Arc<AppState>) {
                 Arc::clone(&delivery.event),
             );
         }
+        // #1660 (Engineer ruling, 29 Oct 17:12 GMT): the asks leave after
+        // this round's shares are sealed and recorded, so their answers
+        // are answers to asks sent after the seal.
+        crypto_exclusion::ask_heads(state, &key.stable_group_id, head_asks).await;
     }
 }
 
@@ -629,13 +632,15 @@ pub(super) fn note_survivor_head(
     sender: &[u8; 32],
     installed: &std::collections::BTreeSet<String>,
     sender_seat: Option<crypto_exclusion::SenderSeat>,
+    ask_seq: Option<u64>,
 ) {
     for (key, delivery) in removals.iter_mut() {
         if key.stable_group_id == stable_group_id
             && crypto_exclusion::report_may_close(
                 sender_seat.clone(),
                 delivery.gss_epoch.is_some(),
-                delivery.share_went_to.get(sender).map(String::as_str),
+                delivery.share_went_to.get(sender),
+                ask_seq,
             )
         {
             crypto_exclusion::note_converged(
@@ -657,10 +662,17 @@ pub(super) fn note_share_went_to(
     epoch: u64,
     recipient: &[u8; 32],
     kem: &str,
+    ask_seq_at_seal: u64,
 ) {
     for (key, delivery) in removals.iter_mut() {
         if key.stable_group_id == stable_group_id && delivery.gss_epoch == Some(epoch) {
-            delivery.share_went_to.insert(*recipient, kem.to_string());
+            delivery.share_went_to.insert(
+                *recipient,
+                crypto_exclusion::ShareRecord {
+                    key: kem.to_string(),
+                    ask_seq_at_seal,
+                },
+            );
         }
     }
 }
@@ -1536,16 +1548,22 @@ mod daemon_tests {
                 let mut inner = state.revocation_evictions.inner.lock().await;
                 let installed: std::collections::BTreeSet<String> =
                     [info.state_hash.clone()].into_iter().collect();
+                let ask_seq = inner
+                    .head_ask_seq
+                    .get(&(stable.clone(), *survivor.as_bytes()))
+                    .copied();
                 note_survivor_head(
                     &mut inner.removals,
                     &stable,
                     survivor.as_bytes(),
                     &installed,
                     // The #1660 gate: a live, D60-clean seat whose key is
-                    // the key the rounds' sealed shares went to.
+                    // the key the rounds' sealed shares went to, asked
+                    // after the seal.
                     Some(crypto_exclusion::SenderSeat {
                         key: Some(survivor_kem_b64.clone()),
                     }),
+                    ask_seq,
                 );
                 if let Some(delivery) = inner.removals.get_mut(&key) {
                     delivery.next_at = Instant::now();
@@ -1645,6 +1663,10 @@ mod daemon_tests {
             }
             let installed: std::collections::BTreeSet<String> =
                 [info.state_hash.clone()].into_iter().collect();
+            let ask_seq = inner
+                .head_ask_seq
+                .get(&(stable.clone(), *survivor.as_bytes()))
+                .copied();
             note_survivor_head(
                 &mut inner.removals,
                 &stable,
@@ -1653,6 +1675,7 @@ mod daemon_tests {
                 // The #1660 gate: a live, D60-clean seat that carries no
                 // key. The rounds sealed no share to it.
                 Some(crypto_exclusion::SenderSeat { key: None }),
+                ask_seq,
             );
             let delivery = inner.removals.get(&key).context("the row stays open")?;
             assert_eq!(

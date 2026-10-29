@@ -120,7 +120,7 @@ struct CommitDelivery {
     /// this row's epoch went to. A report closes the seat only when the
     /// key the sender's seat carries now is the key a share went to
     /// ([`report_may_close`]).
-    share_went_to: BTreeMap<[u8; 32], String>,
+    share_went_to: BTreeMap<[u8; 32], super::crypto_exclusion::ShareRecord>,
 }
 
 /// A GSS share that arrived before the recovery that makes its sender an
@@ -288,6 +288,7 @@ pub(super) fn note_survivor_head(
     sender: &[u8; 32],
     installed: &BTreeSet<String>,
     sender_seat: Option<SenderSeat>,
+    ask_seq: Option<u64>,
 ) {
     let Some(delivery) = orc.deliveries.get_mut(stable_group_id) else {
         return;
@@ -295,7 +296,8 @@ pub(super) fn note_survivor_head(
     if !report_may_close(
         sender_seat,
         delivery.reshare_epoch.is_some(),
-        delivery.share_went_to.get(sender).map(String::as_str),
+        delivery.share_went_to.get(sender),
+        ask_seq,
     ) {
         return;
     }
@@ -308,18 +310,26 @@ pub(super) fn note_survivor_head(
 }
 
 /// #1660 ([`super::crypto_exclusion::note_share_went_to`]): keep, on the
-/// GSS commit delivery of `stable_group_id` at `epoch`, the key a sealed
-/// share of that epoch's secret went to for `recipient`.
+/// GSS commit delivery of `stable_group_id` at `epoch`, the record of a
+/// sealed share of that epoch's secret for `recipient` — the key and the
+/// seat's head-ask count at the seal.
 pub(super) fn note_share_went_to(
     orc: &mut OrcState,
     stable_group_id: &str,
     epoch: u64,
     recipient: &[u8; 32],
     kem: &str,
+    ask_seq_at_seal: u64,
 ) {
     if let Some(delivery) = orc.deliveries.get_mut(stable_group_id) {
         if delivery.reshare_epoch == Some(epoch) {
-            delivery.share_went_to.insert(*recipient, kem.to_string());
+            delivery.share_went_to.insert(
+                *recipient,
+                super::crypto_exclusion::ShareRecord {
+                    key: kem.to_string(),
+                    ask_seq_at_seal,
+                },
+            );
         }
     }
 }
@@ -1740,10 +1750,14 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             .await
             .orc
             .install_commit_round(&stable, &delivery.result_head, updates);
-        ask_heads(state, &stable, head_asks);
         for (recipient, attempt) in started {
             spawn_commit_send(state, &stable, &delivery, AgentId(recipient), attempt);
         }
+        // #1660 (Engineer ruling, 29 Oct 17:12 GMT): the share seal is
+        // recorded inside the send task, so the next round's ask is the
+        // first one provably sent after the seal. Only answers to that
+        // and later asks close the seat.
+        ask_heads(state, &stable, head_asks).await;
         for agent in refreshes {
             let task_state = Arc::clone(state);
             let _spawned = state.spawn_detached(async move {
@@ -3857,17 +3871,19 @@ mod tests {
             &survivor,
             &installed,
             Some(SenderSeat { key: None }),
+            Some(1),
         );
         orc.install_commit_round("g", "head-1", Vec::new());
         assert!(!orc.deliveries.contains_key("g"));
     }
 
-    /// #1660 (ADR 0110 §3): a head report closes a seat only through a
-    /// live, D60-clean seat and — for a GSS recovery, whose rounds seal
-    /// the rotated secret — only when a sealed share went to the key the
-    /// seat carries now. A keyed seat whose share was not sealed yet
-    /// (#1660's mid-send order: the key arrives, the report lands before
-    /// the next round) closes nothing.
+    /// #1660 (ADR 0110 §3; Engineer ruling, 29 Oct 17:12 GMT): a head
+    /// report closes a seat only through a live, D60-clean seat and — for
+    /// a GSS recovery, whose rounds seal the rotated secret — only when a
+    /// sealed share went to the key the seat carries now and a head ask
+    /// went to the seat after that seal. A keyed seat whose share was not
+    /// sealed yet, or whose answer could only answer a pre-seal ask,
+    /// closes nothing.
     #[test]
     fn a_report_closes_a_recovery_seat_only_after_its_share_went_to_its_key() {
         let survivor = [7u8; 32];
@@ -3880,9 +3896,14 @@ mod tests {
             .insert(survivor, RecipientDelivery::Sent);
         orc.deliveries.insert("g".into(), delivery);
         let seat = |orc: &OrcState| orc.deliveries["g"].recipients[&survivor];
+        let keyed = || {
+            Some(SenderSeat {
+                key: Some("key-now".to_string()),
+            })
+        };
         // A member removed mid-send has no live seat: the report closes
         // nothing.
-        note_survivor_head(&mut orc, "g", &survivor, &installed, None);
+        note_survivor_head(&mut orc, "g", &survivor, &installed, None, Some(1));
         assert_eq!(seat(&orc), RecipientDelivery::Sent);
         // A live but keyless seat cannot have taken its sealed share.
         note_survivor_head(
@@ -3891,33 +3912,18 @@ mod tests {
             &survivor,
             &installed,
             Some(SenderSeat { key: None }),
+            Some(1),
         );
         assert_eq!(seat(&orc), RecipientDelivery::Sent);
         // A keyed seat whose share was not sealed to that key yet — the
         // key arrived and the report landed before the next round —
         // closes nothing: no share went to the seat's current key.
-        note_survivor_head(
-            &mut orc,
-            "g",
-            &survivor,
-            &installed,
-            Some(SenderSeat {
-                key: Some("key-now".to_string()),
-            }),
-        );
+        note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), Some(1));
         assert_eq!(seat(&orc), RecipientDelivery::Sent);
         // A share of another epoch is not this row's secret: the record
         // keeps only the row's reshare epoch.
-        note_share_went_to(&mut orc, "g", 3, &survivor, "key-now");
-        note_survivor_head(
-            &mut orc,
-            "g",
-            &survivor,
-            &installed,
-            Some(SenderSeat {
-                key: Some("key-now".to_string()),
-            }),
-        );
+        note_share_went_to(&mut orc, "g", 3, &survivor, "key-now", 0);
+        note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), Some(1));
         assert_eq!(
             seat(&orc),
             RecipientDelivery::Sent,
@@ -3925,35 +3931,33 @@ mod tests {
         );
         // A share sealed to a key the seat no longer carries (the rotated
         // stale key) proves nothing about the key it carries now.
-        note_share_went_to(&mut orc, "g", 4, &survivor, "key-rotated");
-        note_survivor_head(
-            &mut orc,
-            "g",
-            &survivor,
-            &installed,
-            Some(SenderSeat {
-                key: Some("key-now".to_string()),
-            }),
-        );
+        note_share_went_to(&mut orc, "g", 4, &survivor, "key-rotated", 0);
+        note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), Some(1));
         assert_eq!(
             seat(&orc),
             RecipientDelivery::Sent,
             "a share that went to a stale key closes nothing"
         );
         // The share went to the seat's current key — the round's record —
-        // and only the report after that converges it. The record is per
-        // seat: the later seal to the key the seat carries now replaces
-        // the stale one.
-        note_share_went_to(&mut orc, "g", 4, &survivor, "key-now");
-        note_survivor_head(
-            &mut orc,
-            "g",
-            &survivor,
-            &installed,
-            Some(SenderSeat {
-                key: Some("key-now".to_string()),
-            }),
+        // and the report converges it only after a head ask went out past
+        // the seal. An answer with no ask since the seal (the ruling's
+        // pre-seal answer, arrived late) closes nothing; the ask count at
+        // the seal was 0. The record is per seat: the later seal to the
+        // key the seat carries now replaces the stale one.
+        note_share_went_to(&mut orc, "g", 4, &survivor, "key-now", 0);
+        note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), None);
+        assert_eq!(
+            seat(&orc),
+            RecipientDelivery::Sent,
+            "an answer with no head ask on record closes nothing"
         );
+        note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), Some(0));
+        assert_eq!(
+            seat(&orc),
+            RecipientDelivery::Sent,
+            "an answer to a pre-seal ask closes nothing (Engineer ruling, 29 Oct 17:12 GMT)"
+        );
+        note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), Some(1));
         assert_eq!(seat(&orc), RecipientDelivery::Converged);
     }
 
@@ -3980,7 +3984,14 @@ mod tests {
                 .recipients
                 .insert(survivor, RecipientDelivery::Sent);
             orc.deliveries.insert("g".into(), delivery);
-            note_survivor_head(&mut orc, "g", &survivor, &installed, Some(sender_seat));
+            note_survivor_head(
+                &mut orc,
+                "g",
+                &survivor,
+                &installed,
+                Some(sender_seat),
+                Some(0),
+            );
             assert_eq!(
                 seat(&orc),
                 RecipientDelivery::Converged,
@@ -6369,6 +6380,16 @@ mod restart_tests {
         assert_eq!(held.state_hash, committed.state_hash);
         assert_eq!(held.secret_epoch, committed.secret_epoch);
         assert_eq!(held.shared_secret.as_deref(), Some(new_secret.as_slice()));
+        // The next round's ask leaves after the re-seal (Engineer ruling,
+        // 29 Oct 17:12 GMT); the survivor's answer to that ask ends the
+        // delivery.
+        {
+            let mut inner = author.revocation_evictions.inner.lock().await;
+            *inner
+                .head_ask_seq
+                .entry((stable.clone(), *survivor.agent.agent_id().as_bytes()))
+                .or_insert(0) += 1;
+        }
         report_head(&author, &survivor, &stable).await?;
         assert!(
             !still_delivering(&author, &stable, &survivor).await,

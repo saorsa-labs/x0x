@@ -1574,6 +1574,7 @@ pub(super) fn note_survivor_head(
     sender: &[u8; 32],
     installed: &BTreeSet<String>,
     sender_seat: Option<SenderSeat>,
+    _ask_seq: Option<u64>,
 ) {
     if sender_seat.is_none() {
         return;
@@ -1728,7 +1729,7 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             &key,
             updates,
         );
-        ask_heads(state, &key.0, head_asks);
+        ask_heads(state, &key.0, head_asks).await;
         for (recipient, attempt) in started {
             spawn_send(
                 state,
@@ -2570,6 +2571,7 @@ mod tests {
             &survivor,
             &installed,
             Some(SenderSeat { key: None }),
+            Some(1),
         );
         assert!(round(&mut rebind).is_empty());
         assert!(!rebind.deliveries.contains_key(&key));
@@ -2607,7 +2609,7 @@ mod tests {
         // A head report of a later head on the chain through "r" from a
         // sender the D60 gate refuses: no convergence evidence.
         let installed = BTreeSet::from(["r".to_string(), "r2".to_string()]);
-        note_survivor_head(&mut rebind, "g", &survivor, &installed, None);
+        note_survivor_head(&mut rebind, "g", &survivor, &installed, None, None);
         assert_eq!(
             round(&mut rebind).len(),
             1,

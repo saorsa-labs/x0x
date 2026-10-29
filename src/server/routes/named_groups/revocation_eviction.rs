@@ -177,6 +177,12 @@ struct S4Inner {
     head_rounds: HashMap<String, HeadRound>,
     /// §2: the last ask of each peer in the current round.
     head_round_asks: HeadRoundAsks,
+    /// #1660 (Engineer ruling, 29 Oct 17:12 GMT): how many head asks
+    /// this node has sent to each seat of each group. A delivery row's
+    /// share record keeps the count at its seal; a report closes a GSS
+    /// seat only after the count moved past that, so only answers that
+    /// could answer an ask sent after the seal close the seat.
+    head_ask_seq: HashMap<(String, [u8; 32]), u64>,
     /// §2: accepted `202 queued` manual bans, persisted in the `.evs` v2
     /// extension until the ban is applied.
     queued_bans: BTreeMap<EvictionKey, u64>,
@@ -1259,6 +1265,9 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
     inner
         .head_round_asks
         .retain(|stable, _| open_groups.contains(stable));
+    inner
+        .head_ask_seq
+        .retain(|(stable, _), _| open_groups.contains(stable));
     for stable in &open_groups {
         let Some((group_key, info)) = by_stable.get(stable.as_str()) else {
             continue;
