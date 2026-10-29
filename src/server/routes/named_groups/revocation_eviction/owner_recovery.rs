@@ -562,6 +562,19 @@ async fn group_by_stable(state: &AppState, group_id: &str) -> Option<(String, Gr
     Some((key, info))
 }
 
+/// `group_by_stable` behind `named_groups_persistence_lock`. #1574 item 5:
+/// `persist_named_group_info` shows its candidate in the map before the
+/// write and restores the map when the write fails, so a drop decided on an
+/// unlocked read ("group gone", "head moved") can act on a candidate that
+/// rolls back. The drives call this for their drop decisions; the
+/// informational reads keep the unlocked form. Lock order: persistence,
+/// then `named_groups` (the pass's snapshot order). Call it with no S4
+/// lock held.
+async fn committed_group_by_stable(state: &AppState, group_id: &str) -> Option<GroupInfo> {
+    let _committed = state.named_groups_persistence_lock.lock().await;
+    group_by_stable(state, group_id).await.map(|(_, info)| info)
+}
+
 /// The members a recovery commit on `info` must reach: the Active seats
 /// other than `local` and the named admins.
 fn survivors(info: &GroupInfo, local: &[u8; 32], removed: &BTreeSet<[u8; 32]>) -> Vec<[u8; 32]> {
@@ -786,10 +799,13 @@ async fn drive_mandates(state: &Arc<AppState>) {
     };
     let capabilities = state.agent.capability_store();
     for (stable, delivery) in due {
-        let head = group_by_stable(state, &stable)
+        // #1574 item 5: the gone/head-moved read below ends the owner's
+        // wait and retires its mandate file, so it reads committed roster
+        // state only (`committed_group_by_stable`).
+        let head = committed_group_by_stable(state, &stable)
             .await
-            .filter(|(_, info)| !info.withdrawn)
-            .map(|(_, info)| info.state_hash);
+            .filter(|info| !info.withdrawn)
+            .map(|info| info.state_hash);
         if head.as_deref() != Some(delivery.parent_head.as_str()) {
             // The commit landed (or the head moved and the mandate no
             // longer applies): the owner's wait ends.
@@ -1443,6 +1459,21 @@ async fn finish_commit(
     for seat in &removed {
         ng::quiesce_member_join_egress(state, group_key, seat).await;
     }
+    // #1574 item 1: both non-durable shapes below are treated as
+    // committed, and that evidence is enough for the drops after them.
+    // `ReplacedNotDurable` keeps the installed candidate in the map (the
+    // persist rolls back only `NotReplaced` and hard errors). The
+    // epoch-installed error is committed state as well: the journal it
+    // leaves is already the commit point, which a restart replays, and
+    // its non-durable roster arm converges memory to the candidate and
+    // sets the same confirmation flag. A power loss before a confirming
+    // save is the one revert; it loses the memory-only `pending` entry
+    // whether or not it was dropped, and the frame is durable here
+    // already (the `write_planned` above). The mandate retire is safe on
+    // a revert too: the owner side still applies to the reverted head
+    // (its parent), so `restore_mandates` keeps it, `drive_mandates`
+    // sends it again, and the member re-commits from the same durable
+    // frame.
     let persisted = match tree.as_ref() {
         Some((guard, _)) => {
             match ng::persist_treekem_and_named_groups_atomic_with_info(
@@ -1560,7 +1591,10 @@ async fn drive_deliveries(state: &Arc<AppState>) {
     let local = *state.agent.agent_id().as_bytes();
     let capabilities = state.agent.capability_store();
     for (stable, delivery) in due {
-        let info = group_by_stable(state, &stable).await.map(|(_, info)| info);
+        // #1574 item 5: the gone/head-moved read below drops the delivery
+        // and its GSS reshare obligation, so it reads committed roster
+        // state only (`committed_group_by_stable`).
+        let info = committed_group_by_stable(state, &stable).await;
         let Some(info) = info.filter(|info| {
             !info.withdrawn
                 && info.fork_quarantine.is_none()
@@ -3195,6 +3229,16 @@ async fn receive_commit(
         .iter()
         .map(|seat| AgentId(seat.agent))
         .collect();
+    // #1574 item 1: the two non-durable arms below treat the install as
+    // done, and that evidence is enough for the drops after them. The
+    // frame was made durable before the install (`write_received`
+    // above), and a restart puts a received frame above the loaded head
+    // back through the stash, so a power-loss revert re-runs this
+    // install and these drops on the durable frame. The epoch-installed
+    // arm is committed by the journal it leaves (the commit point a
+    // restart replays). The dropped `pending`/`mandates` waits are
+    // memory-only, and the owner's durable wait still applies to the
+    // reverted head (its parent), so its resend re-arms them.
     let installed = match (guard.as_mut(), &body.crypto) {
         (
             Some(guard),
@@ -4670,6 +4714,207 @@ mod tests {
             .orc
             .deliveries
             .contains_key(&stable));
+        state.agent.shutdown().await;
+    }
+
+    /// One group with the local admin and `survivor` as Active members,
+    /// inserted under its raw id, for the drive tests below.
+    async fn drive_group(state: &AppState, group_id: &str, survivor: &AgentId) -> GroupInfo {
+        let admin = state.agent.agent_id();
+        let mut info = GroupInfo::new("s4".into(), String::new(), admin, group_id.to_string());
+        info.add_member(
+            hex::encode(survivor.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        info
+    }
+
+    /// #1574 item 5: `drive_mandates` ends the owner's wait on its
+    /// "head moved" read, so the read must hold
+    /// `named_groups_persistence_lock`:
+    /// `persist_named_group_info` shows its candidate in the map before
+    /// the write and restores the map when the write fails. Before the
+    /// fix the drive read a mid-write head candidate and retired the
+    /// owner's wait (and its mandate file) on a head the committed roster
+    /// never moved to.
+    #[tokio::test]
+    async fn an_ended_mandate_wait_waits_out_a_roster_candidate_that_rolls_back() {
+        let (state, _dir) = super::super::super::tests::secure_endpoint_test_state()
+            .await
+            .unwrap();
+        let survivor = AgentId([0x71; 32]);
+        let promoted = *survivor.as_bytes();
+        let group_id = "e7".repeat(16);
+        let info = drive_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.orc.mandates.insert(
+                stable.clone(),
+                MandateDelivery {
+                    mandate: orc::SignedOwnerRecoveryMandateV1 {
+                        body: orc::OwnerRecoveryMandateBodyV1 {
+                            stable_group_id: stable.clone(),
+                            parent_head: info.state_hash.clone(),
+                            parent_revision: info.state_revision,
+                            revoked_admins: Vec::new(),
+                            promoted,
+                            promoted_certificate_digest: String::new(),
+                            owner_public_key: Vec::new(),
+                            issued_at_ms: 0,
+                        },
+                        signature: Vec::new(),
+                    },
+                    bytes: Arc::new(vec![4, 5, 6]),
+                    mandate_id: "m1".to_string(),
+                    promoted,
+                    parent_head: info.state_hash.clone(),
+                    recipients: BTreeMap::from([(promoted, RecipientDelivery::Due)]),
+                    next_at: Instant::now(),
+                },
+            );
+        }
+        // The mid-write window: a moved-head candidate is in the map while
+        // the persistence lock is held — exactly what a failing
+        // `persist_named_group_info` restores.
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate.state_hash = format!("{}-candidate", info.state_hash);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate);
+        let driven = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { drive_mandates(&state).await })
+        };
+        for _ in 0..30 {
+            if driven.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .mandates
+                .contains_key(&stable),
+            "the ended wait must block on the persistence lock, not read the mid-write candidate"
+        );
+        // The write failed: the map is restored under the same lock hold.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        drop(guard);
+        driven.await.unwrap();
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .mandates
+                .contains_key(&stable),
+            "the committed head is the mandate's parent, so the owner keeps waiting"
+        );
+        state.agent.shutdown().await;
+    }
+
+    /// #1574 item 5: `drive_deliveries` drops a recovery delivery on its
+    /// "head moved" read, so the read must hold
+    /// `named_groups_persistence_lock` (the same candidate window as the
+    /// mandate wait above). Before the fix the drive read a mid-write head
+    /// candidate and dropped the delivery — and its GSS reshare
+    /// obligation — on a head the committed roster never moved to.
+    #[tokio::test]
+    async fn a_dropped_recovery_delivery_waits_out_a_roster_candidate_that_rolls_back() {
+        let (state, _dir) = super::super::super::tests::secure_endpoint_test_state()
+            .await
+            .unwrap();
+        let survivor = AgentId([0x72; 32]);
+        let group_id = "e8".repeat(16);
+        let info = drive_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.orc.deliveries.insert(
+                stable.clone(),
+                CommitDelivery {
+                    bytes: Arc::new(vec![1, 2, 3]),
+                    result_head: info.state_hash.clone(),
+                    next_revision: info.state_revision.saturating_add(1),
+                    recipients: BTreeMap::from([(*survivor.as_bytes(), RecipientDelivery::Due)]),
+                    next_at: Instant::now(),
+                    resumed: false,
+                    removed: BTreeSet::new(),
+                    reshare_epoch: None,
+                },
+            );
+        }
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate.state_hash = format!("{}-candidate", info.state_hash);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate);
+        let driven = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { drive_deliveries(&state).await })
+        };
+        for _ in 0..30 {
+            if driven.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .deliveries
+                .contains_key(&stable),
+            "the drop must block on the persistence lock, not read the mid-write candidate"
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        drop(guard);
+        driven.await.unwrap();
+        let inner = state.revocation_evictions.inner.lock().await;
+        let delivery = inner
+            .orc
+            .deliveries
+            .get(&stable)
+            .expect("the committed roster keeps the delivery");
+        assert_ne!(
+            delivery.recipients.get(survivor.as_bytes()),
+            Some(&RecipientDelivery::Due),
+            "the committed roster's round ran"
+        );
+        drop(inner);
         state.agent.shutdown().await;
     }
 }

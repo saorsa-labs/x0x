@@ -463,6 +463,18 @@ async fn commit_locked(
             // The replacement is visible on disk and in memory, so the
             // commit stands and its delivery is scheduled. The guarded
             // egress sends nothing until the re-save is durable (§5).
+            //
+            // #1574 item 1: treating this arm as committed is enough for
+            // the drops below. The persist keeps the candidate in the map
+            // on this outcome (it rolls back only `NotReplaced` and hard
+            // errors), so this process never sees the install revert, and
+            // the dropped `admin_waits`/`renewals`/`held` entries describe
+            // a roster the map already shows. A power loss before a
+            // confirming save is the one revert; it loses that memory-only
+            // state whether or not it was dropped, the frame is durable
+            // here already (the `write_planned` above), and the reverted
+            // roster re-derives the seat's expiry trigger, so the pass
+            // re-opens the work instead of resting on the dropped state.
             tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: certificate rebind persisted without a durability confirmation");
             Ok(())
         }
@@ -1544,6 +1556,15 @@ async fn drive_deliveries(state: &Arc<AppState>) {
     let now = Instant::now();
     let restored: BTreeSet<String> = {
         let mut inner = state.revocation_evictions.inner.lock().await;
+        // #1574 item 6: a delivery past `CRB_DELIVERY_TTL` ends with no
+        // convergence accounting, and that evidence is enough: the frame
+        // carries no key material (§4a), so nothing must be re-sealed, and
+        // the durable catch-up log (`rebind.log`, served by
+        // `serve_catchup`) still serves the exact bytes to a survivor that
+        // asks. The seat's row then completes from the committed roster
+        // through the pass; if a power loss reverts the roster first, the
+        // reverted roster re-derives the seat's expiry trigger, so the
+        // work re-opens.
         inner.rebind.deliveries.retain(|_, delivery| {
             now.saturating_duration_since(delivery.started) < CRB_DELIVERY_TTL
         });
@@ -1583,9 +1604,19 @@ async fn drive_deliveries(state: &Arc<AppState>) {
     let local = *state.agent.agent_id().as_bytes();
     let capabilities = state.agent.capability_store();
     for (key, delivery) in due {
+        // #1574 item 5: this read decides a drop ("group gone", "head
+        // moved"), so it holds `named_groups_persistence_lock`:
+        // `persist_named_group_info` shows its candidate in the map before
+        // the write and restores the map when the write fails, and an
+        // unlocked read could drop a delivery on a candidate that rolls
+        // back. The guard covers only the read; the sends below take no
+        // lock that a roster write holds.
         let info = {
-            let groups = state.named_groups.read().await;
-            groups
+            let _committed = state.named_groups_persistence_lock.lock().await;
+            state
+                .named_groups
+                .read()
+                .await
                 .values()
                 .find(|info| info.stable_group_id() == key.0)
                 .cloned()
@@ -2062,6 +2093,15 @@ pub(in crate::server) async fn receive(
         }
     };
     match ng::persist_named_group_info(state, &group_key, next.clone()).await {
+        // #1574 item 1: `Applied` on the non-durable outcome is enough for
+        // the drops below. The frame was made durable before the install
+        // (`write_received` above), and a restart puts a received frame
+        // above the loaded head back through the stash, so a power-loss
+        // revert re-runs this install and these drops on the durable
+        // frame. The dropped `renewals`/`admin_waits` entries are
+        // memory-only, and the reverted roster re-derives them: the seat's
+        // expiry obligation opens again, so the renewal hand-off and the
+        // admin wait are re-armed.
         Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable) => {}
         Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => {
             // A local fault: the frame stays durable and in the stash.
@@ -2560,7 +2600,7 @@ mod tests {
 mod daemon_tests {
     use super::super::super as ng;
     use super::*;
-    use anyhow::Result;
+    use anyhow::{Context, Result};
 
     /// Install a verified advert. The store keeps an advert only when it is
     /// strictly newer than the held one, so each call passes a later
@@ -2699,6 +2739,106 @@ mod daemon_tests {
                 .await
                 .insert(group_id.clone(), info.clone());
         }
+        Ok(())
+    }
+
+    /// #1574 item 5: `drive_deliveries` drops a delivery on its
+    /// "withdrawn / gone / off the chain" read, so the read must hold
+    /// `named_groups_persistence_lock`: `persist_named_group_info` shows
+    /// its candidate in the map before the write and restores the map when
+    /// the write fails. Before the fix the drive read a mid-write withdraw
+    /// candidate and dropped the delivery the committed roster still
+    /// admits.
+    #[tokio::test]
+    async fn a_rebind_delivery_drop_waits_out_a_roster_candidate_that_rolls_back() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let survivor = AgentId([0x7A; 32]);
+        let group_id = "c9".repeat(16);
+        let mut info = GroupInfo::new(
+            "s4".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.add_member(
+            hex::encode(survivor.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(state.agent.agent_id().as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        let key = (stable.clone(), info.state_hash.clone());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.rebind.deliveries.insert(
+                key.clone(),
+                Delivery {
+                    bytes: Arc::new(b"X0XCRB1\0frame".to_vec()),
+                    result_head: info.state_hash.clone(),
+                    recipients: BTreeMap::from([(*survivor.as_bytes(), RecipientDelivery::Due)]),
+                    next_at: Instant::now(),
+                    started: Instant::now(),
+                    resumed: false,
+                },
+            );
+        }
+        // The mid-write window: a withdraw candidate is in the map while
+        // the persistence lock is held — exactly what a failing
+        // `persist_named_group_info` restores.
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate.withdrawn = true;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate);
+        let driven = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { drive_deliveries(&state).await })
+        };
+        for _ in 0..30 {
+            if driven.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .deliveries
+                .contains_key(&key),
+            "the drop must block on the persistence lock, not read the mid-write candidate"
+        );
+        // The write failed: the map is restored under the same lock hold.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        drop(guard);
+        driven.await?;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let delivery = inner
+            .rebind
+            .deliveries
+            .get(&key)
+            .context("the committed roster keeps the delivery")?;
+        assert_ne!(
+            delivery.recipients.get(survivor.as_bytes()),
+            Some(&RecipientDelivery::Due),
+            "the committed roster's round ran"
+        );
         Ok(())
     }
 }
