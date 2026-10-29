@@ -44,6 +44,21 @@ async fn card_body(
     Ok((status, serde_json::from_slice(&bytes)?))
 }
 
+/// Await the detached card publishes the worker pass spawned, so the
+/// assertions below see the published card deterministically.
+async fn drain_detached_cards(state: &std::sync::Arc<crate::server::AppState>) {
+    let pending: Vec<tokio::task::JoinHandle<()>> = {
+        let mut guard = state
+            .detached_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.as_mut().map(std::mem::take).unwrap_or_default()
+    };
+    for task in pending {
+        let _ = task.await;
+    }
+}
+
 /// A plain listable group owned by this node. The routes' listing gate
 /// needs a non-Hidden discoverability, so the fixture uses
 /// `PublicDirectory`, not the Hidden TreeKEM fixture group.
@@ -254,34 +269,104 @@ async fn local_card_routes_sign_no_card_from_a_held_back_group() -> Result<()> {
         "the shard cache holds no uncommitted card either"
     );
 
-    // Part 5: the hold clears. The sidecar path is writable again, so the
-    // recovery worker's pass lands the authoritative write and commits the
-    // rename; the pass then publishes the group's card from the
-    // now-committed record, so card-by-id and discovery serve the rename.
+    // Part 5: the hold ends. The fixture's group has no armed ATA, so the
+    // pass ends the hold by un-placeholdering the group: its real record
+    // is written durably, and the pass then publishes the owed card —
+    // card-by-id serves the committed rename, and the discovery publish
+    // put the card in the shard cache.
     tokio::fs::remove_dir_all(&sidecar).await?;
     group_recovery::ensure_placeholders(&state).await;
+    drain_detached_cards(&state).await;
     assert!(
         !group_recovery::is_held_back(&state, &stable),
-        "the worker's pass cleared the hold"
+        "the worker's pass ended the hold"
     );
     let (status, body) = card_body(&state, &stable).await?;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["name"].as_str(),
         Some("renamed while held back"),
-        "#1570: card-by-id serves the commit that cleared the hold"
+        "#1570: card-by-id serves the commit that ended the hold"
     );
-    let (status, body) = discover_body(&state).await?;
+    {
+        let directory = state.directory_cache.read().await;
+        let published = directory
+            .get(&stable)
+            .ok_or_else(|| anyhow::anyhow!("the owed card was published"))?;
+        assert_eq!(
+            published.name, "renamed while held back",
+            "#1570: the publish put the committed card in the shard cache"
+        );
+    }
+
+    // Part 6: a second hold, ended by an UNRELATED group's save. Every
+    // encode retries the sidecar write, so group B's persist can end A's
+    // hold outside the worker pass. B's save refreshes no card of A, so
+    // card-by-id stays on A's last committed card until the next worker
+    // pass publishes the owed card.
+    let current = state
+        .named_groups
+        .read()
+        .await
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("group A after part 5"))?;
+    group_recovery::begin_placehold(&state, &key, &current);
+    let outcome = save_named_groups_checked(&state).await;
+    assert!(
+        matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "re-placehold save must be durable: {outcome:?}"
+    );
+    // The sidecar cannot be written again: a non-empty directory holds
+    // its name.
+    tokio::fs::remove_file(&sidecar).await?;
+    tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+    let mut renamed_again = current.clone();
+    renamed_again.name = "renamed again while held back".to_string();
+    renamed_again.roster_revision = renamed_again.roster_revision.saturating_add(1);
+    renamed_again.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    let outcome = persist_named_group_info(&state, &key, renamed_again).await;
+    assert!(
+        !matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "the second rename is held back: {outcome:?}"
+    );
+    assert!(group_recovery::is_held_back(&state, &stable));
+    // Unblocked, and B's durable save ends A's hold in its own encode.
+    tokio::fs::remove_dir_all(&sidecar).await?;
+    let mut b_changed = state
+        .named_groups
+        .read()
+        .await
+        .get(&b_key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("group B"))?;
+    b_changed.roster_revision = b_changed.roster_revision.saturating_add(1);
+    b_changed.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    let outcome = persist_named_group_info(&state, &b_key, b_changed).await;
+    assert!(
+        matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "group B's save must be durable: {outcome:?}"
+    );
+    assert!(
+        !group_recovery::is_held_back(&state, &stable),
+        "group B's save ended group A's hold"
+    );
+    let (status, body) = card_body(&state, &stable).await?;
     assert_eq!(status, StatusCode::OK);
-    let cards = body["groups"].as_array().cloned().unwrap_or_default();
-    let served = cards
-        .iter()
-        .find(|c| c["group_id"].as_str() == Some(stable.as_str()))
-        .ok_or_else(|| anyhow::anyhow!("the renamed card stays listed"))?;
     assert_eq!(
-        served["name"].as_str(),
+        body["name"].as_str(),
         Some("renamed while held back"),
-        "#1570: discovery serves the committed rename after the hold clears"
+        "#1570: no card of A is refreshed by group B's save"
+    );
+    // The next worker pass publishes the owed card.
+    group_recovery::ensure_placeholders(&state).await;
+    drain_detached_cards(&state).await;
+    let (status, body) = card_body(&state, &stable).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["name"].as_str(),
+        Some("renamed again while held back"),
+        "#1570: card-by-id serves the commit that group B's save ended"
     );
     Ok(())
 }

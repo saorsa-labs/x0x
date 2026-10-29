@@ -296,6 +296,11 @@ struct Placeheld {
     /// form (#1570). The group's transition is not published, and the
     /// worker writes again.
     authoritative_failed: bool,
+    /// #1570: a hold skipped the card routes' refresh, so once the hold
+    /// ends the group's card is owed a refresh and publish. Set when a
+    /// hold starts; the worker pass clears it with a publish, whichever
+    /// save ended the hold.
+    card_owed: bool,
     /// Load reconciliation kept a placeholder that matches neither end of
     /// its binding: the live record is that placeholder, inert, and no
     /// authoritative write runs for it.
@@ -1506,6 +1511,9 @@ fn record_encode_outcome(
         if let Some(entry) = placeheld.get_mut(stable) {
             entry.authoritative_failed = failed;
             entry.legacy_pending |= failed;
+            if failed {
+                entry.card_owed = true;
+            }
             entry.encoded = encoded;
         }
     });
@@ -1746,6 +1754,7 @@ pub(super) fn begin_placehold(state: &AppState, key: &str, info: &GroupInfo) {
             encoded: None,
             durable_digest: None,
             authoritative_failed: false,
+            card_owed: false,
             lost: false,
             legacy_pending: true,
         });
@@ -1973,9 +1982,9 @@ async fn resave_legacy(state: &AppState) -> LegacyWrite {
 /// - A placeholder write that was not durable is written again.
 ///
 /// The pass also retries the sidecar write of every held-back group
-/// (#1570) and, after a durable resave, publishes the card of each group
-/// whose hold ended in the pass.
-pub(super) async fn ensure_placeholders(state: &AppState) {
+/// (#1570) and publishes each group's owed card once its hold has ended,
+/// whichever save ended the hold.
+pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
     let bodies: Vec<(String, GroupRecoveryV1)> = {
         let inner = state.group_recovery.inner.lock().await;
         inner
@@ -1989,13 +1998,13 @@ pub(super) async fn ensure_placeholders(state: &AppState) {
             .collect()
     };
     let registered = placeheld_snapshot(state);
-    // #1570: the groups held back when this pass starts. If this pass
-    // lands their record durably — by retrying the sidecar write or by
-    // un-placeholding the group — the hold ends, and the pass publishes
-    // the group's card from the then-committed record.
-    let held_back_before: Vec<String> = registered
+    // #1570: the groups whose card a hold left owed. A hold can end in
+    // any save's encode — every encode retries the sidecar write — so
+    // the pass publishes every owed card whose hold has ended, not only
+    // the holds this pass itself cleared.
+    let owed_cards: Vec<String> = registered
         .iter()
-        .filter(|(_, entry)| entry.authoritative_failed)
+        .filter(|(_, entry)| entry.card_owed)
         .map(|(stable, _)| stable.clone())
         .collect();
     if bodies.is_empty() && registered.is_empty() {
@@ -2057,6 +2066,7 @@ pub(super) async fn ensure_placeholders(state: &AppState) {
                                 encoded: None,
                                 durable_digest,
                                 authoritative_failed: false,
+                                card_owed: false,
                                 lost,
                                 legacy_pending: true,
                             },
@@ -2110,17 +2120,6 @@ pub(super) async fn ensure_placeholders(state: &AppState) {
                 }
             }
         });
-        // #1570: a hold that ended in this pass kept the card routes on
-        // the group's last committed form. That form is durable now, so
-        // the card cache and the discovery shards are refreshed from the
-        // live record, as any state change would refresh them.
-        for stable in held_back_before {
-            if !is_held_back(state, &stable) {
-                if let Some((key, _)) = live.get(&stable) {
-                    super::maybe_publish_group_card_after_state_change(state, key).await;
-                }
-            }
-        }
         for stable in unplacehold {
             // The real record is durable in the legacy views. A group that
             // was placeheld again meanwhile keeps its authoritative record.
@@ -2131,6 +2130,32 @@ pub(super) async fn ensure_placeholders(state: &AppState) {
                 }
             })
             .await;
+        }
+    }
+    // #1570: a hold kept the card routes on the group's last committed
+    // form. Whichever save ended the hold, that form is durable now, so
+    // the owed card is refreshed and published from the live record, as
+    // a state change would refresh it. Detached: the publish's gossip
+    // egress must not stall the tick.
+    for stable in owed_cards {
+        if is_held_back(state, &stable) {
+            continue;
+        }
+        with_placeheld(state, |placeheld| {
+            if let Some(entry) = placeheld.get_mut(&stable) {
+                entry.card_owed = false;
+            }
+        });
+        if let Some((key, _)) = live.get(&stable) {
+            let state_for_card = Arc::clone(state);
+            let key_for_card = key.clone();
+            state.spawn_detached(async move {
+                super::maybe_publish_group_card_after_state_change(
+                    state_for_card.as_ref(),
+                    &key_for_card,
+                )
+                .await;
+            });
         }
     }
 }
