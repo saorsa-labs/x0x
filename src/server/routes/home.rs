@@ -552,7 +552,9 @@ fn recovery_adoption_holds(
 /// Outcome of stamping Home metadata onto a group.
 enum HomeSeal {
     /// The stamped record was sealed and persisted.
-    Sealed(crate::groups::GroupInfo),
+    ///
+    /// Boxed so the defer and failure variants stay small (`large_enum_variant`).
+    Sealed(Box<crate::groups::GroupInfo>),
     /// Recovery conditions failed on the snapshot or under the persist
     /// guard. Nothing was written. The caller defers, the same way a scan
     /// that finds no candidate defers.
@@ -584,7 +586,7 @@ async fn stamp_and_seal_home(
     group_id: &str,
 ) -> Option<crate::groups::GroupInfo> {
     match seal_home(state, group_id, None).await {
-        HomeSeal::Sealed(info) => Some(info),
+        HomeSeal::Sealed(info) => Some(*info),
         HomeSeal::RecoveryDeferred | HomeSeal::Failed => None,
     }
 }
@@ -722,7 +724,7 @@ async fn seal_home(
             return HomeSeal::Failed;
         }
     }
-    HomeSeal::Sealed(info)
+    HomeSeal::Sealed(Box::new(info))
 }
 
 /// Reseal EXISTING Home metadata (round-2 fix 1): keep the metadata as
