@@ -12,8 +12,9 @@
 //! The call sites keep the same `RwLock` guard API.
 //!
 //! The scope is a tokio task-local, so it does not pass across
-//! `tokio::spawn`. A spawned step of the staged join must enter the scope
-//! again.
+//! `tokio::spawn` by itself. The spawn helpers wrap their task with
+//! [`inherit_reseat_scope`], and inbound handlers enter the scope through
+//! [`ReseatStagings`].
 //!
 //! `live_*` and `staging_*` ignore the scope. Every whole-roster encode
 //! uses the live map, so the staging slot never reaches disk. No path holds
@@ -22,6 +23,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
@@ -31,35 +34,124 @@ tokio::task_local! {
 }
 
 /// The staged re-seat join that the current task runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The scope selects the staging slot only while its staging is open. The
+/// swap and the rollback close it, so a task of the staged join that is
+/// still running afterwards uses the live map.
+#[derive(Debug, Clone)]
 pub(crate) struct ReseatScope {
     /// The live-map key of the record under re-seat (the group-id hex).
     pub(crate) group_key: String,
+    open: Arc<AtomicBool>,
 }
 
-/// The re-seat scope of the current task, if any.
-#[cfg_attr(not(test), allow(dead_code, reason = "#1699 part 2 enters the scope"))]
+impl ReseatScope {
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+}
+
+/// The open re-seat staging of the current task, if any.
 pub(crate) fn current_reseat_scope() -> Option<ReseatScope> {
-    RESEAT_SCOPE.try_with(Clone::clone).ok()
-}
-
-/// Whether the current task runs inside a re-seat scope.
-pub(crate) fn in_any_reseat_scope() -> bool {
-    RESEAT_SCOPE.try_with(|_| ()).is_ok()
-}
-
-/// Run `fut` inside the re-seat scope of `group_key`: every
-/// [`ScopedGroupMap`] then selects its staging slot for this task.
-#[cfg_attr(not(test), allow(dead_code, reason = "#1699 part 2 enters the scope"))]
-pub(crate) async fn in_reseat_scope<F: Future>(group_key: impl Into<String>, fut: F) -> F::Output {
     RESEAT_SCOPE
-        .scope(
-            ReseatScope {
-                group_key: group_key.into(),
-            },
-            fut,
-        )
-        .await
+        .try_with(Clone::clone)
+        .ok()
+        .filter(ReseatScope::is_open)
+}
+
+/// Whether the current task runs inside an open re-seat staging.
+pub(crate) fn in_any_reseat_scope() -> bool {
+    RESEAT_SCOPE.try_with(ReseatScope::is_open).unwrap_or(false)
+}
+
+/// Run `fut` inside `scope`: while it is open, every [`ScopedGroupMap`]
+/// selects its staging slot for this task.
+pub(crate) async fn in_reseat_scope<F: Future>(scope: ReseatScope, fut: F) -> F::Output {
+    RESEAT_SCOPE.scope(scope, fut).await
+}
+
+/// `fut`, run in the open re-seat staging of the task that calls this.
+/// Each spawn helper wraps its task with it, so a step that the staged join
+/// spawns stays in the scope.
+pub(crate) fn inherit_reseat_scope<F: Future>(fut: F) -> impl Future<Output = F::Output> {
+    let scope = current_reseat_scope();
+    async move {
+        match scope {
+            Some(scope) => RESEAT_SCOPE.scope(scope, fut).await,
+            None => fut.await,
+        }
+    }
+}
+
+/// `fut`, run outside any re-seat scope (a closed scope shadows the
+/// caller's): for a whole-node worker that a staged join's step can start,
+/// which must see every group's live record.
+pub(crate) async fn outside_reseat_scope<F: Future>(fut: F) -> F::Output {
+    let closed = ReseatScope {
+        group_key: String::new(),
+        open: Arc::new(AtomicBool::new(false)),
+    };
+    RESEAT_SCOPE.scope(closed, fut).await
+}
+
+/// The open re-seat stagings of this node, by live-map key and by stable
+/// group id. An inbound step of a staged join (a join result, a metadata
+/// event, a catch-up response) looks its group up here and enters the
+/// scope ([`ReseatStagings::run_in_staging_of`]).
+#[derive(Debug, Default)]
+pub(crate) struct ReseatStagings {
+    open: StdMutex<HashMap<String, ReseatScope>>,
+}
+
+impl ReseatStagings {
+    fn open_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, ReseatScope>> {
+        self.open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Open the staging of `group_key` (also found by `stable`), or return
+    /// the one that is open.
+    pub(crate) fn open(&self, group_key: &str, stable: &str) -> ReseatScope {
+        let mut open = self.open_map();
+        let scope = open.get(group_key).cloned().unwrap_or_else(|| ReseatScope {
+            group_key: group_key.to_string(),
+            open: Arc::new(AtomicBool::new(true)),
+        });
+        open.insert(group_key.to_string(), scope.clone());
+        open.insert(stable.to_string(), scope.clone());
+        scope
+    }
+
+    /// The open staging that `group_id` (a live-map key or a stable id)
+    /// names.
+    pub(crate) fn scope_for(&self, group_id: &str) -> Option<ReseatScope> {
+        self.open_map().get(group_id).cloned()
+    }
+
+    /// Close the staging of `group_key`. Returns whether one was open.
+    pub(crate) fn close(&self, group_key: &str) -> bool {
+        let mut open = self.open_map();
+        let mut closed = false;
+        open.retain(|_, scope| {
+            let same = scope.group_key == group_key;
+            if same {
+                scope.open.store(false, Ordering::Release);
+                closed = true;
+            }
+            !same
+        });
+        closed
+    }
+
+    /// Run `fut` in the staging that `group_id` names when one is open and
+    /// the task is not in a scope yet; otherwise run it as it is.
+    pub(crate) async fn run_in_staging_of<F: Future>(&self, group_id: &str, fut: F) -> F::Output {
+        match self.scope_for(group_id).filter(|_| !in_any_reseat_scope()) {
+            Some(scope) => in_reseat_scope(scope, fut).await,
+            None => fut.await,
+        }
+    }
 }
 
 /// A group map with a re-seat staging slot (see the module docs).
@@ -108,7 +200,7 @@ impl<V> ScopedGroupMap<V> {
     }
 
     /// Try to write the map that the current task's scope selects.
-    #[cfg_attr(not(test), allow(dead_code, reason = "#1699 part 2 enters the scope"))]
+    #[cfg(test)]
     pub(crate) fn try_write(
         &self,
     ) -> Result<RwLockWriteGuard<'_, HashMap<String, V>>, TryLockError> {
@@ -121,19 +213,16 @@ impl<V> ScopedGroupMap<V> {
     }
 
     /// Write the live map, whatever the scope.
-    #[cfg_attr(not(test), allow(dead_code, reason = "#1699 part 2 enters the scope"))]
     pub(crate) async fn live_write(&self) -> RwLockWriteGuard<'_, HashMap<String, V>> {
         self.live.write().await
     }
 
     /// Read the staging slot, whatever the scope.
-    #[cfg_attr(not(test), allow(dead_code, reason = "#1699 part 2 enters the scope"))]
     pub(crate) async fn staging_read(&self) -> RwLockReadGuard<'_, HashMap<String, V>> {
         self.staging.read().await
     }
 
     /// Write the staging slot, whatever the scope.
-    #[cfg_attr(not(test), allow(dead_code, reason = "#1699 part 2 enters the scope"))]
     pub(crate) async fn staging_write(&self) -> RwLockWriteGuard<'_, HashMap<String, V>> {
         self.staging.write().await
     }
@@ -162,7 +251,9 @@ mod tests {
     #[tokio::test]
     async fn inside_a_scope_the_guards_select_the_staging_slot() {
         let groups = map();
-        in_reseat_scope("g", async {
+        let stagings = ReseatStagings::default();
+        let scope = stagings.open("g", "stable-g");
+        in_reseat_scope(scope, async {
             assert_eq!(
                 current_reseat_scope().map(|scope| scope.group_key),
                 Some("g".to_string())
@@ -187,7 +278,8 @@ mod tests {
     async fn a_spawned_task_does_not_inherit_the_scope() {
         let groups = std::sync::Arc::new(map());
         let inner = std::sync::Arc::clone(&groups);
-        let seen = in_reseat_scope("g", async move {
+        let scope = ReseatStagings::default().open("g", "stable-g");
+        let seen = in_reseat_scope(scope, async move {
             tokio::spawn(async move { inner.read().await.get("g").copied() })
                 .await
                 .ok()
@@ -195,5 +287,23 @@ mod tests {
         })
         .await;
         assert_eq!(seen, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_closed_scope_shadows_the_callers_and_close_falls_back_to_live() {
+        let groups = map();
+        let stagings = ReseatStagings::default();
+        let scope = stagings.open("g", "stable-g");
+        assert!(stagings.scope_for("stable-g").is_some());
+        in_reseat_scope(scope, async {
+            groups.write().await.insert("g".to_string(), 9);
+            let seen = outside_reseat_scope(async { groups.read().await.get("g").copied() }).await;
+            assert_eq!(seen, Some(1), "a whole-node worker sees the live map");
+            assert!(stagings.close("g"));
+            assert_eq!(groups.read().await.get("g"), Some(&1), "closed: live again");
+        })
+        .await;
+        assert!(stagings.scope_for("g").is_none());
+        assert!(stagings.scope_for("stable-g").is_none());
     }
 }
