@@ -532,6 +532,7 @@ async fn build_bound_joiner_scenario(dir: &std::path::Path) -> Result<BoundJoine
                 polls: Vec::new(),
                 tasks: Vec::new(),
                 listener_token: None,
+                held_pending_notice: None,
             },
         );
     record_expected_join_result_inviter(&joiner, key.clone(), authority_hex.clone());

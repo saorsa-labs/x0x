@@ -336,6 +336,11 @@ struct Arm {
     /// The admin that must sign the exclusion commit on every survivor
     /// (the head commit after H), when the ADR row names it.
     committer: Option<&'static str>,
+    /// #1567: nodes that lose B's self-signed `MemberJoined` copy before
+    /// the trigger. A Welcome joiner gets that copy by one gossip delivery
+    /// only; on a loaded host it can come before the joiner can apply it.
+    /// The node must then get B's KeyPackage by the member-keyed catch-up.
+    lost_join_copy: &'static [&'static str],
     cause: &'static str,
 }
 
@@ -355,6 +360,7 @@ const IDLE: Arm = Arm {
     check: Check::Healthy,
     bound: Bound::Completion,
     committer: None,
+    lost_join_copy: &[],
     cause: CAUSE_IDLE,
 };
 
@@ -370,6 +376,13 @@ const SELF_LEAVE: Arm = Arm {
     trigger: Trigger::Leave,
     cause: CAUSE_SELF_LEAVE,
     ..IDLE
+};
+
+/// #1567: [`SELF_LEAVE`], but C has lost B's self-signed `MemberJoined`
+/// copy, as on the loaded Linux CI runs that ended INFRA.
+const SELF_LEAVE_LOST_JOIN_COPY: Arm = Arm {
+    lost_join_copy: &["C"],
+    ..SELF_LEAVE
 };
 
 const LEAVE_THEN_REVOKE: Arm = Arm {
@@ -398,6 +411,7 @@ const MANUAL_DURING_WINDOW: Arm = Arm {
     check: Check::ManualQueued,
     bound: Bound::Fallback,
     committer: None,
+    lost_join_copy: &[],
     cause: CAUSE_MANUAL,
 };
 
@@ -1304,6 +1318,19 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
     // possible author of B's removal while A is away) must hold it by the
     // remove route's own lookup. A miss here is INFRA, not the S4 path.
     key_packages_held(sim, arm.promoted, &group, &b_hex).await?;
+    // #1567: the node keeps only the roster's hash of B's KeyPackage. A
+    // node that still holds the bytes in its roster does not test the
+    // catch-up path, so that is INFRA.
+    for label in arm.lost_join_copy {
+        let state = sim.state(label)?;
+        ensure!(
+            crate::server::routes::named_groups::forget_member_join_copy_for_test(
+                &state, &group, &b_hex,
+            )
+            .await,
+            "{label} holds B's KeyPackage in its roster; the lost-copy premise does not hold"
+        );
+    }
     if arm.hold == Hold::Offline {
         sim.set_online("A", false)?;
     }
@@ -2058,6 +2085,27 @@ fn w3h_1357_control_s4_self_leave_crypto_only() -> Result<()> {
             "w3h_1357_control_s4_self_leave_crypto_only",
             0x1357_0002,
             SELF_LEAVE,
+            Verdict::Green,
+        )
+        .await
+    })
+}
+
+/// #1567: `s4_self_leave_crypto_only` with C's copy of B's self-signed
+/// `MemberJoined` lost. C must take B's KeyPackage from A's member-keyed
+/// catch-up answer to prove B's leaf is gone. Before the fix the answer
+/// was refused, C stayed at e0 and the arm was INFRA.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1357_control_s4_self_leave_lost_join_copy() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1357_control_s4_self_leave_lost_join_copy",
+            0x1357_000e,
+            SELF_LEAVE_LOST_JOIN_COPY,
             Verdict::Green,
         )
         .await
