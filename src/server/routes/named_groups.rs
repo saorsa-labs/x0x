@@ -7689,10 +7689,14 @@ pub(in crate::server) async fn persist_named_group_info(
     // ADR 0109 §4 (#1570 review): a held-back placeheld group's change is
     // not durable, even when the roster file is.
     let outcome = group_recovery::held_back_outcome(state, &stable, outcome);
+    // ZCode on d1be57f1: a held-back group's change is in memory only, so
+    // its roster is not published as a gossip hint. The next save that
+    // lands publishes it.
     if matches!(
         &outcome,
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
-    ) {
+    ) && !group_recovery::is_held_back(state, &stable)
+    {
         refresh_group_rosters_for_gossip(state).await;
     }
     outcome
@@ -7706,6 +7710,7 @@ async fn persist_named_group_info_inner(
     // ADR 0109 §3 step 2: a staged re-seat record keeps the original's
     // marker, so a replacement that dropped it is not a clear.
     state.group_recovery.hold_reseat_marker(&mut info);
+    let stable = info.stable_group_id().to_string();
     // #457 r4: the named write and the TreeKEM snapshot rebind are ONE
     // crash-atomic transaction under the persistence lock — the journal
     // (post-mutation named json + rebound envelope) is written FIRST, the
@@ -7861,6 +7866,19 @@ async fn persist_named_group_info_inner(
             .named_groups_requires_durability_confirmation
             .store(true, Ordering::Release),
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
+    }
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): the journal above was
+    // prepared from its own encode, and the save encoded again. If the
+    // save held this group back, the legacy views keep its last committed
+    // form, so the journalled snapshot is newer than the saved roster and
+    // a restart would reject the pair. Discard this transaction's journals
+    // (the snapshot keeps its saved binding) and report the change as not
+    // durable; the worker writes it again.
+    if group_recovery::is_held_back(state, &stable) {
+        if journals_ours {
+            discard_rebind_journal(state, group_id).await;
+        }
+        return Ok(AtomicWriteOutcome::ReplacedNotDurable);
     }
     if matches!(outcome, Ok(AtomicWriteOutcome::Durable))
         && matches!(prejournaled, RebindOutcome::Rebound)
@@ -11651,6 +11669,23 @@ async fn try_queue_causal_approval(
     );
 }
 
+/// ADR 0109 §4 (#1570): the last roster encode held back the group that a
+/// causal replay changed (its live record now, or its record before the
+/// replay). Its legacy entry kept the last committed form, so the replayed
+/// change is not on disk, even when the roster file is Durable.
+async fn replay_group_held_back(
+    state: &AppState,
+    group_id: &str,
+    before: Option<&x0x::groups::GroupInfo>,
+) -> bool {
+    let groups = state.named_groups.read().await;
+    groups
+        .get(group_id)
+        .into_iter()
+        .chain(before)
+        .any(|info| group_recovery::is_held_back(state, info.stable_group_id()))
+}
+
 /// ADR 0028: drain queued causal approvals after a group-state advance. Each
 /// entry is retried with the full ordinary validator (queueing disabled). An
 /// approval applies exactly once only when its matching request is pending and
@@ -11878,6 +11913,23 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                     }
                 }
                 Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => (false, false),
+            };
+            // ADR 0109 §4 (#1570, ZCode on d1be57f1): the roster file can be
+            // Durable while this group is held back. Its legacy entry then
+            // keeps the last committed form, so the approval is not on disk.
+            // Treat it as a failed persist: roll memory back, keep the queue
+            // receipt and run no effect. The next drain applies it again.
+            let (persisted, visible_not_durable) = if (persisted || visible_not_durable)
+                && replay_group_held_back(state, group_id, group_snapshot.as_ref()).await
+            {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id),
+                    request_id = %pending.request_id,
+                    "ADR 0109 S3: the replayed approval is held back (its authoritative record is not durable); rolling back, retaining queue entry"
+                );
+                (false, false)
+            } else {
+                (persisted, visible_not_durable)
             };
             if !persisted && !visible_not_durable {
                 tracing::warn!(
@@ -24915,9 +24967,13 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
     if sidecar_outcome == AtomicWriteOutcome::NotReplaced && home_suite_json != "{}" {
         anyhow::bail!("withdrawn Home-Suite sidecar repair did not replace the sidecar");
     }
-    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &repair_json)
-        .await
-        .map_err(|e| anyhow::anyhow!("withdrawn named groups repair write: {e}"))?;
+    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &repair_json).await;
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): a roster writer, so a
+    // placeheld group's committed legacy form advances only when this
+    // write landed.
+    group_recovery::commit_legacy_write(state, &outcome);
+    let outcome =
+        outcome.map_err(|e| anyhow::anyhow!("withdrawn named groups repair write: {e}"))?;
     match outcome {
         AtomicWriteOutcome::Durable => state
             .named_groups_requires_durability_confirmation
@@ -35311,9 +35367,12 @@ pub(super) async fn restore_reseat_snapshot_cover(
 /// not there) before the re-seat swap's tree write. That write replaces
 /// the sidecar before its commit point, so a failure after it must put
 /// both files back, as it puts the original's snapshot back.
+/// With them, the committed legacy form of each placeheld group (#1570):
+/// a restore of the named bytes puts those forms back too.
 pub(super) struct RosterStoresBefore {
     home_suite: Option<Vec<u8>>,
     named: Option<Vec<u8>>,
+    committed: group_recovery::CommittedForms,
 }
 
 async fn read_if_present(path: &FsPath) -> Result<Option<Vec<u8>>> {
@@ -35330,6 +35389,7 @@ pub(super) async fn read_roster_stores(state: &AppState) -> Result<RosterStoresB
     Ok(RosterStoresBefore {
         home_suite: read_if_present(&state.home_suite_groups_path).await?,
         named: read_if_present(&state.named_groups_path).await?,
+        committed: group_recovery::committed_forms(state),
     })
 }
 
@@ -35366,6 +35426,11 @@ pub(super) async fn restore_home_suite_store(
 /// Put `named_groups.json` back to `before`, durably. A file that was not
 /// there stays as it is: every roster save writes it. Caller holds
 /// `named_groups_persistence_lock` since [`read_roster_stores`].
+///
+/// #1570 (ZCode on d1be57f1): a Durable restore also puts each placeheld
+/// group's committed legacy form back to the one read with the bytes. A
+/// later held-back save then writes the form that is on disk, never a
+/// form from the write that this restore undid.
 pub(super) async fn restore_named_store(
     state: &AppState,
     before: &RosterStoresBefore,
@@ -35376,7 +35441,10 @@ pub(super) async fn restore_named_store(
     match write_named_groups_json_atomic(&state.named_groups_path, &String::from_utf8_lossy(named))
         .await
     {
-        Ok(AtomicWriteOutcome::Durable) => Ok(()),
+        Ok(AtomicWriteOutcome::Durable) => {
+            group_recovery::restore_committed_forms(state, &before.committed);
+            Ok(())
+        }
         Ok(outcome) => Err(anyhow::anyhow!("named groups restore: {outcome:?}")),
         Err(e) => Err(anyhow::anyhow!("named groups restore: {e}")),
     }
@@ -35861,6 +35929,15 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         .await
         .map_err(|e| before_commit(anyhow::anyhow!("named groups encode: {e}")))?
     };
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): the encode held this group
+    // back, so its legacy entry keeps the last committed form. A snapshot
+    // of the new epoch would then be newer than the saved roster. Write
+    // nothing; the caller rolls back.
+    if group_recovery::is_held_back(state, &stable_group_id) {
+        return Err(before_commit(anyhow::anyhow!(
+            "ADR 0109 §4: the group's authoritative record is not durable (held back)"
+        )));
+    }
 
     #[cfg(test)]
     maybe_force_atomic_persist_post_json_withdrawn_group_for_test(
@@ -36014,14 +36091,17 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         discard_unless_kept(state, group_id_hex, keep_journals).await;
         anyhow::bail!("named groups replacement did not occur");
     }
-    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
-        .await
-        .map_err(|e| {
-            // The legacy journal is already the commit point. A restart
-            // replays this epoch, so the caller must keep the outbound event.
-            anyhow::Error::new(EpochInstalledPersistError)
-                .context(format!("named groups write: {e}"))
-        })?;
+    let outcome =
+        write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json).await;
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): this is a roster writer too,
+    // so a placeheld group's committed legacy form advances only when this
+    // write landed.
+    group_recovery::commit_legacy_write(state, &outcome);
+    let outcome = outcome.map_err(|e| {
+        // The legacy journal is already the commit point. A restart
+        // replays this epoch, so the caller must keep the outbound event.
+        anyhow::Error::new(EpochInstalledPersistError).context(format!("named groups write: {e}"))
+    })?;
     match outcome {
         AtomicWriteOutcome::Durable => state
             .named_groups_requires_durability_confirmation

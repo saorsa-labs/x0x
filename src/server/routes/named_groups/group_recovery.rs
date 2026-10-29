@@ -1472,7 +1472,14 @@ async fn sync_authoritative(
     })
     .await;
     if !written {
-        tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the authoritative record is not durable; the group keeps its committed legacy form");
+        // ZCode on d1be57f1: the worker retries every tick while the
+        // sidecar stays unwritable. Warn once, when the group starts to be
+        // held back; the retries log at debug level.
+        if entry.authoritative_failed {
+            tracing::debug!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the authoritative record is still not durable; the group stays held back");
+        } else {
+            tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the authoritative record is not durable; the group keeps its committed legacy form");
+        }
         return Err(std::io::Error::other(
             "ADR 0109 §4: the S3 authoritative record is not durable",
         ));
@@ -1504,8 +1511,9 @@ fn record_encode_outcome(
     });
 }
 
-/// #1570 rc4, for the one roster writer: the legacy write of the last
-/// encode ended with `outcome`. Only a `Durable` write commits each
+/// #1570 rc4, for each writer of a [`legacy_store_view`] encode (the
+/// checked roster save, the TreeKEM atomic writer and the withdrawn
+/// repair): the legacy write of the last encode ended with `outcome`. Only a `Durable` write commits each
 /// placeheld group's encoded form. After `ReplacedNotDurable` the file
 /// on disk can be either form, and the caller writes memory again (for a
 /// rejected clear, the record with its marker), so the committed form
@@ -1521,6 +1529,41 @@ pub(super) fn commit_legacy_write(
             let encoded = entry.encoded.take();
             if let Some(encoded) = encoded.filter(|_| landed) {
                 entry.committed = encoded;
+            }
+        }
+    });
+}
+
+/// #1645 and #1570 (ZCode on d1be57f1): the committed legacy form of each
+/// placeheld group, read together with the roster store bytes that hold
+/// it ([`super::read_roster_stores`]). A rollback that puts those bytes
+/// back puts these forms back too ([`restore_committed_forms`]), so the
+/// committed form always names what is on disk.
+#[derive(Debug, Clone, Default)]
+pub(super) struct CommittedForms(HashMap<String, LegacyForm>);
+
+/// Read [`CommittedForms`]. Caller holds `named_groups_persistence_lock`.
+pub(super) fn committed_forms(state: &AppState) -> CommittedForms {
+    with_placeheld(state, |placeheld| {
+        CommittedForms(
+            placeheld
+                .iter()
+                .map(|(stable, entry)| (stable.clone(), entry.committed.clone()))
+                .collect(),
+        )
+    })
+}
+
+/// The legacy file holds the bytes read with `forms` again (a Durable
+/// restore): each placeheld group's committed form goes back to the one
+/// read then. A group placeheld since then keeps its own. No encode is
+/// pending after a restore, so `encoded` is cleared.
+pub(super) fn restore_committed_forms(state: &AppState, forms: &CommittedForms) {
+    with_placeheld(state, |placeheld| {
+        for (stable, entry) in placeheld.iter_mut() {
+            entry.encoded = None;
+            if let Some(form) = forms.0.get(stable) {
+                entry.committed = form.clone();
             }
         }
     });
@@ -12771,6 +12814,156 @@ mod tests {
         assert!(
             matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
             "both writes are durable: {outcome:?}"
+        );
+        Ok(())
+    }
+
+    /// Block `stable`'s sidecar (a non-empty directory holds its name),
+    /// change the live record under `key` and save: the group is held
+    /// back.
+    async fn hold_back_by_blocked_sidecar(
+        state: &Arc<AppState>,
+        key: &str,
+        stable: &str,
+        note: &str,
+    ) -> anyhow::Result<()> {
+        let path = sidecar_path(state, stable);
+        if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
+            tokio::fs::remove_file(&path).await?;
+        }
+        tokio::fs::create_dir_all(path.join("blocked")).await?;
+        if let Some(live) = state.named_groups.write().await.get_mut(key) {
+            live.description = note.to_string();
+        }
+        super::super::save_named_groups_checked(state).await?;
+        assert!(
+            is_held_back(state, stable),
+            "{note}: the group is held back"
+        );
+        Ok(())
+    }
+
+    /// ZCode on d1be57f1 (#1570), the #1645 swap rollback: a Durable
+    /// restore of `named_groups.json` puts each placeheld group's committed
+    /// legacy form back with the bytes. Here a Durable save commits v2 of
+    /// group P, the restore puts the v1 bytes back, and then P is held
+    /// back. RED (before the fix): the held-back save wrote P's v2 form,
+    /// which the restore had removed from disk. GREEN: it writes v1, the
+    /// form on disk. (In the swap itself the rollback runs only when the
+    /// swap's legacy write did not land Durable, so no commit is undone
+    /// today; this pins the restore's own contract.) Inert.
+    #[tokio::test]
+    async fn a_roster_restore_puts_the_committed_form_back() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+        let v1 = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("armed legacy entry"))?;
+        assert!(s3::is_s3_placeholder(&v1));
+        let before = super::super::read_roster_stores(&state).await?;
+
+        // A Durable save commits P's v2 form.
+        if let Some(live) = state.named_groups.write().await.get_mut(&key) {
+            live.description = "v2".to_string();
+        }
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        // The rollback puts the v1 bytes back.
+        super::super::restore_named_store(&state, &before).await?;
+        let restored = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("restored legacy entry"))?;
+        assert_eq!(serde_json::to_value(&restored)?, serde_json::to_value(&v1)?);
+
+        // P is held back: its legacy entry must stay the form on disk (v1).
+        hold_back_by_blocked_sidecar(&state, &key, &stable, "v3").await?;
+        let held = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("held legacy entry"))?;
+        assert_eq!(
+            serde_json::to_value(&held)?,
+            serde_json::to_value(&v1)?,
+            "#1570: the held-back form is the restored one, not the undone v2"
+        );
+        Ok(())
+    }
+
+    /// ZCode on d1be57f1 (#1570): an encode clears the held-back latch of
+    /// a placeheld group that has no authoritative write in it: a group
+    /// that is lost, absent from the map, or frozen for a staged re-seat.
+    /// If a branch kept the latch, `is_held_back` would stay true for
+    /// ever, and every later change to the group would be refused (fail
+    /// closed, but a permanent stall). The sidecar stays unwritable in
+    /// each step, so only the branch can clear the latch. Inert.
+    #[tokio::test]
+    async fn the_held_back_latch_clears_for_lost_absent_and_frozen_groups() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+        assert!(!is_held_back(&state, &stable));
+
+        // Lost: load reconciliation kept an inert placeholder.
+        hold_back_by_blocked_sidecar(&state, &key, &stable, "lost").await?;
+        with_placeheld(&state, |placeheld| {
+            if let Some(entry) = placeheld.get_mut(&stable) {
+                entry.lost = true;
+            }
+        });
+        super::super::save_named_groups_checked(&state).await?;
+        assert!(
+            !is_held_back(&state, &stable),
+            "a lost group is not held back"
+        );
+        with_placeheld(&state, |placeheld| {
+            if let Some(entry) = placeheld.get_mut(&stable) {
+                entry.lost = false;
+            }
+        });
+
+        // Absent: the group has no record in the map.
+        hold_back_by_blocked_sidecar(&state, &key, &stable, "absent").await?;
+        let live = state
+            .named_groups
+            .write()
+            .await
+            .remove(&key)
+            .ok_or_else(|| anyhow::anyhow!("live record"))?;
+        super::super::save_named_groups_checked(&state).await?;
+        assert!(
+            !is_held_back(&state, &stable),
+            "an absent group is not held back"
+        );
+        state.named_groups.write().await.insert(key.clone(), live);
+
+        // Frozen: a staged re-seat keeps the original's record. The journal
+        // is written while the sidecar is writable, then it is blocked
+        // again.
+        hold_back_by_blocked_sidecar(&state, &key, &stable, "frozen").await?;
+        let path = sidecar_path(&state, &stable);
+        tokio::fs::remove_dir_all(&path).await?;
+        let original = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("live record"))?;
+        assert!(open_staging_journal_for_test(&state, &key, &original).await?);
+        assert!(
+            is_held_back(&state, &stable),
+            "a journal write keeps the latch"
+        );
+        tokio::fs::remove_file(&path).await?;
+        tokio::fs::create_dir_all(path.join("blocked")).await?;
+        super::super::save_named_groups_checked(&state).await?;
+        assert!(
+            !is_held_back(&state, &stable),
+            "a frozen group is not held back"
         );
         Ok(())
     }

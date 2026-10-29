@@ -75,13 +75,27 @@ async fn held_back_tombstone_deletes_no_snapshot_and_restart_is_consistent() -> 
     tokio::fs::remove_file(&sidecar).await?;
     tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
 
-    // Record the card-cache entries before the tombstone. A durable
-    // tombstone refreshes them from the withdrawn record (it removes them);
-    // a held-back one must not touch them.
+    // Put the group's card in the card cache under both keys before the
+    // tombstone. A durable tombstone refreshes the cache from the
+    // withdrawn record, which removes both entries; a held-back one must
+    // not touch them. (With an empty cache this check could not fail.) The
+    // fixture group is Hidden, so the card is signed from a listed copy;
+    // only its presence in the cache is checked.
+    let mut listed = durable.clone();
+    listed.policy.discoverability = x0x::groups::GroupDiscoverability::PublicDirectory;
+    let card = listed
+        .to_signed_group_card(state.agent.identity().agent_keypair())?
+        .ok_or_else(|| anyhow::anyhow!("the fixture group has a card"))?;
+    {
+        let mut cache = state.group_card_cache.write().await;
+        cache.insert(group_id.clone(), card.clone());
+        cache.insert(stable.clone(), card);
+    }
     let cards_before = {
         let cache = state.group_card_cache.read().await;
         (cache.contains_key(&group_id), cache.contains_key(&stable))
     };
+    assert_eq!(cards_before, (true, true), "the cache holds the card");
 
     // The withdrawal tombstone. Its persist touches the held-back group, so
     // it writes nothing, rolls the live map back and is not durable.

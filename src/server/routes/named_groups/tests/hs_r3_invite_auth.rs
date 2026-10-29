@@ -842,6 +842,14 @@ async fn reseat_invite_at_plain_join_is_refused_outside_staging() -> Result<()> 
         joiner.named_groups.read().await.is_empty(),
         "the refusal comes before any stub"
     );
+    // The refusal is counted under its own reason (docs/api-reference.md,
+    // `invites_refused_reasons`). The joiner has no record of the group,
+    // so the row is keyed by the invite's group ID.
+    assert_eq!(
+        invite_refusal_counts(&joiner, &reseat.group_id),
+        std::collections::BTreeMap::from([("reseat_invite_outside_staging".to_string(), 1)]),
+        "the refusal is counted as reseat_invite_outside_staging"
+    );
 
     // Control: an ordinary owner-axis invite, countersignature removed.
     let (owner_invite, _) = assemble_signed_v4_invite(
@@ -875,7 +883,38 @@ async fn reseat_invite_at_plain_join_is_refused_outside_staging() -> Result<()> 
         "an ordinary invite keeps the countersignature reason"
     );
     assert!(joiner.named_groups.read().await.is_empty());
+    assert_eq!(
+        invite_refusal_counts(&joiner, &reseat.group_id),
+        std::collections::BTreeMap::from([
+            ("invite_owner_countersignature_missing".to_string(), 1),
+            ("reseat_invite_outside_staging".to_string(), 1),
+        ]),
+        "each refusal is counted under its own reason"
+    );
     Ok(())
+}
+
+/// The `invites_refused_reasons` counters that `state` holds for
+/// `group_id`, also for a group that has no record in the map (a joiner
+/// refuses before any stub).
+fn invite_refusal_counts(
+    state: &AppState,
+    group_id: &str,
+) -> std::collections::BTreeMap<String, u64> {
+    state
+        .groups_diagnostics
+        .snapshot(
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &HashMap::new(),
+            state.groups_config.mandate_grace_days,
+        )
+        .groups
+        .into_iter()
+        .find(|row| row.group_id == group_id)
+        .map(|row| row.counters.invites_refused_reasons)
+        .unwrap_or_default()
 }
 
 /// r3 (#468 A5 / Fable 2 + Codex 9) → r4 (addendum item 7): fork

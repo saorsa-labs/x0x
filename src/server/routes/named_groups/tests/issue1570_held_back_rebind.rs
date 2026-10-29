@@ -125,3 +125,180 @@ async fn held_back_metadata_seal_keeps_snapshot_at_saved_roster_across_restart()
     );
     Ok(())
 }
+
+/// ZCode on d1be57f1 (#1570), ADR 0109 §4: the TreeKEM atomic writer is a
+/// roster writer too. When its encode holds the group back, the legacy
+/// views keep the group's last committed form, so a snapshot written for
+/// the new state would be ahead of the saved roster. RED (before the fix):
+/// the writer wrote the snapshot, journal and roster and returned `Ok`.
+/// GREEN: it stops before its commit point, and the snapshot and the
+/// roster on disk do not change.
+#[tokio::test]
+async fn held_back_treekem_atomic_persist_stops_before_commit() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0x74, 0x75).await?;
+    let state = &fixture.state;
+    let group_id = fixture.group_id.clone();
+    let seeded = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("fixture group"))?;
+    let outcome = persist_named_group_info(state, &group_id, seeded).await;
+    assert!(
+        matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "seed persist must be durable: {outcome:?}"
+    );
+    let durable = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("seeded group"))?;
+    let stable = durable.stable_group_id().to_string();
+    group_recovery::begin_placehold(state, &group_id, &durable);
+    let outcome = save_named_groups_checked(state).await;
+    assert!(
+        matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "placehold save must be durable: {outcome:?}"
+    );
+
+    let sidecar = state
+        .data_dir
+        .join(s3::GROUP_RECOVERY_DIR)
+        .join(s3::sidecar_file_name(&stable));
+    tokio::fs::remove_file(&sidecar).await?;
+    tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+    let snapshot_path = treekem_snapshot_path(&state.treekem_dir, &group_id);
+    let journal_path = treekem_journal_path(&state.treekem_dir, &group_id);
+    let snapshot_before = tokio::fs::read(&snapshot_path).await?;
+    let roster_before = tokio::fs::read(&state.named_groups_path).await?;
+
+    let mut renamed = durable.clone();
+    renamed.name = "renamed by the TreeKEM writer while held back".to_string();
+    renamed.roster_revision = renamed.roster_revision.saturating_add(1);
+    renamed.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+    let live = state
+        .treekem_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("live TreeKEM group"))?;
+    let group = live.lock().await;
+    let result =
+        persist_treekem_and_named_groups_atomic_with_info(state, &group_id, renamed, &group).await;
+    drop(group);
+    let error = result.expect_err("#1570: a held-back TreeKEM persist is refused");
+    assert!(
+        persist_stopped_before_commit(&error),
+        "the refusal comes before the commit point: {error:#}"
+    );
+    assert!(group_recovery::is_held_back(state, &stable));
+    assert_eq!(
+        tokio::fs::read(&snapshot_path).await?,
+        snapshot_before,
+        "the snapshot does not move past the saved roster"
+    );
+    assert_eq!(
+        tokio::fs::read(&state.named_groups_path).await?,
+        roster_before,
+        "the roster file does not change"
+    );
+    assert!(!tokio::fs::try_exists(&journal_path).await?);
+    Ok(())
+}
+
+/// ZCode on d1be57f1 (#1570), ADR 0109 §4: a Durable write by the TreeKEM
+/// atomic writer commits the legacy form that its encode gave every other
+/// placeheld group. RED (before the fix): the writer did not commit it, so
+/// a later held-back save wrote the older committed form over the newer
+/// durable one, and a change that was durable on disk went back. GREEN: the
+/// held-back save keeps the form that the TreeKEM writer made durable.
+#[tokio::test]
+async fn treekem_writer_commits_other_placeheld_groups_legacy_form() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0x76, 0x77).await?;
+    let state = &fixture.state;
+    let group_id = fixture.group_id.clone();
+    let treekem_record = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("fixture group"))?;
+
+    // A second group P is placeheld, with a durable authoritative record.
+    let admin = x0x::identity::AgentKeypair::generate()?;
+    let mut other = x0x::groups::GroupInfo::new(
+        "issue1570-other".to_string(),
+        "v1".to_string(),
+        admin.agent_id(),
+        "1570".repeat(16),
+    );
+    other.seal_commit(&admin, 1_000)?;
+    let other_key = other.mls_group_id.clone();
+    let other_stable = other.stable_group_id().to_string();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(other_key.clone(), other.clone());
+    group_recovery::begin_placehold(state, &other_key, &other);
+    let outcome = save_named_groups_checked(state).await;
+    assert!(
+        matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+        "placehold save must be durable: {outcome:?}"
+    );
+
+    // P changes to v2 in memory; the TreeKEM writer's Durable write puts
+    // P's v2 placeholder on disk.
+    if let Some(live) = state.named_groups.write().await.get_mut(&other_key) {
+        live.description = "v2".to_string();
+    }
+    let live = state
+        .treekem_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("live TreeKEM group"))?;
+    let group = live.lock().await;
+    persist_treekem_and_named_groups_atomic_with_info(state, &group_id, treekem_record, &group)
+        .await?;
+    drop(group);
+    let legacy_description = |roster: &[u8]| -> Result<String> {
+        let roster: HashMap<String, x0x::groups::GroupInfo> = serde_json::from_slice(roster)?;
+        let entry = roster
+            .get(&other_key)
+            .ok_or_else(|| anyhow::anyhow!("P's legacy entry"))?;
+        assert!(s3::is_s3_placeholder(entry));
+        Ok(entry.description.clone())
+    };
+    assert_eq!(
+        legacy_description(&tokio::fs::read(&state.named_groups_path).await?)?,
+        "v2",
+        "the TreeKEM writer saved P's v2 placeholder"
+    );
+
+    // P's sidecar cannot be written, and P changes to v3: P is held back.
+    let sidecar = state
+        .data_dir
+        .join(s3::GROUP_RECOVERY_DIR)
+        .join(s3::sidecar_file_name(&other_stable));
+    tokio::fs::remove_file(&sidecar).await?;
+    tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+    if let Some(live) = state.named_groups.write().await.get_mut(&other_key) {
+        live.description = "v3".to_string();
+    }
+    save_named_groups_checked(state).await?;
+    assert!(group_recovery::is_held_back(state, &other_stable));
+    assert_eq!(
+        legacy_description(&tokio::fs::read(&state.named_groups_path).await?)?,
+        "v2",
+        "#1570: the held-back form is the last durable one (v2), not v1"
+    );
+    Ok(())
+}
