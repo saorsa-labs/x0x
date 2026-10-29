@@ -71,7 +71,7 @@ use crate::dm::{DmPath, DurableSendStages};
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
 use crate::trust::TrustDecision;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -127,6 +127,100 @@ pub(crate) fn inbound_peer_revoked(
     machine_id: &MachineId,
 ) -> bool {
     revoked.is_agent_revoked(sender) || revoked.is_machine_revoked(machine_id)
+}
+
+/// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the typed
+/// refusal that answers a TreeKEM catch-up request from a machine-revoked
+/// or binding-revoked device, replacing the interim silent drop. The
+/// refusal names which revocation applies so the requester can stop
+/// re-asking and surface the reason. It travels as an ordinary direct
+/// message on the catch-up lane, so its sender is authenticated exactly
+/// like every catch-up page: the QUIC ML-DSA-65 handshake on the raw
+/// path, the signed envelope on the gossip path. The refused request
+/// itself is still dropped — the refusal adds the reply, never the page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TreeKemCatchupRefusal {
+    pub(crate) message_type: String,
+    group_id: String,
+    /// The requester the refusing peer echoes back, so a refusal for
+    /// another agent's request is never applied to this one.
+    requester_agent_id: String,
+    pub(crate) reason: TreeKemCatchupRefusalReason,
+}
+
+impl TreeKemCatchupRefusal {
+    /// The `message_type` of every refusal on the wire.
+    pub(crate) const MESSAGE_TYPE: &'static str = "treekem_catchup_refusal";
+
+    /// Build the refusal for `requester`'s request about `group_id`.
+    pub(crate) fn new(
+        group_id: String,
+        requester_agent_id: String,
+        reason: TreeKemCatchupRefusalReason,
+    ) -> Self {
+        Self {
+            message_type: Self::MESSAGE_TYPE.to_string(),
+            group_id,
+            requester_agent_id,
+            reason,
+        }
+    }
+
+    pub(crate) fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    pub(crate) fn requester_agent_id(&self) -> &str {
+        &self.requester_agent_id
+    }
+}
+
+/// Which revocation refused the request. A variant this node does not
+/// know (#1604 G5) decodes to `Unknown` and is refused by
+/// `wire_compat::reject_unknown` before any asker state changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub(crate) enum TreeKemCatchupRefusalReason {
+    /// ADR 0110 D70: the requester's machine is revoked; the portable
+    /// agent keeps its seat until that agent itself is revoked.
+    MachineRevoked,
+    /// ADR-0043 check B: the requester's agent-machine binding is
+    /// revoked; both sides stay individually clean.
+    BindingRevoked,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded.
+    #[serde(other, skip_serializing)]
+    Unknown,
+}
+
+/// One probe field of a TreeKEM catch-up request: enough to recognise the
+/// frame (and echo its group) without deserialising the whole request.
+/// Unknown JSON fields are ignored, and a payload that is not the
+/// request shape (another catch-up frame, a user DM, an envelope) fails.
+#[derive(Deserialize)]
+struct TreeKemCatchupRequestPeek {
+    message_type: String,
+    group_id: String,
+}
+
+/// The transport-layer refusal (#1657): when the raw-QUIC revocation or
+/// pairing gate is about to drop a frame, this builds the typed refusal
+/// for it iff it is a TreeKEM catch-up request. Returns the encoded
+/// refusal bytes, machine-addressed back to `requester`.
+pub(crate) fn treekem_catchup_refusal_for(
+    payload: &[u8],
+    requester: &AgentId,
+    reason: TreeKemCatchupRefusalReason,
+) -> Option<Vec<u8>> {
+    let peek = serde_json::from_slice::<TreeKemCatchupRequestPeek>(payload).ok()?;
+    if peek.message_type != "treekem_catchup_request" {
+        return None;
+    }
+    let refusal =
+        TreeKemCatchupRefusal::new(peek.group_id, hex::encode(requester.as_bytes()), reason);
+    serde_json::to_vec(&refusal).ok()
 }
 
 #[doc(hidden)]
@@ -1744,6 +1838,134 @@ mod tests {
         assert!(
             !inbound_peer_revoked(&set, &clean_agent, &clean_machine),
             "a clean (agent, machine) pair must not be dropped"
+        );
+    }
+
+    #[test]
+    fn treekem_refusal_built_only_for_a_catchup_request() {
+        // #1657: the refusal answers a TreeKEM catch-up request alone. The
+        // peek needs message_type and group_id only; unknown fields of the
+        // full request shape are ignored.
+        let requester = AgentId([9u8; 32]);
+        let request = serde_json::json!({
+            "message_type": "treekem_catchup_request",
+            "group_id": "aa",
+            "requester_agent_id": "bb",
+            "from_revision": 0,
+            "from_treekem_epoch": 0,
+            "current_state_hash": "",
+            "missing_prev_state_hash": null,
+            "limit": 1,
+        })
+        .to_string();
+
+        let refusal_bytes = treekem_catchup_refusal_for(
+            request.as_bytes(),
+            &requester,
+            TreeKemCatchupRefusalReason::MachineRevoked,
+        )
+        .expect("a catch-up request gets the refusal");
+        let refusal = serde_json::from_slice::<TreeKemCatchupRefusal>(&refusal_bytes)
+            .expect("the refusal bytes are one JSON refusal frame");
+        assert_eq!(refusal.message_type, TreeKemCatchupRefusal::MESSAGE_TYPE);
+        assert_eq!(refusal.group_id(), "aa");
+        assert_eq!(
+            refusal.requester_agent_id(),
+            hex::encode(requester.as_bytes()),
+            "the refusal echoes the requester it was built for"
+        );
+        assert_eq!(refusal.reason, TreeKemCatchupRefusalReason::MachineRevoked);
+
+        // Anything that is not the request shape gets no refusal: another
+        // catch-up frame, a non-JSON payload, and a JSON frame whose
+        // message_type is not the request tag.
+        let response = serde_json::json!({
+            "message_type": "treekem_catchup_response",
+            "group_id": "aa",
+        })
+        .to_string();
+        assert!(
+            treekem_catchup_refusal_for(
+                response.as_bytes(),
+                &requester,
+                TreeKemCatchupRefusalReason::MachineRevoked
+            )
+            .is_none(),
+            "a catch-up response must not get the refusal"
+        );
+        assert!(
+            treekem_catchup_refusal_for(
+                b"\x00\x01not json",
+                &requester,
+                TreeKemCatchupRefusalReason::MachineRevoked
+            )
+            .is_none(),
+            "a non-JSON payload must not get the refusal"
+        );
+        let other_type = serde_json::json!({
+            "message_type": "treekem_catchup_refusal",
+            "group_id": "aa",
+        })
+        .to_string();
+        assert!(
+            treekem_catchup_refusal_for(
+                other_type.as_bytes(),
+                &requester,
+                TreeKemCatchupRefusalReason::MachineRevoked
+            )
+            .is_none(),
+            "a JSON frame that is not a catch-up request must not get the refusal"
+        );
+    }
+
+    #[test]
+    fn treekem_refusal_reason_round_trips_and_unknown_is_refused() {
+        // #1657: the two known reasons round-trip through their snake_case
+        // wire tags. A tag this node does not know (#1604 G5) decodes to
+        // Unknown — decoding never fails — and the wire-compat gate refuses
+        // a refusal that holds it before any asker state changes.
+        assert_eq!(
+            serde_json::to_value(TreeKemCatchupRefusalReason::MachineRevoked).unwrap(),
+            serde_json::json!("machine_revoked")
+        );
+        assert_eq!(
+            serde_json::to_value(TreeKemCatchupRefusalReason::BindingRevoked).unwrap(),
+            serde_json::json!("binding_revoked")
+        );
+        assert_eq!(
+            serde_json::from_value::<TreeKemCatchupRefusalReason>(serde_json::json!(
+                "machine_revoked"
+            ),)
+            .unwrap(),
+            TreeKemCatchupRefusalReason::MachineRevoked
+        );
+        assert_eq!(
+            serde_json::from_value::<TreeKemCatchupRefusalReason>(serde_json::json!(
+                "binding_revoked"
+            ),)
+            .unwrap(),
+            TreeKemCatchupRefusalReason::BindingRevoked
+        );
+
+        let future = serde_json::json!({
+            "message_type": "treekem_catchup_refusal",
+            "group_id": "aa",
+            "requester_agent_id": "bb",
+            "reason": "some_future_reason",
+        })
+        .to_string();
+        let refusal = serde_json::from_slice::<TreeKemCatchupRefusal>(future.as_bytes())
+            .expect("an unknown reason tag must decode, not fail");
+        assert_eq!(refusal.reason, TreeKemCatchupRefusalReason::Unknown);
+
+        let holding_unknown = TreeKemCatchupRefusal::new(
+            "aa".to_string(),
+            "bb".to_string(),
+            TreeKemCatchupRefusalReason::Unknown,
+        );
+        assert!(
+            crate::wire_compat::reject_unknown("TreeKemCatchupRefusal", holding_unknown).is_err(),
+            "a refusal holding Unknown must be refused fail-closed"
         );
     }
 

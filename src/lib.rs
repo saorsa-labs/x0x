@@ -19165,6 +19165,10 @@ impl Agent {
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let announced_for_direct = std::sync::Arc::clone(&self.announced_machine_bindings);
+        // #1657: the refusing node's agent id, sent with the typed TreeKEM
+        // catch-up refusal so the requester knows who refused. AgentId is
+        // Copy, so the capture needs no clone.
+        let local_agent_id = self.identity.agent_id();
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
@@ -19299,7 +19303,7 @@ impl Agent {
                 // delivered). Fail closed: drop + count, never reach
                 // mark_connected/handle_incoming. Read lock is held only for
                 // the boolean — no await under it (same contract as EP4).
-                let peer_revoked = {
+                let (peer_revoked, agent_revoked, machine_revoked) = {
                     let revoked = revocation_set.read().await;
                     if revoked.revocation_resync_required() {
                         tracing::info!(
@@ -19312,7 +19316,14 @@ impl Agent {
                         drop(revoked);
                         continue;
                     }
-                    direct::inbound_peer_revoked(&revoked, &sender, &machine_id)
+                    // #1657: split the two causes so the refusal below can
+                    // name the revocation that applies. The drop condition
+                    // stays exactly inbound_peer_revoked — agent OR machine —
+                    // and every flag is read under this one lock.
+                    let agent_revoked = revoked.is_agent_revoked(&sender);
+                    let machine_revoked = revoked.is_machine_revoked(&machine_id);
+                    let peer_revoked = direct::inbound_peer_revoked(&revoked, &sender, &machine_id);
+                    (peer_revoked, agent_revoked, machine_revoked)
                 };
                 if peer_revoked {
                     dm.record_incoming_dropped_revoked();
@@ -19324,6 +19335,34 @@ impl Agent {
                         outcome = "drop_revoked",
                         "direct message from revoked sender dropped (direct-path revocation gate, mirrors EP3)"
                     );
+                    // #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): a
+                    // catch-up request from a machine-revoked device gets the typed
+                    // refusal that names the revocation, instead of the silent drop.
+                    // The frame is still dropped; the refusal replaces the silence.
+                    // An agent-revoked sender keeps the silent drop — only the
+                    // machine alone being the cause may be named.
+                    if machine_revoked && !agent_revoked {
+                        if let Some(refusal) = direct::treekem_catchup_refusal_for(
+                            &data,
+                            &sender,
+                            direct::TreeKemCatchupRefusalReason::MachineRevoked,
+                        ) {
+                            if let Err(e) = network
+                                .send_direct(&ant_peer_id, local_agent_id.as_bytes(), &refusal)
+                                .await
+                            {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "recv",
+                                    sender_prefix = %network::hex_prefix(&sender.0, 4),
+                                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                                    outcome = "treekem_refusal_send_failed",
+                                    error = %e,
+                                    "failed to send the typed TreeKEM catch-up refusal to the machine-revoked requester"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -19351,6 +19390,33 @@ impl Agent {
                         reason = ?denial,
                         "direct message dropped at ADR-0043 B/P pairing gate"
                     );
+                    // #1657: check B is a binding revocation, so a catch-up
+                    // request it drops gets the typed refusal that names it
+                    // (same shape as the machine-revoked arm above).
+                    // PlacementPinned stays a silent drop: it states a
+                    // placement fact, not a revocation.
+                    if matches!(denial, key_move::PairingDenial::BindingRevoked) {
+                        if let Some(refusal) = direct::treekem_catchup_refusal_for(
+                            &data,
+                            &sender,
+                            direct::TreeKemCatchupRefusalReason::BindingRevoked,
+                        ) {
+                            if let Err(e) = network
+                                .send_direct(&ant_peer_id, local_agent_id.as_bytes(), &refusal)
+                                .await
+                            {
+                                tracing::warn!(
+                                    target: "x0x::direct",
+                                    stage = "recv",
+                                    sender_prefix = %network::hex_prefix(&sender.0, 4),
+                                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                                    outcome = "treekem_refusal_send_failed",
+                                    error = %e,
+                                    "failed to send the typed TreeKEM catch-up refusal to the binding-revoked requester"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Enforcement — runtime cert-expiry gate (issue #191). EP1

@@ -45,7 +45,7 @@ pub(in crate::server) use requester_offer::{
     RequesterOfferObligation,
 };
 
-use super::super::state::AppState;
+use super::super::state::{AppState, TreeKemCatchupRefusalNote};
 use super::super::{
     api_error, api_error_with_reason, bad_request, forbidden, not_found, parse_agent_id_hex,
     parse_optional_json,
@@ -61,6 +61,7 @@ use super::public_group_bootstrap_outbox::{
     spawn_public_group_bootstrap_delivery,
 };
 use crate as x0x;
+use crate::direct::{TreeKemCatchupRefusal, TreeKemCatchupRefusalReason};
 use crate::groups::aad::secure_share_aad;
 use crate::server::group_access::{self, AccessLevel, MemberState};
 use anyhow::{Context, Result};
@@ -11861,6 +11862,22 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
         return true;
     }
     let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(payload) else {
+        // #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the
+        // asker's mirror of the response arm — the typed refusal a peer
+        // sent instead of a page when it refused this device's request.
+        let Ok(refusal) = serde_json::from_slice::<TreeKemCatchupRefusal>(payload) else {
+            return true;
+        };
+        // #1604 G5: refuse held unknown variants (a refusal reason this
+        // node does not know) before any asker state changes.
+        let Ok(refusal) = crate::wire_compat::reject_unknown("TreeKemCatchupRefusal", refusal)
+        else {
+            return true;
+        };
+        if refusal.message_type != TreeKemCatchupRefusal::MESSAGE_TYPE {
+            return true;
+        }
+        handle_treekem_catchup_refusal(state, sender, machine_id, verified, refusal).await;
         return true;
     };
     // #1604 G5: refuse held unknown variants before any apply.
@@ -11891,6 +11908,111 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
         .is_some()
 }
 
+/// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the asker's
+/// side of the typed refusal. A peer refused this device's catch-up
+/// request, naming its machine or binding revocation. The refusal stops
+/// the 2 s head-round re-ask of that peer (it answered — exactly like
+/// the keyless disclaimer, it confirms or clears no head evidence) and
+/// the reason is surfaced: an operator log line plus the latest note per
+/// group on `AppState`, readable by tests and a later diagnostics
+/// surface. The gates mirror the response handler — an unverified
+/// sender, a sender this node itself holds revoked, and a pending
+/// revocation resync all change nothing, so a revoked peer cannot forge
+/// a silence — and a refusal addressed to another requester is not
+/// ours. A peer that never sends the refusal (an older peer, or the
+/// gossip-inbox path whose payload is ciphertext at its gate) leaves
+/// main's behavior: the ask cadence keeps counting the peer.
+pub(in crate::server) async fn handle_treekem_catchup_refusal(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    machine_id: &MachineId,
+    verified: bool,
+    refusal: TreeKemCatchupRefusal,
+) {
+    if !verified {
+        return;
+    }
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(sender)
+            || revoked.is_machine_revoked(machine_id)
+            || revoked.is_binding_revoked(sender, machine_id)
+            || revoked.revocation_resync_required()
+        {
+            return;
+        }
+    }
+    let self_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if refusal.requester_agent_id() != self_hex {
+        return;
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    tracing::warn!(
+        group_id = %LogHexId::group(refusal.group_id()),
+        peer = %LogHexId::agent(&sender_hex),
+        reason = ?refusal.reason,
+        "TreeKEM catch-up refused: a peer named this device's revocation; the head-round re-ask stops for that peer"
+    );
+    if let Ok(mut notes) = state.treekem_catchup_refusals.lock() {
+        notes.insert(
+            refusal.group_id().to_string(),
+            TreeKemCatchupRefusalNote {
+                reason: refusal.reason,
+                peer: *sender.as_bytes(),
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+    revocation_eviction::note_catchup_refused_peer(
+        state,
+        &[refusal.group_id().to_string()],
+        *sender.as_bytes(),
+    )
+    .await;
+}
+
+/// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): send the
+/// typed refusal for a machine- or binding-revoked catch-up requester.
+/// The refusal names the revocation so the requester can stop re-asking
+/// and surface the reason; it carries no group data beyond what the
+/// request itself named. It travels on the catch-up DM lane, so its
+/// sender is authenticated exactly like a page (the QUIC ML-DSA-65
+/// handshake on the raw path, the signed envelope on the gossip path).
+/// The payload is recorded for tests before the egress attempt, exactly
+/// as the page serve does — the recorder observes the decision, not the
+/// transport.
+async fn send_treekem_catchup_refusal(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    request: &TreeKemCatchupRequest,
+    reason: TreeKemCatchupRefusalReason,
+) {
+    let refusal = TreeKemCatchupRefusal::new(
+        request.group_id.clone(),
+        request.requester_agent_id.clone(),
+        reason,
+    );
+    let payload = match serde_json::to_vec(&refusal) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to serialize TreeKEM catch-up refusal: {e}");
+            return;
+        }
+    };
+    #[cfg(test)]
+    if let Ok(mut recorded) = state.named_group_test_recorders.catchup_refusals.lock() {
+        recorded.push(payload.clone());
+    }
+    if let Err(e) = state
+        .agent
+        .send_direct_with_config(sender, payload, direct_message_send_config())
+        .await
+    {
+        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %hex::encode(sender.as_bytes()), "failed to send TreeKEM catch-up refusal: {e}");
+    }
+}
+
 pub(in crate::server) async fn handle_treekem_catchup_request(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -11905,8 +12027,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // #1577 (ADR 0110 §3): a catch-up page carries membership events and
     // TreeKEM epochs, so the serve is guarded egress. A revoked target
     // keeps its Active seat until the S4 eviction commits, so the roster
-    // check below alone cannot refuse it. Drop the request on the same
-    // path the response handler uses for a revoked sender; no typed reply.
+    // check below alone cannot refuse it.
     // #1616 (ADR 0110 D70): a machine revocation denies that device only;
     // the portable agent keeps its Active seat, so the same roster check
     // cannot refuse the device either — the DM's QUIC-authenticated
@@ -11915,9 +12036,15 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // only — the agent keeps its seat and the device stays clean — so
     // neither gate above can refuse it; the pairing itself does, under
     // its own operator sentence.
+    // #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the
+    // machine and binding refusals answer with the typed refusal that
+    // names the revocation, instead of the interim silent drop — the
+    // requester can stop re-asking and surface the reason. The agent
+    // revocation and a pending revocation resync keep the silent drop:
+    // the approval names machine- and binding-revoked devices only.
     // A pending revocation resync also refuses (fail-closed, as the
     // response handler does), under its own operator sentence.
-    {
+    let typed_refusal = {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
         if revoked.is_agent_revoked(sender) {
@@ -11934,24 +12061,28 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request from a machine-revoked requester"
             );
-            return;
-        }
-        if revoked.is_binding_revoked(sender, machine_id) {
+            Some(TreeKemCatchupRefusalReason::MachineRevoked)
+        } else if revoked.is_binding_revoked(sender, machine_id) {
             tracing::warn!(
                 group_id = %LogHexId::group(&request.group_id),
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request from a requester with a revoked agent-machine binding"
             );
-            return;
-        }
-        if revoked.revocation_resync_required() {
+            Some(TreeKemCatchupRefusalReason::BindingRevoked)
+        } else if revoked.revocation_resync_required() {
             tracing::warn!(
                 group_id = %LogHexId::group(&request.group_id),
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request while the revocation set needs a resync"
             );
             return;
+        } else {
+            None
         }
+    };
+    if let Some(reason) = typed_refusal {
+        send_treekem_catchup_refusal(state, sender, &request, reason).await;
+        return;
     }
     if sender_hex != request.requester_agent_id {
         return;
@@ -47970,6 +48101,7 @@ pub(in crate::server) mod tests {
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
     mod issue1649_reseat_mandate_receive;
+    mod issue1657_typed_refusal_catchup;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -48792,6 +48924,7 @@ pub(in crate::server) mod tests {
                 TREEKEM_CATCHUP_SERVE_SLOTS,
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+            treekem_catchup_refusals: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
             treekem_groups: RwLock::new(HashMap::new()),
             treekem_dir,
