@@ -753,10 +753,14 @@ pub(in crate::server) async fn commit_locked(
     );
     let task_state = Arc::clone(state);
     let card_key = group_key.to_string();
-    let _spawned = state.spawn_detached(async move {
-        ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
-        drive_deliveries(&task_state).await;
-    });
+    // #1699: the delivery worker walks every group's live record, also
+    // when a staged re-seat join's apply committed this exclusion.
+    let _spawned = state.spawn_detached(crate::server::reseat_scope::outside_reseat_scope(
+        async move {
+            ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
+            drive_deliveries(&task_state).await;
+        },
+    ));
     SelfLeaveRekeyStep::Committed
 }
 
@@ -926,10 +930,13 @@ pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_k
     );
     let task_state = Arc::clone(state);
     let card_key = group_key.to_string();
-    let _spawned = state.spawn_detached(async move {
-        ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
-        drive_deliveries(&task_state).await;
-    });
+    // #1699: as above, the worker sees every group's live record.
+    let _spawned = state.spawn_detached(crate::server::reseat_scope::outside_reseat_scope(
+        async move {
+            ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
+            drive_deliveries(&task_state).await;
+        },
+    ));
 }
 
 /// Seal `info`'s current secret to each remaining Active member other

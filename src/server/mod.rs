@@ -1359,6 +1359,7 @@ pub async fn serve_with_options(
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
+        reseat_stagings: Default::default(),
         treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),
         treekem_dir,
         revocation_evictions: routes::named_groups::S4Runtime::default(),
