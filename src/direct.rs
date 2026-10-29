@@ -590,6 +590,7 @@ struct DirectDiagnosticsCounters {
     incoming_signature_failed: AtomicU64,
     incoming_trust_rejected: AtomicU64,
     incoming_dropped_revoked: AtomicU64,
+    incoming_dropped_attribution_overflow: AtomicU64,
     incoming_dropped_expired: AtomicU64,
     incoming_typed_route_dropped: AtomicU64,
     ack_publish_route_failed: AtomicU64,
@@ -649,8 +650,11 @@ pub struct DmDiagnosticsStats {
     pub incoming_decode_failed: u64,
     pub incoming_signature_failed: u64,
     pub incoming_trust_rejected: u64,
-    /// DMs dropped because the sender's agent identity has been revoked.
+    /// DMs dropped because the sender's agent identity or an attributed
+    /// machine has been revoked.
     /// Non-zero means a revoked peer is still attempting to communicate.
+    /// An unattested refusal that also has an overflowed attribution set
+    /// is included here. A separate internal counter stays off this object.
     #[serde(default)]
     pub incoming_dropped_revoked: u64,
     /// DMs dropped because the sender's cached agent certificate has expired
@@ -1145,6 +1149,29 @@ impl DirectMessaging {
         self.diagnostics
             .incoming_dropped_revoked
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an unattested DM dropped because attribution overflowed for a
+    /// sender that already holds a machine revocation, or because the
+    /// stranger pin cap is full and that sender's revoked pair was dropped
+    /// or could not be pinned.
+    ///
+    /// The caller also increments `incoming_dropped_revoked`. This count
+    /// stays off `GET /diagnostics/dm`. The inbox emits a rate-limited
+    /// warning for the same drop. The pin-cap warning does not claim that
+    /// a revoked machine is still attributed.
+    pub(crate) fn record_incoming_dropped_attribution_overflow(&self) {
+        self.diagnostics
+            .incoming_dropped_attribution_overflow
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The internal overflow-refusal count. Not part of the diagnostics API.
+    #[cfg(test)]
+    pub(crate) fn incoming_dropped_attribution_overflow_for_test(&self) -> u64 {
+        self.diagnostics
+            .incoming_dropped_attribution_overflow
+            .load(Ordering::Relaxed)
     }
     /// Record a DM dropped because the sender's cached cert has expired
     /// (issue #191 runtime expiry gate).

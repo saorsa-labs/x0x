@@ -3810,6 +3810,154 @@ mod tests {
         );
     }
 
+    /// A `Grantee::User` peer stays protected after discovery eviction when
+    /// the persisted evidence view still holds the certificate. A stranger
+    /// flood then does not evict that pair.
+    #[tokio::test]
+    async fn issue1659_user_grant_persisted_cert_survives_discovery_eviction_and_stranger_flood() {
+        use crate::server::attribution_probe::{answer, AttributionProbeInput};
+        use crate::share_grant::{Grantee, ShareCap, ShareGrant, ShareGrantStore};
+
+        let peer = Peer::new();
+        let local = AgentKeypair::generate().expect("local");
+        let owner = UserKeypair::generate().expect("owner");
+        let peer_owner = UserKeypair::generate().expect("peer owner");
+        let now_ms = NOW;
+        let now = now_ms / 1000;
+        let (dir, _policy, store) = setup(&peer);
+        let mut record = peer.record(now_ms, now_ms);
+        let cert = AgentCertificate::issue(&peer_owner, &peer.agent).expect("cert");
+        record.certificate = Some(cert.to_storage_bytes().expect("cert bytes"));
+        store
+            .ingest(record, IngestSource::Hello, now_ms)
+            .expect("ingest");
+        let (runtime, ready) = EvidenceRuntime::loading_store_for_test(Arc::new(store));
+        let grants = Arc::new(ShareGrantStore::in_memory(
+            local.agent_id(),
+            Some(owner.user_id()),
+        ));
+        grants
+            .accept(
+                ShareGrant::sign(
+                    &owner,
+                    [9; 32],
+                    Grantee::User(peer_owner.user_id()),
+                    vec![local.agent_id()],
+                    vec![ShareCap::Dm],
+                    now.saturating_sub(1),
+                    now.saturating_add(60),
+                )
+                .expect("sign grant"),
+                now,
+            )
+            .await
+            .expect("store grant");
+        let revoked = crate::revocation::RevocationSet::new();
+        let empty = HashMap::new();
+        let loading = answer(AttributionProbeInput {
+            groups: Some(&empty),
+            local: local.agent_id(),
+            peer: peer.a(),
+            grants: Some(grants.as_ref()),
+            revoked: Some(&revoked),
+            discovery_cert: Some(None),
+            evidence: Some(runtime.as_ref()),
+            now_secs: now,
+        });
+        assert_eq!(
+            loading, None,
+            "evidence that is still loading must not clear a user grant"
+        );
+        ready.cancel();
+        assert!(
+            runtime
+                .try_usable_agent(peer.a(), now_ms)
+                .expect("evidence lock")
+                .is_some(),
+            "the persisted view is usable with an empty discovery cache"
+        );
+        let discovered = answer(AttributionProbeInput {
+            groups: Some(&empty),
+            local: local.agent_id(),
+            peer: peer.a(),
+            grants: Some(grants.as_ref()),
+            revoked: Some(&revoked),
+            discovery_cert: Some(Some(&cert)),
+            evidence: Some(runtime.as_ref()),
+            now_secs: now,
+        });
+        assert_eq!(discovered, Some(true));
+        let evicted = answer(AttributionProbeInput {
+            groups: Some(&empty),
+            local: local.agent_id(),
+            peer: peer.a(),
+            grants: Some(grants.as_ref()),
+            revoked: Some(&revoked),
+            discovery_cert: Some(None),
+            evidence: Some(runtime.as_ref()),
+            now_secs: now,
+        });
+        assert_eq!(
+            evicted,
+            Some(true),
+            "discovery eviction must not drop a user grant backed by persisted evidence"
+        );
+
+        let peer_id = peer.a();
+        let machine = peer.m();
+        let local_id = local.agent_id();
+        let grants_probe = Arc::clone(&grants);
+        let runtime_probe = Arc::clone(&runtime);
+        let bindings = Arc::new(tokio::sync::RwLock::new(
+            crate::dm_inbox::AuthenticatedMachineBindingCache::default(),
+        ));
+        {
+            let mut cache = bindings.write().await;
+            cache.set_stranger_pair_limit_for_test(1);
+            cache.install_relationship_probe(
+                crate::dm_inbox::AttributionRelationshipProbe::from_answer(move |agent| {
+                    if agent != peer_id {
+                        return Some(false);
+                    }
+                    let revoked = crate::revocation::RevocationSet::new();
+                    let empty = HashMap::new();
+                    answer(AttributionProbeInput {
+                        groups: Some(&empty),
+                        local: local_id,
+                        peer: agent,
+                        grants: Some(grants_probe.as_ref()),
+                        revoked: Some(&revoked),
+                        discovery_cert: Some(None),
+                        evidence: Some(runtime_probe.as_ref()),
+                        now_secs: now,
+                    })
+                }),
+            );
+        }
+        crate::dm_inbox::set_resolved_attribution_standing(&bindings, peer_id, false).await;
+        crate::dm_inbox::record_authenticated_machine_binding(&bindings, peer_id, machine, 1).await;
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &bindings,
+            AgentId([0x91; 32]),
+            MachineId([0x91; 32]),
+            2,
+        )
+        .await;
+        crate::dm_inbox::record_authenticated_machine_binding(
+            &bindings,
+            AgentId([0x92; 32]),
+            MachineId([0x92; 32]),
+            3,
+        )
+        .await;
+        let cache = bindings.read().await;
+        assert!(
+            cache.machines_accepted_for(&peer_id).contains(&machine),
+            "a stranger flood does not evict the user-grant pair after discovery eviction"
+        );
+        drop(dir);
+    }
+
     #[test]
     #[ignore = "CPU-only t_v benchmark; run explicitly on Mac and fleet VPS (crypto dependencies optimized in test profile)"]
     fn verify_benchmark_t_v() {

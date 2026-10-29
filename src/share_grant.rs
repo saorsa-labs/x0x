@@ -572,6 +572,31 @@ pub struct ShareGrantStore {
     poisoned: std::sync::Mutex<Option<String>>,
 }
 
+/// Received-grant parties only: the grantee, and the grantor when `cert`
+/// proves the peer is that owner. The `agents` list is not a party.
+fn received_grant_party(
+    grant: &ShareGrant,
+    agent: AgentId,
+    cert: Option<&crate::identity::AgentCertificate>,
+    now: u64,
+) -> bool {
+    let grantee = match grant.grantee {
+        Grantee::Agent(id) => id == agent,
+        Grantee::User(user) => certificate_names_user(cert, user, now),
+    };
+    grantee || certificate_names_user(cert, grant.owner, now)
+}
+
+fn certificate_names_user(
+    cert: Option<&crate::identity::AgentCertificate>,
+    user: UserId,
+    now: u64,
+) -> bool {
+    cert.is_some_and(|certificate| {
+        !certificate.is_expired(now) && certificate.user_id().ok() == Some(user)
+    })
+}
+
 impl ShareGrantStore {
     /// An empty in-memory store (tests, or no data dir).
     #[must_use]
@@ -697,6 +722,12 @@ impl ShareGrantStore {
     }
 
     /// Current relationship membership from already verified held grants.
+    ///
+    /// An issued grant protects its grantee. A received grant protects its
+    /// verified grantor and its grantee. An agent that is only listed in
+    /// `agents` is not a party. The grantor is verified when `cert` names
+    /// the grant owner and is unexpired. The grantee is the agent the grant
+    /// names, or a peer whose certificate names the grantee user.
     pub(crate) fn evidence_related(
         &self,
         agent: AgentId,
@@ -744,8 +775,8 @@ impl ShareGrantStore {
                 }
         }) || state.received.values().any(|g| {
             g.is_active_at(now)
-                && g.agents.contains(&agent)
                 && !revoked.is_share_grant_revoked(&g.grant_id, &g.owner)
+                && received_grant_party(g, agent, cert, now)
         })
     }
 

@@ -1375,6 +1375,29 @@ pub(in crate::server) enum JoinResultMessage {
         /// refusal to exactly the attempt that asked.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_id: Option<String>,
+        /// ADR 0108 §8 (#1575): this joiner understands `Pending` notices
+        /// and sets the `join_pending_notice_v1` capability bit. A v0.46
+        /// joiner never sends the field, and a member NEVER answers
+        /// `Pending` without it — the arm is unreachable for legacy
+        /// decoders.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accepts_pending_notice: bool,
+        /// ADR 0108 §8: the BLAKE3 hex of the canonical bytes of the
+        /// notice the joiner already holds for this attempt, so each
+        /// change is served once.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_notice_hash: Option<String>,
+        /// ADR 0108 §8 (D154): a notice-only request. It may be answered
+        /// with at most one member-signed `no_eligible_admin` `Pending`,
+        /// never a Result, Refused, Welcome, key or roster.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        notice_only: bool,
+        /// ADR 0108 §8 (D154): the joiner's own signed `MemberJoined` for
+        /// this attempt. Notice-only polling only; the member verifies it
+        /// ([`verified_join_attempt_evidence`]) before any D154 staging or
+        /// serving.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_evidence: Option<Box<NamedGroupMetadataEvent>>,
     },
     Result {
         event: Box<NamedGroupMetadataEvent>,
@@ -1428,6 +1451,13 @@ pub(in crate::server) enum JoinResultMessage {
     /// to fetches that carried `accepts_refusal: true` AND a matching
     /// `attempt_id` — a v0.41 joiner can never decode onto this arm.
     Refused { receipt: Box<JoinRefusalReceipt> },
+    /// ADR 0108 §8 (#1575): the typed cause of a held join attempt, signed
+    /// per D154 and served under D145's pre-admission amendment (no key,
+    /// Welcome, roster or certificate bytes). Served ONLY to verified,
+    /// attempt-matching fetches that carried `accepts_pending_notice: true`
+    /// and whose advert sets `join_pending_notice_v1` — a legacy joiner
+    /// never sees this arm.
+    Pending { notice: Box<JoinPendingNotice> },
 }
 
 /// #477 W2 — the terminal refusal reasons. Exactly the DEFINITIVE
@@ -1565,6 +1595,14 @@ pub(in crate::server) struct PendingJoinRefusal {
 const JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING: &str = "owner_certificate_pending";
 const JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN: &str = "no_eligible_admin";
 
+/// Engineer ruling, 27 Oct 2026 (PR #1639 review round 3): staging for the
+/// D154 cause `no_eligible_admin` stays OFF until the notice-only rotation
+/// slice lands. Real joiners never send `attempt_evidence` in this slice, so
+/// the evidence-bound staging arm is reachable only by a sender that mints
+/// its own `MemberJoined`; the rotation slice re-enables it bound to a real
+/// invite or attempt.
+const D154_STAGING_ENABLED: bool = false;
+
 /// ADR 0108 §8: a cause name must be 1 to 64 bytes of `[a-z0-9_]`. A name
 /// a joiner does not know is shown as `unrecognized_cause`, never a decode
 /// failure, so the registry stays open — this gate only keeps a staged
@@ -1581,34 +1619,150 @@ fn valid_join_pending_cause(cause: &str) -> bool {
 /// registry row names (`count`, `revision`, `digests`). Detail may name
 /// counts, revisions and committed certificate digests; it never carries
 /// agent IDs, certificate bytes, roster entries or key material.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::server) struct JoinPendingNoticeDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::server) count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::server) revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(in crate::server) digests: Vec<String>,
+}
+
+/// ADR 0108 §8 (#1575) — the SIGNED wire notice for one held join attempt,
+/// ML-DSA-65 by the signer's agent key over
+/// [`canonical_join_pending_notice_bytes`] (domain
+/// `x0x.named_group.join_pending.v1`; David's 25 Oct 2026 05:14 GMT ruling).
+/// Ten fields in §8's order; `signer_public_key_b64` rides only on a
+/// member-signed `no_eligible_admin` notice (D154) and is NOT part of the
+/// canonical bytes. A notice grants nothing: no seat, key, roster or
+/// certificate bytes ride it (D145 pre-admission replies).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct JoinPendingNotice {
+    pub(in crate::server) group_id: String,
+    pub(in crate::server) member_agent_id: String,
+    pub(in crate::server) signer_agent_id: String,
+    pub(in crate::server) attempt_id: String,
+    pub(in crate::server) cause: String,
+    pub(in crate::server) detail: JoinPendingNoticeDetail,
+    pub(in crate::server) issued_at_ms: u64,
+    pub(in crate::server) nonce: String,
+    /// Base64 ML-DSA-65 signature over the canonical notice bytes.
+    pub(in crate::server) signature_b64: String,
+    /// Present only on a member-signed `no_eligible_admin` notice (D154):
+    /// the signer's agent public key, from which the joiner derives
+    /// `signer_agent_id`. Not part of the canonical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::server) signer_public_key_b64: Option<String>,
+}
+
+const JOIN_PENDING_NOTICE_DOMAIN: &[u8] = b"x0x.named_group.join_pending.v1";
+
+/// §8: the canonical signed bytes — the domain; the string fields
+/// `group_id`, `member_agent_id`, `signer_agent_id`, `attempt_id` and
+/// `cause`, each u32-BE length-prefixed; for `count` and `revision`, a
+/// presence byte and the big-endian value; a u32-BE digest count and each
+/// digest length-prefixed; `issued_at_ms` as u64 BE; and the
+/// length-prefixed `nonce`. Mirrors [`canonical_join_refusal_bytes`] under
+/// its own domain.
+#[must_use]
+fn canonical_join_pending_notice_bytes(notice: &JoinPendingNotice) -> Vec<u8> {
+    fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    let mut buf = Vec::new();
+    buf.extend_from_slice(JOIN_PENDING_NOTICE_DOMAIN);
+    push_lp(&mut buf, notice.group_id.as_bytes());
+    push_lp(&mut buf, notice.member_agent_id.as_bytes());
+    push_lp(&mut buf, notice.signer_agent_id.as_bytes());
+    push_lp(&mut buf, notice.attempt_id.as_bytes());
+    push_lp(&mut buf, notice.cause.as_bytes());
+    match notice.detail.count {
+        Some(count) => {
+            buf.push(1);
+            buf.extend_from_slice(&count.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+    match notice.detail.revision {
+        Some(revision) => {
+            buf.push(1);
+            buf.extend_from_slice(&revision.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+    buf.extend_from_slice(&(notice.detail.digests.len() as u32).to_be_bytes());
+    for digest in &notice.detail.digests {
+        push_lp(&mut buf, digest.as_bytes());
+    }
+    buf.extend_from_slice(&notice.issued_at_ms.to_be_bytes());
+    push_lp(&mut buf, notice.nonce.as_bytes());
+    buf
+}
+
+/// §8: `held_notice_hash` is the BLAKE3 hex of the canonical bytes of the
+/// notice the joiner already holds, so each change is served once.
+#[must_use]
+fn join_pending_notice_hash(notice: &JoinPendingNotice) -> String {
+    hex::encode(blake3::hash(&canonical_join_pending_notice_bytes(notice)).as_bytes())
+}
+
+/// §8: the lazily materialized signature, cached until the cause or detail
+/// changes (`canonical_hash` pins what it signed).
+#[derive(Debug, Clone)]
+pub(in crate::server) struct CachedJoinPendingNotice {
+    pub(in crate::server) canonical_hash: String,
+    pub(in crate::server) signature_b64: String,
 }
 
 /// ADR 0108 §8 (#1575) — a member-side STAGED notice for one held join
 /// attempt, keyed `(group_id, member_agent_id, attempt_id)` exactly like a
-/// staged refusal. Unsigned, in-memory local state only: the signed wire
-/// `JoinPendingNotice` (ML-DSA over canonical bytes, domain
-/// `x0x.named_group.join_pending.v1`) and the `JoinResultMessage::Pending`
-/// serving arm need David's ruling (#1575), so nothing here reaches a
-/// joiner yet. Like a staged refusal it is dropped when a Result or Refused
-/// is staged for the attempt, when its cause clears at the next poll-time
-/// evaluation, and at the 10-minute join staging lifetime.
+/// staged refusal. Unsigned, in-memory local state; the signed wire body
+/// materializes lazily at the first capable serve
+/// ([`serve_staged_join_pending_notice`]) and its bytes stay stable while
+/// the cause and detail are unchanged. Like a staged refusal it is dropped
+/// when a Result or Refused is staged for the attempt, when its cause
+/// clears at the next poll-time evaluation, and at the 10-minute join
+/// staging lifetime.
 pub(in crate::server) struct PendingJoinNotice {
     pub(in crate::server) cause: &'static str,
     pub(in crate::server) detail: JoinPendingNoticeDetail,
     /// The signer §8 names for the cause: the pinned authority, or — for
     /// `no_eligible_admin` — any Active member (D154). Always this node.
     pub(in crate::server) signer_agent_id: String,
-    pub(in crate::server) created_at: std::time::Instant,
+    /// The attempt's expected authority (the inviter the verified evidence
+    /// or the sealed event names). When it is not this node, a served
+    /// `no_eligible_admin` notice is member-signed and carries
+    /// `signer_public_key_b64` (§8 wire shape).
+    pub(in crate::server) inviter_agent_id: Option<String>,
+    /// Pinned at first staging and kept across restaging of the same cause
+    /// and detail, so the wire notice (and its hash) changes only when the
+    /// cause or detail changes.
+    pub(in crate::server) issued_at_ms: u64,
+    pub(in crate::server) cached: Option<CachedJoinPendingNotice>,
+    pub(in crate::server) created_at: Instant,
+}
+
+/// ADR 0108 §8: a staged notice is current while BOTH of its clocks sit
+/// inside the 10-minute lifetime — `created_at` (refreshed when a restage
+/// of the same cause and detail renews the row) and `issued_at_ms` (pinned
+/// at first staging; the clock the joiner's freshness check runs on). The
+/// issued-at clock is what stops a refire from re-polling one attempt id
+/// forever: the joiner drops notices past it, so the member never serves
+/// or refreshes for one past it either (PR #1639 review round 3).
+fn staged_join_pending_notice_is_current(notice: &PendingJoinNotice) -> bool {
+    notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+        && now_millis_u64().saturating_sub(notice.issued_at_ms)
+            < PENDING_JOIN_RESULT_TTL.as_millis() as u64
 }
 
 /// ADR 0108 §8 staging: insert or refresh the notice for one attempt.
 /// TTL-swept at the join staging lifetime, like the staged refusals the
-/// staging sits beside.
+/// staging sits beside. §8's selection order (Result, then Refused, then
+/// notice) forbids a notice sitting beside a staged refusal for the SAME
+/// attempt: when one is already staged (#1628 review item 1 — a typed
+/// refusal followed by a seal retry that returns early), nothing stages.
 async fn stage_join_pending_notice(
     state: &AppState,
     group_id: &str,
@@ -1616,15 +1770,43 @@ async fn stage_join_pending_notice(
     attempt_id: &str,
     cause: &'static str,
     detail: JoinPendingNoticeDetail,
+    inviter_agent_id: Option<String>,
 ) {
     debug_assert!(valid_join_pending_cause(cause), "registry cause shape");
     let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
+    if state
+        .pending_join_refusals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&key)
+    {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            attempt_id = %attempt_id,
+            "ADR 0108 §8: a staged refusal for the attempt forbids staging a notice beside it"
+        );
+        return;
+    }
     let signer_agent_id = hex::encode(state.agent.identity().agent_id().as_bytes());
     let mut notices = state
         .pending_join_notices
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    notices.retain(|_, notice| notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    notices.retain(|_, notice| staged_join_pending_notice_is_current(notice));
+    // §8: a restaging of the SAME cause and detail is the same notice —
+    // its `issued_at_ms` and cached signature stay, so the wire bytes (and
+    // the joiner's `held_notice_hash`) change only when the cause or
+    // detail changes. Only the TTL window refreshes. A restage of a row
+    // past its issued-at lifetime starts a fresh notice instead (the sweep
+    // above removed it), so the joiner's freshness clock never sees a
+    // notice older than the lifetime.
+    if let Some(existing) = notices.get_mut(&key) {
+        if existing.cause == cause && existing.detail == detail {
+            existing.created_at = Instant::now();
+            return;
+        }
+    }
     // §8 Q3 bound: the same 1024-entry cap as the staged refusals beside
     // this map, evicting the oldest. The poll path stages under a
     // joiner-chosen attempt id, so without this a single verified agent
@@ -1644,6 +1826,9 @@ async fn stage_join_pending_notice(
             cause,
             detail,
             signer_agent_id,
+            inviter_agent_id,
+            issued_at_ms: now_millis_u64(),
+            cached: None,
             created_at: Instant::now(),
         },
     );
@@ -1694,7 +1879,11 @@ fn drop_staged_join_pending_notice(
 /// current committed roster. While verified revocations cover every admin
 /// seat (ADR 0110 §4, [`join_artifact_no_eligible_admin`]), it stages the
 /// single cause `no_eligible_admin`, with no detail; it never signs any
-/// other cause. When the conditions do not hold — an eligible admin
+/// other cause. The D154 STAGING is bound to the fetch's verified
+/// `attempt_evidence` (`verified_evidence_inviter`, #1628 review item 2):
+/// on a poll without verified evidence an arbitrary verified sender that
+/// names `member_agent_id` as itself reaches only the drop rules below —
+/// nothing stages. When the conditions do not hold — an eligible admin
 /// returned (which clears only the D154 cause it ended), this node lost its
 /// Active seat, the joiner was removed, banned or revoked, or the group is
 /// withdrawn, quarantined or gone — the staged notice for the attempt is
@@ -1706,16 +1895,14 @@ fn drop_staged_join_pending_notice(
 /// caller holds the group's membership critical section when it still has
 /// it, and stays correct when it must re-acquire the section after the
 /// refusal probe consumed the guard — a terminal answer staged in that gap
-/// forbids staging and drops any staged notice. The wire half adds D154's
-/// full attempt binding (`attempt_evidence`); on today's wire any verified
-/// sender that names `member_agent_id` as itself reaches this evaluation,
-/// and the §8 Q3 cap bounds what it can stage. The notice grants nothing:
+/// forbids staging and drops any staged notice. The notice grants nothing:
 /// it carries no key, Welcome, roster or certificate bytes.
 async fn evaluate_polled_join_pending_notice(
     state: &AppState,
     group_id: &str,
     member_agent_id: &str,
     attempt_id: Option<&str>,
+    verified_evidence_inviter: Option<&str>,
 ) {
     // §8's pre-admission amendment (D145) binds every notice to the
     // attempt: a poll without an attempt id stages nothing.
@@ -1791,15 +1978,36 @@ async fn evaluate_polled_join_pending_notice(
     }
     match join_artifact_no_eligible_admin(state, group_id).await {
         Err(JoinArtifactRefusal::NoEligibleAdmin) => {
-            stage_join_pending_notice(
-                state,
-                group_id,
-                member_agent_id,
-                attempt_id,
-                JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
-                JoinPendingNoticeDetail::default(),
-            )
-            .await;
+            // Engineer ruling, 27 Oct 2026 (PR #1639 review round 3):
+            // staging for `no_eligible_admin` stays OFF until the D154
+            // notice-only rotation slice lands. A real joiner never sends
+            // `attempt_evidence` in this slice, so only a forged
+            // `MemberJoined` could reach this arm — and the evidence check
+            // proves no more than §8's minimum (the event is self-
+            // consistently signed by the sender's own key), not that any
+            // member saw the invite. The rotation slice re-enables staging
+            // bound to a real invite or attempt, with the Active
+            // stub-roster seat check D154 names.
+            if D154_STAGING_ENABLED {
+                if let Some(inviter) = verified_evidence_inviter {
+                    stage_join_pending_notice(
+                        state,
+                        group_id,
+                        member_agent_id,
+                        attempt_id,
+                        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+                        JoinPendingNoticeDetail::default(),
+                        Some(inviter.to_string()),
+                    )
+                    .await;
+                }
+            } else {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    member = %LogHexId::agent(member_agent_id),
+                    "ADR 0108 §8: no_eligible_admin staging stays off until the D154 rotation slice"
+                );
+            }
         }
         // The D154 cover ended, so only the D154 cause clears at this
         // poll. Another cause — S2's `owner_certificate_pending` — is
@@ -1822,6 +2030,21 @@ async fn evaluate_polled_join_pending_notice(
             }
         }
     }
+}
+
+/// ADR 0108 §8 (#1575) — the joiner's current verified notice for one
+/// pending attempt. Newest verified `issued_at_ms` wins (§8 "Current
+/// notice"); a later Result or Refused replaces it. Never extends the poll
+/// and never confirms membership.
+#[derive(Debug, Clone)]
+pub(in crate::server) struct HeldJoinPendingNotice {
+    pub(in crate::server) cause: String,
+    pub(in crate::server) detail: JoinPendingNoticeDetail,
+    pub(in crate::server) issued_at_ms: u64,
+    pub(in crate::server) signer_agent_id: String,
+    /// BLAKE3 hex of the notice's canonical bytes — sent as
+    /// `held_notice_hash` on every poll, so each change is served once.
+    pub(in crate::server) canonical_hash: String,
 }
 
 /// #477 — a joiner-side pending-join attempt. Keyed `join_result_key`.
@@ -1854,6 +2077,11 @@ pub(in crate::server) struct PendingJoinAttempt {
     /// the stub — finalize removes the listener only if the token still
     /// matches (a newer install is never removed).
     pub listener_token: Option<u64>,
+    /// ADR 0108 §8 (#1575): the current verified `JoinPendingNotice` for
+    /// this attempt, surfaced as `pending_cause` on join-status and sent
+    /// as `held_notice_hash` on every poll. Cleared by a later Result or
+    /// Refused, and removed with the attempt at finalize.
+    pub held_pending_notice: Option<HeldJoinPendingNotice>,
 }
 
 /// #477 — the joiner-side terminal outcome for a group.
@@ -3293,6 +3521,23 @@ async fn emit_shard_digest(state: &AppState, kind: x0x::groups::ShardKind, shard
 }
 
 /// Re-publish our own signed cards for groups listed in a Pull request.
+/// The local record a discovery Pull may sign a fresh card from. Pull
+/// requests use the stable `group_id`, so it resolves by either the local
+/// routing key or the D.3 stable id. #1570 (ZCode on 8ac7036f): a held-back
+/// group's live record is ahead of its durable form, so no card is signed
+/// from it; the Pull falls back to a cached card, as for a group this node
+/// does not own.
+pub(super) fn pull_card_record<'a>(
+    state: &AppState,
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    gid: &str,
+) -> Option<&'a x0x::groups::GroupInfo> {
+    groups
+        .get(gid)
+        .or_else(|| groups.values().find(|info| info.stable_group_id() == gid))
+        .filter(|info| !group_recovery::is_held_back(state, info.stable_group_id()))
+}
+
 async fn respond_to_pull(
     state: &AppState,
     kind: x0x::groups::ShardKind,
@@ -3305,14 +3550,8 @@ async fn respond_to_pull(
     for gid in group_ids {
         // We only re-publish cards for groups we *own* / manage locally,
         // not arbitrary cards from our cache (relays may re-publish cached
-        // blobs but cannot re-sign them). Pull requests use stable `group_id`,
-        // so resolve by either the local routing key or the D.3 stable id.
-        let owned_info = groups.get(gid.as_str()).or_else(|| {
-            groups
-                .values()
-                .find(|info| info.stable_group_id() == gid.as_str())
-        });
-        if let Some(info) = owned_info {
+        // blobs but cannot re-sign them).
+        if let Some(info) = pull_card_record(state, &groups, gid) {
             if !x0x::groups::may_publish_to_public_shards(info.policy.discoverability) {
                 continue;
             }
@@ -6511,15 +6750,24 @@ pub(in crate::server) async fn store_named_group_info(
 /// Snapshot the committed roster without retaining a group lock across the
 /// direct-connection and gossip awaits.
 pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState) {
-    let _refresh_guard = state.group_roster_gossip_lock.lock().await;
+    let mut published = state.group_roster_gossip_lock.lock().await;
     let rosters = {
         // The map write can precede an awaited disk save and be rolled back.
         // Serialize this snapshot with that transaction so SG never sees an
         // uncommitted admission or removal. Drop both guards before the
         // direct-connection and gossip awaits below.
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-        let groups = state.named_groups.read().await;
-        let mut entries: Vec<_> = groups.iter().collect();
+        // #1699: every group's roster from the live map, whatever the
+        // caller's scope, with a staged re-seat record in place of its
+        // contained original (as when the staged join ran in the live map).
+        // The staging copy is taken first: no path holds both guards.
+        let staged = state.named_groups.staging_read().await.clone();
+        let groups = state.named_groups.live_read().await;
+        let mut entries: Vec<_> = groups
+            .iter()
+            .filter(|(key, _)| !staged.contains_key(*key))
+            .chain(staged.iter())
+            .collect();
         // Aliases may retain an older view. The exact stable-id key wins;
         // otherwise take the highest revision deterministically. A winning
         // withdrawn record clears its preference rather than reviving an
@@ -6551,6 +6799,16 @@ pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState
             });
             by_group.insert(group.stable_group_id().to_string(), roster);
         }
+        // #1570 (ZCode on fa096d0f): a held-back group's live record is
+        // ahead of its durable form, so any caller's refresh publishes the
+        // hint last published for it, not its live roster. The first
+        // refresh after the group commits publishes the new roster.
+        for (stable, roster) in &mut by_group {
+            if group_recovery::is_held_back(state, stable) {
+                *roster = published.get(stable).cloned().flatten();
+            }
+        }
+        published.clone_from(&by_group);
         by_group.into_values().flatten().collect()
     };
     state.agent.replace_group_rosters_for_gossip(rosters).await;
@@ -6751,6 +7009,21 @@ where
     let (legacy_json, home_suite_json) =
         encode_named_groups_store_excluding_pending_stubs(state, &candidate, rebind_group_id)
             .await?;
+    // ADR 0109 §4 (#1570): the encode holds back a placeheld group whose
+    // authoritative record was not durable. Its legacy entry keeps its last
+    // committed form, which still holds the marker, so the clear is not on
+    // disk. Write and publish nothing; the live record stays contained
+    // (fail closed), and the caller retries.
+    if group_recovery::change_held_back(state, &before, &candidate) {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
+    let mut touched: Vec<&String> = before
+        .keys()
+        .chain(candidate.keys())
+        .filter(|key| before.get(*key) != candidate.get(*key))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
     let prejournaled = if let Some(group_id) = rebind_group_id {
         match prepare_rebind_journal_for_groups(state, group_id, &candidate).await {
             RebindOutcome::Failed(error) => {
@@ -6794,13 +7067,6 @@ where
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
     ) {
         let mut groups = state.named_groups.write().await;
-        let mut touched: Vec<&String> = before
-            .keys()
-            .chain(candidate.keys())
-            .filter(|key| before.get(*key) != candidate.get(*key))
-            .collect();
-        touched.sort_unstable();
-        touched.dedup();
         // Validate every touched key before committing any of them, including
         // additions/removals and all local-only fields in GroupInfo equality.
         if touched
@@ -6924,7 +7190,23 @@ where
         (before, after)
     };
 
-    let outcome = save_named_groups_checked_unlocked(state).await;
+    // ADR 0109 §4 (#1570 rc4): encode, then the one commit check, then
+    // write. A mutation that touches a held-back group writes nothing and
+    // is rolled back, so no caller acknowledges it or runs its effects
+    // (snapshot deletion, withdrawal publication).
+    let encoded = {
+        let groups = state.named_groups.read().await;
+        encode_named_groups_store_excluding_pending_stubs(state, &groups, None).await
+    };
+    let outcome = match encoded {
+        Ok(_) if group_recovery::change_held_back(state, &before, &after) => {
+            Ok(AtomicWriteOutcome::NotReplaced)
+        }
+        Ok((legacy_json, home_suite_json)) => {
+            save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+        }
+        Err(error) => Err(error),
+    };
     if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
         compare_and_restore_named_groups(state, &before, &after).await;
     }
@@ -7470,11 +7752,19 @@ pub(in crate::server) async fn persist_named_group_info(
     group_id: &str,
     info: x0x::groups::GroupInfo,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    let stable = info.stable_group_id().to_string();
     let outcome = persist_named_group_info_inner(state, group_id, info).await;
+    // ADR 0109 §4 (#1570 review): a held-back placeheld group's change is
+    // not durable, even when the roster file is.
+    let outcome = group_recovery::held_back_outcome(state, &stable, outcome);
+    // ZCode on d1be57f1: a held-back group's change is in memory only, so
+    // its roster is not published as a gossip hint. The next save that
+    // lands publishes it.
     if matches!(
         &outcome,
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
-    ) {
+    ) && !group_recovery::is_held_back(state, &stable)
+    {
         refresh_group_rosters_for_gossip(state).await;
     }
     outcome
@@ -7488,6 +7778,7 @@ async fn persist_named_group_info_inner(
     // ADR 0109 §3 step 2: a staged re-seat record keeps the original's
     // marker, so a replacement that dropped it is not a clear.
     state.group_recovery.hold_reseat_marker(&mut info);
+    let stable = info.stable_group_id().to_string();
     // #457 r4: the named write and the TreeKEM snapshot rebind are ONE
     // crash-atomic transaction under the persistence lock — the journal
     // (post-mutation named json + rebound envelope) is written FIRST, the
@@ -7644,6 +7935,19 @@ async fn persist_named_group_info_inner(
             .store(true, Ordering::Release),
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
     }
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): the journal above was
+    // prepared from its own encode, and the save encoded again. If the
+    // save held this group back, the legacy views keep its last committed
+    // form, so the journalled snapshot is newer than the saved roster and
+    // a restart would reject the pair. Discard this transaction's journals
+    // (the snapshot keeps its saved binding) and report the change as not
+    // durable; the worker writes it again.
+    if group_recovery::is_held_back(state, &stable) {
+        if journals_ours {
+            discard_rebind_journal(state, group_id).await;
+        }
+        return Ok(AtomicWriteOutcome::ReplacedNotDurable);
+    }
     if matches!(outcome, Ok(AtomicWriteOutcome::Durable))
         && matches!(prejournaled, RebindOutcome::Rebound)
     {
@@ -7697,7 +8001,9 @@ async fn persist_named_group_info_inner(
 enum RebindOutcome {
     /// Group is not on the TreeKEM plane (or withdrawn/unknown), or the
     /// group has NO snapshot and NO live TreeKEM group on this node
-    /// (pre-existing degradation this write neither caused nor can heal).
+    /// (pre-existing degradation this write neither caused nor can heal),
+    /// or its placeheld record is held back (#1570): the saved roster keeps
+    /// the old record, so the snapshot keeps its binding.
     NotApplicable,
     /// Envelope re-bound (or repaired) and persisted crash-atomically.
     Rebound,
@@ -7757,6 +8063,20 @@ async fn prepare_rebind_journal_for_groups(
             encode_named_groups_store_excluding_pending_stubs(state, groups, Some(group_id))
                 .await
                 .map_err(|e| anyhow::anyhow!("named groups encode for journal: {e}"))?;
+        // ADR 0109 §4 (#1570, Codex P1): the encode above sets the
+        // held-back state, so this check must follow it. A held-back
+        // placeheld group keeps its last durable record in the legacy
+        // views, so the rebound envelope would bind a snapshot that is
+        // newer than the saved roster, and `restore_treekem_groups`
+        // rejects that pair at restart. Write no journal: the snapshot keeps its saved binding.
+        // When the worker later saves the record durably, the snapshot is
+        // older than the roster with the same security binding, which the
+        // restart re-binds (#457).
+        if groups.get(group_id).is_some_and(|record| {
+            group_recovery::is_held_back(state, record.stable_group_id())
+        }) {
+            return Ok(RebindOutcome::NotApplicable);
+        }
         // The LEGACY journal carries the legacy half (its postcard shape
         // is the downgrade-safe replay carrier — old binaries decode and
         // replay exactly this); the separate `.hsjournal` carries the
@@ -7819,11 +8139,11 @@ async fn prepare_rebind_journal_for_groups(
             }
             Err(e) => return Err(anyhow::anyhow!("TreeKEM journal write: {e}")),
         }
-        Ok(())
+        Ok(RebindOutcome::Rebound)
     }
     .await;
     match journalled {
-        Ok(()) => RebindOutcome::Rebound,
+        Ok(outcome) => outcome,
         Err(e) => {
             if journals_ours {
                 discard_rebind_journal(state, group_id).await;
@@ -11417,6 +11737,23 @@ async fn try_queue_causal_approval(
     );
 }
 
+/// ADR 0109 §4 (#1570): the last roster encode held back the group that a
+/// causal replay changed (its live record now, or its record before the
+/// replay). Its legacy entry kept the last committed form, so the replayed
+/// change is not on disk, even when the roster file is Durable.
+async fn replay_group_held_back(
+    state: &AppState,
+    group_id: &str,
+    before: Option<&x0x::groups::GroupInfo>,
+) -> bool {
+    let groups = state.named_groups.read().await;
+    groups
+        .get(group_id)
+        .into_iter()
+        .chain(before)
+        .any(|info| group_recovery::is_held_back(state, info.stable_group_id()))
+}
+
 /// ADR 0028: drain queued causal approvals after a group-state advance. Each
 /// entry is retried with the full ordinary validator (queueing disabled). An
 /// approval applies exactly once only when its matching request is pending and
@@ -11644,6 +11981,23 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                     }
                 }
                 Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => (false, false),
+            };
+            // ADR 0109 §4 (#1570, ZCode on d1be57f1): the roster file can be
+            // Durable while this group is held back. Its legacy entry then
+            // keeps the last committed form, so the approval is not on disk.
+            // Treat it as a failed persist: roll memory back, keep the queue
+            // receipt and run no effect. The next drain applies it again.
+            let (persisted, visible_not_durable) = if (persisted || visible_not_durable)
+                && replay_group_held_back(state, group_id, group_snapshot.as_ref()).await
+            {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id),
+                    request_id = %pending.request_id,
+                    "ADR 0109 S3: the replayed approval is held back (its authoritative record is not durable); rolling back, retaining queue entry"
+                );
+                (false, false)
+            } else {
+                (persisted, visible_not_durable)
             };
             if !persisted && !visible_not_durable {
                 tracing::warn!(
@@ -11890,19 +12244,26 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
     }
     // #1275: the response's events are applied and persisted, so the apply
     // runs shielded; awaiting it keeps the responses in arrival order.
+    // #1699: a staged re-seat join's catch-up applies to its staged tree.
+    let group_id = response.group_id.clone();
     let apply_state = Arc::clone(state);
     let sender = *sender;
     let sender_machine = *machine_id;
     state
         .run_shielded(Box::pin(async move {
-            handle_treekem_catchup_response(
-                &apply_state,
-                &sender,
-                &sender_machine,
-                verified,
-                response,
-            )
-            .await;
+            let stagings = &apply_state.reseat_stagings;
+            stagings
+                .run_in_staging_of(
+                    &group_id,
+                    handle_treekem_catchup_response(
+                        &apply_state,
+                        &sender,
+                        &sender_machine,
+                        verified,
+                        response,
+                    ),
+                )
+                .await;
         }))
         .await
         .is_some()
@@ -17956,17 +18317,26 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     envelope_bytes: Option<Vec<u8>>,
 ) -> Option<ApplyMetadataResult> {
     let apply_state = Arc::clone(state);
+    // #1699: an event of a group under re-seat applies to its staged
+    // record (ADR 0109 §3 step 2); the contained live record keeps its
+    // post-advance state until the swap.
+    let group_id = named_group_metadata_event_group_id(&event).to_string();
     // Boxed: the apply future is large; keep it off this caller's frame.
     state
         .run_shielded(Box::pin(async move {
-            apply_named_group_metadata_event(
-                &apply_state,
-                event,
-                sender,
-                verified,
-                envelope_bytes.as_deref(),
-            )
-            .await
+            let stagings = &apply_state.reseat_stagings;
+            stagings
+                .run_in_staging_of(
+                    &group_id,
+                    apply_named_group_metadata_event(
+                        &apply_state,
+                        event,
+                        sender,
+                        verified,
+                        envelope_bytes.as_deref(),
+                    ),
+                )
+                .await
         }))
         .await
 }
@@ -18423,7 +18793,7 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
         None => None,
     };
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    let (pending, outcome) = {
+    let (pending, outcome, pending_cause) = {
         let groups = state.named_groups.read().await;
         let resolved = groups
             .get(id)
@@ -18451,7 +18821,47 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(id)
             .cloned();
-        (pending, outcome)
+        // ADR 0108 §8 (#1575): the current attempt's held verified notice,
+        // surfaced as `pending_cause` while the join is pending. The
+        // attempt registry is keyed by the invite's group id, so every id
+        // this group resolves under is probed.
+        let pending_cause = if pending {
+            let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let attempts = state
+                .pending_join_attempts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mls_id = resolved.as_ref().map(|(_, info)| info.mls_group_id.clone());
+            [
+                Some(id.to_string()),
+                resolved.clone().map(|(stable, _)| stable),
+                mls_id,
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|group_key| {
+                attempts
+                    .get(&join_result_key(&group_key, &agent_hex))
+                    .and_then(|attempt| attempt.held_pending_notice.clone())
+            })
+            .map(|held| {
+                let (cause, raw_cause) = display_join_pending_cause(&held.cause);
+                let mut value = serde_json::json!({
+                    "cause": cause,
+                    "detail": held.detail,
+                    "issued_at_ms": held.issued_at_ms,
+                    "signer_agent_id": held.signer_agent_id,
+                });
+                // `raw_cause` rides only on an unrecognized name.
+                if let Some(raw) = raw_cause {
+                    value["raw_cause"] = serde_json::Value::String(raw.to_string());
+                }
+                value
+            })
+        } else {
+            None
+        };
+        (pending, outcome, pending_cause)
     };
     let group_exists = state.named_groups.read().await.contains_key(id);
     if !group_exists {
@@ -18474,6 +18884,10 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
         StatusCode::OK,
         serde_json::json!({
             "join_state": if pending { "pending_authority_commit" } else { "idle" },
+            // §8: the key is always present and null unless a verified
+            // notice is held for the current attempt; a later Result or
+            // Refused replaces it.
+            "pending_cause": pending_cause,
             "last_join_outcome": outcome.as_ref().map(|o| serde_json::json!({
                 "outcome": o.outcome,
                 "reason": o.reason,
@@ -18481,6 +18895,29 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
             })),
         }),
     )
+}
+
+/// ADR 0108 §8: the §8 registry rows this tree knows. A well-formed name
+/// outside the registry displays as `unrecognized_cause` with the raw name
+/// (`raw_cause`) — never a decode failure.
+const KNOWN_JOIN_PENDING_CAUSES: [&str; 5] = [
+    "owner_certificate_pending",
+    "evidence_pending",
+    "prerequisite_commit_pending",
+    "authority_catching_up",
+    "no_eligible_admin",
+];
+
+/// §8 display rule: a known registry name passes through; anything else
+/// shows as `unrecognized_cause` carrying the raw name.
+fn display_join_pending_cause(cause: &str) -> (&'static str, Option<&str>) {
+    match KNOWN_JOIN_PENDING_CAUSES
+        .iter()
+        .find(|known| **known == cause)
+    {
+        Some(known) => (*known, None),
+        None => ("unrecognized_cause", Some(cause)),
+    }
 }
 
 pub(in crate::server) async fn get_named_group(
@@ -18835,7 +19272,18 @@ pub(in crate::server) async fn local_join_membership_state(
         return "active";
     }
     let stable = info.stable_group_id().to_string();
-    if expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some() {
+    // #1699: outside the scope of an open re-seat staging, the attempt
+    // under this key is the staged join's, not the contained original's
+    // (ADR 0109 §3 step 2: the live record keeps its membership label).
+    let staged_join = !crate::server::reseat_scope::in_any_reseat_scope()
+        && (state.reseat_stagings.scope_for(&stable).is_some()
+            || state
+                .reseat_stagings
+                .scope_for(&info.mls_group_id)
+                .is_some());
+    if !staged_join
+        && expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some()
+    {
         return "pending_authority_commit";
     }
     match info.members_v2.get(local_agent_hex) {
@@ -22239,6 +22687,7 @@ async fn rearm_sealed_unconfirmed_join(
                     polls: Vec::new(),
                     tasks: Vec::new(),
                     listener_token: None,
+                    held_pending_notice: None,
                 },
             );
     }
@@ -22295,6 +22744,20 @@ pub(in crate::server) async fn join_group_via_invite(
     Json(req): Json<JoinGroupRequest>,
 ) -> impl IntoResponse {
     join_group_via_invite_inner(state, req, false).await
+}
+
+/// ADR 0109 §3a: the shape that only the promoted-admin re-seat mint
+/// makes. The policy has an owner axis, and the inviter-signed view has no
+/// inline owner key. An ordinary mint on an owner axis always carries the
+/// owner key (else `MintInviteError::OwnerKeyUnavailable`), and the key is
+/// inside the inviter-signed view, so it cannot be removed after signing.
+/// No new invite field is used.
+fn is_reseat_invite_shape(invite: &x0x::groups::invite::SignedInvite) -> bool {
+    invite.owner_public_key_b64.is_none()
+        && invite
+            .policy
+            .as_ref()
+            .is_some_and(|policy| policy.admission.owner_certified_user_id().is_some())
 }
 
 /// `POST /groups/join`, and (with `reseat_staging`) ADR 0109 §3's staged
@@ -22496,10 +22959,17 @@ pub(super) async fn join_group_via_invite_inner(
     // sigs, owner half (A2 step 8): the owner countersignature verifies
     // only after the base it commits to has re-derived.
     if let Err(refusal) = invite.verify_v4_owner_countersignature() {
-        let reseat_invite = reseat_staging
-            && refusal == x0x::groups::invite::InviteRefusal::OwnerCountersignatureMissing;
-        if !reseat_invite {
-            return refuse_invite(&state, &invite, refusal.reason());
+        let missing = refusal == x0x::groups::invite::InviteRefusal::OwnerCountersignatureMissing;
+        let staged_reseat = reseat_staging && missing;
+        if !staged_reseat {
+            let reason = if missing && is_reseat_invite_shape(&invite) {
+                // ADR 0109 §3a check 1: a re-seat invite is redeemed
+                // only through the §3 staging join.
+                "reseat_invite_outside_staging"
+            } else {
+                refusal.reason()
+            };
+            return refuse_invite(&state, &invite, reason);
         }
     }
 
@@ -23305,6 +23775,7 @@ pub(super) async fn join_group_via_invite_inner(
                             polls: Vec::new(),
                             tasks: Vec::new(),
                             listener_token: None,
+                            held_pending_notice: None,
                         },
                     );
             }
@@ -24886,9 +25357,13 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
     if sidecar_outcome == AtomicWriteOutcome::NotReplaced && home_suite_json != "{}" {
         anyhow::bail!("withdrawn Home-Suite sidecar repair did not replace the sidecar");
     }
-    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &repair_json)
-        .await
-        .map_err(|e| anyhow::anyhow!("withdrawn named groups repair write: {e}"))?;
+    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &repair_json).await;
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): a roster writer, so a
+    // placeheld group's committed legacy form advances only when this
+    // write landed.
+    group_recovery::commit_legacy_write(state, &outcome);
+    let outcome =
+        outcome.map_err(|e| anyhow::anyhow!("withdrawn named groups repair write: {e}"))?;
     match outcome {
         AtomicWriteOutcome::Durable => state
             .named_groups_requires_durability_confirmation
@@ -35300,9 +35775,12 @@ pub(super) async fn restore_reseat_snapshot_cover(
 /// not there) before the re-seat swap's tree write. That write replaces
 /// the sidecar before its commit point, so a failure after it must put
 /// both files back, as it puts the original's snapshot back.
+/// With them, the committed legacy form of each placeheld group (#1570):
+/// a restore of the named bytes puts those forms back too.
 pub(super) struct RosterStoresBefore {
     home_suite: Option<Vec<u8>>,
     named: Option<Vec<u8>>,
+    committed: group_recovery::CommittedForms,
 }
 
 async fn read_if_present(path: &FsPath) -> Result<Option<Vec<u8>>> {
@@ -35319,6 +35797,7 @@ pub(super) async fn read_roster_stores(state: &AppState) -> Result<RosterStoresB
     Ok(RosterStoresBefore {
         home_suite: read_if_present(&state.home_suite_groups_path).await?,
         named: read_if_present(&state.named_groups_path).await?,
+        committed: group_recovery::committed_forms(state),
     })
 }
 
@@ -35355,6 +35834,11 @@ pub(super) async fn restore_home_suite_store(
 /// Put `named_groups.json` back to `before`, durably. A file that was not
 /// there stays as it is: every roster save writes it. Caller holds
 /// `named_groups_persistence_lock` since [`read_roster_stores`].
+///
+/// #1570 (ZCode on d1be57f1): a Durable restore also puts each placeheld
+/// group's committed legacy form back to the one read with the bytes. A
+/// later held-back save then writes the form that is on disk, never a
+/// form from the write that this restore undid.
 pub(super) async fn restore_named_store(
     state: &AppState,
     before: &RosterStoresBefore,
@@ -35365,7 +35849,10 @@ pub(super) async fn restore_named_store(
     match write_named_groups_json_atomic(&state.named_groups_path, &String::from_utf8_lossy(named))
         .await
     {
-        Ok(AtomicWriteOutcome::Durable) => Ok(()),
+        Ok(AtomicWriteOutcome::Durable) => {
+            group_recovery::restore_committed_forms(state, &before.committed);
+            Ok(())
+        }
         Ok(outcome) => Err(anyhow::anyhow!("named groups restore: {outcome:?}")),
         Err(e) => Err(anyhow::anyhow!("named groups restore: {e}")),
     }
@@ -35850,6 +36337,15 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         .await
         .map_err(|e| before_commit(anyhow::anyhow!("named groups encode: {e}")))?
     };
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): the encode held this group
+    // back, so its legacy entry keeps the last committed form. A snapshot
+    // of the new epoch would then be newer than the saved roster. Write
+    // nothing; the caller rolls back.
+    if group_recovery::is_held_back(state, &stable_group_id) {
+        return Err(before_commit(anyhow::anyhow!(
+            "ADR 0109 §4: the group's authoritative record is not durable (held back)"
+        )));
+    }
 
     #[cfg(test)]
     maybe_force_atomic_persist_post_json_withdrawn_group_for_test(
@@ -36003,14 +36499,17 @@ async fn persist_treekem_and_named_groups_atomic_locked(
         discard_unless_kept(state, group_id_hex, keep_journals).await;
         anyhow::bail!("named groups replacement did not occur");
     }
-    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
-        .await
-        .map_err(|e| {
-            // The legacy journal is already the commit point. A restart
-            // replays this epoch, so the caller must keep the outbound event.
-            anyhow::Error::new(EpochInstalledPersistError)
-                .context(format!("named groups write: {e}"))
-        })?;
+    let outcome =
+        write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json).await;
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): this is a roster writer too,
+    // so a placeheld group's committed legacy form advances only when this
+    // write landed.
+    group_recovery::commit_legacy_write(state, &outcome);
+    let outcome = outcome.map_err(|e| {
+        // The legacy journal is already the commit point. A restart
+        // replays this epoch, so the caller must keep the outbound event.
+        anyhow::Error::new(EpochInstalledPersistError).context(format!("named groups write: {e}"))
+    })?;
     match outcome {
         AtomicWriteOutcome::Durable => state
             .named_groups_requires_durability_confirmation
@@ -41664,20 +42163,28 @@ async fn encode_named_groups_store_excluding_pending_stubs(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     always_include: Option<&str>,
 ) -> std::io::Result<(String, String)> {
-    let durable_view = {
-        let pending = state
-            .pending_join_stubs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (!pending.is_empty()).then(|| {
-            let mut durable_view = groups.clone();
-            durable_view.retain(|key, _| {
-                Some(key.as_str()) == always_include || !pending.contains(key.as_str())
-            });
-            durable_view
-        })
-    };
+    let has_pending = !state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty();
+    let durable_view =
+        has_pending.then(|| without_pending_join_stubs(state, groups.clone(), always_include));
     encode_named_groups_store_for_state(state, durable_view.as_ref().unwrap_or(groups)).await
+}
+
+/// `groups` without unconfirmed join stubs, except `always_include`.
+fn without_pending_join_stubs(
+    state: &AppState,
+    mut groups: HashMap<String, x0x::groups::GroupInfo>,
+    always_include: Option<&str>,
+) -> HashMap<String, x0x::groups::GroupInfo> {
+    let pending = state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    groups.retain(|key, _| Some(key.as_str()) == always_include || !pending.contains(key.as_str()));
+    groups
 }
 
 /// The production store encoder: ADR 0109 §4's S3 placeholder transaction
@@ -41703,9 +42210,21 @@ async fn encode_named_groups_store_allowing(
     allow: Option<&str>,
 ) -> std::io::Result<(String, String)> {
     group_recovery::refuse_roster_write_during_failed_swap(state, allow).await?;
+    // #1699: a write from inside a re-seat scope (ADR 0109 §3 step 2)
+    // changed the staging slot, which never reaches disk. The disk view is
+    // the live map, without unconfirmed join stubs; the open journal's
+    // overlay keeps the original of the group under re-seat.
+    let live_view;
+    let groups = if crate::server::reseat_scope::in_any_reseat_scope() {
+        let live = state.named_groups.live_read().await.clone();
+        live_view = without_pending_join_stubs(state, live, None);
+        &live_view
+    } else {
+        groups
+    };
     // Stack budget (see `migrate_unsplit_home_suite_store_if_needed`): the
     // S3 sidecar writer future lives on the heap, not in every save path.
-    match Box::pin(group_recovery::legacy_store_view(state, groups)).await? {
+    match Box::pin(group_recovery::legacy_store_view(state, groups)).await {
         Some(view) => encode_named_groups_store(&view),
         None => encode_named_groups_store(groups),
     }
@@ -41848,6 +42367,9 @@ async fn save_named_groups_store_checked(
             .store(true, Ordering::Release),
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
     }
+    // ADR 0109 §4 (#1570 rc4): a placeheld group's committed legacy form
+    // advances only when this write landed.
+    group_recovery::commit_legacy_write(state, &outcome);
     outcome
 }
 
@@ -42059,6 +42581,41 @@ const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MEMBER_JOINED_RESEND_POLL_INTERVALS: u32 = 3;
 
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// #1699: a `std` deadline as a tokio one, for `tokio::time::timeout_at`.
+/// `Instant::into()` keeps the `std` reading, but with paused tokio time
+/// (the W3-H sims) tokio's clock runs ahead of `std`'s by all the advanced
+/// time, so a converted deadline has often passed already: a re-seat's
+/// Welcome stream then ended before its final ack, and the subject was
+/// never keyed. The time left is measured on `std`'s clock and added to
+/// tokio's now. When time is not paused the two clocks agree.
+fn tokio_deadline(deadline: Instant) -> tokio::time::Instant {
+    tokio::time::Instant::now() + deadline.saturating_duration_since(Instant::now())
+}
+
+#[cfg(test)]
+mod tokio_deadline_tests {
+    use super::*;
+
+    /// #1699: after paused time advances past a Welcome's TTL in virtual
+    /// time, a deadline 10 minutes ahead on `std`'s clock must still be
+    /// ahead on tokio's. `into()` puts it in the past, so a `timeout_at`
+    /// on it fires at once; [`tokio_deadline`] keeps the time left.
+    #[tokio::test(start_paused = true)]
+    async fn a_std_deadline_keeps_its_time_left_after_paused_time_advances() {
+        tokio::time::advance(PENDING_WELCOME_TTL * 3).await;
+        let deadline = Instant::now() + PENDING_WELCOME_TTL;
+        let converted: tokio::time::Instant = deadline.into();
+        assert!(converted <= tokio::time::Instant::now());
+        let kept = tokio_deadline(deadline);
+        assert!(kept > tokio::time::Instant::now() + PENDING_WELCOME_TTL / 2);
+        let finished = tokio::time::timeout_at(kept, async {
+            tokio::time::sleep(PENDING_WELCOME_TTL / 2).await;
+        })
+        .await;
+        assert!(finished.is_ok());
+    }
+}
 
 // The TreeKEM join-result poll closes at 120s. All fetch retries and the
 // final receive wait must finish inside that window.
@@ -42592,6 +43149,155 @@ fn verify_join_refusal_receipt(
     ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &canonical, &sig).is_ok()
 }
 
+/// ADR 0108 §8 (#1575) — the joiner's notice acceptance checklist. EVERY
+/// dimension must hold, else the notice is dropped (logged) and the
+/// attempt keeps its current cause:
+/// - verified ingress, and the notice names THIS agent, THIS group's
+///   current attempt and that attempt's exact id (a replay for another
+///   attempt never moves);
+/// - the cause is a well-formed registry name (an unknown-but-well-formed
+///   name is HELD and displayed as `unrecognized_cause`, never a decode
+///   failure — §8);
+/// - freshness: inside the 10-minute staging lifetime and not dated more
+///   than 300 s ahead (the refusal receipt's clock-skew rule);
+/// - the signer resolves to the key pinned from the VERIFIED invite (which
+///   must derive `signer_agent_id`, so only the expected authority signs
+///   any cause). A member-signed `no_eligible_admin` notice (D154) is
+///   dropped in this slice: the joiner polls only its authority, so one
+///   can arrive only unsolicited, and §8's "Current notice" rule keeps the
+///   authority's notice current while it polls — the D154 notice-only
+///   rotation slice owns member-signed acceptance (with the Active
+///   stub-roster seat check D154 names);
+/// - the ML-DSA-65 signature verifies over the canonical notice bytes.
+///
+/// Newest-first: a notice older than (or equal to) the held one by
+/// `issued_at_ms` is ignored; a strictly newer one replaces it (§8
+/// "Current notice" — this slice has no notice-only rotation, so the
+/// connection-scoped authority-wins rule of that slice reduces here to
+/// strictly-newer-wins). The notice grants nothing and never finalizes.
+async fn verify_and_hold_join_pending_notice(
+    state: &AppState,
+    verified: bool,
+    notice: &JoinPendingNotice,
+) -> bool {
+    use base64::Engine as _;
+    if !verified {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), "#1575: pending notice over an UNVERIFIED direct message — dropped");
+        return false;
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if notice.member_agent_id != local_hex {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), "#1575: pending notice for a different member — dropped");
+        return false;
+    }
+    if !valid_join_pending_cause(&notice.cause) {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), cause = %notice.cause, "#1575: pending notice cause is not a registry name — dropped");
+        return false;
+    }
+    const JOIN_NOTICE_FUTURE_SKEW: std::time::Duration = std::time::Duration::from_secs(300);
+    let now_ms = now_millis_u64();
+    if notice
+        .issued_at_ms
+        .saturating_add(PENDING_JOIN_RESULT_TTL.as_millis() as u64)
+        < now_ms
+    {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), "#1575: stale pending notice (expired lifetime) — dropped");
+        return false;
+    }
+    if notice.issued_at_ms.saturating_sub(now_ms) > (JOIN_NOTICE_FUTURE_SKEW.as_millis() as u64) {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), ahead_ms = notice.issued_at_ms.saturating_sub(now_ms), "#1575: pending notice dated too far AHEAD — dropped");
+        return false;
+    }
+    let key = join_result_key(&notice.group_id, &notice.member_agent_id);
+    // Read the attempt, resolve the signer key, then re-check and hold
+    // under the registry lock (the attempt id pins the entry).
+    let (attempt_id, inviter_public_key_b64) = {
+        let attempts = state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(attempt) = attempts.get(&key) else {
+            tracing::debug!(group_id = %LogHexId::group(&notice.group_id), "#1575: pending notice with no current attempt entry — dropped");
+            return false;
+        };
+        (
+            attempt.attempt_id.clone(),
+            attempt.inviter_public_key_b64.clone(),
+        )
+    };
+    if attempt_id != notice.attempt_id {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), local_attempt = %attempt_id, notice_attempt = %notice.attempt_id, "#1575: pending notice attempt mismatch — dropped");
+        return false;
+    }
+    // Signer resolution (§8): the pinned inviter key. This slice answers
+    // only its own authority-directed polls (the D154 notice-only rotation
+    // is a follow-up), so a member-signed `no_eligible_admin` notice can
+    // only arrive UNSOLICITED — §8's "Current notice" rule keeps the
+    // authority's notice current while the joiner polls it, so member-signed
+    // notices are dropped until the rotation slice owns their acceptance
+    // (including the Active stub-roster seat check D154 names).
+    let signer_key = BASE64
+        .decode(&inviter_public_key_b64)
+        .ok()
+        .and_then(|bytes| ant_quic::MlDsaPublicKey::from_bytes(&bytes).ok())
+        .filter(|pubkey| {
+            hex::encode(crate::identity::AgentId::from_public_key(pubkey).as_bytes())
+                == notice.signer_agent_id.to_ascii_lowercase()
+        });
+    let Some(signer_key) = signer_key else {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), signer = %LogHexId::agent(&notice.signer_agent_id), cause = %notice.cause, "#1575: notice from a signer that is not the pinned authority — dropped (member-signed acceptance lands with the D154 notice-only rotation)");
+        return false;
+    };
+    let canonical = canonical_join_pending_notice_bytes(notice);
+    let Ok(signature) = BASE64.decode(&notice.signature_b64) else {
+        return false;
+    };
+    let Ok(sig) = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&signature)
+    else {
+        return false;
+    };
+    if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&signer_key, &canonical, &sig)
+        .is_err()
+    {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), signer = %LogHexId::agent(&notice.signer_agent_id), "#1575: pending notice signature verification FAILED — dropped");
+        return false;
+    }
+    let canonical_hash = hex::encode(blake3::hash(&canonical).as_bytes());
+    let mut attempts = state
+        .pending_join_attempts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(attempt) = attempts.get_mut(&key) else {
+        return false;
+    };
+    if attempt.attempt_id != notice.attempt_id {
+        return false;
+    }
+    if attempt
+        .held_pending_notice
+        .as_ref()
+        .is_some_and(|held| held.issued_at_ms >= notice.issued_at_ms)
+    {
+        // §8: older (or same-age) notices are ignored.
+        tracing::debug!(group_id = %LogHexId::group(&notice.group_id), "#1575: pending notice is not newer than the held one — ignored");
+        return false;
+    }
+    attempt.held_pending_notice = Some(HeldJoinPendingNotice {
+        cause: notice.cause.clone(),
+        detail: notice.detail.clone(),
+        issued_at_ms: notice.issued_at_ms,
+        signer_agent_id: notice.signer_agent_id.clone(),
+        canonical_hash,
+    });
+    tracing::debug!(
+        group_id = %LogHexId::group(&notice.group_id),
+        cause = %notice.cause,
+        signer = %LogHexId::agent(&notice.signer_agent_id),
+        "ADR 0108 §8: held a verified join pending notice"
+    );
+    true
+}
+
 /// #477 r2-4 — the refusal lookup with the membership guard ALREADY HELD
 /// (the fetch handler's single critical section covers results + refusals).
 async fn serve_staged_join_refusal(
@@ -42630,11 +43336,556 @@ async fn serve_staged_join_refusal(
     serde_json::to_vec(&response).ok()
 }
 
+/// §8: build the unsigned wire body for a staged notice. Deterministic
+/// while the cause and detail are unchanged — the nonce is derived from
+/// the stable facts and `issued_at_ms` is pinned at first staging — so the
+/// joiner's `held_notice_hash` changes only when the notice does.
+fn wire_body_for_staged_notice(
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    staged: &PendingJoinNotice,
+) -> JoinPendingNotice {
+    let nonce_digest = blake3::hash(
+        format!(
+            "{}:{}:{}:{}:{}:{:?}",
+            staged.signer_agent_id,
+            group_id,
+            member_agent_id,
+            attempt_id,
+            staged.cause,
+            staged.detail
+        )
+        .as_bytes(),
+    );
+    let mut nonce_bytes = [0u8; 16];
+    nonce_bytes.copy_from_slice(&nonce_digest.as_bytes()[..16]);
+    JoinPendingNotice {
+        group_id: group_id.to_string(),
+        member_agent_id: member_agent_id.to_string(),
+        signer_agent_id: staged.signer_agent_id.clone(),
+        attempt_id: attempt_id.to_string(),
+        cause: staged.cause.to_string(),
+        detail: staged.detail.clone(),
+        issued_at_ms: staged.issued_at_ms,
+        nonce: hex::encode(nonce_bytes),
+        signature_b64: String::new(),
+        signer_public_key_b64: None,
+    }
+}
+
+/// ADR 0108 §8 serving: answer one capable, attempt-matching fetch with
+/// the staged notice, signed. Called under the #477 A4 membership critical
+/// section after §8's selection order re-check (Result, then Refused, then
+/// notice). Every §8 serving condition holds here or nothing is served:
+/// the advert gate (`join_pending_notice_v1` on the joiner's current
+/// verified, machine-bound advert), `held_notice_hash` dedup (the joiner
+/// already holds these bytes), `notice_only` narrowing the answer to the
+/// member-signed D154 cause, and — for the signature itself — the §8 lazy
+/// materialization: sign at the first capable serve, cache until the cause
+/// or detail changes, rate-limited per `(group, member)` and globally
+/// (the #477 limiter shape and values, settled by reviewer consensus in
+/// PR #1639 round 4: 1 per joiner per 30 s, 20 per minute overall). The
+/// token is reserved BEFORE the ML-DSA run and refunded on a failed
+/// signature, so an exhausted budget signs nothing and a cached re-serve
+/// spends no token. The staged body must still be inside its 10-minute
+/// lifetime. `signer_public_key_b64` rides only when this node is not the
+/// attempt's expected authority and the cause is `no_eligible_admin` (§8
+/// wire shape; never part of the canonical bytes).
+///
+/// Returns the serialized `Pending` arm, or `None` when nothing may be
+/// served (the joiner retries at the next poll).
+#[allow(clippy::too_many_arguments)]
+async fn serve_staged_join_pending_notice(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    joiner: &AgentId,
+    held_notice_hash: Option<&str>,
+    notice_only: bool,
+) -> Option<Vec<u8>> {
+    // §8: the joiner's current verified, machine-bound advert must set the
+    // bit. Some(false) (a capable advert without it) and None (unknown,
+    // expired or card-only) both serve nothing.
+    if !state
+        .agent
+        .capability_store()
+        .verified_registry_supports(joiner, x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1)
+        .unwrap_or(false)
+    {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            "ADR 0108 §8: joiner advert lacks join_pending_notice_v1 — no notice served"
+        );
+        return None;
+    }
+    let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
+    let (mut notice, canonical_hash, cached_signature, member_key_rides) = {
+        let mut notices = state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        notices.retain(|_, notice| staged_join_pending_notice_is_current(notice));
+        let staged = notices.get_mut(&key)?;
+        // §8 (D154): a notice-only request is answered with at most one
+        // member-signed `no_eligible_admin` — never the S2 cause, never a
+        // Result, Refused, Welcome, key or roster.
+        if notice_only && staged.cause != JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN {
+            return None;
+        }
+        let notice = wire_body_for_staged_notice(group_id, member_agent_id, attempt_id, staged);
+        let canonical_hash = join_pending_notice_hash(&notice);
+        if held_notice_hash == Some(canonical_hash.as_str()) {
+            // §8: the joiner already holds exactly these bytes — send nothing.
+            return None;
+        }
+        let cached_signature = staged
+            .cached
+            .as_ref()
+            .filter(|cached| cached.canonical_hash == canonical_hash)
+            .map(|cached| cached.signature_b64.clone());
+        let member_key_rides = staged.cause == JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN
+            && staged.inviter_agent_id.as_deref() != Some(&staged.signer_agent_id);
+        (notice, canonical_hash, cached_signature, member_key_rides)
+    };
+    let signature_b64 = match cached_signature {
+        Some(cached) => cached,
+        None => {
+            // §8 Q3 (settled by reviewer consensus, PR #1639 review round
+            // 4): the same bounded limiter shape as the refusal signatures
+            // — 1 per (group, member) / 30 s and 20/min globally. The
+            // token is RESERVED BEFORE ML-DSA runs and refunded when
+            // signing fails: an exhausted budget signs nothing (round 3
+            // signed first and discarded the signature, leaving the
+            // signing cost uncapped) and a failed signature spends
+            // nothing. ML-DSA runs OUTSIDE the global notices mutex and
+            // outside the limiter lock; a cached re-serve spends no token.
+            let reserved = {
+                let mut limiter = state
+                    .join_pending_notice_sign_limiter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                limiter.reserve(group_id, member_agent_id)
+            };
+            if !reserved {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    member = %LogHexId::agent(member_agent_id),
+                    "ADR 0108 §8: notice signing throttled (Q3 limits); the joiner retries"
+                );
+                return None;
+            }
+            use base64::Engine as _;
+            let signing_kp = state.agent.identity().agent_keypair();
+            let canonical = canonical_join_pending_notice_bytes(&notice);
+            // #1575 (round 4): a test can force the next sign to fail to
+            // prove the refund below runs; production always signs for real.
+            #[cfg(test)]
+            let sign_outcome = if join_egress_test_barrier::take_notice_sign_failure() {
+                Err(ant_quic::crypto::pqc::types::PqcError::SigningFailed(
+                    "test-forced".to_string(),
+                ))
+            } else {
+                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                    signing_kp.secret_key(),
+                    &canonical,
+                )
+            };
+            #[cfg(not(test))]
+            let sign_outcome = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                signing_kp.secret_key(),
+                &canonical,
+            );
+            let sig = match sign_outcome {
+                Ok(sig) => sig,
+                Err(error) => {
+                    state
+                        .join_pending_notice_sign_limiter
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .refund(group_id, member_agent_id);
+                    tracing::warn!(
+                        group_id = %LogHexId::group(group_id),
+                        member = %LogHexId::agent(member_agent_id),
+                        error = %error,
+                        "#1575: notice signature failed — the limiter token is refunded"
+                    );
+                    return None;
+                }
+            };
+            #[cfg(test)]
+            join_egress_test_barrier::park(member_agent_id, "join_pending_notice_sign").await;
+            let signature_b64 = BASE64.encode(sig.as_bytes());
+            // Cache the signature for the next serve of the same bytes. The
+            // write-back re-checks the row under a fresh lock: a restage
+            // that changed the cause or detail in the gap changed the
+            // canonical bytes, and the cache is skipped.
+            let mut notices = state
+                .pending_join_notices
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(staged) = notices.get_mut(&key) {
+                let current =
+                    wire_body_for_staged_notice(group_id, member_agent_id, attempt_id, staged);
+                if join_pending_notice_hash(&current) == canonical_hash {
+                    staged.cached = Some(CachedJoinPendingNotice {
+                        canonical_hash: canonical_hash.clone(),
+                        signature_b64: signature_b64.clone(),
+                    });
+                }
+            }
+            signature_b64
+        }
+    };
+    notice.signature_b64 = signature_b64;
+    if member_key_rides {
+        use base64::Engine as _;
+        notice.signer_public_key_b64 = Some(
+            BASE64.encode(
+                state
+                    .agent
+                    .identity()
+                    .agent_keypair()
+                    .public_key()
+                    .as_bytes(),
+            ),
+        );
+    }
+    let response = JoinResultMessage::Pending {
+        notice: Box::new(notice),
+    };
+    serde_json::to_vec(&response).ok()
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4, Codex P2): the serving-eligibility
+/// half of the `Pending` reply's admission — the same facts the poll-time
+/// evaluation drops a notice for, re-taken under the group's membership
+/// lock immediately before the reply is written: the joiner was removed,
+/// banned or revoked (or a revocation resync gap makes revocation state
+/// unverifiable), the group is withdrawn, quarantined or gone, this node
+/// lost its Active seat (only a member may sign), or a terminal answer —
+/// a Result or a Refused — was staged for the attempt during delivery. A
+/// notice grants nothing, so the ADR 0110 §4 key-material hold does not
+/// apply: `no_eligible_admin` is itself a §8 notice cause.
+async fn join_pending_notice_serving_blocked(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+) -> bool {
+    let Ok(joiner_agent) = parse_agent_id_hex(member_agent_id) else {
+        return true;
+    };
+    let revoked_joiner = {
+        let revocation_set = state.agent.revocation_set();
+        let set = revocation_set.read().await;
+        if set.revocation_resync_required() {
+            return true;
+        }
+        set.is_agent_revoked(&joiner_agent)
+    };
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (group_blocks, joiner_seat_blocks, this_node_active) = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return true;
+        };
+        (
+            info.withdrawn || info.is_fork_quarantined(),
+            info.members_v2
+                .get(member_agent_id)
+                .is_some_and(|seat| seat.is_removed() || seat.is_banned()),
+            info.has_active_member(&local_hex),
+        )
+    };
+    if group_blocks || joiner_seat_blocks || revoked_joiner || !this_node_active {
+        return true;
+    }
+    // §8 selection order at the write: a terminal answer staged during
+    // delivery supersedes the notice, so the reply is withheld.
+    if state
+        .pending_join_results
+        .read()
+        .await
+        .get(&join_result_key(group_id, member_agent_id))
+        .is_some_and(|pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+    {
+        return true;
+    }
+    state
+        .pending_join_refusals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4, seam hardening): the `Pending`
+/// reply's final eligibility check, run synchronously at the transport
+/// seam immediately before the write. Per the `SeamAdmission` contract
+/// (`x0x::dm`): it NEVER blocks — every lock is a `try_*`, and contention
+/// withholds (fail closed, a retryable refusal at the joiner's next poll).
+/// It re-runs the serving conditions the pre-phase checked — the joiner
+/// revoked or a revocation resync gap, the group withdrawn, quarantined or
+/// unknown, the joiner's seat removed or banned, this node no longer
+/// Active, a Result or Refused staged for the attempt during delivery —
+/// and re-resolves the staged row to the served canonical bytes, so a ban,
+/// a withdrawal or a superseding answer that lands between the pre-phase
+/// and the write stops the reply at the last moment before the bytes go
+/// out (§8's one admitted direct exchange).
+fn join_pending_notice_seam_admissible(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    served_canonical_hash: &str,
+) -> bool {
+    let Ok(joiner_agent) = parse_agent_id_hex(member_agent_id) else {
+        return false;
+    };
+    let revoked_joiner = {
+        let revocation_set = state.agent.revocation_set();
+        let Ok(set) = revocation_set.try_read() else {
+            return false;
+        };
+        if set.revocation_resync_required() {
+            return false;
+        }
+        set.is_agent_revoked(&joiner_agent)
+    };
+    if revoked_joiner {
+        return false;
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    {
+        let Ok(groups) = state.named_groups.try_read() else {
+            return false;
+        };
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return false;
+        };
+        if info.withdrawn
+            || info.is_fork_quarantined()
+            || info
+                .members_v2
+                .get(member_agent_id)
+                .is_some_and(|seat| seat.is_removed() || seat.is_banned())
+            || !info.has_active_member(&local_hex)
+        {
+            return false;
+        }
+    }
+    let staged_result_supersedes = {
+        let Ok(results) = state.pending_join_results.try_read() else {
+            return false;
+        };
+        results
+            .get(&join_result_key(group_id, member_agent_id))
+            .is_some_and(|pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+    };
+    if staged_result_supersedes {
+        return false;
+    }
+    let refusal_staged = {
+        let Ok(refusals) = state.pending_join_refusals.try_lock() else {
+            return false;
+        };
+        refusals.contains_key(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+    };
+    if refusal_staged {
+        return false;
+    }
+    let Ok(notices) = state.pending_join_notices.try_lock() else {
+        return false;
+    };
+    notices
+        .get(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+        .is_some_and(|staged| {
+            staged_join_pending_notice_is_current(staged)
+                && join_pending_notice_hash(&wire_body_for_staged_notice(
+                    group_id,
+                    member_agent_id,
+                    attempt_id,
+                    staged,
+                )) == served_canonical_hash
+        })
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4): the staged-row half of the
+/// `Pending` reply's admission (the async pre-phase's copy): the notice
+/// for the exact attempt is still staged, inside BOTH of its 10-minute
+/// clocks, and still resolves to exactly the canonical bytes that were
+/// signed — a restage that changed the cause or detail (or dropped the row
+/// for a terminal answer) withholds the reply. The seam's own copy is
+/// [`join_pending_notice_seam_admissible`], which takes the same facts
+/// with `try_*` locks only.
+fn join_pending_notice_row_current(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    served_canonical_hash: &str,
+) -> bool {
+    let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
+    let notices = state
+        .pending_join_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    notices.get(&key).is_some_and(|staged| {
+        staged_join_pending_notice_is_current(staged)
+            && join_pending_notice_hash(&wire_body_for_staged_notice(
+                group_id,
+                member_agent_id,
+                attempt_id,
+                staged,
+            )) == served_canonical_hash
+    })
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4, Codex P2): the admission of one
+/// `Pending` notice reply. Like every join artifact it leaves in ONE
+/// admitted direct exchange — never the generic DM sender, whose retries
+/// and gossip/relay fallback would write again with no §8 check at the
+/// seam, so a ban or a withdrawal during delivery could not stop the
+/// reply. The pre-phase re-takes the group's membership lock and re-runs
+/// §8's serving conditions ([`join_pending_notice_serving_blocked`]) plus
+/// the staged-row check; the seam re-runs the same conditions
+/// synchronously at the write with `try_*` locks only
+/// ([`join_pending_notice_seam_admissible`]), so a ban, a withdrawal or a
+/// superseding answer landing between the pre-phase and the write also
+/// stops the reply. The served bytes themselves name what may still be
+/// written: the reply's canonical notice hash must still be the staged
+/// row's.
+fn join_pending_notice_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    response: &[u8],
+) -> x0x::dm::ArtifactAdmission {
+    let state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    let member_agent_id = member_agent_id.to_string();
+    let attempt_id = attempt_id.to_string();
+    let served = response.to_vec();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let group_id = group_id.clone();
+        let member_agent_id = member_agent_id.clone();
+        let attempt_id = attempt_id.clone();
+        let served = served.clone();
+        async move {
+            let Ok(JoinResultMessage::Pending { notice }) =
+                serde_json::from_slice::<JoinResultMessage>(&served)
+            else {
+                return None;
+            };
+            let served_hash = join_pending_notice_hash(&notice);
+            let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
+            {
+                let _membership_guard = lock.lock().await;
+                if join_pending_notice_serving_blocked(
+                    &state,
+                    &group_id,
+                    &member_agent_id,
+                    &attempt_id,
+                )
+                .await
+                {
+                    return None;
+                }
+                if !join_pending_notice_row_current(
+                    &state,
+                    &group_id,
+                    &member_agent_id,
+                    &attempt_id,
+                    &served_hash,
+                ) {
+                    return None;
+                }
+            }
+            let seam_state = Arc::clone(&state);
+            let seam_group = group_id.clone();
+            let seam_member = member_agent_id.clone();
+            let seam_attempt = attempt_id.clone();
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_pending_notice_seam_admissible(
+                    &seam_state,
+                    &seam_group,
+                    &seam_member,
+                    &seam_attempt,
+                    &served_hash,
+                )
+            });
+            Some(seam)
+        }
+    })
+}
+
+/// §8 (PR #1639 review round 3, finding 1): the joiner's advert is unknown
+/// — ask it to republish through the shared single-flight capability
+/// registry (the same route as strict sends), and ONLY when a notice for
+/// this exact attempt is still staged inside its lifetime. A verified fetch
+/// for an unknown group or an unstaged attempt publishes nothing — one
+/// small DM must not buy a network-wide member broadcast. Best-effort: the
+/// 600 s advert cadence converges even when this refresh is lost.
+fn refresh_join_notice_capability(
+    state: &AppState,
+    joiner: &AgentId,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+) {
+    let staged_and_current = {
+        let notices = state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        notices
+            .get(&join_refusal_refusal_key(
+                group_id,
+                member_agent_id,
+                attempt_id,
+            ))
+            .is_some_and(staged_join_pending_notice_is_current)
+    };
+    if !staged_and_current {
+        return;
+    }
+    let agent = Arc::clone(&state.agent);
+    let joiner = *joiner;
+    state.spawn_detached(async move {
+        agent
+            .refresh_application_capability(
+                joiner,
+                x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1,
+            )
+            .await;
+    });
+}
+
 /// Send a serialized join-result response to the fetcher (shared by the
 /// Result and Refused paths).
 async fn send_join_result_response(state: &AppState, sender: &AgentId, payload: &[u8]) {
     let payload_len = payload.len();
     let payload_hash = hex::encode(blake3::hash(payload).as_bytes());
+    // §8 test seam: proves which fetch shapes yield a Result or Refused
+    // reply (a notice-only fetch must never reach this point).
+    #[cfg(test)]
+    join_egress_test_barrier::park(&hex::encode(sender.as_bytes()), "join_result_response").await;
     if let Err(e) = state
         .agent
         .send_direct_with_config(sender, payload.to_vec(), direct_message_send_config())
@@ -42719,7 +43970,9 @@ async fn stage_refusal_if_certificates_unobtainable(
     // stages the pending-notice cause at once, with the pending-seat
     // count — while the typed REFUSAL below stays deadline-gated and
     // retryable. The notice drops when the seal later succeeds (the
-    // staged Result removes it) or when the refusal terminalizes.
+    // staged Result removes it) or when the refusal terminalizes. The
+    // seal path runs on the attempt's authority, so the inviter the
+    // sealed event names is the expected signer here.
     stage_join_pending_notice(
         state,
         group_key,
@@ -42730,6 +43983,7 @@ async fn stage_refusal_if_certificates_unobtainable(
             count: Some(pending.len() as u32),
             ..JoinPendingNoticeDetail::default()
         },
+        member_joined_event_inviter(event),
     )
     .await;
     let (all_digest_only, stable_group_id) = {
@@ -42955,6 +44209,20 @@ impl JoinRefusalSignLimiter {
         } else {
             false
         }
+    }
+
+    /// PR #1639 review round 4 (Codex P2): give back the token `reserve`
+    /// took when the work it admitted does not happen — a notice signature
+    /// that failed after the reservation. Bounded: the global bucket
+    /// returns to the cap at most, and the per-member entry is dropped so
+    /// the next reserve for the pair starts clean.
+    fn refund(&mut self, group_id: &str, member_agent_id: &str) {
+        self.per_member
+            .remove(&(group_id.to_string(), member_agent_id.to_string()));
+        self.global_tokens = self
+            .global_tokens
+            .saturating_add(1)
+            .min(JOIN_REFUSAL_GLOBAL_BUDGET);
     }
 }
 
@@ -43529,8 +44797,9 @@ where
         // A NEWER attempt owns the key.
         return false;
     }
-    // The slot is claimed (registry lock held): spawn and register.
-    let handle = tokio::spawn(task);
+    // The slot is claimed (registry lock held): spawn and register. A
+    // staged re-seat join's attempt task stays in its scope (#1699).
+    let handle = tokio::spawn(crate::server::reseat_scope::inherit_reseat_scope(task));
     #[cfg(test)]
     if let Ok(mut ledger) = ATTEMPT_TASK_HANDLES_FOR_TEST.lock() {
         ledger.push((attempt_id.to_string(), handle.abort_handle()));
@@ -43648,6 +44917,91 @@ fn member_joined_event_attempt_id(event: &NamedGroupMetadataEvent) -> Option<Str
     use base64::Engine as _;
     let raw_sig = BASE64.decode(signature_b64).ok()?;
     Some(member_joined_attempt_id(&canonical, &raw_sig))
+}
+
+/// The inviter a `MemberJoined` event names (`None` for any other kind) —
+/// the expected signer a §8 notice for that attempt is pinned to.
+fn member_joined_event_inviter(event: &NamedGroupMetadataEvent) -> Option<String> {
+    match event {
+        NamedGroupMetadataEvent::MemberJoined {
+            inviter_agent_id, ..
+        } => Some(inviter_agent_id.clone()),
+        _ => None,
+    }
+}
+
+/// ADR 0108 §8 (D154, #1628 review item 2): verify a joiner's signed
+/// `MemberJoined` as attempt evidence. EVERY dimension must hold, else
+/// `None` and the fetch earns no D154 staging:
+/// - the event is a `MemberJoined` whose group id (or stable id) is this
+///   group and whose member is the fetch's `member_agent_id` (already the
+///   verified sender);
+/// - the member public key carried in the event derives that member id
+///   (E4 self-authentication) and the event signature verifies under it;
+/// - the attempt id the joiner names equals blake3 of the canonical event
+///   bytes and the raw signature ([`member_joined_attempt_id`]).
+///
+/// Returns the inviter the evidence names (the attempt's expected
+/// authority).
+fn verified_join_attempt_evidence(
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    evidence: &NamedGroupMetadataEvent,
+) -> Option<String> {
+    use base64::Engine as _;
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id: event_group,
+        stable_group_id,
+        member_agent_id: event_member,
+        member_public_key_b64,
+        role,
+        display_name,
+        inviter_agent_id,
+        invite_secret,
+        ts_ms,
+        treekem_key_package_b64,
+        signature_b64,
+        ..
+    } = evidence
+    else {
+        return None;
+    };
+    if event_group != group_id && stable_group_id.as_deref() != Some(group_id) {
+        return None;
+    }
+    if event_member != member_agent_id {
+        return None;
+    }
+    let key_bytes = BASE64.decode(member_public_key_b64).ok()?;
+    let pubkey = ant_quic::MlDsaPublicKey::from_bytes(&key_bytes).ok()?;
+    let derived = crate::identity::AgentId::from_public_key(&pubkey);
+    if hex::encode(derived.as_bytes()) != event_member.to_ascii_lowercase() {
+        return None;
+    }
+    let canonical = canonical_member_joined_bytes(
+        event_group,
+        stable_id_of(stable_group_id.as_deref(), event_group),
+        event_member,
+        member_public_key_b64,
+        *role,
+        display_name.as_deref(),
+        inviter_agent_id,
+        invite_secret,
+        *ts_ms,
+        treekem_key_package_b64.as_deref(),
+    );
+    let raw_sig = BASE64.decode(signature_b64).ok()?;
+    if member_joined_attempt_id(&canonical, &raw_sig) != attempt_id {
+        return None;
+    }
+    let sig = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&raw_sig).ok()?;
+    if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &canonical, &sig)
+        .is_err()
+    {
+        return None;
+    }
+    Some(inviter_agent_id.clone())
 }
 
 /// #477: the 409 check — same invite while pending is idempotent; a
@@ -44525,7 +45879,7 @@ fn spawn_join_artifact_egress<F>(
             // r5 (lifecycle note section 2.7 item 6): no egress task
             // outlives its artifact's deadline. A timeout drops the body
             // (an unfinished stream resets) and never purges.
-            let _ = tokio::time::timeout_at(deadline.into(), body).await;
+            let _ = tokio::time::timeout_at(tokio_deadline(deadline), body).await;
         }
     });
     // #1274 r3: the drain's completion fence. Only a finished task leaves
@@ -45247,7 +46601,7 @@ pub(super) async fn send_join_artifact(
             .send_direct_pinned_admitted(recipient, payload, &admission, resolve_within)
             .await
     };
-    let outcome = match tokio::time::timeout_at(exchange_deadline.into(), exchange).await {
+    let outcome = match tokio::time::timeout_at(tokio_deadline(exchange_deadline), exchange).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err(format!("{kind} exchange deadline elapsed")),
@@ -45386,6 +46740,20 @@ pub(in crate::server) mod join_egress_test_barrier {
         }
     }
 
+    /// #1575 (PR #1639 review round 4): force the NEXT join-pending-notice
+    /// signature to fail, so a test can prove the serve path refunds the
+    /// limiter token when the ML-DSA run errors. One-shot: the next sign
+    /// consumes the failure.
+    static FAIL_NEXT_NOTICE_SIGN: AtomicBool = AtomicBool::new(false);
+
+    pub(in crate::server) fn force_next_notice_sign_failure() {
+        FAIL_NEXT_NOTICE_SIGN.store(true, Ordering::SeqCst);
+    }
+
+    pub(in crate::server) fn take_notice_sign_failure() -> bool {
+        FAIL_NEXT_NOTICE_SIGN.swap(false, Ordering::SeqCst)
+    }
+
     pub(in crate::server) async fn park(recipient: &str, point: &'static str) {
         let gate = GATES
             .lock()
@@ -45487,11 +46855,27 @@ pub(in crate::server) async fn dispatch_join_result_message(
         // so they run shielded: an abort of this listener cannot cut them
         // off. The listener awaits each, so they still apply in order.
         // `false` (shutdown refused it, or it panicked) stops the listener.
+        // #1699: the result of a staged re-seat join seats its staged
+        // record. A fetch request (below) is served from the live record.
+        let group_id = match &msg {
+            JoinResultMessage::Result { event, .. } => {
+                named_group_metadata_event_group_id(event).to_string()
+            }
+            JoinResultMessage::Refused { receipt } => receipt.group_id.clone(),
+            JoinResultMessage::Pending { notice } => notice.group_id.clone(),
+            JoinResultMessage::FetchRequest { group_id, .. } => group_id.clone(),
+        };
         let apply_state = Arc::clone(state);
         let sender = *sender;
         return state
             .run_shielded(Box::pin(async move {
-                handle_join_result_message(&apply_state, &sender, verified, msg).await;
+                let stagings = &apply_state.reseat_stagings;
+                stagings
+                    .run_in_staging_of(
+                        &group_id,
+                        handle_join_result_message(&apply_state, &sender, verified, msg),
+                    )
+                    .await;
             }))
             .await
             .is_some();
@@ -45570,6 +46954,131 @@ pub(in crate::server) async fn handle_join_result_message(
     handle_join_result_message_bound(state, sender, verified, msg, None).await;
 }
 
+/// ADR 0108 §8 (D154, #1575): the notice half of a fetch with no staged
+/// Result — re-evaluate the notice causes for the attempt, then answer a
+/// capable fetch with the signed `Pending` arm under §8's serving
+/// conditions (capability-gated, `held_notice_hash`-deduped; one direct
+/// exchange, no hidden resend, D145 pre-admission). Runs inside the group's
+/// membership critical section (`notice_section` is `None` only for an
+/// unknown group); the payload is built under the section and the WRITE
+/// happens after the section is released (PR #1639 review round 2), in one
+/// admitted pinned exchange whose admission re-runs §8's serving
+/// conditions under the section again and whose seam re-checks the staged
+/// row at the write (PR #1639 review round 4). Returns `true` when a
+/// `Pending` reply was built and handed to that exchange (admission may
+/// still withhold it; the joiner retries at its next poll).
+#[allow(clippy::too_many_arguments)]
+async fn answer_join_pending_notice_fetch(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: Option<&str>,
+    attempt_evidence: Option<&NamedGroupMetadataEvent>,
+    accepts_pending_notice: bool,
+    held_notice_hash: Option<&str>,
+    notice_only: bool,
+    notice_section: Option<tokio::sync::MutexGuard<'_, ()>>,
+) -> bool {
+    let verified_evidence_inviter =
+        attempt_evidence
+            .zip(attempt_id)
+            .and_then(|(evidence, attempt_id)| {
+                verified_join_attempt_evidence(group_id, member_agent_id, attempt_id, evidence)
+            });
+    evaluate_polled_join_pending_notice(
+        state,
+        group_id,
+        member_agent_id,
+        attempt_id,
+        verified_evidence_inviter.as_deref(),
+    )
+    .await;
+    if accepts_pending_notice && attempt_id.is_some() {
+        match state
+            .agent
+            .capability_store()
+            .verified_registry_supports(sender, x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1)
+        {
+            Some(true) => {
+                let response = serve_staged_join_pending_notice(
+                    state,
+                    group_id,
+                    member_agent_id,
+                    attempt_id.unwrap_or_default(),
+                    sender,
+                    held_notice_hash,
+                    notice_only,
+                )
+                .await;
+                if let Some(response) = response {
+                    // The payload is built under the critical section (local
+                    // work + one lazy signature, like the refusal path); the
+                    // WRITE happens after the section is released, in ONE
+                    // admitted direct exchange — the same pinned
+                    // single-exchange path every join artifact takes (no
+                    // retry, no gossip/relay fallback). The generic DM
+                    // sender is never used: it retries and falls back with
+                    // no §8 check at the write, so a ban or a withdrawal
+                    // during delivery could not stop the reply. The
+                    // admission re-runs §8's serving conditions under the
+                    // membership lock and the seam re-runs them again,
+                    // synchronously and non-blocking, immediately before
+                    // the write (PR #1639 review round 4). A withheld or
+                    // lost reply means the joiner retries at its next poll
+                    // (D145: one direct exchange, no hidden resend).
+                    drop(notice_section);
+                    let admission = join_pending_notice_admission(
+                        state,
+                        group_id,
+                        member_agent_id,
+                        attempt_id.unwrap_or_default(),
+                        &response,
+                    );
+                    let deadline = Instant::now() + PENDING_JOIN_RESULT_TTL;
+                    if let Err(reason) = send_join_artifact(
+                        state,
+                        sender,
+                        &response,
+                        group_id,
+                        "join_pending_notice",
+                        admission,
+                        deadline,
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(group_id),
+                            member = %LogHexId::agent(member_agent_id),
+                            reason = %reason,
+                            "ADR 0108 §8: the Pending notice reply was withheld or lost — the joiner retries at the next poll"
+                        );
+                    }
+                    return true;
+                }
+            }
+            // §8 (PR #1639 review round 3, finding 1): an unknown advert
+            // refreshes ONLY when a notice for this attempt is actually
+            // staged, and only through the shared single-flight registry —
+            // a verified fetch for an unknown group must not trigger a
+            // member broadcast. Some(false) — a current verified advert
+            // without the bit — needs no refresh.
+            None => {
+                refresh_join_notice_capability(
+                    state,
+                    sender,
+                    group_id,
+                    member_agent_id,
+                    attempt_id.unwrap_or_default(),
+                );
+            }
+            Some(false) => {}
+        }
+    }
+    drop(notice_section);
+    false
+}
+
 async fn handle_join_result_message_bound(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -45589,6 +47098,10 @@ async fn handle_join_result_message_bound(
             accepts_refusal,
             accepts_control_blob_ref,
             attempt_id,
+            accepts_pending_notice,
+            held_notice_hash,
+            notice_only,
+            attempt_evidence,
         } => {
             let sender_hex = hex::encode(sender.as_bytes());
             tracing::debug!(
@@ -45607,6 +47120,36 @@ async fn handle_join_result_message_bound(
             // signature nor receive a receipt.
             if !verified && accepts_refusal {
                 tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "#477: refusal-capable fetch over an UNVERIFIED direct message — no refusal served");
+            }
+            // ADR 0108 §8 (D154, PR #1639 review round 3, finding 2): a
+            // notice-only request never yields a Result or a Refused and
+            // cannot admit or seat — the shielded owner-certificate retry
+            // and the staged-Result lookup below are skipped entirely; only
+            // the notice serve can answer it, at most one `Pending`.
+            if notice_only {
+                if verified {
+                    let membership_arc =
+                        group_membership_lock_for_known_group(state, &group_id).await;
+                    let notice_section = match &membership_arc {
+                        Some(arc) => Some(arc.lock().await),
+                        None => None,
+                    };
+                    answer_join_pending_notice_fetch(
+                        state,
+                        sender,
+                        &group_id,
+                        &member_agent_id,
+                        attempt_id.as_deref(),
+                        attempt_evidence.as_deref(),
+                        accepts_pending_notice,
+                        held_notice_hash.as_deref(),
+                        notice_only,
+                        notice_section,
+                    )
+                    .await;
+                }
+                tracing::debug!(group_id = %group_id, member = %member_agent_id, "ADR 0108 §8: notice-only fetch answered with at most one Pending");
+                return;
             }
             // #447: the joiner is still polling — its certificate evidence
             // may have resolved since the last volley rejection (async blob
@@ -45654,8 +47197,10 @@ async fn handle_join_result_message_bound(
             let Some(event) = event else {
                 // #477 A3/A4 — no staged RESULT: answer a capable,
                 // attempt-matching fetch with the staged REFUSAL (if any),
-                // selected in this same critical section.
-                if accepts_refusal && verified {
+                // selected in this same critical section. ADR 0108 §8
+                // (D154): a notice-only request never yields a Result or a
+                // Refused — at most one member-signed `Pending`.
+                if accepts_refusal && verified && !notice_only {
                     if let Some(attempt_id) = attempt_id.as_deref() {
                         // Results take precedence: a successful staging
                         // for this triple removed the refusal already.
@@ -45692,9 +47237,13 @@ async fn handle_join_result_message_bound(
                 );
                 // ADR 0108 §8 (D154, #1575): no Result and no Refused is
                 // staged. A verified, attempt-bound poll from a held joiner
-                // re-evaluates the notice causes this member may sign and
-                // stages the typed local cause; the signed `Pending` serve
-                // itself waits on the wire ruling, so nothing is sent here.
+                // re-evaluates the notice causes and — when the fetch
+                // carries VERIFIED `attempt_evidence` (#1628 review item 2)
+                // — stages the typed cause this member may sign. A capable
+                // fetch is then answered with the signed `Pending` arm
+                // under §8's serving conditions (capability-gated,
+                // `held_notice_hash`-deduped; one direct exchange, no
+                // hidden resend, D145 pre-admission).
                 // The refusal probe above may have consumed the caller's
                 // guard; re-acquire the critical section so §8's Result →
                 // Refused → notice selection stays linearized (the entry
@@ -45708,14 +47257,19 @@ async fn handle_join_result_message_bound(
                             None => None,
                         },
                     };
-                    evaluate_polled_join_pending_notice(
+                    answer_join_pending_notice_fetch(
                         state,
+                        sender,
                         &group_id,
                         &member_agent_id,
                         attempt_id.as_deref(),
+                        attempt_evidence.as_deref(),
+                        accepts_pending_notice,
+                        held_notice_hash.as_deref(),
+                        notice_only,
+                        notice_section,
                     )
                     .await;
-                    drop(notice_section);
                 }
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
@@ -46400,6 +47954,8 @@ async fn handle_join_result_message_bound(
             // critical section; finalize receives the guard instead of
             // re-acquiring it, so no seat finalizer can interleave
             // between acceptance and the terminal write.
+            // ADR 0108 §8: a later Refused replaces any held pending
+            // notice (the finalize removes the whole attempt entry).
             let reason = receipt.reason.as_str();
             let disposition = finalize_join_attempt_with_reason(
                 state,
@@ -46426,6 +47982,13 @@ async fn handle_join_result_message_bound(
                 .groups_diagnostics
                 .record_invite_refusal(&receipt.group_id, reason);
             tracing::warn!(group_id = %LogHexId::group(&receipt.group_id), member = %LogHexId::agent(&receipt.member_agent_id), reason, "#477: join REFUSED by the authority — attempt finalized, stub removed");
+        }
+        // ADR 0108 §8 (#1575): the typed cause of a held attempt. Never an
+        // outcome: the notice is verified and held (or dropped) against the
+        // current attempt; it never finalizes, never extends the poll and
+        // never confirms membership. A later Result or Refused replaces it.
+        JoinResultMessage::Pending { notice } => {
+            verify_and_hold_join_pending_notice(state, verified, &notice).await;
         }
     }
 }
@@ -46633,6 +48196,27 @@ async fn poll_join_result_until_membership_confirmed(
             accepts_refusal: true,
             accepts_control_blob_ref: true,
             attempt_id: Some(attempt_id.clone()),
+            // ADR 0108 §8 (#1575): this joiner sets
+            // `join_pending_notice_v1`, so every poll offers to take a
+            // notice and names the one it already holds — each change is
+            // served once. No notice-only polling in this slice (D154
+            // rotation is a follow-up), so the request stays
+            // authority-directed.
+            accepts_pending_notice: true,
+            held_notice_hash: {
+                let attempts = state
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                attempts.get(&expected_key).and_then(|attempt| {
+                    attempt
+                        .held_pending_notice
+                        .as_ref()
+                        .map(|held| held.canonical_hash.clone())
+                })
+            },
+            notice_only: false,
+            attempt_evidence: None,
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -47521,7 +49105,7 @@ async fn handle_welcome_fetch_request_via<S, F>(
     let stream_deadline = pending.created_at + PENDING_WELCOME_TTL;
     replace_welcome_stream(state, &welcome_id, async move {
         let _ = tokio::time::timeout_at(
-            stream_deadline.into(),
+            tokio_deadline(stream_deadline),
             stream_welcome_blob_guarded(&stream_state, &recipient, &stream_id, pending, transport),
         )
         .await;
@@ -47913,6 +49497,62 @@ pub(in crate::server) type WelcomeFetchWaiter =
 pub(in crate::server) mod tests {
     use super::*;
 
+    /// #1699 part 1 (ZCode on #1703): a roster save from inside a re-seat
+    /// scope encodes the live map without unconfirmed join stubs, never
+    /// the staging slot it changed; outside a scope the encoder takes the
+    /// map it is given. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_save_inside_a_reseat_scope_encodes_the_live_map_without_pending_stubs(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let creator = state.agent.agent_id();
+        let record = |name: &str, key: &str| {
+            x0x::groups::GroupInfo::new(name.to_string(), String::new(), creator, key.to_string())
+        };
+        let (live_key, stub_key, staged_key) = ("a1".repeat(16), "b2".repeat(16), "c3".repeat(16));
+        let live = record("live", &live_key);
+        let staged = record("staged", &staged_key);
+        {
+            let mut groups = state.named_groups.live_write().await;
+            groups.clear();
+            groups.insert(live_key.clone(), live.clone());
+            groups.insert(stub_key.clone(), record("stub", &stub_key));
+        }
+        state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stub_key.clone());
+        let expected = encode_named_groups_store(&HashMap::from([(live_key.clone(), live)]))?;
+        let scope = state
+            .reseat_stagings
+            .open(&staged_key, staged.stable_group_id());
+        let encoded = crate::server::reseat_scope::in_reseat_scope(scope, async {
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(staged_key.clone(), staged.clone());
+            let groups = state.named_groups.read().await;
+            encode_named_groups_store_allowing(&state, &groups, None).await
+        })
+        .await?;
+        assert_eq!(encoded, expected, "the live map, without the stub");
+        assert!(state
+            .named_groups
+            .live_read()
+            .await
+            .get(&staged_key)
+            .is_none());
+        let given = HashMap::from([(staged_key.clone(), staged)]);
+        assert_eq!(
+            encode_named_groups_store_allowing(&state, &given, None).await?,
+            encode_named_groups_store(&given)?,
+            "outside a scope: the given map"
+        );
+        Ok(())
+    }
+
     /// ADR 0108 §8 (#1575): the notice currently staged for one
     /// `(group, member, attempt)`, as `(cause, signer_agent_id, detail)`.
     pub(in crate::server) fn staged_join_pending_notice(
@@ -48097,6 +49737,8 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1570_held_back_rebind;
+    mod issue1570_held_back_tombstone;
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
@@ -48107,6 +49749,8 @@ pub(in crate::server) mod tests {
     mod issue821_read_auth;
     mod issue877_error_body_session;
     mod join_pending_notice_1575;
+    mod join_pending_notice_limiter_1575;
+    mod join_pending_notice_wire_1575;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     #[path = "issue1105_public_revision_catchup.rs"]
@@ -48821,9 +50465,9 @@ pub(in crate::server) mod tests {
             task_list_state_dir: data_dir.join("task-lists"),
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
-            named_groups: RwLock::new(named_groups),
+            named_groups: crate::server::reseat_scope::ScopedGroupMap::new(named_groups),
             gss_publication_gate: Arc::new(RwLock::new(())),
-            group_roster_gossip_lock: Mutex::new(()),
+            group_roster_gossip_lock: Mutex::new(BTreeMap::new()),
             named_groups_path,
             home_suite_groups_path,
             named_groups_persistence_lock: Mutex::new(()),
@@ -48861,11 +50505,12 @@ pub(in crate::server) mod tests {
                     .unwrap_or_default(),
             ),
             profile_path: data_dir.join("profile.json"),
-            mls_groups: RwLock::new(HashMap::new()),
+            mls_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             mls_groups_path: data_dir.join("mls_groups.bin"),
             pending_join_results: RwLock::new(HashMap::new()),
             pending_join_refusals: StdMutex::new(HashMap::new()),
             pending_join_notices: StdMutex::new(HashMap::new()),
+            join_pending_notice_sign_limiter: StdMutex::new(JoinRefusalSignLimiter::default()),
             pending_join_attempts: StdMutex::new(HashMap::new()),
             last_join_outcomes: StdMutex::new(HashMap::new()),
             join_refusal_sign_limiter: StdMutex::new(Default::default()),
@@ -48926,7 +50571,8 @@ pub(in crate::server) mod tests {
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
             treekem_catchup_refusals: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
-            treekem_groups: RwLock::new(HashMap::new()),
+            reseat_stagings: Default::default(),
+            treekem_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             treekem_dir,
             revocation_evictions: S4Runtime::default(),
             group_recovery: S3Runtime::default(),
@@ -49192,6 +50838,10 @@ pub(in crate::server) mod tests {
                 accepts_refusal: true,
                 accepts_control_blob_ref: false,
                 attempt_id: Some("a1".into()),
+                accepts_pending_notice: false,
+                held_notice_hash: None,
+                notice_only: false,
+                attempt_evidence: None,
             };
             let bytes = serde_json::to_vec(&capable).expect("serialize");
             assert!(
@@ -49206,12 +50856,20 @@ pub(in crate::server) mod tests {
                 accepts_refusal: false,
                 accepts_control_blob_ref: false,
                 attempt_id: None,
+                accepts_pending_notice: false,
+                held_notice_hash: None,
+                notice_only: false,
+                attempt_evidence: None,
             };
             let legacy_bytes = serde_json::to_vec(&incapable).expect("serialize");
             assert!(
                 !String::from_utf8_lossy(&legacy_bytes).contains("accepts_refusal")
                     && !String::from_utf8_lossy(&legacy_bytes).contains("accepts_control_blob_ref")
-                    && !String::from_utf8_lossy(&legacy_bytes).contains("attempt_id"),
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("attempt_id")
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("accepts_pending_notice")
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("held_notice_hash")
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("notice_only")
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("attempt_evidence"),
                 "skip_serializing_if keeps false/None fields absent (legacy shape)"
             );
             let ref_capable = JoinResultMessage::FetchRequest {
@@ -49222,6 +50880,10 @@ pub(in crate::server) mod tests {
                 accepts_refusal: true,
                 accepts_control_blob_ref: true,
                 attempt_id: Some("a1".into()),
+                accepts_pending_notice: false,
+                held_notice_hash: None,
+                notice_only: false,
+                attempt_evidence: None,
             };
             let ref_bytes = serde_json::to_vec(&ref_capable).expect("ref-capable serializes");
             assert!(String::from_utf8_lossy(&ref_bytes).contains("accepts_control_blob_ref"));
@@ -49394,6 +51056,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
             // Execute the PRODUCTION refire (stored-bytes branch) — with
@@ -49896,6 +51559,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
             let _poll_window = set_join_poll_window_override(&group, "a7", 120);
@@ -50190,6 +51854,10 @@ pub(in crate::server) mod tests {
                     accepts_refusal: true,
                     accepts_control_blob_ref: false,
                     attempt_id: Some(attempt_b.clone()),
+                    accepts_pending_notice: false,
+                    held_notice_hash: None,
+                    notice_only: false,
+                    attempt_evidence: None,
                 },
             )
             .await;
@@ -50474,6 +52142,10 @@ pub(in crate::server) mod tests {
                         accepts_refusal: true,
                         accepts_control_blob_ref: false,
                         attempt_id: Some(staged_attempt_id),
+                        accepts_pending_notice: false,
+                        held_notice_hash: None,
+                        notice_only: false,
+                        attempt_evidence: None,
                     },
                 )
                 .await
@@ -50593,6 +52265,10 @@ pub(in crate::server) mod tests {
                         accepts_refusal: true,
                         accepts_control_blob_ref: false,
                         attempt_id: None,
+                        accepts_pending_notice: false,
+                        held_notice_hash: None,
+                        notice_only: false,
+                        attempt_evidence: None,
                     },
                 )
                 .await
@@ -50906,6 +52582,10 @@ pub(in crate::server) mod tests {
                     accepts_refusal: accepts,
                     accepts_control_blob_ref: false,
                     attempt_id: attempt,
+                    accepts_pending_notice: false,
+                    held_notice_hash: None,
+                    notice_only: false,
+                    attempt_evidence: None,
                 }
             };
             let cached_sig = || {
@@ -51239,6 +52919,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
             // AUTHORITY-side caches that must survive.
@@ -51415,6 +53096,7 @@ pub(in crate::server) mod tests {
                         polls: vec![poll],
                         tasks: vec![task],
                         listener_token: token,
+                        held_pending_notice: None,
                     },
                 );
             let finalize_arc = group_membership_lock_for_known_group(&state, &group)
@@ -51838,6 +53520,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
             // A VALID receipt for the live attempt, signed by the
@@ -51942,6 +53625,7 @@ pub(in crate::server) mod tests {
                             polls: Vec::new(),
                             tasks: Vec::new(),
                             listener_token: None,
+                            held_pending_notice: None,
                         },
                     );
             };
@@ -52178,6 +53862,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
         }
@@ -62272,6 +63957,10 @@ pub(in crate::server) mod tests {
             accepts_refusal: false,
             accepts_control_blob_ref: false,
             attempt_id: None,
+            accepts_pending_notice: false,
+            held_notice_hash: None,
+            notice_only: false,
+            attempt_evidence: None,
         };
         let payload = serde_json::to_vec(&request);
         assert!(payload.is_ok(), "join-result fetch request serializes");

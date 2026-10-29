@@ -1538,8 +1538,8 @@ token. A session token is refused before the body is read.
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 20) and 429 `invite_cap_reached` (64 live unconsumed records/group). **Invites are single-use**: the link carries a one-time secret that the issuing daemon consumes on the first validated `MemberJoined` (before it publishes the authority-signed `MemberAdded`). A replay's fate depends on where it lands: after the authority validated the original join, a replayed secret is rejected `invite_secret_consumed` and never seated; if the authority has NOT validated yet (event still in flight, or it restarted first) the secret is unburned; a replay by an already-active member is refused earlier as an idempotent no-op (and a same-node duplicate join is an idempotent local success, #188); an addressed invite replayed by the wrong joiner is refused without consuming the secret. None of these paths proves YOUR seat — mint a fresh invite instead. `expiry_secs` only bounds how long an *unconsumed* invite stays valid |
 | POST | `/groups/:id/stores` | `x0x group store create <GROUP_ID> <NAME>` | Open or idempotently re-open a creator-anchored group store: signed plaintext for `SignedPublic`, encrypted for `MlsEncrypted` GSS; current group policy gates writes |
-| POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
-| GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
+| POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `reseat_invite_outside_staging` (an ADR 0109 §3a re-seat invite: owner-axis policy, no inline owner key; it is valid only in the §3 staging join), `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
+| GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. ADR 0108 §8 (#1575): the **200** body always carries the `pending_cause` key (null unless `join_state` is `pending_authority_commit` and the joiner holds a verified `JoinPendingNotice`), holding `pending_cause {cause, raw_cause?, detail {count?, revision?, digests?}, issued_at_ms, signer_agent_id}`; the 404 body after a terminal finalize carries no `pending_cause` key; a well-formed cause this build does not know shows as `unrecognized_cause` with the raw name in `raw_cause`, never a decode failure. A later Result or Refused replaces it. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set the local agent's own display name. Body `{"name":"<display name>"}`. Requires an active seat in the group, any role, on any token class. The label is local, so there is no Home durable fence. The name is not part of the signed roster |
 | PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
 | PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |
@@ -1895,7 +1895,7 @@ the fields shown:
 | `awaiting_attestation` | `reason`, `asked`, `next_retry_at_ms` | The node asks capable admins, then members. `reason` is `no_capable_peer`, `no_reply`, `segment_exhausted`, `renewal_due`, `provisional_unverified`, or the last refusal reason. |
 | `readmission_required` | `cause`, `asked`, `exit` | `cause` is `base_beyond_retention` or `local_state_lost`. `exit` is `manual_remove_and_reinvite` until ADR 0114's repair is in effect. |
 | `manual_clear_required` | `ref` | The head is on the admin's chain, but the marker names a sibling. Use `POST /groups/:id/quarantine/clear`. |
-| `reseat_required` | `cause`, `ref`, `last_refusal`, `asked` | `cause` is `not_on_chain`, `attestation_conflict`, `not_a_member` or `reseat_failed`. An admin must re-seat this node by hand. |
+| `reseat_required` | `cause`, `ref`, `last_refusal`, `asked` | `cause` is `not_on_chain`, `attestation_conflict`, `not_a_member` or `reseat_failed`. An admin must re-seat this node by hand. When this node refuses a re-seat authorisation, `last_refusal` is `authorisation_refused:<cause>`, where `<cause>` is `signature`, `signer`, `subject`, `basis`, `base_seats_subject` or `expired` (ADR 0109 §3); other failed checks, for example `group_mismatch` or `reseat_invite_unpaired`, show their own name. |
 | `reseat_in_progress` | `authorised_by`, `phase`, `expires_at_ms` | A valid authorisation arrived. The staged join runs. |
 | `recovery_deferred` | `cause`, and `file` for a damaged sidecar | `home_gate_closed` (Home activation is off) or `host_commit_pending`. Inside an uncommitted ADR 0094 upgrade trial S3 creates no sidecar and writes no placeholder, and a damaged sidecar stays in place; after host commit S3 continues (a damaged file is then quarantined and rebuilt). |
 | `recovery_refused` | `reason` | `banned_or_revoked`. Final. |
@@ -1922,6 +1922,7 @@ route checks in this order and refuses with the first failure:
 |---|---|---|
 | 400 | `reason_required` | `reason` is empty. |
 | 400 | `basis_unknown` | `basis` does not parse. |
+| 403 | (session token) | A Home or OwnerCertified group, and the caller uses a session token, not the durable API token. A re-seat credential of an owner-axis group admits a device, so a session bearer never mints one. The error text is the Home mutation fence's. |
 | 503 | `recovery_deferred` | `detail.cause` is `host_commit_pending`: an ADR 0094 upgrade trial is not yet host-committed and the group has no sidecar. The route signs, stores and mints nothing. |
 | 409 | `admin_contained` | This admin's own record has a marker or an armed gap. |
 | 409 | `subject_active` | The subject is Active. Remove it first with `DELETE /groups/:id/members/:agent_id`. |
@@ -2009,7 +2010,24 @@ record these frames.
 
 **Sidecar.** S3 state lives in `<data_dir>/group-recovery/<stable_group_id>.grecov`
 (header `X0GRCV1\0`, postcard body). `named_groups.json` and
-`home-suite-groups.json` do not change format.
+`home-suite-groups.json` do not change format. The body holds the ADR 0109 §4
+fields (`generation`, `rebuilt_from`, `served_chain`, `active_ata`,
+`queued_terminal`, `authoritative_record`, `reseat_journal`,
+`staging_record`, `issued_reseats`, `retired`) and, after them, two more:
+
+- `attestation_conflict`: a verified ATA whose sequence diverges from
+  `active_ata` (§2 "Conflict"). While it is kept, catch-up stops at the
+  common prefix, no ATA arms, and the node shows
+  `reseat_required {attestation_conflict}`. A re-seat swap clears it.
+- `authoritative_binding`: the exact `before` and `after` heads (state
+  revision, state hash, marker identity) of the transition that wrote
+  `authoritative_record`, and the earlier authoritative record when the
+  legacy view already held a placeholder (§4 "Transactions"). Load
+  reconciliation uses it to choose which record replaces the legacy
+  placeholder (§4 "Crash reconciliation at load").
+
+The ADR 0085 rule 6 fixture is `tests/fixtures/group_recovery_v1.bin`
+(provenance beside it), with every field set.
 
 ### Certificate rebind (ADR 0110 §4a)
 
@@ -3619,6 +3637,40 @@ reaper counters:
 
 ### `GET /diagnostics/dm`
 
+`stats.incoming_dropped_revoked` counts every DM or ACK the inbox drops
+for one of these reasons:
+
+- the sender's agent is revoked
+- a machine this cache still attributes to that sender is revoked
+- the sender's attribution set overflowed and a revoked machine is also
+  attributed to that sender
+- the stranger revocation pin cap is full (2,048 pinned pairs, half of
+  the 4,096 stranger share; a smaller share uses half of that share)
+  and this sender still has a revoked pair that was dropped or could
+  not be pinned
+
+An overflowed attribution set does not by itself refuse an unattested
+message. When the stranger pin cap is full, refuse unattested traffic
+only from an agent who still has a revoked pair that was dropped or
+could not be pinned, and count only those refusals in
+`incoming_dropped_revoked`. Those records are capped at the stranger
+share. A clean answer or a restart drops them. An open pin cap does not
+refuse. Never evict a revoked pin. Eviction pins a revoked pair when
+the cap and the per-agent limit both have room. A sender this receiver
+cannot link to a revoked machine keeps its normal policy. A Trusted or Known contact, and
+a protected non-contact, are not refused for the pin cap. An internal
+counter for the overflow and dropped-pair refusals stays off this
+response. The daemon emits a rate-limited warning for them, one
+remembered sender at a time, for 256 senders. A further sender shares one
+interval while every remembered interval is still open. A slot whose
+interval has expired is reused. One remembered sender cannot suppress the
+warning for a different remembered sender. Stranger-budget eviction is
+the same kind of warning. A machine past the per-agent cap is not
+recorded. A revocation of that unrecorded machine does not move
+`incoming_dropped_revoked` for an unattested DM or ACK that claims a
+different, clean machine, unless that sender's revoked pair was dropped
+or could not be pinned while the pin cap is full.
+
 `x0x diagnostics dm [--agent <64-hex-agent-id>]` adds `per_peer_digest` (schema 2)
 to the existing DM diagnostics. Optional `?agent=<64-hex-agent-id>` selects exactly
 one agent in that object; malformed IDs return HTTP 400 (CLI validation also
@@ -3692,7 +3744,7 @@ Key counter fields (flattened into each group row):
 | `task_deltas_quarantine_dropped` | Receiver | ADR-0068 D2: held task deltas dropped because the per-list bound (1024 deltas / 1 MiB) was reached — oldest first. Not silent loss (merges are idempotent and anti-entropy refills after the clear), but a climbing value means the quarantine is outlasting the buffer. |
 | `task_deltas_quarantine_applied` | Receiver | ADR-0068 D2: held task deltas applied, in arrival order, after the marker cleared. |
 | `task_deltas_seal_rejected` | Receiver | #895: task deltas refused on a group-scoped list — plaintext on an encrypted group (un-upgraded or non-member sender), a sealed record that cannot be opened with the group's current key, or a sealed author that is not the gossip sender. Never merged. |
-| `invites_refused_reasons` | Joiner / inviter | `{"<reason>": count}` map of signed-invite refusals for this group, keyed by the typed reason. Joiner-side (`POST /groups/join`): `invite_unsigned`, `invite_signature_invalid`, `inviter_key_mismatch`, `inviter_key_revoked`, `invite_owner_countersignature_missing`, `invite_owner_countersignature_invalid`, `invite_malformed`, plus the base/addressing/mode-matrix refusals the join route answers with 409. Inviter-side: `invite_not_addressed_to_joiner` when an addressed invite's `MemberJoined` arrives from a different agent (the secret is not consumed). **Omitted from the row while empty.** |
+| `invites_refused_reasons` | Joiner / inviter | `{"<reason>": count}` map of signed-invite refusals for this group, keyed by the typed reason. Joiner-side (`POST /groups/join`): `invite_unsigned`, `invite_signature_invalid`, `inviter_key_mismatch`, `inviter_key_revoked`, `invite_owner_countersignature_missing`, `invite_owner_countersignature_invalid`, `reseat_invite_outside_staging`, `invite_malformed`, plus the base/addressing/mode-matrix refusals the join route answers with 409. Inviter-side: `invite_not_addressed_to_joiner` when an addressed invite's `MemberJoined` arrives from a different agent (the secret is not consumed). **Omitted from the row while empty.** |
 
 ### `GET /diagnostics/connect`
 
