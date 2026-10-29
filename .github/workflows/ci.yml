@@ -609,7 +609,9 @@ jobs:
     name: W3-H shard (${{ matrix.group }})
     needs: w3h-plan
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # S3 runs the H-S3-c/c2 owner-cert rows at 15 min each (#1689), so its
+    # group gets 150 min. Every other group keeps 120 min.
+    timeout-minutes: ${{ matrix.group == 's3' && 150 || 120 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.w3h-plan.outputs.matrix) }}
