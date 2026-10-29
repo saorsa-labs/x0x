@@ -70,6 +70,7 @@ mod case_1356;
 mod case_1357;
 mod case_1427;
 mod case_1471;
+mod case_1578;
 mod case_1581;
 mod case_1581b;
 mod case_1581c;

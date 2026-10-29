@@ -864,6 +864,8 @@ jobs:
           --expect w3h_1356_red_s3_c2_reseat_retires_marker_and_gap=GREEN
           --require w3h_1666_control_certificate_only_admin_seals
           --expect w3h_1666_control_certificate_only_admin_seals=GREEN
+          --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
+          --expect w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless=GREEN
           --require w3h_1581_s4_ordinary_admin_revoked
           --expect w3h_1581_s4_ordinary_admin_revoked=GREEN
           --require w3h_1581b_control_dropped_eager_frame_retry_floor

@@ -245,7 +245,15 @@ async fn prepare_committed_removal(
         .await
         .values()
         .find(|group| group.stable_group_id() == key.stable_group_id)
-        .and_then(|group| group.members_v2.get(&target).cloned());
+        .and_then(|group| {
+            // #1578 rc11 (audit): the join's key-only marker row reads
+            // as no seat, exactly main's roster.
+            group
+                .members_v2
+                .get(&target)
+                .filter(|member| !group.join_seat_key_marker_only(&member.agent_id))
+                .cloned()
+        });
     match super::locked_removal_state(state, &key, seat.as_ref()).await {
         super::LockedRemoval::NotS4 => return RemovalPrepare::NotS4,
         super::LockedRemoval::Cancelled => return RemovalPrepare::Cancelled,

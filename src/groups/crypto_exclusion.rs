@@ -568,7 +568,12 @@ pub fn check_ahead(
     {
         return Err(CryptoExclusionRefusal::ActorIneligible);
     }
-    if !latest.members_v2.contains_key(&hex::encode(body.target)) {
+    // #1578 rc11 (audit): the join's key-only marker row is not a seat
+    // — the target reads as absent, exactly main's roster, where the
+    // pre-admission joiner holds no row.
+    let target_hex = hex::encode(body.target);
+    if !latest.members_v2.contains_key(&target_hex) || latest.join_seat_key_marker_only(&target_hex)
+    {
         return Err(CryptoExclusionRefusal::TargetNotRemoved);
     }
     Ok(())

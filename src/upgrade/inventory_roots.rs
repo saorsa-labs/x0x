@@ -9,9 +9,9 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::{fmt, io};
 
 use crate::server::InstanceName;
 use crate::storage::{resolve_x0x_home, resolve_x0x_instance_dir};
@@ -35,11 +35,18 @@ pub(super) struct Selection {
     identity_override: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(super) struct LexicalRoots {
     pub name: Option<String>,
     pub data: PathBuf,
     pub identity: PathBuf,
+}
+
+// Instance names and storage paths are private inventory evidence.
+impl fmt::Debug for LexicalRoots {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LexicalRoots(<redacted>)")
+    }
 }
 
 /// Select the config before reading it, as x0xd does. The CLI name selects the

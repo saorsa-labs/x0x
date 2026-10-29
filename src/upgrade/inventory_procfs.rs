@@ -6,16 +6,23 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
-use std::io;
+use std::{fmt, io};
 
 const MAX_BYTES: usize = 1_048_576;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct ProcessStat {
     pub(crate) pid: u32,
     pub(crate) state: u8,
     pub(crate) flags: u64,
     pub(crate) start_ticks: u64,
+}
+
+// Supplied process and account identities stay out of inventory diagnostics.
+impl fmt::Debug for ProcessStat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProcessStat(<redacted>)")
+    }
 }
 
 /// Linux proc_pid_stat(5), fields 1, 3, 9 and 22. The comm field is opaque:
@@ -45,10 +52,16 @@ pub(crate) fn parse_stat(bytes: &[u8]) -> io::Result<ProcessStat> {
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct Credentials {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Credentials(<redacted>)")
+    }
 }
 
 /// Bind all four real/effective/saved/filesystem IDs. Mixed ownership and

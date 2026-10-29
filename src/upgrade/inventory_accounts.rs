@@ -7,8 +7,8 @@
 #![allow(dead_code)] // Private parser; inventory activation is not part of this slice.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
 use std::path::PathBuf;
+use std::{fmt, io};
 
 use sha2::{Digest, Sha256};
 
@@ -18,18 +18,31 @@ const MAX_MEMBERS: usize = 4096;
 // subset and refuse non-ASCII policy tokens instead of normalizing authority.
 const POLICY_WHITESPACE: [char; 6] = [' ', '\t', '\n', '\r', '\x0b', '\x0c'];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Account {
     pub uid: u32,
     pub gid: u32,
     pub home: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct AccountTable {
     users: BTreeMap<String, Account>,
     groups: BTreeMap<String, u32>,
     pub digest: [u8; 32],
+}
+
+// Inventory diagnostics must not disclose account records or their digest.
+impl fmt::Debug for Account {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Account(<redacted>)")
+    }
+}
+
+impl fmt::Debug for AccountTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AccountTable(<redacted>)")
+    }
 }
 
 impl AccountTable {

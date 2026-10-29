@@ -176,6 +176,52 @@ pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
     })
 }
 
+/// #1578 (David's ruling, 28 Oct 02:09 GMT; Engineer ruling, 28 Oct
+/// 09:35 GMT): the head this node claims for a group in a catch-up
+/// answer, from the narrow inputs its caller copied under the groups
+/// read lock. `None` exactly while the node is a keyless GSS survivor
+/// of an encrypted group: the policy is `MlsEncrypted` (a SignedPublic
+/// group is GSS-plane by default and holds no secret and no seat KEM
+/// key by design — its members are not keyless survivors), the group's
+/// secrets are GSS-delivered, the node holds no secret of its saved
+/// head's epoch, and its own roster seat carries no KEM public key —
+/// the #1578 keyless install. Such a node can never identify a share
+/// sealed to its seat, so its install is local fact only and must never
+/// converge an author's delivery row: no peer sees convergence evidence
+/// from it until a secret of that epoch installs, and a chain of
+/// keyless installs claims no head at all. The claim is derived from
+/// the group state itself, never from the hold file: a hold write that
+/// fails, and the restart after it, cannot turn a keyless install into
+/// a head claim (the installed GSS head keeps implying its key). Every
+/// other responder — one with a secret, one whose waiting keeps the old
+/// secret, one whose own seat still carries the KEM key though no
+/// secret of the saved head's epoch remains (a superseded intermediate
+/// install), a SignedPublic member, an encrypted-group joiner that
+/// still waits for
+/// its welcome share (its own seat is not an Active keyless seat: it is
+/// not seated yet, or seated with the KEM key its `MemberJoined`
+/// published), a member of any other plane (a TreeKEM joiner holds
+/// heads with no GSS secret and no seat KEM key by design, so the
+/// keyless marker is meaningless there), and a responder that does not
+/// know the group — claims its saved head, exactly as on main.
+/// Disclosed residue: an encrypted-group member whose own-view roster
+/// lost the KEM key before any share installed omits while in that
+/// state — the same class as the ruled keyless state (no key of the
+/// epoch, no seat key), converging nothing.
+pub(super) fn reported_head(
+    gss_plane: bool,
+    encrypted: bool,
+    saved_head: &str,
+    has_secret: bool,
+    own_seat_keyless: bool,
+) -> Option<String> {
+    if gss_plane && encrypted && !has_secret && own_seat_keyless {
+        None
+    } else {
+        Some(saved_head.to_string())
+    }
+}
+
 /// Whether a parked removal or ban, or a held crypto-only exclusion, still
 /// holds new ciphertext for `group_key`. There is no time limit: only a
 /// secret of the held epoch, or a later one, ends a hold. Call
@@ -576,19 +622,41 @@ pub(super) async fn hold_exclusion(
 
 /// Drop the group's exclusion holds that no longer hold `info` (a secret of
 /// their epoch or a later one is installed), such as an evicted removal's
-/// hold after its key installed. The caller writes the file.
-pub(super) fn prune_exclusions(state: &AppState, group_key: &str, info: &x0x::groups::GroupInfo) {
+/// hold after its key installed, or #1578's keyless install hold after the
+/// share it awaits installed. Returns whether a hold was dropped. The
+/// caller writes the file.
+pub(super) fn prune_exclusions(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) -> bool {
     let mut lot = state
         .gss_share_holds
         .exclusions
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(list) = lot.get_mut(group_key) {
-        list.retain(|hold| holds(info, Some(hold.secret_epoch)));
-        if list.is_empty() {
-            lot.remove(group_key);
-        }
+    let Some(list) = lot.get_mut(group_key) else {
+        return false;
+    };
+    let before = list.len();
+    list.retain(|hold| holds(info, Some(hold.secret_epoch)));
+    let dropped = list.len() != before;
+    if list.is_empty() {
+        lot.remove(group_key);
     }
+    dropped
+}
+
+/// Whether the group has an exclusion hold in memory. A share that installs
+/// with no removal parked still prunes the holds it ends (#1578). Call
+/// [`ensure_loaded`] first.
+pub(super) fn holds_exclusions(state: &AppState, group_key: &str) -> bool {
+    state
+        .gss_share_holds
+        .exclusions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(group_key)
 }
 
 /// The exclusion installed with its secret at `secret_epoch`: its hold,
@@ -715,5 +783,86 @@ pub(in crate::server) mod test_seam {
 
     pub(in crate::server) fn hold_file_exists(state: &AppState, group_key: &str) -> bool {
         hold_path(state, group_key).exists()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1578 rc3 (review finding 1): the keyless claim is derived from
+    /// the group state, not from the hold file. A hold write that fails
+    /// and the restart after it leave the keyless install with no hold
+    /// anywhere — the claim stays absent. Before the fix the saved head
+    /// was served as soon as no hold named the epoch, and the node
+    /// claimed a head it holds no key for.
+    #[test]
+    fn a_keyless_install_claims_no_head_with_no_hold_anywhere() {
+        assert_eq!(
+            reported_head(true, true, "keyless-result-head", false, true),
+            None
+        );
+    }
+
+    /// #1578 rc4 (Engineer ruling, 28 Oct 09:35 GMT; Claude blocking 1,
+    /// Codex P2 on #1635): a SignedPublic group is GSS-plane by default
+    /// and holds no secret and no seat KEM key by design, so its members
+    /// are not keyless survivors. Every invite-joined SignedPublic
+    /// member matched the rc3 predicate and disclaimed its head for
+    /// ever, with no survivor-convergence evidence left for its S4
+    /// removal, rebind and owner-recovery rows. The confidentiality
+    /// check keeps main's answer.
+    #[test]
+    fn a_signed_public_member_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(true, false, "saved-head", false, true),
+            Some("saved-head".to_string())
+        );
+    }
+
+    /// #1578 rc3 (rc3 review, plane gate): a member of any other plane
+    /// — a TreeKEM joiner, which holds heads with no GSS secret and no
+    /// seat KEM key by design — keeps main's answer. Without the plane
+    /// gate every such joiner would disclaim its head for ever.
+    #[test]
+    fn a_non_gss_member_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(false, true, "saved-head", false, true),
+            Some("saved-head".to_string())
+        );
+    }
+
+    /// #1578 rc3 (David's ruling, 28 Oct 02:09 GMT): a superseded
+    /// intermediate install keeps its hold at the epoch and holds no
+    /// secret, but its own seat carries a KEM key, so it is not keyless:
+    /// it claims its saved head, exactly as on main. Before the fix the
+    /// hold at the epoch made the claim absent.
+    #[test]
+    fn a_superseded_intermediate_install_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(true, true, "saved-head", false, false),
+            Some("saved-head".to_string())
+        );
+    }
+
+    /// #1578: a node whose own seat is keyless but that holds the
+    /// secret (the exclusion's author on a snapshot-derived roster,
+    /// which strips every KEM key) vouches for the head it sealed: it
+    /// claims its saved head.
+    #[test]
+    fn a_keyless_seat_that_holds_the_secret_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(true, true, "saved-head", true, true),
+            Some("saved-head".to_string())
+        );
+    }
+
+    /// With a secret and a keyed seat the node claims its saved head.
+    #[test]
+    fn a_keyed_node_claims_its_saved_head() {
+        assert_eq!(
+            reported_head(true, true, "saved-head", true, false),
+            Some("saved-head".to_string())
+        );
     }
 }
