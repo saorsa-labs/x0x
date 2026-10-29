@@ -7712,6 +7712,28 @@ pub(super) mod tests {
             refuser,
             "an unknown refusal reason overwrites no note"
         );
+
+        // #1657 review (Claude, REQUEST-CHANGES 2): a refusal for a
+        // group this node does not hold records nothing — the note map
+        // is bounded by the groups this node holds, so no verified peer
+        // can grow it without limit.
+        dispatch_refusal(
+            &state,
+            &"99".repeat(16),
+            &requester_hex,
+            other,
+            "machine_revoked",
+        )
+        .await;
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
+                .len(),
+            1,
+            "a refusal for a group this node does not hold records no note"
+        );
         Ok(())
     }
 

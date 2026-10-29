@@ -12308,6 +12308,23 @@ pub(in crate::server) async fn handle_treekem_catchup_refusal(
     if refusal.requester_agent_id() != self_hex {
         return;
     }
+    // #1657 review (Claude, REQUEST-CHANGES 2): a refusal for a group
+    // this node does not hold is not an answer to an ask this node made;
+    // recording it would let any verified peer grow the note map without
+    // limit. The note map is bounded by the groups this node holds — as
+    // the head-round marking below already is (it resolves the group and
+    // ignores unknown ids).
+    {
+        let groups = state.named_groups.read().await;
+        if crate::server::resolve_group_entry_locked(&groups, refusal.group_id()).is_none() {
+            tracing::debug!(
+                group_id = %LogHexId::group(refusal.group_id()),
+                peer = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+                "ignoring a TreeKEM catch-up refusal for a group this node does not hold"
+            );
+            return;
+        }
+    }
     let sender_hex = hex::encode(sender.as_bytes());
     tracing::warn!(
         group_id = %LogHexId::group(refusal.group_id()),

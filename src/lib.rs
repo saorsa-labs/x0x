@@ -19196,6 +19196,36 @@ impl Agent {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
             use futures::StreamExt;
             let mut pending = futures::stream::FuturesUnordered::new();
+            // #1657 review (Claude, REQUEST-CHANGES 1): the typed-refusal
+            // sends must never stall this receive loop — a stalled QUIC
+            // send would hold every later direct message. They run here,
+            // drained alongside the ingress barrier, inside the tracked
+            // listener task. One closure builds every send, so all
+            // pushed futures share one type.
+            let mut refusal_sends = futures::stream::FuturesUnordered::new();
+            let send_treekem_refusal = |ant_peer_id: ant_quic::PeerId,
+                                        sender: identity::AgentId,
+                                        machine_id: identity::MachineId,
+                                        refusal: Vec<u8>,
+                                        requester: &'static str| {
+                let network = std::sync::Arc::clone(&network);
+                async move {
+                    if let Err(e) = network
+                        .send_direct(&ant_peer_id, local_agent_id.as_bytes(), &refusal)
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "x0x::direct",
+                            stage = "recv",
+                            sender_prefix = %network::hex_prefix(&sender.0, 4),
+                            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                            outcome = "treekem_refusal_send_failed",
+                            error = %e,
+                            "failed to send the typed TreeKEM catch-up refusal to the {requester} requester"
+                        );
+                    }
+                }
+            };
             loop {
                 // direct_tx is a NetworkNode struct field that outlives
                 // network.shutdown(), so recv_direct() does not return None on
@@ -19204,6 +19234,10 @@ impl Agent {
                     biased;
                     _ = token.cancelled() => break,
                     ready = pending.next(), if !pending.is_empty() => ready,
+                    sent = refusal_sends.next(), if !refusal_sends.is_empty() => {
+                        let _ = sent;
+                        continue;
+                    }
                     r = network.recv_direct_with_ingress() => {
                         let Some((peer, payload, ingress)) = r else { break; };
                         let barrier = std::sync::Arc::clone(&evidence);
@@ -19362,27 +19396,21 @@ impl Agent {
                     // refusal that names the revocation, instead of the silent drop.
                     // The frame is still dropped; the refusal replaces the silence.
                     // An agent-revoked sender keeps the silent drop — only the
-                    // machine alone being the cause may be named.
+                    // machine alone being the cause may be named. The send runs
+                    // on `refusal_sends`, never inline (review finding 1).
                     if machine_revoked && !agent_revoked {
                         if let Some(refusal) = direct::treekem_catchup_refusal_for(
                             &data,
                             &sender,
                             direct::TreeKemCatchupRefusalReason::MachineRevoked,
                         ) {
-                            if let Err(e) = network
-                                .send_direct(&ant_peer_id, local_agent_id.as_bytes(), &refusal)
-                                .await
-                            {
-                                tracing::warn!(
-                                    target: "x0x::direct",
-                                    stage = "recv",
-                                    sender_prefix = %network::hex_prefix(&sender.0, 4),
-                                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
-                                    outcome = "treekem_refusal_send_failed",
-                                    error = %e,
-                                    "failed to send the typed TreeKEM catch-up refusal to the machine-revoked requester"
-                                );
-                            }
+                            refusal_sends.push(send_treekem_refusal(
+                                ant_peer_id,
+                                sender,
+                                machine_id,
+                                refusal,
+                                "machine-revoked",
+                            ));
                         }
                     }
                     continue;
@@ -19414,7 +19442,8 @@ impl Agent {
                     );
                     // #1657: check B is a binding revocation, so a catch-up
                     // request it drops gets the typed refusal that names it
-                    // (same shape as the machine-revoked arm above).
+                    // (same shape as the machine-revoked arm above — the
+                    // send runs on `refusal_sends`, never inline).
                     // PlacementPinned stays a silent drop: it states a
                     // placement fact, not a revocation.
                     if matches!(denial, key_move::PairingDenial::BindingRevoked) {
@@ -19423,20 +19452,13 @@ impl Agent {
                             &sender,
                             direct::TreeKemCatchupRefusalReason::BindingRevoked,
                         ) {
-                            if let Err(e) = network
-                                .send_direct(&ant_peer_id, local_agent_id.as_bytes(), &refusal)
-                                .await
-                            {
-                                tracing::warn!(
-                                    target: "x0x::direct",
-                                    stage = "recv",
-                                    sender_prefix = %network::hex_prefix(&sender.0, 4),
-                                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
-                                    outcome = "treekem_refusal_send_failed",
-                                    error = %e,
-                                    "failed to send the typed TreeKEM catch-up refusal to the binding-revoked requester"
-                                );
-                            }
+                            refusal_sends.push(send_treekem_refusal(
+                                ant_peer_id,
+                                sender,
+                                machine_id,
+                                refusal,
+                                "binding-revoked",
+                            ));
                         }
                     }
                     continue;

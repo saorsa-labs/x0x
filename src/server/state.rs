@@ -1271,7 +1271,9 @@ pub(super) struct AppState {
     /// this daemon received, per group, keyed by the group id its own
     /// request used. Surfaced in the operator log at receive time and
     /// kept here so tests (and a later diagnostics surface) can read
-    /// which revocation a peer named, from which peer, and when.
+    /// which revocation a peer named, from which peer, and when. A
+    /// refusal for a group this node does not hold records nothing
+    /// (review finding 2), so the map is bounded by the local groups.
     pub(super) treekem_catchup_refusals: StdMutex<HashMap<String, TreeKemCatchupRefusalNote>>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
