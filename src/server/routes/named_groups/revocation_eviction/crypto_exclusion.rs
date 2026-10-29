@@ -580,6 +580,39 @@ pub(super) fn note_survivor_head(
     );
 }
 
+/// #1660 (Claude round 5): keep a seat's share record. A seal to the
+/// key the record already holds keeps the EARLIEST ask count — the
+/// rounds of a live row seal again every pass, and a later seal's count
+/// must not push the bar past the ask the answer rode on. A seal to a
+/// different key (a rotation) resets the record to that seal.
+pub(super) fn keep_share_record(
+    map: &mut BTreeMap<[u8; 32], ShareRecord>,
+    recipient: &[u8; 32],
+    kem: &str,
+    ask_seq_at_seal: u64,
+) {
+    match map.get_mut(recipient) {
+        Some(record) if record.key == kem => {
+            record.ask_seq_at_seal = record.ask_seq_at_seal.min(ask_seq_at_seal);
+        }
+        Some(record) => {
+            *record = ShareRecord {
+                key: kem.to_string(),
+                ask_seq_at_seal,
+            };
+        }
+        None => {
+            map.insert(
+                *recipient,
+                ShareRecord {
+                    key: kem.to_string(),
+                    ask_seq_at_seal,
+                },
+            );
+        }
+    }
+}
+
 /// #1660: record that a sealed share of the group secret `epoch` went to
 /// `recipient`'s seat key `kem`. Every S4 plane that seals a share calls
 /// this after its send task is admitted, while no caller holds the S4
@@ -602,13 +635,7 @@ pub(super) async fn note_share_went_to(
         .unwrap_or(0);
     for (key, delivery) in &mut inner.ce.deliveries {
         if key.stable_group_id == stable_group_id && delivery.gss_epoch == Some(epoch) {
-            delivery.share_went_to.insert(
-                *recipient,
-                ShareRecord {
-                    key: kem.to_string(),
-                    ask_seq_at_seal,
-                },
-            );
+            keep_share_record(&mut delivery.share_went_to, recipient, kem, ask_seq_at_seal);
         }
     }
     super::removal_delivery::note_share_went_to(
@@ -7773,6 +7800,29 @@ mod daemon_tests {
             "an answer that could only answer a pre-seal ask closes no seat (#1660)"
         );
         assert!(fx.row_open().await, "the delivery row stays open");
+        // The boundary: the ask count EQUALS the seal's count — the
+        // answer rode the same-numbered ask, not one after the seal. It
+        // closes nothing; the gate is strict.
+        {
+            let mut inner = fx.state.revocation_evictions.inner.lock().await;
+            let sealed_at = inner
+                .ce
+                .deliveries
+                .get(&fx.key)
+                .and_then(|delivery| delivery.share_went_to.get(fx.survivor.as_bytes()))
+                .map(|record| record.ask_seq_at_seal)
+                .expect("the seal record");
+            inner.head_ask_seq.insert(
+                (fx.key.stable_group_id.clone(), *fx.survivor.as_bytes()),
+                sealed_at,
+            );
+        }
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Sent),
+            "an answer at the seal's own ask count closes nothing: the gate is strict"
+        );
         // The next round's ask leaves — after the seal. The fresh answer
         // converges the seat.
         fx.record_post_seal_ask().await;

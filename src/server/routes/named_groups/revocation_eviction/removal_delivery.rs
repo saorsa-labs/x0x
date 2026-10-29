@@ -76,9 +76,11 @@ pub(super) struct RemovalDelivery {
     /// survivor converges (#1573). A survivor holds the removal head until
     /// its share installs, so a lost share is sent again.
     gss_epoch: Option<u64>,
-    /// #1660: per recipient, the KEM public key (b64) a sealed share of
-    /// this row's epoch went to. A report closes the seat only when the
-    /// key the sender's seat carries now is the key a share went to
+    /// #1660: per recipient, the share record of this row's epoch — the
+    /// KEM key (b64) a sealed share went to and the seat's head-ask
+    /// count at the earliest seal to that key. A report closes the seat
+    /// only when the key the sender's seat carries now is the record's
+    /// key and an ask went to the seat past the seal
     /// ([`crypto_exclusion::report_may_close`]).
     share_went_to: BTreeMap<[u8; 32], crypto_exclusion::ShareRecord>,
     /// The next round seals the share too. A live delivery's first round
@@ -666,12 +668,11 @@ pub(super) fn note_share_went_to(
 ) {
     for (key, delivery) in removals.iter_mut() {
         if key.stable_group_id == stable_group_id && delivery.gss_epoch == Some(epoch) {
-            delivery.share_went_to.insert(
-                *recipient,
-                crypto_exclusion::ShareRecord {
-                    key: kem.to_string(),
-                    ask_seq_at_seal,
-                },
+            crypto_exclusion::keep_share_record(
+                &mut delivery.share_went_to,
+                recipient,
+                kem,
+                ask_seq_at_seal,
             );
         }
     }

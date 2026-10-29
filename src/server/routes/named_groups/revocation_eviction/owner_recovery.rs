@@ -116,9 +116,11 @@ struct CommitDelivery {
     /// restored delivery keeps it: the sealed shares were not durable, the
     /// secret is, in the persisted group (#1508 review).
     reshare_epoch: Option<u64>,
-    /// #1660: per recipient, the KEM public key (b64) a sealed share of
-    /// this row's epoch went to. A report closes the seat only when the
-    /// key the sender's seat carries now is the key a share went to
+    /// #1660: per recipient, the share record of this row's epoch — the
+    /// KEM key (b64) a sealed share went to and the seat's head-ask
+    /// count at the earliest seal to that key. A report closes the seat
+    /// only when the key the sender's seat carries now is the record's
+    /// key and an ask went to the seat past the seal
     /// ([`report_may_close`]).
     share_went_to: BTreeMap<[u8; 32], super::crypto_exclusion::ShareRecord>,
 }
@@ -175,6 +177,13 @@ impl OrcState {
     /// its seal (its named, revoked admins are excluded). A delivery that
     /// a restart restored needs one before any resend of its frame or its
     /// GSS shares (its removed seats are excluded).
+    /// #1660 (Claude round 5): the stable group IDs of the live commit
+    /// deliveries — fresh or resumed. The worker pass keeps their
+    /// groups' head-ask counts through its open-group retain.
+    pub(super) fn delivery_groups(&self) -> impl Iterator<Item = &str> {
+        self.deliveries.keys().map(String::as_str)
+    }
+
     pub(super) fn head_round_groups(&self) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
         let mut groups: BTreeMap<String, BTreeSet<[u8; 32]>> = BTreeMap::new();
         for (stable, pending) in &self.pending {
@@ -323,12 +332,11 @@ pub(super) fn note_share_went_to(
 ) {
     if let Some(delivery) = orc.deliveries.get_mut(stable_group_id) {
         if delivery.reshare_epoch == Some(epoch) {
-            delivery.share_went_to.insert(
-                *recipient,
-                super::crypto_exclusion::ShareRecord {
-                    key: kem.to_string(),
-                    ask_seq_at_seal,
-                },
+            super::crypto_exclusion::keep_share_record(
+                &mut delivery.share_went_to,
+                recipient,
+                kem,
+                ask_seq_at_seal,
             );
         }
     }
@@ -1753,10 +1761,12 @@ async fn drive_deliveries(state: &Arc<AppState>) {
         for (recipient, attempt) in started {
             spawn_commit_send(state, &stable, &delivery, AgentId(recipient), attempt);
         }
-        // #1660 (Engineer ruling, 29 Oct 17:12 GMT): the share seal is
-        // recorded inside the send task, so the next round's ask is the
-        // first one provably sent after the seal. Only answers to that
-        // and later asks close the seat.
+        // #1660 (Engineer ruling, 29 Oct 17:12 GMT): this round's seal
+        // is recorded inside its send task, after this ask — so this
+        // round's own answers close nothing. The rounds seal again every
+        // pass, and each seal to the same key keeps the earliest count,
+        // so the ask past that earliest seal is the first whose answers
+        // close the seat.
         ask_heads(state, &stable, head_asks).await;
         for agent in refreshes {
             let task_state = Arc::clone(state);
@@ -3938,13 +3948,35 @@ mod tests {
             RecipientDelivery::Sent,
             "a share that went to a stale key closes nothing"
         );
+        // A seal to a DIFFERENT key resets the record to that seal (a
+        // rotation): the bar is the new seal's count, and this round's
+        // count (1) has not passed it.
+        note_share_went_to(&mut orc, "g", 4, &survivor, "key-now", 3);
+        note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), Some(1));
+        assert_eq!(
+            seat(&orc),
+            RecipientDelivery::Sent,
+            "a seal to a different key resets the count to that seal"
+        );
+        // The rounds of a live row seal again every pass. A later seal to
+        // the SAME key keeps the EARLIEST count: the bar stays the first
+        // seal's (3), and a count past the later seal but not past the
+        // earliest closes nothing.
+        note_share_went_to(&mut orc, "g", 4, &survivor, "key-now", 5);
+        note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), Some(3));
+        assert_eq!(
+            seat(&orc),
+            RecipientDelivery::Sent,
+            "a later seal to the same key keeps the earliest count"
+        );
+        // Back to the base record: a rotation away and a seal at count 0.
+        note_share_went_to(&mut orc, "g", 4, &survivor, "key-rotated", 0);
+        note_share_went_to(&mut orc, "g", 4, &survivor, "key-now", 0);
         // The share went to the seat's current key — the round's record —
         // and the report converges it only after a head ask went out past
         // the seal. An answer with no ask since the seal (the ruling's
         // pre-seal answer, arrived late) closes nothing; the ask count at
-        // the seal was 0. The record is per seat: the later seal to the
-        // key the seat carries now replaces the stale one.
-        note_share_went_to(&mut orc, "g", 4, &survivor, "key-now", 0);
+        // the seal was 0.
         note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), None);
         assert_eq!(
             seat(&orc),
@@ -6394,6 +6426,63 @@ mod restart_tests {
         assert!(
             !still_delivering(&author, &stable, &survivor).await,
             "the delivery ends once the key installed"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1660 round 5 (Claude blocking at ccd7389): a LIVE owner-recovery
+    /// delivery — never restarted, so no resumed row keeps its group in
+    /// the worker's open set — converges through the real worker pass.
+    /// The delivery keeps its group's head-ask counts through the pass,
+    /// and the rounds' repeated seals to the same key keep the earliest
+    /// seal's count, so the ask past that seal closes the seat on the
+    /// survivor's answer. No ask count is raised by hand.
+    #[tokio::test]
+    async fn a_live_gss_recovery_delivery_converges_on_a_post_seal_answer() -> Result<()> {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (author, survivor, info, committed, frame, _admin) =
+            committed_gss_recovery(author_dir.path(), survivor_dir.path(), None, None).await?;
+        let stable = info.stable_group_id().to_string();
+        let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
+        let new_secret = committed.shared_secret.clone().context("new secret")?;
+        // The share arrives first and parks; the frame installs with it.
+        let share = next_share(&author, &stable, &survivor_hex, 0).await?;
+        let early = super::super::super::apply_named_group_metadata_event(
+            &survivor,
+            share,
+            author.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!early.accepted, "the share is parked");
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Applied
+        );
+        let held = survivor.named_groups.read().await[&stable].clone();
+        assert_eq!(held.state_hash, committed.state_hash);
+        assert_eq!(held.shared_secret.as_deref(), Some(new_secret.as_slice()));
+        // The rounds keep asking, sealing and sending; the survivor
+        // answers each ask. The delivery must end on one of them.
+        for _ in 0..200 {
+            report_head(&author, &survivor, &stable).await?;
+            if !still_delivering(&author, &stable, &survivor).await {
+                break;
+            }
+            {
+                let mut inner = author.revocation_evictions.inner.lock().await;
+                if let Some(delivery) = inner.orc.deliveries.get_mut(&stable) {
+                    delivery.next_at = Instant::now();
+                }
+            }
+            worker_tick(&author).await;
+        }
+        assert!(
+            !still_delivering(&author, &stable, &survivor).await,
+            "a live delivery converges on an answer to a post-seal ask (#1660, Engineer ruling, 29 Oct 17:12 GMT)"
         );
         author.agent.shutdown().await;
         survivor.agent.shutdown().await;

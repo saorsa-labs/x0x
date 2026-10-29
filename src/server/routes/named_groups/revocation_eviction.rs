@@ -872,9 +872,11 @@ pub(in crate::server) async fn seal_probe_for_test(
 ///
 /// A sender that is no longer an Active member, or that D60 refuses,
 /// closes no seat. A GSS row's report closes a seat only when a sealed
-/// share went to the key the sender's seat carries now. The report
-/// itself is still a verified, applied page, so it keeps counting for
-/// the §2 head round (chain agreement). Only the seat-closing is gated.
+/// share went to the key the sender's seat carries now, and a head ask
+/// went to the seat after that seal (Engineer ruling, 29 Oct 17:12 GMT).
+/// The report itself is still a verified, applied page, so it keeps
+/// counting for the §2 head round (chain agreement). Only the
+/// seat-closing is gated.
 ///
 /// §3: the same answer is the sender's survivor convergence evidence
 /// for the S4 deliveries of the group
@@ -1258,6 +1260,11 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .iter()
         .map(|key| key.stable_group_id.clone())
         .chain(extra_rounds.keys().cloned())
+        // #1660 (Claude round 5): a live owner-recovery delivery keeps
+        // its group's head-ask counts too. Its rounds ask and seal
+        // again, and the ask gate compares counts that must survive
+        // this pass.
+        .chain(inner.orc.delivery_groups().map(str::to_string))
         .collect();
     inner
         .head_rounds
