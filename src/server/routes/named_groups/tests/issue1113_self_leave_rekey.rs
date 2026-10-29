@@ -2314,31 +2314,87 @@ async fn startup_with_witness(group_id: &str) -> Result<(LeaveFixture, x0x::iden
     Ok((fixture, witness))
 }
 
-/// Wait for every detached task that the fixture started.
+/// Wait for every detached task that the fixture started, and for every
+/// task that those tasks start.
 ///
 /// The S4 pass in [`mark_leaver_removed`] starts a detached head ask to
 /// the witness. That ask calls `request_treekem_catchup_page`, as the
-/// startup sends do. The ask records a helper call only if it reads
-/// `catchup_page_force_ok` as set, so its count depends on when the
-/// runtime first polls it. If that poll comes after the test sets the
+/// startup sends do. The ask records a helper call only if its first
+/// poll reads `catchup_page_force_ok` as set. That read happens once,
+/// after the helper's test-seam park (a no-op unless a test arms the
+/// seam). When that first poll comes after the test sets the
 /// flag, the startup send-bound tests see one helper call more than the
-/// startup sends (CI job 123010651244). The ask finishes here, before
-/// any test can set the flag, so the test counts only its own sends.
+/// startup sends (#1671; CI jobs 123010651244 and 122529831168). One
+/// take of the registry is not enough: a task that one round joins can
+/// start a successor, and a later round must join that successor also.
+/// Every round runs while the flag is still clear, so every ask the
+/// fixture owns reads the flag as clear. The tests then count only their
+/// own sends.
 async fn join_fixture_detached_tasks(state: &AppState) {
-    let tasks = std::mem::take(
-        state
-            .detached_tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-            .expect("detached admission is open in the fixture"),
-    );
-    for task in tasks {
-        tokio::time::timeout(std::time::Duration::from_secs(30), task)
-            .await
-            .expect("a fixture detached task finishes")
-            .expect("a fixture detached task does not panic");
+    for _ in 0..8 {
+        let tasks = std::mem::take(
+            state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .expect("detached admission is open in the fixture"),
+        );
+        if tasks.is_empty() {
+            return;
+        }
+        for task in tasks {
+            tokio::time::timeout(std::time::Duration::from_secs(30), task)
+                .await
+                .expect("a fixture detached task finishes")
+                .expect("a fixture detached task does not panic");
+        }
     }
+    panic!("the fixture's detached tasks did not settle within eight join rounds");
+}
+
+/// A task that [`join_fixture_detached_tasks`] waits for can start
+/// another task that also calls the catch-up helper. The join must wait
+/// for that successor also. When it does not, the successor can run its
+/// first poll after the test sets `catchup_page_force_ok`, and the
+/// send-bound tests count one helper call too many (#1671).
+#[tokio::test]
+async fn the_fixture_join_waits_for_successor_tasks() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let ask_owner = Arc::clone(&state);
+    assert!(
+        state.spawn_detached(async move {
+            let helper_state = Arc::clone(&ask_owner);
+            ask_owner.spawn_detached(async move {
+                let _ = request_treekem_catchup_page(
+                    &helper_state,
+                    "successor-ask-group",
+                    &x0x::identity::AgentId([0x41; 32]),
+                )
+                .await;
+            });
+        }),
+        "detached admission is open in the fixture"
+    );
+    join_fixture_detached_tasks(&state).await;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let recorded = state
+        .named_group_test_recorders
+        .catchup_responses
+        .lock()
+        .expect("catch-up recorder")
+        .len();
+    assert_eq!(
+        recorded, 0,
+        "the successor ask must complete before the flag is set"
+    );
+    Ok(())
 }
 
 /// Startup must not seal on a timer, an empty page, or a hash that is not
