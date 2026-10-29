@@ -4243,8 +4243,11 @@ pub(super) async fn finalize_quarantine(pending: &FsPath) -> bool {
 }
 
 /// ADR 0108 §5a resume: the verified pending copies of `file` (set `V`) in
-/// `txid` order. A copy that fails verification stays pending.
-async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bool) {
+/// `txid` order. A copy that fails verification stays pending. A scan of
+/// the directory that fails reports no copies and the failure, so callers
+/// fail closed instead of replacing a file whose pending evidence they
+/// could not read (#1672 review).
+pub(super) async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bool) {
     let Some(dir) = path.parent() else {
         return (Vec::new(), false);
     };
@@ -4252,11 +4255,19 @@ async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bo
         return (Vec::new(), false);
     };
     let Ok(mut entries) = crate::w3h_inline::fs::read_dir(dir).await else {
-        return (Vec::new(), false);
+        return (Vec::new(), true);
     };
     let mut found = Vec::new();
     let mut failed = false;
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -5682,6 +5693,29 @@ pub(super) mod tests {
             })
             .count();
         assert_eq!(history, 1);
+    }
+
+    /// #1672 review (Codex P2): a scan of the directory that fails must
+    /// report the failure, not "no copies" — with the live file absent,
+    /// `(empty, no failure)` let a replacement land while unverified
+    /// pending copies existed, against §5a step 4. A directory the
+    /// process cannot list (mode `0o000`) reports `(empty, failed)`, so
+    /// the caller fails closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_scan_failure_fails_the_pending_copies_report() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(s4::EVS_FILE_NAME);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("the directory is unscannable");
+        let (copies, failed) = verified_pending_copies(&path).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("the directory is scannable again");
+        assert!(
+            copies.is_empty() && failed,
+            "a scan failure reports no copies and the failure"
+        );
     }
 
     /// An `OwnerCertified` group whose seat `target` commits `cert`.

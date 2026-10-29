@@ -24,6 +24,23 @@ macro_rules! inventory_procfs_regression_tests {
                 s.extend_from_slice(b") S 1 2 3 0 -1 4194304 0 0 0 0 10 11 0 0 20 0 1 0 987654\n");
                 s
             }
+            fn assert_redacted(value: &impl std::fmt::Debug, label: &str) {
+                let expected = format!("{label}(<redacted>)");
+                assert_eq!(format!("{value:?}"), expected);
+                assert_eq!(format!("{value:#?}"), expected);
+                assert_eq!(format!("{:?}", Some(value)), format!("Some({expected})"));
+                assert_eq!(format!("{:#?}", [value]), format!("[\n    {expected},\n]"));
+            }
+            #[test]
+            fn process_stat_debug_redacts_process_identity_and_state() {
+                let process = parse_stat(&stat(b"worker")).unwrap();
+                assert_redacted(&process, "ProcessStat");
+            }
+            #[test]
+            fn credentials_debug_redacts_uid_and_gid() {
+                let credentials = parse_credentials(STATUS).unwrap();
+                assert_redacted(&credentials, "Credentials");
+            }
             #[test]
             fn stat_preserves_pid_flags_and_start_with_opaque_comm() {
                 for comm in [b"worker".as_slice(), b") weird (name)\n", b"\xff\xfe"] {

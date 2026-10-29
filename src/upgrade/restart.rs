@@ -227,7 +227,7 @@ pub(crate) const fn flush_failure_exit_code() -> i32 {
 /// differ from its file, and `x0x autostart --repair` only ever verified the
 /// plist at repair time (#615). `launchctl print` reports what launchd will
 /// actually do after the process exits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct LaunchdLoadedJob {
     /// `program = …` — the executable launchd will (re)run.
     pub program: PathBuf,
@@ -239,6 +239,12 @@ pub struct LaunchdLoadedJob {
     /// loaded fixture jobs), so it is exactly the "restarts after exit 0"
     /// guarantee the supervised exit depends on.
     pub keepalive_unconditional: bool,
+}
+
+impl std::fmt::Debug for LaunchdLoadedJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaunchdLoadedJob(<redacted>)")
+    }
 }
 
 /// Parse the `launchctl print` dump for one job. `None` when the output is
@@ -944,7 +950,7 @@ fn simulate_spawn_expansion(token: &str) -> Option<String> {
 /// structured snapshot to THIS process so the textual `systemctl show`
 /// pass and the structured pass cannot straddle a restart unnoticed.
 #[cfg(any(test, target_os = "linux"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct BusctlExecStart {
     /// Executable path, verbatim (never `$`-expanded by systemd).
     pub(crate) path: String,
@@ -954,6 +960,13 @@ pub(crate) struct BusctlExecStart {
     pub(crate) main_pid: u32,
     /// Unit `InvocationID` at the structured read (16 bytes).
     pub(crate) invocation_id: Option<[u8; 16]>,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+impl std::fmt::Debug for BusctlExecStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BusctlExecStart(<redacted>)")
+    }
 }
 
 /// `{"type":EXPECTED,"data":…}` — busctl's per-property JSON reply shape.
@@ -1243,8 +1256,7 @@ fn readback_systemd_observation_in(
     };
     if !exec_ok {
         return refuse(format!(
-            "unit `{unit}` does not run this executable/argv (systemctl ExecStart {})",
-            show_property(&show_output, "ExecStart").unwrap_or("<absent>")
+            "unit `{unit}` does not run this executable/argv (command values redacted)"
         ));
     }
 
@@ -2474,10 +2486,9 @@ pub(crate) fn readback_windows_wrapper_script(
     let normalize = |path: &str| path.replace('/', "\\").to_lowercase();
     if normalize(&wrapper_executable) != normalize(argv0) {
         return NotGuaranteed {
-            detail: format!(
-                "the wrapper script runs `{wrapper_executable}`, not this instance \
-                 (`{argv0}`)"
-            ),
+            detail: "the wrapper script runs a different executable than this instance \
+                     (command values redacted)"
+                .to_string(),
         };
     }
     let Some(arguments) = arguments else {
@@ -2486,10 +2497,9 @@ pub(crate) fn readback_windows_wrapper_script(
     let argv_tail: &[String] = argv.get(1..).unwrap_or(&[]);
     if arguments != argv_tail {
         return NotGuaranteed {
-            detail: format!(
-                "the wrapper script runs different arguments (`{arguments:?}`) than this \
-                 instance (`{argv_tail:?}`)"
-            ),
+            detail: "the wrapper script runs different arguments than this instance \
+                     (command values redacted)"
+                .to_string(),
         };
     }
     WindowsWrapperReadback::Verified {
@@ -2685,7 +2695,7 @@ pub fn plan_restart_mode(
 /// then carried unchanged through replacement and restart. The plan is never
 /// re-derived after the swap, so a conflicting plan cannot be discovered with
 /// new bytes already installed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RestartPlan {
     /// Who owns the respawn.
     pub mode: RestartMode,
@@ -2718,6 +2728,12 @@ pub struct RestartPlan {
     /// path. Carried into the intent record the same way
     /// `launchd_verified` is (#671).
     pub systemd_verified: Option<SystemdVerifiedUnit>,
+}
+
+impl std::fmt::Debug for RestartPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RestartPlan(<redacted>)")
+    }
 }
 
 impl RestartPlan {
@@ -3031,7 +3047,7 @@ fn resolve_restart_identity(
 ///
 /// Captured by the old process *before* any exit: argv, cwd, and the binary
 /// path are properties of the running process, not of the post-swap files.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct UpgradeHandoff {
     /// Version of the process that initiated the handoff.
     pub from_version: String,
@@ -3073,6 +3089,12 @@ pub struct UpgradeHandoff {
     /// files written before the field existed parseable.
     #[serde(default)]
     pub systemd_verified: Option<SystemdVerifiedUnit>,
+}
+
+impl std::fmt::Debug for UpgradeHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UpgradeHandoff(<redacted>)")
+    }
 }
 
 impl UpgradeHandoff {
@@ -3773,6 +3795,183 @@ fn env_timeout(env_var: &str) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These diagnostics tests use supplied values only: no I/O or live samplers.
+    fn assert_restart_debug_redacted(value: &impl std::fmt::Debug, expected: &str) {
+        assert_eq!(format!("{value:?}"), expected);
+        assert_eq!(format!("{value:#?}"), expected);
+        assert_eq!(format!("{:?}", Some(value)), format!("Some({expected})"));
+        assert_eq!(format!("{:#?}", [value]), format!("[\n    {expected},\n]"));
+    }
+
+    fn assert_restart_error_redacted(error: &RestartOwnershipError, secrets: &[&str]) {
+        for output in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+            format!("{:?}", Some(error)),
+        ] {
+            for secret in secrets {
+                assert!(
+                    !output.contains(secret),
+                    "diagnostic leaked {secret}: {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restart_diagnostics_launchd_job_debug_redacts_arguments() {
+        let job = LaunchdLoadedJob {
+            program: PathBuf::from("/private/launch-secret/x0xd"),
+            arguments: vec!["x0xd".into(), "--token=launch-secret".into()],
+            keepalive_unconditional: true,
+        };
+        assert_eq!(job.arguments[1], "--token=launch-secret");
+        assert_eq!(job.clone(), job);
+        assert_restart_debug_redacted(&job, "LaunchdLoadedJob(<redacted>)");
+    }
+
+    #[test]
+    fn restart_diagnostics_busctl_debug_redacts_arguments() {
+        let start = BusctlExecStart {
+            path: "/private/bus-secret/x0xd".into(),
+            argv: vec!["x0xd".into(), "--token=bus-secret".into()],
+            main_pid: 4242,
+            invocation_id: Some([0xab; 16]),
+        };
+        assert_eq!(start.argv[1], "--token=bus-secret");
+        assert_eq!(start.clone(), start);
+        assert_restart_debug_redacted(&start, "BusctlExecStart(<redacted>)");
+    }
+
+    #[test]
+    fn restart_diagnostics_plan_debug_redacts_arguments() {
+        let plan = RestartPlan {
+            mode: RestartMode::TransactionalHandoff,
+            supervised_exit_code: None,
+            supervision_signal: None,
+            executable: PathBuf::from("/private/plan-secret/x0xd"),
+            argv: vec!["x0xd".into(), "--token=plan-secret".into()],
+            cwd: PathBuf::from("/private/plan-secret"),
+            data_root: PathBuf::from("/private/plan-secret/data"),
+            api_addr: "127.0.0.1:12700".parse().unwrap(),
+            launchd_verified: None,
+            systemd_verified: None,
+        };
+        assert_eq!(plan.argv[1], "--token=plan-secret");
+        assert_eq!(plan.clone(), plan);
+        assert_restart_debug_redacted(&plan, "RestartPlan(<redacted>)");
+    }
+
+    #[test]
+    fn restart_diagnostics_handoff_debug_redacts_without_changing_storage() {
+        let handoff = UpgradeHandoff {
+            from_version: "1.2.3".into(),
+            to_version: "1.3.0".into(),
+            target_path: PathBuf::from("/private/handoff-secret/x0xd"),
+            backup_path: PathBuf::from("/private/handoff-secret/x0xd.backup"),
+            argv: vec!["x0xd".into(), "--token=handoff-secret".into()],
+            cwd: "/private/handoff-secret".into(),
+            env: BTreeMap::from([("X0X_VALUE".into(), "environment-secret".into())]),
+            old_pid: 4242,
+            api_addr: "127.0.0.1:12700".parse().unwrap(),
+            started_at: 1_700_000_000,
+            mode: RestartMode::TransactionalHandoff,
+            launchd_verified: None,
+            systemd_verified: None,
+        };
+        let bytes = serde_json::to_vec(&handoff).unwrap();
+        let restored: UpgradeHandoff = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.argv, handoff.argv);
+        assert_eq!(restored.env, handoff.env);
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
+        assert_restart_debug_redacted(&restored, "UpgradeHandoff(<redacted>)");
+    }
+
+    #[test]
+    fn restart_diagnostics_windows_argument_refusal_redacts_both_vectors() {
+        let script = windows_wrapper_script("1", "C:\\Tools\\x0xd.exe", "'--token=wrapper-secret'");
+        let mut argv = vec![
+            "C:\\Tools\\x0xd.exe".into(),
+            "--token=process-secret".into(),
+        ];
+        let WindowsWrapperReadback::NotGuaranteed { detail } =
+            readback_windows_wrapper_script(&script, &argv)
+        else {
+            panic!("mismatched arguments must still refuse");
+        };
+        assert!(detail.contains("different arguments"));
+        let error = RestartOwnershipError::Unresolved {
+            what: "Windows wrapper restart policy",
+            detail,
+        };
+        assert_restart_error_redacted(&error, &["wrapper-secret", "process-secret"]);
+        argv[1] = "--token=wrapper-secret".into();
+        assert!(matches!(
+            readback_windows_wrapper_script(&script, &argv),
+            WindowsWrapperReadback::Verified { .. }
+        ));
+    }
+
+    #[test]
+    fn restart_diagnostics_windows_executable_refusal_redacts_argv_zero() {
+        let script = windows_wrapper_script("1", "C:\\wrapper-secret\\x0xd.exe", "");
+        let argv = vec!["C:\\process-secret\\x0xd.exe".into()];
+        let WindowsWrapperReadback::NotGuaranteed { detail } =
+            readback_windows_wrapper_script(&script, &argv)
+        else {
+            panic!("mismatched executable must still refuse");
+        };
+        let error = RestartOwnershipError::Unresolved {
+            what: "Windows wrapper restart policy",
+            detail,
+        };
+        assert_restart_error_redacted(&error, &["wrapper-secret", "process-secret"]);
+        assert!(matches!(
+            readback_windows_wrapper_script(&script, &["C:\\wrapper-secret\\x0xd.exe".into()]),
+            WindowsWrapperReadback::Verified { .. }
+        ));
+    }
+
+    #[test]
+    fn restart_diagnostics_systemd_refusal_redacts_exec_start() {
+        let invocation = "aa01aa01aa01aa01aa01aa01aa01aa01";
+        let output = healthy_show(4242, invocation, "/opt/x0x/x0xd", "always")
+            .replace("--name testnet", "--token=unit-secret");
+        let mut argv = vec!["/opt/x0x/x0xd".into(), "--token=process-secret".into()];
+        let verdict = run_readback(
+            SYSTEM_CGROUP,
+            4242,
+            Some(invocation),
+            &argv,
+            Ok(Some(output.clone())),
+            Some(101_000_000),
+        );
+        let SystemdPolicyReadback::NotGuaranteed { detail } = verdict else {
+            panic!("mismatched arguments must still refuse");
+        };
+        assert!(detail.contains("does not run this executable/argv"));
+        let error = RestartOwnershipError::SupervisedSystemdPolicyNotGuaranteed {
+            signal: "INVOCATION_ID".into(),
+            exit_code: 0,
+            detail,
+            retry_after: None,
+        };
+        assert_restart_error_redacted(&error, &["unit-secret", "process-secret"]);
+        argv[1] = "--token=unit-secret".into();
+        assert!(matches!(
+            run_readback(
+                SYSTEM_CGROUP,
+                4242,
+                Some(invocation),
+                &argv,
+                Ok(Some(output)),
+                Some(101_000_000)
+            ),
+            SystemdPolicyReadback::Verified(_)
+        ));
+    }
 
     fn shell_parent_signals() -> SupervisionSignals {
         SupervisionSignals {

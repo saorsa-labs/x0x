@@ -13,7 +13,7 @@
 //!   daemon's live ML-KEM-768 public key (the key the node can actually
 //!   open shares under) with the agent ML-DSA-65 key, seats it on its own
 //!   row, and sends the frame to each other Active member whose verified
-//!   advert sets `key_republish_v1` (bit 11).
+//!   advert sets `key_republish_v1` (bit 12).
 //! - The receiver verifies the frame and seats the key on the actor's
 //!   row ([`receive`]); replays, stale keys, and unsigned or wrong-signer
 //!   frames are refused with the typed reasons

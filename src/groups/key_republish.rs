@@ -25,7 +25,7 @@
 //! must verify under the embedded agent public key, and that key must
 //! derive the claimed actor, so an unsigned or wrong-signer frame is
 //! refused. The capability that gates every send is `key_republish_v1`
-//! ([`crate::dm::CapabilityRegistry::KEY_REPUBLISH_V1`], bit 11). The
+//! ([`crate::dm::CapabilityRegistry::KEY_REPUBLISH_V1`], bit 12). The
 //! body never goes inside a container that a released binary decodes, and
 //! it is never published on the ungated metadata topic.
 

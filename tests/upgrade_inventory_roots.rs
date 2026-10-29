@@ -15,6 +15,19 @@ macro_rules! inventory_roots_tests {
             }
             fn roots(s: &Selection, text: &str) -> LexicalRoots { s.resolve(Some(text.as_bytes())).unwrap() }
             #[test]
+            fn lexical_roots_debug_redacts_instance_and_paths() {
+                let s = selection(Platform::Linux, &["--name", "private-instance"], &[]);
+                let r = roots(&s, "data_dir = '/private/data'\nidentity_dir = '/private/identity'");
+                assert_eq!(r.name.as_deref(), Some("private-instance"));
+                assert_eq!(r.data, Path::new("/private/data"));
+                assert_eq!(r.identity, Path::new("/private/identity"));
+                let expected = "LexicalRoots(<redacted>)";
+                assert_eq!(format!("{r:?}"), expected);
+                assert_eq!(format!("{r:#?}"), expected);
+                assert_eq!(format!("{:?}", Some(&r)), format!("Some({expected})"));
+                assert_eq!(format!("{:#?}", [&r]), format!("[\n    {expected},\n]"));
+            }
+            #[test]
             fn default_linux_roots_use_observed_account_only() {
                 let s = selection(Platform::Linux, &[], &[]);
                 assert_eq!(s.config_path, Path::new("/account/.config/x0x/config.toml"));

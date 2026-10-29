@@ -162,6 +162,18 @@ impl OwnerTrust {
         (self.clock)()
     }
 
+    /// Keep #1659 contact attribution aligned with a trust change.
+    ///
+    /// `relationship` is true for Trusted and Known. A downgrade moves that
+    /// agent's pairs into the stranger LRU. The bindings are the same cache
+    /// the DM inbox records.
+    pub(crate) async fn set_attribution_relationship(&self, agent_id: AgentId, relationship: bool) {
+        self.bindings
+            .write()
+            .await
+            .set_relationship_peer(agent_id, relationship);
+    }
+
     /// ADR 0115 §2: install the announced-binding store.
     pub(crate) fn install_announced_bindings(&self, store: AuthenticatedMachineBindings) {
         if let Ok(mut slot) = self.announced.write() {

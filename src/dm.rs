@@ -109,10 +109,14 @@ impl CapabilityRegistry {
     /// gives bits 4–9 to ADR 0110 and ADR 0109. Bit 4 is
     /// `eviction_handoff_v1`.
     pub const GUI_SHOW_V1: u64 = 1 << 10;
+    /// ADR 0108 §8: serves and understands `JoinPendingNotice` on the
+    /// join-result poll (David's 25 Oct 2026 05:14 GMT ruling). Bit 11,
+    /// the next free bit at acceptance order.
+    pub const JOIN_PENDING_NOTICE_V1: u64 = 1 << 11;
     /// #1663: verifies and seats signed `MemberKeyRepublishV1` (`X0XKR1`)
     /// — a member's republication of a fresh KEM key on its own
-    /// already-Active seat. Bit 11.
-    pub const KEY_REPUBLISH_V1: u64 = 1 << 11;
+    /// already-Active seat. Bit 12.
+    pub const KEY_REPUBLISH_V1: u64 = 1 << 12;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
@@ -129,6 +133,7 @@ impl CapabilityRegistry {
                 | Self::CERTIFICATE_REBIND_V1
                 | Self::OWNER_RECOVERY_V1
                 | Self::GUI_SHOW_V1
+                | Self::JOIN_PENDING_NOTICE_V1
                 | Self::KEY_REPUBLISH_V1,
         }
     }

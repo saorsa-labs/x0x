@@ -574,7 +574,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     strip_seat_kem(sim, "A", &group, &c_hex).await?;
     // #1663: this case pins the #1578 keyless state machine — the hold,
     // the head disclaimer and the open S4 row while the seat stays
-    // keyless (the pre-#1663 behavior a peer without bit 11 still
+    // keyless (the pre-#1663 behavior a peer without bit 12 still
     // sees) — so the automatic key republish, the keyless install's own
     // trigger, is suppressed on C. The #1663 unit test drives the real
     // republication through the wire frame.

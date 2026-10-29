@@ -1788,9 +1788,10 @@ mod s5_bit2_tests {
             assert_eq!(mask, 1_u64 << bit, "{name}");
         }
         assert_eq!(registry_bit(&rows, "eviction_handoff_v1"), 4);
-        // #1663: key_republish_v1 takes the lowest free bit, 11.
-        assert_eq!(registry_bit(&rows, "key_republish_v1"), 11);
-        assert_eq!(CapabilityRegistry::KEY_REPUBLISH_V1, 1_u64 << 11);
+        // #1663: key_republish_v1 takes the lowest free bit after
+        // join_pending_notice_v1 (bit 11, main): bit 12.
+        assert_eq!(registry_bit(&rows, "key_republish_v1"), 12);
+        assert_eq!(CapabilityRegistry::KEY_REPUBLISH_V1, 1_u64 << 12);
     }
 
     fn registry_bit(rows: &[(u32, &str)], name: &str) -> u32 {

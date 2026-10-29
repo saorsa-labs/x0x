@@ -18,6 +18,24 @@ use super::super::state::AppState;
 use super::super::{not_found, parse_agent_id_hex};
 use crate::contacts::{IdentityType, TrustLevel};
 
+/// Re-evaluate attribution after a contact add, change, or delete.
+///
+/// The contact bit is re-read on each attempt. The probe does not run
+/// while the contacts lock is held. Group membership and a live grant
+/// still protect the peer when the contact itself does not.
+pub(in crate::server) async fn sync_contact_relationship(
+    state: &Arc<AppState>,
+    agent_id: x0x::identity::AgentId,
+) {
+    crate::dm_inbox::with_contact_standing(
+        &state.agent.authenticated_machine_bindings(),
+        &state.contacts,
+        agent_id,
+        |_| (),
+    )
+    .await;
+}
+
 /// POST /contacts request body.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -117,6 +135,7 @@ pub(in crate::server) async fn add_contact(
     };
 
     state.contacts.write().await.add(contact);
+    sync_contact_relationship(&state, agent_id).await;
 
     (
         StatusCode::CREATED,
@@ -142,31 +161,42 @@ pub(in crate::server) async fn update_contact(
 
     let mut store = state.contacts.write().await;
 
-    if let Some(ref tl_str) = req.trust_level {
-        let trust_level: TrustLevel = match tl_str.parse() {
-            Ok(t) => t,
+    let trust_level = if let Some(ref tl_str) = req.trust_level {
+        match tl_str.parse::<TrustLevel>() {
+            Ok(level) => Some(level),
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "ok": false, "error": e })),
                 );
             }
-        };
+        }
+    } else {
+        None
+    };
+    let identity_type = if let Some(ref it_str) = req.identity_type {
+        match it_str.parse::<IdentityType>() {
+            Ok(kind) => Some(kind),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "ok": false, "error": e })),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(trust_level) = trust_level {
         store.set_trust(&agent_id, trust_level);
     }
-
-    if let Some(ref it_str) = req.identity_type {
-        let identity_type: IdentityType = match it_str.parse() {
-            Ok(t) => t,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "ok": false, "error": e })),
-                );
-            }
-        };
+    if let Some(identity_type) = identity_type {
         store.set_identity_type(&agent_id, identity_type);
     }
+
+    drop(store);
+    sync_contact_relationship(&state, agent_id).await;
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
@@ -188,6 +218,7 @@ pub(in crate::server) async fn delete_contact(
 
     let removed = state.contacts.write().await.remove(&agent_id);
     if removed.is_some() {
+        sync_contact_relationship(&state, agent_id).await;
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
         not_found("contact not found")
@@ -224,6 +255,7 @@ pub(in crate::server) async fn quick_trust(
         .write()
         .await
         .set_trust(&agent_id, trust_level);
+    sync_contact_relationship(&state, agent_id).await;
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
@@ -246,6 +278,8 @@ pub(in crate::server) async fn revoke_contact(
 
     let mut store = state.contacts.write().await;
     store.revoke(&agent_id, &req.reason);
+    drop(store);
+    sync_contact_relationship(&state, agent_id).await;
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
 }
 

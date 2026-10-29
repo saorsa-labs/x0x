@@ -4,6 +4,7 @@
 //! verified with ML-DSA-65 signatures, and propagated symmetrically via gossip.
 //! Nodes download, verify, and atomically replace their own binary with rollback
 //! support.
+//! Upgrade parsers must not derive Debug for values that can hold argv, environment or credentials.
 
 pub mod apply;
 #[cfg(unix)]
@@ -12,6 +13,12 @@ pub(crate) mod fleet_policy;
 mod inventory_accounts;
 #[cfg(unix)]
 mod inventory_procfs;
+#[cfg(unix)]
+mod inventory_systemd_context;
+#[cfg(unix)]
+mod inventory_systemd_environment;
+#[cfg(unix)]
+mod inventory_systemd_exec;
 #[cfg(unix)]
 mod inventory_systemd_lists;
 pub(crate) mod journal;
