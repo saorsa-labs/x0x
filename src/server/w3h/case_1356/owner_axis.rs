@@ -216,6 +216,9 @@ const GATE_WINDOW: Duration = Duration::from_secs(30 * 60);
 /// X publishes its r+1′ bytes again after this long with no frame to J.
 /// J's join poll ends about 120 s after the join, so retries fit inside it.
 const FORK_REPUBLISH: Duration = Duration::from_secs(10);
+/// J's join-result poll runs `JOIN_RESULT_POLL_TIMEOUT` (120 s) from the
+/// join; in H-S3-c every O->J write is held until it has closed.
+const JOIN_POLL_CLOSED: Duration = Duration::from_secs(130);
 
 type Key = crate::network::sim::Key;
 type Policy = Box<dyn Fn(Key, Key, Option<[u8; 32]>) -> bool + Send + Sync>;
@@ -473,6 +476,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     // J redeems I; O seals J (r+2) and its join result carries the owner's
     // v2 terminal attestation, which arms J's gap gate.
     let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
+    let join_poll_closes = sim.fabric().now() + JOIN_POLL_CLOSED;
     let join_t = sim.fabric().now();
     let (join_code, join_answer) = redeem(sim, "J", &link, &owner).await?;
     let j_hex = sim.agent_hex("J")?;
@@ -571,16 +575,23 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     let fork_frames = pubsub_delivered(sim, "X", "J", forked_at, b"w3h c X fork")?;
     {
         let (held, held_to_j) = (Arc::clone(&held), Arc::clone(&held_to_j));
+        let fabric = Arc::clone(sim.fabric());
         let what = match both {
             true => "X cut; O's r+1 gossip passes to J",
-            false => "X cut; O's r+1 gossip held from J",
+            false => "X cut; O's r+1 gossip and every O->J write until J's join poll closes held from J",
         };
         set_hold(sim, &hold, what, move |origin, dst, msg| {
             let to_j = dst == j && is_held(&held, msg);
             if to_j {
                 held_to_j.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            origin == x || dst == x || (!both && to_j)
+            // H-S3-c: no canonical commit reaches J after r+1′. J's join
+            // poll is a direct write with no pubsub ID, so the ID hold
+            // misses it: O's next join `Result` carries r+2, which
+            // conflicts with r+1′ and installs a marker (ADR 0109 l.96,
+            // correct, but not this row's premise).
+            let poll_open = origin == o && dst == j && fabric.now() < join_poll_closes;
+            origin == x || dst == x || (!both && (to_j || poll_open))
         });
     }
     // H-S3-c2: O publishes its recorded r+1 bytes again (a new message ID,
