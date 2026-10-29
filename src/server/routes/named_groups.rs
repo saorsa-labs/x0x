@@ -3036,6 +3036,13 @@ async fn publish_group_card_to_discovery_inner(
         if !group_card_is_listable(info) {
             return None;
         }
+        // #1570: a held-back group's live record is ahead of its durable
+        // form, so no card is signed or published from it — not by the
+        // republish worker, a create fan-out or a state-change hook. The
+        // next pass after the group commits publishes it.
+        if group_recovery::is_held_back(state, info.stable_group_id()) {
+            return None;
+        }
         let mut candidate = info.clone();
         // Reseal bumps the commit chain; non-reseal republishes the
         // currently-sealed state (idempotent refresh).
@@ -6644,6 +6651,13 @@ pub(in crate::server) async fn refresh_group_card_cache_from_info(
     if !group_card_is_listable(info) {
         cache.remove(key);
         cache.remove(&stable_key);
+        return;
+    }
+    // #1570: a held-back group's live record is ahead of its durable form,
+    // so no fresh card is signed from it into the cache `GET /groups/discover`
+    // and card-by-id serve. The cache keeps the card of the last durable
+    // form until the hold clears.
+    if group_recovery::is_held_back(state, info.stable_group_id()) {
         return;
     }
     match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
@@ -33560,6 +33574,12 @@ pub(in crate::server) async fn discover_groups(
         if !group_card_is_listable(info) {
             continue;
         }
+        // #1570: a held-back group's live record is ahead of its durable
+        // form, so no card is signed from it. Its cached card (merged
+        // above) is served, as for a group this node does not own.
+        if group_recovery::is_held_back(&state, info.stable_group_id()) {
+            continue;
+        }
         if let Ok(Some(card)) = info.to_signed_group_card(signing_kp) {
             merge_card(&card);
         }
@@ -33741,7 +33761,13 @@ pub(in crate::server) async fn get_group_card(
         }
     }
     let groups = state.named_groups.read().await;
-    if let Some(info) = groups.get(&id) {
+    // #1570: a held-back group's live record is ahead of its durable form,
+    // so no card is signed from it. The cached card (checked above) is
+    // served, as for a group this node does not own.
+    if let Some(info) = groups
+        .get(&id)
+        .filter(|info| !group_recovery::is_held_back(&state, info.stable_group_id()))
+    {
         match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
             Ok(Some(card)) => {
                 return Json(serde_json::to_value(&card).unwrap_or(serde_json::Value::Null))
@@ -49277,6 +49303,7 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
     mod issue1570_held_back_tombstone;
     mod issue1577_revoked_catchup_request;
