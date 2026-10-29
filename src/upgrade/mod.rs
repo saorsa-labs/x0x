@@ -13,6 +13,8 @@ mod inventory_accounts;
 #[cfg(unix)]
 mod inventory_procfs;
 #[cfg(unix)]
+mod inventory_systemd_exec;
+#[cfg(unix)]
 mod inventory_systemd_lists;
 pub(crate) mod journal;
 pub(crate) mod log_flush;
