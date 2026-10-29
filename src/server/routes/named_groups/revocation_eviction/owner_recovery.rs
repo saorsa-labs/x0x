@@ -575,6 +575,24 @@ async fn committed_group_by_stable(state: &AppState, group_id: &str) -> Option<G
     group_by_stable(state, group_id).await.map(|(_, info)| info)
 }
 
+/// Whether `next`'s head is the installed roster head of `group_key`.
+/// #1574 item 1: `persist_named_group_info` also returns
+/// `ReplacedNotDurable` from its durability preflight, where an earlier
+/// write was still unconfirmed and its re-save failed again, so this
+/// candidate was never staged. That outcome installed nothing. The commit
+/// sites treat `ReplacedNotDurable` as committed only after this check.
+/// The read holds `named_groups_persistence_lock`, so it sees only
+/// installed or restored roster state.
+async fn roster_head_installed(state: &AppState, group_key: &str, next: &GroupInfo) -> bool {
+    let _committed = state.named_groups_persistence_lock.lock().await;
+    state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .is_some_and(|info| info.state_hash == next.state_hash)
+}
+
 /// The members a recovery commit on `info` must reach: the Active seats
 /// other than `local` and the named admins.
 fn survivors(info: &GroupInfo, local: &[u8; 32], removed: &BTreeSet<[u8; 32]>) -> Vec<[u8; 32]> {
@@ -1463,21 +1481,24 @@ async fn finish_commit(
     // committed, and that evidence is enough for the drops after them.
     // `ReplacedNotDurable` keeps the installed candidate in the map (the
     // persist rolls back only `NotReplaced` and hard errors), so this
-    // process never sees the install revert. The epoch-installed error is
-    // committed state as well: the journal it leaves is already the
-    // commit point, which a restart replays, and its non-durable roster
-    // arm converges memory to the candidate and sets the same
-    // confirmation flag.
+    // process never sees the install revert — except the preflight
+    // refusal, which stages nothing; the installed check separates it.
+    // The epoch-installed error is committed state: the journal it leaves
+    // is already the commit point, which a restart replays, and its
+    // non-durable roster arm converges memory to the candidate and sets
+    // the same confirmation flag.
     // A power loss before a confirming save is the one revert. It erases
     // this node's memory, so the `pending` entry is gone regardless of
-    // the drop above; the durable loss is the mandate retire, and it is
-    // covered: the owner's committed head is still the mandate's parent,
-    // so its durable wait still applies and `drive_mandates` sends the
-    // mandate again. The member re-holds it and commits a fresh frame.
-    // The durable frame above is chain evidence, not a re-drive (a
-    // restart restores an authored frame only at the loaded head), and it
-    // was never sent (the §5 egress guard held it), so the fresh frame
-    // cannot equivocate with it.
+    // the drop above; the durable loss is the mandate retire. When the
+    // owner is another node, its durable wait still applies (the reverted
+    // head is the mandate's parent) and `drive_mandates` sends the
+    // mandate again, so the member re-holds it and commits a fresh frame.
+    // When this node is the owner's own agent, no wait exists anywhere
+    // and nothing re-sends; the owner issues the mandate again, and its
+    // route still applies to the reverted head. The durable frame above
+    // is chain evidence, not a re-drive (a restart restores an authored
+    // frame only at the loaded head), and it was never sent (the §5
+    // egress guard held it), so a fresh frame cannot equivocate with it.
     let persisted = match tree.as_ref() {
         Some((guard, _)) => {
             match ng::persist_treekem_and_named_groups_atomic_with_info(
@@ -1495,11 +1516,16 @@ async fn finish_commit(
         // #1508 r6: `ReplacedNotDurable` installed the new roster (only
         // the directory fsync failed), so the commit stands and the frame
         // and its delivery must stay. The guarded egress publishes nothing
-        // until the re-save is durable (§5, #1508 rc12).
-        None => matches!(
-            ng::persist_named_group_info(state, group_key, next.clone()).await,
-            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
-        ),
+        // until the re-save is durable (§5, #1508 rc12). The preflight
+        // refusal stages nothing, so the installed check gates it (#1574
+        // item 1).
+        None => match ng::persist_named_group_info(state, group_key, next.clone()).await {
+            Ok(ng::AtomicWriteOutcome::Durable) => true,
+            Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+                roster_head_installed(state, group_key, &next).await
+            }
+            Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
+        },
     };
     if !persisted {
         replay_log::rewrite_without(state, ext, held, &stable, at).await;
@@ -3336,11 +3362,16 @@ async fn receive_commit(
             }
         }
         (None, orc::OwnerRecoveryCryptoV1::TreeKem { .. }) => false,
-        // #1508 r6: `ReplacedNotDurable` installed the roster.
-        _ => matches!(
-            ng::persist_named_group_info(state, &group_key, next.clone()).await,
-            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
-        ),
+        // #1508 r6: `ReplacedNotDurable` installed the roster. The
+        // preflight refusal stages nothing, so the installed check gates
+        // it (#1574 item 1).
+        _ => match ng::persist_named_group_info(state, &group_key, next.clone()).await {
+            Ok(ng::AtomicWriteOutcome::Durable) => true,
+            Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+                roster_head_installed(state, &group_key, &next).await
+            }
+            Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
+        },
     };
     drop(guard);
     if !installed {
@@ -5415,6 +5446,62 @@ mod restart_tests {
         Ok(())
     }
 
+    /// #1574 item 1: the plain roster persist also returns
+    /// `ReplacedNotDurable` from its durability preflight — an earlier
+    /// write is still unconfirmed and its re-save fails again — and that
+    /// outcome stages no candidate. The author keeps its held mandate and
+    /// schedules no delivery; the roster keeps the parent. Before the
+    /// fix the author retired its mandate — here the owner's own agent is
+    /// the promoted member, so no owner wait existed to re-send it — and
+    /// scheduled a delivery for a roster the map never installed.
+    #[tokio::test]
+    async fn a_recovery_whose_confirming_resave_fails_keeps_its_mandate() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let author = offline_author(dir.path(), [0x74; 32]).await?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let info = recovery_parent(owner, &admin, [author.agent.identity().agent_keypair()])?;
+        let stable = info.stable_group_id().to_string();
+        hold_persisted(&author, &info).await?;
+        revoke(&author, &admin).await?;
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let (status, Json(body)) =
+            sign_recovery_mandate(&author, owner, &stable, &author_hex).await;
+        anyhow::ensure!(status == StatusCode::ACCEPTED, "mandate: {body}");
+        super::super::revocation_eviction_pass(&author).await;
+
+        author
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _fault = super::super::super::set_save_fault(
+            &author,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        try_commit(&author, &stable).await;
+        {
+            let inner = author.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.orc.pending.contains_key(&stable),
+                "the held mandate is kept"
+            );
+            assert!(
+                !inner.orc.deliveries.contains_key(&stable),
+                "no delivery is scheduled for an install that never happened"
+            );
+        }
+        assert_eq!(
+            head_of(&author, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the roster keeps the parent head"
+        );
+        author.agent.shutdown().await;
+        Ok(())
+    }
+
     /// Codex P1 (#1508 r6), receiver side: the receiver's roster write
     /// renames the file and the directory fsync fails. The recovery is
     /// installed, so the receiver reports it applied and serves the frame.
@@ -5439,6 +5526,39 @@ mod restart_tests {
         );
         let frames = served(&receiver, &stable, info.state_revision).await;
         assert_eq!(frames, vec![(result_head, bytes)]);
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1574 item 1: the durability preflight's `ReplacedNotDurable`
+    /// stages nothing, so the receiver keeps the frame (`Retained`) and
+    /// the roster keeps the parent. Before the fix the receiver returned
+    /// `Applied` and dropped its mandate waits for an install that never
+    /// happened.
+    #[tokio::test]
+    async fn a_received_recovery_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()>
+    {
+        let (author_dir, receiver_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (receiver, info, bytes, _result_head, _admin) =
+            received_recovery(author_dir.path(), receiver_dir.path()).await?;
+        let stable = info.stable_group_id().to_string();
+        receiver
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _fault = super::super::super::set_save_fault(
+            &receiver,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        assert_eq!(
+            receive_bytes(&receiver, &bytes).await?,
+            ReceiveOutcome::Retained { verified: true },
+            "nothing was installed"
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the roster keeps the parent head"
+        );
         receiver.agent.shutdown().await;
         Ok(())
     }

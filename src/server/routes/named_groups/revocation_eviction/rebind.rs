@@ -401,6 +401,25 @@ enum CommitError {
 /// Seal, check, persist and schedule delivery of one rebind. The caller
 /// holds `group_key`'s membership lock and read `info` under it.
 ///
+/// Whether `next`'s head is the installed roster head of `group_key`.
+/// #1574 item 1: `persist_named_group_info` also returns
+/// `ReplacedNotDurable` from its durability preflight, where an earlier
+/// write was still unconfirmed and its re-save failed again, so this
+/// candidate was never staged (the flag short-circuit in
+/// `persist_named_group_info_inner`). That outcome installed nothing. The
+/// commit sites below treat `ReplacedNotDurable` as committed only after
+/// this check. The read holds `named_groups_persistence_lock`, so it sees
+/// only installed or restored roster state.
+async fn roster_head_installed(state: &AppState, group_key: &str, next: &GroupInfo) -> bool {
+    let _committed = state.named_groups_persistence_lock.lock().await;
+    state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .is_some_and(|info| info.state_hash == next.state_hash)
+}
+
 /// §2: every local rebind seal, the self-rebind route's, the admin's and
 /// a held one's, passes [`super::group_head_synced`] here first, just
 /// before the seal and under the membership lock. A replica with no
@@ -459,7 +478,9 @@ async fn commit_locked(
     }
     let persisted = match ng::persist_named_group_info(state, group_key, next.clone()).await {
         Ok(ng::AtomicWriteOutcome::Durable) => Ok(()),
-        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable)
+            if roster_head_installed(state, group_key, &next).await =>
+        {
             // The replacement is visible on disk and in memory, so the
             // commit stands and its delivery is scheduled. The guarded
             // egress sends nothing until the re-save is durable (§5).
@@ -480,6 +501,13 @@ async fn commit_locked(
             // cannot equivocate with it.
             tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: certificate rebind persisted without a durability confirmation");
             Ok(())
+        }
+        // #1574 item 1: the durability preflight returned
+        // `ReplacedNotDurable` without staging this candidate (an earlier
+        // write is still unconfirmed and its re-save failed again).
+        // Nothing was installed, so the commit does not stand.
+        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+            Err("durability preflight refused the replacement".to_string())
         }
         Ok(ng::AtomicWriteOutcome::NotReplaced) => Err("not replaced".to_string()),
         Err(error) => Err(error.to_string()),
@@ -2095,7 +2123,7 @@ pub(in crate::server) async fn receive(
             return ReceiveOutcome::Refused(cr::CertificateRebindRefusal::StateMismatch);
         }
     };
-    match ng::persist_named_group_info(state, &group_key, next.clone()).await {
+    let installed = match ng::persist_named_group_info(state, &group_key, next.clone()).await {
         // #1574 item 1: `Applied` on the non-durable outcome is enough for
         // the drops below. The frame was made durable before the install
         // (`write_received` above), and a restart puts a received frame
@@ -2105,11 +2133,18 @@ pub(in crate::server) async fn receive(
         // memory-only, and the reverted roster re-derives them: the seat's
         // expiry obligation opens again, so the renewal hand-off and the
         // admin wait are re-armed.
-        Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable) => {}
-        Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => {
-            // A local fault: the frame stays durable and in the stash.
-            return ReceiveOutcome::LocalFailure;
+        Ok(ng::AtomicWriteOutcome::Durable) => true,
+        // The preflight can return this outcome without staging this
+        // candidate (#1574 item 1, `roster_head_installed`): the install
+        // then did not happen, and the frame stays for a retry.
+        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+            roster_head_installed(state, &group_key, &next).await
         }
+        Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
+    };
+    if !installed {
+        // A local fault: the frame stays durable and in the stash.
+        return ReceiveOutcome::LocalFailure;
     }
     ng::refresh_group_card_cache_from_info(state, &group_key, &next).await;
     {
@@ -3266,6 +3301,47 @@ pub(super) mod restart_tests {
         Ok(())
     }
 
+    /// #1574 item 1: the durability preflight's `ReplacedNotDurable`
+    /// stages nothing (the confirming re-save failed again), so a
+    /// receiver reports a local failure, not `Applied`: the frame stays
+    /// durable for the retry and the roster keeps the parent. Before the
+    /// fix the receiver returned `Applied` and dropped the seat's waits
+    /// for an install that never happened.
+    #[tokio::test]
+    async fn a_received_rebind_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes, result_head) = fixture.frame()?;
+        receiver
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _fault = super::super::super::set_save_fault(
+            &receiver,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        let outcome = receive(&receiver, fixture.admin.agent_id(), &bytes).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::LocalFailure,
+            "nothing was installed"
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&fixture.info.state_hash),
+            "the roster keeps the parent head"
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&receiver, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 1, "the frame stays durable for the retry");
+        assert_eq!(on_disk[0].result_head, result_head);
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
     /// #1579: a received frame at a revision the `.crblog` already holds
     /// — the crash window left it there, memory has not installed it — is
     /// written beside the held frame, never in its place, and both stay
@@ -3810,6 +3886,103 @@ pub(super) mod restart_tests {
             .await
             .attempt_wait
             .contains_key(&key));
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1574 item 1: the plain roster persist also returns
+    /// `ReplacedNotDurable` from its durability preflight — an earlier
+    /// write is still unconfirmed and its re-save fails again — and that
+    /// outcome stages no candidate. The admin rebind must not treat it as
+    /// an install: nothing landed, so the renewal is kept, the wait stays
+    /// and no delivery is scheduled. Before the fix the commit dropped
+    /// the renewal and the wait and scheduled a delivery for a roster the
+    /// map never installed.
+    #[tokio::test]
+    async fn an_admin_rebind_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = UserKeypair::generate()?;
+        let seat = AgentKeypair::generate()?;
+        let seat_id = seat.agent_id();
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the fresh test state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let info = certified_group(&owner, state.agent.identity().agent_keypair(), &[&seat])?;
+        hold_persisted(&state, &info).await?;
+        let group_key = info.stable_group_id().to_string();
+        let seat_hex = hex::encode(seat_id.as_bytes());
+        let old_digest = info
+            .members_v2
+            .get(&seat_hex)
+            .and_then(cr::committed_digest)
+            .context("the seat's committed digest")?;
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            seat_id,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            now_unix_ms(),
+        ));
+        let key = EvictionKey::new(group_key.clone(), *seat_id.as_bytes());
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, &seat, Some(now_unix_ms() / 1000 + 6000))?;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
+                group_key.clone(),
+                HeadRound::new(&info.state_hash, Instant::now()),
+            );
+            inner.store.intake(
+                &key,
+                x0x::groups::eviction::EvictionTrigger::CertificateExpiry {
+                    certificate_digest: old_digest.clone(),
+                    not_after: now_unix_ms() / 1000,
+                },
+                None,
+                now_unix_ms(),
+                [0; 16],
+            );
+            inner.rebind.renewals.insert(key.clone(), renewal);
+        }
+        state
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _fault = super::super::super::set_save_fault(
+            &state,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        assert!(
+            try_admin_rebind(&state, &key, &group_key).await,
+            "a local write failure is handled here; the caller must not evict"
+        );
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.attempt_wait.get(&key).map(|wait| wait.cause),
+                Some(WaitingCause::WaitingForDurableIntake)
+            );
+            assert!(
+                inner.rebind.renewals.contains_key(&key),
+                "the renewal is kept"
+            );
+            assert!(
+                inner.rebind.deliveries.is_empty(),
+                "no delivery is scheduled for an install that never happened"
+            );
+        }
+        assert_eq!(
+            state.named_groups.read().await[&group_key].state_hash,
+            info.state_hash,
+            "the roster keeps the parent head"
+        );
         state.agent.shutdown().await;
         Ok(())
     }
