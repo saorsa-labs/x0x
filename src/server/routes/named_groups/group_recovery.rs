@@ -395,6 +395,10 @@ struct S3Inner {
     /// Test only: where a failed swap's rollback stops (#1645).
     #[cfg(test)]
     swap_rollback_stop: Option<SwapRollbackStop>,
+    /// Test only (#1708): the worker's pending step parks here, after its
+    /// sidecar re-read and before its reset (`reached`, then `release`).
+    #[cfg(test)]
+    pending_reread_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 /// Test only (#1645): a crash point in a failed swap's rollback, or a
@@ -1257,14 +1261,12 @@ fn with_placeheld<R>(state: &AppState, f: impl FnOnce(&mut HashMap<String, Place
 /// snapshot sees it: present, fault-free, and holding something that arms
 /// (an active ATA or an authoritative record). `None` when the sidecar
 /// arms nothing.
-async fn arms_snapshot(state: &AppState, stable: &str) -> Option<GroupRecoveryV1> {
-    let inner = state.group_recovery.inner.lock().await;
+fn arms_snapshot<'a>(inner: &'a S3Inner, stable: &str) -> Option<&'a GroupRecoveryV1> {
     inner
         .sidecars
         .get(stable)
         .filter(|_| !inner.sidecar_status.contains_key(stable))
         .filter(|body| body.active_ata.is_some() || body.authoritative_record.is_some())
-        .cloned()
 }
 
 /// The S3 placeholder of `info` (§4 "Placeholder"): the #451
@@ -2259,14 +2261,33 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
         // again: one whose body differs from the snapshot (an arming, a
         // conflict, a retirement, any sidecar transition) is left wholly
         // to the next pass, which decides on the fresh body.
+        //
+        // #1708 review (Codex P1, the post-reread arming): the re-read
+        // and the reset are one step under the sidecar `inner` guard.
+        // An arming's pre-save steps do not take the persistence lock:
+        // it installs its ATA (under `inner`) and only then claims the
+        // placeholder. With the guard released between the re-read and
+        // the reset, both steps could land in that gap, and the reset
+        // undid the new claim. Under the guard, an install either lands
+        // before the re-read (the body differs, so the group is skipped)
+        // or after the reset (its claim then supersedes the reset). Lock
+        // order: persistence lock, `inner`, placeheld map.
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
         for stable in &unplacehold {
             let snapshot = bodies
                 .iter()
                 .find(|(held, _)| held == stable)
                 .map(|(_, body)| body);
-            if arms_snapshot(state, stable).await.as_ref() != snapshot {
+            let inner = state.group_recovery.inner.lock().await;
+            if arms_snapshot(&inner, stable) != snapshot {
                 continue;
+            }
+            #[cfg(test)]
+            let mut inner = inner;
+            #[cfg(test)]
+            if let Some((reached, release)) = inner.pending_reread_pause.take() {
+                reached.notify_one();
+                release.notified().await;
             }
             with_placeheld(state, |placeheld| {
                 if let Some(entry) = placeheld.get_mut(stable) {
@@ -2277,6 +2298,7 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
                     entry.encoded = None;
                 }
             });
+            drop(inner);
         }
         resave = true;
     }
@@ -13805,6 +13827,102 @@ mod tests {
             .is_some_and(|entry| !entry.unplacehold_pending
                 && !entry.authoritative_failed
                 && entry.committed.placeholder)));
+        let body = sidecar_on_disk(&state, &stable).await?;
+        assert!(body.active_ata.is_some(), "the re-arm's ATA stays armed");
+        assert!(
+            body.authoritative_record.is_some(),
+            "the sidecar keeps the authoritative record of the armed group"
+        );
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("armed legacy entry"))?;
+        assert!(
+            s3::is_s3_placeholder(&legacy),
+            "the legacy view keeps the placeholder of the armed group"
+        );
+        Ok(())
+    }
+
+    /// #1708 review (Codex P1 at 3bed4e49, the post-reread arming): the
+    /// worker holds the persistence lock and its sidecar re-read finds the
+    /// group unchanged. An arming's pre-save steps (the ATA install and
+    /// the placeholder claim) do not take the persistence lock, so at
+    /// 3bed4e49 they could land after the re-read released its guard and
+    /// before the reset, and the reset undid the claim. The fixed step
+    /// holds the sidecar guard from the re-read through the reset, so the
+    /// install waits and the claim comes after the reset. Red at
+    /// 3bed4e49 (the hook then parks with the guard released). Inert.
+    #[tokio::test]
+    async fn an_arming_after_the_pending_reread_is_not_undone() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata.clone()).await);
+        assert!(!finish_arm(&state, &stable, LegacyWrite::Dropped, &ata).await);
+
+        // The worker parks after its re-read of the disarmed sidecar,
+        // holding the persistence lock.
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        state.group_recovery.inner.lock().await.pending_reread_pause =
+            Some((Arc::clone(&reached), Arc::clone(&release)));
+        let worker_state = Arc::clone(&state);
+        let worker = tokio::spawn(async move { ensure_placeholders(&worker_state).await });
+        reached.notified().await;
+        assert!(
+            state.named_groups_persistence_lock.try_lock().is_err(),
+            "the worker holds the persistence lock at its pending step"
+        );
+
+        // The re-arm runs its pre-save steps in the gap.
+        let ata_two = AdminTerminalAttestation::sign(
+            AtaFields {
+                group: stable.clone(),
+                subject: local_hex(&state),
+                attested_by: hex::encode(admin.agent_id().as_bytes()),
+                signer_public_key: hex::encode(admin.public_key().as_bytes()),
+                from_revision: info.state_revision,
+                from_state_hash: info.state_hash.clone(),
+                sequence: vec!["b1".to_string(), "b2".to_string()],
+                segment_terminal_revision: info.state_revision + 2,
+                segment_terminal_epoch: None,
+                issued_at_ms: now_ms(),
+            },
+            &admin,
+        )?;
+        let arming_state = Arc::clone(&state);
+        let arming_key = key.clone();
+        let arming_info = info.clone();
+        let arming = tokio::spawn(async move {
+            arm_in_place(&arming_state, &arming_key, &arming_info, ata_two).await
+        });
+        // Give the arming every chance to claim the placeholder in the gap.
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if with_placeheld(&state, |placeheld| {
+                placeheld
+                    .get(&stable)
+                    .is_some_and(|entry| !entry.unplacehold_pending)
+            }) {
+                break;
+            }
+        }
+        release.notify_one();
+        worker.await.expect("worker pass panicked");
+        assert!(
+            arming.await.expect("arming task panicked"),
+            "the re-arm published"
+        );
+
+        // The re-arm's claim stands: the armed group keeps its entry, the
+        // sidecar keeps the ATA and the authoritative record, and the
+        // legacy view holds the placeholder.
+        assert!(
+            with_placeheld(&state, |placeheld| placeheld
+                .get(&stable)
+                .is_some_and(|entry| !entry.unplacehold_pending)),
+            "the pending reset must not undo a later arming's claim"
+        );
         let body = sidecar_on_disk(&state, &stable).await?;
         assert!(body.active_ata.is_some(), "the re-arm's ATA stays armed");
         assert!(
