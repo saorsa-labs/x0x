@@ -10,8 +10,10 @@
 //! The page loop must stop with the typed reason
 //! `truncated_page_no_progress` instead: the pending queue keeps its
 //! events (requeue still runs; no state is hidden), and catch-up re-arms
-//! when a later incoming event queues (the 5 s-throttled gap ask) or an
-//! epoch-ahead signal asks again — there is no timer; a quiet group
+//! when a later incoming event queues (the 5 s-throttled gap ask), an
+//! epoch-ahead signal asks again, or a replay APPLIES a retained event
+//! and re-arms this peer at the moved cursor (round 3, review
+//! 5712505625). There is no timer; a quiet group whose gap never clears
 //! stays idle. A page whose events were all already at or below the
 //! cursor (a duplicate from a second peer, or a stale page) pages on:
 //! the next ask carries a newer cursor and can still make progress.
@@ -95,6 +97,29 @@ fn truncated_page(group_id: &str, event: NamedGroupMetadataEvent) -> TreeKemCatc
     }
 }
 
+/// A terminal (non-truncated) page — the responder's last page for the
+/// ask. `events` may be empty: an empty reply is a terminal page.
+fn terminal_page(group_id: &str, events: Vec<NamedGroupMetadataEvent>) -> TreeKemCatchupResponse {
+    TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: group_id.to_string(),
+        events,
+        truncated: false,
+        responder_state_hash: Some("terminal-head".to_string()),
+    }
+}
+
+/// Every page-loop re-arm the response/replay path sent, through the
+/// `catchup_page_rearms` seam: `(group, peer, reason)`.
+fn rearm_requests(state: &AppState) -> Vec<(String, String, &'static str)> {
+    state
+        .named_group_test_recorders
+        .catchup_page_rearms
+        .lock()
+        .expect("re-arm recorder")
+        .clone()
+}
+
 /// Every page re-request the response handler made, counted through the
 /// `catchup_page_force_ok` seam (the same observation point the #1113
 /// page-stream tests use).
@@ -172,10 +197,10 @@ async fn a_no_progress_truncated_page_stops_the_page_re_request_loop() -> Result
     Ok(())
 }
 
-/// The stop holds for a repeated identical page: nothing re-arms the
-/// pair on its own, so the two peers go idle (a paused runtime can park
-/// and advance virtual time) until new state arrives through another
-/// path.
+/// The stop holds for a repeated identical page: no replay applies the
+/// retained fork event, so nothing re-arms the pair on its own and the
+/// two peers go idle (a paused runtime can park and advance virtual
+/// time) until new state arrives through another path.
 #[tokio::test]
 async fn a_repeated_no_progress_page_keeps_the_loop_stopped() -> Result<()> {
     let group_id = "6b".repeat(32);
@@ -202,7 +227,7 @@ async fn a_repeated_no_progress_page_keeps_the_loop_stopped() -> Result<()> {
     assert_eq!(
         page_requests(&state),
         0,
-        "#1685: repeated no-progress truncated pages never re-request; the pair idles instead of spinning"
+        "#1685: repeated no-progress pages re-request nothing (applied state is the only re-arm); the pair idles instead of spinning"
     );
     assert_eq!(
         state
@@ -511,6 +536,339 @@ async fn a_stale_duplicate_page_keeps_paging() -> Result<()> {
             .expect("page-stop recorder")
             .is_empty(),
         "a duplicate page records no stop"
+    );
+    Ok(())
+}
+
+/// Review round 3 P1 (5712505625): the stop must not outlive its
+/// premise. A truncated page stops on a still-new event that only lacks
+/// its predecessor — a TEMPORARY dependency, unlike the fork shape.
+/// When another member's page delivers the missing link and the replay
+/// APPLIES the retained event, the stopped peer is asked for its next
+/// page again (the re-arm), and that peer's page fence closes only when
+/// its own terminal page arrives. At 9efb41f8 nothing re-asks the
+/// stopped peer, so the still-open peer fence defers the self-leave
+/// rekey for ever in a quiet group, even though the dependency cleared.
+#[tokio::test]
+async fn an_applied_replay_rearms_the_stopped_page_loop_to_the_terminal_page() -> Result<()> {
+    let group_id = "70".repeat(32);
+    let (mut state, _dir) = secure_endpoint_test_state().await?;
+    super::super::revocation_eviction::zero_restart_wait_for_test(&mut state);
+    let admin_id = state.agent.agent_id();
+    let admin_hex = hex::encode(admin_id.as_bytes());
+    let group_id_bytes = hex::decode(&group_id)?;
+    let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+    let mut admin_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
+    // Two leavers whose self-leaves chain: E1 (v1) is the dependency E2
+    // (v2) waits for.
+    let mut leavers = Vec::new();
+    for seed in 0u8..2 {
+        let kp = AgentKeypair::generate()?;
+        let id = kp.agent_id();
+        let hex_id = hex::encode(id.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(id, &[9u8 + seed; 32])?;
+        let kp_bytes = prepared.key_package_bytes().to_vec();
+        let added = admin_group.add_member(id, &kp_bytes)?;
+        let _leaver_group = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+        leavers.push((kp, hex_id, kp_bytes));
+    }
+    let epoch_before = admin_group.epoch();
+    let (v1_kp, v1_hex, _) = &leavers[0];
+    let (v2_kp, v2_hex, _) = &leavers[1];
+
+    let mut info = x0x::groups::GroupInfo::new(
+        "issue1685-rearm".to_string(),
+        String::new(),
+        admin_id,
+        group_id.clone(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    for (_, hex_id, kp_bytes) in &leavers {
+        info.add_member(
+            hex_id.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            hex_id,
+            base64::engine::general_purpose::STANDARD.encode(kp_bytes),
+        );
+    }
+    // The two page responders: roster-only active members, like the
+    // second responder in the duplicate-page test.
+    let responder = AgentKeypair::generate()?;
+    let responder_id = responder.agent_id();
+    let responder_hex = hex::encode(responder_id.as_bytes());
+    let helper = AgentKeypair::generate()?;
+    let helper_id = helper.agent_id();
+    let helper_hex = hex::encode(helper_id.as_bytes());
+    for peer_hex in [&responder_hex, &helper_hex] {
+        info.add_member(
+            peer_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+    }
+    info.secret_epoch = epoch_before;
+    info.security_binding = Some(format!("treekem:epoch={epoch_before}"));
+    info.recompute_state_hash();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+    state.treekem_groups.write().await.insert(
+        group_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(admin_group)),
+    );
+    let fence_ids = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group");
+        [
+            group_id.clone(),
+            info.mls_group_id.clone(),
+            info.stable_group_id().to_string(),
+        ]
+    };
+
+    // The two-link chain, sealed on one clone. `seal_commit` bumps the
+    // clone's state_revision and recomputes its hash, so after E1's
+    // seal the clone holds exactly the post-E1 head (revision R+1, hash
+    // H1) that E2 must link from.
+    let mut leaving = {
+        let groups = state.named_groups.read().await;
+        groups.get(&group_id).cloned().expect("group")
+    };
+    leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+    let revision1 = leaving.roster_revision;
+    leaving.remove_member(v1_hex, Some(v1_hex.clone()));
+    let commit1 = leaving.seal_commit(v1_kp, now_millis_u64())?;
+    let event1 = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: group_id.clone(),
+        revision: revision1,
+        actor: v1_hex.clone(),
+        agent_id: v1_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit1),
+    };
+    leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+    let revision2 = leaving.roster_revision;
+    leaving.remove_member(v2_hex, Some(v2_hex.clone()));
+    let commit2 = leaving.seal_commit(v2_kp, now_millis_u64())?;
+    let event2 = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: group_id.clone(),
+        revision: revision2,
+        actor: v2_hex.clone(),
+        agent_id: v2_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit2.clone()),
+    };
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder's truncated page serves E2 before its
+    //    predecessor: E2 queues as a revision gap, nothing applies, the
+    //    cursor does not move — the typed stop. The responder's page
+    //    fence stays open.
+    handle_treekem_catchup_response(
+        &state,
+        &responder_id,
+        &clean_sender_machine(),
+        true,
+        truncated_page(&group_id, event2.clone()),
+    )
+    .await;
+    let stops = state
+        .named_group_test_recorders
+        .catchup_page_stops
+        .lock()
+        .expect("page-stop recorder")
+        .clone();
+    assert_eq!(stops.len(), 1, "the stuck page records one typed stop");
+    assert_eq!(
+        stops[0],
+        (
+            group_id.clone(),
+            responder_hex.clone(),
+            "truncated_page_no_progress"
+        )
+    );
+    assert_eq!(
+        page_requests(&state),
+        0,
+        "the stopped loop asks for no next page at the unmoved cursor"
+    );
+    assert_eq!(pending_len(&state, &group_id).await, 1, "E2 stays queued");
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "the stopped peer's page fence stays open after the stop"
+    );
+
+    // 2. The dependency clears: the helper's TERMINAL page delivers E1.
+    //    E1 applies, the page handler's replay then applies the retained
+    //    E2, and the stopped responder is re-armed — asked for its next
+    //    page at the moved cursor. The helper's page was terminal, so
+    //    the only page request is the re-arm.
+    handle_treekem_catchup_response(
+        &state,
+        &helper_id,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    let head = cursor(&state, &group_id).await;
+    assert_eq!(
+        head.0, revision2,
+        "E1 applied and the replay applied the retained E2 after it"
+    );
+    assert_eq!(
+        head.2, commit2.state_hash,
+        "the two-link chain reached the head E2 sealed"
+    );
+    assert_eq!(pending_len(&state, &group_id).await, 0, "the queue drained");
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "the applied replay re-armed exactly one ask: the stopped responder's next page"
+    );
+    assert_eq!(
+        rearm_requests(&state),
+        vec![(group_id.clone(), responder_hex.clone(), "replay_applied")],
+        "the re-arm is typed and names the stopped peer"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "the re-arm asks; only the peer's own terminal page closes its fence"
+    );
+
+    // 3. The re-armed ask returns the responder's terminal page: the
+    //    fence closes on it (never on the re-arm) and the stream ends.
+    handle_treekem_catchup_response(
+        &state,
+        &responder_id,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![]),
+    )
+    .await;
+    assert!(
+        !self_leave_rekey_fence_any_open(&fence_ids),
+        "the terminal page closed the last open peer fence; the rekey pass is no longer deferred by it"
+    );
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "the terminal page asks for nothing"
+    );
+    assert_eq!(
+        state
+            .named_group_test_recorders
+            .catchup_page_stops
+            .lock()
+            .expect("page-stop recorder")
+            .len(),
+        1,
+        "no new stop: the resumed stream ended on its terminal page"
+    );
+    assert_eq!(
+        rearm_requests(&state).len(),
+        1,
+        "the terminal page retires the stopped-loop accounting without another re-arm"
+    );
+    Ok(())
+}
+
+/// Review round 3 P1 control: the re-arm is paid for by APPLIED state.
+/// A replay that applies nothing (both peers' fork events stay gapped
+/// for ever) must not re-arm any stopped peer, so a quiet group whose
+/// gap never clears stays idle — the #1685 hot loop cannot return
+/// through the re-arm path.
+#[tokio::test]
+async fn a_replay_that_applies_nothing_does_not_rearm_any_stopped_peer() -> Result<()> {
+    let group_id = "71".repeat(32);
+    let responder = AgentKeypair::generate()?;
+    let helper = AgentKeypair::generate()?;
+    let helper_id = helper.agent_id();
+    let helper_hex = hex::encode(helper_id.as_bytes());
+    let (state, _dir) = fork_stranded_pair(&group_id, &responder).await?;
+    // The second responder needs an Active seat for its page to pass the
+    // member gate.
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("group");
+        let inviter = hex::encode(state.agent.agent_id().as_bytes());
+        info.add_member(
+            helper_hex,
+            x0x::groups::GroupRole::Member,
+            Some(inviter),
+            None,
+        );
+    }
+    let head = cursor(&state, &group_id).await;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // The responder stops on its own fork event.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &clean_sender_machine(),
+        true,
+        truncated_page(
+            &group_id,
+            fork_removal_page_event(&group_id, &responder, head.0 + 1),
+        ),
+    )
+    .await;
+    // The helper's page carries the helper's own fork event: nothing
+    // applies, the replay requeues both events, and the helper stops
+    // too. No applied state means no re-arm for either peer.
+    handle_treekem_catchup_response(
+        &state,
+        &helper_id,
+        &clean_sender_machine(),
+        true,
+        truncated_page(
+            &group_id,
+            fork_removal_page_event(&group_id, &helper, head.0 + 1),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        page_requests(&state),
+        0,
+        "a replay that applied nothing re-arms no stopped peer"
+    );
+    assert!(
+        rearm_requests(&state).is_empty(),
+        "no typed re-arm was recorded"
+    );
+    assert_eq!(
+        state
+            .named_group_test_recorders
+            .catchup_page_stops
+            .lock()
+            .expect("page-stop recorder")
+            .len(),
+        2,
+        "both fork pages recorded their own typed stop"
+    );
+    assert_eq!(
+        pending_len(&state, &group_id).await,
+        2,
+        "both fork events stay queued — the gap never cleared"
     );
     Ok(())
 }

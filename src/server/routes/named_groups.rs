@@ -11084,6 +11084,11 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
         entries
     };
     let mut still_pending = VecDeque::new();
+    // #1685 round 3 (review 5712505625): an applied replay is the proof
+    // that a blocked dependency cleared, and it moves the catch-up
+    // cursor. Count it so the pass below can re-arm the page loops this
+    // group stopped on `truncated_page_no_progress`.
+    let mut applied_from_queue = 0usize;
     // #1113: do not seal a responsive rekey between replayed events.
     // The pass runs once after this batch, and only when the queue is empty.
     SELF_LEAVE_REKEY_BATCH
@@ -11098,6 +11103,9 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
                     None,
                 )
                 .await;
+                if applied.accepted {
+                    applied_from_queue = applied_from_queue.saturating_add(1);
+                }
                 if !applied.accepted && treekem_membership_event_frontier(&pending.event).is_some()
                 {
                     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -11145,6 +11153,16 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
             local_epoch,
             &revoked,
         );
+    }
+    // #1685 round 3 (review 5712505625): this replay applied retained
+    // state, so a dependency cleared and the catch-up cursor moved. Every
+    // page loop this group stopped on `truncated_page_no_progress` lost
+    // its premise — the identical next page — so those peers are asked
+    // for their next page again. Each re-arm is paid for by an applied
+    // event, and a peer's fence still closes only on that peer's own
+    // terminal page.
+    if applied_from_queue > 0 {
+        rearm_stopped_treekem_catchup_pages(state, group_id).await;
     }
     // Drop the replay fence before the pass. The pass refuses a group
     // whose fence is still open, including this replay.
@@ -13061,10 +13079,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         // repeat this cursor and the responder would re-serve the
         // identical page. The requeue kept the pending events (no state
         // is hidden); catch-up re-arms when a later incoming event
-        // queues (the 5 s-throttled gap ask) or an epoch-ahead signal
-        // asks again — there is no timer, a quiet group stays idle. The
-        // peer's page fence stays open, exactly as it does for a page
-        // request that could not be sent.
+        // queues (the 5 s-throttled gap ask), an epoch-ahead signal
+        // asks again, or a replay APPLIES a retained event (round 3:
+        // the stopped peer is asked again at the moved cursor — see
+        // `rearm_stopped_treekem_catchup_pages`). There is no timer; a
+        // quiet group whose gap never clears stays idle. The peer's
+        // page fence stays open, exactly as it does for a page request
+        // that could not be sent.
         let cursor_after = {
             let groups = state.named_groups.read().await;
             groups
@@ -13138,7 +13159,8 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                      event, nothing applied and the cursor did not move, so the next \
                      page request would re-fetch the identical page; stopping the page \
                      loop (the pending queue keeps its events; this peer's page fence \
-                     stays open)"
+                     stays open until its terminal page; a replay that applies retained \
+                     state re-arms this peer)"
                 );
             }
             #[cfg(test)]
@@ -13148,7 +13170,19 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push((response.group_id.clone(), sender_hex.clone(), reason));
+            if reason == TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS {
+                // #1685 round 3 (review 5712505625): arm the re-arm path.
+                // The stop's premise is that the next ask at THIS cursor
+                // would re-fetch the identical page; only applied state
+                // can falsify it, so a replay that applies a retained
+                // event asks this peer again.
+                treekem_page_stopped_peers_note(&fence_ids, &sender_hex);
+            }
         } else {
+            // The page moved the cursor, so this peer's stream is live
+            // again: its stopped-loop accounting (if any) is retired —
+            // the next-page request below is the handler's own ask.
+            treekem_page_stopped_peers_clear(&fence_ids, &sender_hex);
             tracing::debug!(
                 target: "treekem.trace",
                 group_id = %response.group_id,
@@ -13195,8 +13229,11 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         let peer_open = self_leave_rekey_fence_peer_open(&fence_ids, &sender_hex);
         let any_open = self_leave_rekey_fence_any_open(&fence_ids);
         if peer_open {
-            // This peer's last page. Close only this peer.
+            // This peer's last page. Close only this peer. The terminal
+            // page also retires this peer's stopped-loop accounting: the
+            // stream reached its head, so nothing is left to re-arm.
             self_leave_rekey_fence_catchup_peer(&fence_ids, &sender_hex, false);
+            treekem_page_stopped_peers_clear(&fence_ids, &sender_hex);
         }
         if peer_open || !any_open {
             // No known page is outstanding, or this page closed one.
@@ -13221,9 +13258,10 @@ const SELF_LEAVE_CATCHUP_PAGE_SENDS: u32 = 3;
 /// on the requester's cursor, so the next page request would serve that
 /// same stuck event first again. Paging stops with this reason; the
 /// pending TreeKEM queue keeps its events, and catch-up re-arms when a
-/// later incoming event queues (the 5 s-throttled gap ask) or an
-/// epoch-ahead signal asks again. There is no timer: a quiet group
-/// stays idle.
+/// later incoming event queues (the 5 s-throttled gap ask), an
+/// epoch-ahead signal asks again, or a replay applies a retained event
+/// and re-arms this peer (round 3, review 5712505625). There is no
+/// timer: a quiet group whose gap never clears stays idle.
 const TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS: &str = "truncated_page_no_progress";
 
 /// #1685: the typed stop reason for a truncated catch-up page whose
@@ -13246,6 +13284,191 @@ const TREEKEM_PAGE_STOP_REWARN_CAP: usize = 1024;
 static TREEKEM_PAGE_STOP_REWARN: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// #1685 round 3 (review 5712505625): the typed re-arm reason recorded
+/// when a replay applied retained state and a peer stopped with
+/// [`TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS`] is asked for its next page
+/// again — the dependency cleared and the cursor moved, so the stop's
+/// premise (the identical next page) no longer holds.
+const TREEKEM_PAGE_STOP_REARM_REASON: &str = "replay_applied";
+
+/// #1685 round 3: how long one armed row of
+/// [`TREEKEM_PAGE_STOPPED_PEERS`] survives. Rows are pruned by age only
+/// when the map passes [`TREEKEM_PAGE_STOPPED_PEERS_CAP`], so the bound
+/// never touches a map inside its budget.
+const TREEKEM_PAGE_STOPPED_PEERS_TTL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// #1685 round 3: the armed-row budget of [`TREEKEM_PAGE_STOPPED_PEERS`]
+/// across every group. Past-TTL rows go first; if that is not enough,
+/// the oldest rows go, so the map stays O(live groups × stopped peers).
+const TREEKEM_PAGE_STOPPED_PEERS_CAP: usize = 1024;
+
+/// #1685 round 3 (review 5712505625): peers whose truncated-page loop
+/// stopped with [`TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS`], per group,
+/// keyed by the same page-fence aliases the peer fence uses. This map is
+/// liveness bookkeeping, not safety state: the peer fence itself stays
+/// open until that peer's terminal page whatever this map holds. A stop
+/// arms its row; a page request that goes out clears it (the stream is
+/// live again); a replay that applies retained state re-arms every armed
+/// row of the group through [`rearm_stopped_treekem_catchup_pages`].
+/// ADR 0088 L2/L3: the waiting state is typed (this map plus
+/// [`TREEKEM_PAGE_STOP_REARM_REASON`]) and visible (the re-arm info
+/// log), and it has an exit (the re-arm ask, or the terminal page that
+/// closes the peer fence).
+static TREEKEM_PAGE_STOPPED_PEERS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<String, std::collections::HashMap<String, std::time::Instant>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// #1685 round 3: arm one peer's stopped-loop row under the fence
+/// aliases. Over budget, past-TTL rows are pruned first, then the
+/// oldest rows until the map is inside its cap.
+fn treekem_page_stopped_peers_note(group_ids: &[String], peer: &str) {
+    let mut guard = TREEKEM_PAGE_STOPPED_PEERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for group_id in group_ids {
+        guard
+            .entry(group_id.clone())
+            .or_default()
+            .insert(peer.to_string(), std::time::Instant::now());
+    }
+    let total: usize = guard.values().map(std::collections::HashMap::len).sum();
+    if total <= TREEKEM_PAGE_STOPPED_PEERS_CAP {
+        return;
+    }
+    guard.retain(|_, peers| {
+        peers.retain(|_, stopped| stopped.elapsed() < TREEKEM_PAGE_STOPPED_PEERS_TTL);
+        !peers.is_empty()
+    });
+    let mut rows: Vec<(std::time::Instant, String, String)> = guard
+        .iter()
+        .flat_map(|(group_id, peers)| {
+            peers
+                .iter()
+                .map(move |(peer, stopped)| (*stopped, group_id.clone(), peer.clone()))
+        })
+        .collect();
+    rows.sort();
+    let excess = rows.len().saturating_sub(TREEKEM_PAGE_STOPPED_PEERS_CAP);
+    for (_, group_id, peer) in rows.into_iter().take(excess) {
+        if let Some(peers) = guard.get_mut(&group_id) {
+            peers.remove(&peer);
+        }
+    }
+    guard.retain(|_, peers| !peers.is_empty());
+}
+
+/// #1685 round 3: retire one peer's stopped-loop row (its page stream
+/// moved again, or its terminal page closed the peer fence).
+fn treekem_page_stopped_peers_clear(group_ids: &[String], peer: &str) {
+    let mut guard = TREEKEM_PAGE_STOPPED_PEERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for group_id in group_ids {
+        if let Some(peers) = guard.get_mut(group_id) {
+            peers.remove(peer);
+        }
+    }
+    guard.retain(|_, peers| !peers.is_empty());
+}
+
+/// #1685 round 3: the peers with an armed stopped-loop row under any of
+/// the fence aliases. Read-only; the row leaves through
+/// [`treekem_page_stopped_peers_clear`] only when a request went out.
+fn treekem_page_stopped_peers(group_ids: &[String]) -> Vec<String> {
+    let guard = TREEKEM_PAGE_STOPPED_PEERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut peers: Vec<String> = guard
+        .iter()
+        .filter(|(group_id, _)| group_ids.contains(group_id))
+        .flat_map(|(_, peers)| peers.keys().cloned())
+        .collect();
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
+/// #1685 round 3 (review 5712505625): a replay that APPLIED a retained
+/// event cleared a dependency and moved the catch-up cursor, so every
+/// page loop this group stopped on `truncated_page_no_progress` lost
+/// its premise — the next ask carries the moved cursor and can make
+/// progress. Ask each armed peer for its next page, inside the usual
+/// send bound. The peer fence stays open: only that peer's terminal
+/// page closes it, never this ask. A peer whose request could not be
+/// sent stays armed, so the next applied replay asks again; every
+/// re-arm is paid for by an applied event, so a quiet group whose gap
+/// never clears is never re-asked (no hot loop, no timer).
+async fn rearm_stopped_treekem_catchup_pages(state: &Arc<AppState>, group_id: &str) {
+    let aliases: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        let mut aliases = vec![group_id.to_string()];
+        let resolved = groups
+            .get_key_value(group_id)
+            .map(|(key, info)| (key.clone(), info))
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+                    .map(|(key, info)| (key.clone(), info))
+            });
+        if let Some((register_key, info)) = resolved {
+            aliases.push(register_key);
+            aliases.push(info.mls_group_id.clone());
+            aliases.push(info.stable_group_id().to_string());
+        }
+        aliases.sort();
+        aliases.dedup();
+        aliases
+    };
+    let peers = treekem_page_stopped_peers(&aliases);
+    for peer_hex in peers {
+        let Ok(peer) = parse_agent_id_hex(&peer_hex) else {
+            treekem_page_stopped_peers_clear(&aliases, &peer_hex);
+            continue;
+        };
+        let mut sent = false;
+        for _ in 0..SELF_LEAVE_CATCHUP_PAGE_SENDS {
+            if request_treekem_catchup_page(state, group_id, &peer).await {
+                sent = true;
+                break;
+            }
+        }
+        if !sent {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                sender = %LogHexId::agent(&peer_hex),
+                reason = TREEKEM_PAGE_STOP_REARM_REASON,
+                "TreeKEM catch-up page re-arm was not sent after replay applied state; \
+                 the peer stays armed and the next applied replay asks again"
+            );
+            continue;
+        }
+        treekem_page_stopped_peers_clear(&aliases, &peer_hex);
+        tracing::info!(
+            group_id = %LogHexId::group(group_id),
+            sender = %LogHexId::agent(&peer_hex),
+            reason = TREEKEM_PAGE_STOP_REARM_REASON,
+            "TreeKEM catch-up page loop re-armed: replay applied retained state, so \
+             this stopped peer is asked for its next page at the moved cursor; its \
+             page fence still closes only on its terminal page"
+        );
+        #[cfg(test)]
+        state
+            .named_group_test_recorders
+            .catchup_page_rearms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((
+                group_id.to_string(),
+                peer_hex,
+                TREEKEM_PAGE_STOP_REARM_REASON,
+            ));
+    }
+}
 
 fn verified_catchup_member_removed_author(
     event: &NamedGroupMetadataEvent,

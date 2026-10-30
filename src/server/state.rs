@@ -1642,6 +1642,11 @@ pub(super) struct NamedGroupTestRecorders {
     /// cursor did not move, and the identical next page request was
     /// deliberately not sent. Tests read the reason here.
     pub(super) catchup_page_stops: StdMutex<Vec<(String, String, &'static str)>>,
+    /// #1685 round 3: every page-loop re-arm that was sent, as
+    /// `(group, peer, reason)` — a replay applied retained state, so a
+    /// peer stopped with `truncated_page_no_progress` was asked for its
+    /// next page again at the moved cursor. Tests read the reason here.
+    pub(super) catchup_page_rearms: StdMutex<Vec<(String, String, &'static str)>>,
 }
 
 #[cfg(test)]
