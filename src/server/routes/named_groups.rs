@@ -13886,6 +13886,10 @@ async fn request_treekem_catchup_page(
             if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
                 recorded.push(group_id.as_bytes().to_vec());
             }
+            // The request is out; the return the ask task waits on is the
+            // ACK. A test that parks here holds that send in flight across
+            // a later seal (#1660 round 7/8, Codex P2 30 Oct).
+            detached_send_test_seam::park(&format!("treekem-catchup-page-ack:{group_id}")).await;
             return true;
         }
     }
