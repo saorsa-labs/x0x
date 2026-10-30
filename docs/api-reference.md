@@ -1757,7 +1757,7 @@ every wait. A wait always names its cause; it does not stop silently.
   - `waiting_for_fork_resolution` — a competing branch exists. A saved
     exclusion is kept as evidence and is not published. A verified
     competing certificate rebind on the same parent is kept the same way;
-    the rebind that won keeps the certificate it displaced, so the
+    the applied rebind retains the certificate it displaced, so the
     competing one stays verifiable (#1650).
   - `waiting_for_receiver_upgrade` — the crypto-only exclusion of a member
     that already left is held. `named` lists each Active member whose
