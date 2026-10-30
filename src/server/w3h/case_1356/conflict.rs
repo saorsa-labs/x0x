@@ -466,6 +466,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     for admin in ["B", "C"] {
         fresh_advert(sim, "J", admin).await?;
     }
+    // A responder answers only a requester whose current advert it holds,
+    // and sends nothing at all otherwise (§2), so B and C need J's too.
+    for admin in ["B", "C"] {
+        fresh_advert(sim, admin, "J").await?;
+    }
     let hashes = (main.state_hash.as_str(), fork.state_hash.as_str());
     let mut seen = Seen::default();
     seen.watch(

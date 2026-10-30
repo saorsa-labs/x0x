@@ -513,6 +513,9 @@ struct SubjectState {
     /// Rounds that ended with no usable answer (the backoff exponent).
     attempts: u32,
     next_retry_at: Instant,
+    /// The head the last request named, and when it was sent; cleared when
+    /// the round restarts from a later head.
+    asked_from: Option<(String, Instant)>,
     /// The index of the next target in the current round.
     next_target: usize,
     /// The target asked last, when, and the head the request named.
@@ -538,6 +541,7 @@ impl SubjectState {
             },
             attempts: 0,
             next_retry_at: now,
+            asked_from: None,
             next_target: 0,
             pending: None,
             asked: BTreeMap::new(),
@@ -3879,6 +3883,20 @@ async fn next_target(
         subject.progress_revision = info.state_revision;
         subject.progress_at = now;
     }
+    // The node left the head its last request named. §2 drops an answer
+    // for an old head, so a request still open is void, and the last
+    // round's silence was for that head: its backoff does not hold here.
+    // The round starts again from the first target once a responder's
+    // per-requester interval (§11) has passed since that request, so the
+    // new head's request is not refused `rate_limited` (#1726).
+    if let Some((_, asked_at)) = subject
+        .asked_from
+        .take_if(|(head, _)| *head != info.state_hash)
+    {
+        subject.pending = None;
+        subject.next_target = 0;
+        subject.next_retry_at = now.max(asked_at + s3::RESPONDER_PER_REQUESTER_INTERVAL);
+    }
     // A gap record alone asks only after GATE_STALL without progress; an
     // armed admin ATA asks for its renewal after ATA_ARMED_LIFETIME.
     let gap_only = !marker && refs.iter().all(|r| matches!(r, RecoveryRef::Gap { .. }));
@@ -3943,6 +3961,7 @@ async fn next_target(
     }
     let target = targets.get(subject.next_target).copied()?;
     subject.pending = Some((*target.as_bytes(), now, info.state_hash.clone()));
+    subject.asked_from = Some((info.state_hash.clone(), now));
     subject
         .asked
         .entry(hex::encode(target.as_bytes()))
@@ -11388,6 +11407,111 @@ mod tests {
             awaiting("no_capable_peer"),
             "asked"
         );
+        Ok(())
+    }
+
+    /// #1726 (W3-H H-S3-x): a backoff holds only at the head it was earned
+    /// at. The node's last round asked from `base` and ended with no
+    /// answer, so its backoff runs (120 s, the second step); it then moves
+    /// to `mid` (here the segment's end, where the next segment is due
+    /// now). Its next round starts from `mid` once a responder's
+    /// per-requester interval (60 s, §11) has passed since that request,
+    /// not after the backoff, and a request still open from `base` is
+    /// dropped. Before the fix the node waited out the backoff (240 s at
+    /// the third step, up to 1 h). Control: at the head it asked from, the
+    /// backoff holds. Inert: an offline agent; an ask shows as
+    /// `no_capable_peer`.
+    #[tokio::test]
+    async fn a_segment_end_after_a_failed_round_asks_without_the_backoff() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (admin, base, mid, ahead, links) = segment_fixture(&state)?;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let ata = sign_ata(&admin, &local, &base, &links[..1])?;
+        let terminal = super::super::NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: ahead.stable_group_id().to_string(),
+            revision: links[1].commit.revision,
+            actor: admin_hex,
+            agent_id: "44".repeat(32),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(links[1].commit.clone()),
+        };
+        let terminal_json = serde_json::to_vec(&terminal)?;
+        let stable = base.stable_group_id().to_string();
+        assert!(
+            update_sidecar(&state, &stable, move |body| {
+                body.active_ata = Some(ata);
+                body.queued_terminal = Some(terminal_json);
+            })
+            .await
+        );
+        assert!(exhausted_segment(&state, &mid).await.is_some());
+        let key = base.mls_group_id.clone();
+        let refs = live_refs(&state, &mid).await;
+        let start = Instant::now();
+        let early = start + Duration::from_secs(1);
+        let due = start + s3::RESPONDER_PER_REQUESTER_INTERVAL;
+        // Two rounds asked from `info`'s head ended with no answer, the last
+        // at `start`; with `open`, a request from that head is still pending.
+        let failed_rounds = |info: &GroupInfo, open: bool| {
+            let mut subject = SubjectState::new(start, info.state_revision);
+            subject.end_round(start);
+            subject.end_round(start);
+            subject.asked_from = Some((info.state_hash.clone(), start));
+            subject.pending = open.then(|| ([7u8; 32], start, info.state_hash.clone()));
+            subject
+        };
+        assert!(failed_rounds(&base, false).next_retry_at > due);
+        let set = |subject: SubjectState| {
+            let state = &state;
+            let stable = stable.clone();
+            async move {
+                state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .subjects
+                    .insert(stable, subject);
+            }
+        };
+
+        // Control: no progress since the failed rounds; the backoff holds
+        // past the responder interval.
+        set(failed_rounds(&mid, false)).await;
+        assert_eq!(
+            next_target(&state, &key, &mid, &local, &refs, due).await,
+            None
+        );
+        assert_eq!(
+            view_of(&state, &stable).await,
+            awaiting("segment_exhausted"),
+            "held by the backoff"
+        );
+
+        // The rounds failed at `base`, then the node moved to `mid`, with
+        // and without a request still open from `base`.
+        for open in [false, true] {
+            set(failed_rounds(&base, open)).await;
+            assert_eq!(
+                next_target(&state, &key, &mid, &local, &refs, early).await,
+                None
+            );
+            assert_eq!(
+                view_of(&state, &stable).await,
+                awaiting("segment_exhausted"),
+                "held by the responder interval (open: {open})"
+            );
+            assert_eq!(
+                next_target(&state, &key, &mid, &local, &refs, due).await,
+                None
+            );
+            assert_eq!(
+                view_of(&state, &stable).await,
+                awaiting("no_capable_peer"),
+                "asked after the interval, not the backoff (open: {open})"
+            );
+        }
         Ok(())
     }
 
