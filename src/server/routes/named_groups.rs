@@ -13372,6 +13372,16 @@ const TREEKEM_PAGE_STOPPED_PEERS_TTL: std::time::Duration =
 /// the oldest rows go, so the map stays O(live groups × stopped peers).
 const TREEKEM_PAGE_STOPPED_PEERS_CAP: usize = 1024;
 
+/// #1685 round 6 (CI clippy, `clippy::type_complexity`): the value of
+/// [`TREEKEM_PAGE_STOPPED_PEERS`] — per group, each stopped peer's
+/// armed row: the QUIC-authenticated machine its stopped page came
+/// from and the stop instant. A named alias, not a new type; the
+/// map's shape is unchanged.
+type TreekemPageStoppedPeersByGroup = std::collections::HashMap<
+    String,
+    std::collections::HashMap<String, (MachineId, std::time::Instant)>,
+>;
+
 /// #1685 round 3 (review 5712505625): peers whose truncated-page loop
 /// stopped with [`TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS`], per group,
 /// keyed by the same page-fence aliases the peer fence uses. The row
@@ -13402,12 +13412,7 @@ const TREEKEM_PAGE_STOPPED_PEERS_CAP: usize = 1024;
 /// the terminal page that closes the peer fence, or the round 4
 /// retirement of a peer that left the roster).
 static TREEKEM_PAGE_STOPPED_PEERS: std::sync::LazyLock<
-    std::sync::Mutex<
-        std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, (MachineId, std::time::Instant)>,
-        >,
-    >,
+    std::sync::Mutex<TreekemPageStoppedPeersByGroup>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// #1685 round 3: arm one peer's stopped-loop row under the fence
