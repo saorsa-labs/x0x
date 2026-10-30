@@ -657,7 +657,8 @@ pub(super) fn note_survivor_head(
 
 /// #1660 ([`crypto_exclusion::note_share_went_to`]): keep, on each GSS
 /// row of `stable_group_id` at `epoch`, the key a sealed share of that
-/// epoch's secret went to for `recipient`.
+/// epoch's secret went to for `recipient`. Returns whether the seal
+/// established any row's record — created it or changed its key.
 pub(super) fn note_share_went_to(
     removals: &mut HashMap<EvictionKey, RemovalDelivery>,
     stable_group_id: &str,
@@ -665,10 +666,11 @@ pub(super) fn note_share_went_to(
     recipient: &[u8; 32],
     kem: &str,
     ask_seq_at_seal: u64,
-) {
+) -> bool {
+    let mut established = false;
     for (key, delivery) in removals.iter_mut() {
         if key.stable_group_id == stable_group_id && delivery.gss_epoch == Some(epoch) {
-            crypto_exclusion::keep_share_record(
+            established |= crypto_exclusion::keep_share_record(
                 &mut delivery.share_went_to,
                 recipient,
                 kem,
@@ -676,6 +678,7 @@ pub(super) fn note_share_went_to(
             );
         }
     }
+    established
 }
 
 /// The guarded admission of one serve to `recipient` (§3 L231):

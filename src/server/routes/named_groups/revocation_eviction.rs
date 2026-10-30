@@ -183,12 +183,15 @@ struct S4Inner {
     /// seat only after the count moved past that, so only answers that
     /// could answer an ask sent after the seal close the seat.
     head_ask_seq: HashMap<(String, [u8; 32]), u64>,
-    /// #1660 (Codex P2, 30 Oct): how many shares were sealed to each
-    /// seat of each group (`crypto_exclusion::note_share_went_to` bumps
-    /// it). An ask task reads it before its request leaves and again
-    /// when the request completed, so a completion whose send was in
-    /// flight across a seal never credits the count that seal's bar is
-    /// judged against.
+    /// #1660 (Engineer ruling, 30 Oct 05:10 GMT): the seat's share-seal
+    /// generation. It advances only when a seal creates the seat's share
+    /// record or changes its key (`crypto_exclusion::note_share_went_to`
+    /// moves it). An ask task reads it before its request leaves and
+    /// again at completion, so a completion whose send was in flight
+    /// across such a seal never credits the count. The generation is
+    /// monotonic for the daemon's life — the worker pass never drops it,
+    /// so a group that leaves the open set and returns never reuses a
+    /// value an in-flight ask still holds.
     share_seal_seq: HashMap<(String, [u8; 32]), u64>,
     /// §2: accepted `202 queued` manual bans, persisted in the `.evs` v2
     /// extension until the ban is applied.
@@ -1293,12 +1296,6 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .retain(|stable, _| open_groups.contains(stable));
     inner
         .head_ask_seq
-        .retain(|(stable, _), _| ask_count_groups.contains(stable));
-    // #1660 (Codex P2, 30 Oct): the seal generation lives and dies with
-    // the count it guards (a dropped-and-recreated entry only ever
-    // discards a credit — the conservative side).
-    inner
-        .share_seal_seq
         .retain(|(stable, _), _| ask_count_groups.contains(stable));
     for stable in &open_groups {
         let Some((group_key, info)) = by_stable.get(stable.as_str()) else {
@@ -7865,5 +7862,40 @@ pub(super) mod tests {
         );
         assert!(inner.store.get(&key).is_some_and(|row| row.phase.is_open()));
         Ok(())
+    }
+
+    /// #1660 (Claude round 8 review): the share-seal generation is
+    /// monotonic for the daemon's life. The worker pass keeps a group's
+    /// entry even when the group owns no open work: a group that drops out
+    /// of the open set and returns must never restart the counter at a
+    /// value an ask that is still in flight read before the drop, or that
+    /// ask's late completion credits a count against the new record's bar.
+    #[tokio::test]
+    async fn a_groups_share_seal_generation_survives_the_worker_pass() {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state()
+            .await
+            .unwrap();
+        // The group "gone" owns no open work — no row, no mandate, no
+        // delivery — so it sits outside `ask_count_groups`.
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner
+                .share_seal_seq
+                .insert(("gone".to_string(), [0x5e; 32]), 7);
+        }
+        super::revocation_eviction_pass(&state).await;
+        let kept = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            inner
+                .share_seal_seq
+                .get(&("gone".to_string(), [0x5e; 32]))
+                .copied()
+        };
+        assert_eq!(
+            kept,
+            Some(7),
+            "a group outside the open set keeps its share-seal generation"
+        );
+        state.agent.shutdown().await;
     }
 }

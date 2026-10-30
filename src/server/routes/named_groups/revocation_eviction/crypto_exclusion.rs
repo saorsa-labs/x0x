@@ -584,22 +584,27 @@ pub(super) fn note_survivor_head(
 /// key the record already holds keeps the EARLIEST ask count — the
 /// rounds of a live row seal again every pass, and a later seal's count
 /// must not push the bar past the ask the answer rode on. A seal to a
-/// different key (a rotation) resets the record to that seal.
+/// different key (a rotation) resets the record to that seal. Returns
+/// whether this seal ESTABLISHED the record — created it or changed its
+/// key; a same-key re-seal returns `false` ([`note_share_went_to`] moves
+/// the generation only for an establishing seal).
 pub(super) fn keep_share_record(
     map: &mut BTreeMap<[u8; 32], ShareRecord>,
     recipient: &[u8; 32],
     kem: &str,
     ask_seq_at_seal: u64,
-) {
+) -> bool {
     match map.get_mut(recipient) {
         Some(record) if record.key == kem => {
             record.ask_seq_at_seal = record.ask_seq_at_seal.min(ask_seq_at_seal);
+            false
         }
         Some(record) => {
             *record = ShareRecord {
                 key: kem.to_string(),
                 ask_seq_at_seal,
             };
+            true
         }
         None => {
             map.insert(
@@ -609,6 +614,7 @@ pub(super) fn keep_share_record(
                     ask_seq_at_seal,
                 },
             );
+            true
         }
     }
 }
@@ -620,9 +626,14 @@ pub(super) fn keep_share_record(
 /// group and epoch keeps the record — the key and the seat's head-ask
 /// count at the seal — and a later report from the seat closes the row
 /// only against this record ([`report_may_close`]). The same critical
-/// section moves the seat's share-seal generation, so an ask whose
-/// request left before this seal cannot credit the count on the
-/// completion of that send ([`ask_heads`], Codex P2, 30 Oct).
+/// section moves the seat's share-seal generation, but only when this
+/// seal ESTABLISHED the seat's record — created it or changed its key
+/// (Engineer ruling, 30 Oct 05:10 GMT). A re-seal to the same key keeps
+/// the earliest bar and does not advance the generation, so an ask whose
+/// request left after that bar is still credited when its send completes:
+/// owner recovery's rounds re-send the commit and re-seal the same key
+/// every pass, and their convergence must not depend on the commit's ACK
+/// losing the race with the ask's ([`ask_heads`], Codex P2, 30 Oct).
 pub(super) async fn note_share_went_to(
     state: &AppState,
     stable_group_id: &str,
@@ -636,19 +647,18 @@ pub(super) async fn note_share_went_to(
         .get(&(stable_group_id.to_string(), *recipient))
         .copied()
         .unwrap_or(0);
-    // #1660 (Codex P2, 30 Oct): this seal moves the seat's share-seal
-    // generation, so an ask whose request left before this seal cannot
-    // credit the count on its late completion ([`ask_heads`]).
-    *inner
-        .share_seal_seq
-        .entry((stable_group_id.to_string(), *recipient))
-        .or_insert(0) += 1;
+    // #1660 (Engineer ruling, 30 Oct 05:10 GMT): an establishing seal
+    // moves the seat's share-seal generation, so an ask whose request
+    // left before it cannot credit the count on its late completion
+    // ([`ask_heads`]). A same-key re-seal moves nothing.
+    let mut established = false;
     for (key, delivery) in &mut inner.ce.deliveries {
         if key.stable_group_id == stable_group_id && delivery.gss_epoch == Some(epoch) {
-            keep_share_record(&mut delivery.share_went_to, recipient, kem, ask_seq_at_seal);
+            established |=
+                keep_share_record(&mut delivery.share_went_to, recipient, kem, ask_seq_at_seal);
         }
     }
-    super::removal_delivery::note_share_went_to(
+    established |= super::removal_delivery::note_share_went_to(
         &mut inner.removals,
         stable_group_id,
         epoch,
@@ -656,7 +666,7 @@ pub(super) async fn note_share_went_to(
         kem,
         ask_seq_at_seal,
     );
-    super::owner_recovery::note_share_went_to(
+    established |= super::owner_recovery::note_share_went_to(
         &mut inner.orc,
         stable_group_id,
         epoch,
@@ -664,6 +674,12 @@ pub(super) async fn note_share_went_to(
         kem,
         ask_seq_at_seal,
     );
+    if established {
+        *inner
+            .share_seal_seq
+            .entry((stable_group_id.to_string(), *recipient))
+            .or_insert(0) += 1;
+    }
 }
 
 /// Ask each of `peers` for a catch-up page of `stable_group_id`, on the
@@ -679,17 +695,24 @@ pub(super) async fn note_share_went_to(
 /// is still in flight. The task reads the seat's share-seal generation
 /// before the request leaves and credits the count only when the
 /// generation still holds at completion — a completion whose send was
-/// in flight across a seal is a pre-seal ask's, and counts nothing
-/// ([`note_share_went_to`] bumps the generation). A delivery row's
-/// share record keeps the count at its seal, and a report closes a GSS
-/// seat only after the count moved past that — only answers that could
-/// answer an ask sent after the seal close the seat. No caller holds
-/// the S4 lock; the task takes it only for the generation and the
-/// count.
+/// in flight across an ESTABLISHING seal is a pre-seal ask's, and
+/// counts nothing ([`note_share_went_to`] bumps the generation only
+/// when a seal creates the seat's record or changes its key, Engineer
+/// ruling, 30 Oct 05:10 GMT; a same-key re-seal keeps the earliest bar
+/// and moves nothing, so owner recovery's rounds converge without
+/// winning the ACK race). A delivery row's share record keeps the count
+/// at its seal, and a report closes a GSS seat only after the count
+/// moved past that — only answers that could answer an ask sent after
+/// the seal close the seat. No caller holds the S4 lock; the task takes
+/// it only for the generation and the count. In tests the task parks at
+/// the `head-ask-settled:{group}` seam once its decision is made, so a
+/// test waits out a failed send without a fixed sleep.
 pub(super) async fn ask_heads(state: &Arc<AppState>, group_id: &str, peers: Vec<AgentId>) {
     for peer in peers {
         let task_state = Arc::clone(state);
         let group_id = group_id.to_string();
+        #[cfg(test)]
+        let settled_key = format!("head-ask-settled:{group_id}");
         let _spawned = state.spawn_detached(async move {
             let seal_seq_before = {
                 let inner = task_state.revocation_evictions.inner.lock().await;
@@ -713,6 +736,8 @@ pub(super) async fn ask_heads(state: &Arc<AppState>, group_id: &str, peers: Vec<
                         .or_insert(0) += 1;
                 }
             }
+            #[cfg(test)]
+            super::super::detached_send_test_seam::park(&settled_key).await;
         });
     }
 }
@@ -7910,13 +7935,20 @@ mod daemon_tests {
     /// not moved, so the answer — which could only answer a pre-seal
     /// ask — closes nothing. Released, the send fails (the fixture peer
     /// has no route) and still counts nothing: no answer can ride a
-    /// count for an ask that never left this node.
+    /// count for an ask that never left this node. The failed-send leg
+    /// waits for the ask task to settle its decision (the
+    /// `head-ask-settled` seam), not a fixed sleep, so a removed gate
+    /// fails this test.
     #[tokio::test]
     async fn a_parked_or_failed_head_ask_counts_nothing() -> Result<()> {
         let fx = seat_report_fixture(true).await?;
         fx.record_share_to_seat_key().await;
         let pause = ng::detached_send_test_seam::arm(&format!(
             "treekem-catchup-page:{}",
+            fx.key.stable_group_id
+        ));
+        let settled = ng::detached_send_test_seam::arm(&format!(
+            "head-ask-settled:{}",
             fx.key.stable_group_id
         ));
         ask_heads(&fx.state, &fx.key.stable_group_id, vec![fx.survivor]).await;
@@ -7934,17 +7966,20 @@ mod daemon_tests {
             "a delayed answer while the ask is parked closes nothing: it counts only when its request went out"
         );
         drop(pause);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        fx.feed_report(Some(&fx.result_head)).await;
-        assert_eq!(
-            fx.seat().await,
-            Some(RecipientDelivery::Sent),
-            "a failed send counts no ask: the count stays at the seal's"
+        for _ in 0..250 {
+            if settled.reached() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+        }
+        assert!(
+            settled.reached(),
+            "the ask task settled its count decision after the failed send"
         );
         assert_eq!(
             fx.ask_count().await,
             None,
-            "no ask that went out, no count (Codex P2, 29 Oct)"
+            "a failed send counts no ask (Codex P2, 29 Oct): the count stays at the seal's"
         );
         assert!(fx.row_open().await, "the delivery row stays open");
         Ok(())
@@ -7996,11 +8031,13 @@ mod daemon_tests {
 
     /// #1660 (Codex P2, 30 Oct): a head ask whose request left BEFORE
     /// the share was sealed, and whose ACK (the completion the count
-    /// waited on) lands AFTER the seal recorded its bar. The completion
-    /// of that in-flight send counts nothing — no ask went out after
-    /// the seal — so the delayed answer to the pre-seal ask closes no
-    /// seat. The fresh ask's send observes the seal, counts normally,
-    /// and only its answer converges the seat.
+    /// waits on) lands AFTER the seal recorded its bar. The ask is held
+    /// at the ACK seam — the request is out, the send is in flight —
+    /// while the seal lands. The completion of that in-flight send
+    /// counts nothing — no ask went out after the seal — so the delayed
+    /// answer to the pre-seal ask closes no seat. The fresh ask's send
+    /// observes the seal, counts normally, and only its answer converges
+    /// the seat.
     #[tokio::test]
     async fn a_pre_seal_ask_completing_after_the_seal_counts_nothing() -> Result<()> {
         let fx = seat_report_fixture(true).await?;
@@ -8008,41 +8045,42 @@ mod daemon_tests {
             .named_group_test_recorders
             .catchup_page_force_ok
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let pause = ng::detached_send_test_seam::arm(&format!(
-            "treekem-catchup-page:{}",
+        let ack = ng::detached_send_test_seam::arm(&format!(
+            "treekem-catchup-page-ack:{}",
+            fx.key.stable_group_id
+        ));
+        let settled = ng::detached_send_test_seam::arm(&format!(
+            "head-ask-settled:{}",
             fx.key.stable_group_id
         ));
         ask_heads(&fx.state, &fx.key.stable_group_id, vec![fx.survivor]).await;
         for _ in 0..250 {
-            if pause.reached() {
+            if ack.reached() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(4)).await;
         }
-        assert!(pause.reached(), "the ask task parked at the send boundary");
-        // The seal happens while the ask's request is out (the send
-        // waits for the recipient's ACK), so the bar is recorded at a
-        // count of zero completed asks.
+        assert!(
+            ack.reached(),
+            "the ask's request went out and its ACK is held: the send is in flight"
+        );
+        // The seal happens while the ask's send is in flight, so the bar
+        // is recorded at a count of zero completed asks. This first seal
+        // creates the seat's record, so it establishes the bar.
         fx.record_share_to_seat_key().await;
         // The ACK lands: the pre-seal send completes, and its completion
         // must not publish a count.
-        drop(pause);
+        drop(ack);
         for _ in 0..250 {
-            let completed = {
-                let recorded = fx
-                    .state
-                    .named_group_test_recorders
-                    .catchup_responses
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                !recorded.is_empty()
-            };
-            if completed {
+            if settled.reached() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(4)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            settled.reached(),
+            "the ask task settled its count decision after the late ACK"
+        );
         assert_eq!(
             fx.ask_count().await,
             None,
@@ -8075,6 +8113,78 @@ mod daemon_tests {
             Some(RecipientDelivery::Converged),
             "the answer to the post-seal ask converges the seat"
         );
+        Ok(())
+    }
+
+    /// #1660 round 3 (Codex P2): the completion step re-reads the
+    /// sender's seat under the S4 lock, so a re-key that lands while the
+    /// report waits between its first roster read and that lock still
+    /// refuses. The report is held inside the revocation verdict's read
+    /// — past its first roster read — while the seat's KEM key rotates:
+    /// the share record of the old key matches nothing the seat carries
+    /// now, so the report closes no seat. The control runs the same
+    /// hold-and-release with no re-key and converges, so the refusal
+    /// checks the in-lock key re-read, not the hold.
+    #[tokio::test]
+    async fn a_rekey_while_the_report_waits_for_the_lock_closes_no_seat() -> Result<()> {
+        // The control: the same held verdict, no re-key — the report
+        // converges the seat.
+        let control = seat_report_fixture(true).await?;
+        control.record_share_to_seat_key().await;
+        control.record_post_seal_ask().await;
+        {
+            let set = control.state.agent.revocation_set();
+            let held = set.write().await;
+            let report = {
+                let state = Arc::clone(&control.state);
+                let group = control.group_id.clone();
+                let sender = control.survivor_hex.clone();
+                let head = control.result_head.clone();
+                tokio::spawn(async move {
+                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head)).await;
+                })
+            };
+            // The report runs to the verdict's revocation-set read and
+            // waits there, past its first roster read (the current key).
+            tokio::task::yield_now().await;
+            drop(held);
+            report.await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        assert_eq!(
+            control.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the control report converges the seat through the held verdict"
+        );
+        let fx = seat_report_fixture(true).await?;
+        fx.record_share_to_seat_key().await;
+        fx.record_post_seal_ask().await;
+        {
+            let set = fx.state.agent.revocation_set();
+            let held = set.write().await;
+            let report = {
+                let state = Arc::clone(&fx.state);
+                let group = fx.group_id.clone();
+                let sender = fx.survivor_hex.clone();
+                let head = fx.result_head.clone();
+                tokio::spawn(async move {
+                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head)).await;
+                })
+            };
+            tokio::task::yield_now().await;
+            // The re-key lands while the report waits: the seat carries a
+            // new key, and the share went to the old one.
+            let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+            fx.key_sender_seat(base64::engine::general_purpose::STANDARD.encode(&kem.public_bytes))
+                .await;
+            drop(held);
+            report.await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Sent),
+            "the report of a seat re-keyed under it closes nothing: the share went to the key it no longer carries (#1660 round 3)"
+        );
+        assert!(fx.row_open().await, "the delivery row stays open");
         Ok(())
     }
 

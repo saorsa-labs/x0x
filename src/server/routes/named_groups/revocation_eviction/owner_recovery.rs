@@ -323,7 +323,8 @@ pub(super) fn note_survivor_head(
 /// #1660 ([`super::crypto_exclusion::note_share_went_to`]): keep, on the
 /// GSS commit delivery of `stable_group_id` at `epoch`, the record of a
 /// sealed share of that epoch's secret for `recipient` — the key and the
-/// seat's head-ask count at the seal.
+/// seat's head-ask count at the seal. Returns whether the seal
+/// established the record — created it or changed its key.
 pub(super) fn note_share_went_to(
     orc: &mut OrcState,
     stable_group_id: &str,
@@ -331,17 +332,19 @@ pub(super) fn note_share_went_to(
     recipient: &[u8; 32],
     kem: &str,
     ask_seq_at_seal: u64,
-) {
-    if let Some(delivery) = orc.deliveries.get_mut(stable_group_id) {
-        if delivery.reshare_epoch == Some(epoch) {
-            super::crypto_exclusion::keep_share_record(
-                &mut delivery.share_went_to,
-                recipient,
-                kem,
-                ask_seq_at_seal,
-            );
-        }
+) -> bool {
+    let Some(delivery) = orc.deliveries.get_mut(stable_group_id) else {
+        return false;
+    };
+    if delivery.reshare_epoch != Some(epoch) {
+        return false;
     }
+    super::crypto_exclusion::keep_share_record(
+        &mut delivery.share_went_to,
+        recipient,
+        kem,
+        ask_seq_at_seal,
+    )
 }
 
 impl OrcState {
@@ -1763,12 +1766,14 @@ async fn drive_deliveries(state: &Arc<AppState>) {
         for (recipient, attempt) in started {
             spawn_commit_send(state, &stable, &delivery, AgentId(recipient), attempt);
         }
-        // #1660 (Engineer ruling, 29 Oct 17:12 GMT): this ask is
+        // #1660 (Engineer ruling, 30 Oct 05:10 GMT): this ask is
         // dispatched after this round's send tasks, and its count lands
-        // only when its request went out, so this round's own answers
-        // close nothing. The rounds seal again every pass, and each seal
-        // to the same key keeps the earliest count, so the ask past that
-        // earliest seal is the first whose answers close the seat.
+        // only when its request went out. A round's re-seal to the same
+        // key keeps the earliest bar and does not advance the share-seal
+        // generation, so the ask is credited even when the commit's ACK
+        // and re-seal land while it is in flight: the seat closes on
+        // this round's answer, not only in a round whose ask wins that
+        // race.
         ask_heads(state, &stable, head_asks).await;
         for agent in refreshes {
             let task_state = Arc::clone(state);
@@ -6528,6 +6533,187 @@ mod restart_tests {
         assert!(
             !still_delivering(&author, &stable, &survivor).await,
             "a live delivery converges on an answer to a post-seal ask (#1660, Engineer ruling, 29 Oct 17:12 GMT)"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1660 round 8 (Claude blocking at c5e18510): a live GSS
+    /// recovery's round re-sends the commit and re-seals the rotated
+    /// secret to the same key while the round's head ask is still out —
+    /// the ask's request left, its ACK has not landed (the
+    /// `treekem-catchup-page-ack` seam holds the send open, so the
+    /// ordering does not lean on the recorder returning at once). The
+    /// re-seal to the same key keeps the earliest bar and does not
+    /// advance the share-seal generation (Engineer ruling, 30 Oct 05:10
+    /// GMT), so the ask's late completion still credits the count, and
+    /// the survivor's answer closes the seat in THAT round: convergence
+    /// does not depend on the commit's ACK losing the race with the
+    /// ask's. At c5e18510 the re-seal moved the generation, the late
+    /// completion credited nothing, and the seat stayed open.
+    #[tokio::test]
+    async fn a_recovery_seat_closes_in_the_round_that_re_seals_while_its_ask_is_out() -> Result<()>
+    {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (author, survivor, info, _committed, frame, _admin) =
+            committed_gss_recovery(author_dir.path(), survivor_dir.path(), None, None).await?;
+        let stable = info.stable_group_id().to_string();
+        let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
+        let survivor_id = *survivor.agent.agent_id().as_bytes();
+        // The share arrives and parks; the frame installs with it, so the
+        // survivor's head names the result the delivery waits on.
+        let share = next_share(&author, &stable, &survivor_hex, 0).await?;
+        let early = super::super::super::apply_named_group_metadata_event(
+            &survivor,
+            share,
+            author.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!early.accepted, "the share is parked");
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Applied
+        );
+        // Rounds run with the recorder off: the fixture has no transport,
+        // so every page ask fails and counts nothing, and the first seal
+        // records its bar at zero. The survivor answers each round, so
+        // the §2 head round holds it answered and the parked round below
+        // dispatches only the delivery's own ask.
+        let mut sealed_at_zero = false;
+        for _ in 0..100 {
+            let state = {
+                let inner = author.revocation_evictions.inner.lock().await;
+                let recorded = inner
+                    .orc
+                    .deliveries
+                    .get(&stable)
+                    .is_some_and(|d| d.share_went_to.contains_key(&survivor_id));
+                let count = inner
+                    .head_ask_seq
+                    .get(&(stable.clone(), survivor_id))
+                    .copied();
+                recorded && count.is_none()
+            };
+            if state {
+                sealed_at_zero = true;
+                break;
+            }
+            report_head(&author, &survivor, &stable).await?;
+            {
+                let mut inner = author.revocation_evictions.inner.lock().await;
+                if let Some(delivery) = inner.orc.deliveries.get_mut(&stable) {
+                    delivery.next_at = Instant::now();
+                }
+            }
+            worker_tick(&author).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            sealed_at_zero,
+            "the first seal recorded its bar with no ask that went out"
+        );
+        assert!(
+            still_delivering(&author, &stable, &survivor).await,
+            "the sealed share alone closes nothing: only a report does"
+        );
+        let shares_before = scheduled_shares(&author)
+            .into_iter()
+            .filter(|(to, _)| to == &survivor_hex)
+            .count();
+        // The parked round: the ask goes out and is held at its ACK while
+        // the same round's commit resend re-seals to the same key.
+        author
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ack = super::super::super::detached_send_test_seam::arm(&format!(
+            "treekem-catchup-page-ack:{stable}"
+        ));
+        {
+            let mut inner = author.revocation_evictions.inner.lock().await;
+            if let Some(delivery) = inner.orc.deliveries.get_mut(&stable) {
+                delivery.next_at = Instant::now();
+            }
+        }
+        worker_tick(&author).await;
+        for _ in 0..250 {
+            if ack.reached() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        assert!(
+            ack.reached(),
+            "the round's ask went out and its ACK is held: the send is in flight"
+        );
+        let mut re_sealed = false;
+        for _ in 0..250 {
+            let shares = scheduled_shares(&author)
+                .into_iter()
+                .filter(|(to, _)| to == &survivor_hex)
+                .count();
+            if shares > shares_before {
+                re_sealed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        assert!(
+            re_sealed,
+            "the round's commit resend re-sealed the share while the ask was out"
+        );
+        // The ruling: the same-key re-seal moved neither the generation
+        // the ask read before its request left nor the earliest bar.
+        {
+            let inner = author.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner
+                    .share_seal_seq
+                    .get(&(stable.clone(), survivor_id))
+                    .copied(),
+                Some(1),
+                "a re-seal to the same key does not advance the share-seal generation"
+            );
+            assert_eq!(
+                inner
+                    .orc
+                    .deliveries
+                    .get(&stable)
+                    .and_then(|d| d.share_went_to.get(&survivor_id))
+                    .map(|record| record.ask_seq_at_seal),
+                Some(0),
+                "the re-seal keeps the earliest seal's bar"
+            );
+        }
+        // The ACK lands. The ask's send was in flight across the re-seal,
+        // and its completion still counts — that is the round-8 fix.
+        drop(ack);
+        let mut counted = None;
+        for _ in 0..250 {
+            counted = {
+                let inner = author.revocation_evictions.inner.lock().await;
+                inner
+                    .head_ask_seq
+                    .get(&(stable.clone(), survivor_id))
+                    .copied()
+            };
+            if counted == Some(1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        assert_eq!(
+            counted,
+            Some(1),
+            "the ask that was out across the same-key re-seal still counts"
+        );
+        report_head(&author, &survivor, &stable).await?;
+        assert!(
+            !still_delivering(&author, &stable, &survivor).await,
+            "the seat closes in the round that re-sealed while its ask was out (#1660 round 8)"
         );
         author.agent.shutdown().await;
         survivor.agent.shutdown().await;
