@@ -14,6 +14,7 @@ mod gss_share_hold;
 pub(in crate::server) use gss_share_hold::GssShareHolds;
 mod key_republish;
 pub(in crate::server) use key_republish::republish_outstanding_keyless_seats;
+pub(in crate::server) use key_republish::PendingKeyRepublish;
 mod revocation_eviction;
 pub(in crate::server) use revocation_eviction::rebind::rebind_member_certificate;
 mod seat_cert_fetch;
@@ -50435,6 +50436,8 @@ pub(in crate::server) mod tests {
             parked_role_updates: StdMutex::new(HashMap::new()),
             parked_gss_removals: StdMutex::new(HashMap::new()),
             gss_share_holds: GssShareHolds::default(),
+            key_republish_pending: StdMutex::new(std::collections::BTreeMap::new()),
+            key_republish_sweep_armed: std::sync::atomic::AtomicBool::new(false),
             join_result_staging_guards: StdMutex::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),

@@ -1101,6 +1101,18 @@ pub(super) struct AppState {
     /// `gss-share-holds/` and loaded again at restart, so no time limit or
     /// restart resumes sealing under the removed member's secret.
     pub(in crate::server) gss_share_holds: crate::server::routes::named_groups::GssShareHolds,
+    /// #1663 review P2: republish frames (`X0XKR1`) still owed to
+    /// recipients whose verified advert was missing or expired at the
+    /// send, or whose send failed, keyed by the group's stable id. The
+    /// sweep in `key_republish.rs` retries them; the startup pass rebuilds
+    /// the debt after a restart (the seat stays selected until its share
+    /// seals). Memory-only by design: dropping the state drops the debt.
+    pub(super) key_republish_pending: StdMutex<
+        std::collections::BTreeMap<String, super::routes::named_groups::PendingKeyRepublish>,
+    >,
+    /// True while this state's pending-republish sweep task runs; the task
+    /// clears it when nothing is owed. A second daemon has its own flag.
+    pub(super) key_republish_sweep_armed: std::sync::atomic::AtomicBool,
     /// #447: `MemberJoined` events rejected ONLY for missing OwnerCertified
     /// certificate evidence (retryable), retained so the authority can
     /// re-apply them once the joiner's announce blob resolves. Keyed by
@@ -1615,6 +1627,9 @@ pub(super) struct NamedGroupTestRecorders {
     /// install's own trigger — stays off and the state lasts. Production
     /// leaves it false: a real keyless survivor republishes at once.
     pub(super) key_republish_suppressed: std::sync::atomic::AtomicBool,
+    /// #1663 review P2: every republish frame send the first pass or the
+    /// sweep spawned, as the recipient's bytes, in order.
+    pub(super) key_republish_sends: StdMutex<Vec<[u8; 32]>>,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
 }

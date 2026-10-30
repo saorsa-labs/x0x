@@ -602,6 +602,26 @@ fn hashless_answer_is_a_keyless_disclaimer(info: &GroupInfo, sender: [u8; 32]) -
         })
 }
 
+/// #1663 review P1 (Claude and Codex controller, 29 Oct): whether this
+/// node's roster view seats a KEM public key on the sender's Active seat
+/// — the keyed-side twin of [`hashless_answer_is_a_keyless_disclaimer`].
+/// A GSS-encrypted group's sealed share installs only under such a key,
+/// so a seat this roster leaves keyless cannot hold the epoch secret: the
+/// head it reports can be the restored head of a survivor that
+/// republished its KEM key (#1663) while still waiting for the share —
+/// David's approved serving behaviour — and is not share-possession
+/// evidence. The seat's KEM key is local data, so this view can differ
+/// from the sender's own; the divergence only holds the recipient's
+/// convergence until the key arrives and the round seals the share (the
+/// ask cadence and every evidence rule outside the convergence marking
+/// are untouched).
+fn sender_seat_carries_a_kem_key(info: &GroupInfo, sender: [u8; 32]) -> bool {
+    info.active_members().any(|member| {
+        super::parse_agent_id_hex(&member.agent_id).is_ok_and(|agent| *agent.as_bytes() == sender)
+            && member.kem_public_key_b64.is_some()
+    })
+}
+
 /// Other active members that could hold a later head of `info`: every
 /// active member except this node and the targets of open rows.
 fn head_holders(
@@ -897,11 +917,12 @@ pub(in crate::server) async fn note_catchup_head(
                         )
                     }),
                     reported.is_none() && hashless_answer_is_a_keyless_disclaimer(info, sender),
+                    reported.is_some() && sender_seat_carries_a_kem_key(info, sender),
                 )
             })
         })
     };
-    let Some((stable, head, classified, keyless_disclaimer)) = current else {
+    let Some((stable, head, classified, keyless_disclaimer, sender_seat_keyed)) = current else {
         return;
     };
     let Some((report, installed)) = classified else {
@@ -928,7 +949,13 @@ pub(in crate::server) async fn note_catchup_head(
     let mut inner = state.revocation_evictions.inner.lock().await;
     // §3: the answer is also the sender's convergence evidence for the
     // S4 deliveries of this group whose result it holds.
-    crypto_exclusion::note_survivor_head(&mut inner, &stable, &sender, &installed);
+    crypto_exclusion::note_survivor_head(
+        &mut inner,
+        &stable,
+        &sender,
+        &installed,
+        sender_seat_keyed,
+    );
     // Only groups with S4 work keep a round (the worker pass creates it).
     if !inner.head_rounds.contains_key(&stable) {
         return;

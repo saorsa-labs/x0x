@@ -452,21 +452,36 @@ pub(super) fn note_converged(
 /// the local chain. It is the convergence evidence for the crypto-only
 /// exclusion, saved-removal, certificate-rebind and owner-recovery commit
 /// deliveries of `stable_group_id` whose result the responder holds.
+///
+/// A GSS delivery takes one more input (#1663 review P1, Claude and Codex
+/// controller, 29 Oct): `sender_seat_keyed`, whether this node's roster
+/// view seats a KEM key on the sender's Active seat. A survivor that
+/// republished its KEM key serves its saved head while it still holds no
+/// secret (David's approved keyed-seat behaviour), so a report from a
+/// seat this roster leaves keyless can be that restored head — it is not
+/// share-possession evidence, and the recipient stays un-converged until
+/// the key arrives and the round seals the share. Share completion stays
+/// distinct from the head report; the head itself is never suppressed.
 pub(super) fn note_survivor_head(
     inner: &mut super::S4Inner,
     stable_group_id: &str,
     sender: &[u8; 32],
     installed: &BTreeSet<String>,
+    sender_seat_keyed: bool,
 ) {
     for (key, delivery) in &mut inner.ce.deliveries {
-        if key.stable_group_id == stable_group_id {
-            note_converged(
-                &mut delivery.recipients,
-                &delivery.result_head,
-                sender,
-                installed,
-            );
+        if key.stable_group_id != stable_group_id {
+            continue;
         }
+        if delivery.gss_epoch.is_some() && !sender_seat_keyed {
+            continue;
+        }
+        note_converged(
+            &mut delivery.recipients,
+            &delivery.result_head,
+            sender,
+            installed,
+        );
     }
     super::removal_delivery::note_survivor_head(
         &mut inner.removals,
@@ -1030,6 +1045,35 @@ pub(in crate::server::routes::named_groups) fn own_seat_cannot_take_a_share(
     let own_hex = hex::encode(state.agent.agent_id().as_bytes());
     info.active_members()
         .any(|member| member.agent_id == own_hex && member.kem_public_key_b64.is_none())
+}
+
+/// #1663 review P1 (Claude and Codex controller, 29 Oct): the ingest of a
+/// republished KEM key (`X0XKR1`) seats a survivor this node's rounds
+/// could not seal to — no roster key, no sealed share. The next round must
+/// seal the current secret to that seat whatever the recipients' statuses,
+/// because a restored head report must not end the delivery shareless, so
+/// the ingest re-arms the group's open GSS deliveries with the same flag
+/// the resumed path sets at boot. Idempotent for members that already
+/// hold the secret: the same-epoch seal is a repeat they refuse.
+pub(in crate::server::routes::named_groups) async fn owe_gss_shares_after_republish(
+    state: &AppState,
+    stable_group_id: &str,
+) {
+    let runtime = &state.revocation_evictions;
+    let mut inner = runtime.inner.lock().await;
+    let mut owed = false;
+    for (key, delivery) in inner.ce.deliveries.iter_mut() {
+        if key.stable_group_id == stable_group_id
+            && delivery.gss_epoch.is_some()
+            && !delivery.gss_shares_pending
+        {
+            delivery.gss_shares_pending = true;
+            owed = true;
+        }
+    }
+    if owed {
+        inner.dirty = true;
+    }
 }
 
 /// A new delivery for a just-committed frame.
@@ -3639,6 +3683,9 @@ mod daemon_tests {
         leaver_kp: x0x::identity::AgentKeypair,
         leave: ng::NamedGroupMetadataEvent,
         old_secret: Vec<u8>,
+        /// The optional extra Member of [`gss_leave_fixture_with`]: an
+        /// agent with no node behind it (a phantom recipient).
+        extra: Option<AgentId>,
     }
 
     async fn gss_leave_fixture() -> Result<GssLeave> {
@@ -3766,6 +3813,7 @@ mod daemon_tests {
             leaver_kp,
             leave,
             old_secret,
+            extra,
         })
     }
 
@@ -5319,6 +5367,34 @@ mod daemon_tests {
             "the keyed seat serves its saved head again — head sync no longer stalls"
         );
 
+        // #1663 review P1 (Claude and Codex controller, 29 Oct): the
+        // pre-share head answer — served by the keyed seat while the
+        // survivor still holds no secret — reaches the author BEFORE the
+        // author seats the key and before any share is sealed. A seat this
+        // roster leaves keyless cannot hold the epoch secret, so the report
+        // is not share-possession evidence: the recipient must not turn
+        // Converged, or the round would skip it and remove the delivery
+        // without ever sealing the share.
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
+        assert_ne!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Converged),
+            "the pre-share head answer is not share-possession evidence"
+        );
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.ce.delivering().contains(&key),
+                "the delivery stays open while the share is still owed"
+            );
+        }
+
         // The wire side: the frame the survivor's daemon builds reaches a
         // peer (the author) through the real ingest, which verifies and
         // seats the key on the peer's copy of the seat. The sequence
@@ -5359,6 +5435,22 @@ mod daemon_tests {
                 "the seated key is the survivor's live ML-KEM public key"
             );
             assert_eq!(seat.kem_key_sequence, Some(2));
+        }
+        {
+            // #1663 review P1: the key ingest re-arms the share seal — the
+            // delivery can not complete shareless whatever the restored
+            // head already reported.
+            let pending = fx
+                .state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .get(&key)
+                .is_some_and(|delivery| delivery.gss_shares_pending);
+            assert!(pending, "the key ingest re-arms the group's share seal");
         }
 
         // Replays and stale keys are refused: the same sequence never
@@ -5453,6 +5545,264 @@ mod daemon_tests {
                 "the obligation completes after the republication keyed the seat"
             );
         }
+        Ok(())
+    }
+
+    /// #1663 review P1 (Claude and Codex controller, 29 Oct): the two
+    /// republish paths must keep the group's membership lock across
+    /// validation, mutation and the durable persist (the house M→P order).
+    /// The test freezes persistence and shows the guard is still held
+    /// while the write waits: with the pre-fix code the guard was dropped
+    /// before the persist (`receive`) or never taken
+    /// (`seat_own_republish`), so an interleaved removal or newer-sequence
+    /// write could persist in the gap and then be overwritten by the older
+    /// clone.
+    #[tokio::test]
+    async fn the_republish_paths_hold_the_membership_lock_through_persistence() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let own = ng::key_republish::build_own_republish(&fx.replica, &fx.group_id)
+            .await
+            .context("the survivor builds its republication")?;
+        assert_eq!(own.key_sequence, 1);
+
+        // The peer ingest: it mutates the live seat, then waits on the
+        // frozen persistence lock — the membership guard must still be held
+        // while it waits.
+        let persistence = fx.state.named_groups_persistence_lock.lock().await;
+        let payload = own.payload.clone();
+        let ingest = {
+            let author = std::sync::Arc::clone(&fx.state);
+            tokio::spawn(
+                async move { ng::key_republish::receive(&author, survivor, &payload).await },
+            )
+        };
+        let mut seated = false;
+        for _ in 0..500 {
+            seated = fx
+                .state
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .and_then(|info| info.members_v2.get(&survivor_hex))
+                .is_some_and(|seat| seat.kem_public_key_b64.is_some());
+            if seated {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seated, "the ingest mutated the live seat");
+        let membership = ng::group_membership_lock(&fx.state, &fx.group_id).await;
+        assert!(
+            membership.try_lock().is_err(),
+            "the ingest holds the membership guard while the persist waits"
+        );
+        drop(persistence);
+        assert_eq!(
+            ingest.await.context("the ingest task")?,
+            ng::key_republish::RepublishOutcome::Installed
+        );
+
+        // The own seat: the same pin on the send side.
+        let persistence = fx.replica.named_groups_persistence_lock.lock().await;
+        let republish = {
+            let replica = std::sync::Arc::clone(&fx.replica);
+            let group_id = fx.group_id.clone();
+            tokio::spawn(
+                async move { ng::key_republish::republish_own_key(&replica, &group_id).await },
+            )
+        };
+        let mut reseated = false;
+        for _ in 0..500 {
+            reseated = fx
+                .replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .and_then(|info| info.members_v2.get(&survivor_hex))
+                .is_some_and(|seat| seat.kem_public_key_b64.is_some());
+            if reseated {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(reseated, "the own republication mutated the live seat");
+        let membership = ng::group_membership_lock(&fx.replica, &fx.group_id).await;
+        assert!(
+            membership.try_lock().is_err(),
+            "the own republication holds the membership guard while the persist waits"
+        );
+        drop(persistence);
+        assert!(
+            republish.await.context("the republication task")?,
+            "the own republication seated and persisted"
+        );
+        Ok(())
+    }
+
+    /// #1663 review P2 (Claude and Codex controller, 29 Oct): a
+    /// republication whose recipient has no current verified advert, or
+    /// whose send fails, stays pending; the sweep retries it once the
+    /// advert arrives, and drops the debt when the peer's own advert rules
+    /// the frame out. The test transport fails every send, which is
+    /// itself the pinned "failed first send" case: the debt survives it.
+    #[tokio::test]
+    async fn a_skipped_or_failed_republish_send_stays_pending_and_retries() -> Result<()> {
+        use anyhow::Context as _;
+        use x0x::dm::CapabilityRegistry;
+        let extra_kp = x0x::identity::AgentKeypair::generate()?;
+        let fx = gss_leave_fixture_build(Some(extra_kp.agent_id()), false).await?;
+        let admin = fx.state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let leaver_hex = hex::encode(fx.leaver.as_bytes());
+        let extra = fx.extra.context("the extra member")?;
+        let extra_hex = hex::encode(extra.as_bytes());
+        // The extra member's advert sets the bit; the author and the
+        // leaver have none (the same `None` as an expired advert).
+        let now = x0x::dm_capability::now_unix_ms();
+        advertise_bits(
+            &fx.replica,
+            extra,
+            CapabilityRegistry::KEY_REPUBLISH_V1,
+            now,
+        );
+        assert!(
+            ng::key_republish::republish_own_key(&fx.replica, &fx.group_id).await,
+            "the republication seated the key"
+        );
+        let sends = |id: [u8; 32]| -> usize {
+            fx.replica
+                .named_group_test_recorders
+                .key_republish_sends
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|sent| **sent == id)
+                .count()
+        };
+        let owed = || -> Vec<String> {
+            let mut owed = ng::key_republish::pending_republish_owed(&fx.replica, &fx.stable);
+            owed.sort();
+            owed
+        };
+        let mut expected = vec![admin_hex.clone(), extra_hex.clone(), leaver_hex.clone()];
+        expected.sort();
+        assert_eq!(
+            sends(*extra.as_bytes()),
+            1,
+            "the advertised peer got the frame"
+        );
+        assert_eq!(sends(*admin.as_bytes()), 0, "no advert yet: no send");
+        assert_eq!(owed(), expected, "every unsent recipient stays owed");
+
+        // The failed first send is retried once its retry interval comes;
+        // the still-unknown adverts get no send.
+        ng::key_republish::pending_republish_due_now(&fx.replica);
+        ng::key_republish::sweep_pending_key_republishes(&fx.replica).await;
+        assert_eq!(
+            sends(*extra.as_bytes()),
+            2,
+            "the failed first send is retried"
+        );
+        assert_eq!(sends(*admin.as_bytes()), 0);
+        assert_eq!(owed(), expected);
+
+        // The late advert unlocks the author's retry.
+        advertise_bits(
+            &fx.replica,
+            admin,
+            CapabilityRegistry::KEY_REPUBLISH_V1,
+            now + 1,
+        );
+        ng::key_republish::pending_republish_due_now(&fx.replica);
+        ng::key_republish::sweep_pending_key_republishes(&fx.replica).await;
+        assert_eq!(
+            sends(*admin.as_bytes()),
+            1,
+            "the late advert unlocks the retry"
+        );
+        assert_eq!(
+            sends(*extra.as_bytes()),
+            3,
+            "the failing send keeps retrying"
+        );
+
+        // An advert that rules the frame out ends the debt: an
+        // intentionally unsupported peer is not owed a retry.
+        let all = CapabilityRegistry::current().bits;
+        advertise_bits(
+            &fx.replica,
+            extra,
+            all & !CapabilityRegistry::KEY_REPUBLISH_V1,
+            now + 2,
+        );
+        ng::key_republish::pending_republish_due_now(&fx.replica);
+        ng::key_republish::sweep_pending_key_republishes(&fx.replica).await;
+        assert_eq!(
+            sends(*extra.as_bytes()),
+            3,
+            "the unsupported peer is not sent to again"
+        );
+        let mut remaining = vec![admin_hex.clone(), leaver_hex.clone()];
+        remaining.sort();
+        assert_eq!(
+            owed(),
+            remaining,
+            "the unsupported peer's debt is dropped; the failing sends stay owed"
+        );
+        Ok(())
+    }
+
+    /// #1663 review P2: a seat that carries its republished key but never
+    /// received the sealed share stays in the startup pass — the sends can
+    /// all have failed before the restart, and the author can not seal the
+    /// share until the frame reaches it. The pass republishes until the
+    /// secret installs.
+    #[tokio::test]
+    async fn a_keyed_secretless_seat_still_republishes_at_startup() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        // The state right after a survivor's own republication: the seat
+        // keyed, the share still owed.
+        {
+            let mut info = fx
+                .replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .cloned()
+                .context("group")?;
+            let seat = info.members_v2.get_mut(&survivor_hex).context("seat")?;
+            seat.kem_public_key_b64 = Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(&fx.replica.agent_kem_keypair.public_bytes),
+            );
+            seat.kem_key_sequence = Some(1);
+            info.shared_secret = None;
+            assert!(matches!(
+                ng::persist_named_group_info(&fx.replica, &fx.group_id, info).await,
+                Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
+            ));
+        }
+        ng::republish_outstanding_keyless_seats(&fx.replica).await;
+        let reseated = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .and_then(|info| info.members_v2.get(&survivor_hex))
+            .is_some_and(|seat| seat.kem_key_sequence == Some(2));
+        assert!(
+            reseated,
+            "the startup pass republishes the keyed secretless seat"
+        );
         Ok(())
     }
 

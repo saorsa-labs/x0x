@@ -1847,13 +1847,24 @@ Active seat, the encrypted GSS plane and the frame's per-seat monotonic
 counter seats the key on the member's row (replays, stale keys, and
 unsigned or wrong-signer frames are refused). The republication is
 automatic: the keyless install itself sends it, and a node that boots
-into the keyless state sends it at startup. Once the seat is keyed — on
+into the keyless state — or into the keyed state whose share never
+installed — sends it at startup. A send the carrier does not accept is
+not done: a recipient whose verified advert is missing or expired, or
+whose send failed, keeps the frame owed, and the daemon retries it at
+the delivery-round interval until the advert sets the bit or rules the
+frame out; the startup pass keeps the seat selected until the share
+installs, so a restart sends it again. Once the seat is keyed — on
 the survivor's own copy and on the authors' copies — the next S4
 delivery round seals the current secret to it and the share installs
 through the existing path, which ends the hold and returns the served
-head; a peer whose verified advert lacks `key_republish_v1` (bit 12)
-keeps the pre-#1663 behavior, so the seat stays keyless in that peer's
-view until it upgrades or the member re-joins. The window between the
+head. Share completion stays distinct from that head: a catch-up answer
+from a seat an author's roster leaves keyless is not share-possession
+evidence (such a seat cannot hold the epoch secret), and the frame's
+ingest re-arms the author's share seal, so the S4 row cannot complete
+without the share it owes. A peer whose verified advert lacks
+`key_republish_v1` (bit 12) keeps the pre-#1663 behavior, so the seat
+stays keyless in that peer's view until it upgrades or the member
+re-joins. The window between the
 keyed seat and the installed share is the same superseded-intermediate
 shape the 02:09 ruling keeps as main's answer, bounded by the share
 delivery the S4 row owes. Until one of the two keys the seat again, the
