@@ -399,30 +399,6 @@ enum CommitError {
     Persist(String),
 }
 
-/// Whether `next`'s head is the installed roster head of `group_key`.
-/// #1574 item 1: `persist_named_group_info` also returns
-/// `ReplacedNotDurable` from its durability preflight, where an earlier
-/// write was still unconfirmed and its re-save failed again, so this
-/// candidate was never staged (the flag short-circuit in
-/// `persist_named_group_info_inner`). That outcome installed nothing. The
-/// commit sites below treat `ReplacedNotDurable` as committed only after
-/// this check. The read holds `named_groups_persistence_lock`, so it sees
-/// only installed or restored roster state.
-///
-/// Known open gap (#1574): the preflight early return itself is not
-/// fixed here. `named_groups.rs` is fenced to the slice that owns it
-/// (#1627 and the card-routes run). Until that slice changes the
-/// preflight, this caller-side check is the guard for it.
-async fn roster_head_installed(state: &AppState, group_key: &str, next: &GroupInfo) -> bool {
-    let _committed = state.named_groups_persistence_lock.lock().await;
-    state
-        .named_groups
-        .read()
-        .await
-        .get(group_key)
-        .is_some_and(|info| info.state_hash == next.state_hash)
-}
-
 /// Seal, check, persist and schedule delivery of one rebind. The caller
 /// holds `group_key`'s membership lock and read `info` under it.
 ///
@@ -484,17 +460,17 @@ async fn commit_locked(
     }
     let persisted = match ng::persist_named_group_info(state, group_key, next.clone()).await {
         Ok(ng::AtomicWriteOutcome::Durable) => Ok(()),
-        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable)
-            if roster_head_installed(state, group_key, &next).await =>
-        {
+        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
             // The replacement is visible on disk and in memory, so the
             // commit stands and its delivery is scheduled. The guarded
             // egress sends nothing until the re-save is durable (§5).
             //
             // #1574 item 1: treating this arm as committed is enough for
-            // the drops below. The persist keeps the candidate in the map
-            // on this outcome (it rolls back only `NotReplaced` and hard
-            // errors), so this process never sees the install revert.
+            // the drops below. The outcome always means the candidate is
+            // staged: the persist keeps it in the map on this outcome
+            // (it rolls back only `NotReplaced` and hard errors), and
+            // the durability preflight reports its refusal as
+            // `NotReplaced` (#1574 slice 3), which takes the arms below.
             // A power loss before a confirming save is the one revert.
             // It erases the memory-only `admin_waits`/`renewals`/`held`
             // entries whether or not they were dropped. The durable frame
@@ -507,13 +483,6 @@ async fn commit_locked(
             // cannot equivocate with it.
             tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: certificate rebind persisted without a durability confirmation");
             Ok(())
-        }
-        // #1574 item 1: the durability preflight returned
-        // `ReplacedNotDurable` without staging this candidate (an earlier
-        // write is still unconfirmed and its re-save failed again).
-        // Nothing was installed, so the commit does not stand.
-        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
-            Err("durability preflight refused the replacement".to_string())
         }
         Ok(ng::AtomicWriteOutcome::NotReplaced) => Err("not replaced".to_string()),
         Err(error) => Err(error.to_string()),
@@ -2155,25 +2124,22 @@ pub(in crate::server) async fn receive(
             return ReceiveOutcome::Refused(cr::CertificateRebindRefusal::StateMismatch);
         }
     };
-    let installed = match ng::persist_named_group_info(state, &group_key, next.clone()).await {
-        // #1574 item 1: `Applied` on the non-durable outcome is enough for
-        // the drops below. The frame was made durable before the install
-        // (`write_received` above), and a restart puts a received frame
-        // above the loaded head back through the stash, so a power-loss
-        // revert re-runs this install and these drops on the durable
-        // frame. The dropped `renewals`/`admin_waits` entries are
-        // memory-only, and the reverted roster re-derives them: the seat's
-        // expiry obligation opens again, so the renewal hand-off and the
-        // admin wait are re-armed.
-        Ok(ng::AtomicWriteOutcome::Durable) => true,
-        // The preflight can return this outcome without staging this
-        // candidate (#1574 item 1, `roster_head_installed`): the install
-        // then did not happen, and the frame stays for a retry.
-        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
-            roster_head_installed(state, &group_key, &next).await
-        }
-        Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
-    };
+    // #1574 item 1: `Applied` on the non-durable outcome is enough for
+    // the drops below. The frame was made durable before the install
+    // (`write_received` above), and a restart puts a received frame
+    // above the loaded head back through the stash, so a power-loss
+    // revert re-runs this install and these drops on the durable
+    // frame. The dropped `renewals`/`admin_waits` entries are
+    // memory-only, and the reverted roster re-derives them: the seat's
+    // expiry obligation opens again, so the renewal hand-off and the
+    // admin wait are re-armed. A `ReplacedNotDurable` here always means
+    // the candidate is staged (the preflight reports its refusal as
+    // `NotReplaced`, #1574 slice 3), so a refused install never reaches
+    // the drops; the frame stays for a retry.
+    let installed = matches!(
+        ng::persist_named_group_info(state, &group_key, next.clone()).await,
+        Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
+    );
     if !installed {
         // A local fault: the frame stays durable and in the stash.
         return ReceiveOutcome::LocalFailure;

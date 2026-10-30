@@ -7829,6 +7829,19 @@ async fn persist_named_group_info_inner(
             Ok(AtomicWriteOutcome::Durable) => state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release),
+            // #1574: this refusal staged nothing of THIS caller's
+            // candidate, so it must not read as "the replacement is
+            // visible, only its directory fsync is unconfirmed" — the
+            // arm every caller uses to keep the candidate and proceed.
+            // Report the refusal as what it is: nothing was replaced.
+            // The flag stays set (the earlier replacement is still
+            // unconfirmed), so the seam keeps refusing publication and
+            // the next save retries this preflight. `Ok(ReplacedNotDurable)`
+            // from this function now always means the caller's candidate
+            // is installed in the live map.
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                return Ok(AtomicWriteOutcome::NotReplaced)
+            }
             outcome => return outcome,
         }
     }

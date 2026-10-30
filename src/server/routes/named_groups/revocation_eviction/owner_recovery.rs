@@ -637,24 +637,6 @@ async fn committed_group_by_stable(state: &AppState, group_id: &str) -> Option<G
     group_by_stable(state, group_id).await.map(|(_, info)| info)
 }
 
-/// Whether `next`'s head is the installed roster head of `group_key`.
-/// #1574 item 1: `persist_named_group_info` also returns
-/// `ReplacedNotDurable` from its durability preflight, where an earlier
-/// write was still unconfirmed and its re-save failed again, so this
-/// candidate was never staged. That outcome installed nothing. The commit
-/// sites treat `ReplacedNotDurable` as committed only after this check.
-/// The read holds `named_groups_persistence_lock`, so it sees only
-/// installed or restored roster state.
-async fn roster_head_installed(state: &AppState, group_key: &str, next: &GroupInfo) -> bool {
-    let _committed = state.named_groups_persistence_lock.lock().await;
-    state
-        .named_groups
-        .read()
-        .await
-        .get(group_key)
-        .is_some_and(|info| info.state_hash == next.state_hash)
-}
-
 /// The members a recovery commit on `info` must reach: the Active seats
 /// other than `local` and the named admins.
 fn survivors(info: &GroupInfo, local: &[u8; 32], removed: &BTreeSet<[u8; 32]>) -> Vec<[u8; 32]> {
@@ -1579,15 +1561,12 @@ async fn finish_commit(
         // the directory fsync failed), so the commit stands and the frame
         // and its delivery must stay. The guarded egress publishes nothing
         // until the re-save is durable (§5, #1508 rc12). The preflight
-        // refusal stages nothing, so the installed check gates it (#1574
-        // item 1).
-        None => match ng::persist_named_group_info(state, group_key, next.clone()).await {
-            Ok(ng::AtomicWriteOutcome::Durable) => true,
-            Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
-                roster_head_installed(state, group_key, &next).await
-            }
-            Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
-        },
+        // refusal stages nothing and reports `NotReplaced` (#1574 item 1,
+        // slice 3), so a refused commit never reaches the drops below.
+        None => matches!(
+            ng::persist_named_group_info(state, group_key, next.clone()).await,
+            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
+        ),
     };
     if !persisted {
         replay_log::rewrite_without(state, ext, held, &stable, at).await;
@@ -3477,15 +3456,13 @@ async fn receive_commit(
         }
         (None, orc::OwnerRecoveryCryptoV1::TreeKem { .. }) => false,
         // #1508 r6: `ReplacedNotDurable` installed the roster. The
-        // preflight refusal stages nothing, so the installed check gates
-        // it (#1574 item 1).
-        _ => match ng::persist_named_group_info(state, &group_key, next.clone()).await {
-            Ok(ng::AtomicWriteOutcome::Durable) => true,
-            Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
-                roster_head_installed(state, &group_key, &next).await
-            }
-            Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
-        },
+        // preflight refusal stages nothing and reports `NotReplaced`
+        // (#1574 item 1, slice 3), so a refused install never reaches
+        // the drops below.
+        _ => matches!(
+            ng::persist_named_group_info(state, &group_key, next.clone()).await,
+            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
+        ),
     };
     drop(guard);
     if !installed {
