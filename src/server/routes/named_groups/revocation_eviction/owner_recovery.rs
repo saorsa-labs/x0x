@@ -1230,6 +1230,10 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
             commit_treekem(state, &group_key, &info, next, body, &revocations).await;
         }
         orc::RecoveryCryptoKind::Gss => {
+            // #1597 item 1: a sealed share can raise the local epoch
+            // before its commit, so the rotation starts at the committed
+            // epoch, as the GSS crypto exclusion does.
+            next.secret_epoch = x0x::groups::crypto_exclusion::committed_secret_epoch(&info);
             let (secret, next_secret_epoch) = next.rotate_shared_secret();
             let Ok(secret) = <[u8; 32]>::try_from(secret.as_slice()) else {
                 return;
