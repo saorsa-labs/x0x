@@ -720,19 +720,21 @@ pub struct GroupInfo {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mandate_capability: BTreeMap<String, owner_mandate::MandateCapabilityState>,
     /// #1650 (ADR 0110 §4a): certificates displaced by an applied
-    /// `CertificateRebindV1`, keyed by the displaced certificate's BLAKE3
-    /// digest — the digest the parent roster signed. Local evidence
-    /// retention: a node that applied one sibling rebind keeps the parent
-    /// certificate it displaced, so a later competing sibling on the same
-    /// parent stays fully verifiable and records as fork evidence instead
-    /// of being refused with `rebind_certificate_evidence_missing` that
-    /// records nothing. Strictly local
-    /// like [`Self::mandate_capability`] (stripped outbound, rejected
-    /// inbound on bootstrap snapshots); participates in the #470
-    /// full-record equality. See
+    /// `CertificateRebindV1` or an installed SignedPublic catch-up head,
+    /// keyed by the displaced certificate's BLAKE3 digest — the digest
+    /// the parent roster signed. Local evidence retention: a node that
+    /// applied one sibling rebind keeps the parent certificate it
+    /// displaced, so a later competing sibling on the same parent stays
+    /// fully verifiable and records as fork evidence instead of being
+    /// refused with `rebind_certificate_evidence_missing` that records
+    /// nothing. Strictly in-memory on this record — never serialized
+    /// with it, so neither legacy JSON format changes (ADR 0110 §5); the
+    /// evidence persists only in the S4 sidecar
+    /// `revocation-evictions.rdc` and never rides an outbound snapshot.
+    /// Participates in the #470 full-record equality. See
     /// [`crate::groups::cert_rebind::install_certificate`].
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub displaced_certificates: BTreeMap<String, crate::identity::AgentCertificate>,
+    #[serde(skip)]
+    pub displaced_certificates: BTreeMap<String, cert_rebind::RetainedCertificate>,
 
     /// Retained, applied state-commit history (issue #111, follow-up to
     /// ADR-0016). Each entry pairs a signed

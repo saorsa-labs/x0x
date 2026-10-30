@@ -4878,6 +4878,24 @@ pub(super) mod restart_tests {
                 "the first sibling is the node's new head"
             );
 
+            // #1650 (ADR 0110 §5): the displaced parent certificate
+            // persists only in the S4 sidecar — neither legacy JSON
+            // format changes.
+            let sidecar = dir.path().join("revocation-evictions.rdc");
+            assert!(
+                tokio::fs::try_exists(&sidecar).await.unwrap_or(false),
+                "the retained evidence is durable in its S4 sidecar"
+            );
+            for legacy in ["named_groups.json", "home-suite-groups.json"] {
+                let json = tokio::fs::read_to_string(dir.path().join(legacy))
+                    .await
+                    .unwrap_or_default();
+                assert!(
+                    !json.contains("displaced_certificates"),
+                    "{legacy} never carries the retained evidence"
+                );
+            }
+
             // The competing sibling is valid on the same parent. The seat
             // is still Active, so the `HeadMismatch` arm falls through to
             // its typed refusal; the frame is fork evidence either way.

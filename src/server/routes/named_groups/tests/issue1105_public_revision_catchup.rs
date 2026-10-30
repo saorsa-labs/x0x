@@ -96,8 +96,12 @@ fn seal_owner_certified(
     authority: &crate::identity::AgentKeypair,
     now_ms: u64,
 ) {
-    let verdict =
-        group.owner_cert_verdict(&crate::groups::owner_cert::OwnerCertEvidence::new(now_ms));
+    // `OwnerCertEvidence` takes a Unix-seconds clock; `now_ms` is
+    // milliseconds. Seated certificates verify against that clock, so a
+    // ms-scale value would read every one of them as expired.
+    let verdict = group.owner_cert_verdict(&crate::groups::owner_cert::OwnerCertEvidence::new(
+        now_ms / 1000,
+    ));
     group
         .seal_commit_with_owner_certs(authority, now_ms, &verdict)
         .expect("owner-certified seal");
@@ -1070,9 +1074,13 @@ fn catchup_refuses_a_snapshot_that_carries_displaced_certificates() {
     let displaced = crate::identity::UserKeypair::generate()
         .and_then(|owner| crate::identity::AgentCertificate::issue(&owner, &authority))
         .expect("a displaced certificate");
-    metadata
-        .displaced_certificates
-        .insert("0".repeat(64), displaced);
+    metadata.displaced_certificates.insert(
+        "0".repeat(64),
+        crate::groups::cert_rebind::RetainedCertificate {
+            certificate: displaced,
+            retained_seq: 1,
+        },
+    );
     let snapshot = signed_public_bootstrap_snapshot(metadata).expect("metadata snapshot");
     assert!(
         snapshot.displaced_certificates.is_empty(),
@@ -1087,9 +1095,12 @@ fn catchup_refuses_a_snapshot_that_carries_displaced_certificates() {
     let mut foreign = snapshot.clone();
     foreign.displaced_certificates.insert(
         "0".repeat(64),
-        crate::identity::UserKeypair::generate()
-            .and_then(|owner| crate::identity::AgentCertificate::issue(&owner, &authority))
-            .expect("a second certificate"),
+        crate::groups::cert_rebind::RetainedCertificate {
+            certificate: crate::identity::UserKeypair::generate()
+                .and_then(|owner| crate::identity::AgentCertificate::issue(&owner, &authority))
+                .expect("a second certificate"),
+            retained_seq: 1,
+        },
     );
     assert!(
         apply_catchup(&lagging, &foreign, &sender, &member_hex).is_none(),
@@ -1098,5 +1109,86 @@ fn catchup_refuses_a_snapshot_that_carries_displaced_certificates() {
     assert!(
         !validate_public_group_bootstrap(&foreign, &sender, &member_hex),
         "a bootstrap snapshot that carries displaced certificates is not legitimate"
+    );
+}
+
+/// #1650 (Codex review P2): a certificate-only rebind winner arriving via
+/// SignedPublic catch-up replaces `members_v2` wholesale; the receiver must
+/// retain the parent certificate bytes it held for the seat, so the
+/// competing sibling rebind on the same parent still verifies as fork
+/// evidence instead of `CertificateEvidenceMissing` (which records nothing).
+#[test]
+fn catchup_retains_displaced_parent_evidence_for_a_competing_sibling() {
+    let owner = crate::identity::UserKeypair::generate().expect("owner");
+    let authority = crate::identity::AgentKeypair::generate().expect("authority");
+    let member = crate::identity::AgentKeypair::generate().expect("member");
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    let sender = hex::encode(authority.agent_id().as_bytes());
+    let now_ms = now_millis_u64();
+    let now_s = now_ms / 1000;
+    let mut parent = crate::groups::GroupInfo::with_policy(
+        "Catch-up".to_string(),
+        String::new(),
+        authority.agent_id(),
+        "ab".repeat(32),
+        owner_certified_policy(owner.user_id()),
+    );
+    parent.add_member(
+        member_hex.clone(),
+        crate::groups::GroupRole::Member,
+        Some(sender.clone()),
+        None,
+    );
+    // The sibling is admin-signed, and an admin signer's parent certificate
+    // is required evidence for `validate_sibling` (#1533 r11): seat it too.
+    let admin_cert = crate::identity::AgentCertificate::issue_with_expiry(
+        &owner,
+        &authority,
+        Some(now_s + 6000),
+    )
+    .expect("admin certificate");
+    crate::groups::cert_rebind::install_certificate(&mut parent, &sender, admin_cert);
+    let parent_cert =
+        crate::identity::AgentCertificate::issue_with_expiry(&owner, &member, Some(now_s + 600))
+            .expect("parent member certificate");
+    let parent_digest = crate::groups::owner_cert::certificate_digest_hex(&parent_cert);
+    crate::groups::cert_rebind::install_certificate(&mut parent, &member_hex, parent_cert);
+    seal_owner_certified(&mut parent, &authority, now_ms);
+    let renewal =
+        crate::identity::AgentCertificate::issue_with_expiry(&owner, &member, Some(now_s + 6000))
+            .expect("winner renewal");
+    let (winner, _winner_frame) = crate::groups::cert_rebind::seal(
+        &parent,
+        *member.agent_id().as_bytes(),
+        &renewal,
+        &authority,
+        now_ms.saturating_add(1),
+    )
+    .expect("winner rebind");
+    let snapshot = signed_public_bootstrap_snapshot(winner).expect("winner snapshot");
+    let caught_up = apply_catchup(&parent, &snapshot, &sender, &member_hex)
+        .expect("the catch-up installs the certificate-only winner");
+    assert!(
+        caught_up
+            .displaced_certificates
+            .contains_key(&parent_digest),
+        "the catch-up retains the displaced parent certificate"
+    );
+    let second_renewal =
+        crate::identity::AgentCertificate::issue_with_expiry(&owner, &member, Some(now_s + 7000))
+            .expect("sibling renewal");
+    let (_sibling_head, sibling) = crate::groups::cert_rebind::seal(
+        &parent,
+        *member.agent_id().as_bytes(),
+        &second_renewal,
+        &authority,
+        now_ms.saturating_add(2),
+    )
+    .expect("sibling rebind");
+    crate::groups::cert_rebind::verify_signatures(&sibling).expect("signatures");
+    assert_eq!(
+        crate::groups::cert_rebind::validate_sibling(&sibling.body, &caught_up, now_s, |_| false),
+        Ok(crate::groups::cert_rebind::RebindSigner::Admin),
+        "the competing sibling on the same parent is verifiable fork evidence after catch-up"
     );
 }

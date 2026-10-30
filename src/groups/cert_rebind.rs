@@ -644,7 +644,12 @@ pub fn validate_sibling(
             .filter(|cert| Some(&owner_cert::certificate_digest_hex(cert)) == digest)
             // #1650: this node's own branch may have displaced the parent
             // certificate; the retained copy verifies the sibling.
-            .or_else(|| current.displaced_certificates.get(digest?))
+            .or_else(|| {
+                current
+                    .displaced_certificates
+                    .get(digest?)
+                    .map(|retained| &retained.certificate)
+            })
     };
     if body.signer != body.seat {
         let signer_cert = held_certificate(
@@ -731,31 +736,97 @@ pub fn install_certificate(info: &mut GroupInfo, seat_hex: &str, cert: AgentCert
 
 /// The retained-evidence bound per group (#1650). A rebind displaces at
 /// most one certificate, so this caps the retained history — and the
-/// persisted record, one ML-DSA-65 certificate per entry — at
+/// sidecar record, one ML-DSA-65 certificate per entry — at
 /// `DISPLACED_CERTIFICATE_CAP` rebinds per group.
 pub const DISPLACED_CERTIFICATE_CAP: usize = 16;
 
+/// One entry of [`GroupInfo::displaced_certificates`]: the displaced
+/// bytes plus their retention recency. `retained_seq` is a per-group
+/// monotonic counter — each retention takes `max + 1` — so
+/// [`enforce_displaced_certificate_cap`] can always tell the oldest
+/// retention from the newest parent evidence. It persists with the
+/// entry in the S4 sidecar, so the eviction order survives a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedCertificate {
+    /// The displaced certificate bytes: the parent evidence a later
+    /// sibling rebind is checked against.
+    pub certificate: AgentCertificate,
+    /// Retention recency within the group; higher is newer.
+    pub retained_seq: u64,
+}
+
 /// Retain `cert` as the parent evidence a later sibling rebind is checked
 /// against (#1650, ADR 0110 §4a), keyed by the digest the parent roster
-/// signed. Past [`DISPLACED_CERTIFICATE_CAP`] one other digest key is
-/// dropped — never the entry just retained, which the next competing
-/// sibling needs: an eviction only drops evidence, it never weakens a
+/// signed. The entry takes the newest `retained_seq`, so the cap
+/// enforcement below can never evict it — the next competing sibling
+/// needs exactly the certificate just displaced.
+fn retain_displaced_certificate(info: &mut GroupInfo, cert: AgentCertificate) {
+    let retained = owner_cert::certificate_digest_hex(&cert);
+    let retained_seq = info
+        .displaced_certificates
+        .values()
+        .map(|entry| entry.retained_seq)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    info.displaced_certificates.insert(
+        retained,
+        RetainedCertificate {
+            certificate: cert,
+            retained_seq,
+        },
+    );
+    enforce_displaced_certificate_cap(info);
+}
+
+/// Enforce [`DISPLACED_CERTIFICATE_CAP`] by retention recency: the
+/// lowest `retained_seq` — the oldest retention — is dropped first, so
+/// the newest parent evidence is never the entry evicted (#1650 review:
+/// the cache must keep the most recent parent evidence, not the largest
+/// digest keys). An eviction only drops evidence, it never weakens a
 /// check — a sibling whose parent bytes were evicted is again refused
 /// with `rebind_certificate_evidence_missing` and records nothing, as
 /// before #1650.
-fn retain_displaced_certificate(info: &mut GroupInfo, cert: AgentCertificate) {
-    let retained = owner_cert::certificate_digest_hex(&cert);
-    info.displaced_certificates.insert(retained.clone(), cert);
+pub fn enforce_displaced_certificate_cap(info: &mut GroupInfo) {
     while info.displaced_certificates.len() > DISPLACED_CERTIFICATE_CAP {
         let Some(dropped) = info
             .displaced_certificates
-            .keys()
-            .find(|digest| **digest != retained)
-            .cloned()
+            .iter()
+            .min_by_key(|(_, entry)| entry.retained_seq)
+            .map(|(digest, _)| digest.clone())
         else {
             break;
         };
         info.displaced_certificates.remove(&dropped);
+    }
+}
+
+/// #1650 (review P2): retain the parent certificates a wholesale roster
+/// replacement displaces — the SignedPublic catch-up install path. The
+/// winner's snapshot commits the new digests and carries no foreign
+/// retained evidence (it is stripped outbound and refused inbound), so
+/// without this the bytes this node held from the parent are gone and a
+/// competing sibling rebind on that parent is refused with
+/// `rebind_certificate_evidence_missing` — which records nothing —
+/// instead of verifying as fork evidence. A seat whose committed digest
+/// the replacement leaves unchanged retains nothing.
+pub fn retain_displaced_by_roster_replacement(next: &mut GroupInfo, parent: &GroupInfo) {
+    for (seat, parent_member) in &parent.members_v2 {
+        let Some(displaced) = parent_member.certificate.as_ref() else {
+            continue;
+        };
+        let displaced_digest = owner_cert::certificate_digest_hex(displaced);
+        let installed = next.members_v2.get(seat).and_then(|member| {
+            member.certificate_digest.clone().or_else(|| {
+                member
+                    .certificate
+                    .as_ref()
+                    .map(owner_cert::certificate_digest_hex)
+            })
+        });
+        if installed.as_deref() != Some(displaced_digest.as_str()) {
+            retain_displaced_certificate(next, displaced.clone());
+        }
     }
 }
 
@@ -1439,28 +1510,67 @@ mod tests {
         }
     }
 
+    /// #1650 review P2: a wholesale roster replacement (the SignedPublic
+    /// catch-up install) retains the parent bytes it displaces, and only
+    /// those — a seat whose committed digest is unchanged retains
+    /// nothing. The wired path is
+    /// `catchup_retains_displaced_parent_evidence_for_a_competing_sibling`
+    /// in the route tests.
+    #[test]
+    fn roster_replacement_retains_the_displaced_parent_bytes() {
+        let f = fixture();
+        let parent = f.info.clone();
+        let parent_digest = owner_cert::certificate_digest_hex(
+            parent.members_v2[&hex_of(&f.member)]
+                .certificate
+                .as_ref()
+                .expect("the parent holds the member certificate"),
+        );
+        // The winner's roster: the same seats, the member's certificate
+        // replaced, and no retained evidence of its own — a sanitized
+        // snapshot never carries the winner's local map.
+        let winner_renewal = cert(&f.owner, &f.member, Some(NOW + 7000));
+        let mut winner = parent.clone();
+        winner.displaced_certificates.clear();
+        if let Some(member) = winner.members_v2.get_mut(&hex_of(&f.member)) {
+            member.certificate_digest = Some(owner_cert::certificate_digest_hex(&winner_renewal));
+            member.certificate = Some(winner_renewal);
+        }
+        let mut next = parent.clone();
+        next.members_v2.clone_from(&winner.members_v2);
+        retain_displaced_by_roster_replacement(&mut next, &parent);
+        assert!(
+            next.displaced_certificates.contains_key(&parent_digest),
+            "the parent certificate the replacement displaced is retained"
+        );
+        assert_eq!(
+            next.displaced_certificates.len(),
+            1,
+            "the admin seat, whose committed digest is unchanged, retains nothing"
+        );
+    }
+
     /// #1650: the retained displaced history stays bounded. Each further
     /// renewal of one seat displaces the last; past
     /// [`DISPLACED_CERTIFICATE_CAP`] the retained map stops growing at the
-    /// cap, holds only displaced digests (never the live certificate), an
-    /// evicted digest is gone, and the newest displacement stays.
+    /// cap, holds only displaced digests (never the live certificate), and
+    /// eviction is by retention recency — exactly the oldest displacements
+    /// are gone and the newest displacement stays.
     #[test]
     fn displaced_certificate_retention_is_bounded() {
         let f = fixture();
         let mut info = f.info.clone();
-        let mut displaced = std::collections::BTreeSet::new();
-        let mut last_displaced = None;
-        let steps = DISPLACED_CERTIFICATE_CAP as u64 + 4;
+        let mut displacement_order = Vec::new();
+        let steps = DISPLACED_CERTIFICATE_CAP + 4;
         for i in 0..=steps {
-            let renewal = cert(&f.owner, &f.member, Some(NOW + 100 + i));
+            let renewal = cert(&f.owner, &f.member, Some(NOW + 100 + i as u64));
             let displaced_now = owner_cert::certificate_digest_hex(
                 info.members_v2[&hex_of(&f.member)]
                     .certificate
                     .as_ref()
                     .expect("the seat holds a certificate"),
             );
-            displaced.insert(displaced_now.clone());
-            last_displaced = Some(displaced_now);
+            displacement_order.push(displaced_now);
             install_certificate(&mut info, &hex_of(&f.member), renewal);
         }
         assert_eq!(
@@ -1471,7 +1581,7 @@ mod tests {
         assert!(
             info.displaced_certificates
                 .keys()
-                .all(|digest| { displaced.contains(digest) }),
+                .all(|digest| displacement_order.contains(digest)),
             "only displaced digests are retained"
         );
         let live = owner_cert::certificate_digest_hex(
@@ -1484,12 +1594,84 @@ mod tests {
             !info.displaced_certificates.contains_key(&live),
             "the live certificate is not retained evidence"
         );
-        // The certificate displaced by the final install is the one the
-        // next competing sibling needs; an eviction never drops it.
-        let newest = last_displaced.expect("the newest displacement");
+        // Retention recency decides: the oldest displacements are evicted,
+        // the newest [`DISPLACED_CERTIFICATE_CAP`] all survive.
+        let evicted = &displacement_order[..displacement_order.len() - DISPLACED_CERTIFICATE_CAP];
+        let retained = &displacement_order[displacement_order.len() - DISPLACED_CERTIFICATE_CAP..];
+        for digest in evicted {
+            assert!(
+                !info.displaced_certificates.contains_key(digest),
+                "the oldest retention {digest} is evicted"
+            );
+        }
+        for digest in retained {
+            assert!(
+                info.displaced_certificates.contains_key(digest),
+                "the newer retention {digest} survives"
+            );
+        }
+    }
+
+    /// #1650 review P2: at the cap, eviction keeps the newest parent
+    /// evidence — by retention recency, not digest order. A full cache
+    /// whose digest-key order is the inverse of its recency (the newest
+    /// evidence at the lexicographically smallest digest, the oldest at
+    /// the largest) must still drop the oldest retention and keep the
+    /// newest, including the entry the same call just retained.
+    #[test]
+    fn cap_eviction_never_drops_the_newest_parent_evidence() {
+        let f = fixture();
+        let mut info = f.info.clone();
+        info.displaced_certificates.clear();
+        let newest = "07";
+        let oldest = "f6";
+        let inverted = [
+            (newest, 16u64),
+            ("18", 15),
+            ("29", 14),
+            ("3a", 13),
+            ("4b", 12),
+            ("5c", 11),
+            ("6d", 10),
+            ("7e", 9),
+            ("8f", 8),
+            ("9a", 7),
+            ("ab", 6),
+            ("bc", 5),
+            ("cd", 4),
+            ("de", 3),
+            ("ef", 2),
+            (oldest, 1),
+        ];
+        assert_eq!(inverted.len(), DISPLACED_CERTIFICATE_CAP);
+        for (digest, retained_seq) in inverted {
+            info.displaced_certificates.insert(
+                digest.to_string(),
+                RetainedCertificate {
+                    certificate: cert(&f.owner, &f.member, Some(NOW + 700)),
+                    retained_seq,
+                },
+            );
+        }
+        let displaced_now = cert(&f.owner, &f.member, Some(NOW + 800));
+        let just_retained = owner_cert::certificate_digest_hex(&displaced_now);
+        retain_displaced_certificate(&mut info, displaced_now);
+        assert_eq!(
+            info.displaced_certificates.len(),
+            DISPLACED_CERTIFICATE_CAP,
+            "one entry beyond the cap is evicted"
+        );
         assert!(
-            info.displaced_certificates.contains_key(&newest),
-            "the newest displacement survives eviction"
+            !info.displaced_certificates.contains_key(oldest),
+            "the oldest retention — here the lexicographically largest digest — is evicted"
+        );
+        assert!(
+            info.displaced_certificates.contains_key(newest),
+            "the newest parent evidence — here the lexicographically smallest digest — survives"
+        );
+        assert!(
+            info.displaced_certificates.contains_key(&just_retained),
+            "the entry the same call just retained survives"
         );
     }
 
