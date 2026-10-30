@@ -725,7 +725,8 @@ pub struct GroupInfo {
     /// retention: a node that applied one sibling rebind keeps the parent
     /// certificate it displaced, so a later competing sibling on the same
     /// parent stays fully verifiable and records as fork evidence instead
-    /// of stalling on `waiting_for_certificate_evidence`. Strictly local
+    /// of being refused with `rebind_certificate_evidence_missing` that
+    /// records nothing. Strictly local
     /// like [`Self::mandate_capability`] (stripped outbound, rejected
     /// inbound on bootstrap snapshots); participates in the #470
     /// full-record equality. See

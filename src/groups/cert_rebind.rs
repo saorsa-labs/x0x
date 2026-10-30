@@ -733,20 +733,26 @@ pub fn install_certificate(info: &mut GroupInfo, seat_hex: &str, cert: AgentCert
 /// most one certificate, so this caps the retained history — and the
 /// persisted record, one ML-DSA-65 certificate per entry — at
 /// `DISPLACED_CERTIFICATE_CAP` rebinds per group.
-pub const DISPLACED_CERTIFICATE_CAP: usize = 64;
+pub const DISPLACED_CERTIFICATE_CAP: usize = 16;
 
 /// Retain `cert` as the parent evidence a later sibling rebind is checked
 /// against (#1650, ADR 0110 §4a), keyed by the digest the parent roster
-/// signed. Past [`DISPLACED_CERTIFICATE_CAP`] one digest key is dropped:
-/// an eviction only drops evidence, it never weakens a check — a sibling
-/// whose parent bytes were evicted is again refused with
-/// `rebind_certificate_evidence_missing` and records nothing, as before
-/// #1650.
+/// signed. Past [`DISPLACED_CERTIFICATE_CAP`] one other digest key is
+/// dropped — never the entry just retained, which the next competing
+/// sibling needs: an eviction only drops evidence, it never weakens a
+/// check — a sibling whose parent bytes were evicted is again refused
+/// with `rebind_certificate_evidence_missing` and records nothing, as
+/// before #1650.
 fn retain_displaced_certificate(info: &mut GroupInfo, cert: AgentCertificate) {
-    info.displaced_certificates
-        .insert(owner_cert::certificate_digest_hex(&cert), cert);
+    let retained = owner_cert::certificate_digest_hex(&cert);
+    info.displaced_certificates.insert(retained.clone(), cert);
     while info.displaced_certificates.len() > DISPLACED_CERTIFICATE_CAP {
-        let Some(dropped) = info.displaced_certificates.keys().next().cloned() else {
+        let Some(dropped) = info
+            .displaced_certificates
+            .keys()
+            .find(|digest| **digest != retained)
+            .cloned()
+        else {
             break;
         };
         info.displaced_certificates.remove(&dropped);
@@ -1436,22 +1442,25 @@ mod tests {
     /// #1650: the retained displaced history stays bounded. Each further
     /// renewal of one seat displaces the last; past
     /// [`DISPLACED_CERTIFICATE_CAP`] the retained map stops growing at the
-    /// cap, holds only displaced digests (never the live certificate), and
-    /// an evicted digest is gone.
+    /// cap, holds only displaced digests (never the live certificate), an
+    /// evicted digest is gone, and the newest displacement stays.
     #[test]
     fn displaced_certificate_retention_is_bounded() {
         let f = fixture();
         let mut info = f.info.clone();
         let mut displaced = std::collections::BTreeSet::new();
+        let mut last_displaced = None;
         let steps = DISPLACED_CERTIFICATE_CAP as u64 + 4;
         for i in 0..=steps {
             let renewal = cert(&f.owner, &f.member, Some(NOW + 100 + i));
-            displaced.insert(owner_cert::certificate_digest_hex(
+            let displaced_now = owner_cert::certificate_digest_hex(
                 info.members_v2[&hex_of(&f.member)]
                     .certificate
                     .as_ref()
                     .expect("the seat holds a certificate"),
-            ));
+            );
+            displaced.insert(displaced_now.clone());
+            last_displaced = Some(displaced_now);
             install_certificate(&mut info, &hex_of(&f.member), renewal);
         }
         assert_eq!(
@@ -1474,6 +1483,13 @@ mod tests {
         assert!(
             !info.displaced_certificates.contains_key(&live),
             "the live certificate is not retained evidence"
+        );
+        // The certificate displaced by the final install is the one the
+        // next competing sibling needs; an eviction never drops it.
+        let newest = last_displaced.expect("the newest displacement");
+        assert!(
+            info.displaced_certificates.contains_key(&newest),
+            "the newest displacement survives eviction"
         );
     }
 
@@ -1506,7 +1522,8 @@ mod tests {
     /// #1533 r11's narrowing itself stays: a node that holds no bytes for
     /// the parent's committed digest (neither live nor retained) refuses
     /// the sibling and records nothing. An unverifiable sibling is never
-    /// accepted as evidence.
+    /// accepted as evidence. This holds for the seat's certificate and
+    /// for an admin signer's.
     #[test]
     fn sibling_without_any_parent_certificate_bytes_is_no_fork_evidence() {
         let f = fixture();
@@ -1524,6 +1541,28 @@ mod tests {
             NOW * 1000 + 2,
         )
         .expect("sibling");
+        assert_eq!(
+            validate_sibling(&frame.body, &current, NOW, |_| false).err(),
+            Some(CertificateRebindRefusal::CertificateEvidenceMissing)
+        );
+
+        // The signer side: an admin whose parent certificate bytes are
+        // gone signs a valid rebind of another seat. The expiry check on
+        // the signer cannot run, so the sibling records nothing either.
+        let (parent, mut current) = own_branch_replaced(&f, &f.admin);
+        if let Some(admin) = current.members_v2.get_mut(&hex_of(&f.admin)) {
+            admin.certificate = None;
+        }
+        current.displaced_certificates.clear();
+        let renewal = cert(&f.owner, &f.member, Some(NOW + 6000));
+        let (_, frame) = seal(
+            &parent,
+            *f.member.agent_id().as_bytes(),
+            &renewal,
+            &f.admin,
+            NOW * 1000 + 2,
+        )
+        .expect("admin-signed sibling");
         assert_eq!(
             validate_sibling(&frame.body, &current, NOW, |_| false).err(),
             Some(CertificateRebindRefusal::CertificateEvidenceMissing)
