@@ -2208,6 +2208,18 @@ pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
         // flag is never lost with the entry. A group with no entry (only
         // a sidecar authoritative record) keeps the pre-#1570 behaviour:
         // nothing of it was ever held back.
+        //
+        // #1708 review (Codex P1, the two-save interleaving): the reset
+        // joins the persistence transaction. Every save holds
+        // `named_groups_persistence_lock` from its encode to its
+        // `commit_legacy_write`, and a save between the two has already
+        // recorded the group's newer real form in `encoded`. Resetting
+        // that field outside the lock dropped the form, so the save's
+        // Durable completion left `committed` at the older form and a
+        // later held-back write could roll it over the newer durable
+        // record. Under the lock the reset runs only between saves: the
+        // parked save's commit consumes its own form first.
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
         with_placeheld(state, |placeheld| {
             for stable in &unplacehold {
                 if let Some(entry) = placeheld.get_mut(stable) {
@@ -13353,6 +13365,187 @@ mod tests {
         // written). The group keeps its last COMMITTED form — the newer
         // durable record the other group's save landed, not the superseded
         // placeholder.
+        let current = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("current live record"))?;
+        begin_placehold(&state, &key, &current);
+        let sidecar = sidecar_path(&state, &stable);
+        tokio::fs::remove_file(&sidecar).await?;
+        tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+        let outcome = super::super::save_named_groups_checked(&state).await;
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "the re-armed save itself lands: {outcome:?}"
+        );
+        assert!(is_held_back(&state, &stable));
+        let kept = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("kept legacy entry"))?;
+        assert!(
+            !s3::is_s3_placeholder(&kept),
+            "a failed authoritative write rolls no placeholder back over the newer durable record"
+        );
+        assert_eq!(kept.description, "newer durable form");
+        assert!(kept.has_active_member(&local));
+
+        // The sidecar is writable again: the pass retries the write and
+        // completes the un-placeholdering.
+        tokio::fs::remove_dir_all(&sidecar).await?;
+        ensure_placeholders(&state).await;
+        assert!(!is_placeheld(&state, &stable));
+        let pending: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in pending {
+            let _ = task.await;
+        }
+        let final_entry = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("final legacy entry"))?;
+        assert!(!s3::is_s3_placeholder(&final_entry));
+        assert_eq!(final_entry.description, "newer durable form");
+        assert!(
+            sidecar_snapshot(&state, &stable)
+                .await
+                .is_none_or(|body| body.authoritative_record.is_none()),
+            "the retired record leaves the sidecar"
+        );
+        Ok(())
+    }
+
+    /// #1708 review (Codex controller P1, the two-save interleaving): a
+    /// save parked after its encode — holding
+    /// `named_groups_persistence_lock`, its Durable commit still to come —
+    /// has recorded the pending group's newer real form in `encoded`. The
+    /// worker's pending step must not reset that form while the save is
+    /// parked: the unfixed step ran outside the lock, so the save's
+    /// Durable completion left `committed` at the older placeholder, and
+    /// the worker's failed retry kept that stale rollback target — a
+    /// re-arm plus a failed authoritative write then wrote the placeholder
+    /// over the newer durable record. Red at 2e878ec7.
+    #[tokio::test]
+    async fn a_parked_save_commits_its_form_across_the_workers_pending_step() -> anyhow::Result<()>
+    {
+        use super::super::AtomicWriteOutcome;
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+
+        // The ATA retires and the live record moves ahead of the durable
+        // placeholder. The pass decides the un-placeholdering, but its own
+        // legacy write fails, so the entry stays pending with the real
+        // record not committed.
+        assert!(update_sidecar(&state, &stable, |body| body.active_ata = None).await);
+        {
+            let mut groups = state.named_groups.write().await;
+            if let Some(live) = groups.get_mut(&key) {
+                live.description = "newer durable form".to_string();
+            }
+        }
+        let legacy_path = state.named_groups_path.clone();
+        tokio::fs::remove_file(&legacy_path).await?;
+        tokio::fs::create_dir_all(legacy_path.join("blocked")).await?;
+        ensure_placeholders(&state).await;
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(
+                |entry| entry.unplacehold_pending && entry.encoded.is_none()
+            )));
+
+        // The first save parks after its encode (the #470 interleave hook),
+        // holding the persistence lock with the group's real form recorded.
+        tokio::fs::remove_dir_all(&legacy_path).await?;
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("save race hook poisoned") = Some((
+            std::sync::Arc::clone(&reached),
+            std::sync::Arc::clone(&release),
+        ));
+        let parked_state = std::sync::Arc::clone(&state);
+        let parked =
+            tokio::spawn(
+                async move { super::super::save_named_groups_checked(&parked_state).await },
+            );
+        reached.notified().await;
+        *state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("save race hook poisoned") = None;
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(|entry| entry
+                .encoded
+                .as_ref()
+                .is_some_and(|form| !form.placeholder))));
+
+        // The worker's pending step runs while the save is parked. The
+        // serialized transition waits for the save's commit, so the
+        // recorded form survives; the unfixed step cleared it here.
+        let worker_state = std::sync::Arc::clone(&state);
+        let worker = tokio::spawn(async move { ensure_placeholders(&worker_state).await });
+        let mut cleared = false;
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+            if with_placeheld(&state, |placeheld| {
+                placeheld
+                    .get(&stable)
+                    .is_some_and(|entry| entry.encoded.is_none())
+            }) {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(
+            !cleared,
+            "the pending step must not clear a parked save's encoded form"
+        );
+
+        // The parked save completes Durable and commits the real form it
+        // landed. The worker's own retry then fails (variant 6 leaves this
+        // save unfaulted and degrades the next legacy write to
+        // not-durable) and must not move the committed form.
+        state.named_groups_save_fault.store(6, Ordering::SeqCst);
+        release.notify_one();
+        let outcome = parked.await.expect("parked save task panicked");
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "the parked save must be durable: {outcome:?}"
+        );
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(
+                |entry| entry.committed.record.description == "newer durable form"
+            )));
+        worker.await.expect("worker pass panicked");
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(|entry| entry.unplacehold_pending
+                && entry.committed.record.description
+                    == "newer durable form")));
+        state.named_groups_save_fault.store(0, Ordering::SeqCst);
+        let landed = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("parked legacy entry"))?;
+        assert!(!s3::is_s3_placeholder(&landed));
+        assert_eq!(landed.description, "newer durable form");
+
+        // A re-arm whose authoritative write fails keeps the newer durable
+        // record — the committed form the parked save committed — never
+        // the superseded placeholder.
         let current = state
             .named_groups
             .read()
