@@ -2820,6 +2820,21 @@ fn secure_share_admission(
 /// ban or terminal mutation quiesces it with the recipient's other egress.
 /// Returns whether a delivery was scheduled.
 fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadataEvent) -> bool {
+    spawn_secure_share_delivery_notifying(state, event, None)
+}
+
+/// [`spawn_secure_share_delivery`], with a hook the FIRST carrier-accepted
+/// write of the share fires (#1663 review P1, Codex controller, 30 Oct):
+/// the S4 crypto-exclusion round's share debt ends on that acceptance —
+/// the one share-possession signal that is independent of the restored
+/// head a keyed-but-shareless seat keeps serving. A withheld, purged or
+/// failed delivery never fires it, so the debt (and the delivery's
+/// obligation) survives the worker's bounded retries.
+fn spawn_secure_share_delivery_notifying(
+    state: &Arc<AppState>,
+    event: &NamedGroupMetadataEvent,
+    accepted: Option<Box<dyn FnOnce() + Send>>,
+) -> bool {
     let NamedGroupMetadataEvent::SecureShareDelivered {
         group_id,
         recipient,
@@ -2857,6 +2872,7 @@ fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadata
     let recipient_hex = recipient.clone();
     let epoch = *secret_epoch;
     let deadline = Instant::now() + SECURE_SHARE_DELIVERY_HORIZON;
+    let mut accepted = accepted;
     spawn_join_artifact_egress(
         state,
         group_id,
@@ -2902,6 +2918,13 @@ fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadata
                 };
                 if written {
                     sent += 1;
+                    // #1663 review P1 (Codex controller, 30 Oct): the
+                    // first carrier-accepted write is the share-debt
+                    // completion signal; later resends of the same share
+                    // fire nothing.
+                    if let Some(fired) = accepted.take() {
+                        fired();
+                    }
                     backoff = GROUP_BACKGROUND_PUBLISH_DELAY;
                     if sent < SECURE_SHARE_SENDS {
                         tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;

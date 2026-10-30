@@ -1860,8 +1860,12 @@ through the existing path, which ends the hold and returns the served
 head. Share completion stays distinct from that head: a catch-up answer
 from a seat an author's roster leaves keyless is not share-possession
 evidence (such a seat cannot hold the epoch secret), and the frame's
-ingest re-arms the author's share seal, so the S4 row cannot complete
-without the share it owes. A peer whose verified advert lacks
+ingest owes the republisher its sealed share on the author's open S4
+rows. That debt — not the roster key — holds the row open whatever a
+restored head already reported: it ends only when the carrier accepts a
+sealed share for the member, and a share batch whose bounded retries
+fail leaves the obligation in place, re-sealed each delivery round. A
+peer whose verified advert lacks
 `key_republish_v1` (bit 12) keeps the pre-#1663 behavior, so the seat
 stays keyless in that peer's view until it upgrades or the member
 re-joins. The window between the

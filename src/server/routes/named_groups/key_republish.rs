@@ -234,14 +234,23 @@ async fn seat_own_republish(
     let _membership_guard = membership_lock.lock().await;
     let next = {
         let mut groups = state.named_groups.write().await;
-        let Some(next) = groups.get_mut(group_key) else {
+        let Some(current) = groups.get_mut(group_key) else {
             return false;
         };
-        if !next.install_republished_kem_key(&local_hex, &own.kem_public_key_b64, own.key_sequence)
-        {
+        // #1663 review P2 (Codex controller, 30 Oct): stage the seat on a
+        // clone and let the persister install it. A mutation of the live
+        // entry precedes the persister's rollback snapshot, so a failed
+        // save would restore the already-advanced sequence and refuse the
+        // identical frame's retry as `StaleKey`.
+        let mut staged = current.clone();
+        if !staged.install_republished_kem_key(
+            &local_hex,
+            &own.kem_public_key_b64,
+            own.key_sequence,
+        ) {
             return false;
         }
-        next.clone()
+        staged
     };
     if !matches!(
         ng::persist_named_group_info(state, group_key, next.clone()).await,
@@ -295,28 +304,31 @@ pub(in crate::server) async fn receive(
     let actor_hex = hex::encode(body.actor);
     let next = {
         let mut groups = state.named_groups.write().await;
-        let Some(next) = groups.get_mut(&group_key) else {
+        let Some(current) = groups.get_mut(&group_key) else {
             return RepublishOutcome::NotApplicable;
         };
         // The frame is self-authenticating (the actor signed it); a
         // relaying sender must still be an Active member of the group.
         let sender_hex = hex::encode(sender.as_bytes());
-        if sender.as_bytes() != &body.actor && !next.has_active_member(&sender_hex) {
+        if sender.as_bytes() != &body.actor && !current.has_active_member(&sender_hex) {
             return RepublishOutcome::Refused(Refusal::ActorIneligible);
         }
-        match kr::validate_against_seat(&body, next) {
+        // #1663 review P2 (Codex controller, 30 Oct): as the own-seat
+        // path — validate and stage on a clone, so a pre-replacement
+        // save failure restores the seat this frame found and the
+        // identical frame's retry is not refused `StaleKey`.
+        let mut staged = match kr::validate_against_seat(&body, current) {
             Err(refusal) => return RepublishOutcome::Refused(refusal),
-            Ok(()) => {
-                if !next.install_republished_kem_key(
-                    &actor_hex,
-                    &body.kem_public_key_b64,
-                    body.key_sequence,
-                ) {
-                    return RepublishOutcome::Refused(Refusal::StaleKey);
-                }
-                next.clone()
-            }
+            Ok(()) => current.clone(),
+        };
+        if !staged.install_republished_kem_key(
+            &actor_hex,
+            &body.kem_public_key_b64,
+            body.key_sequence,
+        ) {
+            return RepublishOutcome::Refused(Refusal::StaleKey);
         }
+        staged
     };
     // The membership guard spans the mutation and the durable persist (the
     // house M→P lock order): a removal or a newer-sequence republication
@@ -333,10 +345,14 @@ pub(in crate::server) async fn receive(
     // The seated key may key a survivor this node's delivery rounds could
     // not seal to: the next round must seal the current secret to that
     // seat whatever a restored head already reported, so the delivery can
-    // not complete shareless (#1663 review P1).
+    // not complete shareless (#1663 review P1). The republishing actor's
+    // share stays owed — held against its convergence — until the carrier
+    // accepts a sealed share for it (#1663 review P1, Codex controller,
+    // 30 Oct).
     super::revocation_eviction::crypto_exclusion::owe_gss_shares_after_republish(
         state,
         &body.stable_group_id,
+        &body.actor,
     )
     .await;
     // The republication of the LOCAL seat ends the keyless holds: the
