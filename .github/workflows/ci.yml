@@ -609,11 +609,12 @@ jobs:
     name: W3-H shard (${{ matrix.group }})
     needs: w3h-plan
     runs-on: ubuntu-latest
-    # S3 runs the H-S3-c/c2 owner-cert rows at 15 min each (#1689), so its
-    # group gets 150 min. Every other group keeps 120 min. The isolated test
+    # S3 runs the H-S3-c/c2 owner-cert rows at 15 min each (#1689) and the
+    # H-S3-d7 flood row (#1717), so its group gets 165 min (Engineer ruling,
+    # 30 Oct; no shard split). Every other group keeps 120 min. The isolated test
     # phase has its own deadline (`X0X_RUNTIME_TIMEOUT_SECONDS` below), which
     # must also fit inside this limit with room for setup and upload.
-    timeout-minutes: ${{ matrix.group == 's3' && 150 || 120 }}
+    timeout-minutes: ${{ matrix.group == 's3' && 165 || 120 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.w3h-plan.outputs.matrix) }}
@@ -664,10 +665,10 @@ jobs:
         env:
           X0X_ISOLATION_ROLE: w3h-harness
           # The deadline of the isolated test phase only (the build runs
-          # before it). S3 needs about 130 min for 20 reruns, so it gets
-          # 8400 s (140 min) inside its 150-min job; every other group keeps
+          # before it). S3 needs about 135 min for 20 reruns, so it gets
+          # 9300 s (155 min) inside its 165-min job; every other group keeps
           # 6600 s. `isolated-runtime.py` caps the value at 21600 s.
-          X0X_RUNTIME_TIMEOUT_SECONDS: ${{ matrix.group == 's3' && 8400 || 6600 }}
+          X0X_RUNTIME_TIMEOUT_SECONDS: ${{ matrix.group == 's3' && 9300 || 6600 }}
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
         # The profile default-filter still intersects this expression, so

@@ -720,7 +720,6 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     seen.verify("the gate window")?;
     let j_status = status(sim, "J", &group).await?;
     let j1 = view(sim, "J", &group).await?;
-    o_to_j_held.store(false, std::sync::atomic::Ordering::SeqCst);
     if both {
         // H-S3-c2 prerequisite: canonical r+1 reached J, so J holds both
         // the marker and the gap record before the re-seat. A missing one
@@ -807,6 +806,9 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         .await
         .is_ok();
     sim.stop("O", RestartMode::Graceful).await?;
+    // #1689 review: the O->J hold ends only once O is stopped, so a late
+    // O re-send of r+2 cannot reach J between the advance and the stop.
+    o_to_j_held.store(false, std::sync::atomic::Ordering::SeqCst);
     let path = format!("/groups/{group}/members/{j_hex}");
     let (code, body) = sim.api("A", Method::DELETE, &path, None).await?;
     ensure!(code.is_success(), "A removes J: {code} {body}");
