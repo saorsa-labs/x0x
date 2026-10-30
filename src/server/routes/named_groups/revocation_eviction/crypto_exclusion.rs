@@ -619,7 +619,10 @@ pub(super) fn keep_share_record(
 /// lock (this function takes it). Each of its GSS delivery rows of that
 /// group and epoch keeps the record — the key and the seat's head-ask
 /// count at the seal — and a later report from the seat closes the row
-/// only against this record ([`report_may_close`]).
+/// only against this record ([`report_may_close`]). The same critical
+/// section moves the seat's share-seal generation, so an ask whose
+/// request left before this seal cannot credit the count on the
+/// completion of that send ([`ask_heads`], Codex P2, 30 Oct).
 pub(super) async fn note_share_went_to(
     state: &AppState,
     stable_group_id: &str,
@@ -633,6 +636,13 @@ pub(super) async fn note_share_went_to(
         .get(&(stable_group_id.to_string(), *recipient))
         .copied()
         .unwrap_or(0);
+    // #1660 (Codex P2, 30 Oct): this seal moves the seat's share-seal
+    // generation, so an ask whose request left before this seal cannot
+    // credit the count on its late completion ([`ask_heads`]).
+    *inner
+        .share_seal_seq
+        .entry((stable_group_id.to_string(), *recipient))
+        .or_insert(0) += 1;
     for (key, delivery) in &mut inner.ce.deliveries {
         if key.stable_group_id == stable_group_id && delivery.gss_epoch == Some(epoch) {
             keep_share_record(&mut delivery.share_went_to, recipient, kem, ask_seq_at_seal);
@@ -664,22 +674,44 @@ pub(super) async fn note_share_went_to(
 /// after the send succeeded — a refused admission, a task still parked
 /// at the send boundary and a failed send count nothing, so no answer
 /// can ride a count for an ask that never left this node (Codex P2,
-/// 29 Oct). A delivery row's share record keeps the count at its seal,
-/// and a report closes a GSS seat only after the count moved past that
-/// — only answers that could answer an ask sent after the seal close
-/// the seat. No caller holds the S4 lock; the task takes it only for
-/// the count.
+/// 29 Oct). #1660 (Codex P2, 30 Oct): the send returns only after the
+/// recipient's ACK, so a seal can record its bar while an earlier ask
+/// is still in flight. The task reads the seat's share-seal generation
+/// before the request leaves and credits the count only when the
+/// generation still holds at completion — a completion whose send was
+/// in flight across a seal is a pre-seal ask's, and counts nothing
+/// ([`note_share_went_to`] bumps the generation). A delivery row's
+/// share record keeps the count at its seal, and a report closes a GSS
+/// seat only after the count moved past that — only answers that could
+/// answer an ask sent after the seal close the seat. No caller holds
+/// the S4 lock; the task takes it only for the generation and the
+/// count.
 pub(super) async fn ask_heads(state: &Arc<AppState>, group_id: &str, peers: Vec<AgentId>) {
     for peer in peers {
         let task_state = Arc::clone(state);
         let group_id = group_id.to_string();
         let _spawned = state.spawn_detached(async move {
+            let seal_seq_before = {
+                let inner = task_state.revocation_evictions.inner.lock().await;
+                inner
+                    .share_seal_seq
+                    .get(&(group_id.clone(), *peer.as_bytes()))
+                    .copied()
+                    .unwrap_or(0)
+            };
             if super::super::request_treekem_catchup_page(&task_state, &group_id, &peer).await {
                 let mut inner = task_state.revocation_evictions.inner.lock().await;
-                *inner
-                    .head_ask_seq
-                    .entry((group_id, *peer.as_bytes()))
-                    .or_insert(0) += 1;
+                let seal_seq_now = inner
+                    .share_seal_seq
+                    .get(&(group_id.clone(), *peer.as_bytes()))
+                    .copied()
+                    .unwrap_or(0);
+                if seal_seq_now == seal_seq_before {
+                    *inner
+                        .head_ask_seq
+                        .entry((group_id, *peer.as_bytes()))
+                        .or_insert(0) += 1;
+                }
             }
         });
     }
@@ -7958,6 +7990,90 @@ mod daemon_tests {
             fx.seat().await,
             Some(RecipientDelivery::Converged),
             "the answer to the sent ask converges the seat"
+        );
+        Ok(())
+    }
+
+    /// #1660 (Codex P2, 30 Oct): a head ask whose request left BEFORE
+    /// the share was sealed, and whose ACK (the completion the count
+    /// waited on) lands AFTER the seal recorded its bar. The completion
+    /// of that in-flight send counts nothing — no ask went out after
+    /// the seal — so the delayed answer to the pre-seal ask closes no
+    /// seat. The fresh ask's send observes the seal, counts normally,
+    /// and only its answer converges the seat.
+    #[tokio::test]
+    async fn a_pre_seal_ask_completing_after_the_seal_counts_nothing() -> Result<()> {
+        let fx = seat_report_fixture(true).await?;
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let pause = ng::detached_send_test_seam::arm(&format!(
+            "treekem-catchup-page:{}",
+            fx.key.stable_group_id
+        ));
+        ask_heads(&fx.state, &fx.key.stable_group_id, vec![fx.survivor]).await;
+        for _ in 0..250 {
+            if pause.reached() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+        }
+        assert!(pause.reached(), "the ask task parked at the send boundary");
+        // The seal happens while the ask's request is out (the send
+        // waits for the recipient's ACK), so the bar is recorded at a
+        // count of zero completed asks.
+        fx.record_share_to_seat_key().await;
+        // The ACK lands: the pre-seal send completes, and its completion
+        // must not publish a count.
+        drop(pause);
+        for _ in 0..250 {
+            let completed = {
+                let recorded = fx
+                    .state
+                    .named_group_test_recorders
+                    .catchup_responses
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                !recorded.is_empty()
+            };
+            if completed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            fx.ask_count().await,
+            None,
+            "the late completion of a send that left before the seal counts nothing"
+        );
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Sent),
+            "the delayed answer to the pre-seal ask closes nothing: its ask left before the seal"
+        );
+        assert!(fx.row_open().await, "the delivery row stays open");
+        // The post-seal ask: its send observes the seal's generation, so
+        // its completion counts, and only its answer converges the seat.
+        ask_heads(&fx.state, &fx.key.stable_group_id, vec![fx.survivor]).await;
+        for _ in 0..250 {
+            if fx.ask_count().await == Some(1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+        }
+        assert_eq!(
+            fx.ask_count().await,
+            Some(1),
+            "the ask sent after the seal counts"
+        );
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the answer to the post-seal ask converges the seat"
         );
         Ok(())
     }

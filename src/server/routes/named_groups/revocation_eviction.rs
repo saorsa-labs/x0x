@@ -183,6 +183,13 @@ struct S4Inner {
     /// seat only after the count moved past that, so only answers that
     /// could answer an ask sent after the seal close the seat.
     head_ask_seq: HashMap<(String, [u8; 32]), u64>,
+    /// #1660 (Codex P2, 30 Oct): how many shares were sealed to each
+    /// seat of each group (`crypto_exclusion::note_share_went_to` bumps
+    /// it). An ask task reads it before its request leaves and again
+    /// when the request completed, so a completion whose send was in
+    /// flight across a seal never credits the count that seal's bar is
+    /// judged against.
+    share_seal_seq: HashMap<(String, [u8; 32]), u64>,
     /// §2: accepted `202 queued` manual bans, persisted in the `.evs` v2
     /// extension until the ban is applied.
     queued_bans: BTreeMap<EvictionKey, u64>,
@@ -1286,6 +1293,12 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .retain(|stable, _| open_groups.contains(stable));
     inner
         .head_ask_seq
+        .retain(|(stable, _), _| ask_count_groups.contains(stable));
+    // #1660 (Codex P2, 30 Oct): the seal generation lives and dies with
+    // the count it guards (a dropped-and-recreated entry only ever
+    // discards a credit — the conservative side).
+    inner
+        .share_seal_seq
         .retain(|(stable, _), _| ask_count_groups.contains(stable));
     for stable in &open_groups {
         let Some((group_key, info)) = by_stable.get(stable.as_str()) else {
