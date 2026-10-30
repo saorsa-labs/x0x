@@ -1807,7 +1807,7 @@ every wait. A wait always names its cause; it does not stop silently.
 | `DELETE /groups/:id/members/:agent_id`, `POST /groups/:id/ban/:agent_id`, `POST /groups/:id/state/seal` | `202 Accepted` | `{"ok": true, "queued": true, "status": <cause>, "group_id", "target", "request", "waiting": {"cause"}}` with cause `waiting_for_head_sync`, `waiting_for_durable_intake` or `local_committer_ineligible`. This admin is designated or past its fallback time, but the S4 evaluation does not let it seal yet. The daemon checks again under the group's membership lock, just before any change. The request is queued. Nothing is sealed from a stale head. |
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
-| `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold lasts until the seat is keyed again — a sealed share of the held epoch (or a later one) installs, or the key republication of #1663 seats the seat's KEM key again while the node holds no secret. It has no timer of its own. Between that republication and the share install the endpoint answers the no-secret `424`: the node still holds no secret to encrypt under. |
+| `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold lasts until the seat is keyed again — a sealed share of the held epoch (or a later one) installs, or the key republication of #1663 seats the seat's KEM key again while the node holds no secret. It has no timer of its own. Between that republication and the share install the endpoint answers `424 Failed Dependency` with `{"ok": false, "error": "no shared secret available — await welcome or ask admin to re-share"}`: the node still holds no secret to encrypt under. |
 
 The same hold refuses group ciphertext on the paths that make no HTTP
 response of their own, and each refusal carries the same reason text: a
@@ -1850,11 +1850,17 @@ automatic: the keyless install itself sends it, and a node that boots
 into the keyless state — or into the keyed state whose share never
 installed — sends it at startup. A send the carrier does not accept is
 not done: a recipient whose verified advert is missing or expired, or
-whose send failed, keeps the frame owed, and the daemon retries it at
-the delivery-round interval until the advert sets the bit or rules the
-frame out; the startup pass keeps the seat selected until the share
-installs, so a restart sends it again. Once the seat is keyed — on
-the survivor's own copy and on the authors' copies — the next S4
+whose send failed, keeps the frame owed, and the daemon retries it
+until the advert sets the bit or rules the frame out. A send the carrier
+accepts is not proof that the peer seated the key, so the daemon sends
+the frame again to each owed Active recipient, up to 6 carrier-accepted
+sends. The sweep interval starts at 5 s and doubles to a maximum of
+80 s. A newer republication for the same group resets the count. A
+recipient that leaves the group's Active roster, or is revoked, is no
+longer owed. The receiver refuses a repeat of a seated key as
+`stale_key`, so a repeat does no harm. The startup pass keeps the seat
+selected until the share installs, so a restart sends it again. Once
+the seat is keyed — on the survivor's own copy and on the authors' copies — the next S4
 delivery round seals the current secret to it and the share installs
 through the existing path, which ends the hold and returns the served
 head. Share completion stays distinct from that head: a catch-up answer
@@ -1864,8 +1870,11 @@ ingest owes the republisher its sealed share on the author's open S4
 rows. That debt — not the roster key — holds the row open whatever a
 restored head already reported: it ends only when the carrier accepts a
 sealed share for the member, and a share batch whose bounded retries
-fail leaves the obligation in place, re-sealed each delivery round. A
-peer whose verified advert lacks
+fail leaves the obligation in place, re-sealed each delivery round. If
+the member republishes while the author's GSS delivery is open, the
+author resets the member's earlier convergence: the member converges
+again only after the new-key share is accepted and the member reports
+its head. A peer whose verified advert lacks
 `key_republish_v1` (bit 12) keeps the pre-#1663 behavior, so the seat
 stays keyless in that peer's view until it upgrades or the member
 re-joins. The window between the
@@ -1900,10 +1909,12 @@ not on the metadata topic and not in a legacy-decoded container:
   carries, and which must derive the member's agent ID. It rides the
   direct-message carrier only. Receivers verify the signature, the
   signer's Active seat, the encrypted GSS plane and the frame's per-seat
-  monotonic counter (`key_sequence`; a replay or stale key is refused as
-  `stale_key`, a wrong signer as `bad_signature`, an unseated signer as
-  `actor_ineligible`). A daemon sends it only to a member whose current
-  verified advert sets bit 12.
+  monotonic counter (`key_sequence`). Refusals are typed; for example, a
+  replay or stale key is refused as `stale_key`, a wrong signer as
+  `bad_signature`, and an unseated signer as `actor_ineligible`. A daemon
+  sends it only to a member whose current verified advert sets bit 12.
+  A member that is removed and then admitted again starts a new counter:
+  its `kem_key_sequence` resets when its seat returns to Active.
 
 - `X0XORC1` — owner recovery (ADR 0110 §4b(1), bit 7
   `owner_recovery_v1`). One postcard frame type with two variants: the

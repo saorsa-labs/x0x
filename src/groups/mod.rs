@@ -2615,6 +2615,16 @@ impl GroupInfo {
         self.members_v2
             .entry(agent_id_hex.clone())
             .and_modify(|m| {
+                // #1663 review round 4 (Claude, 30 Oct): a row returning
+                // to Active from Removed or Banned starts a fresh
+                // republication epoch — the re-joined member's own row is
+                // new, so a retained counter would refuse its every
+                // republication as stale. The reset rides the signed
+                // re-admission every peer applies alike; an already-Active
+                // row keeps its counter.
+                if m.state != GroupMemberState::Active {
+                    m.kem_key_sequence = None;
+                }
                 m.role = role;
                 m.state = GroupMemberState::Active;
                 m.updated_at = now;

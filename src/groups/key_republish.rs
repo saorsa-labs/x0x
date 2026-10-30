@@ -479,6 +479,55 @@ mod tests {
         );
     }
 
+    /// #1663 review round 4 (Claude, 30 Oct): a Removed row that becomes
+    /// Active again starts a fresh republication epoch. The re-joined
+    /// member's own row is new (no counter), so a counter retained across
+    /// the re-admission would refuse its every republication as stale;
+    /// the reset rides the re-admission every peer applies alike, and an
+    /// already-Active row keeps its counter.
+    #[test]
+    fn a_readmitted_seat_starts_a_fresh_republication_counter() {
+        let actor = keypair();
+        let key = kem_b64();
+        let mut info = group(&actor, Some(&key));
+        let actor_hex = hex::encode(actor.agent_id().as_bytes());
+        assert!(info.install_republished_kem_key(&actor_hex, &key, 3));
+        info.remove_member(&actor_hex, Some(actor_hex.clone()));
+        info.add_member_with_kem(
+            actor_hex.clone(),
+            GroupRole::Member,
+            None,
+            None,
+            Some(key.clone()),
+        );
+        assert_eq!(
+            info.members_v2
+                .get(&actor_hex)
+                .and_then(|seat| seat.kem_key_sequence),
+            None,
+            "the re-admission resets the retained republication counter"
+        );
+        let fresh_key = kem_b64();
+        assert!(
+            info.install_republished_kem_key(&actor_hex, &fresh_key, 1),
+            "the re-joined member's first republication seats"
+        );
+        info.add_member_with_kem(
+            actor_hex.clone(),
+            GroupRole::Member,
+            None,
+            None,
+            Some(fresh_key.clone()),
+        );
+        assert_eq!(
+            info.members_v2
+                .get(&actor_hex)
+                .and_then(|seat| seat.kem_key_sequence),
+            Some(1),
+            "an already-Active row keeps its counter"
+        );
+    }
+
     /// The join's key-only marker row (#1578 rc7/rc11) is not a seat: a
     /// republish for a pre-admission joiner is refused.
     #[test]

@@ -1098,11 +1098,22 @@ pub(in crate::server::routes::named_groups) fn own_seat_cannot_take_a_share(
 /// persistence can put it back (#1663 review round 4, Codex P1, 30 Oct):
 /// per delivery, the actor whose debt was armed, the entry's previous
 /// value (`None` when the actor owed nothing, `Some(old key)` when a
-/// newer republication superseded an older debt) and whether THIS call
-/// set the batch trigger.
+/// newer republication superseded an older debt), whether THIS call
+/// set the batch trigger, and whether it reset the actor's convergence
+/// (round 5).
 #[derive(Debug, Default)]
 pub(in crate::server::routes::named_groups) struct ArmedShareDebt {
-    entries: Vec<(EvictionKey, [u8; 32], Option<String>, bool)>,
+    entries: Vec<ArmedEntry>,
+}
+
+/// One delivery's part of an [`ArmedShareDebt`].
+#[derive(Debug)]
+struct ArmedEntry {
+    key: EvictionKey,
+    actor: [u8; 32],
+    previous: Option<String>,
+    set_pending: bool,
+    reset_converged: bool,
 }
 
 /// #1663 review P1 (Claude and Codex controller, 29 Oct): the ingest of a
@@ -1124,6 +1135,14 @@ pub(in crate::server::routes::named_groups) struct ArmedShareDebt {
 /// observed without the membership guard) and passes the returned token
 /// to [`retract_gss_shares_after_republish`] when that write fails, so
 /// key visibility and the obligation move together, failure included.
+///
+/// #1663 review round 5 (Codex P2 on cb2b8cf1, 30 Oct): the new debt
+/// also resets an actor that already converged on the delivery to
+/// [`RecipientDelivery::Sent`]. Its old convergence is evidence for the
+/// old key only: left in place, the new-key share's acceptance would end
+/// the debt and the round would remove the delivery on that stale
+/// status, with no head report after the new share. As `Sent`, the
+/// actor converges again only on a head report after the debt ends.
 pub(in crate::server::routes::named_groups) async fn owe_gss_shares_after_republish(
     state: &AppState,
     stable_group_id: &str,
@@ -1141,16 +1160,29 @@ pub(in crate::server::routes::named_groups) async fn owe_gss_shares_after_republ
         if set_pending {
             delivery.gss_shares_pending = true;
         }
-        if delivery.recipients.contains_key(actor) {
-            let previous = delivery.gss_shares_owed.insert(*actor, kem_key.to_string());
-            armed
-                .entries
-                .push((key.clone(), *actor, previous, set_pending));
-        } else if set_pending {
+        let (previous, reset_converged) = match delivery.recipients.get_mut(actor) {
+            Some(status) => {
+                let reset = *status == RecipientDelivery::Converged;
+                if reset {
+                    *status = RecipientDelivery::Sent;
+                }
+                (
+                    delivery.gss_shares_owed.insert(*actor, kem_key.to_string()),
+                    reset,
+                )
+            }
             // The batch trigger this call set on a delivery the actor is
             // not a recipient of still belongs to the rollback.
-            armed.entries.push((key.clone(), *actor, None, set_pending));
-        }
+            None if set_pending => (None, false),
+            None => continue,
+        };
+        armed.entries.push(ArmedEntry {
+            key: key.clone(),
+            actor: *actor,
+            previous,
+            set_pending,
+            reset_converged,
+        });
     }
     if !armed.entries.is_empty() {
         inner.dirty = true;
@@ -1162,7 +1194,9 @@ pub(in crate::server::routes::named_groups) async fn owe_gss_shares_after_republ
 /// write that would have made the keyed seat visible failed, so the
 /// obligation it arms must not survive it (#1663 review round 4, Codex
 /// P1, 30 Oct). The batch trigger this call set clears (a round may
-/// already have consumed it); an older key's debt entry returns.
+/// already have consumed it); an older key's debt entry returns; a
+/// convergence this call reset returns while the status is still the
+/// `Sent` it left (round 5).
 pub(in crate::server::routes::named_groups) async fn retract_gss_shares_after_republish(
     state: &AppState,
     armed: ArmedShareDebt,
@@ -1170,10 +1204,24 @@ pub(in crate::server::routes::named_groups) async fn retract_gss_shares_after_re
     let runtime = &state.revocation_evictions;
     let mut inner = runtime.inner.lock().await;
     let mut retracted = false;
-    for (key, actor, previous, set_pending) in armed.entries {
+    for ArmedEntry {
+        key,
+        actor,
+        previous,
+        set_pending,
+        reset_converged,
+    } in armed.entries
+    {
         let Some(delivery) = inner.ce.deliveries.get_mut(&key) else {
             continue;
         };
+        if reset_converged {
+            if let Some(status) = delivery.recipients.get_mut(&actor) {
+                if *status == RecipientDelivery::Sent {
+                    *status = RecipientDelivery::Converged;
+                }
+            }
+        }
         match previous {
             Some(kem) => {
                 delivery.gss_shares_owed.insert(actor, kem);
@@ -6027,6 +6075,103 @@ mod daemon_tests {
                 "the obligation completes after the accepted share"
             );
         }
+        Ok(())
+    }
+
+    /// #1663 review round 5 (Codex P2 on cb2b8cf1, 30 Oct): survivor A
+    /// already converged and survivor B is still pending when A loses its
+    /// key and republishes. The new-key debt resets A to `Sent`, so after
+    /// B converges and A's new-key share is accepted, the delivery is
+    /// still open until A reports its head again. A failed save puts A's
+    /// convergence back.
+    #[tokio::test]
+    async fn a_new_key_debt_resets_the_actors_prior_convergence() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        let actor = *fx.replica.agent.agent_id().as_bytes();
+        let pending = [0xB5; 32];
+        {
+            let mut inner = fx.state.revocation_evictions.inner.lock().await;
+            let delivery = inner
+                .ce
+                .deliveries
+                .get_mut(&key)
+                .context("the open GSS delivery")?;
+            delivery
+                .recipients
+                .insert(actor, RecipientDelivery::Converged);
+            delivery.recipients.insert(pending, RecipientDelivery::Sent);
+        }
+        let status = |state: &Arc<AppState>| {
+            let state = Arc::clone(state);
+            let key = key.clone();
+            async move {
+                state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .ce
+                    .deliveries
+                    .get(&key)
+                    .and_then(|delivery| delivery.recipients.get(&actor).copied())
+            }
+        };
+        // A failed save retracts the debt and puts the convergence back.
+        let armed = owe_gss_shares_after_republish(&fx.state, &fx.stable, &actor, "old").await;
+        assert_eq!(status(&fx.state).await, Some(RecipientDelivery::Sent));
+        retract_gss_shares_after_republish(&fx.state, armed).await;
+        assert_eq!(
+            status(&fx.state).await,
+            Some(RecipientDelivery::Converged),
+            "the rollback restores the convergence it reset"
+        );
+        // The real ordering: the debt resets A, B converges, A's new-key
+        // share is accepted. A is still `Sent`, so the round keeps the
+        // delivery open for A's next head report.
+        let _armed = owe_gss_shares_after_republish(&fx.state, &fx.stable, &actor, "new").await;
+        assert_eq!(
+            status(&fx.state).await,
+            Some(RecipientDelivery::Sent),
+            "the new-key debt resets the prior convergence"
+        );
+        let epoch = {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            inner
+                .ce
+                .deliveries
+                .get(&key)
+                .and_then(|delivery| delivery.gss_epoch)
+                .context("a GSS delivery")?
+        };
+        {
+            let mut inner = fx.state.revocation_evictions.inner.lock().await;
+            if let Some(delivery) = inner.ce.deliveries.get_mut(&key) {
+                delivery
+                    .recipients
+                    .insert(pending, RecipientDelivery::Converged);
+            }
+        }
+        gss_share_accepted(&fx.state, &fx.stable, &hex::encode(actor), epoch, "new").await;
+        let inner = fx.state.revocation_evictions.inner.lock().await;
+        let delivery = inner.ce.deliveries.get(&key).context("still open")?;
+        assert!(delivery.gss_shares_owed.is_empty(), "the debt ended");
+        assert!(
+            !all_converged(&delivery.recipients),
+            "A's stale convergence cannot complete the delivery"
+        );
         Ok(())
     }
 

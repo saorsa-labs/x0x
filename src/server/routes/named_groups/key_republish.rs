@@ -35,6 +35,9 @@
 //! [`sweep_pending_key_republishes`] retries it after the advert arrives
 //! or the failure passes. The startup pass rebuilds the debt after a
 //! restart, because the seat stays selected until its share seals.
+//! The wire has no ack, so one accepted send does not end the debt: it
+//! ends after a fixed number of accepted sends on a backed-off schedule
+//! (#1663 review round 5, Claude, 30 Oct).
 
 use crate::dm::CapabilityRegistry;
 use crate::groups::key_republish as kr;
@@ -47,8 +50,23 @@ use crate::server::routes::named_groups::gss_share_hold;
 use crate::server::state::AppState;
 
 /// How often the pending-republish sweep retries an owed frame (#1663
-/// review P2): the cadence of one S4 delivery round.
+/// review P2): the cadence of one S4 delivery round. It is also the first
+/// backoff step of each group's debt.
 const KEY_REPUBLISH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #1663 review round 5 (Claude, 30 Oct): the ceiling of the per-group
+/// backoff. The interval doubles after each sweep of the group (5, 10,
+/// 20, 40, 80 s) and then stays at this value.
+const KEY_REPUBLISH_MAX_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(80);
+
+/// #1663 review round 5 (Claude, 30 Oct): the number of carrier-accepted
+/// sends that end one recipient's debt. The wire has no ack, and a
+/// receiver can refuse a frame it gets too early (its roster is behind:
+/// `ActorIneligible`; a local storage fault: `LocalFailure`). So one
+/// accepted send does not prove the key seated. The first send and five
+/// backed-off sweeps cover about 2.5 min. A repeat of a seated frame is
+/// harmless: the receiver refuses it as `StaleKey`.
+const KEY_REPUBLISH_ACCEPTED_SENDS: u8 = 6;
 
 /// The built republication of this node's own seat: the encoded frame, the
 /// recipients (every other Active member), and the sequence it seats.
@@ -61,17 +79,25 @@ pub(super) struct OwnRepublish {
 }
 
 /// One group's republication frames still owed to recipients (#1663
-/// review P2): each `owed` recipient had no current verified advert when
-/// the republication ran, or its send failed. The sweep re-sends the frame
-/// until the carrier accepts it, or an advert that lacks
-/// `key_republish_v1` rules the peer out, or the group ends. Memory-only
-/// by design: the startup pass keeps selecting the group until its share
-/// seals, so a restart rebuilds the debt.
+/// review P2): each `owed` recipient maps to the number of sends of the
+/// current `payload` that the carrier accepted. The sweep re-sends the
+/// frame until [`KEY_REPUBLISH_ACCEPTED_SENDS`] sends are accepted, or an
+/// advert that lacks `key_republish_v1` rules the peer out, or the peer
+/// stops being an Active, unrevoked member, or the group ends (#1663
+/// review round 5, Claude, 30 Oct). Memory-only by design: the startup
+/// pass keeps selecting the group until its share seals, so a restart
+/// rebuilds the debt.
 pub(in crate::server) struct PendingKeyRepublish {
     payload: std::sync::Arc<Vec<u8>>,
-    owed: std::collections::BTreeSet<[u8; 32]>,
+    owed: std::collections::BTreeMap<[u8; 32], u8>,
+    /// The wait after the next sweep of this group; it doubles after each
+    /// sweep, up to [`KEY_REPUBLISH_MAX_RETRY_INTERVAL`].
+    interval: std::time::Duration,
     next_at: std::time::Instant,
 }
+
+/// The per-state pending-republish map, keyed by stable group id.
+type PendingMap = std::collections::BTreeMap<String, PendingKeyRepublish>;
 
 /// What the ingest of one frame did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,9 +484,7 @@ fn own_seat_awaits_its_share(state: &AppState, info: &x0x::groups::GroupInfo) ->
             .any(|member| member.agent_id == own_hex)
 }
 
-fn pending_lock(
-    state: &AppState,
-) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, PendingKeyRepublish>> {
+fn pending_lock(state: &AppState) -> std::sync::MutexGuard<'_, PendingMap> {
     state
         .key_republish_pending
         .lock()
@@ -479,27 +503,104 @@ fn record_pending_republish(
     if owed.is_empty() {
         return;
     }
-    {
-        let mut pending = pending_lock(state);
-        let entry = pending
-            .entry(stable_group_id.to_string())
-            .or_insert_with(|| PendingKeyRepublish {
-                payload: std::sync::Arc::new(payload.clone()),
-                owed: std::collections::BTreeSet::new(),
-                next_at: std::time::Instant::now() + KEY_REPUBLISH_RETRY_INTERVAL,
-            });
-        if entry.payload.as_slice() != payload.as_slice() {
-            entry.payload = std::sync::Arc::new(payload);
-        }
-        entry.owed.extend(owed.iter().copied());
-    }
+    record_into(
+        &mut pending_lock(state),
+        stable_group_id,
+        payload,
+        owed,
+        std::time::Instant::now(),
+    );
     arm_pending_sweep(state);
 }
 
-/// Send one owed frame to `agent`. A send the carrier accepts clears the
-/// recipient's debt; a failed one leaves it for the next sweep (#1663
-/// review P2). The receiver's sequence check refuses a repeat of a frame
-/// it already seated, so a duplicate send is refused, not replayed.
+/// The map step of [`record_pending_republish`]. #1663 review round 5
+/// (Claude, 30 Oct): a different `payload` (a newer sequence) replaces the
+/// frame, sets every recipient's accepted-send count to zero, and starts
+/// the backoff again — the sends of the old frame do not seat the new key.
+/// The same `payload` only adds the recipients that are not owed yet.
+fn record_into(
+    pending: &mut PendingMap,
+    stable_group_id: &str,
+    payload: Vec<u8>,
+    owed: &[[u8; 32]],
+    now: std::time::Instant,
+) {
+    let entry = pending
+        .entry(stable_group_id.to_string())
+        .or_insert_with(|| PendingKeyRepublish {
+            payload: std::sync::Arc::new(payload.clone()),
+            owed: std::collections::BTreeMap::new(),
+            interval: KEY_REPUBLISH_RETRY_INTERVAL,
+            next_at: now + KEY_REPUBLISH_RETRY_INTERVAL,
+        });
+    if entry.payload.as_slice() != payload.as_slice() {
+        entry.payload = std::sync::Arc::new(payload);
+        entry.owed.values_mut().for_each(|accepted| *accepted = 0);
+        entry.interval = KEY_REPUBLISH_RETRY_INTERVAL;
+        entry.next_at = now + KEY_REPUBLISH_RETRY_INTERVAL;
+    }
+    for recipient in owed {
+        entry.owed.entry(*recipient).or_insert(0);
+    }
+}
+
+/// #1663 review round 5 (Claude, 30 Oct): count one carrier-accepted send
+/// of `payload` to `recipient`. The debt ends at
+/// [`KEY_REPUBLISH_ACCEPTED_SENDS`]; the group's entry goes when the last
+/// debt ends. A send of a frame that a newer one replaced does not count.
+fn note_accepted_into(
+    pending: &mut PendingMap,
+    stable_group_id: &str,
+    recipient: &[u8; 32],
+    payload: &[u8],
+) {
+    let Some(entry) = pending.get_mut(stable_group_id) else {
+        return;
+    };
+    if entry.payload.as_slice() != payload {
+        return;
+    }
+    let Some(accepted) = entry.owed.get_mut(recipient) else {
+        return;
+    };
+    *accepted = accepted.saturating_add(1);
+    if *accepted >= KEY_REPUBLISH_ACCEPTED_SENDS {
+        entry.owed.remove(recipient);
+        if entry.owed.is_empty() {
+            pending.remove(stable_group_id);
+        }
+    }
+}
+
+/// The due step of one sweep: snapshot each group whose retry time came,
+/// and back off its next retry (#1663 review round 5, Claude, 30 Oct). The
+/// interval doubles after each sweep of the group, up to
+/// [`KEY_REPUBLISH_MAX_RETRY_INTERVAL`].
+fn take_due(pending: &mut PendingMap, now: std::time::Instant) -> Vec<DueRepublish> {
+    let mut due = Vec::new();
+    for (stable, entry) in pending.iter_mut() {
+        if entry.next_at > now {
+            continue;
+        }
+        entry.interval = entry
+            .interval
+            .saturating_mul(2)
+            .min(KEY_REPUBLISH_MAX_RETRY_INTERVAL);
+        entry.next_at = now + entry.interval;
+        due.push(DueRepublish {
+            stable_group_id: stable.clone(),
+            payload: std::sync::Arc::clone(&entry.payload),
+            owed: entry.owed.keys().copied().collect(),
+        });
+    }
+    due
+}
+
+/// Send one owed frame to `agent`. A send the carrier accepts counts
+/// toward the recipient's bound (#1663 review round 5, Claude, 30 Oct); a
+/// failed one does not count, and the next sweep retries it (#1663 review
+/// P2). The receiver's sequence check refuses a repeat of a frame it
+/// already seated, so a duplicate send is refused, not replayed.
 fn spawn_republish_send(
     state: &std::sync::Arc<AppState>,
     stable_group_id: &str,
@@ -524,7 +625,12 @@ fn spawn_republish_send(
             tracing::debug!(%error, "#1663: key republish send failed; the sweep retries it");
             return;
         }
-        drop_pending_recipient(&task_state, &stable, agent.as_bytes());
+        note_accepted_into(
+            &mut pending_lock(&task_state),
+            &stable,
+            agent.as_bytes(),
+            payload.as_slice(),
+        );
     });
 }
 
@@ -534,7 +640,7 @@ fn drop_pending_recipient(state: &AppState, stable_group_id: &str, recipient: &[
     let mut pending = pending_lock(state);
     let dropped = pending
         .get_mut(stable_group_id)
-        .is_some_and(|entry| entry.owed.remove(recipient));
+        .is_some_and(|entry| entry.owed.remove(recipient).is_some());
     if dropped
         && pending
             .get(stable_group_id)
@@ -567,6 +673,16 @@ fn arm_pending_sweep(state: &std::sync::Arc<AppState>) {
             if pending_lock(&task_state).is_empty() {
                 break;
             }
+            // #1663 review round 5 (Claude, 30 Oct): a record raced the
+            // clear. Take the flag again before this task continues; if a
+            // concurrent arm took it first, that arm's task owns the
+            // sweep, and this one stops (one task per state).
+            if task_state
+                .key_republish_sweep_armed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
         }
     });
 }
@@ -585,51 +701,68 @@ struct DueRepublish {
 /// that rules it out clears the debt (an intentionally unsupported peer
 /// is not owed a retry), and a still-unknown one gets a refresh request.
 /// The debt ends with the group too: a withdrawn group or a left seat
-/// owes nothing. Returns whether anything is still owed.
+/// owes nothing. A recipient that is no longer an Active member (Removed,
+/// Banned or absent), or whose agent id is revoked, is owed nothing too
+/// (#1663 review round 5, Claude, 30 Oct). Returns whether anything is
+/// still owed.
 pub(in crate::server) async fn sweep_pending_key_republishes(
     state: &std::sync::Arc<AppState>,
 ) -> bool {
-    let now = std::time::Instant::now();
-    let due: Vec<DueRepublish> = {
-        let mut pending = pending_lock(state);
-        let mut due = Vec::new();
-        for (stable, entry) in pending.iter_mut() {
-            if entry.next_at > now {
-                continue;
-            }
-            entry.next_at = now + KEY_REPUBLISH_RETRY_INTERVAL;
-            due.push(DueRepublish {
-                stable_group_id: stable.clone(),
-                payload: std::sync::Arc::clone(&entry.payload),
-                owed: entry.owed.iter().copied().collect(),
-            });
-        }
-        due
-    };
+    let due = take_due(&mut pending_lock(state), std::time::Instant::now());
     if !due.is_empty() {
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let capabilities = state.agent.capability_store();
         let mut refreshes: Vec<AgentId> = Vec::new();
         for due in due {
             let group_key = ng::resolve_named_group_storage_key(state, &due.stable_group_id).await;
-            let live = match group_key {
+            // `None`: the group is not live here. `Some`: the owed
+            // recipients that are no longer Active members.
+            let departed: Option<Vec<[u8; 32]>> = match group_key {
                 Some(group_key) => {
                     let groups = state.named_groups.read().await;
-                    groups.get(&group_key).is_some_and(|info| {
-                        !info.withdrawn
-                            && x0x::groups::crypto_exclusion::is_gss_encrypted(info)
-                            && info.members_v2.get(&local_hex).is_some_and(|seat| {
-                                seat.state == x0x::groups::member::GroupMemberState::Active
-                            })
-                    })
+                    groups
+                        .get(&group_key)
+                        .filter(|info| {
+                            !info.withdrawn
+                                && x0x::groups::crypto_exclusion::is_gss_encrypted(info)
+                                && info.members_v2.get(&local_hex).is_some_and(|seat| {
+                                    seat.state == x0x::groups::member::GroupMemberState::Active
+                                })
+                        })
+                        .map(|info| {
+                            due.owed
+                                .iter()
+                                .filter(|recipient| {
+                                    !info.has_active_member(&hex::encode(recipient))
+                                })
+                                .copied()
+                                .collect()
+                        })
                 }
-                None => false,
+                None => None,
             };
-            if !live {
+            let Some(departed) = departed else {
                 pending_lock(state).remove(&due.stable_group_id);
                 continue;
+            };
+            // A revoked recipient fails closed, as `receive` does for a
+            // revoked actor or sender.
+            let revoked: Vec<[u8; 32]> = {
+                let revocation_set = state.agent.revocation_set();
+                let set = revocation_set.read().await;
+                due.owed
+                    .iter()
+                    .filter(|recipient| set.is_agent_revoked(&AgentId(**recipient)))
+                    .copied()
+                    .collect()
+            };
+            for recipient in departed.iter().chain(revoked.iter()) {
+                drop_pending_recipient(state, &due.stable_group_id, recipient);
             }
             for recipient in due.owed {
+                if departed.contains(&recipient) || revoked.contains(&recipient) {
+                    continue;
+                }
                 match capabilities.verified_registry_supports(
                     &AgentId(recipient),
                     CapabilityRegistry::KEY_REPUBLISH_V1,
@@ -671,7 +804,7 @@ pub(in crate::server) fn pending_republish_owed(
 ) -> Vec<String> {
     pending_lock(state)
         .get(stable_group_id)
-        .map(|entry| entry.owed.iter().map(hex::encode).collect())
+        .map(|entry| entry.owed.keys().map(hex::encode).collect())
         .unwrap_or_default()
 }
 
@@ -682,5 +815,324 @@ pub(in crate::server) fn pending_republish_due_now(state: &AppState) {
     let now = std::time::Instant::now();
     for entry in pending_lock(state).values_mut() {
         entry.next_at = now;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! #1663 review round 5 (Claude, 30 Oct): the bounded retry, the
+    //! sweep's recipient checks, and the refusals of [`receive`].
+    use super::*;
+    use anyhow::Result;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const R1: [u8; 32] = [0x11; 32];
+    const R2: [u8; 32] = [0x22; 32];
+
+    fn owed_of(pending: &PendingMap, stable: &str) -> Vec<[u8; 32]> {
+        pending
+            .get(stable)
+            .map(|entry| entry.owed.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// One carrier-accepted send does not end the debt; the bound does.
+    /// A failed send is not counted (it never reaches `note_accepted_into`).
+    #[test]
+    fn key_republish_accepted_sends_end_the_debt_at_the_bound() {
+        let mut pending = PendingMap::new();
+        let payload = vec![1u8, 2, 3];
+        record_into(
+            &mut pending,
+            "g",
+            payload.clone(),
+            &[R1, R2],
+            Instant::now(),
+        );
+        for _ in 1..KEY_REPUBLISH_ACCEPTED_SENDS {
+            note_accepted_into(&mut pending, "g", &R1, &payload);
+        }
+        assert_eq!(
+            owed_of(&pending, "g"),
+            vec![R1, R2],
+            "one send short of the bound: still owed"
+        );
+        note_accepted_into(&mut pending, "g", &R1, &payload);
+        assert_eq!(owed_of(&pending, "g"), vec![R2], "the bound ends the debt");
+        for _ in 0..KEY_REPUBLISH_ACCEPTED_SENDS {
+            note_accepted_into(&mut pending, "g", &R2, &payload);
+        }
+        assert!(pending.is_empty(), "the last debt removes the group entry");
+    }
+
+    /// A newer frame resets every count and the backoff, and a late
+    /// accept of the replaced frame does not count toward the new one.
+    #[test]
+    fn key_republish_newer_payload_resets_counts_and_backoff() {
+        let mut pending = PendingMap::new();
+        let old = vec![1u8];
+        let new = vec![2u8];
+        let t0 = Instant::now();
+        record_into(&mut pending, "g", old.clone(), &[R1], t0);
+        for _ in 1..KEY_REPUBLISH_ACCEPTED_SENDS {
+            note_accepted_into(&mut pending, "g", &R1, &old);
+        }
+        let swept = t0 + KEY_REPUBLISH_RETRY_INTERVAL;
+        assert_eq!(take_due(&mut pending, swept).len(), 1);
+        let t1 = swept + Duration::from_secs(1);
+        record_into(&mut pending, "g", new.clone(), &[R2], t1);
+        let entry = pending.get("g");
+        assert!(
+            entry.is_some_and(|entry| entry.interval == KEY_REPUBLISH_RETRY_INTERVAL
+                && entry.next_at == t1 + KEY_REPUBLISH_RETRY_INTERVAL
+                && entry.payload.as_slice() == new.as_slice()
+                && entry.owed.values().all(|accepted| *accepted == 0))
+        );
+        assert_eq!(owed_of(&pending, "g"), vec![R1, R2]);
+        // The replaced frame's late accept does not count.
+        note_accepted_into(&mut pending, "g", &R1, &old);
+        for _ in 1..KEY_REPUBLISH_ACCEPTED_SENDS {
+            note_accepted_into(&mut pending, "g", &R1, &new);
+        }
+        assert_eq!(
+            owed_of(&pending, "g"),
+            vec![R1, R2],
+            "the old frame's sends did not carry over"
+        );
+        note_accepted_into(&mut pending, "g", &R1, &new);
+        assert_eq!(owed_of(&pending, "g"), vec![R2]);
+        // The same frame recorded again keeps the counts.
+        note_accepted_into(&mut pending, "g", &R2, &new);
+        record_into(&mut pending, "g", new.clone(), &[R1, R2], t1);
+        assert!(pending.get("g").is_some_and(
+            |entry| entry.owed.get(&R1) == Some(&0) && entry.owed.get(&R2) == Some(&1)
+        ));
+    }
+
+    /// The sweep interval of a group doubles after each sweep, up to the
+    /// cap; a group not yet due is not swept.
+    #[test]
+    fn key_republish_sweep_backoff_doubles_to_the_cap() {
+        let mut pending = PendingMap::new();
+        let mut now = Instant::now();
+        record_into(&mut pending, "g", vec![1], &[R1], now);
+        assert!(take_due(&mut pending, now).is_empty(), "not due at once");
+        let mut waits = Vec::new();
+        let mut wait = KEY_REPUBLISH_RETRY_INTERVAL;
+        for _ in 0..6 {
+            now += wait;
+            assert_eq!(take_due(&mut pending, now).len(), 1);
+            let next_at = pending.get("g").map(|entry| entry.next_at);
+            assert_eq!(
+                take_due(&mut pending, now + Duration::from_millis(1)).len(),
+                0
+            );
+            wait = next_at.map_or(Duration::ZERO, |at| at - now);
+            waits.push(wait.as_secs());
+        }
+        assert_eq!(waits, vec![10, 20, 40, 80, 80, 80]);
+    }
+
+    /// A GSS `MlsEncrypted` group owned by `state`, with each of
+    /// `members` as an Active Member. Returns the storage key and the
+    /// stable id.
+    async fn gss_group(state: &Arc<AppState>, members: &[AgentId]) -> (String, String) {
+        let admin = state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let group_id = "d5".repeat(16);
+        let mut info =
+            x0x::groups::GroupInfo::new("kr".into(), String::new(), admin, group_id.clone());
+        for member in members {
+            info.add_member(
+                hex::encode(member.as_bytes()),
+                x0x::groups::GroupRole::Member,
+                Some(admin_hex.clone()),
+                None,
+            );
+        }
+        info.recompute_state_hash();
+        assert!(x0x::groups::crypto_exclusion::is_gss_encrypted(&info));
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        (group_id, stable)
+    }
+
+    async fn edit_group(
+        state: &AppState,
+        group_key: &str,
+        edit: impl FnOnce(&mut x0x::groups::GroupInfo),
+    ) {
+        if let Some(info) = state.named_groups.write().await.get_mut(group_key) {
+            edit(info);
+        }
+    }
+
+    async fn revoke(state: &AppState, kp: &x0x::identity::AgentKeypair) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(kp.agent_id()),
+            kp.public_key(),
+            kp.secret_key(),
+            now,
+            None,
+        )?;
+        let revocation_set = state.agent.revocation_set();
+        let inserted = revocation_set
+            .write()
+            .await
+            .verify_and_insert(record, None)?;
+        assert!(inserted, "the self-revocation is new");
+        assert!(revocation_set.read().await.is_agent_revoked(&kp.agent_id()));
+        Ok(())
+    }
+
+    /// A signed `X0XKR1` frame by `actor` that seats `state`'s KEM key.
+    fn frame(
+        state: &AppState,
+        actor: &x0x::identity::AgentKeypair,
+        stable: &str,
+        key_sequence: u64,
+    ) -> Result<Vec<u8>> {
+        let b64 = &base64::engine::general_purpose::STANDARD;
+        let body = kr::MemberKeyRepublishBodyV1 {
+            stable_group_id: stable.to_string(),
+            actor: *actor.agent_id().as_bytes(),
+            agent_public_key_b64: b64.encode(actor.public_key().as_bytes()),
+            kem_public_key_b64: b64.encode(&state.agent_kem_keypair.public_bytes),
+            key_sequence,
+        };
+        let signed = kr::sign(body, actor).map_err(|refusal| anyhow::anyhow!(refusal.as_str()))?;
+        Ok(kr::encode_frame(&signed)?)
+    }
+
+    const INELIGIBLE: RepublishOutcome =
+        RepublishOutcome::Refused(kr::MemberKeyRepublishRefusal::ActorIneligible);
+
+    /// The sweep drops the debt of a recipient that is Removed, Banned,
+    /// absent or revoked; an Active, unrevoked recipient stays owed.
+    #[tokio::test]
+    async fn key_republish_sweep_drops_a_departed_or_revoked_recipient() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let revoked_kp = x0x::identity::AgentKeypair::generate()?;
+        let removed = AgentId([0x31; 32]);
+        let banned = AgentId([0x32; 32]);
+        let active = AgentId([0x33; 32]);
+        let absent = AgentId([0x34; 32]);
+        let revoked = revoked_kp.agent_id();
+        let (group_key, stable) = gss_group(&state, &[removed, banned, active, revoked]).await;
+        record_pending_republish(
+            &state,
+            &stable,
+            vec![7, 7, 7],
+            &[
+                *removed.as_bytes(),
+                *banned.as_bytes(),
+                *active.as_bytes(),
+                *absent.as_bytes(),
+                *revoked.as_bytes(),
+            ],
+        );
+        assert_eq!(pending_republish_owed(&state, &stable).len(), 5);
+        edit_group(&state, &group_key, |info| {
+            info.remove_member(&hex::encode(removed.as_bytes()), None);
+            info.ban_member(&hex::encode(banned.as_bytes()), None);
+        })
+        .await;
+        revoke(&state, &revoked_kp).await?;
+        pending_republish_due_now(&state);
+        assert!(sweep_pending_key_republishes(&state).await);
+        assert_eq!(
+            pending_republish_owed(&state, &stable),
+            vec![hex::encode(active.as_bytes())],
+            "only the Active, unrevoked recipient stays owed"
+        );
+        Ok(())
+    }
+
+    /// (a) A relay from a sender that is not an Active member is refused,
+    /// though the actor's own seat is sound: the same frame from an
+    /// Active relaying member seats the key.
+    #[tokio::test]
+    async fn key_republish_receive_refuses_a_relay_from_a_non_member() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let actor = x0x::identity::AgentKeypair::generate()?;
+        let relay = AgentId([0x42; 32]);
+        let (_, stable) = gss_group(&state, &[actor.agent_id(), relay]).await;
+        let payload = frame(&state, &actor, &stable, 1)?;
+        let outsider = AgentId([0x41; 32]);
+        assert_eq!(receive(&state, outsider, &payload).await, INELIGIBLE);
+        assert_eq!(
+            receive(&state, relay, &payload).await,
+            RepublishOutcome::Installed,
+            "the control: an Active member's relay of the same frame seats it"
+        );
+        Ok(())
+    }
+
+    /// (b) A revoked sender, and a revoked actor, are refused.
+    #[tokio::test]
+    async fn key_republish_receive_refuses_a_revoked_actor_or_sender() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let actor = x0x::identity::AgentKeypair::generate()?;
+        let relay = x0x::identity::AgentKeypair::generate()?;
+        let (_, stable) = gss_group(&state, &[actor.agent_id(), relay.agent_id()]).await;
+        let payload = frame(&state, &actor, &stable, 1)?;
+        revoke(&state, &relay).await?;
+        assert_eq!(
+            receive(&state, relay.agent_id(), &payload).await,
+            INELIGIBLE,
+            "a revoked relaying member"
+        );
+        revoke(&state, &actor).await?;
+        assert_eq!(
+            receive(&state, actor.agent_id(), &payload).await,
+            INELIGIBLE,
+            "a revoked actor sending its own frame"
+        );
+        Ok(())
+    }
+
+    /// (c) A frame for a group this node does not hold is not applicable.
+    #[tokio::test]
+    async fn key_republish_receive_of_an_unknown_group_is_not_applicable() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let actor = x0x::identity::AgentKeypair::generate()?;
+        let payload = frame(&state, &actor, &"e7".repeat(32), 1)?;
+        assert_eq!(
+            receive(&state, actor.agent_id(), &payload).await,
+            RepublishOutcome::NotApplicable
+        );
+        Ok(())
+    }
+
+    /// (d) A Banned seat is not Active: `validate_against_seat` refuses
+    /// the actor, and nothing seats.
+    #[tokio::test]
+    async fn key_republish_receive_refuses_a_banned_seat() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let actor = x0x::identity::AgentKeypair::generate()?;
+        let actor_hex = hex::encode(actor.agent_id().as_bytes());
+        let (group_key, stable) = gss_group(&state, &[actor.agent_id()]).await;
+        edit_group(&state, &group_key, |info| info.ban_member(&actor_hex, None)).await;
+        let payload = frame(&state, &actor, &stable, 1)?;
+        assert_eq!(
+            receive(&state, actor.agent_id(), &payload).await,
+            INELIGIBLE
+        );
+        assert!(state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .and_then(|info| info.members_v2.get(&actor_hex))
+            .is_some_and(|seat| seat.kem_key_sequence.is_none()));
+        Ok(())
     }
 }
