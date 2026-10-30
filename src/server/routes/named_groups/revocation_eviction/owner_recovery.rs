@@ -5506,21 +5506,25 @@ mod restart_tests {
         let (status, Json(body)) =
             sign_recovery_mandate(&author, owner, &stable, &author_hex).await;
         anyhow::ensure!(status == StatusCode::ACCEPTED, "mandate: {body}");
-        // #1689 CI: the route's detached `drive` must end here, before the
-        // pass. If it is still running across the pass, it can commit the
-        // recovery before the save fault below is set, and the mandate is
-        // gone. That happened under load in Test Suite and Coverage; a
-        // join after the pass instead fails on every run.
-        let route_tasks: Vec<_> = author
-            .detached_tasks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-            .map(std::mem::take)
-            .unwrap_or_default();
-        for task in route_tasks {
+        // The route starts its own drive. Finish that attempt before
+        // the pass opens the head-sync round and before installing the
+        // one-shot fault below. Otherwise it can race the explicit
+        // attempt, consume the fault, and let the other attempt commit.
+        let tasks = {
+            let mut tasks = author
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tasks.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in tasks {
             task.await?;
         }
+        assert_eq!(
+            head_of(&author, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the route's drive waits for head sync before the fault is armed"
+        );
         super::super::revocation_eviction_pass(&author).await;
 
         author
