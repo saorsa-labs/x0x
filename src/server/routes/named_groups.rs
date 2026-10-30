@@ -3045,7 +3045,16 @@ async fn publish_group_card_with_reseal(
 ) -> Option<x0x::groups::GroupStateCommit> {
     let membership_lock = group_membership_lock(state, group_id).await;
     let _membership_guard = membership_lock.lock().await;
-    publish_group_card_to_discovery_inner(state, group_id, true).await
+    let commit = publish_group_card_to_discovery_inner(state, group_id, true).await;
+    // #1570, #1708 review: a reseal that published ends the hold itself,
+    // so its publish settles the owed card. Left set, the next worker
+    // pass published the same card again.
+    if commit.is_some() {
+        if let Some(info) = state.named_groups.read().await.get(group_id) {
+            group_recovery::settle_card_debt(state, info.stable_group_id());
+        }
+    }
+    commit
 }
 
 async fn publish_group_card_to_discovery_inner(
@@ -3070,6 +3079,20 @@ async fn publish_group_card_to_discovery_inner(
         // member-scoped withdrawal signal needs it, and that is not a leak
         // because members already know the group.
         if !group_card_is_listable(info) {
+            return None;
+        }
+        // #1570: a held-back group's live record is ahead of its durable
+        // form, so no card is signed or published from it — not by the
+        // republish worker, a create fan-out or a state-change hook. The
+        // worker pass publishes the owed card once the hold ends,
+        // whichever save ended the hold. "Held back" here includes a
+        // group whose un-placeholdering write has not landed
+        // (Engineer ruling, 29 Oct 2026). The reseal path
+        // (`seal_group_state`) keeps main's behaviour: its persist must
+        // land Durable before this point publishes, and that persist
+        // retries the sidecar write, so a seal may itself end the hold
+        // and succeed (Engineer ruling, 29 Oct 2026, 19:56).
+        if !reseal && group_recovery::is_card_held_back(state, info.stable_group_id()) {
             return None;
         }
         let mut candidate = info.clone();
@@ -3526,7 +3549,8 @@ async fn emit_shard_digest(state: &AppState, kind: x0x::groups::ShardKind, shard
 /// routing key or the D.3 stable id. #1570 (ZCode on 8ac7036f): a held-back
 /// group's live record is ahead of its durable form, so no card is signed
 /// from it; the Pull falls back to a cached card, as for a group this node
-/// does not own.
+/// does not own. #1570 (29 Oct 2026): "held back" includes a group whose
+/// un-placeholdering write has not landed.
 pub(super) fn pull_card_record<'a>(
     state: &AppState,
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
@@ -3535,7 +3559,7 @@ pub(super) fn pull_card_record<'a>(
     groups
         .get(gid)
         .or_else(|| groups.values().find(|info| info.stable_group_id() == gid))
-        .filter(|info| !group_recovery::is_held_back(state, info.stable_group_id()))
+        .filter(|info| !group_recovery::is_card_held_back(state, info.stable_group_id()))
 }
 
 async fn respond_to_pull(
@@ -6682,6 +6706,14 @@ pub(in crate::server) async fn refresh_group_card_cache_from_info(
     if !group_card_is_listable(info) {
         cache.remove(key);
         cache.remove(&stable_key);
+        return;
+    }
+    // #1570: a held-back group's live record is ahead of its durable form,
+    // so no fresh card is signed from it into the cache `GET /groups/discover`
+    // and card-by-id serve. The cache keeps the card of the last durable
+    // form until the hold clears; a group whose un-placeholdering write
+    // has not landed is held back too (29 Oct 2026 ruling).
+    if group_recovery::is_card_held_back(state, info.stable_group_id()) {
         return;
     }
     match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
@@ -34073,6 +34105,14 @@ pub(in crate::server) async fn discover_groups(
         if !group_card_is_listable(info) {
             continue;
         }
+        // #1570: a held-back group's live record is ahead of its durable
+        // form, so no card is signed from it. Its cached card (merged
+        // above) is served, as for a group this node does not own; a
+        // group whose un-placeholdering write has not landed is held
+        // back too (29 Oct 2026 ruling).
+        if group_recovery::is_card_held_back(&state, info.stable_group_id()) {
+            continue;
+        }
         if let Ok(Some(card)) = info.to_signed_group_card(signing_kp) {
             merge_card(&card);
         }
@@ -34254,7 +34294,15 @@ pub(in crate::server) async fn get_group_card(
         }
     }
     let groups = state.named_groups.read().await;
-    if let Some(info) = groups.get(&id) {
+    // #1570: a held-back group's live record is ahead of its durable form,
+    // so no card is signed from it. The cached card (checked above) is
+    // served, as for a group this node does not own; a group whose
+    // un-placeholdering write has not landed is held back too (29 Oct
+    // 2026 ruling).
+    if let Some(info) = groups
+        .get(&id)
+        .filter(|info| !group_recovery::is_card_held_back(&state, info.stable_group_id()))
+    {
         match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
             Ok(Some(card)) => {
                 return Json(serde_json::to_value(&card).unwrap_or(serde_json::Value::Null))
@@ -49884,6 +49932,7 @@ pub(in crate::server) mod tests {
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
     mod issue1569_owner_certified_placeholder;
+    mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
     mod issue1570_held_back_tombstone;
     mod issue1577_revoked_catchup_request;
