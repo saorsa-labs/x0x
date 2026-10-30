@@ -3143,17 +3143,19 @@ impl UpgradeHandoff {
 
     /// Parse legacy helper intent; refuse unknown formats and M2 handoffs.
     pub fn read(path: &Path) -> std::io::Result<Self> {
-        serde_json::from_value(super::journal::read_handoff(path)?).map_err(io_other)
+        // The helper logs this error. Parser errors can quote credentials
+        // from the record, so keep the error kind but omit those details.
+        let value = super::journal::read_handoff(path).map_err(|error| {
+            std::io::Error::new(error.kind(), "upgrade handoff record could not be read")
+        })?;
+        serde_json::from_value(value)
+            .map_err(|_| std::io::Error::other("invalid upgrade handoff record"))
     }
 
     /// Backup path the swap created for this target (`x0xd.backup`).
     pub fn backup_path_for(target_path: &Path) -> PathBuf {
         target_path.with_extension("backup")
     }
-}
-
-fn io_other(err: serde_json::Error) -> std::io::Error {
-    std::io::Error::other(err.to_string())
 }
 
 /// Build the respawn argv: skip the recorded `argv[0]` and append
@@ -7246,5 +7248,65 @@ mod tests {
             "loaded job without KeepAlive must fail closed: {verdict}"
         );
         negative_guard.cleanup().expect("clean negative fixture");
+    }
+}
+
+#[cfg(test)]
+mod refusal_diagnostics_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn refusal_diagnostics_handoff_parser_error_omits_record_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(HANDOFF_FILE_NAME);
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version": super::super::journal::SCHEMA_VERSION,
+            "record_kind": "handoff", "transaction_id": "tx",
+            "instance_id": "alice", "generation": "handoff-parser-secret"
+        }))
+        .unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let raw = super::super::journal::read_handoff(&path).unwrap_err();
+        assert!(raw.to_string().contains("handoff-parser-secret"));
+        let error = UpgradeHandoff::read(&path).unwrap_err();
+        assert_eq!(error.kind(), raw.kind());
+        for diagnostic in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(!diagnostic.contains("handoff-parser-secret"));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn refusal_diagnostics_handoff_keeps_missing_file_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = UpgradeHandoff::read(&dir.path().join(HANDOFF_FILE_NAME)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn refusal_diagnostics_handoff_keeps_valid_legacy_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(HANDOFF_FILE_NAME);
+        let value = json!({
+            "from_version": "0.48.1", "to_version": "0.48.2",
+            "target_path": "/owned/bin/x0xd", "backup_path": "/owned/bin/x0xd.backup",
+            "argv": ["x0xd", "argument-secret"], "cwd": "/owned",
+            "env": {"TOKEN": "environment-secret"}, "old_pid": 23,
+            "api_addr": "127.0.0.1:12700", "started_at": 1,
+            "mode": "TransactionalHandoff", "launchd_verified": null,
+            "systemd_verified": null
+        });
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let record = UpgradeHandoff::read(&path).unwrap();
+        assert_eq!(record.argv[1], "argument-secret");
+        assert_eq!(record.env["TOKEN"], "environment-secret");
+        assert_eq!(serde_json::to_value(record).unwrap(), value);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }
