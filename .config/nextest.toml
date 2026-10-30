@@ -67,7 +67,7 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 success-output = "final"
 
 # ADR 0109 H-S3-c/c2 (#1689): each row runs a 30-minute virtual advance and
-# a re-seat on five nodes, 255-600 s of wall time per run (more on the
+# a re-seat on four nodes, 255-600 s of wall time per run (more on the
 # 4-vCPU runner). The 300 s kill above would end them with no receipt, so
 # these two rows alone get 15 minutes. The stress count stays 20. They
 # start first in each rerun, like the long cases below.

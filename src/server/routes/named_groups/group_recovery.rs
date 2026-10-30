@@ -14007,6 +14007,33 @@ mod tests {
         original_kept(&state, &key, &info).await
     }
 
+    /// #1689 review: [`check_reseat_keys`] needs the map key, the record's
+    /// `mls_group_id` and the invite's `group_id` to be one key; any one
+    /// apart is `record_key_divergent`.
+    #[test]
+    fn check_reseat_keys_needs_one_key() -> anyhow::Result<()> {
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let key = "1689".repeat(16);
+        let other = "a1".repeat(32);
+        let info = GroupInfo::new("keys".into(), String::new(), admin.agent_id(), key.clone());
+        let invite = |group_id: &str| {
+            x0x::groups::invite::SignedInvite::new(
+                group_id.to_string(),
+                "keys".into(),
+                &admin.agent_id(),
+                3600,
+            )
+        };
+        assert_eq!(check_reseat_keys(&key, &info, &invite(&key)), Ok(()));
+        for (map_key, invite_id) in [(&other, &key), (&key, &other)] {
+            assert_eq!(
+                check_reseat_keys(map_key, &info, &invite(invite_id)),
+                Err("record_key_divergent")
+            );
+        }
+        Ok(())
+    }
+
     /// #1689 review (Engineer ruling, 29 Oct): a legacy record whose map
     /// key (its pre-pin genesis id) differs from its `mls_group_id` is
     /// refused with `record_key_divergent` (cause `group_mismatch`) before
