@@ -1758,7 +1758,9 @@ every wait. A wait always names its cause; it does not stop silently.
     exclusion is kept as evidence and is not published. A verified
     competing certificate rebind on the same parent is kept the same way;
     the applied rebind retains the certificate it displaced, so the
-    competing one stays verifiable (#1650).
+    competing one stays verifiable (#1650). The retained evidence is
+    capped per group; a sibling whose displaced certificate was evicted
+    again records nothing.
   - `waiting_for_receiver_upgrade` — the crypto-only exclusion of a member
     that already left is held. `named` lists each Active member whose
     current verified advert lacks `crypto_exclusion_v1`. The hold ends when

@@ -42524,8 +42524,12 @@ async fn save_named_groups_store_checked(
     group_recovery::commit_legacy_write(state, &outcome);
     // #1650 (ADR 0110 §5): neither legacy JSON carries displaced rebind
     // certificates; the retained evidence persists in its own S4
-    // sidecar, refreshed once the roster save landed.
-    if outcome.is_ok() {
+    // sidecar, refreshed once the roster save landed (`NotReplaced` and
+    // a failed write leave the previous projection standing).
+    if matches!(
+        outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
         revocation_eviction::displaced_certs::sync_after_save(state).await;
     }
     outcome

@@ -24,8 +24,9 @@
 //! - **Load.** Entries whose certificate does not hash to their digest
 //!   key are dropped: a retained entry is evidence only for the digest
 //!   the parent roster signed. A damaged file is quarantined
-//!   (ADR 0108 §5a) and its evidence is lost; a newer layout stays on
-//!   disk, not loaded.
+//!   (ADR 0108 §5a) and its evidence is lost (inside an ADR 0094 trial
+//!   it is left in place and the first save after host commit replaces
+//!   it); a newer layout stays on disk, not loaded.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path as FsPath, PathBuf};
@@ -137,13 +138,17 @@ fn decode(
 /// Refresh the sidecar after a roster save that landed. See the module
 /// doc for the write rules.
 pub(in crate::server) async fn sync_after_save(state: &AppState) {
-    // §5: no write inside an ADR 0094 trial; the evidence stays in
-    // memory only until the gate opens.
+    // §5: no write inside an ADR 0094 trial; the evidence then stays in
+    // memory only until the first save after the gate opens.
     if !super::host_commit_gate_open(state) {
         return;
     }
     let file = {
-        let groups = state.named_groups.read().await;
+        // The same view the legacy encode uses (#1699): inside a re-seat
+        // scope the scoped read is the staging slot, which never reaches
+        // disk — projecting it would retire other groups' durable
+        // evidence.
+        let groups = state.named_groups.live_read().await;
         project(&groups)
     };
     let file_path = path(&state.data_dir);
@@ -204,7 +209,7 @@ pub(in crate::server) async fn load_into(
             tracing::warn!(
                 reason,
                 path = %file_path.display(),
-                "ADR 0110 S4: damaged displaced rebind certificates inside an ADR 0094 trial; quarantine waits for host commit"
+                "ADR 0110 S4: damaged displaced rebind certificates inside an ADR 0094 trial; not loaded, and the first save after host commit replaces the file"
             );
             return;
         }
@@ -420,6 +425,58 @@ mod tests {
                 .await
                 .unwrap_or(false),
             "an empty projection retires the file"
+        );
+        receiver.agent.shutdown().await;
+    }
+
+    /// #1699 (round-2 self-review): inside a re-seat staging scope the
+    /// scoped read is the staging slot, which never reaches disk — the
+    /// legacy encode reads the live map there. The projection must do
+    /// the same: a save from inside a staging scope must not retire or
+    /// shrink the durable evidence of the live groups.
+    #[tokio::test]
+    async fn sync_inside_a_reseat_scope_keeps_the_live_projection() {
+        let dir = tempfile::tempdir().expect("dir");
+        let receiver = super::super::rebind::restart_tests::offline_daemon(dir.path(), None)
+            .await
+            .expect("daemon");
+        let (digest, info, _) = retained_group();
+        let key = info.stable_group_id().to_string();
+        receiver
+            .named_groups
+            .live_write()
+            .await
+            .insert(key.clone(), info);
+        sync_after_save(&receiver).await;
+        let durable = crate::w3h_inline::fs::read(path(dir.path()))
+            .await
+            .expect("the sidecar holds the live projection");
+        // The staged record holds no retained evidence of its own.
+        let mut staged = receiver.named_groups.live_read().await[&key].clone();
+        staged.displaced_certificates.clear();
+        receiver.reseat_stagings.open(&key, &key);
+        receiver
+            .named_groups
+            .staging_write()
+            .await
+            .insert(key.clone(), staged);
+        receiver
+            .reseat_stagings
+            .run_in_staging_of(&key, sync_after_save(&receiver))
+            .await;
+        let after = crate::w3h_inline::fs::read(path(dir.path()))
+            .await
+            .expect("the sidecar survives the staging-scope save");
+        assert_eq!(
+            durable, after,
+            "a staging-scope save projects the live map, not the staging slot"
+        );
+        assert!(
+            decode(&after)
+                .expect("decode")
+                .get(&key)
+                .is_some_and(|entries| entries.contains_key(&digest)),
+            "the live group's evidence is still durable"
         );
         receiver.agent.shutdown().await;
     }
