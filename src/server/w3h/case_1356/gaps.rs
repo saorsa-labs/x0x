@@ -146,7 +146,7 @@ pub(super) async fn s0(
     Ok((group, minted))
 }
 
-async fn promote(
+pub(super) async fn promote(
     sim: &Sim,
     admin: &str,
     member: &str,
@@ -186,7 +186,7 @@ async fn promote(
 }
 
 /// `admin` removes `member`; returns once `admin` no longer lists it.
-async fn remove(sim: &Sim, admin: &str, member: &str, group: &str) -> Result<()> {
+pub(super) async fn remove(sim: &Sim, admin: &str, member: &str, group: &str) -> Result<()> {
     let hex = sim.agent_hex(member)?;
     let (code, removed) = sim
         .api(
@@ -213,7 +213,7 @@ async fn remove(sim: &Sim, admin: &str, member: &str, group: &str) -> Result<()>
 }
 
 /// J redeems `link`; returns once A lists J, with A's view after the seal.
-async fn seal_j(sim: &Sim, link: &str, group: &str) -> Result<View> {
+pub(super) async fn seal_j(sim: &Sim, link: &str, group: &str) -> Result<View> {
     join(sim, "J", link).await?;
     let j_hex = sim.agent_hex("J")?;
     sim.until("A seals J", SETUP, async |s: &Sim| {
@@ -254,7 +254,7 @@ pub(super) async fn recovery_route(sim: &Sim, label: &str, group: &str) -> Resul
 
 /// Whether `admin`'s requester list shows `requester` answered with
 /// `answer` (a JSON string or an object keyed by it).
-fn answered(route: &Value, requester: &str, answer: &str) -> bool {
+pub(super) fn answered(route: &Value, requester: &str, answer: &str) -> bool {
     route["requesters"].as_array().is_some_and(|rows| {
         rows.iter().any(|row| {
             row["requester"]
@@ -286,7 +286,7 @@ impl JWindow {
 }
 
 /// `{state}` plus its `reason` or `cause`, as one short string.
-fn recovery_text(recovery: &Value) -> String {
+pub(super) fn recovery_text(recovery: &Value) -> String {
     if recovery.is_null() {
         return "null".to_string();
     }
@@ -1142,7 +1142,7 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
 /// Start every label in `labels`. The labels in `ranked` get their
 /// pre-generated keys reassigned among themselves so that their agent IDs
 /// rise in that order.
-async fn start_ranked(sim: &mut Sim, labels: &[&str], ranked: &[&str]) -> Result<()> {
+pub(super) async fn start_ranked(sim: &mut Sim, labels: &[&str], ranked: &[&str]) -> Result<()> {
     let mut pairs = Vec::new();
     for label in ranked {
         pairs.push(sim.take_keys(label)?);

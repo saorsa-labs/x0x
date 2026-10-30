@@ -1766,4 +1766,414 @@ mod daemon_tests {
         );
         Ok(())
     }
+
+    /// Poll until `seat`'s stored status becomes `want`: a send's
+    /// completion writes it asynchronously.
+    async fn seat_becomes(
+        state: &Arc<AppState>,
+        key: &EvictionKey,
+        seat: &[u8; 32],
+        want: RecipientDelivery,
+    ) -> bool {
+        for _ in 0..250 {
+            let seen = state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .removals
+                .get(key)
+                .and_then(|delivery| delivery.recipients.get(seat).copied());
+            if seen == Some(want) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    /// A live GSS group at `epoch` whose survivor seat has no KEM key
+    /// (`insert_group` adds none), with its removal event of `target`.
+    async fn keyless_gss_group(
+        state: &Arc<AppState>,
+        group_id: &str,
+        survivor: &AgentId,
+        target: &[u8; 32],
+        epoch: u64,
+    ) -> (GroupInfo, NamedGroupMetadataEvent) {
+        let mut info = insert_group(state, group_id, survivor).await;
+        info.secret_epoch = epoch;
+        info.shared_secret = Some(vec![epoch as u8; 32]);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let mut event = removal_event(group_id, target);
+        if let NamedGroupMetadataEvent::MemberRemoved {
+            secret_epoch,
+            commit,
+            ..
+        } = &mut event
+        {
+            *secret_epoch = Some(epoch);
+            *commit = Some(super::tests::commit("p", &info.state_hash));
+        }
+        (info, event)
+    }
+
+    /// #1633 (the 25 Oct close call lived under a day, 27 Oct 23:42 UTC
+    /// to 28 Oct 00:18 UTC), ADR 0110
+    /// §3 L228 — survivor convergence, not a transport ACK, proves
+    /// delivery. A GSS removal aimed at a seat this author's roster shows
+    /// with no KEM key seals no share to it, and the keyless survivor
+    /// claims no head while keyless (#1627, David's ruling, 28 Oct 02:09
+    /// GMT), so it converges no row: no acceptance of the carrier and no
+    /// absent answer closes the seat. The recovery is the seat re-joining
+    /// keyed, so the author's own round seals the share; only the
+    /// installed share's report — the share-proof — converges the seat
+    /// and ends the row.
+    #[tokio::test]
+    async fn a_keyless_seat_stays_pending_until_the_share_proof_converges_it() -> Result<()> {
+        use base64::Engine as _;
+        let (state, _dir) = state_past_restart_wait().await?;
+        let survivor = AgentId([0x85; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let target = [0x86; 32];
+        let group_id = "d9".repeat(16);
+        let (info, event) = keyless_gss_group(&state, &group_id, &survivor, &target, 5).await;
+        let stable = info.stable_group_id().to_string();
+        let result_head = info.state_hash.clone();
+        let key = EvictionKey::new(stable.clone(), target);
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.removals.insert(
+                key.clone(),
+                new_delivery(
+                    event,
+                    info.state_hash.clone(),
+                    vec![*survivor.as_bytes()],
+                    false,
+                    Instant::now(),
+                ),
+            );
+        }
+        drive(&state).await;
+        assert!(
+            seat_becomes(&state, &key, survivor.as_bytes(), RecipientDelivery::Sent).await,
+            "the carrier's acceptance is Sent, not delivery: an ACK closes no seat (ADR 0110 §3)"
+        );
+        // Force another round: the obligation stays open while the
+        // survivor is keyless. The keyless disclaimer — the survivor
+        // claims no head while keyless (#1627, David's ruling, 28 Oct
+        // 02:09 GMT) — fed here at the catch-up entry point (the served
+        // shape is pinned by the crypto-exclusion tests): with no round
+        // open it creates no obligation, and it converges no seat.
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            if let Some(delivery) = inner.removals.get_mut(&key) {
+                delivery.next_at = Instant::now();
+            }
+        }
+        drive(&state).await;
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            None,
+        )
+        .await;
+        assert!(
+            seat_becomes(&state, &key, survivor.as_bytes(), RecipientDelivery::Sent).await,
+            "the keyless disclaimer converges nothing: the seat stays Sent"
+        );
+        assert_eq!(
+            shares_to(&state, &survivor_hex),
+            0,
+            "a reshare-due round seals no share to a seat with no KEM key"
+        );
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.removals.contains_key(&key),
+                "the row stays open while the survivor is keyless"
+            );
+            assert_eq!(
+                inner
+                    .removals
+                    .get(&key)
+                    .and_then(|delivery| delivery.recipients.get(survivor.as_bytes())),
+                Some(&RecipientDelivery::Sent),
+                "the keyless seat is Sent, not Converged"
+            );
+        }
+
+        // The recovery: the seat re-joins keyed, so the author's own round
+        // can seal the share.
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_id)
+            .context("group")?
+            .members_v2
+            .get_mut(&survivor_hex)
+            .context("seat")?
+            .kem_public_key_b64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(&kem.public_bytes));
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            if let Some(delivery) = inner.removals.get_mut(&key) {
+                delivery.next_at = Instant::now();
+            }
+        }
+        drive(&state).await;
+        assert!(
+            shares_to(&state, &survivor_hex) >= 1,
+            "the author's own round sealed the share once the seat had a key"
+        );
+        assert!(
+            seat_becomes(&state, &key, survivor.as_bytes(), RecipientDelivery::Sent).await,
+            "even a sealed share is not delivery: the seat stays Sent"
+        );
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .removals
+                .contains_key(&key),
+            "no report arrived: the row stays open after the seal"
+        );
+
+        // This row's state machine has no survivor node, so the report is
+        // fed at the catch-up entry point: the share-proof of the sealed
+        // share (the served shape is pinned by the crypto-exclusion
+        // tests), and only it converges the seat. The real install path
+        // is proven by the owner-recovery and crypto-exclusion
+        // two-node tests.
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            Some(&result_head),
+        )
+        .await;
+        assert!(
+            seat_becomes(
+                &state,
+                &key,
+                survivor.as_bytes(),
+                RecipientDelivery::Converged
+            )
+            .await,
+            "the share-proof report converges the seat"
+        );
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            if let Some(delivery) = inner.removals.get_mut(&key) {
+                delivery.next_at = Instant::now();
+            }
+        }
+        drive(&state).await;
+        assert!(
+            !state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .removals
+                .contains_key(&key),
+            "only the share-proof report ends the delivery"
+        );
+        Ok(())
+    }
+
+    /// #1633 restart (the 25 Oct close call lived under a day, 27 Oct
+    /// 23:42 UTC to 28 Oct 00:18 UTC): the
+    /// restarted author keeps the §3 obligation. It holds no close record,
+    /// and none is re-derived: the resumed round sends the saved event and
+    /// the carrier takes it, but ADR 0110 §3 L228 — survivor convergence,
+    /// not a transport ACK, proves delivery — keeps the seat open. The
+    /// keyless survivor claims no head while keyless (#1627, David's
+    /// ruling, 28 Oct 02:09 GMT), so it converges no row. The row ends
+    /// only when the seat re-joins keyed, its share seals and installs,
+    /// and the report proves it.
+    #[tokio::test]
+    async fn a_restarted_author_keeps_a_keyless_seat_pending_until_convergence() -> Result<()> {
+        use base64::Engine as _;
+        let (state, dir) = state_past_restart_wait().await?;
+        let survivor = AgentId([0x87; 32]);
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let target = [0x88; 32];
+        let group_id = "da".repeat(16);
+        let (info, event) = keyless_gss_group(&state, &group_id, &survivor, &target, 6).await;
+        let stable = info.stable_group_id().to_string();
+        let result_head = info.state_hash.clone();
+        let bytes = serde_json::to_vec(&event).expect("encode");
+        super::super::super::persist_named_group_info(&state, &stable, info.clone()).await?;
+        let key = EvictionKey::new(stable.clone(), target);
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store.intake(
+                &key,
+                x0x::groups::eviction::EvictionTrigger::AgentRevocation {
+                    record_hash: [7; 32],
+                    record_bytes: vec![7],
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            let row = inner.store.get_mut(&key).context("row")?;
+            row.phase = Phase::CommittedDeliveryPending;
+            row.parent_head = Some("p".to_string());
+            row.result_head = Some(result_head.clone());
+            row.result_epoch = Some(6);
+            row.outgoing_event = Some(bytes);
+            inner.dirty = true;
+        }
+        assert!(
+            super::super::persist_obligations(&state).await,
+            "the saved removal event is durable"
+        );
+
+        // The author restarts mid-delivery: the row and its saved event
+        // persist, and the loaded roster still seats the survivor with no
+        // KEM key. No close record exists to re-derive, so the restarted
+        // author closes nothing from a record: the seat stays Sent and
+        // the row stays open until the survivor converges.
+        let mut restarted = super::super::super::tests::secure_endpoint_test_state_at(
+            dir.path(),
+            Arc::clone(&state.agent),
+        )
+        .await?;
+        super::super::zero_restart_wait_for_test(&mut restarted);
+        super::super::load_persisted_obligations(&restarted).await;
+        {
+            let inner = restarted.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.removals.contains_key(&key),
+                "the saved event's delivery resumes"
+            );
+            assert!(
+                !inner.head_rounds.contains_key(&stable),
+                "no round is inserted by hand: the worker opens it"
+            );
+        }
+        // The restarted worker opens the head round itself: the pass
+        // reads the open store row and the loaded group's head, which is
+        // the result head.
+        super::super::revocation_eviction_pass(&restarted).await;
+        drive(&restarted).await;
+        assert!(
+            seat_becomes(
+                &restarted,
+                &key,
+                survivor.as_bytes(),
+                RecipientDelivery::Sent
+            )
+            .await,
+            "the resumed round sends: the carrier's acceptance is Sent, not delivery"
+        );
+        assert_eq!(
+            shares_to(&restarted, &survivor_hex),
+            0,
+            "no share can be sealed to a seat with no KEM key"
+        );
+        // The keyless disclaimer — the survivor claims no head while
+        // keyless (#1627, David's ruling, 28 Oct 02:09 GMT) — fed here
+        // at the catch-up entry point (the served shape is pinned by
+        // the crypto-exclusion tests); it converges nothing on the
+        // restarted author either.
+        super::super::note_catchup_head(
+            &restarted,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            None,
+        )
+        .await;
+        {
+            let inner = restarted.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.removals.contains_key(&key),
+                "the restarted author closes nothing from a record"
+            );
+            assert_eq!(
+                inner
+                    .removals
+                    .get(&key)
+                    .and_then(|delivery| delivery.recipients.get(survivor.as_bytes())),
+                Some(&RecipientDelivery::Sent),
+                "the keyless seat stays Sent on the restarted author"
+            );
+        }
+
+        // The recovery on the restarted author: the seat re-joins keyed,
+        // so the resumed round seals the share.
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        restarted
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_id)
+            .context("group")?
+            .members_v2
+            .get_mut(&survivor_hex)
+            .context("seat")?
+            .kem_public_key_b64 =
+            Some(base64::engine::general_purpose::STANDARD.encode(&kem.public_bytes));
+        {
+            let mut inner = restarted.revocation_evictions.inner.lock().await;
+            if let Some(delivery) = inner.removals.get_mut(&key) {
+                delivery.next_at = Instant::now();
+            }
+        }
+        drive(&restarted).await;
+        assert!(
+            shares_to(&restarted, &survivor_hex) >= 1,
+            "the restarted author's round sealed the share once the seat had a key"
+        );
+
+        // The share-proof report of the keyed recovery, fed at the
+        // catch-up entry point as above, is the only thing that
+        // converges the seat and ends the row.
+        super::super::note_catchup_head(
+            &restarted,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            Some(&result_head),
+        )
+        .await;
+        assert!(
+            seat_becomes(
+                &restarted,
+                &key,
+                survivor.as_bytes(),
+                RecipientDelivery::Converged
+            )
+            .await,
+            "the share-proof report converges the seat"
+        );
+        {
+            let mut inner = restarted.revocation_evictions.inner.lock().await;
+            if let Some(delivery) = inner.removals.get_mut(&key) {
+                delivery.next_at = Instant::now();
+            }
+        }
+        drive(&restarted).await;
+        assert!(
+            !restarted
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .removals
+                .contains_key(&key),
+            "only the share-proof report ends the delivery"
+        );
+        Ok(())
+    }
 }

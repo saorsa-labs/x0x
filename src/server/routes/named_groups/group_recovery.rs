@@ -5674,6 +5674,7 @@ fn authorisation_refused_cause(check: &str) -> &str {
         | "signer_revoked" => "signer",
         "subject_mismatch" => "subject",
         "basis_not_live" | "basis_unknown" => "basis",
+        "record_key_divergent" => "group_mismatch",
         other => other,
     }
 }
@@ -5735,6 +5736,26 @@ fn check_reseat_authority(
         }
     }
     Ok(())
+}
+
+/// #1689 review: the live record's map key, its `mls_group_id` and the
+/// re-seat invite's `group_id` must be one key. The staging slot opens at
+/// the map key, the staged join seats the record at the invite's
+/// `group_id`, and the promote and the discard close the slot by one key.
+/// A legacy record keyed apart from its `mls_group_id` (a pre-pin genesis
+/// id) would leave a slot open under the other key, so it is refused
+/// (`record_key_divergent`, cause `group_mismatch`) before anything is
+/// journalled or moved.
+fn check_reseat_keys(
+    group_key: &str,
+    info: &GroupInfo,
+    invite: &x0x::groups::invite::SignedInvite,
+) -> Result<(), &'static str> {
+    if group_key == info.mls_group_id && invite.group_id == group_key {
+        Ok(())
+    } else {
+        Err("record_key_divergent")
+    }
 }
 
 /// The subject's checks on an invite paired with an authorisation (§3).
@@ -5854,7 +5875,9 @@ async fn consume_reseat(
         refuse_authorisation(state, &stable, info.state_revision, cause).await;
         return;
     }
-    if let Err(cause) = check_reseat_invite(&invite, &authorisation, &stable, &local) {
+    if let Err(cause) = check_reseat_invite(&invite, &authorisation, &stable, &local)
+        .and_then(|()| check_reseat_keys(group_key, &info, &invite))
+    {
         drop(membership_guard);
         refuse_authorisation(state, &stable, info.state_revision, cause).await;
         return;
@@ -6028,11 +6051,19 @@ async fn open_staging(state: &Arc<AppState>, group_key: &str, info: &GroupInfo) 
 /// live map. Returns whether a staging was open.
 async fn discard_staging(state: &AppState, key: &str, stable: &str) -> bool {
     let closed = state.reseat_stagings.close(key);
-    state
-        .named_groups
-        .staging_write()
-        .await
-        .retain(|staged_key, info| staged_key != key && info.stable_group_id() != stable);
+    {
+        // #1689 review: `refresh_group_rosters_for_gossip` reads the slot
+        // under this lock. Emptying it under the same lock narrows the race
+        // with a rollback but does not close it: a refresh that read the
+        // slot before this point can still publish the abandoned staged
+        // roster once, and the next refresh replaces it.
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        state
+            .named_groups
+            .staging_write()
+            .await
+            .retain(|staged_key, info| staged_key != key && info.stable_group_id() != stable);
+    }
     state.treekem_groups.staging_write().await.remove(key);
     state.mls_groups.staging_write().await.remove(key);
     if closed {
@@ -6353,6 +6384,15 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
     let Some((key, source)) = seated else {
         return false;
     };
+    // The slot is opened at the original's key ([`open_staging`]), and the
+    // promote and discard below close it by that key. [`consume_reseat`]
+    // refuses a record whose keys differ, so this is a backstop that
+    // should not run: a staged record at another key is never promoted,
+    // and the journal stays open and rolls back.
+    if key != journal.live_key {
+        tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged key is not the journalled live key (unexpected); the swap is refused");
+        return false;
+    }
     let expected = journal.record_digest;
     // §3 step 3 (#1533 review): `Swapping` lifts the legacy overlay and the
     // marker hold, then one durable roster write puts the staged record in
@@ -13879,6 +13919,7 @@ mod tests {
             ("expired", "expired"),
             ("group_mismatch", "group_mismatch"),
             ("reseat_invite_unpaired", "reseat_invite_unpaired"),
+            ("record_key_divergent", "group_mismatch"),
         ] {
             assert_eq!(authorisation_refused_cause(check), cause, "{check}");
         }
@@ -13964,6 +14005,87 @@ mod tests {
             "the staged join ran: {refusal:?}"
         );
         original_kept(&state, &key, &info).await
+    }
+
+    /// #1689 review: [`check_reseat_keys`] needs the map key, the record's
+    /// `mls_group_id` and the invite's `group_id` to be one key; any one
+    /// apart is `record_key_divergent`.
+    #[test]
+    fn check_reseat_keys_needs_one_key() -> anyhow::Result<()> {
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let key = "1689".repeat(16);
+        let other = "a1".repeat(32);
+        let info = GroupInfo::new("keys".into(), String::new(), admin.agent_id(), key.clone());
+        let invite = |group_id: &str| {
+            x0x::groups::invite::SignedInvite::new(
+                group_id.to_string(),
+                "keys".into(),
+                &admin.agent_id(),
+                3600,
+            )
+        };
+        assert_eq!(check_reseat_keys(&key, &info, &invite(&key)), Ok(()));
+        for (map_key, invite_id) in [(&other, &key), (&key, &other)] {
+            assert_eq!(
+                check_reseat_keys(map_key, &info, &invite(invite_id)),
+                Err("record_key_divergent")
+            );
+        }
+        Ok(())
+    }
+
+    /// #1689 review (Engineer ruling, 29 Oct): a legacy record whose map
+    /// key (its pre-pin genesis id) differs from its `mls_group_id` is
+    /// refused with `record_key_divergent` (cause `group_mismatch`) before
+    /// anything is journalled or moved. Before the guard this valid offer
+    /// from a local admin reached the staged join. Inert.
+    #[tokio::test]
+    async fn a_reseat_of_a_record_keyed_apart_from_its_mls_group_id_is_refused(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let member = x0x::identity::AgentKeypair::generate()?;
+        let (key, mut info) = authority_fixture(&state, &admin, &member, None).await?;
+        let legacy = "1689".repeat(16);
+        assert_ne!(legacy, info.mls_group_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            legacy.clone(),
+            hex::encode(admin.agent_id().as_bytes()),
+            1_000,
+            String::new(),
+        ));
+        info.fork_quarantine = Some(original_marker(&state, &info));
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.remove(&key);
+            groups.insert(legacy.clone(), info.clone());
+        }
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        assert_eq!(info.stable_group_id(), legacy);
+        let (basis, revision, hash) = unseen_removal(&info);
+        // A v4 invite signs `group_id` equal to `stable_group_id` (E1), so
+        // the admin mints it at the record's stable (legacy) id.
+        let mut minted_view = info.clone();
+        minted_view.mls_group_id = legacy.clone();
+        let offer = reseat_offer(
+            &minted_view,
+            &admin,
+            state.agent.agent_id(),
+            basis,
+            (revision, &hash),
+        )?;
+        let refusal = deliver_offer(&state, &info, &admin, offer).await;
+        assert_eq!(
+            refusal.as_deref(),
+            Some("authorisation_refused:group_mismatch")
+        );
+        for open_key in [&legacy, &info.mls_group_id] {
+            assert!(state.reseat_stagings.scope_for(open_key).is_none());
+        }
+        original_kept(&state, &legacy, &info).await
     }
 
     /// A `Removal` basis is checked against this node's own chain: a
