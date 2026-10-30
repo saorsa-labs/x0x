@@ -1360,6 +1360,7 @@ pub async fn serve_with_options(
             routes::named_groups::TREEKEM_CATCHUP_SERVE_SLOTS,
         )),
         treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+        treekem_catchup_refusals: StdMutex::new(HashMap::new()),
         group_membership_locks: RwLock::new(HashMap::new()),
         reseat_stagings: Default::default(),
         treekem_groups: reseat_scope::ScopedGroupMap::new(treekem_groups),

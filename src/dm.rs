@@ -117,6 +117,17 @@ impl CapabilityRegistry {
     /// — a member's republication of a fresh KEM key on its own
     /// already-Active seat. Bit 12.
     pub const KEY_REPUBLISH_V1: u64 = 1 << 12;
+    /// #1657 (ADR 0110 §3; David's approval, 28 Oct 2026 02:08 GMT):
+    /// sends and understands the typed `treekem_catchup_refusal` that
+    /// answers a TreeKEM catch-up request from a machine-revoked or
+    /// binding-revoked device. Bit 13, the next free bit after #1663's
+    /// `key_republish_v1` (bit 12, PR #1716). Every refusal send is
+    /// gated on the requester machine's verified advert carrying this
+    /// bit (Engineer rulings, 29 Oct 2026 22:14 and 22:52 GMT): a peer
+    /// without the bit, and a peer with no verified advert, keep
+    /// main's silent drop, so an older peer never records the refusal
+    /// as a durable DM-history row.
+    pub const TREEKEM_CATCHUP_REFUSAL_V1: u64 = 1 << 13;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
@@ -134,7 +145,8 @@ impl CapabilityRegistry {
                 | Self::OWNER_RECOVERY_V1
                 | Self::GUI_SHOW_V1
                 | Self::JOIN_PENDING_NOTICE_V1
-                | Self::KEY_REPUBLISH_V1,
+                | Self::KEY_REPUBLISH_V1
+                | Self::TREEKEM_CATCHUP_REFUSAL_V1,
         }
     }
 
