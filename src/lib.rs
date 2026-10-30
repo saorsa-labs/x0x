@@ -1163,7 +1163,9 @@ fn treekem_refusal_capability_admits(
 /// [`Agent::signing_gate_allows`] on the pieces the refusal-only reply
 /// path captures: a quiesced (mid-move/retire-pending) or quarantined
 /// machine sends no refusal, exactly as it produces no agent
-/// signature.
+/// signature. One deliberate divergence (Codex rc3 note): the corrupt
+/// moves.bin fail-close runs BEFORE the empty-log return, so an empty
+/// log under lost move state fails closed here too.
 async fn treekem_refusal_signing_gate_allows(
     identity: &std::sync::Arc<identity::Identity>,
     move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
@@ -1171,15 +1173,16 @@ async fn treekem_refusal_signing_gate_allows(
 ) -> bool {
     let agent = identity.agent_id();
     let holds_key = true;
+    // A corrupt/undecodable moves.bin fail-closes every empty log:
+    // state loss must not assert custody by signing a refusal.
+    if move_state_load_failed.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
     let state = move_state.read().await;
     if state.log(&agent).is_empty() {
         // The refusal is sent for the daemon's own agent, so this is
         // exactly `agent == self.agent_id() && holds_key`.
         return holds_key;
-    }
-    // A corrupt/undecodable moves.bin fail-closes every empty log.
-    if move_state_load_failed.load(std::sync::atomic::Ordering::Acquire) {
-        return false;
     }
     state
         .fold(&agent)
@@ -1207,7 +1210,7 @@ async fn send_treekem_refusal_frame(
             stage = "refusal_reply",
             machine_prefix = %network::hex_prefix(&machine_id.0, 4),
             outcome = "treekem_refusal_dedupe",
-            "typed TreeKEM catch-up refusal withheld: this (machine, group) pair was answered inside the dedupe window"
+            "typed TreeKEM catch-up refusal withheld: this (machine, group) pair was answered inside the dedupe window, or the window is at its bound and new pairs are suppressed until rows expire"
         );
         return;
     }

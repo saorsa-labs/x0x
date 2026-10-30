@@ -262,8 +262,10 @@ const TREEKEM_REFUSAL_DEDUPE_TTL: std::time::Duration = std::time::Duration::fro
 
 /// Bound of the dedupe map: it holds one row per distinct refused
 /// (machine, group) pair inside the TTL window. When the window holds
-/// more rows than this, the whole window is dropped rather than grown
-/// — a revocation flood must not buy unbounded memory.
+/// this many rows, NEW pairs are not answered and not recorded until
+/// rows expire — fresh rows are never dropped, so a requester cannot
+/// buy a window reset by cycling group ids (Codex rc3 P2), and a
+/// revocation flood cannot buy unbounded memory.
 const TREEKEM_REFUSAL_DEDUPE_CAP: usize = 512;
 
 /// #1657: the shared bookkeeping of the refusal-only reply path,
@@ -288,9 +290,11 @@ pub(crate) struct TreeKemRefusalReplies {
 impl TreeKemRefusalReplies {
     /// Admit one (machine, group) refusal answer: `true` when it has
     /// no fresh entry (and one is now held), `false` when the same
-    /// pair was answered inside the dedupe window. A poisoned lock
-    /// fails open — the dedupe bounds duplicate answers, it is not a
-    /// security gate.
+    /// pair was answered inside the dedupe window — or when the map is
+    /// at its bound, where a NEW pair is suppressed (not recorded)
+    /// until rows expire rather than displacing fresh ones. A poisoned
+    /// lock fails open — the dedupe bounds duplicate answers, it is not
+    /// a security gate.
     pub(crate) fn admit(&self, machine_id: MachineId, group_id: &str) -> bool {
         let Some(bytes) = treekem_group_id_bytes(group_id) else {
             return false;
@@ -300,17 +304,18 @@ impl TreeKemRefusalReplies {
         };
         let now = std::time::Instant::now();
         recent.retain(|_, at| now.duration_since(*at) < TREEKEM_REFUSAL_DEDUPE_TTL);
+        let key = (machine_id, bytes);
+        // The incoming pair is checked first: a fresh row always wins,
+        // including at the bound — an immediate repeat is never
+        // re-admitted (Codex rc3 P2).
+        if recent.contains_key(&key) {
+            return false;
+        }
         if recent.len() >= TREEKEM_REFUSAL_DEDUPE_CAP {
-            recent.clear();
+            return false;
         }
-        use std::collections::hash_map::Entry;
-        match recent.entry((machine_id, bytes)) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(vacant) => {
-                vacant.insert(now);
-                true
-            }
-        }
+        recent.insert(key, now);
+        true
     }
 
     /// The dedupe window of one (machine, group) pair, aged to expire
@@ -2184,6 +2189,36 @@ mod tests {
         assert!(
             !replies.admit(machine, "not hex!"),
             "a malformed group id is never admitted"
+        );
+    }
+
+    #[test]
+    fn treekem_refusal_dedupe_holds_at_capacity() {
+        // Codex rc3 P2: at the bound the window must keep deduping a
+        // recorded pair — neither a full clear nor a fresh-entry drop
+        // may re-admit an immediate repeat. New pairs are suppressed
+        // until rows expire, and one expiry frees the window again.
+        let replies = TreeKemRefusalReplies::default();
+        let machine = MachineId([5u8; 32]);
+        for i in 0..TREEKEM_REFUSAL_DEDUPE_CAP {
+            let group = format!("{i:064x}");
+            assert!(replies.admit(machine, &group), "pair {i} fills the window");
+        }
+        let recorded = format!("{:064x}", 0usize);
+        assert!(
+            !replies.admit(machine, &recorded),
+            "an immediate repeat of a recorded pair stays deduped at capacity"
+        );
+        assert!(
+            !replies.admit(machine, &format!("{:064x}", TREEKEM_REFUSAL_DEDUPE_CAP)),
+            "a new pair is suppressed while the window is full"
+        );
+        // The window drains by TTL, so suppression is not a reset: one
+        // expired row frees a slot and new pairs are answered again.
+        replies.expire_for_test(machine, &recorded);
+        assert!(
+            replies.admit(machine, &format!("{:064x}", TREEKEM_REFUSAL_DEDUPE_CAP + 1)),
+            "after an entry expires the window answers new pairs again"
         );
     }
 
