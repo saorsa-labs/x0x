@@ -43,6 +43,12 @@ run-wrapper = 'w3h-sim'
 default-filter = 'test(/(^|::)w3h_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# The H-S3-c/c2 rows: see the `w3h-gate` override below.
+[[profile.w3h.overrides]]
+filter = 'test(/(^|::)w3h_1356_red_s3_c2?_(promoted_admin_reseats_owner_axis_node|reseat_retires_marker_and_gap)$/)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+priority = 60
+
 # The CI `W3-H harness` gate job only: the same as `w3h`, plus raw payload
 # dumps (`<case>-<pid>.payloads`, test identities only; the first run of
 # each case and the first run whose digest differs from it) next to the
@@ -59,6 +65,16 @@ run-wrapper = 'w3h-sim-dump'
 default-filter = 'test(/(^|::)w3h_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 success-output = "final"
+
+# ADR 0109 H-S3-c/c2 (#1689): each row runs a 30-minute virtual advance and
+# a re-seat on four nodes, 255-600 s of wall time per run (more on the
+# 4-vCPU runner). The 300 s kill above would end them with no receipt, so
+# these two rows alone get 15 minutes. The stress count stays 20. They
+# start first in each rerun, like the long cases below.
+[[profile.w3h-gate.overrides]]
+filter = 'test(/(^|::)w3h_1356_red_s3_c2?_(promoted_admin_reseats_owner_axis_node|reseat_retires_marker_and_gap)$/)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+priority = 60
 
 # Start the longest sims first in each rerun. In list order the 83 s
 # #1427 catch-up case waited for the 1023 sims (about 145 s each on the
@@ -100,6 +116,16 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # Network integration tests need longer timeouts for QUIC handshakes
 # and gossip propagation on macOS
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+# ADR 0109 H-S3-c/c2 (#1689): the same two rows as the `w3h` overrides
+# above. A GREEN run does the full 30-minute virtual advance and re-seat.
+# On 27ac757 the Test Suite killed both at the 600 s limit (CI run
+# 40864998747); one local run takes 180-260 s. These two rows alone get
+# 15 minutes here too, and start first.
+[[profile.default.overrides]]
+filter = 'test(/(^|::)w3h_1356_red_s3_c2?_(promoted_admin_reseats_owner_axis_node|reseat_retires_marker_and_gap)$/)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+priority = 60
 
 # Tests that create multiple QUIC endpoints on localhost must not run
 # concurrently on macOS — ant-quic's dual-stack socket handling causes

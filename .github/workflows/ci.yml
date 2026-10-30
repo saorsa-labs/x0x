@@ -609,7 +609,12 @@ jobs:
     name: W3-H shard (${{ matrix.group }})
     needs: w3h-plan
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # S3 runs the H-S3-c/c2 owner-cert rows at 15 min each (#1689) and the
+    # H-S3-d7 flood row (#1717), so its group gets 165 min (Engineer ruling,
+    # 30 Oct; no shard split). Every other group keeps 120 min. The isolated test
+    # phase has its own deadline (`X0X_RUNTIME_TIMEOUT_SECONDS` below), which
+    # must also fit inside this limit with room for setup and upload.
+    timeout-minutes: ${{ matrix.group == 's3' && 165 || 120 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.w3h-plan.outputs.matrix) }}
@@ -659,7 +664,11 @@ jobs:
       - name: Run W3-H cases 20 times
         env:
           X0X_ISOLATION_ROLE: w3h-harness
-          X0X_RUNTIME_TIMEOUT_SECONDS: 6600
+          # The deadline of the isolated test phase only (the build runs
+          # before it). S3 needs about 135 min for 20 reruns, so it gets
+          # 9300 s (155 min) inside its 165-min job; every other group keeps
+          # 6600 s. `isolated-runtime.py` caps the value at 21600 s.
+          X0X_RUNTIME_TIMEOUT_SECONDS: ${{ matrix.group == 's3' && 9300 || 6600 }}
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
         # The profile default-filter still intersects this expression, so
@@ -852,6 +861,12 @@ jobs:
           --expect w3h_1356_red_s3_t_deferred_until_host_commit=GREEN
           --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
           --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
+          --require w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node
+          --expect w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node=GREEN
+          --require w3h_1356_red_s3_c2_reseat_retires_marker_and_gap
+          --expect w3h_1356_red_s3_c2_reseat_retires_marker_and_gap=GREEN
+          --require w3h_1666_control_certificate_only_admin_seals
+          --expect w3h_1666_control_certificate_only_admin_seals=GREEN
           --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
           --expect w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless=GREEN
           --require w3h_1581_s4_ordinary_admin_revoked
