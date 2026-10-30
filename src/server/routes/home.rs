@@ -425,16 +425,46 @@ pub(crate) async fn find_home(
     }
 }
 
-/// A group that matches the full Home policy for `owner` whether or not the
-/// Home metadata was stamped — the crash-recovery predicate (review fix 3:
-/// a crash between create and stamp must adopt the created group, not mint
-/// a second one).
+/// ADR 0109 §4 (D81) Home-policy check. Policy only.
+///
+/// The S3 Home gate calls this through `is_home_policy_group`. A shared
+/// group that uses the Home policy stays gated, stamped or not. Crash
+/// recovery does not use this predicate. It uses
+/// [`is_home_recovery_candidate`].
 #[must_use]
 pub(in crate::server) fn is_home_candidate(
     info: &crate::groups::GroupInfo,
     owner: &crate::identity::UserId,
 ) -> bool {
     is_home_policy(&info.policy, owner)
+}
+
+/// Crash-recovery predicate (review fix 3, #1687).
+///
+/// True when the policy is exactly [`home_policy`] for `owner` and the
+/// creator is the sole active member. The recovery scan also requires that
+/// this agent is that creator, and that Home metadata is not stamped yet.
+/// A crash between create and stamp then adopts that group instead of
+/// minting a second Home.
+///
+/// Policy equality is not enough. A shared group can use the same five
+/// axes. Accepting it here makes recovery stamp Home metadata and seal a
+/// commit that is never published. The other members keep the previous
+/// head and later refuse the owner's next commit.
+#[must_use]
+pub(in crate::server) fn is_home_recovery_candidate(
+    info: &crate::groups::GroupInfo,
+    owner: &crate::identity::UserId,
+) -> bool {
+    if !is_home_policy(&info.policy, owner) {
+        return false;
+    }
+    let creator_hex = hex::encode(info.creator.as_bytes());
+    let mut active = info.active_members();
+    match (active.next(), active.next()) {
+        (Some(member), None) => member.agent_id == creator_hex,
+        _ => false,
+    }
 }
 
 /// Read + verify the marker (review fix 3): PARSED (never a bare
@@ -501,6 +531,52 @@ async fn write_marker(path: &std::path::Path, marker: &HomeMarker) {
     }
 }
 
+/// Crash recovery may stamp this group only while every adoption condition
+/// still holds on the record in hand: not withdrawn, Home metadata absent,
+/// Home policy, and this agent is the creator and the sole active member.
+///
+/// The scan, the seal snapshot, and the persist closure all use this
+/// predicate. A check that runs only at selection is stale once that read
+/// guard drops.
+fn recovery_adoption_holds(
+    info: &crate::groups::GroupInfo,
+    owner: &crate::identity::UserId,
+    local_hex: &str,
+) -> bool {
+    !info.withdrawn
+        && info.home.is_none()
+        && is_home_recovery_candidate(info, owner)
+        && hex::encode(info.creator.as_bytes()) == local_hex
+}
+
+/// Outcome of stamping Home metadata onto a group.
+enum HomeSeal {
+    /// The stamped record was sealed and persisted.
+    ///
+    /// Boxed so the defer and failure variants stay small (`large_enum_variant`).
+    Sealed(Box<crate::groups::GroupInfo>),
+    /// Recovery conditions failed on the snapshot or under the persist
+    /// guard. Nothing was written. The caller defers, the same way a scan
+    /// that finds no candidate defers.
+    RecoveryDeferred,
+    /// The seal or the persist failed. The caller stops this pass.
+    Failed,
+}
+
+/// Stamp and seal a crash-recovery candidate.
+///
+/// Re-checks [`recovery_adoption_holds`] on the snapshot that is sealed and
+/// again on the live record inside the persist closure. A certified join
+/// between selection and either of those points defers instead of sealing
+/// an unpublished shared-group commit.
+async fn stamp_recovered_home(
+    state: &Arc<AppState>,
+    group_id: &str,
+    owner: crate::identity::UserId,
+) -> HomeSeal {
+    seal_home(state, group_id, Some(owner)).await
+}
+
 /// Stamp Home metadata on `group_id` and SEAL it into the signed state
 /// chain (review fix 1): the Home digest enters the state hash via
 /// `public_meta()`, so `primary_agent` is covered by an owner-agent-signed
@@ -509,17 +585,40 @@ async fn stamp_and_seal_home(
     state: &Arc<AppState>,
     group_id: &str,
 ) -> Option<crate::groups::GroupInfo> {
+    match seal_home(state, group_id, None).await {
+        HomeSeal::Sealed(info) => Some(*info),
+        HomeSeal::RecoveryDeferred | HomeSeal::Failed => None,
+    }
+}
+
+async fn seal_home(
+    state: &Arc<AppState>,
+    group_id: &str,
+    recovery_owner: Option<crate::identity::UserId>,
+) -> HomeSeal {
     let signing_kp = state.agent.identity().agent_keypair();
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     // ADR-0066 §4 / ADR-0067: capture the lifecycle epoch token in the SAME
     // read guard as the clone, so the token and the record are the same
     // observation. See the re-check at the persist below.
     let (mut info, captured_epoch) = {
         let groups = state.named_groups.read().await;
-        let info = groups.get(group_id).cloned()?;
+        let Some(info) = groups.get(group_id).cloned() else {
+            return HomeSeal::Failed;
+        };
         let token = crate::server::lifecycle_epoch_token_locked(&groups, group_id);
         (info, token)
     };
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if let Some(owner) = recovery_owner {
+        if !recovery_adoption_holds(&info, &owner, &local_hex) {
+            #[cfg(test)]
+            recovery_seal_observation::record(
+                group_id,
+                recovery_seal_observation::RecoveryRefusePoint::Snapshot,
+            );
+            return HomeSeal::RecoveryDeferred;
+        }
+    }
     let mut placements = std::collections::BTreeMap::new();
     // Round-2 fix 3: the founding agent provisions as ROAMING — ADR-0038
     // requires the Home agent to follow the user across machines, so the
@@ -527,6 +626,7 @@ async fn stamp_and_seal_home(
     // fresh install. NOMINAL UNTIL ADR-0043: placement is still the
     // ADR-0037 placeholder (no move protocol, no enforcement) — this bit
     // is the stated intent; 0043 makes it load-bearing.
+    let local_for_persist = local_hex.clone();
     placements.insert(local_hex.clone(), crate::groups::MemberPlacement::Roaming);
     info.home = Some(crate::groups::HomeMetadata {
         primary_agent: local_hex,
@@ -547,7 +647,7 @@ async fn stamp_and_seal_home(
         seal_commit_owner_certified(state, &mut info, signing_kp, now_millis_u64()).await
     {
         tracing::error!(group_id, "Home metadata seal failed: {e}");
-        return None;
+        return HomeSeal::Failed;
     }
     // ADR-0066 §4 / ADR-0067 — re-check under the write guard before the
     // insert.
@@ -566,12 +666,31 @@ async fn stamp_and_seal_home(
     // marker half is compared in BOTH directions — this path never installs
     // a marker, so unlike the TreeKEM persist there is no install to
     // mistake a new marker for, and resurrection is refused too.
+    //
+    // Recovery also re-checks sole-member adoption on the live record in
+    // this same closure. MarkerOnly does not see a certified join, and the
+    // insert would otherwise persist the pre-join snapshot.
+    let recovery_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     match persist_named_groups_mutation_epoch_checked(
         state,
         group_id,
         captured_epoch.as_ref(),
         EpochScope::MarkerOnly,
         |groups| {
+            if let Some(owner) = recovery_owner {
+                let still = groups
+                    .get(group_id)
+                    .is_some_and(|live| recovery_adoption_holds(live, &owner, &local_for_persist));
+                if !still {
+                    recovery_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                    #[cfg(test)]
+                    recovery_seal_observation::record(
+                        group_id,
+                        recovery_seal_observation::RecoveryRefusePoint::Persist,
+                    );
+                    return false;
+                }
+            }
             groups.insert(group_id.to_string(), info.clone());
             true
         },
@@ -590,17 +709,22 @@ async fn stamp_and_seal_home(
                 "ADR-0066 §4: refusing to seal Home metadata — the group's fork-quarantine \
                  marker changed while the seal was in flight; the marker is preserved"
             );
-            return None;
+            return HomeSeal::Failed;
+        }
+        EpochCheckedPersist::Applied(_)
+            if recovery_lost.load(std::sync::atomic::Ordering::Relaxed) =>
+        {
+            return HomeSeal::RecoveryDeferred;
         }
         EpochCheckedPersist::Applied(_) => {
             tracing::error!(
                 group_id,
                 "Home metadata could not be persisted (marker not written; will retry)"
             );
-            return None;
+            return HomeSeal::Failed;
         }
     }
-    Some(info)
+    HomeSeal::Sealed(Box::new(info))
 }
 
 /// Reseal EXISTING Home metadata (round-2 fix 1): keep the metadata as
@@ -618,8 +742,9 @@ async fn reseal_home(state: &Arc<AppState>, group_id: &str) -> Option<crate::gro
     info.home.as_ref()?;
     // Round-3 fix b: explicit Admin-role gate — resealing writes a signed
     // commit for the group; only an active Admin (or better) of THIS group
-    // may author it. find_home guarantees it on the trusted path, but this
-    // function is also the chokepoint for any future caller.
+    // may author it. find_home guarantees an active member on the trusted
+    // path, not an Admin seat, so this check is the authority gate. It is
+    // also the chokepoint for any future caller.
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     if !info
         .caller_role(&local_hex)
@@ -936,6 +1061,7 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
     }
     let owner = user_kp.user_id();
     let owner_hex = hex::encode(owner.as_bytes());
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let marker_path = state.data_dir.join(HOME_MARKER_FILE);
 
     // 1) Trusted Home already present (the marker is only advisory — the
@@ -943,11 +1069,11 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
     if let Some((id, info)) = find_home(state, &owner).await {
         // Round-2 fix 1: a restored Home whose state hash does not commit
         // to its (nonempty) metadata is LEGACY-UNSIGNED (a `9c86f2d`-era
-        // Home sealed before `home_digest` existed) or tampered. We are
-        // the owner with an active Admin seat (find_home guarantees it),
-        // so reseal the existing metadata through the provisioning commit
-        // path; if resealing is impossible, strip the metadata and warn —
-        // never keep trusting unsigned Home claims.
+        // Home sealed before `home_digest` existed) or tampered. find_home
+        // guarantees an active member, not an Admin seat. `reseal_home`
+        // checks Admin and refuses otherwise. Reseal through the
+        // provisioning commit path; if resealing is impossible, strip the
+        // metadata and warn — never keep trusting unsigned Home claims.
         if info.home.is_some() && !info.state_hash_is_current() {
             tracing::warn!(
                 group_id = %id,
@@ -971,8 +1097,15 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
                         true
                     })
                     .await;
-                    // Fall through: the (now unstamped) group becomes a
-                    // recovery candidate below and is re-stamped fresh.
+                    // The metadata is untrusted, so it is removed. This arm
+                    // then returns. It does not adopt the group. The restore
+                    // sweep above usually reseals or strips the same record
+                    // first. This arm runs when the roster changes between
+                    // that sweep and this read. A later pass adopts an
+                    // unstamped group only when this agent created it and
+                    // that creator is the sole active member. A seated
+                    // multi-member group stays unstamped, and that pass
+                    // provisions a new Home.
                 }
             }
         } else if !primary_agent_trusted(
@@ -1007,10 +1140,14 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
         return ProvisionStep::Done;
     }
 
-    // 2) Crash recovery (review fix 3): a group matching the FULL Home
-    //    policy exists but was never stamped (crash between create and
-    //    stamp, or a failed stamp/persist). Adopt the OLDEST such group —
-    //    complete its metadata + seal instead of minting a duplicate.
+    // 2) Crash recovery (review fix 3, #1687): adopt the oldest unstamped
+    //    group this agent created when that creator is the sole active
+    //    member (a crash between create and stamp, or a failed stamp).
+    //    `recovery_adoption_holds` rejects a shared group, a withdrawn
+    //    group, and a sole-member group this agent did not create. Any of
+    //    those would otherwise be stamped and sealed without publication.
+    //    The S3 gate (ADR 0109 §4, D81) stays on `is_home_candidate`, which
+    //    checks policy only.
     let candidate: Option<String> = {
         // #487: same durability rule + TOCTOU recheck as find_home — the
         // pending-set snapshot is re-verified after the groups read
@@ -1029,8 +1166,7 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
                 .iter()
                 .filter(|(id, info)| {
                     !pending_before.iter().any(|p| p == id.as_str())
-                        && info.home.is_none()
-                        && is_home_candidate(info, &owner)
+                        && recovery_adoption_holds(info, &owner, &local_hex)
                 })
                 .map(|(id, info)| (id.clone(), info.created_at))
                 .collect();
@@ -1054,22 +1190,38 @@ async fn provision_home_steps(state: &Arc<AppState>, defer_fresh: bool) -> Provi
         }
     };
     if let Some(id) = candidate {
-        tracing::info!(
-            group_id = %id,
-            "adopting unstamped Home-shaped group (crash recovery); stamping + sealing"
-        );
-        if let Some(info) = stamp_and_seal_home(state, &id).await {
-            write_marker(
-                &marker_path,
-                &HomeMarker {
-                    group_id: id,
-                    owner_user_id: owner_hex,
-                    provisioned_at_ms: info.home.as_ref().map_or(0, |h| h.provisioned_at_ms),
-                },
-            )
-            .await;
+        // The selection guard has dropped. A certified join can land before
+        // `stamp_and_seal_home` reads its own snapshot. Recheck there, and
+        // again under the persist guard. When the sole-member condition no
+        // longer holds, fall through. Startup then defers (`AwaitOwnerSync`);
+        // the later pass provisions a new Home and does not seal this group.
+        #[cfg(test)]
+        inject_certified_join_before_recovery_seal(state, &local_hex, &id).await;
+        match stamp_recovered_home(state, &id, owner).await {
+            HomeSeal::Sealed(info) => {
+                tracing::info!(
+                    group_id = %id,
+                    "adopting unstamped Home-shaped group (crash recovery); stamping + sealing"
+                );
+                write_marker(
+                    &marker_path,
+                    &HomeMarker {
+                        group_id: id,
+                        owner_user_id: owner_hex,
+                        provisioned_at_ms: info.home.as_ref().map_or(0, |h| h.provisioned_at_ms),
+                    },
+                )
+                .await;
+                return ProvisionStep::Done;
+            }
+            HomeSeal::RecoveryDeferred => {
+                tracing::info!(
+                    group_id = %id,
+                    "crash recovery deferred: the group is no longer a sole-member Home this agent created"
+                );
+            }
+            HomeSeal::Failed => return ProvisionStep::Done,
         }
-        return ProvisionStep::Done;
     }
 
     // 3a) #824: linearize the pointer check against the create. Every writer
@@ -1871,6 +2023,85 @@ pub(in crate::server) async fn seat_home(
         .into_response()
 }
 
+/// Test-only seam for the recovery seal race (#1709 P2). Release builds
+/// compile neither the module nor its call sites.
+#[cfg(test)]
+mod recovery_seal_observation {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    /// Where recovery refused to seal.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum RecoveryRefusePoint {
+        /// The fresh seal snapshot was no longer a sole-member recovery.
+        Snapshot,
+        /// The live record changed before the sealed snapshot was written.
+        Persist,
+    }
+
+    static REFUSALS: LazyLock<Mutex<HashMap<String, RecoveryRefusePoint>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static JOINS: LazyLock<Mutex<HashMap<String, String>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) fn record(group_id: &str, point: RecoveryRefusePoint) {
+        lock(&REFUSALS).insert(group_id.to_string(), point);
+    }
+
+    pub(super) fn refusal(group_id: &str) -> Option<RecoveryRefusePoint> {
+        lock(&REFUSALS).get(group_id).copied()
+    }
+
+    pub(super) struct JoinGuard {
+        local_hex: String,
+    }
+
+    impl Drop for JoinGuard {
+        fn drop(&mut self) {
+            lock(&JOINS).remove(&self.local_hex);
+        }
+    }
+
+    /// Arm a certified-join stand-in for this agent. The recovery pass
+    /// applies it after it selects a candidate and before it seals.
+    pub(super) fn arm_join(local_hex: &str, peer_hex: String) -> JoinGuard {
+        lock(&JOINS).insert(local_hex.to_string(), peer_hex);
+        JoinGuard {
+            local_hex: local_hex.to_string(),
+        }
+    }
+
+    pub(super) fn take_join(local_hex: &str) -> Option<String> {
+        lock(&JOINS).remove(local_hex)
+    }
+}
+
+#[cfg(test)]
+async fn inject_certified_join_before_recovery_seal(
+    state: &AppState,
+    local_hex: &str,
+    group_id: &str,
+) {
+    let Some(peer_hex) = recovery_seal_observation::take_join(local_hex) else {
+        return;
+    };
+    let mut groups = state.named_groups.write().await;
+    if let Some(info) = groups.get_mut(group_id) {
+        info.add_member(
+            peer_hex,
+            crate::groups::GroupRole::Member,
+            Some(local_hex.to_string()),
+            None,
+        );
+    }
+}
+
 #[cfg(test)]
 pub(in crate::server::routes) mod tests {
     use super::*;
@@ -2044,6 +2275,422 @@ pub(in crate::server::routes) mod tests {
             "adopted the crashed-create group, not a new one"
         );
         assert!(info.home.is_some(), "metadata stamped + sealed");
+        Ok(())
+    }
+
+    /// WHY (#1687): a shared group with Home policy is not this agent's
+    /// Home. Crash recovery must not adopt it, and must not seal a commit
+    /// the other members never receive.
+    #[tokio::test]
+    async fn shared_home_shaped_group_is_not_adopted_or_sealed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x87; 32]).await?;
+        let owner = owner_of(&state);
+        let req = CreateGroupRequest {
+            name: "shared".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: Some(home_policy(&owner)),
+        };
+        let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let shared_id: String = body["group_id"].as_str().unwrap_or_default().to_string();
+        assert!(!shared_id.is_empty());
+
+        let peer = crate::identity::AgentKeypair::generate()?;
+        let peer_hex = hex::encode(peer.agent_id().as_bytes());
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&shared_id).expect("created group");
+            assert!(
+                is_home_recovery_candidate(info, &owner),
+                "sole-member Home-shaped group is still a recovery candidate"
+            );
+            info.add_member(peer_hex, crate::groups::GroupRole::Member, None, None);
+            assert!(
+                is_home_candidate(info, &owner),
+                "a shared Home-policy group stays inside the ADR 0109 §4 gate"
+            );
+            assert!(
+                !is_home_recovery_candidate(info, &owner),
+                "a shared Home-shaped group is not a recovery candidate"
+            );
+        }
+        let (revision, hash, log_len) = {
+            let groups = state.named_groups.read().await;
+            let info = groups.get(&shared_id).expect("shared group");
+            assert!(info.home.is_none());
+            (
+                info.state_revision,
+                info.state_hash.clone(),
+                info.commit_log.len(),
+            )
+        };
+
+        provision_home(&state).await;
+
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&shared_id).expect("shared group remains");
+        assert!(info.home.is_none(), "shared group was not stamped as Home");
+        assert_eq!(info.state_revision, revision, "no unpublished seal");
+        assert_eq!(info.state_hash, hash, "no unpublished seal");
+        assert_eq!(info.commit_log.len(), log_len, "no unpublished seal");
+        drop(groups);
+
+        let (home_id, home) = find_home(&state, &owner)
+            .await
+            .expect("a real Home is provisioned");
+        assert_ne!(
+            home_id, shared_id,
+            "recovery must not adopt the shared group"
+        );
+        assert!(home.home.is_some());
+        let marker = read_verified_marker(&state, &hex::encode(owner.as_bytes())).await;
+        assert!(marker.is_none_or(|m| m.group_id != shared_id));
+        Ok(())
+    }
+
+    /// WHY (#1687 review): deleting the creator check in the recovery scan
+    /// must fail. A sole-member Home-policy group created by another agent
+    /// matches [`is_home_recovery_candidate`] and must still not be adopted.
+    #[tokio::test]
+    async fn sole_member_home_created_by_another_agent_is_not_adopted() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x88; 32]).await?;
+        let owner = owner_of(&state);
+        let req = CreateGroupRequest {
+            name: "foreign".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: Some(home_policy(&owner)),
+        };
+        let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let foreign_id: String = body["group_id"].as_str().unwrap_or_default().to_string();
+        assert!(!foreign_id.is_empty());
+
+        let peer = crate::identity::AgentKeypair::generate()?;
+        let peer_hex = hex::encode(peer.agent_id().as_bytes());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let (revision, hash, log_len) = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&foreign_id).expect("created group");
+            info.creator = peer.agent_id();
+            info.remove_member(&local_hex, None);
+            info.add_member(peer_hex, crate::groups::GroupRole::Admin, None, None);
+            assert!(
+                is_home_recovery_candidate(info, &owner),
+                "the creator is the sole active member"
+            );
+            assert_ne!(
+                hex::encode(info.creator.as_bytes()),
+                local_hex,
+                "this agent did not create the group"
+            );
+            (
+                info.state_revision,
+                info.state_hash.clone(),
+                info.commit_log.len(),
+            )
+        };
+
+        provision_home(&state).await;
+
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&foreign_id).expect("foreign group remains");
+        assert!(info.home.is_none(), "foreign group was not stamped as Home");
+        assert_eq!(info.state_revision, revision, "no unpublished seal");
+        assert_eq!(info.state_hash, hash, "no unpublished seal");
+        assert_eq!(info.commit_log.len(), log_len, "no unpublished seal");
+        drop(groups);
+
+        let (home_id, home) = find_home(&state, &owner)
+            .await
+            .expect("a real Home is provisioned");
+        assert_ne!(
+            home_id, foreign_id,
+            "recovery must not adopt the foreign group"
+        );
+        assert!(home.home.is_some());
+        Ok(())
+    }
+
+    /// WHY (review nit, #1709): the third arm of the recovery predicate is
+    /// "one active member, and that member is not the creator". A withdrawn
+    /// sole-member group is also refused at adoption time.
+    #[test]
+    fn recovery_rejects_non_creator_sole_member_and_withdrawn_group() {
+        let owner = crate::identity::UserId([0xC7; 32]);
+        let creator = crate::identity::AgentId([0xC8; 32]);
+        let other = crate::identity::AgentId([0xC9; 32]);
+        let creator_hex = hex::encode(creator.as_bytes());
+        let other_hex = hex::encode(other.as_bytes());
+        let mut info = crate::groups::GroupInfo::with_policy(
+            "home-shaped".to_string(),
+            String::new(),
+            creator,
+            "c7".repeat(16),
+            home_policy(&owner),
+        );
+        info.remove_member(&creator_hex, None);
+        info.add_member(other_hex, crate::groups::GroupRole::Admin, None, None);
+        assert_eq!(info.active_member_count(), 1);
+        assert!(
+            is_home_candidate(&info, &owner),
+            "Home policy alone stays inside the S3 gate"
+        );
+        assert!(
+            !is_home_recovery_candidate(&info, &owner),
+            "the sole active member is not the creator"
+        );
+        assert!(!recovery_adoption_holds(&info, &owner, &creator_hex));
+
+        let mut sole = crate::groups::GroupInfo::with_policy(
+            "withdrawn".to_string(),
+            String::new(),
+            creator,
+            "c8".repeat(16),
+            home_policy(&owner),
+        );
+        assert!(recovery_adoption_holds(&sole, &owner, &creator_hex));
+        sole.withdrawn = true;
+        assert!(
+            is_home_recovery_candidate(&sole, &owner),
+            "withdrawal is a separate adoption check"
+        );
+        assert!(!recovery_adoption_holds(&sole, &owner, &creator_hex));
+    }
+
+    async fn unstamped_local_home(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<(String, u64, String, usize)> {
+        let owner = owner_of(state);
+        let req = CreateGroupRequest {
+            name: "Home".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: Some(home_policy(&owner)),
+        };
+        let response = create_named_group(State(Arc::clone(state)), Json(req)).await;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created = body["group_id"].as_str().unwrap_or_default().to_string();
+        assert!(!created.is_empty());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&created).expect("created group");
+        assert!(
+            recovery_adoption_holds(info, &owner, &local_hex),
+            "the fixture is a sole-member recovery candidate"
+        );
+        Ok((
+            created,
+            info.state_revision,
+            info.state_hash.clone(),
+            info.commit_log.len(),
+        ))
+    }
+
+    fn assert_group_not_sealed(
+        info: &crate::groups::GroupInfo,
+        revision: u64,
+        hash: &str,
+        log_len: usize,
+    ) {
+        assert!(info.home.is_none(), "recovery must not stamp Home metadata");
+        assert_eq!(info.state_revision, revision, "no unpublished seal");
+        assert_eq!(info.state_hash, hash, "no unpublished seal");
+        assert_eq!(info.commit_log.len(), log_len, "no unpublished seal");
+    }
+
+    /// WHY (Codex P2, #1709): the sole-member check at selection does not
+    /// cover the snapshot `stamp_and_seal_home` seals. A second member who
+    /// arrives between those points must make recovery defer. The same
+    /// fixture with no join still seals (positive control). A join that
+    /// lands inside the persist guard, after a valid snapshot, must also
+    /// defer.
+    #[tokio::test]
+    async fn second_member_between_selection_and_seal_defers_recovery() -> anyhow::Result<()> {
+        let positive = tempfile::tempdir()?;
+        let positive_state = owned_state(positive.path(), [0xD1; 32]).await?;
+        let (positive_id, _, _, _) = unstamped_local_home(&positive_state).await?;
+        let positive_step = provision_home_steps(&positive_state, true).await;
+        assert_eq!(
+            positive_step,
+            ProvisionStep::Done,
+            "sole-member recovery still seals"
+        );
+        let positive_owner = owner_of(&positive_state);
+        let (sealed_id, sealed) = find_home(&positive_state, &positive_owner)
+            .await
+            .expect("positive control seals the crashed group");
+        assert_eq!(sealed_id, positive_id);
+        assert!(sealed.home.is_some());
+        assert!(sealed.state_hash_is_current());
+
+        let between = tempfile::tempdir()?;
+        let between_state = owned_state(between.path(), [0xD2; 32]).await?;
+        let (between_id, revision, hash, log_len) = unstamped_local_home(&between_state).await?;
+        let between_owner = owner_of(&between_state);
+        let local_hex = hex::encode(between_state.agent.agent_id().as_bytes());
+        let peer = crate::identity::AgentKeypair::generate()?;
+        let _join = super::recovery_seal_observation::arm_join(
+            &local_hex,
+            hex::encode(peer.agent_id().as_bytes()),
+        );
+        let between_step = provision_home_steps(&between_state, true).await;
+        assert_eq!(
+            between_step,
+            ProvisionStep::AwaitOwnerSync,
+            "a join between selection and seal defers recovery"
+        );
+        assert_eq!(
+            super::recovery_seal_observation::refusal(&between_id),
+            Some(super::recovery_seal_observation::RecoveryRefusePoint::Snapshot),
+            "the seal snapshot itself must fail the sole-member check"
+        );
+        {
+            let groups = between_state.named_groups.read().await;
+            let info = groups.get(&between_id).expect("group remains");
+            assert_group_not_sealed(info, revision, &hash, log_len);
+            assert!(info.active_member_count() >= 2);
+        }
+        assert!(
+            find_home(&between_state, &between_owner).await.is_none(),
+            "deferred recovery does not mint a Home on this pass"
+        );
+
+        let during = tempfile::tempdir()?;
+        let during_state = owned_state(during.path(), [0xD3; 32]).await?;
+        let (during_id, revision, hash, log_len) = unstamped_local_home(&during_state).await?;
+        let during_owner = owner_of(&during_state);
+        let during_local = hex::encode(during_state.agent.agent_id().as_bytes());
+        let during_peer = crate::identity::AgentKeypair::generate()?;
+        let during_peer_hex = hex::encode(during_peer.agent_id().as_bytes());
+        let hook_group = during_id.clone();
+        let hook_local = during_local.clone();
+        let _barrier = super::super::named_groups::epoch_recheck_barrier::install(
+            &during_id,
+            Box::new(move |groups| {
+                if let Some(info) = groups.get_mut(&hook_group) {
+                    info.add_member(
+                        during_peer_hex.clone(),
+                        crate::groups::GroupRole::Member,
+                        Some(hook_local.clone()),
+                        None,
+                    );
+                }
+            }),
+        );
+        let during_step = provision_home_steps(&during_state, true).await;
+        assert_eq!(
+            during_step,
+            ProvisionStep::AwaitOwnerSync,
+            "a join under the persist guard defers recovery"
+        );
+        assert_eq!(
+            super::recovery_seal_observation::refusal(&during_id),
+            Some(super::recovery_seal_observation::RecoveryRefusePoint::Persist),
+            "the persist closure must refuse a membership change"
+        );
+        {
+            let groups = during_state.named_groups.read().await;
+            let info = groups.get(&during_id).expect("group remains");
+            assert_group_not_sealed(info, revision, &hash, log_len);
+            assert!(info.active_member_count() >= 2);
+        }
+        assert!(
+            find_home(&during_state, &during_owner).await.is_none(),
+            "deferred recovery does not mint a Home on this pass"
+        );
+        Ok(())
+    }
+
+    /// WHY (Engineer, 29 Oct 2026): ADR 0109 §4 (D81) stays policy-only.
+    /// An unstamped multi-member Home-policy group still defers with
+    /// `home_gate_closed`. Narrowing [`is_home_candidate`] would drop it
+    /// out of the gate.
+    #[tokio::test]
+    async fn unstamped_shared_home_policy_group_defers_with_home_gate_closed() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x89; 32]).await?;
+        let owner = owner_of(&state);
+        let peer = crate::identity::AgentKeypair::generate()?;
+        let peer_hex = hex::encode(peer.agent_id().as_bytes());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let mut info = crate::groups::GroupInfo::with_policy(
+            "unstamped-shared-home".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "1687".repeat(16),
+            home_policy(&owner),
+        );
+        info.add_member(
+            peer_hex,
+            crate::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+        );
+        assert!(info.home.is_none(), "the group is unstamped");
+        assert!(info.active_member_count() >= 2);
+        assert!(
+            is_home_candidate(&info, &owner),
+            "Home policy alone keeps the S3 gate"
+        );
+        assert!(
+            !is_home_recovery_candidate(&info, &owner),
+            "crash recovery does not adopt a shared group"
+        );
+        info.fork_quarantine = Some(crate::groups::ForkQuarantine {
+            revision: info.state_revision,
+            state_hash: "sibling".to_string(),
+            committed_by: local_hex,
+            observed_at_ms: 1,
+            snapshot: crate::groups::ForkSnapshot {
+                terminal_commit: info.terminal_commit_header(),
+                conflicting_commit: info.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        let group_id = info.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let worker = tokio::spawn(super::super::named_groups::run_group_recovery_worker(
+            Arc::clone(&state),
+        ));
+        let mut deferred = None;
+        for _ in 0..40 {
+            let response = super::super::named_groups::get_group_recovery(
+                State(Arc::clone(&state)),
+                axum::extract::Path(group_id.clone()),
+            )
+            .await
+            .into_response();
+            let (status, body) = response_json(response).await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if body["recovery"]["cause"] == "home_gate_closed" {
+                deferred = Some(body);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        worker.abort();
+        let _ = worker.await;
+
+        let body = deferred.expect("S3 defers an unstamped multi-member Home-policy group");
+        assert_eq!(body["recovery"]["state"], "recovery_deferred");
+        assert_eq!(body["recovery"]["cause"], "home_gate_closed");
         Ok(())
     }
 
@@ -5849,6 +6496,68 @@ mod round2_tests {
                 .is_none_or(|_| info.state_hash_is_current()),
             "metadata is either absent or sealed — never unsigned"
         );
+        Ok(())
+    }
+
+    /// WHY (#1687 review): a seated multi-member Home that cannot be
+    /// resealed is not a crash-recovery candidate. The pass strips the
+    /// untrusted metadata and provisions a new Home. It does not stamp
+    /// the shared group again.
+    #[tokio::test]
+    async fn unrestorable_shared_home_is_not_readopted() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x5A; 32]).await?;
+        let owner = owner_of(&state);
+        provision_home(&state).await;
+        let (id, info) = find_home(&state, &owner).await.expect("home");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        let mut broken = info.clone();
+        let meta = crate::groups::state_commit::GroupPublicMeta {
+            home_digest: None,
+            ..broken.public_meta()
+        };
+        let roster_root = crate::groups::compute_roster_root(&broken.members_v2);
+        let policy_hash = crate::groups::compute_policy_hash(&broken.policy);
+        let meta_hash = crate::groups::compute_public_meta_hash(&meta);
+        broken.state_hash = crate::groups::state_commit::compute_state_hash(
+            broken.stable_group_id(),
+            broken.state_revision,
+            broken.prev_state_hash.as_deref(),
+            &roster_root,
+            &policy_hash,
+            &meta_hash,
+            broken.security_binding.as_deref(),
+            broken.withdrawn,
+        );
+        let stranger = crate::identity::AgentKeypair::generate()?;
+        let stranger_hex = hex::encode(stranger.agent_id().as_bytes());
+        broken.add_member(stranger_hex, crate::groups::GroupRole::Member, None, None);
+        if let Some(member) = broken.members_v2.get_mut(&local_hex) {
+            member.role = crate::groups::GroupRole::Member;
+        }
+        assert!(!broken.state_hash_is_current(), "unsigned condition holds");
+        assert!(
+            !is_home_recovery_candidate(&broken, &owner),
+            "a seated multi-member group is not a recovery candidate"
+        );
+        let (revision, log_len) = (broken.state_revision, broken.commit_log.len());
+        state.named_groups.write().await.insert(id.clone(), broken);
+
+        provision_home(&state).await;
+
+        let groups = state.named_groups.read().await;
+        let stripped = groups.get(&id).expect("original group kept");
+        assert!(stripped.home.is_none(), "untrusted metadata was stripped");
+        assert_eq!(stripped.state_revision, revision, "no unpublished seal");
+        assert_eq!(stripped.commit_log.len(), log_len, "no unpublished seal");
+        drop(groups);
+
+        let (home_id, home) = find_home(&state, &owner)
+            .await
+            .expect("a new Home is provisioned");
+        assert_ne!(home_id, id, "the shared group was not adopted");
+        assert!(home.home.is_some());
         Ok(())
     }
 
