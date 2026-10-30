@@ -811,16 +811,7 @@ pub(in crate::server) async fn commit_locked(
         epoch = next_epoch,
         "ADR 0110 S4: crypto-only exclusion committed"
     );
-    let task_state = Arc::clone(state);
-    let card_key = group_key.to_string();
-    // #1699: the delivery worker walks every group's live record, also
-    // when a staged re-seat join's apply committed this exclusion.
-    let _spawned = state.spawn_detached(crate::server::reseat_scope::outside_reseat_scope(
-        async move {
-            ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
-            drive_deliveries(&task_state).await;
-        },
-    ));
+    spawn_post_commit_round(state, group_key);
     SelfLeaveRekeyStep::Committed
 }
 
@@ -988,9 +979,18 @@ pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_k
         secret_epoch = next_secret_epoch,
         "ADR 0110 S4: GSS crypto-only exclusion committed"
     );
+    spawn_post_commit_round(state, group_key);
+}
+
+/// After a committed crypto-only exclusion (TreeKEM or GSS), publish the
+/// group card of `group_key` and run one delivery round, in a detached
+/// task. #1699: the delivery worker walks every group's live record, also
+/// when a staged re-seat join's apply committed this exclusion, so the
+/// task runs outside any re-seat scope.
+fn spawn_post_commit_round(state: &Arc<AppState>, group_key: &str) {
+    use super::super as ng;
     let task_state = Arc::clone(state);
     let card_key = group_key.to_string();
-    // #1699: as above, the worker sees every group's live record.
     let _spawned = state.spawn_detached(crate::server::reseat_scope::outside_reseat_scope(
         async move {
             ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
@@ -3936,6 +3936,103 @@ mod daemon_tests {
         Ok(())
     }
 
+    /// #1699 (#1689 review P3): both commit paths (`commit_locked` and
+    /// `commit_gss`) start their detached card and delivery round through
+    /// [`spawn_post_commit_round`]. A staged re-seat join's apply can commit
+    /// an exclusion, so that round must run outside the caller's re-seat
+    /// scope and judge the delivery by the live record. Here the live
+    /// original is contained (fork-quarantined) and the staged copy is not.
+    /// The round, started inside the open staging, must see the live marker
+    /// and move the row to the fork set. In the scope it would see the
+    /// staged copy, find no recipient left and drop the row. Inert: an
+    /// offline agent.
+    #[tokio::test]
+    async fn the_post_commit_round_started_in_a_reseat_scope_sees_the_live_map() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let group_id = "cd".repeat(16);
+        let mut staged = GroupInfo::new("ce-reseat".into(), String::new(), admin, group_id.clone());
+        staged.recompute_state_hash();
+        let stable = staged.stable_group_id().to_string();
+        let mut live = staged.clone();
+        live.fork_quarantine = Some(x0x::groups::ForkQuarantine {
+            revision: 1,
+            state_hash: "sibling".into(),
+            committed_by: String::new(),
+            observed_at_ms: 0,
+            snapshot: x0x::groups::ForkSnapshot {
+                terminal_commit: live.terminal_commit_header(),
+                conflicting_commit: live.terminal_commit_header(),
+                classification: None,
+            },
+            no_anchor: true,
+        });
+        state
+            .named_groups
+            .live_write()
+            .await
+            .insert(group_id.clone(), live);
+        state
+            .named_groups
+            .staging_write()
+            .await
+            .insert(group_id.clone(), staged.clone());
+        let key = EvictionKey::new(stable.clone(), [0x79; 32]);
+        new_delivery(
+            &mut state.revocation_evictions.inner.lock().await.ce,
+            &key,
+            &staged.state_hash,
+            staged.state_revision.saturating_add(1),
+            Arc::new(Vec::new()),
+            Vec::new(),
+            false,
+        );
+
+        let scope = state.reseat_stagings.open(&group_id, &stable);
+        crate::server::reseat_scope::in_reseat_scope(scope, async {
+            assert!(crate::server::reseat_scope::in_any_reseat_scope());
+            assert!(
+                state
+                    .named_groups
+                    .read()
+                    .await
+                    .get(&group_id)
+                    .is_some_and(|info| info.fork_quarantine.is_none()),
+                "the caller sees the staged copy"
+            );
+            spawn_post_commit_round(&state, &group_id);
+        })
+        .await;
+        for _ in 0..500 {
+            if !state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .contains_key(&key)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.reseat_stagings.scope_for(&group_id).is_some(),
+            "the staging stayed open while the round ran"
+        );
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert!(
+            !inner.ce.deliveries.contains_key(&key),
+            "the round ran and ended the delivery"
+        );
+        assert!(
+            inner.ce.fork.contains(&key),
+            "the round judged the delivery by the live, contained original"
+        );
+        Ok(())
+    }
+
     /// A GSS `MlsEncrypted` group on the committer `state` (the only admin)
     /// with a leaver and the survivor `replica`, and the leaver's signed
     /// self-leave. The roster that seats both is a retained commit at
@@ -5495,6 +5592,310 @@ mod daemon_tests {
                 "the obligation completes only after the seat is keyed and the share is sealed"
             );
         }
+        Ok(())
+    }
+
+    /// #1635 fix round (Codex P1, 28 Oct): the delayed-exclusion shape.
+    /// The survivor already installed the exclusion keyless — its head is
+    /// the result H1, it holds no secret and its seat carries no KEM key
+    /// — while an admin is still at H0, the exclusion frame not yet
+    /// arrived on its own delivery row. Before David's 28 Oct 02:09 GMT
+    /// ruling the keyless survivor reported the hold's parent H0 in its
+    /// catch-up answers: the lagging admin's classify passed (the report
+    /// named its own head), its head round confirmed and its startup
+    /// check satisfied the peer, so the admin could seal at H0 against
+    /// the H1 chain. The ruling closes the vector at the source: the
+    /// keyless survivor's served answer omits `responder_state_hash`, so
+    /// the lagging admin reads no head from it. The parent shape — the
+    /// pre-fix answer — is pinned as the vector: it passes both gates.
+    #[tokio::test]
+    async fn a_keyless_survivors_answer_confirms_no_lagging_admins_round() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        // #1663 test seam: this test pins the keyless state, so the
+        // automatic republication stays off (as the other #1578 tests).
+        fx.replica
+            .named_group_test_recorders
+            .key_republish_suppressed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let admin = fx.state.agent.agent_id();
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        // The replica's post-leave state is H0 — the lagging admin's view.
+        // It is cloned BEFORE the frame moves the replica to H1.
+        let parent_info = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        let parent_head = parent_info.state_hash.clone();
+        let stable = parent_info.stable_group_id().to_string();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the survivor installs the verified frame keyless (#1578)"
+        );
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+
+        // The lagging admin: still at H0, the exclusion not yet arrived.
+        // Its head round is open and its startup gate waits on the
+        // survivor.
+        let (lagging, _lagging_dir) = ng::tests::secure_endpoint_test_state().await?;
+        lagging
+            .named_groups
+            .write()
+            .await
+            .insert(fx.group_id.clone(), parent_info);
+        {
+            let mut inner = lagging.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
+                stable.clone(),
+                super::super::HeadRound::new(&parent_head, Instant::now()),
+            );
+        }
+        ng::self_leave_startup_require(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            std::slice::from_ref(&survivor_hex),
+        );
+
+        // The real served answer of the keyless survivor at H1: no head.
+        // The gated serve answers a member requester (the author, as the
+        // fixture test above asks); the answer the lagging admin reads
+        // from the gated carrier is this same page.
+        let served = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
+        assert_eq!(
+            served, None,
+            "the keyless survivor claims no head (David's ruling, 28 Oct 02:09 GMT)"
+        );
+        super::super::note_catchup_head(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
+        {
+            let inner = lagging.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner.head_rounds.get(&stable).expect("the round").confirmed,
+                "the keyless disclaimer confirms no round: no seal at H0 against the H1 chain"
+            );
+        }
+        ng::self_leave_startup_note_verified_head(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
+        assert!(
+            ng::self_leave_startup_open(&lagging, &fx.group_id),
+            "the absent field satisfies no startup peer"
+        );
+
+        // The ruled-out shape: had the keyless survivor reported the
+        // hold's parent H0 — the pre-fix answer — both gates would pass.
+        // That is the vector the keyless absence closes, pinned here.
+        super::super::note_catchup_head(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            Some(&parent_head),
+        )
+        .await;
+        {
+            let inner = lagging.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.head_rounds.get(&stable).expect("the round").confirmed,
+                "a parent report is OnLocalChain at H0: the vector the keyless absence closes"
+            );
+        }
+        ng::self_leave_startup_note_verified_head(
+            &lagging,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            Some(&parent_head),
+        )
+        .await;
+        assert!(
+            !ng::self_leave_startup_open(&lagging, &fx.group_id),
+            "a parent report would satisfy the startup peer: the vector, pinned"
+        );
+        Ok(())
+    }
+
+    /// #1635 review round 5 (Claude P1 at a00ab3a): a keyless GSS
+    /// install holds the ciphertext boundary, and
+    /// `POST /groups/:id/secure/encrypt` must answer the typed 409
+    /// (David's approval, 28 Oct 08:59 GMT; the API-docs row and the
+    /// W3-H case `w3h_1578_red_…` promise the same). The GSS arm read
+    /// `secure_message_key()` before the hold check, and a keyless
+    /// install holds no secret, so the route fell into the
+    /// waiting-joiner 424. The hold check in the keyless arm serves the
+    /// typed refusal; a member with no hold (a joiner awaiting its
+    /// welcome share) keeps the 424. This test fails if the 424 comes
+    /// back.
+    #[tokio::test]
+    async fn a_keyless_survivors_encrypt_answers_the_typed_409_not_the_joiners_424() -> Result<()> {
+        use anyhow::Context as _;
+        use base64::Engine as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        // #1663 test seam: this test pins the keyless state, so the
+        // automatic republication stays off (as the other #1578 tests).
+        fx.replica
+            .named_group_test_recorders
+            .key_republish_suppressed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let admin = fx.state.agent.agent_id();
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the survivor installs the verified frame keyless (#1578)"
+        );
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        // The state the 409 names: the install moved the head, the
+        // survivor holds no secret of the new epoch, and the durable
+        // exclusion hold is active.
+        {
+            let groups = fx.replica.named_groups.read().await;
+            let info = groups.get(&fx.group_id).context("group")?;
+            assert!(
+                info.shared_secret.is_none(),
+                "the install is keyless: no secret of the new epoch"
+            );
+        }
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            1,
+            "the exclusion hold is active"
+        );
+        let (status, body) = ng::secure_group_encrypt(
+            axum::extract::State(std::sync::Arc::clone(&fx.replica)),
+            axum::extract::Path(fx.group_id.clone()),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            axum::Json(ng::SecureEncryptRequest {
+                payload_b64: base64::engine::general_purpose::STANDARD.encode(b"#1635 probe"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "the keyless survivor's encrypt answers the typed 409, not the joiner's 424: {body:?}"
+        );
+        assert!(
+            body["error"].as_str().is_some_and(
+                |text| text.contains(ng::GroupCiphertextHold::PendingGssRemoval.reason())
+            ),
+            "the refusal is the hold's typed reason: {body:?}"
+        );
+        // The other side of the boundary (the review's P3): a member
+        // with no secret and NO hold — a joiner awaiting its welcome
+        // share — keeps the waiting answer, the 424. The hold is the
+        // only thing that separates the two answers.
+        let joiner_id = "e4".repeat(16);
+        let mut joiner =
+            x0x::groups::GroupInfo::new("e3".into(), String::new(), survivor, joiner_id.clone());
+        joiner.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        joiner.add_member(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(survivor_hex.clone()),
+            None,
+        );
+        // A joiner holds no secret: genesis seats the creator's secret,
+        // and the welcome share has not arrived, so the seat waits.
+        joiner.shared_secret = None;
+        joiner.recompute_state_hash();
+        fx.replica
+            .named_groups
+            .write()
+            .await
+            .insert(joiner_id.clone(), joiner);
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &joiner_id),
+            0,
+            "the joiner's group has no hold"
+        );
+        let (status, body) = ng::secure_group_encrypt(
+            axum::extract::State(std::sync::Arc::clone(&fx.replica)),
+            axum::extract::Path(joiner_id),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            axum::Json(ng::SecureEncryptRequest {
+                payload_b64: base64::engine::general_purpose::STANDARD
+                    .encode(b"#1635 joiner probe"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FAILED_DEPENDENCY,
+            "a joiner with no hold keeps the waiting answer: {body:?}"
+        );
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("no shared secret available")),
+            "the joiner's refusal names the welcome wait, not the hold: {body:?}"
+        );
         Ok(())
     }
 
