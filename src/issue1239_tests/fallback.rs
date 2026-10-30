@@ -1,7 +1,7 @@
 //! Budget expiry cannot remove the ordinary contact-card delivery path.
 
 use super::*;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 async fn contact_fixture(
     dir: &std::path::Path,
@@ -88,14 +88,19 @@ async fn expired_post_dial_read_uses_contact_card() -> Result<(), Box<dyn std::e
         machines: Vec::new(),
         dm_capabilities: Some(dm::DmCapabilities::v1_gossip_ready(kem.public_bytes)),
     });
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let signal = Arc::clone(&entered);
+    let hold_taken = Arc::new(AtomicBool::new(false));
+    let hold_flag = Arc::clone(&hold_taken);
+    let dial_started = Arc::new(AtomicBool::new(false));
+    let dial_flag = Arc::clone(&dial_started);
     let (hold, hold_rx) = std::sync::mpsc::channel();
     let (release, release_rx) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
         if hold_rx.recv().is_ok() {
+            // The delayed writer is part of the test: the handshake below
+            // must not depend on this thread winning any race.
+            std::thread::sleep(Duration::from_millis(50));
             let _held = store.hold_state_for_testing();
-            signal.notify_one();
+            hold_flag.store(true, Ordering::SeqCst);
             let _ = release_rx.recv();
         }
     });
@@ -104,7 +109,9 @@ async fn expired_post_dial_read_uses_contact_card() -> Result<(), Box<dyn std::e
         .evidence_dial
         .set(Arc::new(move |_| {
             let hold = hold.clone();
+            let dial_flag = Arc::clone(&dial_flag);
             Box::pin(async move {
+                dial_flag.store(true, Ordering::SeqCst);
                 hold.send(()).unwrap();
                 std::future::pending::<()>().await;
             })
@@ -113,9 +120,32 @@ async fn expired_post_dial_read_uses_contact_card() -> Result<(), Box<dyn std::e
     tokio::time::pause();
     let send = agent.send_direct_with_config(&recipient, vec![0x39], publish_config());
     tokio::pin!(send);
-    tokio::select! {
-        _ = entered.notified() => {},
-        result = &mut send => panic!("send ended before the dial/store stall: {result:?}"),
+    loop {
+        match futures::poll!(&mut send) {
+            Poll::Pending => {}
+            Poll::Ready(result) => panic!("send ended before the dial/store stall: {result:?}"),
+        }
+        if dial_started.load(Ordering::SeqCst) {
+            break;
+        }
+        // The pre-dial evidence stages may still need worker replies, so
+        // keep polling `send` until the dial hook fires. The 1 ms virtual
+        // watchdog bounds each park: time creeps 1 ms per idle cycle, which
+        // no evidence budget (2 s or more) can notice.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // The dial now stalls inside the hook; only the writer thread's hold
+    // handshake remains, and nothing may re-poll `send` while it happens.
+    // The handshake must also keep the runtime out of park: a parked
+    // current-thread runtime auto-advances paused time through every
+    // registered timer (the 3 s dial cap, then the whole-send deadline)
+    // while the delayed writer makes progress, and the first poll below
+    // then finds the send already expired. A task that yields in a loop is
+    // always runnable, so the runtime never parks: virtual time freezes
+    // for the whole handshake while real time lets the writer take the
+    // hold.
+    while !hold_taken.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
     }
     tokio::time::advance(Duration::from_secs(3) + Duration::from_millis(1)).await;
     assert!(futures::poll!(&mut send).is_pending());

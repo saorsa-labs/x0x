@@ -8,8 +8,8 @@
 // This private parser remains dormant until complete inventory is integrated.
 #![allow(dead_code)]
 
-use std::io;
 use std::path::{Path, PathBuf};
+use std::{fmt, io};
 
 const MAX_BYTES: usize = 1_048_576;
 const MAX_ARGUMENTS: usize = 4096;
@@ -26,16 +26,29 @@ const COMMAND_PROPERTIES: [&str; 7] = [
     "ExecStopPost",
 ];
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct LiteralCommand {
     pub(crate) executable: PathBuf,
     pub(crate) argv: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct SourceCommand {
     pub(crate) property: String,
     pub(crate) command: LiteralCommand,
+}
+
+// Arguments can contain credentials; nested diagnostics must also stay redacted.
+impl fmt::Debug for LiteralCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LiteralCommand(<redacted>)")
+    }
+}
+
+impl fmt::Debug for SourceCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SourceCommand(<redacted>)")
+    }
 }
 
 /// Keep every nonempty command assignment in source order. Empty resets do not

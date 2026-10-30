@@ -193,9 +193,11 @@ pub(super) fn holds(info: &x0x::groups::GroupInfo, epoch: Option<u64>) -> bool {
 /// the group state itself, never from the hold file: a hold write that
 /// fails, and the restart after it, cannot turn a keyless install into
 /// a head claim (the installed GSS head keeps implying its key). Every
-/// other responder — one with a secret (a superseded intermediate
-/// install included), one whose waiting keeps the old secret, a
-/// SignedPublic member, an encrypted-group joiner that still waits for
+/// other responder — one with a secret, one whose waiting keeps the old
+/// secret, one whose own seat still carries the KEM key though no
+/// secret of the saved head's epoch remains (a superseded intermediate
+/// install), a SignedPublic member, an encrypted-group joiner that
+/// still waits for
 /// its welcome share (its own seat is not an Active keyless seat: it is
 /// not seated yet, or seated with the KEM key its `MemberJoined`
 /// published), a member of any other plane (a TreeKEM joiner holds

@@ -18,6 +18,25 @@ macro_rules! inventory_accounts_regression_tests {
                 AccountTable::parse(POLICY, PASSWD, GROUP).unwrap()
             }
 
+            fn assert_redacted(value: &impl std::fmt::Debug, label: &str) {
+                let expected = format!("{label}(<redacted>)");
+                assert_eq!(format!("{value:?}"), expected);
+                assert_eq!(format!("{value:#?}"), expected);
+                assert_eq!(format!("{:?}", Some(value)), format!("Some({expected})"));
+                assert_eq!(format!("{:#?}", [value]), format!("[\n    {expected},\n]"));
+            }
+
+            #[test]
+            fn account_debug_redacts_ids_and_home() {
+                let accounts = table();
+                assert_redacted(accounts.by_uid(12345).unwrap(), "Account");
+            }
+
+            #[test]
+            fn account_table_debug_redacts_names_groups_and_digest() {
+                assert_redacted(&table(), "AccountTable");
+            }
+
             #[test]
             fn inventory_accounts_resolve_only_the_bound_files_table() {
                 let table = table();

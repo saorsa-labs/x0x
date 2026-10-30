@@ -934,6 +934,12 @@ pub struct Agent {
     /// signing gate instead of re-enabling the pre-0043 exception (state
     /// loss must never resurrect a custodian the durable log moved away).
     move_state_load_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #1657: shared bookkeeping of the refusal-only reply path (the
+    /// per-(machine, group) dedupe and the test egress recorder), used
+    /// by BOTH refusal senders — the raw-QUIC listener arms and
+    /// [`Agent::send_treekem_refusal_reply`] — so one pair is answered
+    /// once per window across paths. See `direct::TreeKemRefusalReplies`.
+    treekem_refusal_replies: std::sync::Arc<direct::TreeKemRefusalReplies>,
     /// ADR-0043 review-r5: ceremony gate mirrored on the agent so the
     /// LIBRARY API (`move_authorize`/`move_export`/`move_import`/
     /// `move_activate`/`move_abort`/`move_retire`) is unreachable when
@@ -1131,6 +1137,135 @@ impl Drop for ShutdownBodyGuard {
 struct KvSnapshotRegistry {
     closed: bool,
     entries: std::collections::HashMap<std::path::PathBuf, std::sync::Weak<kv::KvStoreSync>>,
+}
+
+/// #1657: gate 2 of the refusal-only reply path — the requester
+/// machine's verified capability advert must carry
+/// `treekem_catchup_refusal_v1` (bit 13). `Some(true)` alone admits: a
+/// peer whose advert lacks the bit, and a peer with no verified
+/// advert, keeps main's silent drop (Engineer rulings, 29 Oct 22:14
+/// and 22:52 GMT — an older peer must never record the refusal as a
+/// durable DM-history row).
+fn treekem_refusal_capability_admits(
+    capability_store: &dm_capability::CapabilityStore,
+    machine_id: &identity::MachineId,
+) -> bool {
+    capability_store.machine_registry_supports(
+        machine_id,
+        dm::CapabilityRegistry::TREEKEM_CATCHUP_REFUSAL_V1,
+    ) == Some(true)
+}
+
+/// #1657: the ADR-0043 signing-gate decision specialised to the typed
+/// TreeKEM catch-up refusal, which is always sent for THIS daemon's
+/// own agent (so `holds_agent_key` is true by definition — an imported
+/// foreign key never sends refusals). Mirrors
+/// [`Agent::signing_gate_allows`] on the pieces the refusal-only reply
+/// path captures: a quiesced (mid-move/retire-pending) or quarantined
+/// machine sends no refusal, exactly as it produces no agent
+/// signature. One deliberate divergence (Codex rc3 note): the corrupt
+/// moves.bin fail-close runs BEFORE the empty-log return, so an empty
+/// log under lost move state fails closed here too.
+async fn treekem_refusal_signing_gate_allows(
+    identity: &std::sync::Arc<identity::Identity>,
+    move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+    move_state_load_failed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> bool {
+    let agent = identity.agent_id();
+    let holds_key = true;
+    // A corrupt/undecodable moves.bin fail-closes every empty log:
+    // state loss must not assert custody by signing a refusal.
+    if move_state_load_failed.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    let state = move_state.read().await;
+    if state.log(&agent).is_empty() {
+        // The refusal is sent for the daemon's own agent, so this is
+        // exactly `agent == self.agent_id() && holds_key`.
+        return holds_key;
+    }
+    state
+        .fold(&agent)
+        .may_sign(&identity.machine_id(), holds_key)
+}
+
+/// #1657: the shared tail of BOTH typed-refusal senders — the raw-QUIC
+/// listener arms and [`Agent::send_treekem_refusal_reply`]. Dedupes the
+/// (machine, group) pair, builds the refusal, records it at the egress
+/// seam (tests), and sends it machine-addressed over raw QUIC under
+/// [`direct::TREEKEM_REFUSAL_SEND_TIMEOUT`]. The caller has already run
+/// the shape, capability and signing gates.
+async fn send_treekem_refusal_frame(
+    network: Option<&std::sync::Arc<network::NetworkNode>>,
+    replies: &std::sync::Arc<direct::TreeKemRefusalReplies>,
+    local_agent_id: identity::AgentId,
+    requester: identity::AgentId,
+    machine_id: identity::MachineId,
+    group_id: &str,
+    reason: direct::TreeKemCatchupRefusalReason,
+) {
+    if !replies.admit(machine_id, group_id) {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "refusal_reply",
+            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+            outcome = "treekem_refusal_dedupe",
+            "typed TreeKEM catch-up refusal withheld: this (machine, group) pair was answered inside the dedupe window, or the window is at its bound and new pairs are suppressed until rows expire"
+        );
+        return;
+    }
+    let refusal = direct::TreeKemCatchupRefusal::new(
+        group_id.to_string(),
+        hex::encode(requester.as_bytes()),
+        reason,
+    );
+    let payload = match serde_json::to_vec(&refusal) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(
+                target: "x0x::direct",
+                stage = "refusal_reply",
+                "failed to serialize the typed TreeKEM catch-up refusal: {e}"
+            );
+            return;
+        }
+    };
+    #[cfg(test)]
+    if let Ok(mut egress) = replies.egress.lock() {
+        egress.push((machine_id, payload.clone()));
+    }
+    let Some(network) = network else {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "refusal_reply",
+            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+            outcome = "treekem_refusal_no_transport",
+            "typed TreeKEM catch-up refusal decided but this node has no network transport"
+        );
+        return;
+    };
+    let peer_id = ant_quic::PeerId(machine_id.0);
+    let send = network.send_direct(&peer_id, local_agent_id.as_bytes(), &payload);
+    match tokio::time::timeout(direct::TREEKEM_REFUSAL_SEND_TIMEOUT, send).await {
+        Err(_) => tracing::warn!(
+            target: "x0x::direct",
+            stage = "refusal_reply",
+            sender_prefix = %network::hex_prefix(&requester.0, 4),
+            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+            outcome = "treekem_refusal_send_timeout",
+            "timed out sending the typed TreeKEM catch-up refusal to the refused requester"
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            target: "x0x::direct",
+            stage = "refusal_reply",
+            sender_prefix = %network::hex_prefix(&requester.0, 4),
+            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+            outcome = "treekem_refusal_send_failed",
+            error = %e,
+            "failed to send the typed TreeKEM catch-up refusal to the refused requester"
+        ),
+        Ok(Ok(())) => {}
+    }
 }
 
 impl std::fmt::Debug for Agent {
@@ -3823,8 +3958,13 @@ async fn apply_legacy_revocation_records(
                     if let Some(entry) = discovery_cache.write().await.remove(agent_id) {
                         machine_cache.write().await.remove(&entry.machine_id);
                     }
-                    let mut cs = contact_store.write().await;
-                    cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
+                    {
+                        let mut cs = contact_store.write().await;
+                        cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
+                    }
+                    owner_trust
+                        .set_attribution_relationship(*agent_id, false)
+                        .await;
                     tracing::info!(
                         agent = %hex::encode(agent_id.as_bytes()),
                         "evicted revoked agent (received via gossip)"
@@ -6156,9 +6296,7 @@ impl HeartbeatContext {
             .load(std::sync::atomic::Ordering::Acquire);
         let (user_id, agent_certificate) = if include_user {
             (
-                self.identity
-                    .user_keypair()
-                    .map(identity::UserKeypair::user_id),
+                self.identity.disclosed_user_id(),
                 self.identity.agent_certificate().cloned(),
             )
         } else {
@@ -7688,7 +7826,7 @@ impl Agent {
             .own_cert_pair
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            (self.identity.user_id(), Some(renewal.clone()));
+            (self.identity.disclosed_user_id(), Some(renewal.clone()));
         tracing::info!(
             agent_id = %hex::encode(self.agent_id().as_bytes()),
             not_after = ?renewal.not_after(),
@@ -10116,6 +10254,91 @@ impl Agent {
         self.send_direct_with_history(to, payload, config, None, Some(machine))
             .await
             .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// #1657 (Claude round 3, finding 2; Codex P2 2): the refusal-only
+    /// reply path. Sends the typed TreeKEM catch-up refusal to the
+    /// machine whose request this node is refusing — never through
+    /// ordinary DM egress. Ordinary egress ([`Self::send_direct_all_stages`])
+    /// denies exactly the revoked (agent, machine) pairing this refusal
+    /// answers: the ADR-0043 §9 B/P preflight (discovery, capability
+    /// binding and registry resolutions) and `pin_show_machine` all
+    /// reject it, so a refusal sent that way never leaves. This path
+    /// reaches the refused device on its own machine id (the ant-quic
+    /// PeerId IS the machine id) over the authenticated raw-QUIC path
+    /// to that machine, and NOTHING else: it carries
+    /// one refusal frame, it opens no other route, and ordinary and key
+    /// egress denial for the revoked binding is untouched.
+    ///
+    /// Gates, in order — a refusal that fails any of them keeps main's
+    /// silent drop:
+    /// 1. the group id is exactly 64 hex (the shape every generator
+    ///    produces);
+    /// 2. the requester machine's verified capability advert carries
+    ///    `treekem_catchup_refusal_v1` (bit 13) — a peer without the
+    ///    bit, or with no verified advert, would record the refusal as
+    ///    a durable DM-history row (Engineer rulings, 29 Oct 22:14 and
+    ///    22:52 GMT);
+    /// 3. the ADR-0043 signing gate holds for this daemon's own agent
+    ///    (a quiesced or quarantined machine sends no refusal);
+    /// 4. the (machine, group) pair was not answered inside the dedupe
+    ///    window.
+    ///
+    /// The send itself is bounded by
+    /// [`direct::TREEKEM_REFUSAL_SEND_TIMEOUT`].
+    pub(crate) async fn send_treekem_refusal_reply(
+        &self,
+        requester: &identity::AgentId,
+        machine_id: identity::MachineId,
+        group_id: &str,
+        reason: direct::TreeKemCatchupRefusalReason,
+    ) {
+        if !direct::treekem_group_id_echoable(group_id) {
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "refusal_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "treekem_refusal_bad_group_id",
+                "typed TreeKEM catch-up refusal withheld: the group id is not 64 hex"
+            );
+            return;
+        }
+        if !treekem_refusal_capability_admits(&self.capability_store, &machine_id) {
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "refusal_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "treekem_refusal_capability_withheld",
+                "typed TreeKEM catch-up refusal withheld: the requester machine's verified advert lacks bit 13 (silent drop, main's behavior)"
+            );
+            return;
+        }
+        if !treekem_refusal_signing_gate_allows(
+            &self.identity,
+            &self.move_state,
+            &self.move_state_load_failed,
+        )
+        .await
+        {
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "refusal_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "treekem_refusal_signing_gate_withheld",
+                "typed TreeKEM catch-up refusal withheld: the ADR-0043 signing gate refuses this machine"
+            );
+            return;
+        }
+        send_treekem_refusal_frame(
+            self.network.as_ref(),
+            &self.treekem_refusal_replies,
+            self.identity.agent_id(),
+            *requester,
+            machine_id,
+            group_id,
+            reason,
+        )
+        .await;
     }
 
     /// #461: provenance variant for the direct-send HTTP route — identical
@@ -13987,6 +14210,7 @@ impl Agent {
                 revoked: std::sync::Arc::clone(&self.revocation_set),
                 moves: std::sync::Arc::clone(&self.move_state),
                 contacts: std::sync::Arc::clone(&self.contact_store),
+                authenticated: self.authenticated_machine_bindings(),
                 identity_dir: self.identity_dir.clone(),
                 evidence: std::sync::Arc::clone(self.peer_evidence()),
                 local_user: self.user_id(),
@@ -14916,6 +15140,16 @@ impl Agent {
                         announcement.announced_at.saturating_mul(1000), now.saturating_mul(1000),
                     );
                 }
+                // Probe before the bindings write lock. The contact bit is
+                // re-read if a concurrent resolve wins the epoch. The
+                // contacts lock is not held while groups and grants are scanned.
+                dm_inbox::with_contact_standing(
+                    &authenticated_machine_bindings,
+                    &contact_store,
+                    announcement.agent_id,
+                    |_| (),
+                )
+                .await;
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,
@@ -15139,7 +15373,7 @@ impl Agent {
         let addresses = filter_discovery_announcement_addrs(addresses, allow_local_scope);
 
         let (user_id, agent_certificate) = if include_user_identity {
-            let user_id = self.user_id().ok_or_else(|| {
+            let user_id = self.identity.disclosed_user_id().ok_or_else(|| {
                 error::IdentityError::Storage(std::io::Error::other(
                     "human identity disclosure requested but no user identity is configured — set user_key_path in your config.toml to point at your user keypair file",
                 ))
@@ -18197,6 +18431,12 @@ impl Agent {
                     let mut cs = self.contact_store.write().await;
                     cs.set_trust(agent_id, contacts::TrustLevel::Blocked);
                 }
+                dm_inbox::set_attribution_relationship(
+                    &self.authenticated_machine_bindings,
+                    *agent_id,
+                    false,
+                )
+                .await;
                 tracing::info!(
                     agent = %hex::encode(agent_id.as_bytes()),
                     "evicted revoked agent from discovery cache"
@@ -19167,11 +19407,90 @@ impl Agent {
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let announced_for_direct = std::sync::Arc::clone(&self.announced_machine_bindings);
+        // #1657: the refusal-only reply path's pieces — the capability
+        // gate, the signing-gate inputs and the shared dedupe state —
+        // captured so the listener arms run the SAME gates the catch-up
+        // serve handler runs (Engineer rulings, 29 Oct 22:14 and 22:52
+        // GMT), never a bare transport send.
+        let refusal_capability_store = std::sync::Arc::clone(&self.capability_store);
+        let refusal_identity = std::sync::Arc::clone(&self.identity);
+        let refusal_move_state_load_failed = std::sync::Arc::clone(&self.move_state_load_failed);
+        let refusal_replies = std::sync::Arc::clone(&self.treekem_refusal_replies);
+        // #1657: the refusing node's agent id, sent with the typed TreeKEM
+        // catch-up refusal so the requester knows who refused. AgentId is
+        // Copy, so the capture needs no clone.
+        let local_agent_id = self.identity.agent_id();
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
             use futures::StreamExt;
             let mut pending = futures::stream::FuturesUnordered::new();
+            // #1657 review (Claude, REQUEST-CHANGES 1): the typed-refusal
+            // sends must never stall this receive loop — a stalled QUIC
+            // send would hold every later direct message. They run here,
+            // drained alongside the ingress barrier, inside the tracked
+            // listener task. One closure builds every send, so all
+            // pushed futures share one type. Review round 1 also bounds
+            // the backlog: each send is capped in time, the queue in
+            // depth — a revoked device that never grants stream credit
+            // cannot make the listener hold unbounded refusal bytes.
+            const TREEKEM_REFUSAL_SEND_CAP: usize = 16;
+            let mut refusal_sends = futures::stream::FuturesUnordered::new();
+            let send_treekem_refusal = |sender: identity::AgentId,
+                                        machine_id: identity::MachineId,
+                                        group_id: String,
+                                        reason: direct::TreeKemCatchupRefusalReason| {
+                let network = std::sync::Arc::clone(&network);
+                let capability_store = std::sync::Arc::clone(&refusal_capability_store);
+                let identity = std::sync::Arc::clone(&refusal_identity);
+                let move_state = std::sync::Arc::clone(&move_state_direct);
+                let move_state_load_failed =
+                    std::sync::Arc::clone(&refusal_move_state_load_failed);
+                let replies = std::sync::Arc::clone(&refusal_replies);
+                async move {
+                    // Gate 2 of the refusal-only reply path (see
+                    // `Agent::send_treekem_refusal_reply`): the requester
+                    // machine's verified advert must carry bit 13, else
+                    // the frame keeps main's silent drop.
+                    if !treekem_refusal_capability_admits(&capability_store, &machine_id) {
+                        tracing::debug!(
+                            target: "x0x::direct",
+                            stage = "recv",
+                            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                            outcome = "treekem_refusal_capability_withheld",
+                            "typed TreeKEM catch-up refusal withheld: the requester machine's verified advert lacks bit 13 (silent drop, main's behavior)"
+                        );
+                        return;
+                    }
+                    // Gate 3: the ADR-0043 signing gate.
+                    if !treekem_refusal_signing_gate_allows(
+                        &identity,
+                        &move_state,
+                        &move_state_load_failed,
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            target: "x0x::direct",
+                            stage = "recv",
+                            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                            outcome = "treekem_refusal_signing_gate_withheld",
+                            "typed TreeKEM catch-up refusal withheld: the ADR-0043 signing gate refuses this machine"
+                        );
+                        return;
+                    }
+                    send_treekem_refusal_frame(
+                        Some(&network),
+                        &replies,
+                        local_agent_id,
+                        sender,
+                        machine_id,
+                        &group_id,
+                        reason,
+                    )
+                    .await;
+                }
+            };
             loop {
                 // direct_tx is a NetworkNode struct field that outlives
                 // network.shutdown(), so recv_direct() does not return None on
@@ -19180,6 +19499,10 @@ impl Agent {
                     biased;
                     _ = token.cancelled() => break,
                     ready = pending.next(), if !pending.is_empty() => ready,
+                    sent = refusal_sends.next(), if !refusal_sends.is_empty() => {
+                        let _ = sent;
+                        continue;
+                    }
                     r = network.recv_direct_with_ingress() => {
                         let Some((peer, payload, ingress)) = r else { break; };
                         let barrier = std::sync::Arc::clone(&evidence);
@@ -19301,7 +19624,7 @@ impl Agent {
                 // delivered). Fail closed: drop + count, never reach
                 // mark_connected/handle_incoming. Read lock is held only for
                 // the boolean — no await under it (same contract as EP4).
-                let peer_revoked = {
+                let (peer_revoked, agent_revoked, machine_revoked) = {
                     let revoked = revocation_set.read().await;
                     if revoked.revocation_resync_required() {
                         tracing::info!(
@@ -19314,7 +19637,14 @@ impl Agent {
                         drop(revoked);
                         continue;
                     }
-                    direct::inbound_peer_revoked(&revoked, &sender, &machine_id)
+                    // #1657: split the two causes so the refusal below can
+                    // name the revocation that applies. The drop condition
+                    // stays exactly inbound_peer_revoked — agent OR machine —
+                    // and every flag is read under this one lock.
+                    let agent_revoked = revoked.is_agent_revoked(&sender);
+                    let machine_revoked = revoked.is_machine_revoked(&machine_id);
+                    let peer_revoked = direct::inbound_peer_revoked(&revoked, &sender, &machine_id);
+                    (peer_revoked, agent_revoked, machine_revoked)
                 };
                 if peer_revoked {
                     dm.record_incoming_dropped_revoked();
@@ -19326,6 +19656,34 @@ impl Agent {
                         outcome = "drop_revoked",
                         "direct message from revoked sender dropped (direct-path revocation gate, mirrors EP3)"
                     );
+                    // #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): a
+                    // catch-up request from a machine-revoked device gets the typed
+                    // refusal that names the revocation, instead of the silent drop.
+                    // The frame is still dropped; the refusal replaces the silence.
+                    // An agent-revoked sender keeps the silent drop — only the
+                    // machine alone being the cause may be named. The send runs
+                    // on `refusal_sends`, never inline (review finding 1).
+                    if machine_revoked && !agent_revoked {
+                        if let Some(group_id) = direct::treekem_catchup_refusal_probe(&data, &sender)
+                        {
+                            if refusal_sends.len() < TREEKEM_REFUSAL_SEND_CAP {
+                                refusal_sends.push(send_treekem_refusal(
+                                    sender,
+                                    machine_id,
+                                    group_id,
+                                    direct::TreeKemCatchupRefusalReason::MachineRevoked,
+                                ));
+                            } else {
+                                tracing::debug!(
+                                    target: "x0x::direct",
+                                    stage = "recv",
+                                    sender_prefix = %network::hex_prefix(&sender.0, 4),
+                                    outcome = "treekem_refusal_backlog_full",
+                                    "typed TreeKEM catch-up refusal dropped: the send backlog is full"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -19353,6 +19711,33 @@ impl Agent {
                         reason = ?denial,
                         "direct message dropped at ADR-0043 B/P pairing gate"
                     );
+                    // #1657: check B is a binding revocation, so a catch-up
+                    // request it drops gets the typed refusal that names it
+                    // (same shape as the machine-revoked arm above — the
+                    // send runs on `refusal_sends`, never inline).
+                    // PlacementPinned stays a silent drop: it states a
+                    // placement fact, not a revocation.
+                    if matches!(denial, key_move::PairingDenial::BindingRevoked) {
+                        if let Some(group_id) = direct::treekem_catchup_refusal_probe(&data, &sender)
+                        {
+                            if refusal_sends.len() < TREEKEM_REFUSAL_SEND_CAP {
+                                refusal_sends.push(send_treekem_refusal(
+                                    sender,
+                                    machine_id,
+                                    group_id,
+                                    direct::TreeKemCatchupRefusalReason::BindingRevoked,
+                                ));
+                            } else {
+                                tracing::debug!(
+                                    target: "x0x::direct",
+                                    stage = "recv",
+                                    sender_prefix = %network::hex_prefix(&sender.0, 4),
+                                    outcome = "treekem_refusal_backlog_full",
+                                    "typed TreeKEM catch-up refusal dropped: the send backlog is full"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Enforcement — runtime cert-expiry gate (issue #191). EP1
@@ -22167,6 +22552,28 @@ fn schedule_reconnect(
     tracker.insert(peer_id_bytes, handle);
 }
 
+/// The owner-issued certificate a certificate-only device (no user key)
+/// loads from `path`: test builds only (W3-H, #1572), and only when it
+/// verifies and binds `agent`. Production keeps loading `agent.cert` only
+/// beside the user key, so this is always `None` there.
+#[cfg(test)]
+async fn certificate_only_cert(
+    path: Option<&std::path::Path>,
+    agent: &identity::AgentKeypair,
+) -> Option<identity::AgentCertificate> {
+    let cert = storage::load_agent_certificate_from(path?).await.ok()?;
+    let binds_agent = cert.agent_id().is_ok_and(|id| id == agent.agent_id());
+    (binds_agent && cert.verify().is_ok()).then_some(cert)
+}
+
+#[cfg(not(test))]
+async fn certificate_only_cert(
+    _path: Option<&std::path::Path>,
+    _agent: &identity::AgentKeypair,
+) -> Option<identity::AgentCertificate> {
+    None
+}
+
 impl AgentBuilder {
     /// Set a custom path for the machine keypair.
     ///
@@ -22648,7 +23055,14 @@ impl AgentBuilder {
             cert_journal_path = journal_path;
             identity::Identity::new_with_user(machine_keypair, agent_keypair, user_kp, cert)
         } else {
-            identity::Identity::new(machine_keypair, agent_keypair)
+            let certificate_only =
+                certificate_only_cert(self.agent_cert_path.as_deref(), &agent_keypair).await;
+            match certificate_only {
+                Some(cert) => {
+                    identity::Identity::new_with_certificate(machine_keypair, agent_keypair, cert)
+                }
+                None => identity::Identity::new(machine_keypair, agent_keypair),
+            }
         };
 
         // Configure the bootstrap peer cache. The cache *instance* is owned
@@ -23178,11 +23592,12 @@ impl AgentBuilder {
         // immediately on restart, even before the next gossip heartbeat.
         // L3: capture the identity's cert pair before it moves into the
         // struct — the blob responder serves this pair to fetchers.
-        let own_pair_user = identity.user_id();
+        let own_pair_user = identity.disclosed_user_id();
         let own_pair_cert = identity.agent_certificate().cloned();
         Ok(Agent {
             move_state,
             move_state_load_failed,
+            treekem_refusal_replies: std::sync::Arc::new(direct::TreeKemRefusalReplies::default()),
             move_ceremony_enabled: self.move_ceremony_enabled,
             stream_reauth,
             history_service: tokio::sync::Mutex::new(history_service),
@@ -26547,6 +26962,10 @@ fn spawn_relay_dm_listener(
 
             match disposition {
                 peer_relay::RelayDisposition::DeliverLocally => {
+                    // #1659 does not run on this path. The injected frame
+                    // uses the envelope's claimed machine. Relay delivery is
+                    // off unless `[peer_relay] enabled = true`. See
+                    // docs/design/adr-0021-mechanics.md.
                     let sender_machine_id = relayed.inner.sender_machine_id;
                     let sender_peer_id = ant_quic::PeerId(sender_machine_id);
                     let inner_wire = match postcard::to_allocvec(&relayed.inner) {
@@ -27102,6 +27521,57 @@ mod tests {
             "the zero-fanout miss must be counted"
         );
         agent.shutdown().await;
+    }
+
+    /// W3-H (#1572): a test build loads an owner-issued `agent.cert` with
+    /// no user key only when it binds this agent; the announce then names
+    /// the certificate's issuer.
+    #[tokio::test]
+    async fn certificate_only_device_loads_its_own_certificate() {
+        let owner = identity::UserKeypair::generate().expect("owner user key");
+        let agent_kp = identity::AgentKeypair::generate().expect("agent key");
+        let other = identity::AgentKeypair::generate().expect("other agent key");
+        for (issued_to, loads) in [(&agent_kp, true), (&other, false)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cert_path = dir.path().join("agent.cert");
+            let cert = identity::AgentCertificate::issue(&owner, issued_to).expect("issue");
+            storage::save_agent_certificate_to(&cert, cert_path.clone())
+                .await
+                .expect("save cert");
+            storage::save_agent_keypair_to(&agent_kp, dir.path().join("agent.key"))
+                .await
+                .expect("save agent key");
+            let agent = Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .with_agent_cert_path(&cert_path)
+                .with_identity_dir(dir.path())
+                .with_peer_cache_disabled()
+                .build()
+                .await
+                .expect("agent");
+            let identity = agent.identity();
+            assert_eq!(identity.user_id(), None, "no user key: not the owner");
+            assert_eq!(identity.agent_certificate().is_some(), loads);
+            let disclosed = loads.then(|| owner.user_id());
+            assert_eq!(identity.disclosed_user_id(), disclosed);
+            // The blob responder serves the pair the announce advertises
+            // (a cold fetch of the certificate by its digest).
+            let (user, cert) = agent
+                .own_cert_pair
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert_eq!(user, disclosed);
+            let advertised =
+                announce_v3::cert_digest(&disclosed, &identity.agent_certificate().cloned());
+            let served = agent
+                .announce_blob_cache
+                .serve_request(&advertised, &user, &cert)
+                .await;
+            assert_eq!(served.is_some(), loads, "the advertised digest is served");
+            agent.shutdown().await;
+        }
     }
 
     mod own_agent_certificate_lookup_797 {

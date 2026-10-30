@@ -483,9 +483,21 @@ pub(super) async fn drive(state: &Arc<AppState>) {
     }
     let local = *state.agent.agent_id().as_bytes();
     for (key, delivery) in due {
+        // #1574 item 5: this read decides the three drops below ("group
+        // gone", fork containment, "head moved"), so it holds
+        // `named_groups_persistence_lock`: `persist_named_group_info`
+        // shows its candidate in the map before the write and restores the
+        // map when the write fails, and an unlocked read could drop a
+        // delivery on a candidate that rolls back (#1620 fixed the same
+        // shape in the removal barrier's `live_head_is`). The guard covers
+        // only the read; the round and send work below take no lock that a
+        // roster write holds.
         let info = {
-            let groups = state.named_groups.read().await;
-            groups
+            let _committed = state.named_groups_persistence_lock.lock().await;
+            state
+                .named_groups
+                .read()
+                .await
                 .values()
                 .find(|info| info.stable_group_id() == key.stable_group_id)
                 .cloned()
@@ -1172,6 +1184,83 @@ mod daemon_tests {
             delivery.recipients.get(survivor.as_bytes()),
             Some(&RecipientDelivery::Due),
             "the survivor's send started"
+        );
+        Ok(())
+    }
+
+    /// #1574 item 5: `drive` drops a removal on its "group gone" read, so
+    /// the read must hold `named_groups_persistence_lock`:
+    /// `persist_named_group_info` shows its candidate in the map before
+    /// the write and restores the map when the write fails. Before the
+    /// fix the drive read a mid-write withdraw candidate and dropped the
+    /// delivery the committed roster still admits.
+    #[tokio::test]
+    async fn a_removal_delivery_drop_waits_out_a_roster_candidate_that_rolls_back() -> Result<()> {
+        let (state, _dir) = state_past_restart_wait().await?;
+        let survivor = AgentId([0x63; 32]);
+        let target = [0x64; 32];
+        let group_id = "d6".repeat(16);
+        let info = insert_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        let key = EvictionKey::new(stable.clone(), target);
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.removals.insert(
+                key.clone(),
+                new_delivery(
+                    removal_event(&group_id, &target),
+                    info.state_hash.clone(),
+                    vec![*survivor.as_bytes()],
+                    false,
+                    Instant::now(),
+                ),
+            );
+        }
+        // The mid-write window: a withdraw candidate is in the map while
+        // the persistence lock is held — exactly what a failing
+        // `persist_named_group_info` restores.
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate.withdrawn = true;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate);
+        let driven = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { drive(&state).await })
+        };
+        for _ in 0..30 {
+            if driven.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .removals
+                .contains_key(&key),
+            "the drop must block on the persistence lock, not read the mid-write candidate"
+        );
+        // The write failed: the map is restored under the same lock hold.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        drop(guard);
+        driven.await?;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let delivery = inner.removals.get(&key).context("delivery kept")?;
+        assert_ne!(
+            delivery.recipients.get(survivor.as_bytes()),
+            Some(&RecipientDelivery::Due),
+            "the committed roster's round ran"
         );
         Ok(())
     }

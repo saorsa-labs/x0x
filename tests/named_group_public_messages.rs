@@ -87,6 +87,7 @@ fn public_open_members_only_accepts_active_member() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     validate_public_message(&ctx, &msg).unwrap();
 }
@@ -101,6 +102,7 @@ fn public_open_rejects_non_member() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     let err = validate_public_message(&ctx, &msg).unwrap_err();
     assert!(matches!(err, IngestError::WritePolicyViolation { .. }));
@@ -125,6 +127,7 @@ fn banned_author_rejected_in_every_mode() {
             group_id: "g1",
             policy: &policy,
             members_v2: &members,
+            join_seat_marker_agents: std::collections::BTreeSet::new(),
         };
         let err = validate_public_message(&ctx, &msg).unwrap_err();
         assert!(
@@ -145,6 +148,7 @@ fn moderated_public_accepts_unknown_non_banned() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     validate_public_message(&ctx, &msg).unwrap();
 }
@@ -161,6 +165,7 @@ fn admin_only_rejects_plain_member() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     let err = validate_public_message(&ctx, &msg).unwrap_err();
     assert!(matches!(err, IngestError::WritePolicyViolation { .. }));
@@ -178,6 +183,7 @@ fn admin_only_accepts_admin() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     validate_public_message(&ctx, &msg).unwrap();
 }
@@ -194,6 +200,7 @@ fn admin_only_accepts_owner() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     validate_public_message(&ctx, &msg).unwrap();
 }
@@ -208,6 +215,7 @@ fn mls_encrypted_rejects_public_message() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     let err = validate_public_message(&ctx, &msg).unwrap_err();
     assert!(matches!(err, IngestError::ConfidentialityMismatch));
@@ -223,6 +231,7 @@ fn group_id_mismatch_rejected() {
         group_id: "g-other",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     let err = validate_public_message(&ctx, &msg).unwrap_err();
     assert!(matches!(err, IngestError::GroupIdMismatch { .. }));
@@ -241,6 +250,7 @@ fn tampered_body_breaks_signature() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     let err = validate_public_message(&ctx, &msg).unwrap_err();
     assert!(matches!(err, IngestError::InvalidSignature(_)));
@@ -257,6 +267,7 @@ fn oversized_body_rejected() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     let err = validate_public_message(&ctx, &msg).unwrap_err();
     assert!(matches!(err, IngestError::MessageTooLarge { .. }));
@@ -278,6 +289,7 @@ fn author_swap_breaks_signature() {
         group_id: "g1",
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents: std::collections::BTreeSet::new(),
     };
     let err = validate_public_message(&ctx, &msg).unwrap_err();
     assert!(matches!(err, IngestError::InvalidSignature(_)));

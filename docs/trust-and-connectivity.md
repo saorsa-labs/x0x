@@ -318,6 +318,49 @@ unverified. The connector records a dialed machine only when an authority
 store confirms it. An unconfirmed connection can carry the current send as an
 unverified hint, but never creates a binding.
 
+When this receiver can attribute a revoked machine to an agent, an
+unattested DM or ACK on the inbox topic or the compatibility bus requires
+an origin attestation (#1659; David, 28 Oct 2026, D283). An ACK is
+delivery evidence. The same trigger covers it: only once the agent has a
+machine revocation. An ACK is not accepted from a device this receiver
+would refuse a DM from. That is a deliberate partial override of ADR
+0021's accept-with-binding-fallback policy for those linked agents only.
+The relay `DeliverLocally` path does not apply it. The caps (8 machines
+per agent, 65,536 pairs split into a contact remainder of 45,056, a
+protected non-contact share of 16,384, and a stranger LRU of 4,096, and
+4,096 named overflowed agents), the rule that a machine past the per-agent cap
+is not recorded, and the restart residual are in
+[ADR-0021 mechanics](design/adr-0021-mechanics.md). An unknown revocation
+answer does not evict a protected pair or a stranger pair and does not
+count as a confirmed revocation. A revoked pair in the protected share
+stays pinned, up to 2 machines for that agent. A revoked stranger pair
+stays pinned on the same per-agent limit, and only up to 2,048 pins in
+the stranger share. The inbox never evicts a revoked pin to make room.
+Eviction pins a revoked stranger pair when that cap and the per-agent
+limit both have room, including a pair that was recorded clean and
+revoked later. A later revoked pair does not replace a pin already
+held. Leaving the stranger share releases that agent's pins. Pairs that
+were dropped or could not be pinned are remembered only up to the
+stranger share size, at most 8 machines for one agent. The oldest
+record is forgotten. That loss, the pins, and those records are process
+memory and are dropped on restart. When the pin cap is full, an
+unattested DM or ACK is refused only from an agent who still has such a
+record, and only those refusals increment `incoming_dropped_revoked`.
+A clean probe answer removes the record. An open pin cap does not
+refuse that agent. A sender this receiver cannot link to a revoked
+machine keeps its normal policy.
+Overflow does not refuse an unattested DM or ACK by itself. When the
+daemon does refuse because a revoked machine is also attributed, the
+drop increments `incoming_dropped_revoked`. An unattested DM or ACK that
+claims a different, clean machine can still be accepted when this
+receiver cannot link that sender to a revoked machine. An agent-key
+compromise is not stopped by this check: the holder can mint a fresh
+machine and a valid attestation.
+A binding tombstone blocks only the named pair. Containing the
+compromised agent key requires an agent revocation. A tombstone that
+names a revoked machine keeps refusing that legacy agent's unattested
+DMs while the revocation record is held.
+
 Behaviour to know:
 
 - **Rendezvous-discovered agents are addresses only.** An agent that

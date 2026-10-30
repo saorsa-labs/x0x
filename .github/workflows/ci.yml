@@ -85,6 +85,13 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # W3-H idle-step code is behind `tokio_unstable`. The plain clippy
+      # above does not build it (#1245, #1654).
+      - name: Run clippy under tokio_unstable
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        env:
+          RUSTFLAGS: --cfg tokio_unstable
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest
@@ -793,6 +800,8 @@ jobs:
           --expect w3h_1357_red_s4_idle_revocation_one_admin=GREEN
           --require w3h_1357_control_s4_self_leave_crypto_only
           --expect w3h_1357_control_s4_self_leave_crypto_only=GREEN
+          --require w3h_1357_control_s4_self_leave_lost_join_copy
+          --expect w3h_1357_control_s4_self_leave_lost_join_copy=GREEN
           --require w3h_1357_red_s4_fallback_rank_manual
           --expect w3h_1357_red_s4_fallback_rank_manual=GREEN
           --require w3h_1357_control_s4_manual_remove_without_obligation
@@ -827,6 +836,8 @@ jobs:
           --expect w3h_1356_red_s3_aligned_stale_joiner_catches_up=GREEN
           --require w3h_1356_control_s3_attestation_touches_only_the_subject
           --expect w3h_1356_control_s3_attestation_touches_only_the_subject=GREEN
+          --require w3h_1356_control_s3_d7_request_flood_rate_limited
+          --expect w3h_1356_control_s3_d7_request_flood_rate_limited=GREEN
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
           --expect w3h_1356_red_s3_forked_node_shows_reseat_required=GREEN
           --require w3h_1356_control_s3_forked_node_not_auto_recovered
@@ -843,6 +854,16 @@ jobs:
           --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
           --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
           --expect w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless=GREEN
+          --require w3h_1581_s4_ordinary_admin_revoked
+          --expect w3h_1581_s4_ordinary_admin_revoked=GREEN
+          --require w3h_1581b_control_dropped_eager_frame_retry_floor
+          --expect w3h_1581b_control_dropped_eager_frame_retry_floor=GREEN
+          --require w3h_1581b_red_dropped_eager_frame_total_a_loss
+          --expect w3h_1581b_red_dropped_eager_frame_total_a_loss=GREEN
+          --require w3h_1581c_control_restart_stale_head_resume
+          --expect w3h_1581c_control_restart_stale_head_resume=GREEN
+          --require w3h_1581c_red_restart_stale_head_no_sync_past_wait
+          --expect w3h_1581c_red_restart_stale_head_no_sync_past_wait=RED
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable

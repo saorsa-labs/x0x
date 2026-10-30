@@ -771,10 +771,14 @@ pub(in crate::server) async fn commit_locked(
     );
     let task_state = Arc::clone(state);
     let card_key = group_key.to_string();
-    let _spawned = state.spawn_detached(async move {
-        ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
-        drive_deliveries(&task_state).await;
-    });
+    // #1699: the delivery worker walks every group's live record, also
+    // when a staged re-seat join's apply committed this exclusion.
+    let _spawned = state.spawn_detached(crate::server::reseat_scope::outside_reseat_scope(
+        async move {
+            ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
+            drive_deliveries(&task_state).await;
+        },
+    ));
     SelfLeaveRekeyStep::Committed
 }
 
@@ -944,10 +948,13 @@ pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_k
     );
     let task_state = Arc::clone(state);
     let card_key = group_key.to_string();
-    let _spawned = state.spawn_detached(async move {
-        ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
-        drive_deliveries(&task_state).await;
-    });
+    // #1699: as above, the worker sees every group's live record.
+    let _spawned = state.spawn_detached(crate::server::reseat_scope::outside_reseat_scope(
+        async move {
+            ng::maybe_publish_group_card_after_state_change(&task_state, &card_key).await;
+            drive_deliveries(&task_state).await;
+        },
+    ));
 }
 
 /// Seal `info`'s current secret to each remaining Active member other
@@ -4566,6 +4573,13 @@ mod daemon_tests {
             .collect()
     }
 
+    /// #1616: the transport machine of a simulated DM whose sender device
+    /// is clean — the same id named_groups' `clean_sender_machine` uses,
+    /// which no test revokes.
+    fn clean_sender_machine() -> x0x::identity::MachineId {
+        x0x::identity::MachineId([0x16; 32])
+    }
+
     /// The `responder_state_hash` this node really serves in a catch-up
     /// answer for `group_id` (#1578 review: the tests feed the served
     /// answer, never a hand-built value).
@@ -4585,6 +4599,7 @@ mod daemon_tests {
         ng::handle_treekem_catchup_request(
             state,
             &requester,
+            &clean_sender_machine(),
             true,
             ng::TreeKemCatchupRequest {
                 message_type: "treekem_catchup_request".to_string(),
@@ -6102,6 +6117,7 @@ mod daemon_tests {
         ng::handle_treekem_catchup_request(
             &state,
             &requester,
+            &clean_sender_machine(),
             true,
             ng::TreeKemCatchupRequest {
                 message_type: "treekem_catchup_request".to_string(),

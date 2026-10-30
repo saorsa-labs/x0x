@@ -45,7 +45,7 @@ pub(in crate::server) use requester_offer::{
     RequesterOfferObligation,
 };
 
-use super::super::state::AppState;
+use super::super::state::{AppState, TreeKemCatchupRefusalNote};
 use super::super::{
     api_error, api_error_with_reason, bad_request, forbidden, not_found, parse_agent_id_hex,
     parse_optional_json,
@@ -61,6 +61,7 @@ use super::public_group_bootstrap_outbox::{
     spawn_public_group_bootstrap_delivery,
 };
 use crate as x0x;
+use crate::direct::{TreeKemCatchupRefusal, TreeKemCatchupRefusalReason};
 use crate::groups::aad::secure_share_aad;
 use crate::server::group_access::{self, AccessLevel, MemberState};
 use anyhow::{Context, Result};
@@ -83,7 +84,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, MutexGuard, RwLock};
 use x0x::contacts::TrustLevel;
-use x0x::identity::AgentId;
+use x0x::identity::{AgentId, MachineId};
 use x0x::logging::LogHexId;
 use x0x::Agent;
 
@@ -1320,9 +1321,11 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     /// of its saved head's epoch, and its own roster seat carries no KEM
     /// key, it claims no head). Every other responder — a SignedPublic
     /// member, an encrypted-group joiner still waiting for its welcome
-    /// share, and a superseded intermediate install included — serves
-    /// exactly main's value. A present value is always the responder's
-    /// saved head. A startup self-leave seal trusts this only when it
+    /// share, and a superseded intermediate install whose seat still
+    /// carries the KEM key — serves exactly main's value. A present
+    /// value is the responder's saved head, except that a responder
+    /// that does not know the group serves an empty string (main's
+    /// answer). A startup self-leave seal trusts this only when it
     /// equals the local head after the page is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
@@ -1372,6 +1375,29 @@ pub(in crate::server) enum JoinResultMessage {
         /// refusal to exactly the attempt that asked.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt_id: Option<String>,
+        /// ADR 0108 §8 (#1575): this joiner understands `Pending` notices
+        /// and sets the `join_pending_notice_v1` capability bit. A v0.46
+        /// joiner never sends the field, and a member NEVER answers
+        /// `Pending` without it — the arm is unreachable for legacy
+        /// decoders.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accepts_pending_notice: bool,
+        /// ADR 0108 §8: the BLAKE3 hex of the canonical bytes of the
+        /// notice the joiner already holds for this attempt, so each
+        /// change is served once.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_notice_hash: Option<String>,
+        /// ADR 0108 §8 (D154): a notice-only request. It may be answered
+        /// with at most one member-signed `no_eligible_admin` `Pending`,
+        /// never a Result, Refused, Welcome, key or roster.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        notice_only: bool,
+        /// ADR 0108 §8 (D154): the joiner's own signed `MemberJoined` for
+        /// this attempt. Notice-only polling only; the member verifies it
+        /// ([`verified_join_attempt_evidence`]) before any D154 staging or
+        /// serving.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_evidence: Option<Box<NamedGroupMetadataEvent>>,
     },
     Result {
         event: Box<NamedGroupMetadataEvent>,
@@ -1425,6 +1451,13 @@ pub(in crate::server) enum JoinResultMessage {
     /// to fetches that carried `accepts_refusal: true` AND a matching
     /// `attempt_id` — a v0.41 joiner can never decode onto this arm.
     Refused { receipt: Box<JoinRefusalReceipt> },
+    /// ADR 0108 §8 (#1575): the typed cause of a held join attempt, signed
+    /// per D154 and served under D145's pre-admission amendment (no key,
+    /// Welcome, roster or certificate bytes). Served ONLY to verified,
+    /// attempt-matching fetches that carried `accepts_pending_notice: true`
+    /// and whose advert sets `join_pending_notice_v1` — a legacy joiner
+    /// never sees this arm.
+    Pending { notice: Box<JoinPendingNotice> },
 }
 
 /// #477 W2 — the terminal refusal reasons. Exactly the DEFINITIVE
@@ -1562,6 +1595,14 @@ pub(in crate::server) struct PendingJoinRefusal {
 const JOIN_PENDING_CAUSE_OWNER_CERTIFICATE_PENDING: &str = "owner_certificate_pending";
 const JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN: &str = "no_eligible_admin";
 
+/// Engineer ruling, 27 Oct 2026 (PR #1639 review round 3): staging for the
+/// D154 cause `no_eligible_admin` stays OFF until the notice-only rotation
+/// slice lands. Real joiners never send `attempt_evidence` in this slice, so
+/// the evidence-bound staging arm is reachable only by a sender that mints
+/// its own `MemberJoined`; the rotation slice re-enables it bound to a real
+/// invite or attempt.
+const D154_STAGING_ENABLED: bool = false;
+
 /// ADR 0108 §8: a cause name must be 1 to 64 bytes of `[a-z0-9_]`. A name
 /// a joiner does not know is shown as `unrecognized_cause`, never a decode
 /// failure, so the registry stays open — this gate only keeps a staged
@@ -1578,34 +1619,150 @@ fn valid_join_pending_cause(cause: &str) -> bool {
 /// registry row names (`count`, `revision`, `digests`). Detail may name
 /// counts, revisions and committed certificate digests; it never carries
 /// agent IDs, certificate bytes, roster entries or key material.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::server) struct JoinPendingNoticeDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::server) count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::server) revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(in crate::server) digests: Vec<String>,
+}
+
+/// ADR 0108 §8 (#1575) — the SIGNED wire notice for one held join attempt,
+/// ML-DSA-65 by the signer's agent key over
+/// [`canonical_join_pending_notice_bytes`] (domain
+/// `x0x.named_group.join_pending.v1`; David's 25 Oct 2026 05:14 GMT ruling).
+/// Ten fields in §8's order; `signer_public_key_b64` rides only on a
+/// member-signed `no_eligible_admin` notice (D154) and is NOT part of the
+/// canonical bytes. A notice grants nothing: no seat, key, roster or
+/// certificate bytes ride it (D145 pre-admission replies).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct JoinPendingNotice {
+    pub(in crate::server) group_id: String,
+    pub(in crate::server) member_agent_id: String,
+    pub(in crate::server) signer_agent_id: String,
+    pub(in crate::server) attempt_id: String,
+    pub(in crate::server) cause: String,
+    pub(in crate::server) detail: JoinPendingNoticeDetail,
+    pub(in crate::server) issued_at_ms: u64,
+    pub(in crate::server) nonce: String,
+    /// Base64 ML-DSA-65 signature over the canonical notice bytes.
+    pub(in crate::server) signature_b64: String,
+    /// Present only on a member-signed `no_eligible_admin` notice (D154):
+    /// the signer's agent public key, from which the joiner derives
+    /// `signer_agent_id`. Not part of the canonical bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::server) signer_public_key_b64: Option<String>,
+}
+
+const JOIN_PENDING_NOTICE_DOMAIN: &[u8] = b"x0x.named_group.join_pending.v1";
+
+/// §8: the canonical signed bytes — the domain; the string fields
+/// `group_id`, `member_agent_id`, `signer_agent_id`, `attempt_id` and
+/// `cause`, each u32-BE length-prefixed; for `count` and `revision`, a
+/// presence byte and the big-endian value; a u32-BE digest count and each
+/// digest length-prefixed; `issued_at_ms` as u64 BE; and the
+/// length-prefixed `nonce`. Mirrors [`canonical_join_refusal_bytes`] under
+/// its own domain.
+#[must_use]
+fn canonical_join_pending_notice_bytes(notice: &JoinPendingNotice) -> Vec<u8> {
+    fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    let mut buf = Vec::new();
+    buf.extend_from_slice(JOIN_PENDING_NOTICE_DOMAIN);
+    push_lp(&mut buf, notice.group_id.as_bytes());
+    push_lp(&mut buf, notice.member_agent_id.as_bytes());
+    push_lp(&mut buf, notice.signer_agent_id.as_bytes());
+    push_lp(&mut buf, notice.attempt_id.as_bytes());
+    push_lp(&mut buf, notice.cause.as_bytes());
+    match notice.detail.count {
+        Some(count) => {
+            buf.push(1);
+            buf.extend_from_slice(&count.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+    match notice.detail.revision {
+        Some(revision) => {
+            buf.push(1);
+            buf.extend_from_slice(&revision.to_be_bytes());
+        }
+        None => buf.push(0),
+    }
+    buf.extend_from_slice(&(notice.detail.digests.len() as u32).to_be_bytes());
+    for digest in &notice.detail.digests {
+        push_lp(&mut buf, digest.as_bytes());
+    }
+    buf.extend_from_slice(&notice.issued_at_ms.to_be_bytes());
+    push_lp(&mut buf, notice.nonce.as_bytes());
+    buf
+}
+
+/// §8: `held_notice_hash` is the BLAKE3 hex of the canonical bytes of the
+/// notice the joiner already holds, so each change is served once.
+#[must_use]
+fn join_pending_notice_hash(notice: &JoinPendingNotice) -> String {
+    hex::encode(blake3::hash(&canonical_join_pending_notice_bytes(notice)).as_bytes())
+}
+
+/// §8: the lazily materialized signature, cached until the cause or detail
+/// changes (`canonical_hash` pins what it signed).
+#[derive(Debug, Clone)]
+pub(in crate::server) struct CachedJoinPendingNotice {
+    pub(in crate::server) canonical_hash: String,
+    pub(in crate::server) signature_b64: String,
 }
 
 /// ADR 0108 §8 (#1575) — a member-side STAGED notice for one held join
 /// attempt, keyed `(group_id, member_agent_id, attempt_id)` exactly like a
-/// staged refusal. Unsigned, in-memory local state only: the signed wire
-/// `JoinPendingNotice` (ML-DSA over canonical bytes, domain
-/// `x0x.named_group.join_pending.v1`) and the `JoinResultMessage::Pending`
-/// serving arm need David's ruling (#1575), so nothing here reaches a
-/// joiner yet. Like a staged refusal it is dropped when a Result or Refused
-/// is staged for the attempt, when its cause clears at the next poll-time
-/// evaluation, and at the 10-minute join staging lifetime.
+/// staged refusal. Unsigned, in-memory local state; the signed wire body
+/// materializes lazily at the first capable serve
+/// ([`serve_staged_join_pending_notice`]) and its bytes stay stable while
+/// the cause and detail are unchanged. Like a staged refusal it is dropped
+/// when a Result or Refused is staged for the attempt, when its cause
+/// clears at the next poll-time evaluation, and at the 10-minute join
+/// staging lifetime.
 pub(in crate::server) struct PendingJoinNotice {
     pub(in crate::server) cause: &'static str,
     pub(in crate::server) detail: JoinPendingNoticeDetail,
     /// The signer §8 names for the cause: the pinned authority, or — for
     /// `no_eligible_admin` — any Active member (D154). Always this node.
     pub(in crate::server) signer_agent_id: String,
-    pub(in crate::server) created_at: std::time::Instant,
+    /// The attempt's expected authority (the inviter the verified evidence
+    /// or the sealed event names). When it is not this node, a served
+    /// `no_eligible_admin` notice is member-signed and carries
+    /// `signer_public_key_b64` (§8 wire shape).
+    pub(in crate::server) inviter_agent_id: Option<String>,
+    /// Pinned at first staging and kept across restaging of the same cause
+    /// and detail, so the wire notice (and its hash) changes only when the
+    /// cause or detail changes.
+    pub(in crate::server) issued_at_ms: u64,
+    pub(in crate::server) cached: Option<CachedJoinPendingNotice>,
+    pub(in crate::server) created_at: Instant,
+}
+
+/// ADR 0108 §8: a staged notice is current while BOTH of its clocks sit
+/// inside the 10-minute lifetime — `created_at` (refreshed when a restage
+/// of the same cause and detail renews the row) and `issued_at_ms` (pinned
+/// at first staging; the clock the joiner's freshness check runs on). The
+/// issued-at clock is what stops a refire from re-polling one attempt id
+/// forever: the joiner drops notices past it, so the member never serves
+/// or refreshes for one past it either (PR #1639 review round 3).
+fn staged_join_pending_notice_is_current(notice: &PendingJoinNotice) -> bool {
+    notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL
+        && now_millis_u64().saturating_sub(notice.issued_at_ms)
+            < PENDING_JOIN_RESULT_TTL.as_millis() as u64
 }
 
 /// ADR 0108 §8 staging: insert or refresh the notice for one attempt.
 /// TTL-swept at the join staging lifetime, like the staged refusals the
-/// staging sits beside.
+/// staging sits beside. §8's selection order (Result, then Refused, then
+/// notice) forbids a notice sitting beside a staged refusal for the SAME
+/// attempt: when one is already staged (#1628 review item 1 — a typed
+/// refusal followed by a seal retry that returns early), nothing stages.
 async fn stage_join_pending_notice(
     state: &AppState,
     group_id: &str,
@@ -1613,15 +1770,43 @@ async fn stage_join_pending_notice(
     attempt_id: &str,
     cause: &'static str,
     detail: JoinPendingNoticeDetail,
+    inviter_agent_id: Option<String>,
 ) {
     debug_assert!(valid_join_pending_cause(cause), "registry cause shape");
     let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
+    if state
+        .pending_join_refusals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&key)
+    {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            attempt_id = %attempt_id,
+            "ADR 0108 §8: a staged refusal for the attempt forbids staging a notice beside it"
+        );
+        return;
+    }
     let signer_agent_id = hex::encode(state.agent.identity().agent_id().as_bytes());
     let mut notices = state
         .pending_join_notices
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    notices.retain(|_, notice| notice.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    notices.retain(|_, notice| staged_join_pending_notice_is_current(notice));
+    // §8: a restaging of the SAME cause and detail is the same notice —
+    // its `issued_at_ms` and cached signature stay, so the wire bytes (and
+    // the joiner's `held_notice_hash`) change only when the cause or
+    // detail changes. Only the TTL window refreshes. A restage of a row
+    // past its issued-at lifetime starts a fresh notice instead (the sweep
+    // above removed it), so the joiner's freshness clock never sees a
+    // notice older than the lifetime.
+    if let Some(existing) = notices.get_mut(&key) {
+        if existing.cause == cause && existing.detail == detail {
+            existing.created_at = Instant::now();
+            return;
+        }
+    }
     // §8 Q3 bound: the same 1024-entry cap as the staged refusals beside
     // this map, evicting the oldest. The poll path stages under a
     // joiner-chosen attempt id, so without this a single verified agent
@@ -1641,6 +1826,9 @@ async fn stage_join_pending_notice(
             cause,
             detail,
             signer_agent_id,
+            inviter_agent_id,
+            issued_at_ms: now_millis_u64(),
+            cached: None,
             created_at: Instant::now(),
         },
     );
@@ -1691,7 +1879,11 @@ fn drop_staged_join_pending_notice(
 /// current committed roster. While verified revocations cover every admin
 /// seat (ADR 0110 §4, [`join_artifact_no_eligible_admin`]), it stages the
 /// single cause `no_eligible_admin`, with no detail; it never signs any
-/// other cause. When the conditions do not hold — an eligible admin
+/// other cause. The D154 STAGING is bound to the fetch's verified
+/// `attempt_evidence` (`verified_evidence_inviter`, #1628 review item 2):
+/// on a poll without verified evidence an arbitrary verified sender that
+/// names `member_agent_id` as itself reaches only the drop rules below —
+/// nothing stages. When the conditions do not hold — an eligible admin
 /// returned (which clears only the D154 cause it ended), this node lost its
 /// Active seat, the joiner was removed, banned or revoked, or the group is
 /// withdrawn, quarantined or gone — the staged notice for the attempt is
@@ -1703,16 +1895,14 @@ fn drop_staged_join_pending_notice(
 /// caller holds the group's membership critical section when it still has
 /// it, and stays correct when it must re-acquire the section after the
 /// refusal probe consumed the guard — a terminal answer staged in that gap
-/// forbids staging and drops any staged notice. The wire half adds D154's
-/// full attempt binding (`attempt_evidence`); on today's wire any verified
-/// sender that names `member_agent_id` as itself reaches this evaluation,
-/// and the §8 Q3 cap bounds what it can stage. The notice grants nothing:
+/// forbids staging and drops any staged notice. The notice grants nothing:
 /// it carries no key, Welcome, roster or certificate bytes.
 async fn evaluate_polled_join_pending_notice(
     state: &AppState,
     group_id: &str,
     member_agent_id: &str,
     attempt_id: Option<&str>,
+    verified_evidence_inviter: Option<&str>,
 ) {
     // §8's pre-admission amendment (D145) binds every notice to the
     // attempt: a poll without an attempt id stages nothing.
@@ -1788,15 +1978,36 @@ async fn evaluate_polled_join_pending_notice(
     }
     match join_artifact_no_eligible_admin(state, group_id).await {
         Err(JoinArtifactRefusal::NoEligibleAdmin) => {
-            stage_join_pending_notice(
-                state,
-                group_id,
-                member_agent_id,
-                attempt_id,
-                JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
-                JoinPendingNoticeDetail::default(),
-            )
-            .await;
+            // Engineer ruling, 27 Oct 2026 (PR #1639 review round 3):
+            // staging for `no_eligible_admin` stays OFF until the D154
+            // notice-only rotation slice lands. A real joiner never sends
+            // `attempt_evidence` in this slice, so only a forged
+            // `MemberJoined` could reach this arm — and the evidence check
+            // proves no more than §8's minimum (the event is self-
+            // consistently signed by the sender's own key), not that any
+            // member saw the invite. The rotation slice re-enables staging
+            // bound to a real invite or attempt, with the Active
+            // stub-roster seat check D154 names.
+            if D154_STAGING_ENABLED {
+                if let Some(inviter) = verified_evidence_inviter {
+                    stage_join_pending_notice(
+                        state,
+                        group_id,
+                        member_agent_id,
+                        attempt_id,
+                        JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN,
+                        JoinPendingNoticeDetail::default(),
+                        Some(inviter.to_string()),
+                    )
+                    .await;
+                }
+            } else {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    member = %LogHexId::agent(member_agent_id),
+                    "ADR 0108 §8: no_eligible_admin staging stays off until the D154 rotation slice"
+                );
+            }
         }
         // The D154 cover ended, so only the D154 cause clears at this
         // poll. Another cause — S2's `owner_certificate_pending` — is
@@ -1819,6 +2030,21 @@ async fn evaluate_polled_join_pending_notice(
             }
         }
     }
+}
+
+/// ADR 0108 §8 (#1575) — the joiner's current verified notice for one
+/// pending attempt. Newest verified `issued_at_ms` wins (§8 "Current
+/// notice"); a later Result or Refused replaces it. Never extends the poll
+/// and never confirms membership.
+#[derive(Debug, Clone)]
+pub(in crate::server) struct HeldJoinPendingNotice {
+    pub(in crate::server) cause: String,
+    pub(in crate::server) detail: JoinPendingNoticeDetail,
+    pub(in crate::server) issued_at_ms: u64,
+    pub(in crate::server) signer_agent_id: String,
+    /// BLAKE3 hex of the notice's canonical bytes — sent as
+    /// `held_notice_hash` on every poll, so each change is served once.
+    pub(in crate::server) canonical_hash: String,
 }
 
 /// #477 — a joiner-side pending-join attempt. Keyed `join_result_key`.
@@ -1851,6 +2077,11 @@ pub(in crate::server) struct PendingJoinAttempt {
     /// the stub — finalize removes the listener only if the token still
     /// matches (a newer install is never removed).
     pub listener_token: Option<u64>,
+    /// ADR 0108 §8 (#1575): the current verified `JoinPendingNotice` for
+    /// this attempt, surfaced as `pending_cause` on join-status and sent
+    /// as `held_notice_hash` on every poll. Cleared by a later Result or
+    /// Refused, and removed with the attempt at finalize.
+    pub held_pending_notice: Option<HeldJoinPendingNotice>,
 }
 
 /// #477 — the joiner-side terminal outcome for a group.
@@ -2718,13 +2949,25 @@ fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadata
     true
 }
 
-fn named_group_member_values(info: &x0x::groups::GroupInfo) -> Vec<serde_json::Value> {
+fn named_group_member_values(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+) -> Vec<serde_json::Value> {
     // Include active + banned (banned members still appear in the roster for
-    // audit / admin view). Removed members are dropped.
+    // audit / admin view). Removed members are dropped. #1578 rc9: the
+    // join's own-key marker row holds no admission state, so it is not a
+    // member — the listing and the count stay exactly main's (no public
+    // API change). #1578 rc11 (Claude item 6): the filter is scoped to
+    // the LOCAL agent's row — the only row the local join path ever
+    // marks — so no remote row of the same shape can be hidden.
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let mut members: Vec<&x0x::groups::GroupMember> = info
         .members_v2
         .values()
-        .filter(|m| !m.is_removed())
+        .filter(|m| {
+            !m.is_removed()
+                && (m.agent_id != local_agent_hex || !join_seat_key_marker_only(info, &m.agent_id))
+        })
         .collect();
     members.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     members
@@ -2743,8 +2986,20 @@ fn named_group_member_values(info: &x0x::groups::GroupInfo) -> Vec<serde_json::V
 }
 
 #[allow(dead_code)]
-fn named_group_member_values_all(info: &x0x::groups::GroupInfo) -> Vec<serde_json::Value> {
-    let mut members: Vec<&x0x::groups::GroupMember> = info.members_v2.values().collect();
+fn named_group_member_values_all(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+) -> Vec<serde_json::Value> {
+    // #1578 rc11 (Claude item 6): scoped to the local agent's row, as
+    // [`named_group_member_values`].
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut members: Vec<&x0x::groups::GroupMember> = info
+        .members_v2
+        .values()
+        .filter(|m| {
+            !(m.agent_id == local_agent_hex && join_seat_key_marker_only(info, &m.agent_id))
+        })
+        .collect();
     members.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     members
         .into_iter()
@@ -3266,6 +3521,23 @@ async fn emit_shard_digest(state: &AppState, kind: x0x::groups::ShardKind, shard
 }
 
 /// Re-publish our own signed cards for groups listed in a Pull request.
+/// The local record a discovery Pull may sign a fresh card from. Pull
+/// requests use the stable `group_id`, so it resolves by either the local
+/// routing key or the D.3 stable id. #1570 (ZCode on 8ac7036f): a held-back
+/// group's live record is ahead of its durable form, so no card is signed
+/// from it; the Pull falls back to a cached card, as for a group this node
+/// does not own.
+pub(super) fn pull_card_record<'a>(
+    state: &AppState,
+    groups: &'a HashMap<String, x0x::groups::GroupInfo>,
+    gid: &str,
+) -> Option<&'a x0x::groups::GroupInfo> {
+    groups
+        .get(gid)
+        .or_else(|| groups.values().find(|info| info.stable_group_id() == gid))
+        .filter(|info| !group_recovery::is_held_back(state, info.stable_group_id()))
+}
+
 async fn respond_to_pull(
     state: &AppState,
     kind: x0x::groups::ShardKind,
@@ -3278,14 +3550,8 @@ async fn respond_to_pull(
     for gid in group_ids {
         // We only re-publish cards for groups we *own* / manage locally,
         // not arbitrary cards from our cache (relays may re-publish cached
-        // blobs but cannot re-sign them). Pull requests use stable `group_id`,
-        // so resolve by either the local routing key or the D.3 stable id.
-        let owned_info = groups.get(gid.as_str()).or_else(|| {
-            groups
-                .values()
-                .find(|info| info.stable_group_id() == gid.as_str())
-        });
-        if let Some(info) = owned_info {
+        // blobs but cannot re-sign them).
+        if let Some(info) = pull_card_record(state, &groups, gid) {
             if !x0x::groups::may_publish_to_public_shards(info.policy.discoverability) {
                 continue;
             }
@@ -5776,18 +6042,6 @@ async fn classify_refused_joiner_fork_chain(
     if commit.verify_structure().is_err() {
         return false;
     }
-    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
-    // this same mandate; if it produced a successor, the lineage gate
-    // above is still empty and the marker was handled there — never
-    // record the owner's own anchored chain as fork evidence.
-    if let (Some(owner_id), Some(mandate)) = (
-        current.policy.admission.owner_certified_user_id(),
-        owner_mandate,
-    ) {
-        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
-            return false;
-        }
-    }
     let base = x0x::groups::state_commit::AlternateChainBase {
         group_id: current.stable_group_id(),
         base_revision: current.state_revision,
@@ -5842,6 +6096,21 @@ async fn classify_refused_joiner_fork_chain(
             "joiner served chain is owner-anchored to this exact terminal — stale-base gap, not fork evidence"
         );
         return true;
+    }
+    // The owner-anchor clear (outcome (a)) ran inside the apply hook with
+    // this same mandate; if it produced a successor, the lineage check at
+    // the top of this fn is still empty and the marker was handled there —
+    // never record the owner's own anchored chain as fork evidence. This check
+    // sits AFTER the v2 gap branch: an owner seal of a stale-base joiner
+    // carries both the mandate and the v2 terminal binding, and it must
+    // still arm the ADR 0109 gap gate (H-S3-c).
+    if let (Some(owner_id), Some(mandate)) = (
+        current.policy.admission.owner_certified_user_id(),
+        owner_mandate,
+    ) {
+        if mandate_anchors_commit_under_trusted_owner(current, owner_id, mandate, commit) {
+            return false;
+        }
     }
     if served_chain_owner_v1_only {
         // A genuine v1 signature authenticates the parent, but cannot
@@ -6363,6 +6632,7 @@ where
         current_revision: current.state_revision,
         current_withdrawn: current.withdrawn,
         members_v2: &current.members_v2,
+        join_seat_marker_agents: current.join_seat_key_marker_agents(),
         group_id: current.stable_group_id(),
     };
     x0x::groups::state_commit::validate_apply(&ctx, commit, action_kind)?;
@@ -6386,6 +6656,7 @@ where
         current_revision: current.state_revision,
         current_withdrawn: current.withdrawn,
         members_v2: &current.members_v2,
+        join_seat_marker_agents: current.join_seat_key_marker_agents(),
         group_id: current.stable_group_id(),
     };
     x0x::groups::state_commit::validate_apply_terminal(&ctx, commit, action_kind)?;
@@ -6479,15 +6750,24 @@ pub(in crate::server) async fn store_named_group_info(
 /// Snapshot the committed roster without retaining a group lock across the
 /// direct-connection and gossip awaits.
 pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState) {
-    let _refresh_guard = state.group_roster_gossip_lock.lock().await;
+    let mut published = state.group_roster_gossip_lock.lock().await;
     let rosters = {
         // The map write can precede an awaited disk save and be rolled back.
         // Serialize this snapshot with that transaction so SG never sees an
         // uncommitted admission or removal. Drop both guards before the
         // direct-connection and gossip awaits below.
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-        let groups = state.named_groups.read().await;
-        let mut entries: Vec<_> = groups.iter().collect();
+        // #1699: every group's roster from the live map, whatever the
+        // caller's scope, with a staged re-seat record in place of its
+        // contained original (as when the staged join ran in the live map).
+        // The staging copy is taken first: no path holds both guards.
+        let staged = state.named_groups.staging_read().await.clone();
+        let groups = state.named_groups.live_read().await;
+        let mut entries: Vec<_> = groups
+            .iter()
+            .filter(|(key, _)| !staged.contains_key(*key))
+            .chain(staged.iter())
+            .collect();
         // Aliases may retain an older view. The exact stable-id key wins;
         // otherwise take the highest revision deterministically. A winning
         // withdrawn record clears its preference rather than reviving an
@@ -6519,6 +6799,16 @@ pub(in crate::server) async fn refresh_group_rosters_for_gossip(state: &AppState
             });
             by_group.insert(group.stable_group_id().to_string(), roster);
         }
+        // #1570 (ZCode on fa096d0f): a held-back group's live record is
+        // ahead of its durable form, so any caller's refresh publishes the
+        // hint last published for it, not its live roster. The first
+        // refresh after the group commits publishes the new roster.
+        for (stable, roster) in &mut by_group {
+            if group_recovery::is_held_back(state, stable) {
+                *roster = published.get(stable).cloned().flatten();
+            }
+        }
+        published.clone_from(&by_group);
         by_group.into_values().flatten().collect()
     };
     state.agent.replace_group_rosters_for_gossip(rosters).await;
@@ -6698,6 +6988,9 @@ async fn persist_named_groups_quarantine_clear_gated_unlocked<F>(
 where
     F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
 {
+    // #1645 (round 5 review): as in `persist_named_group_info_inner`, a
+    // failed re-seat swap refuses this write before anything is staged.
+    group_recovery::refuse_roster_write_during_failed_swap(state, None).await?;
     let before = {
         let groups = state.named_groups.read().await;
         groups.clone()
@@ -6716,6 +7009,21 @@ where
     let (legacy_json, home_suite_json) =
         encode_named_groups_store_excluding_pending_stubs(state, &candidate, rebind_group_id)
             .await?;
+    // ADR 0109 §4 (#1570): the encode holds back a placeheld group whose
+    // authoritative record was not durable. Its legacy entry keeps its last
+    // committed form, which still holds the marker, so the clear is not on
+    // disk. Write and publish nothing; the live record stays contained
+    // (fail closed), and the caller retries.
+    if group_recovery::change_held_back(state, &before, &candidate) {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
+    let mut touched: Vec<&String> = before
+        .keys()
+        .chain(candidate.keys())
+        .filter(|key| before.get(*key) != candidate.get(*key))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
     let prejournaled = if let Some(group_id) = rebind_group_id {
         match prepare_rebind_journal_for_groups(state, group_id, &candidate).await {
             RebindOutcome::Failed(error) => {
@@ -6728,9 +7036,12 @@ where
     } else {
         RebindOutcome::NotApplicable
     };
+    // #1645 (round 5 review): a cleanup below discards only the journals
+    // this call wrote (`Rebound`), never journals another transaction left.
+    let journals_ours = rebind_group_id.filter(|_| matches!(prejournaled, RebindOutcome::Rebound));
     let outcome = save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await;
     if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
-        if let Some(group_id) = rebind_group_id {
+        if let Some(group_id) = journals_ours {
             discard_rebind_journal(state, group_id).await;
         }
     }
@@ -6746,7 +7057,7 @@ where
             state
                 .named_groups_requires_durability_confirmation
                 .store(true, Ordering::Release);
-        } else if let Some(group_id) = rebind_group_id {
+        } else if let Some(group_id) = journals_ours {
             discard_rebind_journal(state, group_id).await;
         }
         return outcome;
@@ -6756,13 +7067,6 @@ where
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
     ) {
         let mut groups = state.named_groups.write().await;
-        let mut touched: Vec<&String> = before
-            .keys()
-            .chain(candidate.keys())
-            .filter(|key| before.get(*key) != candidate.get(*key))
-            .collect();
-        touched.sort_unstable();
-        touched.dedup();
         // Validate every touched key before committing any of them, including
         // additions/removals and all local-only fields in GroupInfo equality.
         if touched
@@ -6782,7 +7086,7 @@ where
                 save_named_groups_checked_unlocked(state).await,
                 Ok(AtomicWriteOutcome::Durable)
             ) {
-                if let Some(group_id) = rebind_group_id {
+                if let Some(group_id) = journals_ours {
                     discard_rebind_journal(state, group_id).await;
                 }
             }
@@ -6886,7 +7190,23 @@ where
         (before, after)
     };
 
-    let outcome = save_named_groups_checked_unlocked(state).await;
+    // ADR 0109 §4 (#1570 rc4): encode, then the one commit check, then
+    // write. A mutation that touches a held-back group writes nothing and
+    // is rolled back, so no caller acknowledges it or runs its effects
+    // (snapshot deletion, withdrawal publication).
+    let encoded = {
+        let groups = state.named_groups.read().await;
+        encode_named_groups_store_excluding_pending_stubs(state, &groups, None).await
+    };
+    let outcome = match encoded {
+        Ok(_) if group_recovery::change_held_back(state, &before, &after) => {
+            Ok(AtomicWriteOutcome::NotReplaced)
+        }
+        Ok((legacy_json, home_suite_json)) => {
+            save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await
+        }
+        Err(error) => Err(error),
+    };
     if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
         compare_and_restore_named_groups(state, &before, &after).await;
     }
@@ -7215,6 +7535,15 @@ pub(in crate::server) enum SaveFault {
     /// write (the candidate install) is `ReplacedNotDurable` after the
     /// rename and its corrective re-save fails.
     PreflightOkThenReplacedNotDurableAfterWriteThenError = 6,
+    /// #1658: only the TreeKEM atomic persist reads it. The snapshot file
+    /// is written, then the named half fails as `NotReplaced` and the
+    /// journal pair is discarded: the transaction does not commit, but the
+    /// new snapshot is on disk (the failed re-seat swap's tree write).
+    NamedNotReplacedAfterSnapshot = 7,
+    /// #1645: only the TreeKEM atomic persist reads it. The Home-Suite
+    /// sidecar journal is written, then the legacy journal write (the
+    /// commit point) fails: no live file changes.
+    JournalWriteFails = 8,
 }
 
 // #470 — per-instance fault helpers; all `#[cfg(test)]` so no trace in
@@ -7423,11 +7752,19 @@ pub(in crate::server) async fn persist_named_group_info(
     group_id: &str,
     info: x0x::groups::GroupInfo,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    let stable = info.stable_group_id().to_string();
     let outcome = persist_named_group_info_inner(state, group_id, info).await;
+    // ADR 0109 §4 (#1570 review): a held-back placeheld group's change is
+    // not durable, even when the roster file is.
+    let outcome = group_recovery::held_back_outcome(state, &stable, outcome);
+    // ZCode on d1be57f1: a held-back group's change is in memory only, so
+    // its roster is not published as a gossip hint. The next save that
+    // lands publishes it.
     if matches!(
         &outcome,
         Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
-    ) {
+    ) && !group_recovery::is_held_back(state, &stable)
+    {
         refresh_group_rosters_for_gossip(state).await;
     }
     outcome
@@ -7441,6 +7778,7 @@ async fn persist_named_group_info_inner(
     // ADR 0109 §3 step 2: a staged re-seat record keeps the original's
     // marker, so a replacement that dropped it is not a clear.
     state.group_recovery.hold_reseat_marker(&mut info);
+    let stable = info.stable_group_id().to_string();
     // #457 r4: the named write and the TreeKEM snapshot rebind are ONE
     // crash-atomic transaction under the persistence lock — the journal
     // (post-mutation named json + rebound envelope) is written FIRST, the
@@ -7462,6 +7800,12 @@ async fn persist_named_group_info_inner(
             outcome => return outcome,
         }
     }
+    // #1645 (round 5 review): refuse here, before anything is staged. A
+    // failed re-seat swap keeps its transaction journals, and the rollback
+    // paths below discard this group's journals. A pin is set only under
+    // the persistence lock held here, so no pin can appear later in this
+    // transaction.
+    group_recovery::refuse_roster_write_during_failed_swap(state, None).await?;
     // #1103: both the all-clean SEAL and MemberAdded's mandate/gap-adoption
     // arms replace a record whose fork marker was cleared on a clone. Route
     // every such replacement through the same candidate gate as manual clear.
@@ -7497,17 +7841,21 @@ async fn persist_named_group_info_inner(
     // the NEW sidecar on disk with no journal to explain it.
     let pre_sidecar_bytes = tokio::fs::read(&state.home_suite_groups_path).await.ok();
     // #457 r5b/r5c rollback — PRE-DURABLE only (the named save failed or
-    // the journal preparation failed): discard both journals, restore the
-    // in-memory map, the stub marker, AND the on-disk sidecar to its
-    // pre-transaction bytes.
+    // the journal preparation failed): discard both journals when this
+    // transaction wrote them (#1645 round 5: never journals another
+    // transaction left), restore the in-memory map, the stub marker, AND
+    // the on-disk sidecar to its pre-transaction bytes.
     async fn rollback_pre_durable(
         state: &AppState,
         group_id: &str,
+        journals_ours: bool,
         snapshot: &HashMap<String, x0x::groups::GroupInfo>,
         confirmed_stub: bool,
         pre_sidecar_bytes: &Option<Vec<u8>>,
     ) {
-        discard_rebind_journal(state, group_id).await;
+        if journals_ours {
+            discard_rebind_journal(state, group_id).await;
+        }
         *state.named_groups.write().await = snapshot.clone();
         if confirmed_stub {
             state
@@ -7545,6 +7893,8 @@ async fn persist_named_group_info_inner(
     };
     // Journal-first (TreeKEM-plane groups only; NotApplicable otherwise).
     let prejournaled = prepare_rebind_journal_locked(state, group_id).await;
+    // A failed preparation already discarded what it wrote.
+    let journals_ours = matches!(prejournaled, RebindOutcome::Rebound);
     match prejournaled {
         RebindOutcome::NotApplicable => {}
         RebindOutcome::Rebound => {}
@@ -7552,6 +7902,7 @@ async fn persist_named_group_info_inner(
             rollback_pre_durable(
                 state,
                 group_id,
+                journals_ours,
                 &snapshot,
                 confirmed_stub,
                 &pre_sidecar_bytes,
@@ -7567,6 +7918,7 @@ async fn persist_named_group_info_inner(
         rollback_pre_durable(
             state,
             group_id,
+            journals_ours,
             &snapshot,
             confirmed_stub,
             &pre_sidecar_bytes,
@@ -7582,6 +7934,19 @@ async fn persist_named_group_info_inner(
             .named_groups_requires_durability_confirmation
             .store(true, Ordering::Release),
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
+    }
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): the journal above was
+    // prepared from its own encode, and the save encoded again. If the
+    // save held this group back, the legacy views keep its last committed
+    // form, so the journalled snapshot is newer than the saved roster and
+    // a restart would reject the pair. Discard this transaction's journals
+    // (the snapshot keeps its saved binding) and report the change as not
+    // durable; the worker writes it again.
+    if group_recovery::is_held_back(state, &stable) {
+        if journals_ours {
+            discard_rebind_journal(state, group_id).await;
+        }
+        return Ok(AtomicWriteOutcome::ReplacedNotDurable);
     }
     if matches!(outcome, Ok(AtomicWriteOutcome::Durable))
         && matches!(prejournaled, RebindOutcome::Rebound)
@@ -7636,7 +8001,9 @@ async fn persist_named_group_info_inner(
 enum RebindOutcome {
     /// Group is not on the TreeKEM plane (or withdrawn/unknown), or the
     /// group has NO snapshot and NO live TreeKEM group on this node
-    /// (pre-existing degradation this write neither caused nor can heal).
+    /// (pre-existing degradation this write neither caused nor can heal),
+    /// or its placeheld record is held back (#1570): the saved roster keeps
+    /// the old record, so the snapshot keeps its binding.
     NotApplicable,
     /// Envelope re-bound (or repaired) and persisted crash-atomically.
     Rebound,
@@ -7683,6 +8050,11 @@ async fn prepare_rebind_journal_for_groups(
         Ok(None) => return RebindOutcome::NotApplicable,
         Err(e) => return RebindOutcome::Failed(e),
     };
+    // #1645 (round 5 review): set once this call's `.hsjournal` is in
+    // place. Before that, a failure discards nothing: any journal on disk
+    // belongs to another transaction (a failed re-seat swap keeps its
+    // journals for the startup replay).
+    let mut journals_ours = false;
     let journalled = async {
         // #451 seam: the two-file split encode, stub-excluded — THIS
         // group's post-mutation entry is the confirmed state being
@@ -7691,6 +8063,20 @@ async fn prepare_rebind_journal_for_groups(
             encode_named_groups_store_excluding_pending_stubs(state, groups, Some(group_id))
                 .await
                 .map_err(|e| anyhow::anyhow!("named groups encode for journal: {e}"))?;
+        // ADR 0109 §4 (#1570, Codex P1): the encode above sets the
+        // held-back state, so this check must follow it. A held-back
+        // placeheld group keeps its last durable record in the legacy
+        // views, so the rebound envelope would bind a snapshot that is
+        // newer than the saved roster, and `restore_treekem_groups`
+        // rejects that pair at restart. Write no journal: the snapshot keeps its saved binding.
+        // When the worker later saves the record durably, the snapshot is
+        // older than the roster with the same security binding, which the
+        // restart re-binds (#457).
+        if groups.get(group_id).is_some_and(|record| {
+            group_recovery::is_held_back(state, record.stable_group_id())
+        }) {
+            return Ok(RebindOutcome::NotApplicable);
+        }
         // The LEGACY journal carries the legacy half (its postcard shape
         // is the downgrade-safe replay carrier — old binaries decode and
         // replay exactly this); the separate `.hsjournal` carries the
@@ -7723,6 +8109,7 @@ async fn prepare_rebind_journal_for_groups(
         write_home_suite_sidecar_journal(&state.treekem_dir, &tx, &home_suite_json)
             .await
             .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))?;
+        journals_ours = true;
         let journal = TreeKemNamedPersistJournal {
             version: TREEKEM_NAMED_JOURNAL_VERSION,
             group_id_hex: group_id.to_string(),
@@ -7752,13 +8139,15 @@ async fn prepare_rebind_journal_for_groups(
             }
             Err(e) => return Err(anyhow::anyhow!("TreeKEM journal write: {e}")),
         }
-        Ok(())
+        Ok(RebindOutcome::Rebound)
     }
     .await;
     match journalled {
-        Ok(()) => RebindOutcome::Rebound,
+        Ok(outcome) => outcome,
         Err(e) => {
-            discard_rebind_journal(state, group_id).await;
+            if journals_ours {
+                discard_rebind_journal(state, group_id).await;
+            }
             RebindOutcome::Failed(e)
         }
     }
@@ -7880,6 +8269,11 @@ async fn rebind_envelope_for(
     };
     if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
         return Ok(None);
+    }
+    // #1567: a staged re-seat's metadata seal keeps the original's TreeKEM
+    // state on disk, as the roster view keeps the original record.
+    if let Some(cover) = reseat_snapshot_cover(state, group_id).await? {
+        return Ok(cover.into_envelope());
     }
     // Arm 1: live group — encode the current snapshot under the new
     // binding. Contention retried briefly, then failed.
@@ -9195,6 +9589,37 @@ fn recovery_seat_may_receive_key_package(
         .is_some_and(|member| member.state == x0x::groups::GroupMemberState::Removed)
 }
 
+/// #1113 / #1567: a Removed seat may take back its KeyPackage bytes from
+/// the member's own signed `MemberJoined`, with no inviter attestation,
+/// when the bytes hash to the KeyPackage hash that the verified roster
+/// commits for the seat. A Welcome joiner needs this: its roster has no
+/// `added_by` for the members seated before it (the v4 invite roster is a
+/// projection without it), so the inviter attestation never verifies
+/// there. The leaf-removal proof of a self-leave reads these bytes.
+fn removed_seat_self_signed_key_package(
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+) -> bool {
+    let NamedGroupMetadataEvent::MemberJoined {
+        member_agent_id,
+        treekem_key_package_b64: Some(kp_b64),
+        ..
+    } = event
+    else {
+        return false;
+    };
+    let seat_commits_bytes = info.members_v2.get(member_agent_id).is_some_and(|member| {
+        member.state == x0x::groups::GroupMemberState::Removed
+            && member
+                .treekem_key_package_hash
+                .as_deref()
+                .is_some_and(|expected| {
+                    blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
+                })
+    });
+    seat_commits_bytes && verify_member_joined_key_package_event(event)
+}
+
 fn verify_authority_attested_member_joined_recovery(
     info: &x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
@@ -10165,18 +10590,8 @@ async fn apply_recovered_member_key_package_locked(
         let Some(info) = groups.get(&storage_key) else {
             return false;
         };
-        let authority_ok = verify_authority_attested_member_joined_recovery(info, event);
-        let removed_member = info.members_v2.get(member_agent_id).filter(|member| {
-            member.state == x0x::groups::GroupMemberState::Removed
-                && member
-                    .treekem_key_package_hash
-                    .as_deref()
-                    .is_some_and(|expected| {
-                        blake3::hash(kp_b64.as_bytes()).to_hex().as_str() == expected
-                    })
-        });
-        if !authority_ok
-            && (removed_member.is_none() || !verify_member_joined_key_package_event(event))
+        if !verify_authority_attested_member_joined_recovery(info, event)
+            && !removed_seat_self_signed_key_package(info, event)
         {
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
@@ -10261,6 +10676,34 @@ pub(in crate::server) async fn s4_seal_probe_for_test(
     target_hex: &str,
 ) -> String {
     revocation_eviction::seal_probe_for_test(state, group_id, target_hex).await
+}
+
+/// W3-H (#1567, test builds only): remove this node's cached copies of
+/// `member_agent_id`'s `MemberJoined` for `group_id`, as when its one
+/// gossip delivery came before this node could apply it. Returns `false`
+/// when the roster already holds the member's KeyPackage bytes (then the
+/// catch-up path is not under test), or when the group is unknown.
+#[cfg(test)]
+pub(in crate::server) async fn forget_member_join_copy_for_test(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+) -> bool {
+    let roster_holds_bytes = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return false;
+        };
+        info.members_v2
+            .get(member_agent_id)
+            .and_then(current_member_treekem_key_package)
+            .is_some()
+    };
+    if roster_holds_bytes {
+        return false;
+    }
+    let _status = prune_treekem_cache_member(state, group_id, member_agent_id, "w3h_1567").await;
+    true
 }
 
 /// W3-H (#1357, test builds only): whether this node can resolve
@@ -11294,6 +11737,23 @@ async fn try_queue_causal_approval(
     );
 }
 
+/// ADR 0109 §4 (#1570): the last roster encode held back the group that a
+/// causal replay changed (its live record now, or its record before the
+/// replay). Its legacy entry kept the last committed form, so the replayed
+/// change is not on disk, even when the roster file is Durable.
+async fn replay_group_held_back(
+    state: &AppState,
+    group_id: &str,
+    before: Option<&x0x::groups::GroupInfo>,
+) -> bool {
+    let groups = state.named_groups.read().await;
+    groups
+        .get(group_id)
+        .into_iter()
+        .chain(before)
+        .any(|info| group_recovery::is_held_back(state, info.stable_group_id()))
+}
+
 /// ADR 0028: drain queued causal approvals after a group-state advance. Each
 /// entry is retried with the full ordinary validator (queueing disabled). An
 /// approval applies exactly once only when its matching request is pending and
@@ -11522,6 +11982,23 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                 }
                 Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => (false, false),
             };
+            // ADR 0109 §4 (#1570, ZCode on d1be57f1): the roster file can be
+            // Durable while this group is held back. Its legacy entry then
+            // keeps the last committed form, so the approval is not on disk.
+            // Treat it as a failed persist: roll memory back, keep the queue
+            // receipt and run no effect. The next drain applies it again.
+            let (persisted, visible_not_durable) = if (persisted || visible_not_durable)
+                && replay_group_held_back(state, group_id, group_snapshot.as_ref()).await
+            {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id),
+                    request_id = %pending.request_id,
+                    "ADR 0109 S3: the replayed approval is held back (its authoritative record is not durable); rolling back, retaining queue entry"
+                );
+                (false, false)
+            } else {
+                (persisted, visible_not_durable)
+            };
             if !persisted && !visible_not_durable {
                 tracing::warn!(
                     group_id = %LogHexId::group(group_id),
@@ -11703,6 +12180,7 @@ pub(in crate::server) async fn w3h_rebind_delivery_report(state: &Arc<AppState>)
 pub(in crate::server) async fn dispatch_treekem_catchup_message(
     state: &Arc<AppState>,
     sender: &AgentId,
+    machine_id: &MachineId,
     verified: bool,
     payload: &[u8],
 ) -> bool {
@@ -11721,13 +12199,39 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
         };
         let serve_state = Arc::clone(state);
         let requester = *sender;
+        // #1616: the QUIC-authenticated sender machine of the DM, so the
+        // serve can refuse a revoked device (ADR 0110 D70).
+        let sender_machine = *machine_id;
         let _admitted = state.spawn_detached(async move {
-            handle_treekem_catchup_request(&serve_state, &requester, verified, request).await;
+            handle_treekem_catchup_request(
+                &serve_state,
+                &requester,
+                &sender_machine,
+                verified,
+                request,
+            )
+            .await;
             drop(slot);
         });
         return true;
     }
     let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(payload) else {
+        // #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the
+        // asker's mirror of the response arm — the typed refusal a peer
+        // sent instead of a page when it refused this device's request.
+        let Ok(refusal) = serde_json::from_slice::<TreeKemCatchupRefusal>(payload) else {
+            return true;
+        };
+        // #1604 G5: refuse held unknown variants (a refusal reason this
+        // node does not know) before any asker state changes.
+        let Ok(refusal) = crate::wire_compat::reject_unknown("TreeKemCatchupRefusal", refusal)
+        else {
+            return true;
+        };
+        if refusal.message_type != TreeKemCatchupRefusal::MESSAGE_TYPE {
+            return true;
+        }
+        handle_treekem_catchup_refusal(state, sender, machine_id, verified, refusal).await;
         return true;
     };
     // #1604 G5: refuse held unknown variants before any apply.
@@ -11740,19 +12244,205 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
     }
     // #1275: the response's events are applied and persisted, so the apply
     // runs shielded; awaiting it keeps the responses in arrival order.
+    // #1699: a staged re-seat join's catch-up applies to its staged tree.
+    let group_id = response.group_id.clone();
     let apply_state = Arc::clone(state);
     let sender = *sender;
+    let sender_machine = *machine_id;
     state
         .run_shielded(Box::pin(async move {
-            handle_treekem_catchup_response(&apply_state, &sender, verified, response).await;
+            let stagings = &apply_state.reseat_stagings;
+            stagings
+                .run_in_staging_of(
+                    &group_id,
+                    handle_treekem_catchup_response(
+                        &apply_state,
+                        &sender,
+                        &sender_machine,
+                        verified,
+                        response,
+                    ),
+                )
+                .await;
         }))
         .await
         .is_some()
 }
 
+/// #1657: how long one surfaced refusal note suppresses the warn for
+/// an identical repeat (same peer, same reason, same group). The note
+/// itself is always refreshed; only the operator log line is deduped,
+/// so no verified peer can flood it.
+const TREEKEM_REFUSAL_REWARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the asker's
+/// side of the typed refusal. A peer refused this device's catch-up
+/// request, naming its machine or binding revocation. The refusal stops
+/// the 2 s head-round re-ask of that peer when it answered a peer this
+/// node asked this round (it answered — exactly like the keyless
+/// disclaimer, it confirms or clears no head evidence) and the reason
+/// is surfaced for EVERY ask kind — head-round, gap, page and
+/// key-package catch-up asks alike (review round 3, finding 3): an
+/// operator log line plus the latest note per group on `AppState`,
+/// readable by tests and a later diagnostics surface. The gates mirror
+/// the response handler — an unverified sender, a sender this node
+/// itself holds revoked, and a pending revocation resync all change
+/// nothing, so a revoked peer cannot forge a silence — and a refusal
+/// addressed to another requester is not ours. The warn states what the
+/// PEER reports, not verified local state, and a repeated identical
+/// note does not re-warn. A peer that never sends the refusal (an
+/// older peer, or the gossip-inbox path whose payload is ciphertext at
+/// its gate) leaves main's behavior: the ask cadence keeps counting
+/// the peer.
+pub(in crate::server) async fn handle_treekem_catchup_refusal(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    machine_id: &MachineId,
+    verified: bool,
+    refusal: TreeKemCatchupRefusal,
+) {
+    if !verified {
+        return;
+    }
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(sender)
+            || revoked.is_machine_revoked(machine_id)
+            || revoked.is_binding_revoked(sender, machine_id)
+            || revoked.revocation_resync_required()
+        {
+            return;
+        }
+    }
+    let self_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if refusal.requester_agent_id() != self_hex {
+        return;
+    }
+    // #1657 review (Claude, REQUEST-CHANGES 2): a refusal for a group
+    // this node does not hold is not an answer to an ask this node made;
+    // recording it would let any verified peer grow the note map without
+    // limit. The note map is bounded by the groups this node holds — as
+    // the head-round marking below already is (it resolves the group and
+    // ignores unknown ids).
+    {
+        let groups = state.named_groups.read().await;
+        if crate::server::resolve_group_entry_locked(&groups, refusal.group_id()).is_none() {
+            tracing::debug!(
+                group_id = %LogHexId::group(refusal.group_id()),
+                peer = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+                "ignoring a TreeKEM catch-up refusal for a group this node does not hold"
+            );
+            return;
+        }
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    // Review round 3, finding 3: the asked-peer check now guards the
+    // RE-ASK STOP only. Only a refusal from a peer this node asked this
+    // head round may close that peer's unanswered slot — an unsolicited
+    // refusal still cannot stop a re-ask — but a refusal from any peer
+    // that passed the gates above is surfaced below, because the usual
+    // catch-up asks (gap, page, key package) never write a head round
+    // at all.
+    if !revocation_eviction::note_catchup_refused_peer(
+        state,
+        &[refusal.group_id().to_string()],
+        *sender.as_bytes(),
+    )
+    .await
+    {
+        tracing::debug!(
+            group_id = %LogHexId::group(refusal.group_id()),
+            peer = %LogHexId::agent(&sender_hex),
+            "a TreeKEM catch-up refusal from a peer this node did not ask this round: the reason is surfaced, the head-round re-ask cadence keeps counting the peer"
+        );
+    }
+    // The surface: warn once per distinct (peer, reason) per group — a
+    // repeated identical refusal refreshes the note but does not re-warn,
+    // so no verified peer can flood the operator log.
+    let repeated = state
+        .treekem_catchup_refusals
+        .lock()
+        .ok()
+        .and_then(|notes| {
+            notes.get(refusal.group_id()).and_then(|note| {
+                (note.peer == *sender.as_bytes()
+                    && note.reason == refusal.reason
+                    && note.at.elapsed() < TREEKEM_REFUSAL_REWARN_AFTER)
+                    .then_some(())
+            })
+        })
+        .is_some();
+    if !repeated {
+        tracing::warn!(
+            group_id = %LogHexId::group(refusal.group_id()),
+            peer = %LogHexId::agent(&sender_hex),
+            reason = ?refusal.reason,
+            "TreeKEM catch-up refused: the peer reports this device's revocation (peer-reported, not locally verified); the head-round re-ask stops for that peer when it was asked this round"
+        );
+    }
+    if let Ok(mut notes) = state.treekem_catchup_refusals.lock() {
+        notes.insert(
+            refusal.group_id().to_string(),
+            TreeKemCatchupRefusalNote {
+                reason: refusal.reason,
+                peer: *sender.as_bytes(),
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
+/// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): send the
+/// typed refusal for a machine- or binding-revoked catch-up requester.
+/// The refusal names the revocation so the requester can stop re-asking
+/// and surface the reason; it carries no group data beyond what the
+/// request itself named. It travels machine-addressed on the catch-up
+/// DM lane, so its sender is authenticated exactly like a page (the
+/// QUIC ML-DSA-65 handshake on the raw path, the signed envelope on
+/// the gossip path).
+/// Review round 1, finding 2: the refusal echoes the authenticated
+/// sender id, never an id the request chose (the requester-id check
+/// above already refused a mismatch), and it is MACHINE-addressed, so
+/// it reaches the revoked device that asked — never a clean device of
+/// the same agent.
+/// Review round 3 (Claude finding 2 / Codex P2 2): ordinary DM egress
+/// (`send_direct_bound_to_machine` → `send_direct_all_stages`) cannot
+/// carry it — its ADR-0043 B/P pairing preflight and `pin_show_machine`
+/// deny exactly the revoked pairing this refusal answers, so the frame
+/// never left. The send now runs on the refusal-only reply path
+/// (`Agent::send_treekem_refusal_reply`), which reaches the requesting
+/// machine without opening any other route and keeps ordinary/key
+/// egress denial untouched. The test recorder observes the DECISION
+/// here (exactly as the page serve does); the egress itself is
+/// recorded at the send seam on the agent, after every gate.
+async fn send_treekem_catchup_refusal(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    machine_id: &MachineId,
+    request: &TreeKemCatchupRequest,
+    reason: TreeKemCatchupRefusalReason,
+) {
+    #[cfg(test)]
+    if let Ok(payload) = serde_json::to_vec(&TreeKemCatchupRefusal::new(
+        request.group_id.clone(),
+        hex::encode(sender.as_bytes()),
+        reason,
+    )) {
+        if let Ok(mut recorded) = state.named_group_test_recorders.catchup_refusals.lock() {
+            recorded.push(payload);
+        }
+    }
+    state
+        .agent
+        .send_treekem_refusal_reply(sender, *machine_id, &request.group_id, reason)
+        .await;
+}
+
 pub(in crate::server) async fn handle_treekem_catchup_request(
     state: &Arc<AppState>,
     sender: &AgentId,
+    machine_id: &MachineId,
     verified: bool,
     request: TreeKemCatchupRequest,
 ) {
@@ -11763,11 +12453,24 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // #1577 (ADR 0110 §3): a catch-up page carries membership events and
     // TreeKEM epochs, so the serve is guarded egress. A revoked target
     // keeps its Active seat until the S4 eviction commits, so the roster
-    // check below alone cannot refuse it. Drop the request on the same
-    // path the response handler uses for a revoked sender; no typed reply.
+    // check below alone cannot refuse it.
+    // #1616 (ADR 0110 D70): a machine revocation denies that device only;
+    // the portable agent keeps its Active seat, so the same roster check
+    // cannot refuse the device either — the DM's QUIC-authenticated
+    // sender machine refuses it, under its own operator sentence.
+    // #1622 (ADR 0110 D70): a binding revocation retires the pairing
+    // only — the agent keeps its seat and the device stays clean — so
+    // neither gate above can refuse it; the pairing itself does, under
+    // its own operator sentence.
+    // #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the
+    // machine and binding refusals answer with the typed refusal that
+    // names the revocation, instead of the interim silent drop — the
+    // requester can stop re-asking and surface the reason. The agent
+    // revocation and a pending revocation resync keep the silent drop:
+    // the approval names machine- and binding-revoked devices only.
     // A pending revocation resync also refuses (fail-closed, as the
     // response handler does), under its own operator sentence.
-    {
+    let typed_refusal = {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
         if revoked.is_agent_revoked(sender) {
@@ -11778,16 +12481,40 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             );
             return;
         }
-        if revoked.revocation_resync_required() {
+        if revoked.is_machine_revoked(machine_id) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %LogHexId::agent(&sender_hex),
+                "rejecting TreeKEM catch-up request from a machine-revoked requester"
+            );
+            Some(TreeKemCatchupRefusalReason::MachineRevoked)
+        } else if revoked.is_binding_revoked(sender, machine_id) {
+            tracing::warn!(
+                group_id = %LogHexId::group(&request.group_id),
+                requester = %LogHexId::agent(&sender_hex),
+                "rejecting TreeKEM catch-up request from a requester with a revoked agent-machine binding"
+            );
+            Some(TreeKemCatchupRefusalReason::BindingRevoked)
+        } else if revoked.revocation_resync_required() {
             tracing::warn!(
                 group_id = %LogHexId::group(&request.group_id),
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request while the revocation set needs a resync"
             );
             return;
+        } else {
+            None
         }
-    }
+    };
+    // Review round 1, finding 2: a request whose claimed requester is not
+    // the authenticated sender gets no reply at all, so the refusal below
+    // only ever answers a request that named this sender — and echoes the
+    // authenticated `sender_hex`, never the id the request chose.
     if sender_hex != request.requester_agent_id {
+        return;
+    }
+    if let Some(reason) = typed_refusal {
+        send_treekem_catchup_refusal(state, sender, machine_id, &request, reason).await;
         return;
     }
     let (authorized, log_keys, held_group) = {
@@ -12067,6 +12794,7 @@ pub(in crate::server) fn catchup_846_gate_armed(info: &x0x::groups::GroupInfo) -
 pub(in crate::server) async fn handle_treekem_catchup_response(
     state: &Arc<AppState>,
     sender: &AgentId,
+    machine_id: &MachineId,
     verified: bool,
     response: TreeKemCatchupResponse,
 ) {
@@ -12077,7 +12805,17 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
-        if revoked.is_agent_revoked(sender) || revoked.revocation_resync_required() {
+        // #1616 (ADR 0110 D70): a machine-revoked device is dropped with
+        // its agent. Its portable agent keeps the Active seat the roster
+        // check below sees, so the machine gate must fire first.
+        // #1622 (ADR 0110 D70): a revoked agent-machine binding retires
+        // the pairing only — agent and device each stay clean — so the
+        // pairing itself is dropped here, before the roster check.
+        if revoked.is_agent_revoked(sender)
+            || revoked.is_machine_revoked(machine_id)
+            || revoked.is_binding_revoked(sender, machine_id)
+            || revoked.revocation_resync_required()
+        {
             return;
         }
     }
@@ -12190,10 +12928,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                         }
                     }
                 }
+                // #1567: the same two proofs as the install below. The
+                // member-keyed answer for a self-leaver is checked on its
+                // Removed seat too: on a Welcome joiner the inviter
+                // attestation never verifies, and a refused answer left the
+                // crypto-only exclusion waiting for this evidence for ever.
                 let recovery_event = member_joined_kp_cache_entry(&event)
                     .map(|(_, ev)| ev)
                     .filter(|ev| {
                         verify_authority_attested_member_joined_recovery(&response_info, ev)
+                            || removed_seat_self_signed_key_package(&response_info, ev)
                     });
                 // A survivor may relay a signed removal. The transport sender
                 // is that survivor. The author is the verified commit signer.
@@ -13630,8 +14374,16 @@ async fn replay_parked_role_updates(state: &Arc<AppState>, group_key: &str) {
         let member_seated = {
             let groups = state.named_groups.read().await;
             groups.get(group_key).is_some_and(|info| {
-                role_update_target(&entry.event)
-                    .is_some_and(|member| info.members_v2.contains_key(member))
+                role_update_target(&entry.event).is_some_and(|member| {
+                    // #1578 rc11 (Claude blocking 1): the join's
+                    // key-only marker row is not a landing. A drain
+                    // that treats it as one replays the update against
+                    // the stub (refused, or re-parked with a fresh
+                    // parked_at) instead of keeping the entry with its
+                    // ORIGINAL parked_at until the member truly lands
+                    // or the TTL expires.
+                    info.members_v2.contains_key(member) && !join_seat_key_marker_only(info, member)
+                })
             })
         };
         if !member_seated {
@@ -15072,6 +15824,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 action_kind,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
+                    // #1578 rc11 (audit): the join's key-only marker row
+                    // is not a seat. Main holds no row for the
+                    // pre-admission joiner (remove_member is a no-op
+                    // there); converting the marker to a Removed row
+                    // would feed the downstream removed-seat logic a
+                    // seat main never has.
+                    if next.join_seat_key_marker_only(&agent_id) {
+                        next.members_v2.remove(&agent_id);
+                    }
                     next.remove_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
@@ -15162,6 +15923,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 drop(mls_groups);
             }
             if removed_self {
+                // #1645 (round 5 audit): the removal persist below is refused
+                // while a re-seat swap has failed. Refuse before the teardown
+                // removes this group's tree and journals.
+                if group_recovery::refuse_roster_write_during_failed_swap(state, None)
+                    .await
+                    .is_err()
+                {
+                    return ApplyMetadataResult::REJECTED;
+                }
                 // ADR 0107 (r5, G5): this node no longer serves the group's
                 // join artifacts — retire them before the group leaves the
                 // roster.
@@ -15483,13 +16253,24 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !actor_authorized {
                 return ApplyMetadataResult::REJECTED;
             }
-            let Some(target) = info.members_v2.get(&agent_id).cloned() else {
+            let Some(target) = info
+                .members_v2
+                .get(&agent_id)
+                // #1578 rc11 (Claude blocking 1): the join's key-only
+                // marker row is not a seat. Treating it as one applied
+                // the role update against the joiner's pre-admission
+                // stub instead of parking it, so the joiner's own view
+                // lost its new role with no error.
+                .filter(|_| !join_seat_key_marker_only(&info, &agent_id))
+                .cloned()
+            else {
                 // #876 (issue item 3): the member's own MemberAdded has
                 // not reached this roster yet (its join blob can lag
-                // behind the control-blob staging budget). Never drop the
-                // signed role update silently — park it and replay once
-                // the member lands. The apply result stays REJECTED so
-                // ordering semantics are unchanged.
+                // behind the control-blob staging budget) — or the only
+                // row is the join's key-only marker (#1578 rc11). Never
+                // drop the signed role update silently — park it and
+                // replay once the member lands. The apply result stays
+                // REJECTED so ordering semantics are unchanged.
                 park_role_update_for_late_member(
                     state,
                     &resolved_group_key,
@@ -15582,6 +16363,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
+                    // #1578 rc11 (audit): the join's key-only marker row
+                    // is not a seat. Main holds no row, so ban_member
+                    // inserts its Guest-role Banned entry there; keeping
+                    // the marker's Member role would bind a different
+                    // roster root than main's shape.
+                    if next.join_seat_key_marker_only(&agent_id) {
+                        next.members_v2.remove(&agent_id);
+                    }
                     next.ban_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
@@ -15638,6 +16427,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let banned_self = agent_id == local_agent_hex;
             if banned_self {
+                // #1645 (round 5 audit): as for `member_removed_self`, refuse
+                // before the teardown while a re-seat swap has failed.
+                if group_recovery::refuse_roster_write_during_failed_swap(state, None)
+                    .await
+                    .is_err()
+                {
+                    return banned_reject("failed_reseat_swap", &resolved_group_key);
+                }
                 // #531 I4a: teardown has BEGUN. This is not an accept — the
                 // persist below can still reject, so nothing durable is claimed
                 // here. The durable outcome is logged after persistence only.
@@ -15758,10 +16555,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 |next| {
                     next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     if next.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-                        if let Some(member) = next.members_v2.get_mut(&agent_id) {
-                            member.state = x0x::groups::GroupMemberState::Removed;
-                            member.updated_at = commit.committed_at;
-                            member.removed_by = None;
+                        // #1578 rc11 (audit): the join's key-only marker
+                        // row is not a seat — main holds no row to flip.
+                        if !next.join_seat_key_marker_only(&agent_id) {
+                            if let Some(member) = next.members_v2.get_mut(&agent_id) {
+                                member.state = x0x::groups::GroupMemberState::Removed;
+                                member.updated_at = commit.committed_at;
+                                member.removed_by = None;
+                            }
                         }
                     } else {
                         next.unban_member(&agent_id);
@@ -17585,17 +18386,26 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     envelope_bytes: Option<Vec<u8>>,
 ) -> Option<ApplyMetadataResult> {
     let apply_state = Arc::clone(state);
+    // #1699: an event of a group under re-seat applies to its staged
+    // record (ADR 0109 §3 step 2); the contained live record keeps its
+    // post-advance state until the swap.
+    let group_id = named_group_metadata_event_group_id(&event).to_string();
     // Boxed: the apply future is large; keep it off this caller's frame.
     state
         .run_shielded(Box::pin(async move {
-            apply_named_group_metadata_event(
-                &apply_state,
-                event,
-                sender,
-                verified,
-                envelope_bytes.as_deref(),
-            )
-            .await
+            let stagings = &apply_state.reseat_stagings;
+            stagings
+                .run_in_staging_of(
+                    &group_id,
+                    apply_named_group_metadata_event(
+                        &apply_state,
+                        event,
+                        sender,
+                        verified,
+                        envelope_bytes.as_deref(),
+                    ),
+                )
+                .await
         }))
         .await
 }
@@ -18008,7 +18818,7 @@ pub(in crate::server) async fn list_named_groups(
         // records, not live groups — never list them.
         .filter(|info| !info.withdrawn)
         .map(|info| {
-            let member_count = named_group_member_values(info).len();
+            let member_count = named_group_member_values(&state, info).len();
             serde_json::json!({
                 "group_id": info.mls_group_id,
                 "name": info.name,
@@ -18052,7 +18862,7 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
         None => None,
     };
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-    let (pending, outcome) = {
+    let (pending, outcome, pending_cause) = {
         let groups = state.named_groups.read().await;
         let resolved = groups
             .get(id)
@@ -18080,7 +18890,47 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(id)
             .cloned();
-        (pending, outcome)
+        // ADR 0108 §8 (#1575): the current attempt's held verified notice,
+        // surfaced as `pending_cause` while the join is pending. The
+        // attempt registry is keyed by the invite's group id, so every id
+        // this group resolves under is probed.
+        let pending_cause = if pending {
+            let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let attempts = state
+                .pending_join_attempts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mls_id = resolved.as_ref().map(|(_, info)| info.mls_group_id.clone());
+            [
+                Some(id.to_string()),
+                resolved.clone().map(|(stable, _)| stable),
+                mls_id,
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|group_key| {
+                attempts
+                    .get(&join_result_key(&group_key, &agent_hex))
+                    .and_then(|attempt| attempt.held_pending_notice.clone())
+            })
+            .map(|held| {
+                let (cause, raw_cause) = display_join_pending_cause(&held.cause);
+                let mut value = serde_json::json!({
+                    "cause": cause,
+                    "detail": held.detail,
+                    "issued_at_ms": held.issued_at_ms,
+                    "signer_agent_id": held.signer_agent_id,
+                });
+                // `raw_cause` rides only on an unrecognized name.
+                if let Some(raw) = raw_cause {
+                    value["raw_cause"] = serde_json::Value::String(raw.to_string());
+                }
+                value
+            })
+        } else {
+            None
+        };
+        (pending, outcome, pending_cause)
     };
     let group_exists = state.named_groups.read().await.contains_key(id);
     if !group_exists {
@@ -18103,6 +18953,10 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
         StatusCode::OK,
         serde_json::json!({
             "join_state": if pending { "pending_authority_commit" } else { "idle" },
+            // §8: the key is always present and null unless a verified
+            // notice is held for the current attempt; a later Result or
+            // Refused replaces it.
+            "pending_cause": pending_cause,
             "last_join_outcome": outcome.as_ref().map(|o| serde_json::json!({
                 "outcome": o.outcome,
                 "reason": o.reason,
@@ -18110,6 +18964,29 @@ async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json
             })),
         }),
     )
+}
+
+/// ADR 0108 §8: the §8 registry rows this tree knows. A well-formed name
+/// outside the registry displays as `unrecognized_cause` with the raw name
+/// (`raw_cause`) — never a decode failure.
+const KNOWN_JOIN_PENDING_CAUSES: [&str; 5] = [
+    "owner_certificate_pending",
+    "evidence_pending",
+    "prerequisite_commit_pending",
+    "authority_catching_up",
+    "no_eligible_admin",
+];
+
+/// §8 display rule: a known registry name passes through; anything else
+/// shows as `unrecognized_cause` carrying the raw name.
+fn display_join_pending_cause(cause: &str) -> (&'static str, Option<&str>) {
+    match KNOWN_JOIN_PENDING_CAUSES
+        .iter()
+        .find(|known| **known == cause)
+    {
+        Some(known) => (*known, None),
+        None => ("unrecognized_cause", Some(cause)),
+    }
 }
 
 pub(in crate::server) async fn get_named_group(
@@ -18155,7 +19032,7 @@ pub(in crate::server) async fn get_named_group(
     // #447: an operator reading the group is a natural moment to sweep
     // retained owner-cert-pending joins whose evidence may have landed.
     retry_pending_owner_cert_joins(&state, Some(&id)).await;
-    let members = named_group_member_values(&info);
+    let members = named_group_member_values(&state, &info);
     // ADR 0110 (D64): the S4 obligations and their typed waits.
     let s4_status = revocation_eviction::group_status_json(&state, &info).await;
     // ADR 0109 §8: the additive `recovery` object (absent when S3 holds no
@@ -18440,6 +19317,21 @@ pub(in crate::server) async fn clear_group_quarantine(
 /// authority's own roster lists us; `pending_authority_commit` means we hold
 /// a join stub and an expected-inviter pin but our own roster seat never
 /// landed — the limbo state that used to read as `already_joined: true`.
+/// #1578 rc8: the join seats the joiner's own published KEM key on a
+/// Pending row of its own stub (rc7). The row carries no admission
+/// state — only the key — so every join-state check treats it as
+/// absent: [`local_join_membership_state`] reports `not_member`, and
+/// [`classify_not_member_join_row`] sees no roster entry, so the #1148
+/// clear and the ADR 0107 re-arm keep working for an encrypted GSS
+/// join whose attempt expired.
+fn join_seat_key_marker_only(info: &x0x::groups::GroupInfo, joiner_hex: &str) -> bool {
+    // #1578 rc11: the predicate itself lives on GroupInfo
+    // (`crate::groups::GroupInfo::join_seat_key_marker_only`) so the
+    // lib-layer seat checks share this one definition; this alias keeps
+    // the server call sites.
+    info.join_seat_key_marker_only(joiner_hex)
+}
+
 pub(in crate::server) async fn local_join_membership_state(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
@@ -18449,12 +19341,31 @@ pub(in crate::server) async fn local_join_membership_state(
         return "active";
     }
     let stable = info.stable_group_id().to_string();
-    if expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some() {
+    // #1699: outside the scope of an open re-seat staging, the attempt
+    // under this key is the staged join's, not the contained original's
+    // (ADR 0109 §3 step 2: the live record keeps its membership label).
+    let staged_join = !crate::server::reseat_scope::in_any_reseat_scope()
+        && (state.reseat_stagings.scope_for(&stable).is_some()
+            || state
+                .reseat_stagings
+                .scope_for(&info.mls_group_id)
+                .is_some());
+    if !staged_join
+        && expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some()
+    {
         return "pending_authority_commit";
     }
     match info.members_v2.get(local_agent_hex) {
         Some(member) if member.is_active() => "active",
-        Some(member) if member.state == x0x::groups::GroupMemberState::Pending => "pending",
+        // #1578 rc8: the join's own-key marker row holds no admission
+        // state, so it reads as `not_member` (see
+        // [`join_seat_key_marker_only`]).
+        Some(member)
+            if member.state == x0x::groups::GroupMemberState::Pending
+                && !join_seat_key_marker_only(info, local_agent_hex) =>
+        {
+            "pending"
+        }
         _ => "not_member",
     }
 }
@@ -18489,7 +19400,7 @@ pub(in crate::server) async fn get_named_group_members(
     if let Err(resp) = admission {
         return resp;
     }
-    let members = named_group_member_values(info);
+    let members = named_group_member_values(&state, info);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -20390,10 +21301,13 @@ pub(in crate::server) async fn ingest_public_message(
                     info.members_v2.clone(),
                     info.stable_group_id().to_string(),
                     info.withdrawn,
+                    // #1578 rc11 (audit): the join's key-only marker
+                    // rows are not member seats for the ingest gate.
+                    info.join_seat_key_marker_agents(),
                 )
             })
     };
-    let Some((policy, members, stable_id, withdrawn)) = snapshot else {
+    let Some((policy, members, stable_id, withdrawn, join_seat_marker_agents)) = snapshot else {
         // Unknown group — count under the stable id we were given as the
         // logging key. Useful for spotting messages that arrived before the
         // local daemon learned about the group.
@@ -20402,13 +21316,14 @@ pub(in crate::server) async fn ingest_public_message(
     };
     if withdrawn {
         state.groups_diagnostics.record_other_drop(&stable_id);
-        tracing::debug!(group_id = %group_id_for_log, "E: dropped public message for withdrawn group");
+        tracing::debug!(group_id = %LogHexId::group(group_id_for_log), "E: dropped public message for withdrawn group");
         return;
     }
     let ctx = x0x::groups::PublicIngestContext {
         group_id: &stable_id,
         policy: &policy,
         members_v2: &members,
+        join_seat_marker_agents,
     };
     // Review r5: pass the receiver's ADR-0018 revocation view so a
     // rider message from a revoked sub-agent is rejected at ingest —
@@ -21604,7 +22519,10 @@ fn classify_not_member_join_row(
         return NotMemberJoinRow::Quarantined;
     }
     let never_seated = lineage.is_some_and(|l| l.seated_at_revision.is_none());
-    let no_roster_entry = !info.members_v2.contains_key(joiner_hex);
+    // #1578 rc8: the join's own-key marker row is transparent here —
+    // it holds no admission state, only the joiner's published key.
+    let no_roster_entry =
+        !info.members_v2.contains_key(joiner_hex) || join_seat_key_marker_only(info, joiner_hex);
     if never_seated && no_roster_entry && !info.withdrawn {
         NotMemberJoinRow::UnseatedJoinRemnant
     } else if lineage.is_none() && no_roster_entry && !info.withdrawn {
@@ -21838,6 +22756,7 @@ async fn rearm_sealed_unconfirmed_join(
                     polls: Vec::new(),
                     tasks: Vec::new(),
                     listener_token: None,
+                    held_pending_notice: None,
                 },
             );
     }
@@ -21894,6 +22813,20 @@ pub(in crate::server) async fn join_group_via_invite(
     Json(req): Json<JoinGroupRequest>,
 ) -> impl IntoResponse {
     join_group_via_invite_inner(state, req, false).await
+}
+
+/// ADR 0109 §3a: the shape that only the promoted-admin re-seat mint
+/// makes. The policy has an owner axis, and the inviter-signed view has no
+/// inline owner key. An ordinary mint on an owner axis always carries the
+/// owner key (else `MintInviteError::OwnerKeyUnavailable`), and the key is
+/// inside the inviter-signed view, so it cannot be removed after signing.
+/// No new invite field is used.
+fn is_reseat_invite_shape(invite: &x0x::groups::invite::SignedInvite) -> bool {
+    invite.owner_public_key_b64.is_none()
+        && invite
+            .policy
+            .as_ref()
+            .is_some_and(|policy| policy.admission.owner_certified_user_id().is_some())
 }
 
 /// `POST /groups/join`, and (with `reseat_staging`) ADR 0109 §3's staged
@@ -22095,10 +23028,17 @@ pub(super) async fn join_group_via_invite_inner(
     // sigs, owner half (A2 step 8): the owner countersignature verifies
     // only after the base it commits to has re-derived.
     if let Err(refusal) = invite.verify_v4_owner_countersignature() {
-        let reseat_invite = reseat_staging
-            && refusal == x0x::groups::invite::InviteRefusal::OwnerCountersignatureMissing;
-        if !reseat_invite {
-            return refuse_invite(&state, &invite, refusal.reason());
+        let missing = refusal == x0x::groups::invite::InviteRefusal::OwnerCountersignatureMissing;
+        let staged_reseat = reseat_staging && missing;
+        if !staged_reseat {
+            let reason = if missing && is_reseat_invite_shape(&invite) {
+                // ADR 0109 §3a check 1: a re-seat invite is redeemed
+                // only through the §3 staging join.
+                "reseat_invite_outside_staging"
+            } else {
+                refusal.reason()
+            };
+            return refuse_invite(&state, &invite, reason);
         }
     }
 
@@ -22618,6 +23558,48 @@ pub(super) async fn join_group_via_invite_inner(
                     "failed to sign the join announcement",
                 );
             };
+            // #1578 rc7/rc8: the joiner's own copy of its own seat
+            // records exactly the key the signed MemberJoined carries —
+            // a binding-signature failure drops the key from the event,
+            // and the row must not claim a key the authority never saw.
+            // Without the row every invite-joined member's own view
+            // stays keyless for ever, so the receiver-side keyless
+            // predicate (own seat cannot take a share) matched every
+            // joiner, not the seat that genuinely lost its key data.
+            // The marker row is Pending and key-only; the join-state
+            // checks treat it as absent
+            // ([`join_seat_key_marker_only`]), and `add_member` never
+            // clears the key when the authority's MemberAdded seats the
+            // row.
+            if let NamedGroupMetadataEvent::MemberJoined {
+                kem_public_key_b64: Some(kem_b64),
+                member_agent_id,
+                ts_ms,
+                ..
+            } = &member_joined_resend.event
+            {
+                let at_secs = ts_ms / 1000;
+                info.members_v2
+                    .entry(member_agent_id.clone())
+                    .and_modify(|m| m.kem_public_key_b64 = Some(kem_b64.clone()))
+                    .or_insert_with(|| x0x::groups::GroupMember {
+                        agent_id: member_agent_id.clone(),
+                        user_id: None,
+                        role: x0x::groups::GroupRole::Member,
+                        state: x0x::groups::GroupMemberState::Pending,
+                        display_name: None,
+                        joined_at: at_secs,
+                        updated_at: at_secs,
+                        added_by: None,
+                        removed_by: None,
+                        kem_public_key_b64: Some(kem_b64.clone()),
+                        treekem_key_package_b64: None,
+                        treekem_key_package_hash: None,
+                        certificate: None,
+                        certificate_missing_since_ms: None,
+                        certificate_digest: None,
+                    });
+            }
             // named_groups.json only becomes durable when the member's
             // own `MemberAdded` is observed in the chain (the apply path
             // persists at that point). Exception: when the invite's
@@ -22862,6 +23844,7 @@ pub(super) async fn join_group_via_invite_inner(
                             polls: Vec::new(),
                             tasks: Vec::new(),
                             listener_token: None,
+                            held_pending_notice: None,
                         },
                     );
             }
@@ -23322,7 +24305,7 @@ pub(in crate::server) async fn add_named_group_member(
         };
         let metadata_topic = next.metadata_topic.clone();
         let event_group_id = next.stable_group_id().to_string();
-        let members = named_group_member_values(&next);
+        let members = named_group_member_values(&state, &next);
         let bootstrap_group = next.clone();
         // ADR 0030 §5: a SignedPublic add owes the new member the committed
         // snapshot. Record that debt durably in the same step as the roster
@@ -23725,7 +24708,7 @@ async fn add_treekem_named_group_member(
     }
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
-    let members = named_group_member_values(&next);
+    let members = named_group_member_values(&state, &next);
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -23939,7 +24922,7 @@ pub(in crate::server) async fn remove_named_group_member(
             }
         };
         let metadata_topic = next.metadata_topic.clone();
-        let members = named_group_member_values(&next);
+        let members = named_group_member_values(&state, &next);
         let delivery_roster = next.clone();
         drop(named_groups);
         let event = NamedGroupMetadataEvent::MemberRemoved {
@@ -24426,7 +25409,10 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         if !has_withdrawn_same_stable_group_record(&groups, group_id, stable_group_id) {
             return Ok(false);
         }
-        encode_named_groups_store_for_state(state, &groups)
+        // #1645: a failed re-seat swap of `group_id` does not refuse this
+        // write. It removes the group's tree and journals, so no pair is
+        // left to mix.
+        encode_named_groups_store_allowing(state, &groups, Some(group_id))
             .await
             .map_err(|e| anyhow::anyhow!("withdrawn named groups repair encode: {e}"))?
     };
@@ -24440,9 +25426,13 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
     if sidecar_outcome == AtomicWriteOutcome::NotReplaced && home_suite_json != "{}" {
         anyhow::bail!("withdrawn Home-Suite sidecar repair did not replace the sidecar");
     }
-    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &repair_json)
-        .await
-        .map_err(|e| anyhow::anyhow!("withdrawn named groups repair write: {e}"))?;
+    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &repair_json).await;
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): a roster writer, so a
+    // placeheld group's committed legacy form advances only when this
+    // write landed.
+    group_recovery::commit_legacy_write(state, &outcome);
+    let outcome =
+        outcome.map_err(|e| anyhow::anyhow!("withdrawn named groups repair write: {e}"))?;
     match outcome {
         AtomicWriteOutcome::Durable => state
             .named_groups_requires_durability_confirmation
@@ -24803,6 +25793,18 @@ async fn drop_local_named_group_state(
     // path.PARENT(), so passing the dir itself synced its parent).
     {
         let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        // #1645 (round 5 review): the absence persist below is refused
+        // while a re-seat swap has failed. Refuse before the journal
+        // removals, so the swap keeps the journals its restart replays.
+        if let Err(e) = group_recovery::refuse_roster_write_during_failed_swap(state, None).await {
+            tracing::error!(
+                group_id = %LogHexId::group(id),
+                reason = %reason,
+                error = %e,
+                "#1645: delete refused before its journal removal — nothing changed"
+            );
+            return false;
+        }
         // #457 r10 item 10.1 — a TreeKEM-dir fsync failure in the
         // PRE-COMMIT phase FAILS the delete BEFORE any destructive step
         // (the group, its journals, and its snapshot all remain; the
@@ -27360,19 +28362,19 @@ async fn rekey_treekem_self_leaves(state: &Arc<AppState>, group_id: &str) {
     }
     let membership_lock = group_membership_lock(state, &group_key).await;
     let _membership_guard = membership_lock.lock().await;
-    // ADR 0110 §4 (D75): this daemon is the committing admin, and every
-    // admin seat is revoked, so it stops sealing. A new rekey epoch would
-    // reach the revoked admins' leaves. A commit already on the local chain
+    // ADR 0110 §4 (D75) and #1578: group ciphertext is withheld here
+    // either because this committing admin's every admin seat is revoked
+    // (a new rekey epoch would reach the revoked admins' leaves) or
+    // because this node installed a verified exclusion keyless and still
+    // waits for its sealed share. A commit already on the local chain
     // is still published by the resume path: survivors need that link to
     // follow the chain the owner-recovery commit extends (§4b(1)).
-    if group_ciphertext_withheld(state, &group_key, None)
-        .await
-        .is_some()
-    {
+    if let Some(hold) = group_ciphertext_withheld(state, &group_key, None).await {
         if self_leave_rekey_log_once(&format!("s4:{group_key}")) {
             tracing::info!(
                 group_id = %LogHexId::group(&group_key),
-                "self-leave TreeKEM rekey deferred: no eligible admin remains (ADR 0110 §4)"
+                reason = %hold.reason(),
+                "self-leave TreeKEM rekey deferred: group ciphertext is withheld (ADR 0110 §4, #1578)"
             );
         }
         return;
@@ -27857,8 +28859,8 @@ async fn remove_treekem_named_group_member(
             "group_id": id,
             "removed_member": agent_id_hex,
             "epoch": treekem_epoch,
-            "member_count": named_group_member_values(&next).len(),
-            "members": named_group_member_values(&next),
+            "member_count": named_group_member_values(&state, &next).len(),
+            "members": named_group_member_values(&state, &next),
         })),
     )
 }
@@ -28585,7 +29587,9 @@ async fn owner_certified_seal_with_eviction(
 /// chain and republish the signed public card (no-op payload change —
 /// used to refresh / repair / force-propagate the chain).
 ///
-/// Admin or higher only.
+/// Admin or higher only — except that the §4 refusal below runs first:
+/// while every admin seat is revoked, members get the typed
+/// `group_admin_revoked` state, not the seat 403 (ADR 0110 §4b(3)).
 ///
 /// ADR-0038: for OwnerCertified groups this endpoint is the full
 /// re-verification point — see `owner_certified_seal_with_eviction`.
@@ -28599,6 +29603,14 @@ pub(in crate::server) async fn seal_group_state(
     if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
         return resp;
     }
+    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
+    // message, admission or key reaches a revoked admin key. Like the
+    // other §4 routes (invite, remove, ban, approve, reseal), this runs
+    // before the caller's seat gate: every member gets the typed state,
+    // not the seat 403 (#1581, ADR 0110 §4b(3) "seal on B and C").
+    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
+        return resp;
+    }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     {
         // #1166 S3: the admin trio (the inlined caller_role gate and
@@ -28608,11 +29620,6 @@ pub(in crate::server) async fn seal_group_state(
         if let Err(resp) = group_access::admit_admin_group_route(&groups, &id, &local_hex) {
             return resp;
         }
-    }
-    // ADR 0110 §4 (D75, D126): no eligible admin remains, so no new
-    // message, admission or key reaches a revoked admin key.
-    if let Some(resp) = revocation_eviction::s4_no_eligible_admin_refusal(&state, &id).await {
-        return resp;
     }
     // ADR 0110 §2: a seal that would evict a pending S4 target before
     // this node's fallback time is deferred (`waiting_for_designated_admin`).
@@ -30850,7 +31857,13 @@ pub(in crate::server) async fn update_member_role(
     };
 
     // P0-7: target must exist in members_v2 (active, banned, or removed — NOT absent).
-    let target_entry = info.members_v2.get(&agent_id_hex).cloned();
+    // #1578 rc11 (audit): the join's key-only marker row is not a seat —
+    // the target reads as absent (404), exactly main's roster.
+    let target_entry = info
+        .members_v2
+        .get(&agent_id_hex)
+        .filter(|_| !join_seat_key_marker_only(info, &agent_id_hex))
+        .cloned();
     let Some(target_entry) = target_entry else {
         return (
             StatusCode::NOT_FOUND,
@@ -34043,42 +35056,31 @@ pub(in crate::server) async fn secure_group_encrypt(
         .await;
     }
 
-    let Some(key) = info.secure_message_key() else {
-        // #1578 (David's approval, 28 Oct 08:59 GMT; Claude P1 on
-        // #1635): a keyless GSS install holds the ciphertext boundary,
-        // and the hold's typed 409 — not the waiting-joiner 424 — is
-        // the answer for exactly this state (the API-docs row and the
-        // W3-H case `w3h_1578_red_…` promise it). The hold is what
-        // separates the keyless survivor from a joiner that merely
-        // awaits its welcome share, which keeps the 424 below.
-        let keyless_hold = crate::server::resolve_group_entry_locked(&groups, &id).is_some_and(
-            |(group_key, entry)| pending_gss_removal_withholds(&state, group_key, entry),
-        );
-        if keyless_hold {
-            return api_error(
-                StatusCode::CONFLICT,
-                GroupCiphertextHold::PendingGssRemoval.reason(),
-            );
-        }
-        return api_error(
-            StatusCode::FAILED_DEPENDENCY,
-            "no shared secret available — await welcome or ask admin to re-share",
-        );
-    };
+    // #1508 rc16 (Codex P1): the share hold is checked on the snapshot
+    // the key came from. A share that installs after this read ends the
+    // hold, but this send still uses the old key, which the removed
+    // member holds. #1578 (David's approval, 28 Oct 08:59 GMT): the hold
+    // gates the endpoint before the key-presence refusal — a survivor
+    // that installed the exclusion keyless holds no secret at all, and
+    // its refusal is the typed 409, not the no-secret 424.
+    let key = info.secure_message_key();
     let epoch = info.secret_epoch;
     let group_id_clone = info.stable_group_id().to_string();
-    // #1508 rc16 (Codex P1): the share hold is checked on the snapshot the
-    // key came from. A share that installs after this read ends the hold,
-    // but this send still uses the old key, which the removed member holds.
-    let key_held = crate::server::resolve_group_entry_locked(&groups, &id)
+    let hold_open = crate::server::resolve_group_entry_locked(&groups, &id)
         .is_some_and(|(group_key, info)| pending_gss_removal_withholds(&state, group_key, info));
     drop(groups);
-    if key_held {
+    if hold_open {
         return api_error(
             StatusCode::CONFLICT,
             GroupCiphertextHold::PendingGssRemoval.reason(),
         );
     }
+    let Some(key) = key else {
+        return api_error(
+            StatusCode::FAILED_DEPENDENCY,
+            "no shared secret available — await welcome or ask admin to re-share",
+        );
+    };
     gss_encrypt_after_key_probe(&state).await;
     // #1508 rc18 (Codex P1): a verified GSS removal, ban or crypto-only
     // exclusion parks under this gate held exclusively
@@ -34445,7 +35447,14 @@ pub(in crate::server) async fn secure_group_reseal(
     // KEM key) is rejected with a distinct 409 + reason so it stays
     // machine-separable from an absent recipient (404) and from the
     // withdrawn-group 409 (which carries no reason).
-    let Some(recipient_member) = info.members_v2.get(&req.recipient) else {
+    let Some(recipient_member) = info
+        .members_v2
+        .get(&req.recipient)
+        // #1578 rc11 (audit): the join's key-only marker row is not a
+        // member seat — the recipient reads as absent (404), exactly
+        // main's roster.
+        .filter(|_| !join_seat_key_marker_only(info, &req.recipient))
+    else {
         return not_found("recipient is not a member");
     };
     if !recipient_member.is_active() {
@@ -34686,6 +35695,14 @@ fn encode_treekem_snapshot_envelope(
     let snapshot = group
         .to_snapshot_bytes()
         .map_err(|e| anyhow::anyhow!("treekem snapshot encode: {e}"))?;
+    encode_treekem_snapshot_envelope_bytes(info, snapshot)
+}
+
+/// [`encode_treekem_snapshot_envelope`] for snapshot bytes already taken.
+fn encode_treekem_snapshot_envelope_bytes(
+    info: &x0x::groups::GroupInfo,
+    snapshot: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
     let mut bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
     let envelope = TreeKemSnapshotEnvelope {
         version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
@@ -34725,6 +35742,189 @@ fn treekem_snapshot_envelope_matches_info(
     envelope.state_revision == info.state_revision
         && envelope.state_hash == info.state_hash
         && envelope.security_binding == info.security_binding
+}
+
+/// ADR 0109 §3 step 2 (#1567): what `<key>.snap` holds while a re-seat of
+/// that key is staged ([`reseat_snapshot_cover`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ReseatSnapshotCover {
+    /// The original's envelope.
+    Keep(Vec<u8>),
+    /// Nothing: the original had no tree and no snapshot file (the #871
+    /// gate-only, pre-Welcome joiner).
+    Absent,
+}
+
+impl ReseatSnapshotCover {
+    /// The envelope to write, or `None` to write no snapshot file.
+    fn into_envelope(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Keep(envelope) => Some(envelope),
+            Self::Absent => None,
+        }
+    }
+}
+
+/// ADR 0109 §3 step 2 (#1567): the cover for `<group_id_hex>.snap` while a
+/// re-seat of that key is staged, or `None` when no re-seat is staged
+/// there.
+///
+/// The staged join installs its tree under the original's key. The legacy
+/// overlay keeps the original record in the roster files until the swap,
+/// so the snapshot file must keep the original's TreeKEM state too.
+/// Otherwise a restart, or a released binary, finds the original record
+/// beside the staged tree. When the epochs match, the startup re-bind
+/// (#457) then pairs them. The cover is the journalled tree bound to the
+/// journalled record, or else the snapshot file as it is (the original's),
+/// or else no file. The staged tree reaches disk only in the swap
+/// ([`group_recovery`]'s `swap_staged_tree`).
+///
+/// Callers hold `named_groups_persistence_lock`, which the swap also
+/// holds when it ends the cover.
+pub(super) async fn reseat_snapshot_cover(
+    state: &AppState,
+    group_id_hex: &str,
+) -> Result<Option<ReseatSnapshotCover>> {
+    let Some(journal) = group_recovery::staging_journal_for_key(state, group_id_hex).await else {
+        return Ok(None);
+    };
+    if let Some(tree) = journal.live_tree {
+        let original: x0x::groups::GroupInfo = serde_json::from_slice(&journal.live_record)
+            .map_err(|e| anyhow::anyhow!("re-seat journal record decode: {e}"))?;
+        return encode_treekem_snapshot_envelope_bytes(&original, tree)
+            .map(|envelope| Some(ReseatSnapshotCover::Keep(envelope)));
+    }
+    snapshot_file_cover(state, group_id_hex).await.map(Some)
+}
+
+/// `<group_id_hex>.snap` as it is on disk, as a [`ReseatSnapshotCover`]
+/// to put back later.
+pub(super) async fn snapshot_file_cover(
+    state: &AppState,
+    group_id_hex: &str,
+) -> Result<ReseatSnapshotCover> {
+    match tokio::fs::read(treekem_snapshot_path(&state.treekem_dir, group_id_hex)).await {
+        Ok(envelope) => Ok(ReseatSnapshotCover::Keep(envelope)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReseatSnapshotCover::Absent),
+        Err(e) => Err(anyhow::anyhow!(
+            "ADR 0109 S3: the TreeKEM snapshot cannot be read: {e}"
+        )),
+    }
+}
+
+/// #1567: put `cover` back on disk as `<group_id_hex>.snap` (a failed swap
+/// left the staged tree there): write the original's envelope, or remove
+/// the file. Both are durable: the removal syncs the directory, or a power
+/// loss can bring the staged file back, and the next cover read takes it
+/// for the original's.
+pub(super) async fn restore_reseat_snapshot_cover(
+    state: &AppState,
+    group_id_hex: &str,
+    cover: ReseatSnapshotCover,
+) -> Result<()> {
+    match cover {
+        ReseatSnapshotCover::Keep(envelope) => {
+            persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, envelope).await
+        }
+        ReseatSnapshotCover::Absent => {
+            let path = treekem_snapshot_path(&state.treekem_dir, group_id_hex);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow::anyhow!("treekem snapshot remove: {e}")),
+            }
+            sync_parent_dir_for_path(&path)
+                .map_err(|e| anyhow::anyhow!("treekem snapshot remove: directory sync: {e}"))
+        }
+    }
+}
+
+/// #1645 (Codex P1 on #1683): the bytes of both roster stores (the
+/// Home-Suite sidecar, then `named_groups.json`; `None` for a file that is
+/// not there) before the re-seat swap's tree write. That write replaces
+/// the sidecar before its commit point, so a failure after it must put
+/// both files back, as it puts the original's snapshot back.
+/// With them, the committed legacy form of each placeheld group (#1570):
+/// a restore of the named bytes puts those forms back too.
+pub(super) struct RosterStoresBefore {
+    home_suite: Option<Vec<u8>>,
+    named: Option<Vec<u8>>,
+    committed: group_recovery::CommittedForms,
+}
+
+async fn read_if_present(path: &FsPath) -> Result<Option<Vec<u8>>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("{}: {e}", path.display())),
+    }
+}
+
+/// Read [`RosterStoresBefore`]. Caller holds
+/// `named_groups_persistence_lock` until any restore.
+pub(super) async fn read_roster_stores(state: &AppState) -> Result<RosterStoresBefore> {
+    Ok(RosterStoresBefore {
+        home_suite: read_if_present(&state.home_suite_groups_path).await?,
+        named: read_if_present(&state.named_groups_path).await?,
+        committed: group_recovery::committed_forms(state),
+    })
+}
+
+/// Put the Home-Suite sidecar back to `before` (write its bytes, or remove
+/// a file that was not there), durably. Unlike
+/// [`restore_home_suite_sidecar`], the outcome is returned: the re-seat
+/// swap keeps its transaction journals until this is durable. Caller holds
+/// `named_groups_persistence_lock` since [`read_roster_stores`].
+pub(super) async fn restore_home_suite_store(
+    state: &AppState,
+    before: &RosterStoresBefore,
+) -> Result<()> {
+    let path = &state.home_suite_groups_path;
+    match before.home_suite.as_deref() {
+        Some(bytes) => {
+            match write_home_suite_sidecar(state, &String::from_utf8_lossy(bytes)).await {
+                Ok(AtomicWriteOutcome::Durable) => Ok(()),
+                Ok(outcome) => Err(anyhow::anyhow!("Home-Suite sidecar restore: {outcome:?}")),
+                Err(e) => Err(anyhow::anyhow!("Home-Suite sidecar restore: {e}")),
+            }
+        }
+        None => {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(anyhow::anyhow!("Home-Suite sidecar remove: {e}")),
+            }
+            sync_parent_dir_for_path(path)
+                .map_err(|e| anyhow::anyhow!("Home-Suite sidecar remove: directory sync: {e}"))
+        }
+    }
+}
+
+/// Put `named_groups.json` back to `before`, durably. A file that was not
+/// there stays as it is: every roster save writes it. Caller holds
+/// `named_groups_persistence_lock` since [`read_roster_stores`].
+///
+/// #1570 (ZCode on d1be57f1): a Durable restore also puts each placeheld
+/// group's committed legacy form back to the one read with the bytes. A
+/// later held-back save then writes the form that is on disk, never a
+/// form from the write that this restore undid.
+pub(super) async fn restore_named_store(
+    state: &AppState,
+    before: &RosterStoresBefore,
+) -> Result<()> {
+    let Some(named) = before.named.as_deref() else {
+        return Ok(());
+    };
+    match write_named_groups_json_atomic(&state.named_groups_path, &String::from_utf8_lossy(named))
+        .await
+    {
+        Ok(AtomicWriteOutcome::Durable) => {
+            group_recovery::restore_committed_forms(state, &before.committed);
+            Ok(())
+        }
+        Ok(outcome) => Err(anyhow::anyhow!("named groups restore: {outcome:?}")),
+        Err(e) => Err(anyhow::anyhow!("named groups restore: {e}")),
+    }
 }
 
 async fn persist_treekem_snapshot_bytes(
@@ -34808,6 +36008,15 @@ pub(super) async fn persist_treekem_snapshot_bound(
         "withdrawn_snapshot_persist",
     )
     .await?;
+    // #1567: while a re-seat is staged here, the file keeps the original's
+    // state. A retained journal then needs no refresh: its envelope is the
+    // same cover.
+    if let Some(cover) = reseat_snapshot_cover(state, group_id_hex).await? {
+        if let Some(envelope) = cover.into_envelope() {
+            persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, envelope).await?;
+        }
+        return Ok(());
+    }
     let bytes = encode_treekem_snapshot_envelope(&info, group)?;
     persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, bytes).await?;
     ensure_treekem_persistence_allowed_locked(
@@ -34923,7 +36132,35 @@ async fn refresh_retained_treekem_journal_snapshot(
 /// the caller reports as failed and rolls back. Discarding it only when the
 /// named write did not land keeps the #457 rule "never discard a journal
 /// whose named half is durable" (the caller then aligns the live group).
-async fn discard_seal_journal_pair(state: &AppState, group_id_hex: &str) {
+/// [`discard_seal_journal_pair`] unless the caller keeps the pair
+/// ([`persist_treekem_and_named_groups_atomic_locked`]'s `keep_journals`).
+async fn discard_unless_kept(state: &AppState, group_id_hex: &str, keep: bool) {
+    if !keep {
+        discard_seal_journal_pair(state, group_id_hex).await;
+    }
+}
+
+/// #1645: [`discard_seal_journal_pair`], checked. The legacy journal (the
+/// commit point) is removed durably: a removal that fails, or whose
+/// directory sync fails, is an error, because a restart can still replay
+/// the pair. An orphan `.hsjournal` is discarded at startup, so its
+/// removal is best effort.
+pub(super) async fn discard_seal_journal_pair_durable(
+    state: &AppState,
+    group_id_hex: &str,
+) -> Result<()> {
+    let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
+    match tokio::fs::remove_file(&journal_path).await {
+        Ok(()) => sync_parent_dir_for_path(&journal_path)
+            .map_err(|e| anyhow::anyhow!("TreeKEM journal remove: directory sync: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("TreeKEM journal remove: {e}")),
+    }
+    remove_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex).await;
+    Ok(())
+}
+
+pub(super) async fn discard_seal_journal_pair(state: &AppState, group_id_hex: &str) {
     let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
     if let Err(e) = tokio::fs::remove_file(&journal_path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -34955,6 +36192,58 @@ impl std::fmt::Display for EpochInstalledPersistError {
 
 impl std::error::Error for EpochInstalledPersistError {}
 
+/// #1645 (Codex P1, round 4): the atomic persist stopped before its commit
+/// point (the legacy TreeKEM journal). No live file (sidecar, snapshot,
+/// `named_groups.json`) changed and no journal replays the transaction,
+/// so the files on disk are the files from before the call. The marker is
+/// the signal, not the error text. It shows the wrapped error's text, so
+/// callers that read the text see no change.
+#[derive(Debug)]
+struct BeforeCommitPersistError(anyhow::Error);
+
+impl std::fmt::Display for BeforeCommitPersistError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for BeforeCommitPersistError {}
+
+fn before_commit(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(BeforeCommitPersistError(error))
+}
+
+/// Whether `error` is from an atomic persist that stopped before its commit
+/// point ([`BeforeCommitPersistError`]).
+pub(super) fn persist_stopped_before_commit(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<BeforeCommitPersistError>().is_some()
+}
+
+/// #1645 (round 4 review): the atomic persist found the group withdrawn
+/// and its repair ran: the rosters hold the withdrawn record, and the
+/// group's snapshot and journals are removed. The marker is the signal.
+/// It shows the wrapped error's text.
+#[derive(Debug)]
+struct WithdrawnPersistError(anyhow::Error);
+
+impl std::fmt::Display for WithdrawnPersistError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for WithdrawnPersistError {}
+
+fn withdrew(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(WithdrawnPersistError(error))
+}
+
+/// Whether `error` is from an atomic persist whose withdrawn repair ran
+/// ([`WithdrawnPersistError`]).
+pub(super) fn persist_withdrew_group(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<WithdrawnPersistError>().is_some()
+}
+
 async fn persist_treekem_and_named_groups_atomic_with_info(
     state: &AppState,
     group_id_hex: &str,
@@ -34966,6 +36255,26 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     // the same marker).
     state.group_recovery.hold_reseat_marker(&mut info);
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    persist_treekem_and_named_groups_atomic_locked(state, group_id_hex, info, group, false).await
+}
+
+/// [`persist_treekem_and_named_groups_atomic_with_info`] for a caller that
+/// already holds `named_groups_persistence_lock` (the ADR 0109 re-seat
+/// swap, #1567).
+///
+/// With `keep_journals`, a write that fails after the commit point keeps
+/// the journal pair (#1645, Codex P1 on #1683): a restart then replays this
+/// transaction, so the files are a matching pair until the caller has put
+/// the previous files back and discards the pair itself
+/// ([`discard_seal_journal_pair_durable`]), or until a retry commits. A
+/// withdrawn group's pair is always discarded.
+async fn persist_treekem_and_named_groups_atomic_locked(
+    state: &AppState,
+    group_id_hex: &str,
+    info: x0x::groups::GroupInfo,
+    group: &x0x::mls::TreeKemMlsGroup,
+    keep_journals: bool,
+) -> anyhow::Result<()> {
     let stable_group_id = info.stable_group_id().to_string();
     #[cfg(test)]
     maybe_force_post_crypto_withdrawn_group_for_test(state, group_id_hex, Some(&stable_group_id))
@@ -34978,7 +36287,9 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     )
     .await?
     {
-        anyhow::bail!("refusing to persist key material for withdrawn group");
+        return Err(withdrew(anyhow::anyhow!(
+            "refusing to persist key material for withdrawn group"
+        )));
     }
     // Issue #451 + review r2: the durable trio (sidecar / snapshot /
     // named_groups.json) must only change AFTER their repair payloads are
@@ -35053,11 +36364,11 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
                      fork-quarantine marker changed between authorization and the \
                      persist lock"
                 );
-                anyhow::bail!(
+                return Err(before_commit(anyhow::anyhow!(
                     "fork_quarantined: the group's fork-quarantine marker changed \
                      between authorization and the persist lock; re-read the group \
                      and retry (see docs/runbooks for the manual clear)"
-                );
+                )));
             }
         }
         let mut next_groups = groups.clone();
@@ -35087,10 +36398,23 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         // containment cannot have moved under it, so the results agree.
         enforce_containment_invariant(&mut next_groups, &groups);
         // #451 (merged main): the two-file split encoder.
-        encode_named_groups_store_for_state(state, &next_groups)
-            .await
-            .map_err(|e| anyhow::anyhow!("named groups encode: {e}"))?
+        encode_named_groups_store_allowing(
+            state,
+            &next_groups,
+            keep_journals.then_some(group_id_hex),
+        )
+        .await
+        .map_err(|e| before_commit(anyhow::anyhow!("named groups encode: {e}")))?
     };
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): the encode held this group
+    // back, so its legacy entry keeps the last committed form. A snapshot
+    // of the new epoch would then be newer than the saved roster. Write
+    // nothing; the caller rolls back.
+    if group_recovery::is_held_back(state, &stable_group_id) {
+        return Err(before_commit(anyhow::anyhow!(
+            "ADR 0109 §4: the group's authoritative record is not durable (held back)"
+        )));
+    }
 
     #[cfg(test)]
     maybe_force_atomic_persist_post_json_withdrawn_group_for_test(
@@ -35100,7 +36424,28 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     )
     .await;
 
-    let snapshot_envelope = encode_treekem_snapshot_envelope(&info, group)?;
+    // #1567: a staged re-seat keeps the original's tree in the snapshot and
+    // in the journal (which a released binary replays), as the roster view
+    // above keeps the original record. An original with no snapshot file
+    // keeps none: only the roster half is written.
+    let snapshot_envelope = match reseat_snapshot_cover(state, group_id_hex)
+        .await
+        .map_err(before_commit)?
+    {
+        Some(ReseatSnapshotCover::Keep(envelope)) => envelope,
+        Some(ReseatSnapshotCover::Absent) => {
+            return persist_named_half_without_snapshot_locked(
+                state,
+                group_id_hex,
+                &stable_group_id,
+                info,
+                &named_groups_json,
+                &home_suite_json,
+            )
+            .await;
+        }
+        None => encode_treekem_snapshot_envelope(&info, group).map_err(before_commit)?,
+    };
     // 1) Repair payloads first: the legacy journal (old binaries replay it
     //    into snapshot + named_groups.json), then the sidecar journal.
     let journal = TreeKemNamedPersistJournal {
@@ -35110,7 +36455,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         snapshot_envelope: snapshot_envelope.clone(),
     };
     let journal_bytes = postcard::to_stdvec(&journal)
-        .map_err(|e| anyhow::anyhow!("TreeKEM journal encode: {e}"))?;
+        .map_err(|e| before_commit(anyhow::anyhow!("TreeKEM journal encode: {e}")))?;
     let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
     // Review r3, item 1: durable + crash-atomic (temp → file fsync →
     // rename → dir fsync) so a power loss can never leave a torn journal
@@ -35131,7 +36476,14 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         },
         &home_suite_json,
     )
-    .await?;
+    .await
+    .map_err(before_commit)?;
+    #[cfg(test)]
+    if state.named_groups_save_fault.load(Ordering::SeqCst) == SaveFault::JournalWriteFails as u8 {
+        return Err(before_commit(anyhow::anyhow!(
+            "TreeKEM journal write: test fault"
+        )));
+    }
     match x0x::storage::write_private_bytes_durable_typed(&journal_path, journal_bytes).await {
         Ok(()) => {}
         Err(e) if e.crossed_rename() => {
@@ -35147,7 +36499,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
                 "#1187: TreeKEM seal journal is in place but its directory fsync failed; completing the transaction (a restart would replay it)"
             );
         }
-        Err(e) => return Err(anyhow::anyhow!("TreeKEM journal write: {e}")),
+        Err(e) => return Err(before_commit(anyhow::anyhow!("TreeKEM journal write: {e}"))),
     }
     // 2) Live files, each now repairable from the journals above.
     // #1187: past the commit point, a failure that does NOT durably commit
@@ -35156,12 +36508,12 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     let sidecar_outcome = match write_home_suite_sidecar(state, &home_suite_json).await {
         Ok(outcome) => outcome,
         Err(e) => {
-            discard_seal_journal_pair(state, group_id_hex).await;
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             return Err(anyhow::anyhow!("Home-Suite sidecar write: {e}"));
         }
     };
     if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
-        discard_seal_journal_pair(state, group_id_hex).await;
+        discard_unless_kept(state, group_id_hex, keep_journals).await;
         anyhow::bail!("Home-Suite sidecar replacement did not occur");
     }
     match persist_treekem_snapshot_bytes_typed(&state.treekem_dir, group_id_hex, snapshot_envelope)
@@ -35182,7 +36534,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
             );
         }
         Err(e) => {
-            discard_seal_journal_pair(state, group_id_hex).await;
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             return Err(anyhow::anyhow!("treekem snapshot write: {e}"));
         }
     }
@@ -35196,22 +36548,37 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     {
         Ok(true) => {
             discard_seal_journal_pair(state, group_id_hex).await;
-            anyhow::bail!("refusing to persist key material for withdrawn group");
+            return Err(withdrew(anyhow::anyhow!(
+                "refusing to persist key material for withdrawn group"
+            )));
         }
         Ok(false) => {}
         Err(e) => {
-            discard_seal_journal_pair(state, group_id_hex).await;
+            // #1645: the repair did not run, so the group still has key
+            // material, and the sidecar and snapshot above are on disk. The
+            // re-seat swap keeps the pair that replays them.
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             return Err(e);
         }
     }
-    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
-        .await
-        .map_err(|e| {
-            // The legacy journal is already the commit point. A restart
-            // replays this epoch, so the caller must keep the outbound event.
-            anyhow::Error::new(EpochInstalledPersistError)
-                .context(format!("named groups write: {e}"))
-        })?;
+    #[cfg(test)]
+    if state.named_groups_save_fault.load(Ordering::SeqCst)
+        == SaveFault::NamedNotReplacedAfterSnapshot as u8
+    {
+        discard_unless_kept(state, group_id_hex, keep_journals).await;
+        anyhow::bail!("named groups replacement did not occur");
+    }
+    let outcome =
+        write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json).await;
+    // ADR 0109 §4 (#1570, ZCode on d1be57f1): this is a roster writer too,
+    // so a placeheld group's committed legacy form advances only when this
+    // write landed.
+    group_recovery::commit_legacy_write(state, &outcome);
+    let outcome = outcome.map_err(|e| {
+        // The legacy journal is already the commit point. A restart
+        // replays this epoch, so the caller must keep the outbound event.
+        anyhow::Error::new(EpochInstalledPersistError).context(format!("named groups write: {e}"))
+    })?;
     match outcome {
         AtomicWriteOutcome::Durable => state
             .named_groups_requires_durability_confirmation
@@ -35240,7 +36607,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         AtomicWriteOutcome::NotReplaced => {
             // #1187: the named half did not land, so the journal must not
             // replay this transaction at restart (the caller rolls back).
-            discard_seal_journal_pair(state, group_id_hex).await;
+            discard_unless_kept(state, group_id_hex, keep_journals).await;
             anyhow::bail!("named groups replacement did not occur");
         }
     }
@@ -35267,6 +36634,61 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         .remove(group_id_hex);
     // #451 (merged main): the sidecar journal completes with the legacy one.
     remove_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex).await;
+    Ok(())
+}
+
+/// #1567: [`persist_treekem_and_named_groups_atomic_locked`] while a
+/// re-seat of a tree-less original is staged under `group_id_hex`
+/// ([`ReseatSnapshotCover::Absent`]). The snapshot file stays absent, so
+/// no TreeKEM journal is written: the checked roster save (sidecar, then
+/// `named_groups.json`) is the whole transaction. The outcomes are those
+/// of the atomic persist's named write. Caller holds
+/// `named_groups_persistence_lock`.
+async fn persist_named_half_without_snapshot_locked(
+    state: &AppState,
+    group_id_hex: &str,
+    stable_group_id: &str,
+    info: x0x::groups::GroupInfo,
+    named_groups_json: &str,
+    home_suite_json: &str,
+) -> anyhow::Result<()> {
+    if repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
+        state,
+        group_id_hex,
+        Some(stable_group_id),
+        "withdrawn_atomic_persist_late",
+    )
+    .await?
+    {
+        anyhow::bail!("refusing to persist key material for withdrawn group");
+    }
+    let outcome = save_named_groups_store_checked(state, named_groups_json, home_suite_json)
+        .await
+        .map_err(|e| anyhow::anyhow!("named groups write: {e}"))?;
+    let durable = match outcome {
+        AtomicWriteOutcome::Durable => true,
+        AtomicWriteOutcome::ReplacedNotDurable => false,
+        AtomicWriteOutcome::NotReplaced => anyhow::bail!("named groups replacement did not occur"),
+    };
+    state
+        .named_groups_requires_durability_confirmation
+        .store(!durable, Ordering::Release);
+    // #732 r8: the install converges, as the atomic persist's does.
+    {
+        let mut groups = state.named_groups.write().await;
+        let before = groups.clone();
+        groups.insert(group_id_hex.to_string(), info);
+        enforce_containment_invariant(&mut groups, &before);
+    }
+    if !durable {
+        return Err(anyhow::Error::new(EpochInstalledPersistError)
+            .context("named groups replacement was not directory-durable"));
+    }
+    state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(group_id_hex);
     Ok(())
 }
 
@@ -40694,7 +42116,15 @@ fn split_named_groups_for_store(
     for (id, info) in groups {
         if is_home_suite_group_entry(info) {
             home_suite.insert(id.clone(), info.clone());
-            legacy.insert(id.clone(), legacy_safe_placeholder(info));
+            let mut placeholder = legacy_safe_placeholder(info);
+            // #1569, ADR 0109 §4: an S3 placeholder keeps its all-Removed
+            // roster in both files (an exception to the empty roster of
+            // `legacy_safe_placeholder`). An empty roster seats the creator
+            // as an Active admin on a released load.
+            if x0x::groups::recovery::is_s3_placeholder(info) {
+                placeholder.members_v2 = info.members_v2.clone();
+            }
+            legacy.insert(id.clone(), placeholder);
         } else {
             legacy.insert(id.clone(), info.clone());
         }
@@ -40810,20 +42240,28 @@ async fn encode_named_groups_store_excluding_pending_stubs(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     always_include: Option<&str>,
 ) -> std::io::Result<(String, String)> {
-    let durable_view = {
-        let pending = state
-            .pending_join_stubs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (!pending.is_empty()).then(|| {
-            let mut durable_view = groups.clone();
-            durable_view.retain(|key, _| {
-                Some(key.as_str()) == always_include || !pending.contains(key.as_str())
-            });
-            durable_view
-        })
-    };
+    let has_pending = !state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty();
+    let durable_view =
+        has_pending.then(|| without_pending_join_stubs(state, groups.clone(), always_include));
     encode_named_groups_store_for_state(state, durable_view.as_ref().unwrap_or(groups)).await
+}
+
+/// `groups` without unconfirmed join stubs, except `always_include`.
+fn without_pending_join_stubs(
+    state: &AppState,
+    mut groups: HashMap<String, x0x::groups::GroupInfo>,
+    always_include: Option<&str>,
+) -> HashMap<String, x0x::groups::GroupInfo> {
+    let pending = state
+        .pending_join_stubs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    groups.retain(|key, _| Some(key.as_str()) == always_include || !pending.contains(key.as_str()));
+    groups
 }
 
 /// The production store encoder: ADR 0109 §4's S3 placeholder transaction
@@ -40833,9 +42271,37 @@ async fn encode_named_groups_store_for_state(
     state: &AppState,
     groups: &HashMap<String, x0x::groups::GroupInfo>,
 ) -> std::io::Result<(String, String)> {
+    encode_named_groups_store_allowing(state, groups, None).await
+}
+
+/// [`encode_named_groups_store_for_state`]. Every whole-roster write
+/// encodes here, so this is the backstop where a write waits for a failed
+/// re-seat swap whose files are not yet a matching pair
+/// ([`group_recovery::refuse_roster_write_during_failed_swap`]). A write
+/// that stages or removes journals first refuses earlier, before it
+/// touches them (#1645 round 5). `allow` is the key of the swap's own
+/// retry.
+async fn encode_named_groups_store_allowing(
+    state: &AppState,
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    allow: Option<&str>,
+) -> std::io::Result<(String, String)> {
+    group_recovery::refuse_roster_write_during_failed_swap(state, allow).await?;
+    // #1699: a write from inside a re-seat scope (ADR 0109 §3 step 2)
+    // changed the staging slot, which never reaches disk. The disk view is
+    // the live map, without unconfirmed join stubs; the open journal's
+    // overlay keeps the original of the group under re-seat.
+    let live_view;
+    let groups = if crate::server::reseat_scope::in_any_reseat_scope() {
+        let live = state.named_groups.live_read().await.clone();
+        live_view = without_pending_join_stubs(state, live, None);
+        &live_view
+    } else {
+        groups
+    };
     // Stack budget (see `migrate_unsplit_home_suite_store_if_needed`): the
     // S3 sidecar writer future lives on the heap, not in every save path.
-    match Box::pin(group_recovery::legacy_store_view(state, groups)).await? {
+    match Box::pin(group_recovery::legacy_store_view(state, groups)).await {
         Some(view) => encode_named_groups_store(&view),
         None => encode_named_groups_store(groups),
     }
@@ -40978,6 +42444,9 @@ async fn save_named_groups_store_checked(
             .store(true, Ordering::Release),
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
     }
+    // ADR 0109 §4 (#1570 rc4): a placeheld group's committed legacy form
+    // advances only when this write landed.
+    group_recovery::commit_legacy_write(state, &outcome);
     outcome
 }
 
@@ -41189,6 +42658,41 @@ const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MEMBER_JOINED_RESEND_POLL_INTERVALS: u32 = 3;
 
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// #1699: a `std` deadline as a tokio one, for `tokio::time::timeout_at`.
+/// `Instant::into()` keeps the `std` reading, but with paused tokio time
+/// (the W3-H sims) tokio's clock runs ahead of `std`'s by all the advanced
+/// time, so a converted deadline has often passed already: a re-seat's
+/// Welcome stream then ended before its final ack, and the subject was
+/// never keyed. The time left is measured on `std`'s clock and added to
+/// tokio's now. When time is not paused the two clocks agree.
+fn tokio_deadline(deadline: Instant) -> tokio::time::Instant {
+    tokio::time::Instant::now() + deadline.saturating_duration_since(Instant::now())
+}
+
+#[cfg(test)]
+mod tokio_deadline_tests {
+    use super::*;
+
+    /// #1699: after paused time advances past a Welcome's TTL in virtual
+    /// time, a deadline 10 minutes ahead on `std`'s clock must still be
+    /// ahead on tokio's. `into()` puts it in the past, so a `timeout_at`
+    /// on it fires at once; [`tokio_deadline`] keeps the time left.
+    #[tokio::test(start_paused = true)]
+    async fn a_std_deadline_keeps_its_time_left_after_paused_time_advances() {
+        tokio::time::advance(PENDING_WELCOME_TTL * 3).await;
+        let deadline = Instant::now() + PENDING_WELCOME_TTL;
+        let converted: tokio::time::Instant = deadline.into();
+        assert!(converted <= tokio::time::Instant::now());
+        let kept = tokio_deadline(deadline);
+        assert!(kept > tokio::time::Instant::now() + PENDING_WELCOME_TTL / 2);
+        let finished = tokio::time::timeout_at(kept, async {
+            tokio::time::sleep(PENDING_WELCOME_TTL / 2).await;
+        })
+        .await;
+        assert!(finished.is_ok());
+    }
+}
 
 // The TreeKEM join-result poll closes at 120s. All fetch retries and the
 // final receive wait must finish inside that window.
@@ -41722,6 +43226,155 @@ fn verify_join_refusal_receipt(
     ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &canonical, &sig).is_ok()
 }
 
+/// ADR 0108 §8 (#1575) — the joiner's notice acceptance checklist. EVERY
+/// dimension must hold, else the notice is dropped (logged) and the
+/// attempt keeps its current cause:
+/// - verified ingress, and the notice names THIS agent, THIS group's
+///   current attempt and that attempt's exact id (a replay for another
+///   attempt never moves);
+/// - the cause is a well-formed registry name (an unknown-but-well-formed
+///   name is HELD and displayed as `unrecognized_cause`, never a decode
+///   failure — §8);
+/// - freshness: inside the 10-minute staging lifetime and not dated more
+///   than 300 s ahead (the refusal receipt's clock-skew rule);
+/// - the signer resolves to the key pinned from the VERIFIED invite (which
+///   must derive `signer_agent_id`, so only the expected authority signs
+///   any cause). A member-signed `no_eligible_admin` notice (D154) is
+///   dropped in this slice: the joiner polls only its authority, so one
+///   can arrive only unsolicited, and §8's "Current notice" rule keeps the
+///   authority's notice current while it polls — the D154 notice-only
+///   rotation slice owns member-signed acceptance (with the Active
+///   stub-roster seat check D154 names);
+/// - the ML-DSA-65 signature verifies over the canonical notice bytes.
+///
+/// Newest-first: a notice older than (or equal to) the held one by
+/// `issued_at_ms` is ignored; a strictly newer one replaces it (§8
+/// "Current notice" — this slice has no notice-only rotation, so the
+/// connection-scoped authority-wins rule of that slice reduces here to
+/// strictly-newer-wins). The notice grants nothing and never finalizes.
+async fn verify_and_hold_join_pending_notice(
+    state: &AppState,
+    verified: bool,
+    notice: &JoinPendingNotice,
+) -> bool {
+    use base64::Engine as _;
+    if !verified {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), "#1575: pending notice over an UNVERIFIED direct message — dropped");
+        return false;
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if notice.member_agent_id != local_hex {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), "#1575: pending notice for a different member — dropped");
+        return false;
+    }
+    if !valid_join_pending_cause(&notice.cause) {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), cause = %notice.cause, "#1575: pending notice cause is not a registry name — dropped");
+        return false;
+    }
+    const JOIN_NOTICE_FUTURE_SKEW: std::time::Duration = std::time::Duration::from_secs(300);
+    let now_ms = now_millis_u64();
+    if notice
+        .issued_at_ms
+        .saturating_add(PENDING_JOIN_RESULT_TTL.as_millis() as u64)
+        < now_ms
+    {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), "#1575: stale pending notice (expired lifetime) — dropped");
+        return false;
+    }
+    if notice.issued_at_ms.saturating_sub(now_ms) > (JOIN_NOTICE_FUTURE_SKEW.as_millis() as u64) {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), ahead_ms = notice.issued_at_ms.saturating_sub(now_ms), "#1575: pending notice dated too far AHEAD — dropped");
+        return false;
+    }
+    let key = join_result_key(&notice.group_id, &notice.member_agent_id);
+    // Read the attempt, resolve the signer key, then re-check and hold
+    // under the registry lock (the attempt id pins the entry).
+    let (attempt_id, inviter_public_key_b64) = {
+        let attempts = state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(attempt) = attempts.get(&key) else {
+            tracing::debug!(group_id = %LogHexId::group(&notice.group_id), "#1575: pending notice with no current attempt entry — dropped");
+            return false;
+        };
+        (
+            attempt.attempt_id.clone(),
+            attempt.inviter_public_key_b64.clone(),
+        )
+    };
+    if attempt_id != notice.attempt_id {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), local_attempt = %attempt_id, notice_attempt = %notice.attempt_id, "#1575: pending notice attempt mismatch — dropped");
+        return false;
+    }
+    // Signer resolution (§8): the pinned inviter key. This slice answers
+    // only its own authority-directed polls (the D154 notice-only rotation
+    // is a follow-up), so a member-signed `no_eligible_admin` notice can
+    // only arrive UNSOLICITED — §8's "Current notice" rule keeps the
+    // authority's notice current while the joiner polls it, so member-signed
+    // notices are dropped until the rotation slice owns their acceptance
+    // (including the Active stub-roster seat check D154 names).
+    let signer_key = BASE64
+        .decode(&inviter_public_key_b64)
+        .ok()
+        .and_then(|bytes| ant_quic::MlDsaPublicKey::from_bytes(&bytes).ok())
+        .filter(|pubkey| {
+            hex::encode(crate::identity::AgentId::from_public_key(pubkey).as_bytes())
+                == notice.signer_agent_id.to_ascii_lowercase()
+        });
+    let Some(signer_key) = signer_key else {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), signer = %LogHexId::agent(&notice.signer_agent_id), cause = %notice.cause, "#1575: notice from a signer that is not the pinned authority — dropped (member-signed acceptance lands with the D154 notice-only rotation)");
+        return false;
+    };
+    let canonical = canonical_join_pending_notice_bytes(notice);
+    let Ok(signature) = BASE64.decode(&notice.signature_b64) else {
+        return false;
+    };
+    let Ok(sig) = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&signature)
+    else {
+        return false;
+    };
+    if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&signer_key, &canonical, &sig)
+        .is_err()
+    {
+        tracing::warn!(group_id = %LogHexId::group(&notice.group_id), signer = %LogHexId::agent(&notice.signer_agent_id), "#1575: pending notice signature verification FAILED — dropped");
+        return false;
+    }
+    let canonical_hash = hex::encode(blake3::hash(&canonical).as_bytes());
+    let mut attempts = state
+        .pending_join_attempts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(attempt) = attempts.get_mut(&key) else {
+        return false;
+    };
+    if attempt.attempt_id != notice.attempt_id {
+        return false;
+    }
+    if attempt
+        .held_pending_notice
+        .as_ref()
+        .is_some_and(|held| held.issued_at_ms >= notice.issued_at_ms)
+    {
+        // §8: older (or same-age) notices are ignored.
+        tracing::debug!(group_id = %LogHexId::group(&notice.group_id), "#1575: pending notice is not newer than the held one — ignored");
+        return false;
+    }
+    attempt.held_pending_notice = Some(HeldJoinPendingNotice {
+        cause: notice.cause.clone(),
+        detail: notice.detail.clone(),
+        issued_at_ms: notice.issued_at_ms,
+        signer_agent_id: notice.signer_agent_id.clone(),
+        canonical_hash,
+    });
+    tracing::debug!(
+        group_id = %LogHexId::group(&notice.group_id),
+        cause = %notice.cause,
+        signer = %LogHexId::agent(&notice.signer_agent_id),
+        "ADR 0108 §8: held a verified join pending notice"
+    );
+    true
+}
+
 /// #477 r2-4 — the refusal lookup with the membership guard ALREADY HELD
 /// (the fetch handler's single critical section covers results + refusals).
 async fn serve_staged_join_refusal(
@@ -41760,11 +43413,556 @@ async fn serve_staged_join_refusal(
     serde_json::to_vec(&response).ok()
 }
 
+/// §8: build the unsigned wire body for a staged notice. Deterministic
+/// while the cause and detail are unchanged — the nonce is derived from
+/// the stable facts and `issued_at_ms` is pinned at first staging — so the
+/// joiner's `held_notice_hash` changes only when the notice does.
+fn wire_body_for_staged_notice(
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    staged: &PendingJoinNotice,
+) -> JoinPendingNotice {
+    let nonce_digest = blake3::hash(
+        format!(
+            "{}:{}:{}:{}:{}:{:?}",
+            staged.signer_agent_id,
+            group_id,
+            member_agent_id,
+            attempt_id,
+            staged.cause,
+            staged.detail
+        )
+        .as_bytes(),
+    );
+    let mut nonce_bytes = [0u8; 16];
+    nonce_bytes.copy_from_slice(&nonce_digest.as_bytes()[..16]);
+    JoinPendingNotice {
+        group_id: group_id.to_string(),
+        member_agent_id: member_agent_id.to_string(),
+        signer_agent_id: staged.signer_agent_id.clone(),
+        attempt_id: attempt_id.to_string(),
+        cause: staged.cause.to_string(),
+        detail: staged.detail.clone(),
+        issued_at_ms: staged.issued_at_ms,
+        nonce: hex::encode(nonce_bytes),
+        signature_b64: String::new(),
+        signer_public_key_b64: None,
+    }
+}
+
+/// ADR 0108 §8 serving: answer one capable, attempt-matching fetch with
+/// the staged notice, signed. Called under the #477 A4 membership critical
+/// section after §8's selection order re-check (Result, then Refused, then
+/// notice). Every §8 serving condition holds here or nothing is served:
+/// the advert gate (`join_pending_notice_v1` on the joiner's current
+/// verified, machine-bound advert), `held_notice_hash` dedup (the joiner
+/// already holds these bytes), `notice_only` narrowing the answer to the
+/// member-signed D154 cause, and — for the signature itself — the §8 lazy
+/// materialization: sign at the first capable serve, cache until the cause
+/// or detail changes, rate-limited per `(group, member)` and globally
+/// (the #477 limiter shape and values, settled by reviewer consensus in
+/// PR #1639 round 4: 1 per joiner per 30 s, 20 per minute overall). The
+/// token is reserved BEFORE the ML-DSA run and refunded on a failed
+/// signature, so an exhausted budget signs nothing and a cached re-serve
+/// spends no token. The staged body must still be inside its 10-minute
+/// lifetime. `signer_public_key_b64` rides only when this node is not the
+/// attempt's expected authority and the cause is `no_eligible_admin` (§8
+/// wire shape; never part of the canonical bytes).
+///
+/// Returns the serialized `Pending` arm, or `None` when nothing may be
+/// served (the joiner retries at the next poll).
+#[allow(clippy::too_many_arguments)]
+async fn serve_staged_join_pending_notice(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    joiner: &AgentId,
+    held_notice_hash: Option<&str>,
+    notice_only: bool,
+) -> Option<Vec<u8>> {
+    // §8: the joiner's current verified, machine-bound advert must set the
+    // bit. Some(false) (a capable advert without it) and None (unknown,
+    // expired or card-only) both serve nothing.
+    if !state
+        .agent
+        .capability_store()
+        .verified_registry_supports(joiner, x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1)
+        .unwrap_or(false)
+    {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            member = %LogHexId::agent(member_agent_id),
+            "ADR 0108 §8: joiner advert lacks join_pending_notice_v1 — no notice served"
+        );
+        return None;
+    }
+    let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
+    let (mut notice, canonical_hash, cached_signature, member_key_rides) = {
+        let mut notices = state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        notices.retain(|_, notice| staged_join_pending_notice_is_current(notice));
+        let staged = notices.get_mut(&key)?;
+        // §8 (D154): a notice-only request is answered with at most one
+        // member-signed `no_eligible_admin` — never the S2 cause, never a
+        // Result, Refused, Welcome, key or roster.
+        if notice_only && staged.cause != JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN {
+            return None;
+        }
+        let notice = wire_body_for_staged_notice(group_id, member_agent_id, attempt_id, staged);
+        let canonical_hash = join_pending_notice_hash(&notice);
+        if held_notice_hash == Some(canonical_hash.as_str()) {
+            // §8: the joiner already holds exactly these bytes — send nothing.
+            return None;
+        }
+        let cached_signature = staged
+            .cached
+            .as_ref()
+            .filter(|cached| cached.canonical_hash == canonical_hash)
+            .map(|cached| cached.signature_b64.clone());
+        let member_key_rides = staged.cause == JOIN_PENDING_CAUSE_NO_ELIGIBLE_ADMIN
+            && staged.inviter_agent_id.as_deref() != Some(&staged.signer_agent_id);
+        (notice, canonical_hash, cached_signature, member_key_rides)
+    };
+    let signature_b64 = match cached_signature {
+        Some(cached) => cached,
+        None => {
+            // §8 Q3 (settled by reviewer consensus, PR #1639 review round
+            // 4): the same bounded limiter shape as the refusal signatures
+            // — 1 per (group, member) / 30 s and 20/min globally. The
+            // token is RESERVED BEFORE ML-DSA runs and refunded when
+            // signing fails: an exhausted budget signs nothing (round 3
+            // signed first and discarded the signature, leaving the
+            // signing cost uncapped) and a failed signature spends
+            // nothing. ML-DSA runs OUTSIDE the global notices mutex and
+            // outside the limiter lock; a cached re-serve spends no token.
+            let reserved = {
+                let mut limiter = state
+                    .join_pending_notice_sign_limiter
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                limiter.reserve(group_id, member_agent_id)
+            };
+            if !reserved {
+                tracing::debug!(
+                    group_id = %LogHexId::group(group_id),
+                    member = %LogHexId::agent(member_agent_id),
+                    "ADR 0108 §8: notice signing throttled (Q3 limits); the joiner retries"
+                );
+                return None;
+            }
+            use base64::Engine as _;
+            let signing_kp = state.agent.identity().agent_keypair();
+            let canonical = canonical_join_pending_notice_bytes(&notice);
+            // #1575 (round 4): a test can force the next sign to fail to
+            // prove the refund below runs; production always signs for real.
+            #[cfg(test)]
+            let sign_outcome = if join_egress_test_barrier::take_notice_sign_failure() {
+                Err(ant_quic::crypto::pqc::types::PqcError::SigningFailed(
+                    "test-forced".to_string(),
+                ))
+            } else {
+                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                    signing_kp.secret_key(),
+                    &canonical,
+                )
+            };
+            #[cfg(not(test))]
+            let sign_outcome = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                signing_kp.secret_key(),
+                &canonical,
+            );
+            let sig = match sign_outcome {
+                Ok(sig) => sig,
+                Err(error) => {
+                    state
+                        .join_pending_notice_sign_limiter
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .refund(group_id, member_agent_id);
+                    tracing::warn!(
+                        group_id = %LogHexId::group(group_id),
+                        member = %LogHexId::agent(member_agent_id),
+                        error = %error,
+                        "#1575: notice signature failed — the limiter token is refunded"
+                    );
+                    return None;
+                }
+            };
+            #[cfg(test)]
+            join_egress_test_barrier::park(member_agent_id, "join_pending_notice_sign").await;
+            let signature_b64 = BASE64.encode(sig.as_bytes());
+            // Cache the signature for the next serve of the same bytes. The
+            // write-back re-checks the row under a fresh lock: a restage
+            // that changed the cause or detail in the gap changed the
+            // canonical bytes, and the cache is skipped.
+            let mut notices = state
+                .pending_join_notices
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(staged) = notices.get_mut(&key) {
+                let current =
+                    wire_body_for_staged_notice(group_id, member_agent_id, attempt_id, staged);
+                if join_pending_notice_hash(&current) == canonical_hash {
+                    staged.cached = Some(CachedJoinPendingNotice {
+                        canonical_hash: canonical_hash.clone(),
+                        signature_b64: signature_b64.clone(),
+                    });
+                }
+            }
+            signature_b64
+        }
+    };
+    notice.signature_b64 = signature_b64;
+    if member_key_rides {
+        use base64::Engine as _;
+        notice.signer_public_key_b64 = Some(
+            BASE64.encode(
+                state
+                    .agent
+                    .identity()
+                    .agent_keypair()
+                    .public_key()
+                    .as_bytes(),
+            ),
+        );
+    }
+    let response = JoinResultMessage::Pending {
+        notice: Box::new(notice),
+    };
+    serde_json::to_vec(&response).ok()
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4, Codex P2): the serving-eligibility
+/// half of the `Pending` reply's admission — the same facts the poll-time
+/// evaluation drops a notice for, re-taken under the group's membership
+/// lock immediately before the reply is written: the joiner was removed,
+/// banned or revoked (or a revocation resync gap makes revocation state
+/// unverifiable), the group is withdrawn, quarantined or gone, this node
+/// lost its Active seat (only a member may sign), or a terminal answer —
+/// a Result or a Refused — was staged for the attempt during delivery. A
+/// notice grants nothing, so the ADR 0110 §4 key-material hold does not
+/// apply: `no_eligible_admin` is itself a §8 notice cause.
+async fn join_pending_notice_serving_blocked(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+) -> bool {
+    let Ok(joiner_agent) = parse_agent_id_hex(member_agent_id) else {
+        return true;
+    };
+    let revoked_joiner = {
+        let revocation_set = state.agent.revocation_set();
+        let set = revocation_set.read().await;
+        if set.revocation_resync_required() {
+            return true;
+        }
+        set.is_agent_revoked(&joiner_agent)
+    };
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let (group_blocks, joiner_seat_blocks, this_node_active) = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return true;
+        };
+        (
+            info.withdrawn || info.is_fork_quarantined(),
+            info.members_v2
+                .get(member_agent_id)
+                .is_some_and(|seat| seat.is_removed() || seat.is_banned()),
+            info.has_active_member(&local_hex),
+        )
+    };
+    if group_blocks || joiner_seat_blocks || revoked_joiner || !this_node_active {
+        return true;
+    }
+    // §8 selection order at the write: a terminal answer staged during
+    // delivery supersedes the notice, so the reply is withheld.
+    if state
+        .pending_join_results
+        .read()
+        .await
+        .get(&join_result_key(group_id, member_agent_id))
+        .is_some_and(|pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+    {
+        return true;
+    }
+    state
+        .pending_join_refusals
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4, seam hardening): the `Pending`
+/// reply's final eligibility check, run synchronously at the transport
+/// seam immediately before the write. Per the `SeamAdmission` contract
+/// (`x0x::dm`): it NEVER blocks — every lock is a `try_*`, and contention
+/// withholds (fail closed, a retryable refusal at the joiner's next poll).
+/// It re-runs the serving conditions the pre-phase checked — the joiner
+/// revoked or a revocation resync gap, the group withdrawn, quarantined or
+/// unknown, the joiner's seat removed or banned, this node no longer
+/// Active, a Result or Refused staged for the attempt during delivery —
+/// and re-resolves the staged row to the served canonical bytes, so a ban,
+/// a withdrawal or a superseding answer that lands between the pre-phase
+/// and the write stops the reply at the last moment before the bytes go
+/// out (§8's one admitted direct exchange).
+fn join_pending_notice_seam_admissible(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    served_canonical_hash: &str,
+) -> bool {
+    let Ok(joiner_agent) = parse_agent_id_hex(member_agent_id) else {
+        return false;
+    };
+    let revoked_joiner = {
+        let revocation_set = state.agent.revocation_set();
+        let Ok(set) = revocation_set.try_read() else {
+            return false;
+        };
+        if set.revocation_resync_required() {
+            return false;
+        }
+        set.is_agent_revoked(&joiner_agent)
+    };
+    if revoked_joiner {
+        return false;
+    }
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    {
+        let Ok(groups) = state.named_groups.try_read() else {
+            return false;
+        };
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group_id) else {
+            return false;
+        };
+        if info.withdrawn
+            || info.is_fork_quarantined()
+            || info
+                .members_v2
+                .get(member_agent_id)
+                .is_some_and(|seat| seat.is_removed() || seat.is_banned())
+            || !info.has_active_member(&local_hex)
+        {
+            return false;
+        }
+    }
+    let staged_result_supersedes = {
+        let Ok(results) = state.pending_join_results.try_read() else {
+            return false;
+        };
+        results
+            .get(&join_result_key(group_id, member_agent_id))
+            .is_some_and(|pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL)
+    };
+    if staged_result_supersedes {
+        return false;
+    }
+    let refusal_staged = {
+        let Ok(refusals) = state.pending_join_refusals.try_lock() else {
+            return false;
+        };
+        refusals.contains_key(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+    };
+    if refusal_staged {
+        return false;
+    }
+    let Ok(notices) = state.pending_join_notices.try_lock() else {
+        return false;
+    };
+    notices
+        .get(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ))
+        .is_some_and(|staged| {
+            staged_join_pending_notice_is_current(staged)
+                && join_pending_notice_hash(&wire_body_for_staged_notice(
+                    group_id,
+                    member_agent_id,
+                    attempt_id,
+                    staged,
+                )) == served_canonical_hash
+        })
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4): the staged-row half of the
+/// `Pending` reply's admission (the async pre-phase's copy): the notice
+/// for the exact attempt is still staged, inside BOTH of its 10-minute
+/// clocks, and still resolves to exactly the canonical bytes that were
+/// signed — a restage that changed the cause or detail (or dropped the row
+/// for a terminal answer) withholds the reply. The seam's own copy is
+/// [`join_pending_notice_seam_admissible`], which takes the same facts
+/// with `try_*` locks only.
+fn join_pending_notice_row_current(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    served_canonical_hash: &str,
+) -> bool {
+    let key = join_refusal_refusal_key(group_id, member_agent_id, attempt_id);
+    let notices = state
+        .pending_join_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    notices.get(&key).is_some_and(|staged| {
+        staged_join_pending_notice_is_current(staged)
+            && join_pending_notice_hash(&wire_body_for_staged_notice(
+                group_id,
+                member_agent_id,
+                attempt_id,
+                staged,
+            )) == served_canonical_hash
+    })
+}
+
+/// ADR 0108 §8 (PR #1639 review round 4, Codex P2): the admission of one
+/// `Pending` notice reply. Like every join artifact it leaves in ONE
+/// admitted direct exchange — never the generic DM sender, whose retries
+/// and gossip/relay fallback would write again with no §8 check at the
+/// seam, so a ban or a withdrawal during delivery could not stop the
+/// reply. The pre-phase re-takes the group's membership lock and re-runs
+/// §8's serving conditions ([`join_pending_notice_serving_blocked`]) plus
+/// the staged-row check; the seam re-runs the same conditions
+/// synchronously at the write with `try_*` locks only
+/// ([`join_pending_notice_seam_admissible`]), so a ban, a withdrawal or a
+/// superseding answer landing between the pre-phase and the write also
+/// stops the reply. The served bytes themselves name what may still be
+/// written: the reply's canonical notice hash must still be the staged
+/// row's.
+fn join_pending_notice_admission(
+    state: &Arc<AppState>,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    response: &[u8],
+) -> x0x::dm::ArtifactAdmission {
+    let state = Arc::clone(state);
+    let group_id = group_id.to_string();
+    let member_agent_id = member_agent_id.to_string();
+    let attempt_id = attempt_id.to_string();
+    let served = response.to_vec();
+    join_artifact_admission(move || {
+        let state = Arc::clone(&state);
+        let group_id = group_id.clone();
+        let member_agent_id = member_agent_id.clone();
+        let attempt_id = attempt_id.clone();
+        let served = served.clone();
+        async move {
+            let Ok(JoinResultMessage::Pending { notice }) =
+                serde_json::from_slice::<JoinResultMessage>(&served)
+            else {
+                return None;
+            };
+            let served_hash = join_pending_notice_hash(&notice);
+            let lock = group_membership_lock_for_known_group(&state, &group_id).await?;
+            {
+                let _membership_guard = lock.lock().await;
+                if join_pending_notice_serving_blocked(
+                    &state,
+                    &group_id,
+                    &member_agent_id,
+                    &attempt_id,
+                )
+                .await
+                {
+                    return None;
+                }
+                if !join_pending_notice_row_current(
+                    &state,
+                    &group_id,
+                    &member_agent_id,
+                    &attempt_id,
+                    &served_hash,
+                ) {
+                    return None;
+                }
+            }
+            let seam_state = Arc::clone(&state);
+            let seam_group = group_id.clone();
+            let seam_member = member_agent_id.clone();
+            let seam_attempt = attempt_id.clone();
+            let seam: x0x::dm::SeamAdmission = Box::new(move || {
+                join_pending_notice_seam_admissible(
+                    &seam_state,
+                    &seam_group,
+                    &seam_member,
+                    &seam_attempt,
+                    &served_hash,
+                )
+            });
+            Some(seam)
+        }
+    })
+}
+
+/// §8 (PR #1639 review round 3, finding 1): the joiner's advert is unknown
+/// — ask it to republish through the shared single-flight capability
+/// registry (the same route as strict sends), and ONLY when a notice for
+/// this exact attempt is still staged inside its lifetime. A verified fetch
+/// for an unknown group or an unstaged attempt publishes nothing — one
+/// small DM must not buy a network-wide member broadcast. Best-effort: the
+/// 600 s advert cadence converges even when this refresh is lost.
+fn refresh_join_notice_capability(
+    state: &AppState,
+    joiner: &AgentId,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+) {
+    let staged_and_current = {
+        let notices = state
+            .pending_join_notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        notices
+            .get(&join_refusal_refusal_key(
+                group_id,
+                member_agent_id,
+                attempt_id,
+            ))
+            .is_some_and(staged_join_pending_notice_is_current)
+    };
+    if !staged_and_current {
+        return;
+    }
+    let agent = Arc::clone(&state.agent);
+    let joiner = *joiner;
+    state.spawn_detached(async move {
+        agent
+            .refresh_application_capability(
+                joiner,
+                x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1,
+            )
+            .await;
+    });
+}
+
 /// Send a serialized join-result response to the fetcher (shared by the
 /// Result and Refused paths).
 async fn send_join_result_response(state: &AppState, sender: &AgentId, payload: &[u8]) {
     let payload_len = payload.len();
     let payload_hash = hex::encode(blake3::hash(payload).as_bytes());
+    // §8 test seam: proves which fetch shapes yield a Result or Refused
+    // reply (a notice-only fetch must never reach this point).
+    #[cfg(test)]
+    join_egress_test_barrier::park(&hex::encode(sender.as_bytes()), "join_result_response").await;
     if let Err(e) = state
         .agent
         .send_direct_with_config(sender, payload.to_vec(), direct_message_send_config())
@@ -41849,7 +44047,9 @@ async fn stage_refusal_if_certificates_unobtainable(
     // stages the pending-notice cause at once, with the pending-seat
     // count — while the typed REFUSAL below stays deadline-gated and
     // retryable. The notice drops when the seal later succeeds (the
-    // staged Result removes it) or when the refusal terminalizes.
+    // staged Result removes it) or when the refusal terminalizes. The
+    // seal path runs on the attempt's authority, so the inviter the
+    // sealed event names is the expected signer here.
     stage_join_pending_notice(
         state,
         group_key,
@@ -41860,6 +44060,7 @@ async fn stage_refusal_if_certificates_unobtainable(
             count: Some(pending.len() as u32),
             ..JoinPendingNoticeDetail::default()
         },
+        member_joined_event_inviter(event),
     )
     .await;
     let (all_digest_only, stable_group_id) = {
@@ -42085,6 +44286,20 @@ impl JoinRefusalSignLimiter {
         } else {
             false
         }
+    }
+
+    /// PR #1639 review round 4 (Codex P2): give back the token `reserve`
+    /// took when the work it admitted does not happen — a notice signature
+    /// that failed after the reservation. Bounded: the global bucket
+    /// returns to the cap at most, and the per-member entry is dropped so
+    /// the next reserve for the pair starts clean.
+    fn refund(&mut self, group_id: &str, member_agent_id: &str) {
+        self.per_member
+            .remove(&(group_id.to_string(), member_agent_id.to_string()));
+        self.global_tokens = self
+            .global_tokens
+            .saturating_add(1)
+            .min(JOIN_REFUSAL_GLOBAL_BUDGET);
     }
 }
 
@@ -42659,8 +44874,9 @@ where
         // A NEWER attempt owns the key.
         return false;
     }
-    // The slot is claimed (registry lock held): spawn and register.
-    let handle = tokio::spawn(task);
+    // The slot is claimed (registry lock held): spawn and register. A
+    // staged re-seat join's attempt task stays in its scope (#1699).
+    let handle = tokio::spawn(crate::server::reseat_scope::inherit_reseat_scope(task));
     #[cfg(test)]
     if let Ok(mut ledger) = ATTEMPT_TASK_HANDLES_FOR_TEST.lock() {
         ledger.push((attempt_id.to_string(), handle.abort_handle()));
@@ -42778,6 +44994,91 @@ fn member_joined_event_attempt_id(event: &NamedGroupMetadataEvent) -> Option<Str
     use base64::Engine as _;
     let raw_sig = BASE64.decode(signature_b64).ok()?;
     Some(member_joined_attempt_id(&canonical, &raw_sig))
+}
+
+/// The inviter a `MemberJoined` event names (`None` for any other kind) —
+/// the expected signer a §8 notice for that attempt is pinned to.
+fn member_joined_event_inviter(event: &NamedGroupMetadataEvent) -> Option<String> {
+    match event {
+        NamedGroupMetadataEvent::MemberJoined {
+            inviter_agent_id, ..
+        } => Some(inviter_agent_id.clone()),
+        _ => None,
+    }
+}
+
+/// ADR 0108 §8 (D154, #1628 review item 2): verify a joiner's signed
+/// `MemberJoined` as attempt evidence. EVERY dimension must hold, else
+/// `None` and the fetch earns no D154 staging:
+/// - the event is a `MemberJoined` whose group id (or stable id) is this
+///   group and whose member is the fetch's `member_agent_id` (already the
+///   verified sender);
+/// - the member public key carried in the event derives that member id
+///   (E4 self-authentication) and the event signature verifies under it;
+/// - the attempt id the joiner names equals blake3 of the canonical event
+///   bytes and the raw signature ([`member_joined_attempt_id`]).
+///
+/// Returns the inviter the evidence names (the attempt's expected
+/// authority).
+fn verified_join_attempt_evidence(
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+    evidence: &NamedGroupMetadataEvent,
+) -> Option<String> {
+    use base64::Engine as _;
+    let NamedGroupMetadataEvent::MemberJoined {
+        group_id: event_group,
+        stable_group_id,
+        member_agent_id: event_member,
+        member_public_key_b64,
+        role,
+        display_name,
+        inviter_agent_id,
+        invite_secret,
+        ts_ms,
+        treekem_key_package_b64,
+        signature_b64,
+        ..
+    } = evidence
+    else {
+        return None;
+    };
+    if event_group != group_id && stable_group_id.as_deref() != Some(group_id) {
+        return None;
+    }
+    if event_member != member_agent_id {
+        return None;
+    }
+    let key_bytes = BASE64.decode(member_public_key_b64).ok()?;
+    let pubkey = ant_quic::MlDsaPublicKey::from_bytes(&key_bytes).ok()?;
+    let derived = crate::identity::AgentId::from_public_key(&pubkey);
+    if hex::encode(derived.as_bytes()) != event_member.to_ascii_lowercase() {
+        return None;
+    }
+    let canonical = canonical_member_joined_bytes(
+        event_group,
+        stable_id_of(stable_group_id.as_deref(), event_group),
+        event_member,
+        member_public_key_b64,
+        *role,
+        display_name.as_deref(),
+        inviter_agent_id,
+        invite_secret,
+        *ts_ms,
+        treekem_key_package_b64.as_deref(),
+    );
+    let raw_sig = BASE64.decode(signature_b64).ok()?;
+    if member_joined_attempt_id(&canonical, &raw_sig) != attempt_id {
+        return None;
+    }
+    let sig = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&raw_sig).ok()?;
+    if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &canonical, &sig)
+        .is_err()
+    {
+        return None;
+    }
+    Some(inviter_agent_id.clone())
 }
 
 /// #477: the 409 check — same invite while pending is idempotent; a
@@ -43655,7 +45956,7 @@ fn spawn_join_artifact_egress<F>(
             // r5 (lifecycle note section 2.7 item 6): no egress task
             // outlives its artifact's deadline. A timeout drops the body
             // (an unfinished stream resets) and never purges.
-            let _ = tokio::time::timeout_at(deadline.into(), body).await;
+            let _ = tokio::time::timeout_at(tokio_deadline(deadline), body).await;
         }
     });
     // #1274 r3: the drain's completion fence. Only a finished task leaves
@@ -44377,7 +46678,7 @@ pub(super) async fn send_join_artifact(
             .send_direct_pinned_admitted(recipient, payload, &admission, resolve_within)
             .await
     };
-    let outcome = match tokio::time::timeout_at(exchange_deadline.into(), exchange).await {
+    let outcome = match tokio::time::timeout_at(tokio_deadline(exchange_deadline), exchange).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err(format!("{kind} exchange deadline elapsed")),
@@ -44516,6 +46817,20 @@ pub(in crate::server) mod join_egress_test_barrier {
         }
     }
 
+    /// #1575 (PR #1639 review round 4): force the NEXT join-pending-notice
+    /// signature to fail, so a test can prove the serve path refunds the
+    /// limiter token when the ML-DSA run errors. One-shot: the next sign
+    /// consumes the failure.
+    static FAIL_NEXT_NOTICE_SIGN: AtomicBool = AtomicBool::new(false);
+
+    pub(in crate::server) fn force_next_notice_sign_failure() {
+        FAIL_NEXT_NOTICE_SIGN.store(true, Ordering::SeqCst);
+    }
+
+    pub(in crate::server) fn take_notice_sign_failure() -> bool {
+        FAIL_NEXT_NOTICE_SIGN.swap(false, Ordering::SeqCst)
+    }
+
     pub(in crate::server) async fn park(recipient: &str, point: &'static str) {
         let gate = GATES
             .lock()
@@ -44617,11 +46932,27 @@ pub(in crate::server) async fn dispatch_join_result_message(
         // so they run shielded: an abort of this listener cannot cut them
         // off. The listener awaits each, so they still apply in order.
         // `false` (shutdown refused it, or it panicked) stops the listener.
+        // #1699: the result of a staged re-seat join seats its staged
+        // record. A fetch request (below) is served from the live record.
+        let group_id = match &msg {
+            JoinResultMessage::Result { event, .. } => {
+                named_group_metadata_event_group_id(event).to_string()
+            }
+            JoinResultMessage::Refused { receipt } => receipt.group_id.clone(),
+            JoinResultMessage::Pending { notice } => notice.group_id.clone(),
+            JoinResultMessage::FetchRequest { group_id, .. } => group_id.clone(),
+        };
         let apply_state = Arc::clone(state);
         let sender = *sender;
         return state
             .run_shielded(Box::pin(async move {
-                handle_join_result_message(&apply_state, &sender, verified, msg).await;
+                let stagings = &apply_state.reseat_stagings;
+                stagings
+                    .run_in_staging_of(
+                        &group_id,
+                        handle_join_result_message(&apply_state, &sender, verified, msg),
+                    )
+                    .await;
             }))
             .await
             .is_some();
@@ -44700,6 +47031,131 @@ pub(in crate::server) async fn handle_join_result_message(
     handle_join_result_message_bound(state, sender, verified, msg, None).await;
 }
 
+/// ADR 0108 §8 (D154, #1575): the notice half of a fetch with no staged
+/// Result — re-evaluate the notice causes for the attempt, then answer a
+/// capable fetch with the signed `Pending` arm under §8's serving
+/// conditions (capability-gated, `held_notice_hash`-deduped; one direct
+/// exchange, no hidden resend, D145 pre-admission). Runs inside the group's
+/// membership critical section (`notice_section` is `None` only for an
+/// unknown group); the payload is built under the section and the WRITE
+/// happens after the section is released (PR #1639 review round 2), in one
+/// admitted pinned exchange whose admission re-runs §8's serving
+/// conditions under the section again and whose seam re-checks the staged
+/// row at the write (PR #1639 review round 4). Returns `true` when a
+/// `Pending` reply was built and handed to that exchange (admission may
+/// still withhold it; the joiner retries at its next poll).
+#[allow(clippy::too_many_arguments)]
+async fn answer_join_pending_notice_fetch(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: &str,
+    member_agent_id: &str,
+    attempt_id: Option<&str>,
+    attempt_evidence: Option<&NamedGroupMetadataEvent>,
+    accepts_pending_notice: bool,
+    held_notice_hash: Option<&str>,
+    notice_only: bool,
+    notice_section: Option<tokio::sync::MutexGuard<'_, ()>>,
+) -> bool {
+    let verified_evidence_inviter =
+        attempt_evidence
+            .zip(attempt_id)
+            .and_then(|(evidence, attempt_id)| {
+                verified_join_attempt_evidence(group_id, member_agent_id, attempt_id, evidence)
+            });
+    evaluate_polled_join_pending_notice(
+        state,
+        group_id,
+        member_agent_id,
+        attempt_id,
+        verified_evidence_inviter.as_deref(),
+    )
+    .await;
+    if accepts_pending_notice && attempt_id.is_some() {
+        match state
+            .agent
+            .capability_store()
+            .verified_registry_supports(sender, x0x::dm::CapabilityRegistry::JOIN_PENDING_NOTICE_V1)
+        {
+            Some(true) => {
+                let response = serve_staged_join_pending_notice(
+                    state,
+                    group_id,
+                    member_agent_id,
+                    attempt_id.unwrap_or_default(),
+                    sender,
+                    held_notice_hash,
+                    notice_only,
+                )
+                .await;
+                if let Some(response) = response {
+                    // The payload is built under the critical section (local
+                    // work + one lazy signature, like the refusal path); the
+                    // WRITE happens after the section is released, in ONE
+                    // admitted direct exchange — the same pinned
+                    // single-exchange path every join artifact takes (no
+                    // retry, no gossip/relay fallback). The generic DM
+                    // sender is never used: it retries and falls back with
+                    // no §8 check at the write, so a ban or a withdrawal
+                    // during delivery could not stop the reply. The
+                    // admission re-runs §8's serving conditions under the
+                    // membership lock and the seam re-runs them again,
+                    // synchronously and non-blocking, immediately before
+                    // the write (PR #1639 review round 4). A withheld or
+                    // lost reply means the joiner retries at its next poll
+                    // (D145: one direct exchange, no hidden resend).
+                    drop(notice_section);
+                    let admission = join_pending_notice_admission(
+                        state,
+                        group_id,
+                        member_agent_id,
+                        attempt_id.unwrap_or_default(),
+                        &response,
+                    );
+                    let deadline = Instant::now() + PENDING_JOIN_RESULT_TTL;
+                    if let Err(reason) = send_join_artifact(
+                        state,
+                        sender,
+                        &response,
+                        group_id,
+                        "join_pending_notice",
+                        admission,
+                        deadline,
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            group_id = %LogHexId::group(group_id),
+                            member = %LogHexId::agent(member_agent_id),
+                            reason = %reason,
+                            "ADR 0108 §8: the Pending notice reply was withheld or lost — the joiner retries at the next poll"
+                        );
+                    }
+                    return true;
+                }
+            }
+            // §8 (PR #1639 review round 3, finding 1): an unknown advert
+            // refreshes ONLY when a notice for this attempt is actually
+            // staged, and only through the shared single-flight registry —
+            // a verified fetch for an unknown group must not trigger a
+            // member broadcast. Some(false) — a current verified advert
+            // without the bit — needs no refresh.
+            None => {
+                refresh_join_notice_capability(
+                    state,
+                    sender,
+                    group_id,
+                    member_agent_id,
+                    attempt_id.unwrap_or_default(),
+                );
+            }
+            Some(false) => {}
+        }
+    }
+    drop(notice_section);
+    false
+}
+
 async fn handle_join_result_message_bound(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -44719,6 +47175,10 @@ async fn handle_join_result_message_bound(
             accepts_refusal,
             accepts_control_blob_ref,
             attempt_id,
+            accepts_pending_notice,
+            held_notice_hash,
+            notice_only,
+            attempt_evidence,
         } => {
             let sender_hex = hex::encode(sender.as_bytes());
             tracing::debug!(
@@ -44737,6 +47197,36 @@ async fn handle_join_result_message_bound(
             // signature nor receive a receipt.
             if !verified && accepts_refusal {
                 tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "#477: refusal-capable fetch over an UNVERIFIED direct message — no refusal served");
+            }
+            // ADR 0108 §8 (D154, PR #1639 review round 3, finding 2): a
+            // notice-only request never yields a Result or a Refused and
+            // cannot admit or seat — the shielded owner-certificate retry
+            // and the staged-Result lookup below are skipped entirely; only
+            // the notice serve can answer it, at most one `Pending`.
+            if notice_only {
+                if verified {
+                    let membership_arc =
+                        group_membership_lock_for_known_group(state, &group_id).await;
+                    let notice_section = match &membership_arc {
+                        Some(arc) => Some(arc.lock().await),
+                        None => None,
+                    };
+                    answer_join_pending_notice_fetch(
+                        state,
+                        sender,
+                        &group_id,
+                        &member_agent_id,
+                        attempt_id.as_deref(),
+                        attempt_evidence.as_deref(),
+                        accepts_pending_notice,
+                        held_notice_hash.as_deref(),
+                        notice_only,
+                        notice_section,
+                    )
+                    .await;
+                }
+                tracing::debug!(group_id = %group_id, member = %member_agent_id, "ADR 0108 §8: notice-only fetch answered with at most one Pending");
+                return;
             }
             // #447: the joiner is still polling — its certificate evidence
             // may have resolved since the last volley rejection (async blob
@@ -44784,8 +47274,10 @@ async fn handle_join_result_message_bound(
             let Some(event) = event else {
                 // #477 A3/A4 — no staged RESULT: answer a capable,
                 // attempt-matching fetch with the staged REFUSAL (if any),
-                // selected in this same critical section.
-                if accepts_refusal && verified {
+                // selected in this same critical section. ADR 0108 §8
+                // (D154): a notice-only request never yields a Result or a
+                // Refused — at most one member-signed `Pending`.
+                if accepts_refusal && verified && !notice_only {
                     if let Some(attempt_id) = attempt_id.as_deref() {
                         // Results take precedence: a successful staging
                         // for this triple removed the refusal already.
@@ -44822,9 +47314,13 @@ async fn handle_join_result_message_bound(
                 );
                 // ADR 0108 §8 (D154, #1575): no Result and no Refused is
                 // staged. A verified, attempt-bound poll from a held joiner
-                // re-evaluates the notice causes this member may sign and
-                // stages the typed local cause; the signed `Pending` serve
-                // itself waits on the wire ruling, so nothing is sent here.
+                // re-evaluates the notice causes and — when the fetch
+                // carries VERIFIED `attempt_evidence` (#1628 review item 2)
+                // — stages the typed cause this member may sign. A capable
+                // fetch is then answered with the signed `Pending` arm
+                // under §8's serving conditions (capability-gated,
+                // `held_notice_hash`-deduped; one direct exchange, no
+                // hidden resend, D145 pre-admission).
                 // The refusal probe above may have consumed the caller's
                 // guard; re-acquire the critical section so §8's Result →
                 // Refused → notice selection stays linearized (the entry
@@ -44838,14 +47334,19 @@ async fn handle_join_result_message_bound(
                             None => None,
                         },
                     };
-                    evaluate_polled_join_pending_notice(
+                    answer_join_pending_notice_fetch(
                         state,
+                        sender,
                         &group_id,
                         &member_agent_id,
                         attempt_id.as_deref(),
+                        attempt_evidence.as_deref(),
+                        accepts_pending_notice,
+                        held_notice_hash.as_deref(),
+                        notice_only,
+                        notice_section,
                     )
                     .await;
-                    drop(notice_section);
                 }
                 tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
                 return;
@@ -45530,6 +48031,8 @@ async fn handle_join_result_message_bound(
             // critical section; finalize receives the guard instead of
             // re-acquiring it, so no seat finalizer can interleave
             // between acceptance and the terminal write.
+            // ADR 0108 §8: a later Refused replaces any held pending
+            // notice (the finalize removes the whole attempt entry).
             let reason = receipt.reason.as_str();
             let disposition = finalize_join_attempt_with_reason(
                 state,
@@ -45556,6 +48059,13 @@ async fn handle_join_result_message_bound(
                 .groups_diagnostics
                 .record_invite_refusal(&receipt.group_id, reason);
             tracing::warn!(group_id = %LogHexId::group(&receipt.group_id), member = %LogHexId::agent(&receipt.member_agent_id), reason, "#477: join REFUSED by the authority — attempt finalized, stub removed");
+        }
+        // ADR 0108 §8 (#1575): the typed cause of a held attempt. Never an
+        // outcome: the notice is verified and held (or dropped) against the
+        // current attempt; it never finalizes, never extends the poll and
+        // never confirms membership. A later Result or Refused replaces it.
+        JoinResultMessage::Pending { notice } => {
+            verify_and_hold_join_pending_notice(state, verified, &notice).await;
         }
     }
 }
@@ -45763,6 +48273,27 @@ async fn poll_join_result_until_membership_confirmed(
             accepts_refusal: true,
             accepts_control_blob_ref: true,
             attempt_id: Some(attempt_id.clone()),
+            // ADR 0108 §8 (#1575): this joiner sets
+            // `join_pending_notice_v1`, so every poll offers to take a
+            // notice and names the one it already holds — each change is
+            // served once. No notice-only polling in this slice (D154
+            // rotation is a follow-up), so the request stays
+            // authority-directed.
+            accepts_pending_notice: true,
+            held_notice_hash: {
+                let attempts = state
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                attempts.get(&expected_key).and_then(|attempt| {
+                    attempt
+                        .held_pending_notice
+                        .as_ref()
+                        .map(|held| held.canonical_hash.clone())
+                })
+            },
+            notice_only: false,
+            attempt_evidence: None,
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -46651,7 +49182,7 @@ async fn handle_welcome_fetch_request_via<S, F>(
     let stream_deadline = pending.created_at + PENDING_WELCOME_TTL;
     replace_welcome_stream(state, &welcome_id, async move {
         let _ = tokio::time::timeout_at(
-            stream_deadline.into(),
+            tokio_deadline(stream_deadline),
             stream_welcome_blob_guarded(&stream_state, &recipient, &stream_id, pending, transport),
         )
         .await;
@@ -47043,6 +49574,62 @@ pub(in crate::server) type WelcomeFetchWaiter =
 pub(in crate::server) mod tests {
     use super::*;
 
+    /// #1699 part 1 (ZCode on #1703): a roster save from inside a re-seat
+    /// scope encodes the live map without unconfirmed join stubs, never
+    /// the staging slot it changed; outside a scope the encoder takes the
+    /// map it is given. Inert: an offline agent.
+    #[tokio::test]
+    async fn a_save_inside_a_reseat_scope_encodes_the_live_map_without_pending_stubs(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let creator = state.agent.agent_id();
+        let record = |name: &str, key: &str| {
+            x0x::groups::GroupInfo::new(name.to_string(), String::new(), creator, key.to_string())
+        };
+        let (live_key, stub_key, staged_key) = ("a1".repeat(16), "b2".repeat(16), "c3".repeat(16));
+        let live = record("live", &live_key);
+        let staged = record("staged", &staged_key);
+        {
+            let mut groups = state.named_groups.live_write().await;
+            groups.clear();
+            groups.insert(live_key.clone(), live.clone());
+            groups.insert(stub_key.clone(), record("stub", &stub_key));
+        }
+        state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(stub_key.clone());
+        let expected = encode_named_groups_store(&HashMap::from([(live_key.clone(), live)]))?;
+        let scope = state
+            .reseat_stagings
+            .open(&staged_key, staged.stable_group_id());
+        let encoded = crate::server::reseat_scope::in_reseat_scope(scope, async {
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(staged_key.clone(), staged.clone());
+            let groups = state.named_groups.read().await;
+            encode_named_groups_store_allowing(&state, &groups, None).await
+        })
+        .await?;
+        assert_eq!(encoded, expected, "the live map, without the stub");
+        assert!(state
+            .named_groups
+            .live_read()
+            .await
+            .get(&staged_key)
+            .is_none());
+        let given = HashMap::from([(staged_key.clone(), staged)]);
+        assert_eq!(
+            encode_named_groups_store_allowing(&state, &given, None).await?,
+            encode_named_groups_store(&given)?,
+            "outside a scope: the given map"
+        );
+        Ok(())
+    }
+
     /// ADR 0108 §8 (#1575): the notice currently staged for one
     /// `(group, member, attempt)`, as `(cause, signer_agent_id, detail)`.
     pub(in crate::server) fn staged_join_pending_notice(
@@ -47227,12 +49814,21 @@ pub(in crate::server) mod tests {
     pub(in crate::server) mod issue1275_listener_apply_shield;
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
+    mod issue1569_owner_certified_placeholder;
+    mod issue1570_held_back_rebind;
+    mod issue1570_held_back_tombstone;
     mod issue1577_revoked_catchup_request;
+    mod issue1616_machine_revoked_catchup;
+    mod issue1622_binding_revoked_catchup;
+    mod issue1649_reseat_mandate_receive;
+    mod issue1657_typed_refusal_catchup;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
     mod issue877_error_body_session;
     mod join_pending_notice_1575;
+    mod join_pending_notice_limiter_1575;
+    mod join_pending_notice_wire_1575;
     mod owner_mandate;
     mod pr291_restart_marker_matrix;
     #[path = "issue1105_public_revision_catchup.rs"]
@@ -47246,6 +49842,14 @@ pub(in crate::server) mod tests {
     #[path = "issue1224_unsigned_group_card.rs"]
     mod unsigned_group_card_1224;
     mod wp_c;
+
+    /// #1616: the transport machine of a simulated DM whose sender device
+    /// is clean. The catch-up handlers thread the QUIC-authenticated sender
+    /// machine of the direct message; tests that do not exercise a machine
+    /// revocation pass this id, which no test revokes.
+    fn clean_sender_machine() -> MachineId {
+        MachineId([0x16; 32])
+    }
 
     fn fake_group_state_commit(
         group_id: &str,
@@ -47939,9 +50543,9 @@ pub(in crate::server) mod tests {
             task_list_state_dir: data_dir.join("task-lists"),
             crdt_subscriptions_persistence_lock: Mutex::new(()),
             crdt_handle_locks: RwLock::new(HashMap::new()),
-            named_groups: RwLock::new(named_groups),
+            named_groups: crate::server::reseat_scope::ScopedGroupMap::new(named_groups),
             gss_publication_gate: Arc::new(RwLock::new(())),
-            group_roster_gossip_lock: Mutex::new(()),
+            group_roster_gossip_lock: Mutex::new(BTreeMap::new()),
             named_groups_path,
             home_suite_groups_path,
             named_groups_persistence_lock: Mutex::new(()),
@@ -47979,11 +50583,12 @@ pub(in crate::server) mod tests {
                     .unwrap_or_default(),
             ),
             profile_path: data_dir.join("profile.json"),
-            mls_groups: RwLock::new(HashMap::new()),
+            mls_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             mls_groups_path: data_dir.join("mls_groups.bin"),
             pending_join_results: RwLock::new(HashMap::new()),
             pending_join_refusals: StdMutex::new(HashMap::new()),
             pending_join_notices: StdMutex::new(HashMap::new()),
+            join_pending_notice_sign_limiter: StdMutex::new(JoinRefusalSignLimiter::default()),
             pending_join_attempts: StdMutex::new(HashMap::new()),
             last_join_outcomes: StdMutex::new(HashMap::new()),
             join_refusal_sign_limiter: StdMutex::new(Default::default()),
@@ -48042,8 +50647,10 @@ pub(in crate::server) mod tests {
                 TREEKEM_CATCHUP_SERVE_SLOTS,
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+            treekem_catchup_refusals: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
-            treekem_groups: RwLock::new(HashMap::new()),
+            reseat_stagings: Default::default(),
+            treekem_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
             treekem_dir,
             revocation_evictions: S4Runtime::default(),
             group_recovery: S3Runtime::default(),
@@ -48309,6 +50916,10 @@ pub(in crate::server) mod tests {
                 accepts_refusal: true,
                 accepts_control_blob_ref: false,
                 attempt_id: Some("a1".into()),
+                accepts_pending_notice: false,
+                held_notice_hash: None,
+                notice_only: false,
+                attempt_evidence: None,
             };
             let bytes = serde_json::to_vec(&capable).expect("serialize");
             assert!(
@@ -48323,12 +50934,20 @@ pub(in crate::server) mod tests {
                 accepts_refusal: false,
                 accepts_control_blob_ref: false,
                 attempt_id: None,
+                accepts_pending_notice: false,
+                held_notice_hash: None,
+                notice_only: false,
+                attempt_evidence: None,
             };
             let legacy_bytes = serde_json::to_vec(&incapable).expect("serialize");
             assert!(
                 !String::from_utf8_lossy(&legacy_bytes).contains("accepts_refusal")
                     && !String::from_utf8_lossy(&legacy_bytes).contains("accepts_control_blob_ref")
-                    && !String::from_utf8_lossy(&legacy_bytes).contains("attempt_id"),
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("attempt_id")
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("accepts_pending_notice")
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("held_notice_hash")
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("notice_only")
+                    && !String::from_utf8_lossy(&legacy_bytes).contains("attempt_evidence"),
                 "skip_serializing_if keeps false/None fields absent (legacy shape)"
             );
             let ref_capable = JoinResultMessage::FetchRequest {
@@ -48339,6 +50958,10 @@ pub(in crate::server) mod tests {
                 accepts_refusal: true,
                 accepts_control_blob_ref: true,
                 attempt_id: Some("a1".into()),
+                accepts_pending_notice: false,
+                held_notice_hash: None,
+                notice_only: false,
+                attempt_evidence: None,
             };
             let ref_bytes = serde_json::to_vec(&ref_capable).expect("ref-capable serializes");
             assert!(String::from_utf8_lossy(&ref_bytes).contains("accepts_control_blob_ref"));
@@ -48511,6 +51134,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
             // Execute the PRODUCTION refire (stored-bytes branch) — with
@@ -49013,6 +51637,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
             let _poll_window = set_join_poll_window_override(&group, "a7", 120);
@@ -49307,6 +51932,10 @@ pub(in crate::server) mod tests {
                     accepts_refusal: true,
                     accepts_control_blob_ref: false,
                     attempt_id: Some(attempt_b.clone()),
+                    accepts_pending_notice: false,
+                    held_notice_hash: None,
+                    notice_only: false,
+                    attempt_evidence: None,
                 },
             )
             .await;
@@ -49591,6 +52220,10 @@ pub(in crate::server) mod tests {
                         accepts_refusal: true,
                         accepts_control_blob_ref: false,
                         attempt_id: Some(staged_attempt_id),
+                        accepts_pending_notice: false,
+                        held_notice_hash: None,
+                        notice_only: false,
+                        attempt_evidence: None,
                     },
                 )
                 .await
@@ -49710,6 +52343,10 @@ pub(in crate::server) mod tests {
                         accepts_refusal: true,
                         accepts_control_blob_ref: false,
                         attempt_id: None,
+                        accepts_pending_notice: false,
+                        held_notice_hash: None,
+                        notice_only: false,
+                        attempt_evidence: None,
                     },
                 )
                 .await
@@ -50023,6 +52660,10 @@ pub(in crate::server) mod tests {
                     accepts_refusal: accepts,
                     accepts_control_blob_ref: false,
                     attempt_id: attempt,
+                    accepts_pending_notice: false,
+                    held_notice_hash: None,
+                    notice_only: false,
+                    attempt_evidence: None,
                 }
             };
             let cached_sig = || {
@@ -50356,6 +52997,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
             // AUTHORITY-side caches that must survive.
@@ -50532,6 +53174,7 @@ pub(in crate::server) mod tests {
                         polls: vec![poll],
                         tasks: vec![task],
                         listener_token: token,
+                        held_pending_notice: None,
                     },
                 );
             let finalize_arc = group_membership_lock_for_known_group(&state, &group)
@@ -50955,6 +53598,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
             // A VALID receipt for the live attempt, signed by the
@@ -51059,6 +53703,7 @@ pub(in crate::server) mod tests {
                             polls: Vec::new(),
                             tasks: Vec::new(),
                             listener_token: None,
+                            held_pending_notice: None,
                         },
                     );
             };
@@ -51295,6 +53940,7 @@ pub(in crate::server) mod tests {
                         polls: Vec::new(),
                         tasks: Vec::new(),
                         listener_token: None,
+                        held_pending_notice: None,
                     },
                 );
         }
@@ -53593,6 +56239,182 @@ pub(in crate::server) mod tests {
             assert!(
                 lot.get(group_id).is_none_or(|list| list.is_empty()),
                 "#876: the parking lot drained after the replay"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1578 rc11 (Claude blocking 1): the role update that arrives
+    /// while the target holds ONLY the join's key-only marker row
+    /// (rc7) must park and replay after `MemberAdded` — exactly what
+    /// main does for a member with no row at all. rc10 read the
+    /// marker row as a seat, applied the update against the
+    /// pre-admission stub (the evidence check refused it) and never
+    /// parked it, so the joiner's own view lost its new role with no
+    /// error. RED at rc10 703a0ef, GREEN here (see
+    /// `~/x0x-zcode/evidence/1578/rc11/`).
+    #[tokio::test]
+    async fn rc11_role_update_parks_when_only_the_join_marker_row_exists() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "rc11-role-update-join-marker";
+        let (mut info, admin_hex, _member_hex) = metadata_terminality_test_group(&state, group_id);
+        // The map-key/stable-id mismatch shape, as the #876 template.
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "rc11-stable-role-marker".to_string(),
+            hex::encode(state.agent.agent_id().as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        let foreign = "44".repeat(32);
+        // The joiner's own stub row (rc7): Pending, the published KEM
+        // key, and no admission state and no live join request — so it
+        // is exactly the key-only marker.
+        info.members_v2.insert(
+            foreign.clone(),
+            x0x::groups::GroupMember {
+                agent_id: foreign.clone(),
+                user_id: None,
+                role: x0x::groups::GroupRole::Member,
+                state: x0x::groups::GroupMemberState::Pending,
+                display_name: None,
+                joined_at: 0,
+                updated_at: 0,
+                added_by: None,
+                removed_by: None,
+                kem_public_key_b64: Some("joiner-kem".to_string()),
+                treekem_key_package_b64: None,
+                treekem_key_package_hash: None,
+                certificate: None,
+                certificate_missing_since_ms: None,
+                certificate_digest: None,
+            },
+        );
+        assert!(join_seat_key_marker_only(&info, &foreign));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+
+        // The owner's chain, exactly as the #876 template seals it:
+        // MemberAdded seats `foreign`, RoleUpdated promotes them.
+        let mut seated = parent.clone();
+        seated.roster_revision = seated.roster_revision.saturating_add(1);
+        seated.add_member(
+            foreign.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let revision_add = seated.roster_revision;
+        let commit_add = sign_metadata_terminality_commit(&parent, &seated, &state, 2_000);
+        seated.prev_state_hash = Some(parent.state_hash.clone());
+        seated.state_hash = commit_add.state_hash.clone();
+        seated.state_revision = commit_add.revision;
+        let member_added = NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64: Vec::new(),
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_add,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            owner_mandate: None,
+            commit: Some(commit_add),
+            reseat_mandate: None,
+        };
+
+        let mut adminified = seated.clone();
+        adminified.roster_revision = adminified.roster_revision.saturating_add(1);
+        adminified.set_member_role(&foreign, x0x::groups::GroupRole::Admin);
+        let revision_role = adminified.roster_revision;
+        let commit_role = sign_metadata_terminality_commit(&seated, &adminified, &state, 3_000);
+        let role_update = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: revision_role,
+            actor: admin_hex.clone(),
+            agent_id: foreign.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(commit_role),
+        };
+
+        // 1) The role update arrives FIRST: the target's only row is
+        //    the key-only marker — not a seat — so the apply parks it.
+        let applied = apply_named_group_metadata_event(
+            &state,
+            role_update.clone(),
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!applied.accepted, "the member has not landed yet");
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                lot.get(group_id).map(Vec::len),
+                Some(1),
+                "#1578 rc11: the marker-only row parks the role update, it is not a seat"
+            );
+        }
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(group_id).expect("group retained");
+            let row = &stored.members_v2[&foreign];
+            assert!(
+                row.state == x0x::groups::GroupMemberState::Pending
+                    && row.role == x0x::groups::GroupRole::Member,
+                "#1578 rc11: nothing was written onto the marker row"
+            );
+        }
+
+        // 2) The MemberAdded lands: accepted, the marker is replaced by
+        //    the real seat, and the parked role update replays.
+        let applied_add = apply_named_group_metadata_event(
+            &state,
+            member_added,
+            state.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(applied_add.accepted, "the member lands: {applied_add:?}");
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(group_id).expect("group retained");
+            assert!(stored.has_active_member(&foreign));
+            assert_eq!(
+                stored.members_v2[&foreign].role,
+                x0x::groups::GroupRole::Admin,
+                "#1578 rc11: the parked role update replayed onto the landed seat"
+            );
+        }
+        {
+            let lot = state
+                .parked_role_updates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(
+                lot.get(group_id).is_none_or(|list| list.is_empty()),
+                "#1578 rc11: the parking lot drained after the replay"
             );
         }
         Ok(())
@@ -61213,6 +64035,10 @@ pub(in crate::server) mod tests {
             accepts_refusal: false,
             accepts_control_blob_ref: false,
             attempt_id: None,
+            accepts_pending_notice: false,
+            held_notice_hash: None,
+            notice_only: false,
+            attempt_evidence: None,
         };
         let payload = serde_json::to_vec(&request);
         assert!(payload.is_ok(), "join-result fetch request serializes");
@@ -64251,7 +67077,14 @@ pub(in crate::server) mod tests {
         let response = member_keyed_treekem_catchup_response(&w_state, &log_keys, &request)
             .await
             .expect("independent witness W serves B's cached event");
-        handle_treekem_catchup_response(&a_state, &w_state.agent.agent_id(), true, response).await;
+        handle_treekem_catchup_response(
+            &a_state,
+            &w_state.agent.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response,
+        )
+        .await;
         assert_eq!(
             member_treekem_kp(&a_state, &group_id, &member_hex)
                 .await
@@ -65519,6 +68352,106 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// #1567: a Welcome joiner's roster has no `added_by` for the members
+    /// seated before it, so the inviter attestation never verifies there.
+    /// After such a member self-leaves, the member-keyed catch-up answer
+    /// must still install its own signed KeyPackage on the Removed seat
+    /// when the bytes match the committed hash; with any other committed
+    /// hash nothing installs. Before the fix the answer was always refused
+    /// and the crypto-only exclusion waited for this evidence for ever.
+    #[tokio::test]
+    async fn catchup_installs_self_signed_key_package_on_removed_seat_without_added_by(
+    ) -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0xa5, 0xa6).await?;
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+        let member_hex = fixture.member_hex.clone();
+        let inviter_hex = hex::encode(state.agent.agent_id().as_bytes());
+        insert_active_member_without_kp(state, &group_id, &member_hex, &inviter_hex).await;
+        let committed_hash = {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("group exists");
+            let seat = info.members_v2.get_mut(&member_hex).expect("seat exists");
+            // The Welcome joiner's view: no inviter on the seat, and the
+            // member has left.
+            seat.added_by = None;
+            seat.state = x0x::groups::GroupMemberState::Removed;
+            seat.treekem_key_package_hash
+                .clone()
+                .expect("the roster commits the package hash")
+        };
+        let courier = x0x::identity::AgentKeypair::generate()?;
+        insert_active_member_without_kp(
+            state,
+            &group_id,
+            &hex::encode(courier.agent_id().as_bytes()),
+            &inviter_hex,
+        )
+        .await;
+        let response = TreeKemCatchupResponse {
+            message_type: "treekem_catchup_response".to_string(),
+            group_id: fixture.stable_group_id.clone(),
+            events: vec![fixture.event.clone()],
+            truncated: false,
+            responder_state_hash: None,
+        };
+
+        // Negative control: the roster commits other bytes for the seat.
+        {
+            let mut groups = state.named_groups.write().await;
+            let seat = groups
+                .get_mut(&group_id)
+                .and_then(|info| info.members_v2.get_mut(&member_hex))
+                .expect("seat exists");
+            seat.treekem_key_package_hash = Some("00".repeat(32));
+        }
+        handle_treekem_catchup_response(
+            state,
+            &courier.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response.clone(),
+        )
+        .await;
+        assert!(
+            member_treekem_kp(state, &group_id, &member_hex)
+                .await
+                .is_none(),
+            "bytes that the roster does not commit never install"
+        );
+
+        {
+            let mut groups = state.named_groups.write().await;
+            let seat = groups
+                .get_mut(&group_id)
+                .and_then(|info| info.members_v2.get_mut(&member_hex))
+                .expect("seat exists");
+            seat.treekem_key_package_hash = Some(committed_hash);
+        }
+        handle_treekem_catchup_response(
+            state,
+            &courier.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response,
+        )
+        .await;
+        let installed = member_treekem_kp(state, &group_id, &member_hex).await;
+        let NamedGroupMetadataEvent::MemberJoined {
+            treekem_key_package_b64: Some(expected),
+            ..
+        } = &fixture.event
+        else {
+            panic!("fixture event is a package-bearing MemberJoined");
+        };
+        assert_eq!(
+            installed.as_deref(),
+            Some(expected.as_str()),
+            "the Removed seat takes back its own signed, committed KeyPackage"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn recovered_member_key_package_rejects_unauthorized_and_revoked_couriers() -> Result<()>
     {
@@ -65537,8 +68470,14 @@ pub(in crate::server) mod tests {
             responder_state_hash: None,
         };
         let unauthorized = x0x::identity::AgentKeypair::generate()?;
-        handle_treekem_catchup_response(state, &unauthorized.agent_id(), true, response.clone())
-            .await;
+        handle_treekem_catchup_response(
+            state,
+            &unauthorized.agent_id(),
+            &clean_sender_machine(),
+            true,
+            response.clone(),
+        )
+        .await;
         assert!(
             member_treekem_kp(state, &group_id, &member_hex)
                 .await
@@ -65563,7 +68502,14 @@ pub(in crate::server) mod tests {
             .write()
             .await
             .verify_and_insert(revocation, None)?;
-        handle_treekem_catchup_response(state, &courier_id, true, response).await;
+        handle_treekem_catchup_response(
+            state,
+            &courier_id,
+            &clean_sender_machine(),
+            true,
+            response,
+        )
+        .await;
         assert!(
             member_treekem_kp(state, &group_id, &member_hex)
                 .await

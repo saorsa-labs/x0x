@@ -1529,13 +1529,13 @@ impl std::error::Error for GroupRecoveryDecodeError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ReseatPhase {
-    /// The journal is durable and the original record is still live (or
-    /// its move aside is not yet durable). No staged join runs. A resume
-    /// in this phase only rolls back: the record under the group's key is
-    /// the original, never a staged result.
+    /// The journal is durable and the original record is live. No staged
+    /// join runs. A resume in this phase only rolls back: the record under
+    /// the group's key is the original, never a staged result.
     Prepared,
-    /// The original record is durably out of the live map (it is kept in
-    /// the journal) and the staged join runs.
+    /// The staged join runs in a staging slot outside the live map; the
+    /// original stays live, contained, until the swap (#1699). The legacy
+    /// files keep the original (it is also in the journal).
     Staging,
     /// The staged record is Active with keys; the swap is due.
     Swapping,
@@ -1592,13 +1592,13 @@ impl ReseatJournalV1 {
     }
 
     /// §3 step 3: `live` is the staged result of this journal's re-seat,
-    /// ready to swap in. A crash can leave the ORIGINAL record under the
-    /// group's key with this journal open (before the move aside became
-    /// durable), and that forked record can show this node Active with a
-    /// tree. So the check binds the result to the journal and to the
+    /// ready to swap in. The ORIGINAL record stays under the group's key
+    /// with this journal open (#1699: the staged join runs outside the
+    /// live map, and a restart loads the original), and that forked record
+    /// can show this node Active with a tree. So the check binds the result to the journal and to the
     /// authorisation, not only to the seat:
-    /// - the phase is past [`ReseatPhase::Prepared`]: the original left
-    ///   the live map durably before the staged join started;
+    /// - the phase is past [`ReseatPhase::Prepared`]: the staging was open
+    ///   durably before the staged join started;
     /// - the record is not the journalled original (digest);
     /// - it is the authorised group, uncontained (or holding only the
     ///   journalled original's marker, which the staged record holds until
@@ -1665,6 +1665,13 @@ pub struct RetiredRecordV1 {
 
 /// The S3 sidecar body (§4). Embedded `GroupInfo` records and events are
 /// JSON documents carried as bytes.
+///
+/// The fields up to `retired` are the ADR 0109 §4 list. The last two,
+/// `attestation_conflict` and `authoritative_binding`, are not in that list:
+/// they carry §2 "Conflict" and §4 "Transactions" state (#1568). postcard is
+/// positional, so the field order is the format: a new field needs a new
+/// header version. `tests/fixtures/group_recovery_v1.bin` pins the layout
+/// (ADR 0085 rule 6).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupRecoveryV1 {
     /// Incremented by every transition.
@@ -1963,6 +1970,7 @@ pub fn apply_link_state_only(
         current_revision: current.state_revision,
         current_withdrawn: current.withdrawn,
         members_v2: &current.members_v2,
+        join_seat_marker_agents: current.join_seat_key_marker_agents(),
         group_id: current.stable_group_id(),
     };
     let self_rebind = sc::compute_public_meta_hash(&current.public_meta())
@@ -2137,6 +2145,9 @@ pub fn promotion_prefix(
     }
     None
 }
+
+#[cfg(test)]
+mod format_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -2563,8 +2574,8 @@ mod tests {
     }
 
     /// §3 "A crash resumes from the journal's phase": a crash after the
-    /// journal but before the move aside leaves the ORIGINAL forked record
-    /// live, and it shows this node Active. Before the fix the swap checked
+    /// journal leaves the ORIGINAL forked record live, and it shows this
+    /// node Active. Before the fix the swap checked
     /// only "Active with a tree", so it closed the journal on the original.
     #[test]
     fn swap_binds_the_staged_result_to_the_journal_and_phase() {

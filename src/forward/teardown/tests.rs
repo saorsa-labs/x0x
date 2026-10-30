@@ -340,6 +340,25 @@ impl World {
         stop
     }
 
+    /// Wait (wall time) until the loop finishes one more pass than
+    /// `before`. A pass's grant reads run on blocking workers (#1239)
+    /// that end on wall time — paused tokio time never drives them — so
+    /// the finished-pass count is the only completion signal a test can
+    /// wait on. A yield proves nothing: a first pass still in flight
+    /// across a later revoke re-reads the revocation set, denies and
+    /// tears its stream down — correct for the §4 bound, but early for
+    /// a still-open assert (#1599 recurrence, #1688 Coverage Gate).
+    async fn wait_for_finished_pass(&self, before: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while self.live.passes_for_testing() == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first reauth pass must finish"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     fn reasons(&self) -> std::collections::BTreeMap<String, u64> {
         self.diag.torn_down_reasons()
     }
@@ -1511,9 +1530,20 @@ async fn kick_during_spacing_deadline_from_event() {
     let _stop = w.spawn_loop(None);
     tokio::time::sleep(Duration::from_millis(1)).await;
 
-    // First pass: no-op kick so the loop enters spacing.
+    // First pass: no-op kick so the loop enters spacing. Its grant reads
+    // end on wall time (#1239), so wait for the finished-pass count
+    // before paused time moves or the grant is revoked: a first pass
+    // still in flight across the revoke re-reads the revocation set,
+    // denies, and tears the stream down at once — correct for the §4
+    // bound, but it defeats the deadline-from-event measurement below
+    // (the #1599 recurrence behind the #1688 Coverage Gate failure).
+    // After the wait, the held discovery-cache write parks every later
+    // pass on its first await, before any grant read, so only the event
+    // deadline can close the stream.
+    let passes = w.live.passes_for_testing();
     w.kick.notify_waiters();
     tokio::task::yield_now().await;
+    w.wait_for_finished_pass(passes).await;
     tokio::time::advance(Duration::from_millis(100)).await;
     tokio::task::yield_now().await;
 
@@ -1645,10 +1675,11 @@ async fn kick_during_inflight_pass_deadline_from_event() {
 /// clip to the pending event deadline so teardown still lands in
 /// [`EVENT_BOUND`], not ~5.15 s.
 ///
-/// The first kick often completes without blocking on the discovery-cache
-/// write lock (same as [`kick_during_inflight_pass_deadline_from_event`]'s
-/// first pass). The long stall is the *second* pass, which does block —
-/// matching that sibling's observed gate trace.
+/// Each re-check's first await is the machine gate's discovery-cache
+/// read, so with the write held (confirmed before the priming kick) the
+/// priming pass parks there too, and the second kick coalesces as that
+/// stalled pass's pending event. Whichever pass fail-closes first, the
+/// asserts below pin the deadline arithmetic, not the pass identity.
 #[tokio::test(start_paused = true)]
 async fn kick_late_in_long_pass_spacing_respects_event_deadline() {
     let w = World::new().await;
@@ -1670,8 +1701,9 @@ async fn kick_late_in_long_pass_spacing_respects_event_deadline() {
         .await
         .expect("discovery-cache write holder must start");
 
-    // Priming kick: may complete immediately. Drain spacing so the next
-    // kick starts a fresh pass against the held cache write.
+    // Priming kick: the pass parks on the held cache write at its first
+    // await. The advance only moves paused time; the kick below coalesces
+    // as that stalled pass's pending event.
     w.kick.notify_waiters();
     tokio::task::yield_now().await;
     tokio::time::advance(REAUTH_MIN_SPACING).await;

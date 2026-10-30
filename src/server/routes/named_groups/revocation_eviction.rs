@@ -538,21 +538,20 @@ fn note_head_report(
 
 /// #1578 rc4 (Engineer ruling, 28 Oct 09:35 GMT; Codex P1, both PRs):
 /// the catch-up answer of a keyless holder carries no
-/// `responder_state_hash`. From a current peer that absence is the
-/// keyless state itself — every other responder serves the field — and
-/// the answer counts: the holder is not silent, so the re-ask loop
-/// stops counting it. It erases no evidence. Becoming keyless does not
-/// invalidate the head the holder reported, and its exclusion frames
-/// travel separately, so the conflicting report persists until the
-/// holder itself reports a head on the local chain — possible again
-/// once its seat is keyed (the documented leave-and-re-join recovery;
-/// David's 02:25 key-republication ruling is a follow-up) — or it is no
-/// longer a holder (ADR 0110 §2, the rule applied to head-sync retries
-/// on 22 Oct). Until then removals, bans and seals wait at
+/// `responder_state_hash`. Only a sender that passed
+/// [`hashless_answer_is_a_keyless_disclaimer`] reaches this: for every
+/// other sender the caller keeps main's behavior and never calls. The
+/// holder answered, so the re-ask loop stops counting it. It erases no
+/// evidence. Becoming keyless does not invalidate the head the holder
+/// reported, and its exclusion frames travel separately, so the
+/// conflicting report persists until the holder itself reports a head
+/// on the local chain — possible again once its seat is keyed (the
+/// documented leave-and-re-join recovery; David's 02:25
+/// key-republication ruling is a follow-up) — or it is no longer a
+/// holder (ADR 0110 §2, the rule applied to head-sync retries on 22
+/// Oct). Until then removals, bans and seals wait at
 /// `waiting_for_head_sync`: expiry alone cannot authorize a known stale
-/// seal. An old peer's field-less answer changes nothing here in
-/// practice: an old peer never served a head, so it was never in the
-/// set.
+/// seal.
 fn note_head_disclaimed(
     rounds: &mut HashMap<String, HeadRound>,
     asks: &mut HeadRoundAsks,
@@ -570,6 +569,102 @@ fn note_head_disclaimed(
     round_asks(asks, stable_group_id, round.started)
         .answered
         .insert(sender);
+}
+
+/// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): a peer's
+/// typed refusal named this device's machine or binding revocation. The
+/// peer answered, so the 2 s re-ask loop stops counting it — exactly
+/// like the keyless disclaimer, it confirms no head and clears no
+/// evidence, because a refusal proves nothing about any head. Only a
+/// round that exists is touched (only groups with S4 work keep one).
+fn note_head_refused(
+    rounds: &mut HashMap<String, HeadRound>,
+    asks: &mut HeadRoundAsks,
+    stable_group_id: &str,
+    sender: [u8; 32],
+) {
+    let Some(round) = rounds.get_mut(stable_group_id) else {
+        return;
+    };
+    round_asks(asks, stable_group_id, round.started)
+        .answered
+        .insert(sender);
+}
+
+/// The asker-side entry point for a received #1657 typed refusal: mark
+/// the refusing peer answered for its group's current head round, iff
+/// this node asked that peer this round (review round 1,
+/// forged-refusal hardening). Returns whether the refusal was honored.
+/// See [`note_head_refused`].
+pub(in crate::server) async fn note_catchup_refused_peer(
+    state: &AppState,
+    group_ids: &[String],
+    sender: [u8; 32],
+) -> bool {
+    let stable = {
+        let groups = state.named_groups.read().await;
+        group_ids.iter().find_map(|id| {
+            crate::server::resolve_group_entry_locked(&groups, id)
+                .map(|(_, info)| info.stable_group_id().to_string())
+        })
+    };
+    let Some(stable) = stable else {
+        return false;
+    };
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    let Some(round) = inner.head_rounds.get(&stable) else {
+        return false;
+    };
+    // Only a peer this node asked this round may answer it: an
+    // unsolicited refusal — a peer this node never asked — changes
+    // nothing, so no verified peer can stop a re-ask, warn, or note a
+    // revocation it was not asked about.
+    let asked = inner
+        .head_round_asks
+        .get(&stable)
+        .is_some_and(|asks| asks.started == round.started && asks.last_ask.contains_key(&sender));
+    if !asked {
+        return false;
+    }
+    let state_inner = &mut *inner;
+    note_head_refused(
+        &mut state_inner.head_rounds,
+        &mut state_inner.head_round_asks,
+        &stable,
+        sender,
+    );
+    true
+}
+
+/// #1578 rc10 (Engineer ruling (2), 28 Oct 23:34 GMT; Claude blocking
+/// at 2e3d2f5): whether a catch-up answer that carries no
+/// `responder_state_hash` comes from a keyless survivor — an
+/// `MlsEncrypted`-group member on the GSS plane whose Active seat in
+/// this node's roster view carries no KEM public key (David's ruling,
+/// 28 Oct 02:09 GMT; the sender-side claim is
+/// [`crypto_exclusion::own_seat_cannot_take_a_share`] with
+/// `super::gss_share_hold::reported_head`). Only such a sender's hash-less
+/// answer counts as answered; every other one — an old peer that never
+/// served the field, a keyed seat, a joiner whose `MemberJoined`
+/// published its KEM key, a member of another plane, a sender this
+/// roster does not seat — is exactly main's reply: ignored, so the ask
+/// cadence still counts the sender and asks it again. The seat's KEM
+/// key is local data, not in the roster root, so this node's view of
+/// the sender's seat can differ from the sender's own; a divergence
+/// changes only the ask cadence: a view that lacks a key the sender
+/// holds counts that sender's hash-less reply as answered and re-asks
+/// it less (never more), and a view that seats a key the sender lacks
+/// keeps main's ignored reply. No evidence rule changes either way
+/// (the conflicting/confirmed sets are untouched by this predicate's
+/// path).
+fn hashless_answer_is_a_keyless_disclaimer(info: &GroupInfo, sender: [u8; 32]) -> bool {
+    info.secure_plane == x0x::mls::SecureGroupPlane::Gss
+        && info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
+        && info.active_members().any(|member| {
+            super::parse_agent_id_hex(&member.agent_id)
+                .is_ok_and(|agent| *agent.as_bytes() == sender)
+                && member.kem_public_key_b64.is_none()
+        })
 }
 
 /// Other active members that could hold a later head of `info`: every
@@ -827,16 +922,22 @@ pub(in crate::server) async fn seal_probe_for_test(
 }
 
 /// §2: the catch-up response handler calls this for each verified,
-/// applied, non-truncated page that carries the responder's saved head
-/// (`responder_state_hash`). The sender is an active, unrevoked member;
-/// the handler checked that. §3: the same answer is the sender's survivor
-/// convergence evidence for the S4 deliveries of the group
-/// ([`crypto_exclusion::note_survivor_head`]). An absent field is the
-/// #1578 keyless disclaimer (David's ruling, 28 Oct 02:09 GMT): no head
-/// is convergence evidence, and the sender's answer counts for the ask
-/// cadence only ([`note_head_disclaimed`]). Its unresolved head evidence
-/// persists: a keyless reply does not prove the head the sender reported
-/// reached the local chain (ADR 0110 §2).
+/// applied, non-truncated catch-up page, with or without the
+/// responder's saved head (`responder_state_hash`). The sender is an
+/// active, unrevoked member; the handler checked that. §3: the same
+/// answer is the sender's survivor convergence evidence for the S4
+/// deliveries of the group ([`crypto_exclusion::note_survivor_head`]).
+/// An absent field is the
+/// #1578 keyless disclaimer (David's ruling, 28 Oct 02:09 GMT) only
+/// from a keyless survivor
+/// ([`hashless_answer_is_a_keyless_disclaimer`], Engineer ruling (2),
+/// 28 Oct 23:34 GMT): no head is convergence evidence, and that
+/// sender's answer counts for the ask cadence only
+/// ([`note_head_disclaimed`]); its unresolved head evidence persists,
+/// because a keyless reply does not prove the head the sender reported
+/// reached the local chain (ADR 0110 §2). Every other sender's
+/// hash-less answer is exactly main's reply: ignored, so the ask
+/// cadence still counts the sender.
 pub(in crate::server) async fn note_catchup_head(
     state: &AppState,
     group_ids: &[String],
@@ -846,6 +947,7 @@ pub(in crate::server) async fn note_catchup_head(
     let Ok(sender) = super::parse_agent_id_hex(sender_hex) else {
         return;
     };
+    let sender = *sender.as_bytes();
     let current = {
         let groups = state.named_groups.read().await;
         group_ids.iter().find_map(|id| {
@@ -859,32 +961,39 @@ pub(in crate::server) async fn note_catchup_head(
                             installed_heads(info, reported),
                         )
                     }),
+                    reported.is_none() && hashless_answer_is_a_keyless_disclaimer(info, sender),
                 )
             })
         })
     };
-    let Some((stable, head, classified)) = current else {
+    let Some((stable, head, classified, keyless_disclaimer)) = current else {
         return;
     };
-    let mut inner = state.revocation_evictions.inner.lock().await;
     let Some((report, installed)) = classified else {
+        if !keyless_disclaimer {
+            // Not a keyless survivor: main's reply. An old peer's or any
+            // other sender's hash-less answer changes nothing.
+            return;
+        }
         // The keyless disclaimer: it names no head, so the survivor-head
         // pass gets nothing; the holder answered, and its unresolved
         // evidence stays (ADR 0110 §2).
+        let mut inner = state.revocation_evictions.inner.lock().await;
         let state_inner = &mut *inner;
         note_head_disclaimed(
             &mut state_inner.head_rounds,
             &mut state_inner.head_round_asks,
             &stable,
             &head,
-            *sender.as_bytes(),
+            sender,
             Instant::now(),
         );
         return;
     };
+    let mut inner = state.revocation_evictions.inner.lock().await;
     // §3: the answer is also the sender's convergence evidence for the
     // S4 deliveries of this group whose result it holds.
-    crypto_exclusion::note_survivor_head(&mut inner, &stable, sender.as_bytes(), &installed);
+    crypto_exclusion::note_survivor_head(&mut inner, &stable, &sender, &installed);
     // Only groups with S4 work keep a round (the worker pass creates it).
     if !inner.head_rounds.contains_key(&stable) {
         return;
@@ -895,7 +1004,7 @@ pub(in crate::server) async fn note_catchup_head(
         &mut state_inner.head_round_asks,
         &stable,
         &head,
-        *sender.as_bytes(),
+        sender,
         report,
         Instant::now(),
     );
@@ -1196,10 +1305,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             .map_or(Duration::ZERO, |budget| budget.elapsed(now));
         let active_admins = active_admins_of(info);
         let target_hex = hex::encode(key.target);
-        let target_seated = info
-            .members_v2
-            .get(&target_hex)
-            .is_some_and(|member| is_seated(member.state));
+        let target_seated = seat_target(info, &target_hex);
         // §5 memory-only durability: every trigger S4 derives today is
         // durable elsewhere (the revocation store, the verified chain or a
         // committed certificate), so a memory-only sidecar does not hold
@@ -1436,7 +1542,12 @@ fn revocation_seats(groups: &[(String, GroupInfo)], leaves: &RetainedLeaves) -> 
                 .unwrap_or_default();
             hasher.update(&target);
             hasher.update(&[
-                u8::from(is_seated(member.state)),
+                // #1578 rc11 (audit): the join's key-only marker row
+                // hashes as an unseated entry — exactly main's roster,
+                // which holds no row for the pre-admission joiner.
+                u8::from(
+                    is_seated(member.state) && !info.join_seat_key_marker_only(&member.agent_id),
+                ),
                 match leaves.tracks(stable, &target) {
                     Some(true) => 1,
                     Some(false) => 0,
@@ -1639,6 +1750,18 @@ fn is_seated(state: GroupMemberState) -> bool {
     matches!(state, GroupMemberState::Active | GroupMemberState::Pending)
 }
 
+/// #1578 rc11 (Claude blocking 1, audit): the seat gate for a named
+/// target. The join's key-only marker row
+/// (`GroupInfo::join_seat_key_marker_only`) is not a seat — the
+/// pre-admission joiner is unseated, exactly main's roster, where it
+/// holds no row before its `MemberAdded` lands.
+fn seat_target(info: &GroupInfo, agent_hex: &str) -> bool {
+    info.members_v2
+        .get(agent_hex)
+        .is_some_and(|member| is_seated(member.state))
+        && !info.join_seat_key_marker_only(agent_hex)
+}
+
 fn owner_certified(info: &GroupInfo) -> bool {
     matches!(
         info.policy.admission,
@@ -1675,7 +1798,10 @@ fn derive_triggers(
             // read as an absent leaf (§3, #1508 review P1).
             let retained_leaf = leaves.tracks(stable, &target).unwrap_or(false)
                 || leaves.undecided(stable, &target);
-            let seated = is_seated(member.state);
+            // #1578 rc11 (audit): the join's key-only marker row does
+            // not open work — the pre-admission joiner holds no seat.
+            let seated =
+                is_seated(member.state) && !info.join_seat_key_marker_only(&member.agent_id);
             let incarnation = ce::seat_incarnation(info, &member.agent_id);
             // §1: an Agent-subject revocation creates work where the target
             // has a seat or a retained cryptographic leaf.
@@ -1883,7 +2009,7 @@ fn reconcile_completion(
         }
         let target_hex = hex::encode(key.target);
         let member = info.members_v2.get(&target_hex);
-        let seated = member.is_some_and(|member| is_seated(member.state));
+        let seated = seat_target(info, &target_hex);
         let stable = key.stable_group_id.as_str();
         if seated {
             // §1a/D135: an expiry-only row ends when the committed
@@ -2220,8 +2346,14 @@ async fn prepared_removal_recheck(
         let info = groups.get(group_key);
         (
             info.map(|info| info.state_hash.clone()),
-            info.and_then(|info| info.members_v2.get(&hex::encode(key.target)))
-                .cloned(),
+            // #1578 rc11 (audit): the join's key-only marker row reads
+            // as no seat, exactly main's roster.
+            info.and_then(|info| {
+                info.members_v2
+                    .get(&hex::encode(key.target))
+                    .filter(|member| !info.join_seat_key_marker_only(&member.agent_id))
+                    .cloned()
+            }),
         )
     };
     // A rebind that changed the seat's certificate cancels the removal
@@ -2322,7 +2454,11 @@ async fn seal_request_gate(
         let seated: Vec<String> = info
             .members_v2
             .values()
-            .filter(|member| is_seated(member.state))
+            // #1578 rc11 (audit): the join's key-only marker row is
+            // not a seated target.
+            .filter(|member| {
+                is_seated(member.state) && !info.join_seat_key_marker_only(&member.agent_id)
+            })
             .map(|member| member.agent_id.clone())
             .collect();
         (info.stable_group_id().to_string(), seated)
@@ -3317,10 +3453,7 @@ pub(in crate::server) fn s4_eviction_seal_tolerates(info: &GroupInfo, failed: &[
 
 fn eviction_seal_tolerates(scope: &EvictionSealScope, info: &GroupInfo, failed: &[String]) -> bool {
     scope.stable_group_id == info.stable_group_id()
-        && !info
-            .members_v2
-            .get(&scope.target_hex)
-            .is_some_and(|member| is_seated(member.state))
+        && !seat_target(info, &scope.target_hex)
         && !failed.is_empty()
         && failed
             .iter()
@@ -3397,8 +3530,11 @@ pub(in crate::server) async fn s4_exclusion_cancelled_under_lock(
         let info = groups.get(group_key)?;
         (
             info.stable_group_id().to_string(),
+            // #1578 rc11 (audit): the join's key-only marker row reads
+            // as no seat, exactly main's roster.
             info.members_v2
                 .get(&hex::encode(target.as_bytes()))
+                .filter(|member| !info.join_seat_key_marker_only(&member.agent_id))
                 .cloned(),
         )
     };
@@ -3567,10 +3703,7 @@ async fn drive_queued_bans(state: &Arc<AppState>) {
             // A TreeKEM ban of a target with no leaf cannot run through
             // the existing route; it applies once the target is seated
             // again (a rejoin), so retry slowly while it is not.
-            let seated = info
-                .members_v2
-                .get(&target_hex)
-                .is_some_and(|member| is_seated(member.state));
+            let seated = seat_target(info, &target_hex);
             let retry = if seated {
                 S4_COMMIT_RETRY
             } else {
@@ -4175,8 +4308,11 @@ pub(super) async fn finalize_quarantine(pending: &FsPath) -> bool {
 }
 
 /// ADR 0108 §5a resume: the verified pending copies of `file` (set `V`) in
-/// `txid` order. A copy that fails verification stays pending.
-async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bool) {
+/// `txid` order. A copy that fails verification stays pending. A scan of
+/// the directory that fails reports no copies and the failure, so callers
+/// fail closed instead of replacing a file whose pending evidence they
+/// could not read (#1672 review).
+pub(super) async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bool) {
     let Some(dir) = path.parent() else {
         return (Vec::new(), false);
     };
@@ -4184,11 +4320,19 @@ async fn verified_pending_copies(path: &FsPath) -> (Vec<([u8; 16], PathBuf)>, bo
         return (Vec::new(), false);
     };
     let Ok(mut entries) = crate::w3h_inline::fs::read_dir(dir).await else {
-        return (Vec::new(), false);
+        return (Vec::new(), true);
     };
     let mut found = Vec::new();
     let mut failed = false;
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -5613,6 +5757,29 @@ pub(super) mod tests {
             })
             .count();
         assert_eq!(history, 1);
+    }
+
+    /// #1672 review (Codex P2): a scan of the directory that fails must
+    /// report the failure, not "no copies" — with the live file absent,
+    /// `(empty, no failure)` let a replacement land while unverified
+    /// pending copies existed, against §5a step 4. A directory the
+    /// process cannot list (mode `0o000`) reports `(empty, failed)`, so
+    /// the caller fails closed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_scan_failure_fails_the_pending_copies_report() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(s4::EVS_FILE_NAME);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000))
+            .expect("the directory is unscannable");
+        let (copies, failed) = verified_pending_copies(&path).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("the directory is scannable again");
+        assert!(
+            copies.is_empty() && failed,
+            "a scan failure reports no copies and the failure"
+        );
     }
 
     /// An `OwnerCertified` group whose seat `target` commits `cert`.
@@ -7165,12 +7332,18 @@ pub(super) mod tests {
     /// confirmer plus the elapsed restart wait leaves the group at
     /// `waiting_for_head_sync` (ADR 0110 §2: expiry alone cannot
     /// authorize a known stale seal). The rc3 code cleared the entry;
-    /// this test fails if that comes back.
+    /// this test fails if that comes back. rc10 seats the survivor as
+    /// the ruling's keyless survivor — an Active seat of the encrypted
+    /// GSS group with no KEM key — because rc10's gate
+    /// ([`super::hashless_answer_is_a_keyless_disclaimer`], Engineer
+    /// ruling (2), 28 Oct 23:34 GMT) counts the hash-less answer only
+    /// from such a sender.
     #[tokio::test]
     async fn a_served_keyless_answer_keeps_the_conflicting_entry() -> anyhow::Result<()> {
         let (state, _dir) =
             crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
         let group_id = "c7".repeat(16);
+        let survivor = [5; 32];
         let mut info = GroupInfo::new(
             "keyless-disclaimer".into(),
             String::new(),
@@ -7181,6 +7354,7 @@ pub(super) mod tests {
         info.secret_epoch = 4;
         info.shared_secret = Some(vec![7; 32]);
         info.security_binding = Some("gss:epoch=4".to_string());
+        info.add_member(hex::encode(survivor), GroupRole::Member, None, None);
         info.recompute_state_hash();
         let stable = info.stable_group_id().to_string();
         state
@@ -7188,7 +7362,6 @@ pub(super) mod tests {
             .write()
             .await
             .insert(group_id.clone(), info.clone());
-        let survivor = [5; 32];
         let survivor_hex = hex::encode(survivor);
         let confirmer = [6; 32];
         let confirmer_hex = hex::encode(confirmer);
@@ -7257,6 +7430,566 @@ pub(super) mod tests {
         assert!(
             group_head_synced(&state, &group_id).await,
             "the survivor's own on-chain report resolves its entry"
+        );
+        Ok(())
+    }
+
+    /// #1578 rc10 (Engineer ruling (2), 28 Oct 23:34 GMT; Claude
+    /// blocking at 2e3d2f5): a hash-less catch-up answer counts as the
+    /// sender's answer only from a keyless survivor. Three members of
+    /// one encrypted GSS group answer without `responder_state_hash`:
+    /// one whose Active seat in this node's roster carries the KEM key
+    /// its `MemberJoined` published (rc7), one this roster does not
+    /// seat at all (the shape of an old peer), and the keyless
+    /// survivor. The first two are exactly main's reply — ignored, so
+    /// the ask cadence still counts them and asks them again; only the
+    /// survivor's counts. rc9 counted all three; this test fails if
+    /// that comes back.
+    #[tokio::test]
+    async fn rc10_a_hashless_answer_counts_only_from_a_keyless_survivor() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "d4".repeat(16);
+        let keyed = [8; 32];
+        let unseated = [0x0a; 32];
+        let keyless = [9; 32];
+        let mut info = GroupInfo::new(
+            "rc10-keyless-gate".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.secret_epoch = 4;
+        info.shared_secret = Some(vec![7; 32]);
+        info.security_binding = Some("gss:epoch=4".to_string());
+        info.add_member_with_kem(
+            hex::encode(keyed),
+            GroupRole::Member,
+            None,
+            None,
+            Some("published-by-member-joined".to_string()),
+        );
+        info.add_member(hex::encode(keyless), GroupRole::Member, None, None);
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        for sender in [keyed, unseated, keyless] {
+            note_catchup_head(
+                &state,
+                std::slice::from_ref(&group_id),
+                &hex::encode(sender),
+                None,
+            )
+            .await;
+        }
+        let inner = state.revocation_evictions.inner.lock().await;
+        let answered = |sender: [u8; 32]| {
+            inner
+                .head_round_asks
+                .values()
+                .any(|asks| asks.answered.contains(&sender))
+        };
+        assert!(
+            !answered(keyed),
+            "a keyed seat's hash-less reply is main's ignored reply: it is asked again"
+        );
+        assert!(
+            !answered(unseated),
+            "a sender this roster does not seat is main's ignored reply: it is asked again"
+        );
+        assert!(
+            answered(keyless),
+            "the keyless survivor answered: the round does not re-ask it every 2 s"
+        );
+        Ok(())
+    }
+
+    /// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the
+    /// asker's side of the typed refusal. A peer answers this node's
+    /// catch-up ask with the typed refusal naming this device's machine
+    /// revocation: the peer counts as answered — the 2 s head-round
+    /// re-ask stops asking it — the reason is kept per group on
+    /// `AppState`, and nothing is confirmed or cleared (a refusal is no
+    /// head evidence, exactly like the keyless disclaimer). A refusal
+    /// from a sender this node holds revoked, a refusal whose reason
+    /// this node does not know (#1604 G5), an unsolicited refusal from
+    /// a peer this node did not ask, an unverified or misaddressed one,
+    /// a refusal during a revocation resync, and one for a group this
+    /// node does not hold, all change nothing. The test drives the real
+    /// dispatch arm, so it also pins the wire plug-in.
+    #[tokio::test]
+    async fn a_typed_catchup_refusal_stops_that_peers_reask_and_surfaces_the_reason(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "d6".repeat(16);
+        let refuser = [0x0b; 32];
+        let other = [0x0c; 32];
+        let mut info = GroupInfo::new(
+            "1657-typed-refusal".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.add_member(hex::encode(refuser), GroupRole::Member, None, None);
+        info.add_member(hex::encode(other), GroupRole::Member, None, None);
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        // The round asked `refuser` (review round 1: only an asked peer's
+        // refusal is honored); `other` is a holder this node did not ask.
+        let round_started = Instant::now();
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
+                stable.clone(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: round_started,
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+            inner.head_round_asks.insert(
+                stable.clone(),
+                RoundAsks {
+                    started: round_started,
+                    last_ask: BTreeMap::from([(refuser, round_started)]),
+                    answered: BTreeSet::new(),
+                },
+            );
+        }
+        let requester_hex = hex::encode(state.agent.agent_id().as_bytes());
+        async fn dispatch_refusal(
+            state: &Arc<AppState>,
+            group_id: &str,
+            requester_hex: &str,
+            sender: [u8; 32],
+            reason: &str,
+            verified: bool,
+        ) -> bool {
+            let payload = serde_json::json!({
+                "message_type": "treekem_catchup_refusal",
+                "group_id": group_id,
+                "requester_agent_id": requester_hex,
+                "reason": reason,
+            })
+            .to_string()
+            .into_bytes();
+            super::super::dispatch_treekem_catchup_message(
+                state,
+                &x0x::identity::AgentId(sender),
+                &x0x::identity::MachineId([0x16; 32]),
+                verified,
+                &payload,
+            )
+            .await
+        }
+        let refusal_received_at = std::time::Instant::now();
+        assert!(
+            dispatch_refusal(
+                &state,
+                &group_id,
+                &requester_hex,
+                refuser,
+                "machine_revoked",
+                true
+            )
+            .await,
+            "the dispatch arm reports the refusal consumed, not a shutdown"
+        );
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            let answered = |sender: [u8; 32]| {
+                inner
+                    .head_round_asks
+                    .values()
+                    .any(|asks| asks.answered.contains(&sender))
+            };
+            assert!(
+                answered(refuser),
+                "the refusing peer answered: the round does not re-ask it every 2 s"
+            );
+            assert!(
+                !answered(other),
+                "a peer that did not refuse is still counted by the ask cadence"
+            );
+        }
+        {
+            let notes = state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes");
+            let note = notes
+                .get(&group_id)
+                .expect("the refusal reason is kept for the group");
+            assert_eq!(
+                note.reason,
+                super::super::TreeKemCatchupRefusalReason::MachineRevoked
+            );
+            assert_eq!(note.peer, refuser, "the note names the refusing peer");
+            assert!(
+                note.at >= refusal_received_at,
+                "the note is stamped when the refusal arrived"
+            );
+        }
+
+        // A refusal from a sender this node holds revoked changes
+        // nothing: a revoked peer must not be able to forge a silence.
+        let revoked_sender = x0x::identity::AgentKeypair::generate()?;
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(revoked_sender.agent_id()),
+            revoked_sender.public_key(),
+            revoked_sender.secret_key(),
+            crate::server::routes::named_groups::now_millis_u64() / 1_000,
+            Some("test".to_string()),
+        )
+        .expect("sign revocation");
+        assert!(state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, None)
+            .expect("self-revocation verifies"));
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &requester_hex,
+            revoked_sender.agent_id().0,
+            "machine_revoked",
+            true,
+        )
+        .await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner
+                    .head_round_asks
+                    .values()
+                    .any(|asks| asks.answered.contains(&revoked_sender.agent_id().0)),
+                "a revoked sender's refusal marks no peer answered"
+            );
+        }
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
+                .get(&group_id)
+                .expect("the earlier note stands")
+                .peer,
+            refuser,
+            "a revoked sender's refusal overwrites no note"
+        );
+
+        // Review round 1 (forged-refusal hardening) + review round 3,
+        // finding 3: an unsolicited refusal — from a clean holder this
+        // node did NOT ask — stops no re-ask (only a peer asked this
+        // round may close its unanswered slot), but it IS surfaced: the
+        // note records the latest refusal that passed the gates, so a
+        // gap/page ask gets its reason too. The note map stays bounded
+        // by the groups this node holds.
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &requester_hex,
+            other,
+            "machine_revoked",
+            true,
+        )
+        .await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner
+                    .head_round_asks
+                    .values()
+                    .any(|asks| asks.answered.contains(&other)),
+                "a peer this node did not ask is not marked answered by its refusal"
+            );
+        }
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
+                .get(&group_id)
+                .expect("the unsolicited refusal is surfaced")
+                .peer,
+            other,
+            "an unsolicited refusal refreshes the note (the surface) while stopping no re-ask"
+        );
+
+        // An unverified refusal, and one addressed to another requester,
+        // change nothing (review round 1, test gaps).
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &requester_hex,
+            refuser,
+            "binding_revoked",
+            false,
+        )
+        .await;
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &hex::encode([0x0e; 32]),
+            refuser,
+            "binding_revoked",
+            true,
+        )
+        .await;
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
+                .get(&group_id)
+                .expect("the earlier note stands")
+                .reason,
+            super::super::TreeKemCatchupRefusalReason::MachineRevoked,
+            "an unverified or misaddressed refusal overwrites no note"
+        );
+
+        // #1604 G5: a refusal reason this node does not know is refused
+        // at the dispatch arm, before any asker state changes — sent
+        // here from the asked peer, so only that gate can stop it.
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &requester_hex,
+            refuser,
+            "some_future_reason",
+            true,
+        )
+        .await;
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
+                .get(&group_id)
+                .expect("the earlier note stands")
+                .reason,
+            super::super::TreeKemCatchupRefusalReason::MachineRevoked,
+            "an unknown refusal reason overwrites no note"
+        );
+
+        // #1657 review (Claude, REQUEST-CHANGES 2): a refusal for a
+        // group this node does not hold records nothing — the note map
+        // is bounded by the groups this node holds, so no verified peer
+        // can grow it without limit.
+        dispatch_refusal(
+            &state,
+            &"99".repeat(16),
+            &requester_hex,
+            refuser,
+            "machine_revoked",
+            true,
+        )
+        .await;
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
+                .len(),
+            1,
+            "a refusal for a group this node does not hold records no note"
+        );
+
+        // A pending revocation resync fails closed: no refusal is
+        // honored while the local revocation set is unverified (the
+        // #1577 fabric's quarantined carrier).
+        *state.agent.revocation_set().write().await =
+            x0x::revocation::RevocationSet::quarantined_carrier(
+                x0x::revocation::REVOCATION_CARRIER_V3,
+            );
+        dispatch_refusal(
+            &state,
+            &group_id,
+            &requester_hex,
+            refuser,
+            "binding_revoked",
+            true,
+        )
+        .await;
+        assert_eq!(
+            state
+                .treekem_catchup_refusals
+                .lock()
+                .expect("refusal notes")
+                .get(&group_id)
+                .expect("the earlier note stands")
+                .reason,
+            super::super::TreeKemCatchupRefusalReason::MachineRevoked,
+            "a refusal during a revocation resync overwrites no note"
+        );
+        Ok(())
+    }
+
+    /// #1578 rc11 (Claude non-blocking 3): the plane check of
+    /// [`hashless_answer_is_a_keyless_disclaimer`] pinned. A TreeKEM
+    /// group holds no GSS secret and seats no KEM key by design, so
+    /// its keyless Active member is not a keyless survivor: the
+    /// hash-less answer stays main's ignored reply, and the ask
+    /// cadence keeps counting the sender. Delete the
+    /// `secure_plane == Gss` check and this test fails: the predicate
+    /// matches, `note_catchup_head` records the sender answered, and
+    /// it is never asked again.
+    #[tokio::test]
+    async fn rc11_a_treekem_plane_keyless_seat_is_not_a_keyless_survivor() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "d5".repeat(16);
+        let keyless = [10; 32];
+        let mut info = GroupInfo::new(
+            "rc11-treekem-plane".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.policy.confidentiality = x0x::groups::GroupConfidentiality::MlsEncrypted;
+        info.add_member(hex::encode(keyless), GroupRole::Member, None, None);
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &hex::encode(keyless),
+            None,
+        )
+        .await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let answered = |sender: [u8; 32]| {
+            inner
+                .head_round_asks
+                .values()
+                .any(|asks| asks.answered.contains(&sender))
+        };
+        assert!(
+            !answered(keyless),
+            "a TreeKEM keyless seat's hash-less reply is main's ignored reply: it is asked again"
+        );
+        Ok(())
+    }
+
+    /// #1578 rc11 (Claude non-blocking 3): the confidentiality check of
+    /// [`hashless_answer_is_a_keyless_disclaimer`] pinned. A
+    /// SignedPublic group is GSS-plane and seats no KEM key by design,
+    /// so its keyless Active member is not a keyless survivor: the
+    /// hash-less answer stays main's ignored reply, and the ask
+    /// cadence keeps counting the sender (rc4 pinned the same gate on
+    /// the claim side). Delete the `policy.confidentiality ==
+    /// MlsEncrypted` check and this test fails: the predicate matches,
+    /// `note_catchup_head` records the sender answered, and it is
+    /// never asked again.
+    #[tokio::test]
+    async fn rc11_a_signed_public_group_keyless_seat_is_not_a_keyless_survivor(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "d6".repeat(16);
+        let keyless = [11; 32];
+        let mut info = GroupInfo::new(
+            "rc11-signed-public".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.policy.confidentiality = x0x::groups::GroupConfidentiality::SignedPublic;
+        info.add_member(hex::encode(keyless), GroupRole::Member, None, None);
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::new(),
+                },
+            );
+        note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &hex::encode(keyless),
+            None,
+        )
+        .await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let answered = |sender: [u8; 32]| {
+            inner
+                .head_round_asks
+                .values()
+                .any(|asks| asks.answered.contains(&sender))
+        };
+        assert!(
+            !answered(keyless),
+            "a SignedPublic member's hash-less reply is main's ignored reply: it is asked again"
         );
         Ok(())
     }

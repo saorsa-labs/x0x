@@ -42,8 +42,8 @@ use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 
 use super::crypto_exclusion::{
-    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, next_attempt,
-    note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
+    all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
+    next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
 use super::mandate_store::{self, PendingOrcV1};
@@ -160,7 +160,7 @@ pub(super) struct OrcState {
     mandates_restored: bool,
     /// Authored and installed recovery commits, for catch-up serving; the
     /// authored and the received frames are durable ([`replay_log`]).
-    log: replay_log::HeldLog<ORC_LOG_PER_GROUP>,
+    log: replay_log::HeldLog<ORC_LOG_PER_GROUP, true>,
 }
 
 impl OrcState {
@@ -297,7 +297,7 @@ impl OrcState {
     }
 }
 
-fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP> {
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<ORC_LOG_PER_GROUP, true> {
     &mut inner.orc.log
 }
 
@@ -562,6 +562,37 @@ async fn group_by_stable(state: &AppState, group_id: &str) -> Option<(String, Gr
     Some((key, info))
 }
 
+/// `group_by_stable` behind `named_groups_persistence_lock`. #1574 item 5:
+/// `persist_named_group_info` shows its candidate in the map before the
+/// write and restores the map when the write fails, so a drop decided on an
+/// unlocked read ("group gone", "head moved") can act on a candidate that
+/// rolls back. The drives call this for their drop decisions; the
+/// informational reads keep the unlocked form. Lock order: persistence,
+/// then `named_groups` (the pass's snapshot order). Call it with no S4
+/// lock held.
+async fn committed_group_by_stable(state: &AppState, group_id: &str) -> Option<GroupInfo> {
+    let _committed = state.named_groups_persistence_lock.lock().await;
+    group_by_stable(state, group_id).await.map(|(_, info)| info)
+}
+
+/// Whether `next`'s head is the installed roster head of `group_key`.
+/// #1574 item 1: `persist_named_group_info` also returns
+/// `ReplacedNotDurable` from its durability preflight, where an earlier
+/// write was still unconfirmed and its re-save failed again, so this
+/// candidate was never staged. That outcome installed nothing. The commit
+/// sites treat `ReplacedNotDurable` as committed only after this check.
+/// The read holds `named_groups_persistence_lock`, so it sees only
+/// installed or restored roster state.
+async fn roster_head_installed(state: &AppState, group_key: &str, next: &GroupInfo) -> bool {
+    let _committed = state.named_groups_persistence_lock.lock().await;
+    state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .is_some_and(|info| info.state_hash == next.state_hash)
+}
+
 /// The members a recovery commit on `info` must reach: the Active seats
 /// other than `local` and the named admins.
 fn survivors(info: &GroupInfo, local: &[u8; 32], removed: &BTreeSet<[u8; 32]>) -> Vec<[u8; 32]> {
@@ -786,10 +817,13 @@ async fn drive_mandates(state: &Arc<AppState>) {
     };
     let capabilities = state.agent.capability_store();
     for (stable, delivery) in due {
-        let head = group_by_stable(state, &stable)
+        // #1574 item 5: the gone/head-moved read below ends the owner's
+        // wait and retires its mandate file, so it reads committed roster
+        // state only (`committed_group_by_stable`).
+        let head = committed_group_by_stable(state, &stable)
             .await
-            .filter(|(_, info)| !info.withdrawn)
-            .map(|(_, info)| info.state_hash);
+            .filter(|info| !info.withdrawn)
+            .map(|info| info.state_hash);
         if head.as_deref() != Some(delivery.parent_head.as_str()) {
             // The commit landed (or the head moved and the mandate no
             // longer applies): the owner's wait ends.
@@ -1443,6 +1477,28 @@ async fn finish_commit(
     for seat in &removed {
         ng::quiesce_member_join_egress(state, group_key, seat).await;
     }
+    // #1574 item 1: both non-durable shapes below are treated as
+    // committed, and that evidence is enough for the drops after them.
+    // `ReplacedNotDurable` keeps the installed candidate in the map (the
+    // persist rolls back only `NotReplaced` and hard errors), so this
+    // process never sees the install revert — except the preflight
+    // refusal, which stages nothing; the installed check separates it.
+    // The epoch-installed error is committed state: the journal it leaves
+    // is already the commit point, which a restart replays, and its
+    // non-durable roster arm converges memory to the candidate and sets
+    // the same confirmation flag.
+    // A power loss before a confirming save is the one revert. It erases
+    // this node's memory, so the `pending` entry is gone regardless of
+    // the drop above; the durable loss is the mandate retire. When the
+    // owner is another node, its durable wait still applies (the reverted
+    // head is the mandate's parent) and `drive_mandates` sends the
+    // mandate again, so the member re-holds it and commits a fresh frame.
+    // When this node is the owner's own agent, no wait exists anywhere
+    // and nothing re-sends; the owner issues the mandate again, and its
+    // route still applies to the reverted head. The durable frame above
+    // is chain evidence, not a re-drive (a restart restores an authored
+    // frame only at the loaded head), and it was never sent (the §5
+    // egress guard held it), so a fresh frame cannot equivocate with it.
     let persisted = match tree.as_ref() {
         Some((guard, _)) => {
             match ng::persist_treekem_and_named_groups_atomic_with_info(
@@ -1460,14 +1516,19 @@ async fn finish_commit(
         // #1508 r6: `ReplacedNotDurable` installed the new roster (only
         // the directory fsync failed), so the commit stands and the frame
         // and its delivery must stay. The guarded egress publishes nothing
-        // until the re-save is durable (§5, #1508 rc12).
-        None => matches!(
-            ng::persist_named_group_info(state, group_key, next.clone()).await,
-            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
-        ),
+        // until the re-save is durable (§5, #1508 rc12). The preflight
+        // refusal stages nothing, so the installed check gates it (#1574
+        // item 1).
+        None => match ng::persist_named_group_info(state, group_key, next.clone()).await {
+            Ok(ng::AtomicWriteOutcome::Durable) => true,
+            Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+                roster_head_installed(state, group_key, &next).await
+            }
+            Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
+        },
     };
     if !persisted {
-        replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+        replay_log::rewrite_without(state, ext, held, &stable, at).await;
         rollback(&mut tree, &next, "owner_recovery_persist_failed");
         tracing::error!(group_id = %ng::LogHexId::group(group_key), "ADR 0110 S4: owner recovery deferred: persist failed");
         set_wait(state, &stable, None).await;
@@ -1560,7 +1621,10 @@ async fn drive_deliveries(state: &Arc<AppState>) {
     let local = *state.agent.agent_id().as_bytes();
     let capabilities = state.agent.capability_store();
     for (stable, delivery) in due {
-        let info = group_by_stable(state, &stable).await.map(|(_, info)| info);
+        // #1574 item 5: the gone/head-moved read below drops the delivery
+        // and its GSS reshare obligation, so it reads committed roster
+        // state only (`committed_group_by_stable`).
+        let info = committed_group_by_stable(state, &stable).await;
         let Some(info) = info.filter(|info| {
             !info.withdrawn
                 && info.fork_quarantine.is_none()
@@ -1746,8 +1810,13 @@ fn spawn_commit_send(
 /// Serve the recovery commit frames this node holds for the group (any of
 /// `group_ids`) above `from_revision` to a catch-up requester, oldest
 /// first, on the distinct gated carrier only, never inside a legacy
-/// catch-up page (§4b(1) "Mixed versions"). Each write uses the guarded
-/// admission with [`HeadRule::OnChain`] and the `owner_recovery_v1` gate.
+/// catch-up page (§4b(1) "Mixed versions"). A competing frame kept as
+/// fork evidence (#1579) is not on this node's verified chain, so it is
+/// skipped, not served, and it does not stop the round. A
+/// fork-quarantined group serves nothing on purpose: `head_rule_admits`
+/// refuses every frame of it, so the skip leaves the round empty. Each
+/// write uses the guarded admission with [`HeadRule::OnChain`] and the
+/// `owner_recovery_v1` gate.
 ///
 /// The author's frames survive a restart ([`replay_log`]). A GSS frame
 /// moves the requester's epoch without the secret, so an admin also seals
@@ -1768,8 +1837,25 @@ pub(in crate::server) async fn serve_catchup(
         .orc
         .log
         .catchup_frames(group_ids, from_revision);
+    if frames.is_empty() {
+        return;
+    }
+    // The frames all come from one group (`catchup_frames` serves the
+    // first of `group_ids` that has a log).
+    let Some(first_group) = frames.first().map(|(group, _, _)| group.clone()) else {
+        return;
+    };
+    let Some((_, info)) = group_by_stable(state, &first_group).await else {
+        return;
+    };
     let mut gss_groups = BTreeSet::new();
     for (group_id, result_head, bytes) in frames {
+        // #1579: a competing frame kept as fork evidence is not on this
+        // node's verified chain. It is never served, and it does not stop
+        // the round for the frames that are.
+        if !head_rule_admits(&info, &HeadRule::OnChain(result_head.clone())) {
+            continue;
+        }
         if matches!(
             orc::decode_frame(&bytes),
             Ok(orc::OwnerRecoveryFrameV1::Commit(frame))
@@ -2226,7 +2312,14 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             role,
             ..
         } => {
-            let target = cursor.members_v2.get(agent_id)?;
+            // #1578 rc11 (audit): the join's key-only marker row is not
+            // a seat — the replay stops on it, exactly as the apply
+            // side parks a role update for a member that has not
+            // landed.
+            let target = cursor
+                .members_v2
+                .get(agent_id)
+                .filter(|_| !cursor.join_seat_key_marker_only(agent_id))?;
             if !admin(actor)
                 || target.is_removed()
                 || target.is_banned()
@@ -2438,7 +2531,15 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             ..
         } => {
             let ban = matches!(held.event, Event::MemberBanned { .. });
-            let target = cursor.members_v2.get(agent_id);
+            // #1578 rc11 (audit): the join's key-only marker row reads
+            // as no seat here, and the mutation below drops it first —
+            // ban_member on the marker would keep its Member role on
+            // the Banned row, and the roster root binds the role, so
+            // the reconstructed root would diverge from main's.
+            let target = cursor
+                .members_v2
+                .get(agent_id)
+                .filter(|_| !cursor.join_seat_key_marker_only(agent_id));
             if !admin(actor)
                 || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
                 || target.is_some_and(|member| member.is_banned())
@@ -2453,6 +2554,9 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                 |next| {
                     next.roster_revision =
                         super::super::adopt_roster_revision(next.roster_revision, *revision);
+                    if next.join_seat_key_marker_only(agent_id) {
+                        next.members_v2.remove(agent_id);
+                    }
                     if ban {
                         next.ban_member(agent_id, Some(actor.clone()));
                     } else {
@@ -2472,11 +2576,20 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             secret_epoch: Some(to),
             ..
         } => {
-            let target = cursor.members_v2.get(agent_id)?;
+            // #1578 rc11 (audit): the join's key-only marker row is not
+            // a seat — the replay stops on it, and the mutation drops
+            // it first so the removal sees exactly main's roster.
+            let target = cursor
+                .members_v2
+                .get(agent_id)
+                .filter(|_| !cursor.join_seat_key_marker_only(agent_id))?;
             if !admin(actor) || target.is_removed() || target.is_banned() {
                 return None;
             }
             return gss_rotation_step(cursor, commit, *revision, *to, |next| {
+                if next.join_seat_key_marker_only(agent_id) {
+                    next.members_v2.remove(agent_id);
+                }
                 next.remove_member(agent_id, Some(actor.clone()));
             });
         }
@@ -2498,6 +2611,13 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                 return None;
             }
             return gss_rotation_step(cursor, commit, *revision, *to, |next| {
+                // #1578 rc11 (audit): drop the join's key-only marker
+                // row first — ban_member on it would keep its Member
+                // role on the Banned row, and the roster root binds
+                // the role.
+                if next.join_seat_key_marker_only(agent_id) {
+                    next.members_v2.remove(agent_id);
+                }
                 next.ban_member(agent_id, Some(actor.clone()));
             });
         }
@@ -3163,7 +3283,7 @@ async fn receive_commit(
     {
         Ok(next) => next,
         Err(error) => {
-            replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+            replay_log::rewrite_without(state, ext, held, &stable, at).await;
             tracing::info!(group_id = %ng::LogHexId::group(&group_key), "ADR 0110 S4: owner recovery commit refused by the chained apply: {error}");
             return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
         }
@@ -3173,6 +3293,17 @@ async fn receive_commit(
         .iter()
         .map(|seat| AgentId(seat.agent))
         .collect();
+    // #1574 item 1: the two non-durable arms below treat the install as
+    // done, and that evidence is enough for the drops after them. The
+    // frame was made durable before the install (`write_received`
+    // above), and a restart puts a received frame above the loaded head
+    // back through the stash, so a power-loss revert re-runs this
+    // install and these drops on the durable frame. The epoch-installed
+    // arm is committed by the journal it leaves (the commit point a
+    // restart replays). The in-memory `pending`/`mandates` drop retires
+    // no file here, so a restart also re-arms the held sides from the
+    // pending-mandate file while the reverted head is the mandate's
+    // parent; the owner's re-send covers the same recovery.
     let installed = match (guard.as_mut(), &body.crypto) {
         (
             Some(guard),
@@ -3237,7 +3368,7 @@ async fn receive_commit(
                     guard,
                     "owner_recovery_proof_failed",
                 );
-                replay_log::rewrite_from_memory(state, ext, held, &stable).await;
+                replay_log::rewrite_without(state, ext, held, &stable, at).await;
                 return ReceiveOutcome::Refused(orc::OwnerRecoveryRefusal::RecoveryProofInvalid);
             }
             match ng::persist_treekem_and_named_groups_atomic_with_info(
@@ -3265,11 +3396,16 @@ async fn receive_commit(
             }
         }
         (None, orc::OwnerRecoveryCryptoV1::TreeKem { .. }) => false,
-        // #1508 r6: `ReplacedNotDurable` installed the roster.
-        _ => matches!(
-            ng::persist_named_group_info(state, &group_key, next.clone()).await,
-            Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
-        ),
+        // #1508 r6: `ReplacedNotDurable` installed the roster. The
+        // preflight refusal stages nothing, so the installed check gates
+        // it (#1574 item 1).
+        _ => match ng::persist_named_group_info(state, &group_key, next.clone()).await {
+            Ok(ng::AtomicWriteOutcome::Durable) => true,
+            Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+                roster_head_installed(state, &group_key, &next).await
+            }
+            Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
+        },
     };
     drop(guard);
     if !installed {
@@ -3829,6 +3965,9 @@ mod tests {
 
     /// #1357: recovery commit frames are held for catch-up serving, oldest
     /// first, above the requested revision, deduplicated and bounded.
+    /// #1579: a frame at a held revision with a different result head is a
+    /// competing commit: it is kept beside the held one, as fork evidence,
+    /// and it never replaces it.
     #[test]
     fn catchup_frames_are_bounded_ordered_and_above_the_revision() {
         let mut orc = OrcState::default();
@@ -3847,12 +3986,15 @@ mod tests {
         let all = orc.log.catchup_frames(&["x".into(), "g".into()], 0);
         assert_eq!(all.len(), ORC_LOG_PER_GROUP);
         let heads: Vec<&str> = all.iter().map(|(_, head, _)| head.as_str()).collect();
-        let expected: Vec<String> = (3..=total).map(|revision| format!("h{revision}")).collect();
+        let mut expected: Vec<String> =
+            (4..=total).map(|revision| format!("h{revision}")).collect();
+        expected.push("dup".to_string());
         assert_eq!(heads, expected);
         assert!(all.iter().all(|(id, _, _)| id == "g"));
         let tail = orc.log.catchup_frames(&["g".into()], total - 1);
-        assert_eq!(tail.len(), 1);
+        assert_eq!(tail.len(), 2, "the competing frame is held too");
         assert_eq!(tail[0].1, format!("h{total}"));
+        assert_eq!(tail[1].1, "dup");
         assert!(orc.log.catchup_frames(&["other".into()], 0).is_empty());
     }
 
@@ -4250,7 +4392,20 @@ mod tests {
         assert_eq!(committed.state_revision, info.state_revision + 1);
         let bytes = {
             let mut inner = state.revocation_evictions.inner.lock().await;
-            let bytes = inner.orc.deliveries[&stable].bytes.to_vec();
+            // The expected frame is read from the durable log, not from
+            // `deliveries`: this fixture's survivor set is empty (the
+            // revoked admin is removed and the promotee is local), so
+            // the delivery is born converged (`all_converged` holds
+            // vacuously) and a delivery pass may legitimately remove it
+            // before this lock. The log is the commit's own record and
+            // is never swept, so the bytes this test compares against
+            // after the restart are the bytes the commit wrote.
+            let planned = inner
+                .orc
+                .log
+                .catchup_frames(std::slice::from_ref(&stable), info.state_revision);
+            assert_eq!(planned.len(), 1, "the commit wrote exactly one frame");
+            let bytes = planned[0].2.as_ref().clone();
             inner.orc = OrcState::default();
             bytes
         };
@@ -4642,6 +4797,208 @@ mod tests {
             .orc
             .deliveries
             .contains_key(&stable));
+        state.agent.shutdown().await;
+    }
+
+    /// One group with the local admin and `survivor` as Active members,
+    /// inserted under its raw id, for the drive tests below.
+    async fn drive_group(state: &AppState, group_id: &str, survivor: &AgentId) -> GroupInfo {
+        let admin = state.agent.agent_id();
+        let mut info = GroupInfo::new("s4".into(), String::new(), admin, group_id.to_string());
+        info.add_member(
+            hex::encode(survivor.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        info
+    }
+
+    /// #1574 item 5: `drive_mandates` ends the owner's wait on its
+    /// "head moved" read, so the read must hold
+    /// `named_groups_persistence_lock`:
+    /// `persist_named_group_info` shows its candidate in the map before
+    /// the write and restores the map when the write fails. Before the
+    /// fix the drive read a mid-write head candidate and retired the
+    /// owner's wait (and its mandate file) on a head the committed roster
+    /// never moved to.
+    #[tokio::test]
+    async fn an_ended_mandate_wait_waits_out_a_roster_candidate_that_rolls_back() {
+        let (state, _dir) = super::super::super::tests::secure_endpoint_test_state()
+            .await
+            .unwrap();
+        let survivor = AgentId([0x71; 32]);
+        let promoted = *survivor.as_bytes();
+        let group_id = "e7".repeat(16);
+        let info = drive_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.orc.mandates.insert(
+                stable.clone(),
+                MandateDelivery {
+                    mandate: orc::SignedOwnerRecoveryMandateV1 {
+                        body: orc::OwnerRecoveryMandateBodyV1 {
+                            stable_group_id: stable.clone(),
+                            parent_head: info.state_hash.clone(),
+                            parent_revision: info.state_revision,
+                            revoked_admins: Vec::new(),
+                            promoted,
+                            promoted_certificate_digest: String::new(),
+                            owner_public_key: Vec::new(),
+                            issued_at_ms: 0,
+                        },
+                        signature: Vec::new(),
+                    },
+                    bytes: Arc::new(vec![4, 5, 6]),
+                    mandate_id: "m1".to_string(),
+                    promoted,
+                    parent_head: info.state_hash.clone(),
+                    recipients: BTreeMap::from([(promoted, RecipientDelivery::Due)]),
+                    next_at: Instant::now(),
+                },
+            );
+        }
+        // The mid-write window: a moved-head candidate is in the map while
+        // the persistence lock is held — exactly what a failing
+        // `persist_named_group_info` restores.
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate.state_hash = format!("{}-candidate", info.state_hash);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate);
+        let driven = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { drive_mandates(&state).await })
+        };
+        for _ in 0..30 {
+            if driven.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .mandates
+                .contains_key(&stable),
+            "the ended wait must block on the persistence lock, not read the mid-write candidate"
+        );
+        // The write failed: the map is restored under the same lock hold.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        drop(guard);
+        driven.await.unwrap();
+        let inner = state.revocation_evictions.inner.lock().await;
+        let stored = inner
+            .orc
+            .mandates
+            .get(&stable)
+            .expect("the committed head is the mandate's parent, so the owner keeps waiting");
+        assert_ne!(
+            stored.recipients.get(&promoted),
+            Some(&RecipientDelivery::Due),
+            "the committed head's round ran"
+        );
+        drop(inner);
+        state.agent.shutdown().await;
+    }
+
+    /// #1574 item 5: `drive_deliveries` drops a recovery delivery on its
+    /// "head moved" read, so the read must hold
+    /// `named_groups_persistence_lock` (the same candidate window as the
+    /// mandate wait above). Before the fix the drive read a mid-write head
+    /// candidate and dropped the delivery — and its GSS reshare
+    /// obligation — on a head the committed roster never moved to.
+    #[tokio::test]
+    async fn a_dropped_recovery_delivery_waits_out_a_roster_candidate_that_rolls_back() {
+        let (state, _dir) = super::super::super::tests::secure_endpoint_test_state()
+            .await
+            .unwrap();
+        let survivor = AgentId([0x72; 32]);
+        let group_id = "e8".repeat(16);
+        let info = drive_group(&state, &group_id, &survivor).await;
+        let stable = info.stable_group_id().to_string();
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.orc.deliveries.insert(
+                stable.clone(),
+                CommitDelivery {
+                    bytes: Arc::new(vec![1, 2, 3]),
+                    result_head: info.state_hash.clone(),
+                    next_revision: info.state_revision.saturating_add(1),
+                    recipients: BTreeMap::from([(*survivor.as_bytes(), RecipientDelivery::Due)]),
+                    next_at: Instant::now(),
+                    resumed: false,
+                    removed: BTreeSet::new(),
+                    reshare_epoch: None,
+                },
+            );
+        }
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate.state_hash = format!("{}-candidate", info.state_hash);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate);
+        let driven = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { drive_deliveries(&state).await })
+        };
+        for _ in 0..30 {
+            if driven.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .deliveries
+                .contains_key(&stable),
+            "the drop must block on the persistence lock, not read the mid-write candidate"
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        drop(guard);
+        driven.await.unwrap();
+        let inner = state.revocation_evictions.inner.lock().await;
+        let delivery = inner
+            .orc
+            .deliveries
+            .get(&stable)
+            .expect("the committed roster keeps the delivery");
+        assert_ne!(
+            delivery.recipients.get(survivor.as_bytes()),
+            Some(&RecipientDelivery::Due),
+            "the committed roster's round ran"
+        );
+        drop(inner);
         state.agent.shutdown().await;
     }
 }
@@ -5136,6 +5493,81 @@ mod restart_tests {
         Ok(())
     }
 
+    /// #1574 item 1: the plain roster persist also returns
+    /// `ReplacedNotDurable` from its durability preflight — an earlier
+    /// write is still unconfirmed and its re-save fails again — and that
+    /// outcome stages no candidate. The author keeps its held mandate and
+    /// schedules no delivery; the roster keeps the parent. Before the
+    /// fix the author retired its mandate — here the owner's own agent is
+    /// the promoted member, so no owner wait existed to re-send it — and
+    /// scheduled a delivery for a roster the map never installed.
+    #[tokio::test]
+    async fn a_recovery_whose_confirming_resave_fails_keeps_its_mandate() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let author = offline_author(dir.path(), [0x74; 32]).await?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let info = recovery_parent(owner, &admin, [author.agent.identity().agent_keypair()])?;
+        let stable = info.stable_group_id().to_string();
+        hold_persisted(&author, &info).await?;
+        revoke(&author, &admin).await?;
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let (status, Json(body)) =
+            sign_recovery_mandate(&author, owner, &stable, &author_hex).await;
+        anyhow::ensure!(status == StatusCode::ACCEPTED, "mandate: {body}");
+        // The route starts its own drive. Finish that attempt before
+        // the pass opens the head-sync round and before installing the
+        // one-shot fault below. Otherwise it can race the explicit
+        // attempt, consume the fault, and let the other attempt commit.
+        let tasks = {
+            let mut tasks = author
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tasks.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in tasks {
+            task.await?;
+        }
+        assert_eq!(
+            head_of(&author, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the route's drive waits for head sync before the fault is armed"
+        );
+        super::super::revocation_eviction_pass(&author).await;
+
+        author
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _fault = super::super::super::set_save_fault(
+            &author,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        try_commit(&author, &stable).await;
+        {
+            let inner = author.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.orc.pending.contains_key(&stable),
+                "the held mandate is kept"
+            );
+            assert!(
+                !inner.orc.deliveries.contains_key(&stable),
+                "no delivery is scheduled for an install that never happened"
+            );
+        }
+        assert_eq!(
+            head_of(&author, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the roster keeps the parent head"
+        );
+        author.agent.shutdown().await;
+        Ok(())
+    }
+
     /// Codex P1 (#1508 r6), receiver side: the receiver's roster write
     /// renames the file and the directory fsync fails. The recovery is
     /// installed, so the receiver reports it applied and serves the frame.
@@ -5160,6 +5592,39 @@ mod restart_tests {
         );
         let frames = served(&receiver, &stable, info.state_revision).await;
         assert_eq!(frames, vec![(result_head, bytes)]);
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1574 item 1: the durability preflight's `ReplacedNotDurable`
+    /// stages nothing, so the receiver keeps the frame (`Retained`) and
+    /// the roster keeps the parent. Before the fix the receiver returned
+    /// `Applied` and dropped its mandate waits for an install that never
+    /// happened.
+    #[tokio::test]
+    async fn a_received_recovery_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()>
+    {
+        let (author_dir, receiver_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (receiver, info, bytes, _result_head, _admin) =
+            received_recovery(author_dir.path(), receiver_dir.path()).await?;
+        let stable = info.stable_group_id().to_string();
+        receiver
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _fault = super::super::super::set_save_fault(
+            &receiver,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        assert_eq!(
+            receive_bytes(&receiver, &bytes).await?,
+            ReceiveOutcome::Retained { verified: true },
+            "nothing was installed"
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the roster keeps the parent head"
+        );
         receiver.agent.shutdown().await;
         Ok(())
     }
@@ -6280,6 +6745,143 @@ mod restart_tests {
             .map(|(_, share)| share)
             .next_back()
             .context("Q seals its current secret to the survivor")
+    }
+
+    /// #1579: a competing recovery frame kept below the head never stops
+    /// the catch-up round — proven at the real `serve_catchup` loop. Two
+    /// promoted members hold the owner key and seal competing recoveries
+    /// from one parent; this node commits its own and holds the other as
+    /// evidence, first in the log. The round skips the competitor, sends
+    /// the on-chain frame (the test-build in-process stand-in admits it)
+    /// and then seals the current secret to the requester: the scheduled
+    /// share is the evidence the round ran past the competitor to its
+    /// end. A `return` at the skip ends the round on the competitor, and
+    /// no share is sealed.
+    #[tokio::test]
+    async fn the_catchup_round_skips_a_competing_recovery_frame_and_seals_the_share() -> Result<()>
+    {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let owner_seed = [0x73; 32];
+        let author = offline_author(author_dir.path(), owner_seed).await?;
+        let survivor = zero_restart_wait(
+            offline_daemon(
+                survivor_dir.path(),
+                Some(x0x::identity::UserKeypair::from_seed(&owner_seed)?),
+            )
+            .await?,
+        )?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let survivor_id = survivor.agent.agent_id();
+        let survivor_hex = hex::encode(survivor_id.as_bytes());
+        let author_hex = hex::encode(author.agent.agent_id().as_bytes());
+        let mut info = recovery_parent(
+            owner,
+            &admin,
+            [
+                author.agent.identity().agent_keypair(),
+                survivor.agent.identity().agent_keypair(),
+            ],
+        )?;
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        {
+            use base64::Engine as _;
+            for (state, seat) in [
+                (&author, author_hex.clone()),
+                (&survivor, survivor_hex.clone()),
+            ] {
+                info.members_v2
+                    .get_mut(&seat)
+                    .context("seat")?
+                    .kem_public_key_b64 = Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(&state.agent_kem_keypair.public_bytes),
+                );
+            }
+        }
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        for state in [&author, &survivor] {
+            hold_persisted(state, &info).await?;
+            revoke(state, &admin).await?;
+        }
+        // Each daemon holds the other's current verified advert, so the
+        // capability gate never withholds and no commit waits on D76.
+        let bits = x0x::dm::CapabilityRegistry::current().bits;
+        let now = x0x::dm_capability::now_unix_ms();
+        super::tests::advertise(&author, survivor_id, bits, now);
+        super::tests::advertise(&survivor, author.agent.agent_id(), bits, now);
+        // The survivor seals a competing recovery from the same parent.
+        let (competed, competitor_bytes) = commit_own_recovery(&survivor, &stable, &info).await?;
+        // The competitor enters this node's log first: the evidence the
+        // round must serve past, before this node commits its own branch.
+        {
+            let mut inner = author.revocation_evictions.inner.lock().await;
+            inner.orc.log.remember(
+                &stable,
+                competed.state_revision,
+                competed.state_hash.as_str(),
+                Arc::new(competitor_bytes),
+                false,
+            );
+        }
+        let (committed, _bytes) = commit_own_recovery(&author, &stable, &info).await?;
+        anyhow::ensure!(
+            committed.state_revision == competed.state_revision
+                && committed.state_hash != competed.state_hash,
+            "the two recoveries compete at one revision"
+        );
+        let order: Vec<String> = author
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .orc
+            .log
+            .catchup_frames(std::slice::from_ref(&stable), info.state_revision)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert_eq!(
+            order,
+            vec![competed.state_hash.clone(), committed.state_hash.clone()],
+            "the round meets the competitor first, then the on-chain frame"
+        );
+        // The real round: skip the competitor, serve the on-chain frame,
+        // seal the current secret to the requester.
+        let before = scheduled_shares(&author).len();
+        serve_catchup(
+            &author,
+            &survivor_id,
+            std::slice::from_ref(&stable),
+            info.state_revision,
+        )
+        .await;
+        let share = scheduled_shares(&author)
+            .into_iter()
+            .skip(before)
+            .filter(|(to, _)| *to == survivor_hex)
+            .map(|(_, share)| share)
+            .next_back()
+            .context("the round served past the competitor and sealed the share")?;
+        let expected = <[u8; 32]>::try_from(
+            committed
+                .shared_secret
+                .as_deref()
+                .context("the committed secret")?,
+        )?;
+        assert_eq!(
+            open_share(&share, &survivor.agent_kem_keypair)?,
+            (committed.secret_epoch, expected),
+            "the share opens to the current secret"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
     }
 
     /// Codex P1 (#1508 rc12 r3): the recovery promotes P, P promotes Q,

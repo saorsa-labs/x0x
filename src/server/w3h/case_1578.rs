@@ -10,13 +10,21 @@
 //! encrypted groups are TreeKEM).
 //!
 //! The #1578 shape and the injection. A seat's KEM public key is local
-//! data: `compute_roster_root` hashes only `id:role:state[:cert]`, so
-//! one member's view of a seat can differ from another's. The injection
-//! removes C's seat key from TWO live roster maps, under each node's own
-//! `named_groups` write lock: on A (the author side — `spawn_gss_share_to`
-//! then logs `no KEM key on record for a survivor` and skips the seal, so
-//! no share of the rotated secret can ever reach C) and on C itself (the
-//! receiver side — the `own_seat_cannot_take_a_share` predicate). Each
+//! data: `compute_roster_root` hashes only `id:role:state[:cert]`, and
+//! the roster projection a state commit carries has no KEM field at
+//! all, so one member's view of a seat differs from another's by
+//! design. The inviter seats a joiner's key from its verified
+//! `MemberJoined`, and (rc7) the join seats the same key on the
+//! joiner's OWN copy of its own seat — before rc7 the joiner's own view
+//! never carried one, so the receiver-side keyless predicate matched
+//! every joiner. The injection removes the key from BOTH live copies,
+//! under each node's own `named_groups` write lock: on A (the author
+//! side — `spawn_gss_share_to` then logs `no KEM key on record for a
+//! survivor` and skips the seal, so no share of the rotated secret can
+//! ever reach C) and on C itself (the receiver side — the
+//! `own_seat_cannot_take_a_share` predicate). On `main` the red run
+//! finds C's own copy already keyless (the pre-rc7 gap) and skips that
+//! strip; the recorded evidence stage names the shape it saw. Each
 //! daemon keeps its own `agent_kem_keypair`; only the roster row is
 //! stripped, so the sealed chain and every head stay untouched. This
 //! mirrors the local fixture `gss_leave_fixture_build(None, false)`
@@ -306,6 +314,9 @@ async fn served_head_claim(
         crate::server::routes::named_groups::handle_treekem_catchup_request(
             &state,
             &requester_id,
+            // #1616: the DM's QUIC-authenticated sender machine; clean
+            // here (the clean-machine id no test revokes).
+            &crate::identity::MachineId([0x16; 32]),
             true,
             request,
         )
@@ -453,16 +464,18 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let c_hex = sim.agent_hex("C")?;
 
     // The precondition the injection removes: C's seat carries a KEM key
-    // in A's copy and in C's own.
-    let what = "C's seat carries a KEM key on A and on C";
+    // in A's copy (the inviter seated it from C's verified MemberJoined)
+    // and in C's own (the join records the key it publishes, #1578 rc7).
+    // On `main` the joiner's own view never carried one — the join stub
+    // seated no KEM material — which is itself the gap rc7 closed; the
+    // evidence stage below records which shape this run sees.
+    let what = "C's seat carries a KEM key on A";
     let mut seen = Observations::default();
     sim.until(what, SETUP, async |s: &Sim| {
-        for holder in ["A", "C"] {
-            match seen.observe(seat_kem(s, holder, &group, &c_hex)).await {
-                Some(true) => {}
-                Some(false) => return false,
-                None => return true,
-            }
+        match seen.observe(seat_kem(s, "A", &group, &c_hex)).await {
+            Some(true) => {}
+            Some(false) => return false,
+            None => return true,
         }
         true
     })
@@ -524,7 +537,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     receipt.evidence(
         "c_seat_carried_a_kem_key_before_the_injection",
         true,
-        "waited until both A's copy and C's own copy seated the key".to_string(),
+        "waited until A's copy seated the key; rc7 seats the joiner's own copy at join".to_string(),
         at(sim),
     );
     receipt.evidence(
@@ -535,8 +548,29 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     );
     ensure!(c_before, "C could not decrypt at e0 before the leave");
 
-    // The injection (both copies; see the module notes).
-    strip_seat_kem(sim, "C", &group, &c_hex).await?;
+    // The injection (see the module notes). A's copy: the inviter's
+    // record, stripped unconditionally. C's own copy: keyed by the join
+    // (rc7) and stripped here; on `main` it never carried the key, so
+    // the strip is skipped and the natural gap is recorded instead.
+    let c_own_key_seated = sim
+        .within(
+            "read C's own copy of its seat",
+            secs(5),
+            seat_kem(sim, "C", &group, &c_hex),
+        )
+        .await??;
+    receipt.note(if c_own_key_seated {
+        "the join seated the joiner's own key in its own view (rc7); the \
+         injection strips it there"
+            .to_string()
+    } else {
+        "the joiner's own view never carried the key (the pre-rc7 gap; \
+         main) — the strip is skipped and the natural gap is the shape"
+            .to_string()
+    });
+    if c_own_key_seated {
+        strip_seat_kem(sim, "C", &group, &c_hex).await?;
+    }
     strip_seat_kem(sim, "A", &group, &c_hex).await?;
     sim.fabric()
         .mark("fault: C's roster seat carries no KEM key (A's copy and C's own; #1578 shape)");
@@ -731,7 +765,9 @@ async fn run(case: &str, seed: u64) -> Receipt {
     receipt.note(
         "The #1578 injection removes the survivor seat's KEM public key from the live roster \
          maps of A (the author: no share can be sealed to the seat) and C (the receiver: the \
-         keyless-install predicate). The key is local data, not in the roster root, so the \
+         keyless-install predicate). The join seats the joiner's own key in its own view \
+         (rc7); a run that finds C's own copy already keyless (pre-rc7, main) skips that \
+         strip and records the gap. The key is local data, not in the roster root, so the \
          chain and every head are untouched; each daemon keeps its own agent_kem_keypair. \
          This mirrors gss_leave_fixture_build(None, false) in the local fixture.",
     );

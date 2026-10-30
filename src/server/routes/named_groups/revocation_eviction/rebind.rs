@@ -131,7 +131,7 @@ pub(super) struct RebindState {
     deliveries: HashMap<(String, String), Delivery>,
     /// Frames held for catch-up; the authored and the received frames are
     /// durable ([`replay_log`]).
-    log: replay_log::HeldLog<CRB_LOG_PER_GROUP>,
+    log: replay_log::HeldLog<CRB_LOG_PER_GROUP, true>,
     stash: FrameStash<CRB_STASH_CAP>,
     /// Verified renewals an admin holds for a seat, from a hand-off.
     renewals: HashMap<EvictionKey, AgentCertificate>,
@@ -177,7 +177,7 @@ impl RebindState {
     }
 }
 
-fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROUP> {
+fn held(inner: &mut super::S4Inner) -> &mut replay_log::HeldLog<CRB_LOG_PER_GROUP, true> {
     &mut inner.rebind.log
 }
 
@@ -398,6 +398,30 @@ enum CommitError {
     Persist(String),
 }
 
+/// Whether `next`'s head is the installed roster head of `group_key`.
+/// #1574 item 1: `persist_named_group_info` also returns
+/// `ReplacedNotDurable` from its durability preflight, where an earlier
+/// write was still unconfirmed and its re-save failed again, so this
+/// candidate was never staged (the flag short-circuit in
+/// `persist_named_group_info_inner`). That outcome installed nothing. The
+/// commit sites below treat `ReplacedNotDurable` as committed only after
+/// this check. The read holds `named_groups_persistence_lock`, so it sees
+/// only installed or restored roster state.
+///
+/// Known open gap (#1574): the preflight early return itself is not
+/// fixed here. `named_groups.rs` is fenced to the slice that owns it
+/// (#1627 and the card-routes run). Until that slice changes the
+/// preflight, this caller-side check is the guard for it.
+async fn roster_head_installed(state: &AppState, group_key: &str, next: &GroupInfo) -> bool {
+    let _committed = state.named_groups_persistence_lock.lock().await;
+    state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .is_some_and(|info| info.state_hash == next.state_hash)
+}
+
 /// Seal, check, persist and schedule delivery of one rebind. The caller
 /// holds `group_key`'s membership lock and read `info` under it.
 ///
@@ -459,18 +483,42 @@ async fn commit_locked(
     }
     let persisted = match ng::persist_named_group_info(state, group_key, next.clone()).await {
         Ok(ng::AtomicWriteOutcome::Durable) => Ok(()),
-        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable)
+            if roster_head_installed(state, group_key, &next).await =>
+        {
             // The replacement is visible on disk and in memory, so the
             // commit stands and its delivery is scheduled. The guarded
             // egress sends nothing until the re-save is durable (§5).
+            //
+            // #1574 item 1: treating this arm as committed is enough for
+            // the drops below. The persist keeps the candidate in the map
+            // on this outcome (it rolls back only `NotReplaced` and hard
+            // errors), so this process never sees the install revert.
+            // A power loss before a confirming save is the one revert.
+            // It erases the memory-only `admin_waits`/`renewals`/`held`
+            // entries whether or not they were dropped. The durable frame
+            // above is chain evidence, not a re-drive: a restart restores
+            // an authored frame only at the loaded head. The recovery is
+            // re-derivation. The reverted roster re-opens the seat's
+            // expiry trigger, and the hand-off or self-rebind path seals
+            // a fresh frame against the same parent. The first frame was
+            // never sent (the §5 egress guard held it), so the fresh one
+            // cannot equivocate with it.
             tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: certificate rebind persisted without a durability confirmation");
             Ok(())
+        }
+        // #1574 item 1: the durability preflight returned
+        // `ReplacedNotDurable` without staging this candidate (an earlier
+        // write is still unconfirmed and its re-save failed again).
+        // Nothing was installed, so the commit does not stand.
+        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+            Err("durability preflight refused the replacement".to_string())
         }
         Ok(ng::AtomicWriteOutcome::NotReplaced) => Err("not replaced".to_string()),
         Err(error) => Err(error.to_string()),
     };
     if let Err(error) = persisted {
-        replay_log::rewrite_from_memory(state, ext, held, stable).await;
+        replay_log::rewrite_without(state, ext, held, stable, at).await;
         return Err(CommitError::Persist(error));
     }
     ng::refresh_group_card_cache_from_info(state, group_key, &next).await;
@@ -1392,14 +1440,26 @@ async fn drive_held(state: &Arc<AppState>) {
 /// End the seat agent's `waiting_for_admin_rebind` once a rebind or a
 /// removal for its seat landed.
 async fn prune_admin_waits(state: &AppState) {
-    let seats: HashMap<EvictionKey, Option<String>> = {
-        let groups = state.named_groups.read().await;
+    let keys: Vec<EvictionKey> = {
         let inner = state.revocation_evictions.inner.lock().await;
         inner
             .rebind
             .admin_waits
             .keys()
             .chain(inner.rebind.renewals.keys())
+            .cloned()
+            .collect()
+    };
+    // #1574 item 5: the retains below end an admin wait ("the seat's
+    // committed digest moved") or drop a held renewal ("the seat left")
+    // on this read, so it reads committed roster state only (the pattern
+    // of `committed_group_by_stable`, #1620): a rebind or removal
+    // candidate mid-write must not end either. Lock order: persistence,
+    // then `named_groups` (the pass's snapshot order), no S4 lock held.
+    let seats: HashMap<EvictionKey, Option<String>> = {
+        let _committed = state.named_groups_persistence_lock.lock().await;
+        let groups = state.named_groups.read().await;
+        keys.into_iter()
             .map(|key| {
                 let digest = groups
                     .values()
@@ -1407,7 +1467,7 @@ async fn prune_admin_waits(state: &AppState) {
                     .and_then(|info| info.members_v2.get(&hex::encode(key.target)))
                     .filter(|member| member.state == GroupMemberState::Active)
                     .and_then(cr::committed_digest);
-                (key.clone(), digest)
+                (key, digest)
             })
             .collect()
     };
@@ -1544,6 +1604,15 @@ async fn drive_deliveries(state: &Arc<AppState>) {
     let now = Instant::now();
     let restored: BTreeSet<String> = {
         let mut inner = state.revocation_evictions.inner.lock().await;
+        // #1574 item 6: a delivery past `CRB_DELIVERY_TTL` ends with no
+        // convergence accounting, and that evidence is enough: the frame
+        // carries no key material (§4a), so nothing must be re-sealed,
+        // and while the frame stays within the catch-up log's per-group
+        // bound, `rebind.log` (served by `serve_catchup`) still serves
+        // the exact bytes to a survivor that asks. The seat's row then
+        // completes from the committed roster through the pass. If a
+        // power loss reverts the roster first, the reverted roster
+        // re-opens the seat's expiry trigger, so the work re-opens too.
         inner.rebind.deliveries.retain(|_, delivery| {
             now.saturating_duration_since(delivery.started) < CRB_DELIVERY_TTL
         });
@@ -1583,9 +1652,19 @@ async fn drive_deliveries(state: &Arc<AppState>) {
     let local = *state.agent.agent_id().as_bytes();
     let capabilities = state.agent.capability_store();
     for (key, delivery) in due {
+        // #1574 item 5: this read decides a drop ("group gone", "head
+        // moved"), so it holds `named_groups_persistence_lock`:
+        // `persist_named_group_info` shows its candidate in the map before
+        // the write and restores the map when the write fails, and an
+        // unlocked read could drop a delivery on a candidate that rolls
+        // back. The guard covers only the read; the sends below take no
+        // lock that a roster write holds.
         let info = {
-            let groups = state.named_groups.read().await;
-            groups
+            let _committed = state.named_groups_persistence_lock.lock().await;
+            state
+                .named_groups
+                .read()
+                .await
                 .values()
                 .find(|info| info.stable_group_id() == key.0)
                 .cloned()
@@ -1720,10 +1799,14 @@ fn spawn_send(
 /// `group_ids`) above `from_revision`, oldest first, to a catch-up
 /// requester, on the distinct gated carrier only. A requester without a
 /// current verified advert setting `certificate_rebind_v1` gets nothing:
-/// the frame never goes into a legacy-decoded catch-up page. Each write
-/// uses [`guarded_admission_for`] with [`HeadRule::OnChain`]: ADR 0107's
-/// serving guard plus D60 under the membership lock, re-checked at the
-/// seam immediately before the physical write.
+/// the frame never goes into a legacy-decoded catch-up page. A competing
+/// frame kept as fork evidence (#1579) is not on this node's verified
+/// chain, so it is skipped, not served, and it does not stop the round.
+/// A fork-quarantined group serves nothing on purpose: `head_rule_admits`
+/// refuses every frame of it, so the skip leaves the round empty.
+/// Each write uses [`guarded_admission_for`] with [`HeadRule::OnChain`]:
+/// ADR 0107's serving guard plus D60 under the membership lock,
+/// re-checked at the seam immediately before the physical write.
 pub(in crate::server) async fn serve_catchup(
     state: &Arc<AppState>,
     requester: &AgentId,
@@ -1739,7 +1822,27 @@ pub(in crate::server) async fn serve_catchup(
         .rebind
         .log
         .catchup_frames(group_ids, from_revision);
+    // The frames all come from one group (`catchup_frames` serves the
+    // first of `group_ids` that has a log).
+    let info = {
+        let groups = state.named_groups.read().await;
+        frames.first().and_then(|(group, _, _)| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == group)
+                .cloned()
+        })
+    };
+    let Some(info) = info else {
+        return;
+    };
     for (group_id, result_head, bytes) in frames {
+        // #1579: a competing frame kept as fork evidence is not on this
+        // node's verified chain. It is never served, and it does not stop
+        // the round for the frames that are.
+        if !head_rule_admits(&info, &HeadRule::OnChain(result_head.clone())) {
+            continue;
+        }
         let admission = guarded_admission_for(
             state,
             &group_id,
@@ -2038,17 +2141,33 @@ pub(in crate::server) async fn receive(
     {
         Ok(next) => next,
         Err(error) => {
-            replay_log::rewrite_from_memory(state, ext, held, stable).await;
+            replay_log::rewrite_without(state, ext, held, stable, at).await;
             tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0110 S4: certificate rebind commit refused: {error}");
             return ReceiveOutcome::Refused(cr::CertificateRebindRefusal::StateMismatch);
         }
     };
-    match ng::persist_named_group_info(state, &group_key, next.clone()).await {
-        Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable) => {}
-        Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => {
-            // A local fault: the frame stays durable and in the stash.
-            return ReceiveOutcome::LocalFailure;
+    let installed = match ng::persist_named_group_info(state, &group_key, next.clone()).await {
+        // #1574 item 1: `Applied` on the non-durable outcome is enough for
+        // the drops below. The frame was made durable before the install
+        // (`write_received` above), and a restart puts a received frame
+        // above the loaded head back through the stash, so a power-loss
+        // revert re-runs this install and these drops on the durable
+        // frame. The dropped `renewals`/`admin_waits` entries are
+        // memory-only, and the reverted roster re-derives them: the seat's
+        // expiry obligation opens again, so the renewal hand-off and the
+        // admin wait are re-armed.
+        Ok(ng::AtomicWriteOutcome::Durable) => true,
+        // The preflight can return this outcome without staging this
+        // candidate (#1574 item 1, `roster_head_installed`): the install
+        // then did not happen, and the frame stays for a retry.
+        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
+            roster_head_installed(state, &group_key, &next).await
         }
+        Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
+    };
+    if !installed {
+        // A local fault: the frame stays durable and in the stash.
+        return ReceiveOutcome::LocalFailure;
     }
     ng::refresh_group_card_cache_from_info(state, &group_key, &next).await;
     {
@@ -2542,7 +2661,7 @@ mod tests {
 mod daemon_tests {
     use super::super::super as ng;
     use super::*;
-    use anyhow::Result;
+    use anyhow::{Context, Result};
 
     /// Install a verified advert. The store keeps an advert only when it is
     /// strictly newer than the held one, so each call passes a later
@@ -2872,6 +2991,236 @@ mod daemon_tests {
         }
         Ok(())
     }
+
+    /// #1574 item 5: `drive_deliveries` drops a delivery on its
+    /// "withdrawn / gone / off the chain" read, so the read must hold
+    /// `named_groups_persistence_lock`: `persist_named_group_info` shows
+    /// its candidate in the map before the write and restores the map when
+    /// the write fails. Before the fix the drive read a mid-write withdraw
+    /// candidate and dropped the delivery the committed roster still
+    /// admits.
+    #[tokio::test]
+    async fn a_rebind_delivery_drop_waits_out_a_roster_candidate_that_rolls_back() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let survivor = AgentId([0x7A; 32]);
+        let group_id = "c9".repeat(16);
+        let mut info = GroupInfo::new(
+            "s4".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.add_member(
+            hex::encode(survivor.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(state.agent.agent_id().as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        let key = (stable.clone(), info.state_hash.clone());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.rebind.deliveries.insert(
+                key.clone(),
+                Delivery {
+                    bytes: Arc::new(b"X0XCRB1\0frame".to_vec()),
+                    result_head: info.state_hash.clone(),
+                    recipients: BTreeMap::from([(*survivor.as_bytes(), RecipientDelivery::Due)]),
+                    next_at: Instant::now(),
+                    started: Instant::now(),
+                    resumed: false,
+                },
+            );
+        }
+        // The mid-write window: a withdraw candidate is in the map while
+        // the persistence lock is held — exactly what a failing
+        // `persist_named_group_info` restores.
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate.withdrawn = true;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate);
+        let driven = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { drive_deliveries(&state).await })
+        };
+        for _ in 0..30 {
+            if driven.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .deliveries
+                .contains_key(&key),
+            "the drop must block on the persistence lock, not read the mid-write candidate"
+        );
+        // The write failed: the map is restored under the same lock hold.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        drop(guard);
+        driven.await?;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let delivery = inner
+            .rebind
+            .deliveries
+            .get(&key)
+            .context("the committed roster keeps the delivery")?;
+        assert_ne!(
+            delivery.recipients.get(survivor.as_bytes()),
+            Some(&RecipientDelivery::Due),
+            "the committed roster's round ran"
+        );
+        Ok(())
+    }
+
+    /// #1574 item 5 (the review follow-up): `prune_admin_waits` ends the
+    /// seat agent's admin wait ("the seat's committed digest moved") or
+    /// drops its held renewal ("the seat left") on a roster read, so the
+    /// read must hold `named_groups_persistence_lock`:
+    /// `persist_named_group_info` shows its candidate in the map before
+    /// the write and restores the map when the write fails. Before the
+    /// fix the prune read a mid-write rebind candidate and ended the
+    /// wait on roster state that rolled back.
+    #[tokio::test]
+    async fn an_admin_wait_prune_waits_out_a_roster_candidate_that_rolls_back() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let seat = AgentId([0x7B; 32]);
+        let seat_hex = hex::encode(seat.as_bytes());
+        let group_id = "ca".repeat(16);
+        let mut info = GroupInfo::new(
+            "s4".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.add_member(
+            seat_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(state.agent.agent_id().as_bytes())),
+            None,
+        );
+        // The seat's committed digest is the wait's `old_digest`.
+        info.members_v2
+            .get_mut(&seat_hex)
+            .context("the seat's roster entry")?
+            .certificate_digest = Some("old-digest".to_string());
+        info.recompute_state_hash();
+        let key = EvictionKey::new(info.stable_group_id(), *seat.as_bytes());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.rebind.admin_waits.insert(
+                key.clone(),
+                AdminRebindWait {
+                    designated: None,
+                    old_digest: "old-digest".to_string(),
+                    renewal_digest: "new-digest".to_string(),
+                    since_unix_ms: 0,
+                    certificate: AgentCertificate::issue_with_expiry(
+                        &x0x::identity::UserKeypair::generate().context("owner")?,
+                        &x0x::identity::AgentKeypair::generate().context("agent")?,
+                        Some(10),
+                    )
+                    .context("certificate")?,
+                    next_at: Instant::now(),
+                },
+            );
+        }
+        // The mid-write window: a rebind candidate is in the map while
+        // the persistence lock is held — exactly what a failing
+        // `persist_named_group_info` restores.
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate
+            .members_v2
+            .get_mut(&seat_hex)
+            .context("the candidate's roster entry")?
+            .certificate_digest = Some("new-digest".to_string());
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), candidate.clone());
+        let driven = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { prune_admin_waits(&state).await })
+        };
+        for _ in 0..30 {
+            if driven.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .admin_waits
+                .contains_key(&key),
+            "the prune must block on the persistence lock, not read the mid-write candidate"
+        );
+        // The write failed: the map is restored under the same lock hold.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        drop(guard);
+        driven.await?;
+        assert!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .admin_waits
+                .contains_key(&key),
+            "the committed roster keeps the wait"
+        );
+        // The refusal is narrow: a rebind that really lands still ends
+        // the wait.
+        state.named_groups.write().await.insert(group_id, candidate);
+        prune_admin_waits(&state).await;
+        assert!(
+            !state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .rebind
+                .admin_waits
+                .contains_key(&key),
+            "a landed rebind still ends the wait"
+        );
+        Ok(())
+    }
 }
 
 /// #1508 review (Codex P1 F2 and F3): a received frame survives a
@@ -3037,13 +3386,15 @@ pub(super) mod restart_tests {
         info
     }
 
-    /// An `OwnerCertified` group: `admin` is its admin, and `seat` and the
-    /// receiver are certified Members. Each certificate expires in ten
-    /// minutes. The frame rebinds `seat`'s certificate.
+    /// An `OwnerCertified` group: `admin` is its admin, and `seat`,
+    /// `peer` and the receiver are certified Members. Each certificate
+    /// expires in ten minutes. The frame rebinds `seat`'s certificate;
+    /// the competing frame renews `peer`'s.
     struct RebindFixture {
         owner: UserKeypair,
         admin: AgentKeypair,
         seat: AgentKeypair,
+        peer: AgentKeypair,
         info: GroupInfo,
     }
 
@@ -3052,6 +3403,7 @@ pub(super) mod restart_tests {
             let owner = UserKeypair::generate()?;
             let admin = AgentKeypair::generate()?;
             let seat = AgentKeypair::generate()?;
+            let peer = AgentKeypair::generate()?;
             let now = now_unix_ms() / 1000;
             let mut info = GroupInfo::new(
                 "crb".to_string(),
@@ -3062,7 +3414,7 @@ pub(super) mod restart_tests {
             info.policy.admission =
                 x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
             let admin_hex = hex::encode(admin.agent_id().as_bytes());
-            for member in [&seat, receiver] {
+            for member in [&seat, receiver, &peer] {
                 info.add_member(
                     hex::encode(member.agent_id().as_bytes()),
                     GroupRole::Member,
@@ -3070,7 +3422,7 @@ pub(super) mod restart_tests {
                     None,
                 );
             }
-            for member in [&admin, &seat, receiver] {
+            for member in [&admin, &seat, receiver, &peer] {
                 let cert = AgentCertificate::issue_with_expiry(&owner, member, Some(now + 600))?;
                 cr::install_certificate(
                     &mut info,
@@ -3079,16 +3431,32 @@ pub(super) mod restart_tests {
                 );
             }
             info.recompute_state_hash();
+            // The held state is a sealed parent, so its head is a retained
+            // commit: a later frame that does not chain from this node's
+            // head can be checked against it (#1579, the sibling rule).
+            // The admin renews its own certificate once; every fixture
+            // frame seals on that state.
+            let renewal = AgentCertificate::issue_with_expiry(&owner, &admin, Some(now + 900))?;
+            let (parent, _) = cr::seal(
+                &info,
+                *admin.agent_id().as_bytes(),
+                &renewal,
+                &admin,
+                now_unix_ms(),
+            )
+            .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
             Ok(Self {
                 owner,
                 admin,
                 seat,
-                info,
+                peer,
+                info: parent,
             })
         }
 
-        /// The admin's signed rebind of the seat, and its result head.
-        fn frame(&self) -> Result<(Vec<u8>, String)> {
+        /// The admin's signed rebind of the seat, its result head, and
+        /// the state the frame installs (the chain it retains).
+        fn frame_with_state(&self) -> Result<(Vec<u8>, String, GroupInfo)> {
             let now_ms = now_unix_ms();
             let renewal = AgentCertificate::issue_with_expiry(
                 &self.owner,
@@ -3096,6 +3464,35 @@ pub(super) mod restart_tests {
                 Some(now_ms / 1000 + 6000),
             )?;
             let seat = *self.seat.agent_id().as_bytes();
+            let (next, frame) = cr::seal(&self.info, seat, &renewal, &self.admin, now_ms)
+                .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+            let bytes = cr::encode_frame(&frame)?;
+            Ok((bytes, next.state_hash.clone(), next))
+        }
+
+        /// The admin's signed rebind of the seat, and its result head.
+        fn frame(&self) -> Result<(Vec<u8>, String)> {
+            let (bytes, head, _) = self.frame_with_state()?;
+            Ok((bytes, head))
+        }
+
+        /// A second, different rebind on the same parent: a competing
+        /// commit at the same revision (#1579) — the admin renews the
+        /// `peer` member, so a different roster root and result head. It
+        /// does not rebind the same seat again: after one of the pair
+        /// installs, that seat's committed certificate is the renewal,
+        /// and #1533 r11's sibling rule leaves a same-seat sibling
+        /// unvalidated (`CertificateEvidenceMissing` — the parent's
+        /// certificate bytes are gone). A sibling of another seat keeps
+        /// every certificate the rule reads, whichever frame installs.
+        fn competing_frame(&self) -> Result<(Vec<u8>, String)> {
+            let now_ms = now_unix_ms();
+            let renewal = AgentCertificate::issue_with_expiry(
+                &self.owner,
+                &self.peer,
+                Some(now_ms / 1000 + 7000),
+            )?;
+            let seat = *self.peer.agent_id().as_bytes();
             let (next, frame) = cr::seal(&self.info, seat, &renewal, &self.admin, now_ms)
                 .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
             let bytes = cr::encode_frame(&frame)?;
@@ -3243,6 +3640,350 @@ pub(super) mod restart_tests {
         let frames = served(&restarted, &stable, fixture.info.state_revision).await;
         assert_eq!(frames, vec![(result_head, bytes)]);
         restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1574 item 1: the durability preflight's `ReplacedNotDurable`
+    /// stages nothing (the confirming re-save failed again), so a
+    /// receiver reports a local failure, not `Applied`: the frame stays
+    /// durable for the retry and the roster keeps the parent. Before the
+    /// fix the receiver returned `Applied` and dropped the seat's waits
+    /// for an install that never happened.
+    #[tokio::test]
+    async fn a_received_rebind_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes, result_head) = fixture.frame()?;
+        receiver
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _fault = super::super::super::set_save_fault(
+            &receiver,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        let outcome = receive(&receiver, fixture.admin.agent_id(), &bytes).await;
+        assert_eq!(
+            outcome,
+            ReceiveOutcome::LocalFailure,
+            "nothing was installed"
+        );
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&fixture.info.state_hash),
+            "the roster keeps the parent head"
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&receiver, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 1, "the frame stays durable for the retry");
+        assert_eq!(on_disk[0].result_head, result_head);
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1574 item 1, the other arm: a received rebind still applies a
+    /// `ReplacedNotDurable` that staged its candidate (the #1508 r6
+    /// rule). The installed check refuses only the preflight outcome that
+    /// stages nothing.
+    #[tokio::test]
+    async fn a_received_rebind_still_applies_a_staged_replaced_not_durable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes, result_head) = fixture.frame()?;
+        let _fault = super::super::super::set_save_fault(
+            &receiver,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        let outcome = receive(&receiver, fixture.admin.agent_id(), &bytes).await;
+        assert_eq!(outcome, ReceiveOutcome::Applied, "the install is live");
+        assert_eq!(
+            head_of(&receiver, &stable).await.as_ref(),
+            Some(&result_head),
+            "the non-durable install is live"
+        );
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1579: a received frame at a revision the `.crblog` already holds
+    /// — the crash window left it there, memory has not installed it — is
+    /// written beside the held frame, never in its place, and both stay
+    /// durable. After the restart one installs and the other, a valid
+    /// sibling, contains the group as fork evidence. The competing frame
+    /// renews another member's seat: #1533 r11's sibling rule reads the
+    /// parent's certificate bytes for the signer and the rebound seat, so
+    /// a same-seat sibling is unprovable once one of the pair installs.
+    #[tokio::test]
+    async fn a_competing_rebind_frame_is_kept_as_fork_evidence() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes1, head1) = fixture.frame()?;
+        let (bytes2, head2) = fixture.competing_frame()?;
+        assert_ne!(head1, head2, "the fixture frames compete at one revision");
+
+        // The installs fail after each frame write (a crash at that
+        // point): the first frame stays in the file, and the second is
+        // written beside it.
+        let blocked = block_install(&receiver).await?;
+        assert_eq!(
+            receive(&receiver, fixture.admin.agent_id(), &bytes1).await,
+            ReceiveOutcome::LocalFailure
+        );
+        assert_eq!(
+            receive(&receiver, fixture.admin.agent_id(), &bytes2).await,
+            ReceiveOutcome::LocalFailure
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&receiver, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 2, "the competing frame is written");
+        assert_eq!(
+            (on_disk[0].result_head.as_str(), on_disk[0].frame.as_slice()),
+            (head1.as_str(), bytes1.as_slice()),
+            "the held frame is never replaced"
+        );
+        assert_eq!(
+            (on_disk[1].result_head.as_str(), on_disk[1].frame.as_slice()),
+            (head2.as_str(), bytes2.as_slice()),
+            "the competing frame is kept"
+        );
+
+        // The process dies before either install. The restart re-receives
+        // both: one installs, the other contains the group.
+        receiver.agent.shutdown().await;
+        drop(receiver);
+        unblock_install(blocked).await?;
+        let restarted = offline_daemon(dir.path(), None).await?;
+        ensure_restored(&restarted).await;
+        retry_stash(&restarted).await;
+        let head = head_of(&restarted, &stable).await.context("the head")?;
+        assert!(
+            head == head1 || head == head2,
+            "one of the competing pair installed: {head}"
+        );
+        assert!(
+            quarantine_of(&restarted, &stable).await.is_some(),
+            "the other frame contains the group as fork evidence"
+        );
+        let on_disk =
+            replay_log::tests::frames_on_disk(&restarted, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(on_disk.len(), 2, "both frames stay durable as evidence");
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1579 review: a revision holds two file-only frames plus the
+    /// newest write's, and no more. A signer can seal many distinct
+    /// valid frames at one revision; without the bound they fill the
+    /// per-group cap and the oldest frames leave — the catch-up window
+    /// below the head. The two places go to the revision's newest two
+    /// file-only frames, not the first two in file order (#1669): an
+    /// old crash leftover leaves before a newer frame still waiting to
+    /// install. Four distinct frames are written at one revision: the
+    /// newest two and the write's stay, the first — the oldest in file
+    /// order — leaves.
+    #[tokio::test]
+    async fn a_revision_keeps_two_file_only_frames_and_the_newest() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        hold_persisted(&receiver, &fixture.info).await?;
+        let (bytes1, head1) = fixture.frame()?;
+        let (bytes2, head2) = fixture.competing_frame()?;
+        let mut heads = vec![head1.clone(), head2.clone()];
+        let mut frames_in = vec![bytes1, bytes2];
+        for offset in [9000, 9500] {
+            let now_ms = now_unix_ms();
+            let renewal = AgentCertificate::issue_with_expiry(
+                &fixture.owner,
+                &fixture.seat,
+                Some(now_ms / 1000 + offset),
+            )?;
+            let (next, frame) = cr::seal(
+                &fixture.info,
+                *fixture.seat.agent_id().as_bytes(),
+                &renewal,
+                &fixture.admin,
+                now_ms,
+            )
+            .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+            heads.push(next.state_hash);
+            frames_in.push(cr::encode_frame(&frame)?);
+        }
+        let [h1, h2, h3, h4] = heads.as_slice() else {
+            anyhow::bail!("four frames");
+        };
+        assert!(h1 != h2 && h1 != h3 && h1 != h4 && h2 != h3 && h2 != h4 && h3 != h4);
+
+        let _blocked = block_install(&receiver).await?;
+        for bytes in &frames_in {
+            assert_eq!(
+                receive(&receiver, fixture.admin.agent_id(), bytes).await,
+                ReceiveOutcome::LocalFailure,
+                "the install stays blocked; the writes happen"
+            );
+        }
+        let on_disk =
+            replay_log::tests::frames_on_disk(&receiver, replay_log::REBIND_EXTENSION, &stable)
+                .await;
+        assert_eq!(
+            on_disk.len(),
+            3,
+            "two file-only frames and the newest: the third leaves, not the catch-up window"
+        );
+        assert_eq!(
+            (
+                on_disk[0].result_head.as_str(),
+                on_disk[1].result_head.as_str(),
+                on_disk[2].result_head.as_str()
+            ),
+            (h2.as_str(), h3.as_str(), h4.as_str()),
+            "the newest two and the write's stay; the oldest leaves"
+        );
+        receiver.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Install a verified advert for `peer`, as the daemon-tests helper
+    /// does: the catch-up gate reads the requester's current verified
+    /// advert.
+    fn advertise(state: &AppState, peer: AgentId, bits: u64, created_at_unix_ms: u64) {
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry { version: 1, bits };
+        assert!(
+            state.agent.capability_store().insert(
+                peer,
+                x0x::identity::MachineId([4; 32]),
+                capabilities,
+                created_at_unix_ms,
+            ),
+            "verified capability advert"
+        );
+    }
+
+    /// The tracing text `f` produces. These tests run on the current-thread
+    /// runtime, so the thread-local default subscriber sees every event of
+    /// the awaited future.
+    async fn captured_tracing(f: impl std::future::Future<Output = ()>) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f.await;
+        drop(_guard);
+        let bytes = std::mem::take(&mut *sink.0.lock().expect("sink"));
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// #1579: a competing frame kept below the head never stops the
+    /// catch-up round — proven at the real `serve_catchup` loop, offline.
+    /// The log holds the competitor first, then the on-chain frame (the
+    /// installed sibling's branch is this node's head). The loop's head
+    /// rule skips the competitor and still attempts the on-chain frame's
+    /// send, which goes through the real guarded admission and the
+    /// test-build in-process pinned stand-in: the stand-in's admitted
+    /// marker in the captured log is the evidence that the send ran and
+    /// passed the gate. A `return` at the skip (or serving the competitor,
+    /// whose send the seam refuses) ends the round on the competitor, and
+    /// the capture then holds no marker — the frame after the competitor
+    /// never leaves.
+    #[tokio::test]
+    async fn the_catchup_round_serves_past_a_competing_frame_below_the_head() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let receiver = offline_daemon(dir.path(), None).await?;
+        let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
+        let stable = fixture.info.stable_group_id().to_string();
+        let (bytes1, head1, head1_state) = fixture.frame_with_state()?;
+        let (bytes2, head2) = fixture.competing_frame()?;
+        assert_ne!(head1, head2, "the fixture frames compete at one revision");
+        // This node installed the sibling's branch: head1 is the head, and
+        // the competitor at the same revision is evidence only.
+        hold_persisted(&receiver, &head1_state).await?;
+        let revision = head1_state.state_revision;
+        {
+            let mut inner = receiver.revocation_evictions.inner.lock().await;
+            inner
+                .rebind
+                .log
+                .remember(&stable, revision, head2.as_str(), Arc::new(bytes2), false);
+            inner
+                .rebind
+                .log
+                .remember(&stable, revision, head1.as_str(), Arc::new(bytes1), false);
+        }
+        let order: Vec<String> = receiver
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .log
+            .catchup_frames(std::slice::from_ref(&stable), fixture.info.state_revision)
+            .into_iter()
+            .map(|(_, head, _)| head)
+            .collect();
+        assert_eq!(
+            order,
+            vec![head2.clone(), head1.clone()],
+            "the round meets the competitor first, then the on-chain frame"
+        );
+        // A capable member asks this node for catch-up.
+        let requester = fixture.peer.agent_id();
+        advertise(
+            &receiver,
+            requester,
+            x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+            now_unix_ms(),
+        );
+        let captured = captured_tracing(async {
+            serve_catchup(
+                &receiver,
+                &requester,
+                std::slice::from_ref(&stable),
+                fixture.info.state_revision,
+            )
+            .await;
+        })
+        .await;
+        assert!(
+            captured.contains("certificate rebind catch-up send refused or failed")
+                && captured.contains(x0x::dm::PINNED_STANDIN_ADMITTED),
+            "the round skipped the competitor and attempted the on-chain frame's send:\n{captured}"
+        );
+        receiver.agent.shutdown().await;
         Ok(())
     }
 
@@ -3514,6 +4255,202 @@ pub(super) mod restart_tests {
             .await
             .attempt_wait
             .contains_key(&key));
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1574 item 1: the plain roster persist also returns
+    /// `ReplacedNotDurable` from its durability preflight — an earlier
+    /// write is still unconfirmed and its re-save fails again — and that
+    /// outcome stages no candidate. The admin rebind must not treat it as
+    /// an install: nothing landed, so the renewal is kept, the wait stays
+    /// and no delivery is scheduled. Before the fix the commit dropped
+    /// the renewal and the wait and scheduled a delivery for a roster the
+    /// map never installed.
+    #[tokio::test]
+    async fn an_admin_rebind_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = UserKeypair::generate()?;
+        let seat = AgentKeypair::generate()?;
+        let seat_id = seat.agent_id();
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the fresh test state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let info = certified_group(&owner, state.agent.identity().agent_keypair(), &[&seat])?;
+        hold_persisted(&state, &info).await?;
+        let group_key = info.stable_group_id().to_string();
+        let seat_hex = hex::encode(seat_id.as_bytes());
+        let old_digest = info
+            .members_v2
+            .get(&seat_hex)
+            .and_then(cr::committed_digest)
+            .context("the seat's committed digest")?;
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            seat_id,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            now_unix_ms(),
+        ));
+        let key = EvictionKey::new(group_key.clone(), *seat_id.as_bytes());
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, &seat, Some(now_unix_ms() / 1000 + 6000))?;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
+                group_key.clone(),
+                HeadRound::new(&info.state_hash, Instant::now()),
+            );
+            inner.store.intake(
+                &key,
+                x0x::groups::eviction::EvictionTrigger::CertificateExpiry {
+                    certificate_digest: old_digest.clone(),
+                    not_after: now_unix_ms() / 1000,
+                },
+                None,
+                now_unix_ms(),
+                [0; 16],
+            );
+            inner.rebind.renewals.insert(key.clone(), renewal);
+        }
+        state
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _fault = super::super::super::set_save_fault(
+            &state,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        assert!(
+            try_admin_rebind(&state, &key, &group_key).await,
+            "a local write failure is handled here; the caller must not evict"
+        );
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.attempt_wait.get(&key).map(|wait| wait.cause),
+                Some(WaitingCause::WaitingForDurableIntake)
+            );
+            assert!(
+                inner.rebind.renewals.contains_key(&key),
+                "the renewal is kept"
+            );
+            assert!(
+                inner.rebind.deliveries.is_empty(),
+                "no delivery is scheduled for an install that never happened"
+            );
+        }
+        assert_eq!(
+            state.named_groups.read().await[&group_key].state_hash,
+            info.state_hash,
+            "the roster keeps the parent head"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1574 item 1, the other arm: a `ReplacedNotDurable` that did stage
+    /// its candidate still commits. The installed check must not
+    /// over-refuse the non-durable install the #1508 r6 rule keeps.
+    #[tokio::test]
+    async fn an_admin_rebind_still_commits_a_staged_replaced_not_durable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let owner = UserKeypair::generate()?;
+        let seat = AgentKeypair::generate()?;
+        let seat_id = seat.agent_id();
+        let mut state = offline_daemon(dir.path(), None).await?;
+        Arc::get_mut(&mut state)
+            .context("the fresh test state is not shared yet")?
+            .revocation_evictions = S4Runtime::new(S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..S4Timing::default()
+        });
+        let info = certified_group(&owner, state.agent.identity().agent_keypair(), &[&seat])?;
+        hold_persisted(&state, &info).await?;
+        let group_key = info.stable_group_id().to_string();
+        let seat_hex = hex::encode(seat_id.as_bytes());
+        let old_digest = info
+            .members_v2
+            .get(&seat_hex)
+            .and_then(cr::committed_digest)
+            .context("the seat's committed digest")?;
+        let mut capabilities = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        capabilities.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
+        };
+        assert!(state.agent.capability_store().insert(
+            seat_id,
+            x0x::identity::MachineId([4; 32]),
+            capabilities,
+            now_unix_ms(),
+        ));
+        let key = EvictionKey::new(group_key.clone(), *seat_id.as_bytes());
+        let renewal =
+            AgentCertificate::issue_with_expiry(&owner, &seat, Some(now_unix_ms() / 1000 + 6000))?;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.head_rounds.insert(
+                group_key.clone(),
+                HeadRound::new(&info.state_hash, Instant::now()),
+            );
+            inner.store.intake(
+                &key,
+                x0x::groups::eviction::EvictionTrigger::CertificateExpiry {
+                    certificate_digest: old_digest.clone(),
+                    not_after: now_unix_ms() / 1000,
+                },
+                None,
+                now_unix_ms(),
+                [0; 16],
+            );
+            inner.rebind.renewals.insert(key.clone(), renewal);
+        }
+        let _fault = super::super::super::set_save_fault(
+            &state,
+            super::super::super::SaveFault::ReplacedNotDurableAfterWrite,
+        );
+        assert!(try_admin_rebind(&state, &key, &group_key).await);
+        let rebound = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .cloned()
+            .context("group")?;
+        assert_ne!(
+            rebound.state_hash, info.state_hash,
+            "the non-durable install is live"
+        );
+        assert_ne!(
+            rebound
+                .members_v2
+                .get(&seat_hex)
+                .and_then(cr::committed_digest),
+            Some(old_digest),
+            "the rebind committed"
+        );
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert!(
+            !inner.rebind.renewals.contains_key(&key),
+            "the consumed renewal is dropped"
+        );
+        assert!(
+            inner
+                .rebind
+                .deliveries
+                .keys()
+                .any(|(stable, _)| *stable == group_key),
+            "the delivery is scheduled"
+        );
+        drop(inner);
         state.agent.shutdown().await;
         Ok(())
     }

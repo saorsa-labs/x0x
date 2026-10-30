@@ -37,6 +37,12 @@ use super::routes::{
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
 
+/// The gossip roster hint last published per group, by stable ID: the
+/// group's metadata topic and active members, or `None` for a withdrawn
+/// group ([`AppState::group_roster_gossip_lock`]).
+pub(super) type GossipRosterHints =
+    BTreeMap<String, Option<(String, String, Vec<x0x::identity::AgentId>)>>;
+
 fn validate_instance_name_grammar(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.len() > 64 {
         anyhow::bail!("instance name must be 1-64 characters");
@@ -900,12 +906,14 @@ pub(super) struct AppState {
     /// failure rollback, and REST-vs-rehydrate cannot spawn duplicate
     /// long-lived sync listeners. Keyed by `"{kind}:{id}"`.
     pub(super) crdt_handle_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
-    pub(super) named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
+    pub(super) named_groups: super::reseat_scope::ScopedGroupMap<x0x::groups::GroupInfo>,
     /// Orders every GSS encrypted KV seal/publish with authoritative roster
     /// transactions. Writers hold it through durability or rollback.
     pub(super) gss_publication_gate: Arc<RwLock<()>>,
     /// Orders roster snapshots sent to gossip after committed mutations.
-    pub(super) group_roster_gossip_lock: Mutex<()>,
+    /// It holds the roster last published for each group (by stable ID;
+    /// `None` = withdrawn), which a held-back group keeps (#1570).
+    pub(super) group_roster_gossip_lock: Mutex<GossipRosterHints>,
     pub(super) named_groups_path: PathBuf,
     /// Issue #451: disk location of the Home-Suite sidecar
     /// (`home-suite-groups.json`) — the AUTHORITATIVE durable state for
@@ -965,7 +973,7 @@ pub(super) struct AppState {
     pub(super) profile: RwLock<x0x::profile::SelfProfile>,
     /// On-disk location of the self-profile.
     pub(super) profile_path: PathBuf,
-    pub(super) mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
+    pub(super) mls_groups: super::reseat_scope::ScopedGroupMap<x0x::mls::MlsGroup>,
     #[allow(dead_code)]
     pub(super) mls_groups_path: PathBuf,
     /// Authority-signed MemberAdded results staged by an anchor for joiner polling.
@@ -1117,12 +1125,17 @@ pub(super) struct AppState {
     pub(super) pending_join_refusals: StdMutex<HashMap<String, PendingJoinRefusal>>,
     /// ADR 0108 §8 (#1575): member-side staged join pending notices, keyed
     /// `(group_id, member_agent_id, attempt_id)` like the staged refusals.
-    /// Unsigned typed local state for held join attempts: the signed wire
-    /// `JoinPendingNotice` and its `Pending` serving arm wait on David's
-    /// ruling (#1575), so nothing here is served to a joiner. Memory-only,
-    /// TTL-swept at the join staging lifetime.
+    /// Typed local state for held join attempts; the signed wire body
+    /// materializes lazily at the first capable serve (§8) under
+    /// `join_pending_notice_sign_limiter`. Memory-only, TTL-swept at the
+    /// join staging lifetime.
     pub(super) pending_join_notices:
         StdMutex<HashMap<String, crate::server::routes::named_groups::PendingJoinNotice>>,
+    /// ADR 0108 §8: the notice lazy-signing limiter — the #477 limiter
+    /// shape (per-(group, member) tokens + a global bucket) with the same
+    /// values as the refusals while §8 Q3 stays open with David.
+    pub(super) join_pending_notice_sign_limiter:
+        StdMutex<crate::server::routes::named_groups::JoinRefusalSignLimiter>,
     /// #477: joiner-side pending-join attempt registry, keyed
     /// `join_result_key` — the attempt id, the pinned inviter, and the
     /// poll task handle, so a typed refusal / timeout / seat can
@@ -1254,6 +1267,14 @@ pub(super) struct AppState {
     /// task runs; each later observation updates the entry.
     pub(super) treekem_epoch_ahead_targets:
         Mutex<HashMap<String, crate::server::routes::named_groups::EpochAheadTarget>>,
+    /// #1657 (ADR 0110 §3): the latest typed TreeKEM catch-up refusal
+    /// this daemon received, per group, keyed by the group id its own
+    /// request used. Surfaced in the operator log at receive time and
+    /// kept here so tests (and a later diagnostics surface) can read
+    /// which revocation a peer named, from which peer, and when. A
+    /// refusal for a group this node does not hold records nothing
+    /// (review finding 2), so the map is bounded by the local groups.
+    pub(super) treekem_catchup_refusals: StdMutex<HashMap<String, TreeKemCatchupRefusalNote>>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
@@ -1273,7 +1294,10 @@ pub(super) struct AppState {
     /// without blocking other groups (and without holding the map lock across
     /// disk IO). Snapshots persist under [`Self::treekem_dir`].
     pub(super) treekem_groups:
-        RwLock<HashMap<String, Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>>>,
+        super::reseat_scope::ScopedGroupMap<Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>>,
+    /// ADR 0109 §3 step 2 (#1699): the open re-seat stagings, whose staged
+    /// joins use the staging slot of the three group maps.
+    pub(super) reseat_stagings: super::reseat_scope::ReseatStagings,
     /// Directory holding `<group_id>.snap` snapshots and `<group_id>.journal`
     /// TreeKEM persistence journals (mode 0600).
     pub(super) treekem_dir: PathBuf,
@@ -1463,7 +1487,8 @@ impl AppState {
         let tasks = guard.as_mut()?;
         // Reap finished tasks so the registry holds only live ones.
         tasks.retain(|task| !task.is_finished());
-        let handle = tokio::spawn(task);
+        // #1699: a step that a staged re-seat join spawns stays in its scope.
+        let handle = tokio::spawn(super::reseat_scope::inherit_reseat_scope(task));
         let abort = handle.abort_handle();
         tasks.push(handle);
         Some(abort)
@@ -1493,7 +1518,10 @@ impl AppState {
             return false;
         };
         tasks.retain(|task| !task.is_finished());
-        tasks.push(tokio::spawn(task));
+        // #1699: an apply that a staged re-seat join spawns stays in its scope.
+        tasks.push(tokio::spawn(super::reseat_scope::inherit_reseat_scope(
+            task,
+        )));
         true
     }
 
@@ -1521,6 +1549,20 @@ impl AppState {
 /// `(group id, recipient hex)` (see `AppState::join_artifact_egress`).
 pub(super) type JoinArtifactEgressRegistry =
     HashMap<(String, String), Vec<tokio::task::JoinHandle<()>>>;
+
+/// #1657 (ADR 0110 §3): one typed TreeKEM catch-up refusal this daemon
+/// received — which revocation the refusing peer named, from which peer,
+/// and when (see `AppState::treekem_catchup_refusals`). Read by the
+/// #1657 tests today; a diagnostics surface is the follow-up owner.
+#[derive(Debug, Clone)]
+pub(crate) struct TreeKemCatchupRefusalNote {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) reason: crate::direct::TreeKemCatchupRefusalReason,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) peer: [u8; 32],
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) at: std::time::Instant,
+}
 
 #[cfg(test)]
 #[derive(Default)]
@@ -1591,6 +1633,10 @@ pub(super) struct NamedGroupTestRecorders {
         StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
+    /// #1657: every typed catch-up refusal `handle_treekem_catchup_request`
+    /// built, as the exact serialized payload, recorded at the refusal
+    /// DECISION (before any egress). Tests read the payload here.
+    pub(super) catchup_refusals: StdMutex<Vec<Vec<u8>>>,
 }
 
 #[cfg(test)]

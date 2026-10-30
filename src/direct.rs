@@ -71,7 +71,7 @@ use crate::dm::{DmPath, DurableSendStages};
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
 use crate::trust::TrustDecision;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -127,6 +127,222 @@ pub(crate) fn inbound_peer_revoked(
     machine_id: &MachineId,
 ) -> bool {
     revoked.is_agent_revoked(sender) || revoked.is_machine_revoked(machine_id)
+}
+
+/// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the typed
+/// refusal that answers a TreeKEM catch-up request from a machine-revoked
+/// or binding-revoked device, replacing the interim silent drop. The
+/// refusal names which revocation applies so the requester can stop
+/// re-asking and surface the reason. It travels as an ordinary direct
+/// message on the catch-up lane, so its sender is authenticated exactly
+/// like every catch-up page: the QUIC ML-DSA-65 handshake on the raw
+/// path, the signed envelope on the gossip path. The refused request
+/// itself is still dropped — the refusal adds the reply, never the page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TreeKemCatchupRefusal {
+    pub(crate) message_type: String,
+    group_id: String,
+    /// The requester the refusing peer echoes back, so a refusal for
+    /// another agent's request is never applied to this one.
+    requester_agent_id: String,
+    pub(crate) reason: TreeKemCatchupRefusalReason,
+}
+
+impl TreeKemCatchupRefusal {
+    /// The `message_type` of every refusal on the wire.
+    pub(crate) const MESSAGE_TYPE: &'static str = "treekem_catchup_refusal";
+
+    /// Build the refusal for `requester`'s request about `group_id`.
+    pub(crate) fn new(
+        group_id: String,
+        requester_agent_id: String,
+        reason: TreeKemCatchupRefusalReason,
+    ) -> Self {
+        Self {
+            message_type: Self::MESSAGE_TYPE.to_string(),
+            group_id,
+            requester_agent_id,
+            reason,
+        }
+    }
+
+    pub(crate) fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    pub(crate) fn requester_agent_id(&self) -> &str {
+        &self.requester_agent_id
+    }
+}
+
+/// Which revocation refused the request. A variant this node does not
+/// know (#1604 G5) decodes to `Unknown` and is refused by
+/// `wire_compat::reject_unknown` before any asker state changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub(crate) enum TreeKemCatchupRefusalReason {
+    /// ADR 0110 D70: the requester's machine is revoked; the portable
+    /// agent keeps its seat until that agent itself is revoked.
+    MachineRevoked,
+    /// ADR-0043 check B: the requester's agent-machine binding is
+    /// revoked; both sides stay individually clean.
+    BindingRevoked,
+    /// A variant this node does not know, sent by a newer peer (#1604).
+    /// Decoding never fails on it; every consumer treats it fail-closed,
+    /// and it is never encoded.
+    #[serde(other, skip_serializing)]
+    Unknown,
+}
+
+/// One probe field set of a TreeKEM catch-up request: enough to
+/// recognise the frame (and echo its group) without deserialising the
+/// whole request. Unknown JSON fields are ignored, and a payload that
+/// is not the request shape (another catch-up frame, a user DM, an
+/// envelope) fails.
+#[derive(Deserialize)]
+struct TreeKemCatchupRequestPeek {
+    message_type: String,
+    group_id: String,
+    /// The requester the request names. A request always carries it
+    /// (the serve compares it with the authenticated sender), so a
+    /// payload without it is not the request shape.
+    requester_agent_id: String,
+}
+
+/// The group id shape the catch-up lane uses: exactly 64 hex characters
+/// (every generator is `hex::encode` of a 32-byte id — the REST
+/// creation nonce and the BLAKE3 genesis/stable ids). Anything else
+/// fails closed to the silent drop, so a revoked device cannot make
+/// the listener echo request-sized strings (Engineer ruling, 29 Oct
+/// 2026 22:14 GMT: a 64-hex `group_id` check in the peek).
+const TREEKEM_REFUSAL_GROUP_ID_LEN: usize = 64;
+
+/// A group id of the shape the catch-up lane uses: exactly 64 hex
+/// characters. Anything else fails closed to the silent drop.
+pub(crate) fn treekem_group_id_echoable(group_id: &str) -> bool {
+    group_id.len() == TREEKEM_REFUSAL_GROUP_ID_LEN
+        && group_id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The transport-layer refusal probe (#1657): when the raw-QUIC
+/// revocation or pairing gate is about to drop a frame, this proves
+/// the frame is a TreeKEM catch-up request FROM `requester` (the
+/// authenticated sender — the request's claimed requester must name
+/// the same agent, exactly as the serve's check does) and returns its
+/// 64-hex group id for the refusal. `None` keeps the silent drop.
+pub(crate) fn treekem_catchup_refusal_probe(payload: &[u8], requester: &AgentId) -> Option<String> {
+    let peek = serde_json::from_slice::<TreeKemCatchupRequestPeek>(payload).ok()?;
+    if peek.message_type != "treekem_catchup_request" {
+        return None;
+    }
+    if peek.requester_agent_id != hex::encode(requester.as_bytes()) {
+        return None;
+    }
+    if !treekem_group_id_echoable(&peek.group_id) {
+        return None;
+    }
+    Some(peek.group_id)
+}
+
+/// One refusal send is bounded in time (Engineer ruling, 29 Oct 2026
+/// 22:14 GMT: timed-out refusal sends). The raw-QUIC write waits for
+/// stream and flow-control credit the remote peer grants, so an
+/// unbounded send would hold refusal bytes in the listener for as
+/// long as the refused device chooses.
+pub(crate) const TREEKEM_REFUSAL_SEND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// How long one (machine, group) refusal answer stands before the
+/// same requester may be answered again (per-(machine, group) dedupe,
+/// Engineer ruling, 29 Oct 2026 22:14 GMT). A revocation does not
+/// un-apply, so one answer per window is enough for the requester to
+/// stop its re-asks and surface the reason.
+const TREEKEM_REFUSAL_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound of the dedupe map: it holds one row per distinct refused
+/// (machine, group) pair inside the TTL window. When the window holds
+/// this many rows, NEW pairs are not answered and not recorded until
+/// rows expire — fresh rows are never dropped, so a requester cannot
+/// buy a window reset by cycling group ids (Codex rc3 P2), and a
+/// revocation flood cannot buy unbounded memory.
+const TREEKEM_REFUSAL_DEDUPE_CAP: usize = 512;
+
+/// #1657: the shared bookkeeping of the refusal-only reply path,
+/// owned by the agent and used by BOTH refusal senders — the raw-QUIC
+/// listener arms and the catch-up serve handler — so the per-(machine,
+/// group) dedupe holds across paths, and tests can observe the send
+/// at the egress seam (after every gate, exactly where the frame is
+/// handed to the transport), not at the decision.
+#[derive(Default)]
+pub(crate) struct TreeKemRefusalReplies {
+    /// (machine, group id bytes) -> when its refusal was last sent.
+    recent: std::sync::Mutex<std::collections::HashMap<(MachineId, [u8; 32]), std::time::Instant>>,
+    /// #1657 tests: every refusal that passed every gate and reached
+    /// the send seam, as (requester machine, payload). This records
+    /// the egress attempt itself — a gate that stops the send stops
+    /// the record, so a test cannot pass on a refusal that never
+    /// left (Claude round 3, finding 2).
+    #[cfg(test)]
+    pub(crate) egress: std::sync::Mutex<Vec<(MachineId, Vec<u8>)>>,
+}
+
+impl TreeKemRefusalReplies {
+    /// Admit one (machine, group) refusal answer: `true` when it has
+    /// no fresh entry (and one is now held), `false` when the same
+    /// pair was answered inside the dedupe window — or when the map is
+    /// at its bound, where a NEW pair is suppressed (not recorded)
+    /// until rows expire rather than displacing fresh ones. A poisoned
+    /// lock fails open — the dedupe bounds duplicate answers, it is not
+    /// a security gate.
+    pub(crate) fn admit(&self, machine_id: MachineId, group_id: &str) -> bool {
+        let Some(bytes) = treekem_group_id_bytes(group_id) else {
+            return false;
+        };
+        let Ok(mut recent) = self.recent.lock() else {
+            return true;
+        };
+        let now = std::time::Instant::now();
+        recent.retain(|_, at| now.duration_since(*at) < TREEKEM_REFUSAL_DEDUPE_TTL);
+        let key = (machine_id, bytes);
+        // The incoming pair is checked first: a fresh row always wins,
+        // including at the bound — an immediate repeat is never
+        // re-admitted (Codex rc3 P2).
+        if recent.contains_key(&key) {
+            return false;
+        }
+        if recent.len() >= TREEKEM_REFUSAL_DEDUPE_CAP {
+            return false;
+        }
+        recent.insert(key, now);
+        true
+    }
+
+    /// The dedupe window of one (machine, group) pair, aged to expire
+    /// on the next admission (tests drive the TTL without waiting).
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&self, machine_id: MachineId, group_id: &str) {
+        let Some(bytes) = treekem_group_id_bytes(group_id) else {
+            return;
+        };
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.insert(
+                (machine_id, bytes),
+                std::time::Instant::now() - TREEKEM_REFUSAL_DEDUPE_TTL,
+            );
+        }
+    }
+}
+
+/// Decode a 64-hex group id to its 32 bytes. `None` for any other
+/// shape — the caller keeps the silent drop.
+fn treekem_group_id_bytes(group_id: &str) -> Option<[u8; 32]> {
+    if !treekem_group_id_echoable(group_id) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(group_id.as_bytes(), &mut bytes).ok()?;
+    Some(bytes)
 }
 
 #[doc(hidden)]
@@ -496,6 +712,7 @@ struct DirectDiagnosticsCounters {
     incoming_signature_failed: AtomicU64,
     incoming_trust_rejected: AtomicU64,
     incoming_dropped_revoked: AtomicU64,
+    incoming_dropped_attribution_overflow: AtomicU64,
     incoming_dropped_expired: AtomicU64,
     incoming_typed_route_dropped: AtomicU64,
     ack_publish_route_failed: AtomicU64,
@@ -555,8 +772,11 @@ pub struct DmDiagnosticsStats {
     pub incoming_decode_failed: u64,
     pub incoming_signature_failed: u64,
     pub incoming_trust_rejected: u64,
-    /// DMs dropped because the sender's agent identity has been revoked.
+    /// DMs dropped because the sender's agent identity or an attributed
+    /// machine has been revoked.
     /// Non-zero means a revoked peer is still attempting to communicate.
+    /// An unattested refusal that also has an overflowed attribution set
+    /// is included here. A separate internal counter stays off this object.
     #[serde(default)]
     pub incoming_dropped_revoked: u64,
     /// DMs dropped because the sender's cached agent certificate has expired
@@ -1051,6 +1271,29 @@ impl DirectMessaging {
         self.diagnostics
             .incoming_dropped_revoked
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an unattested DM dropped because attribution overflowed for a
+    /// sender that already holds a machine revocation, or because the
+    /// stranger pin cap is full and that sender's revoked pair was dropped
+    /// or could not be pinned.
+    ///
+    /// The caller also increments `incoming_dropped_revoked`. This count
+    /// stays off `GET /diagnostics/dm`. The inbox emits a rate-limited
+    /// warning for the same drop. The pin-cap warning does not claim that
+    /// a revoked machine is still attributed.
+    pub(crate) fn record_incoming_dropped_attribution_overflow(&self) {
+        self.diagnostics
+            .incoming_dropped_attribution_overflow
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The internal overflow-refusal count. Not part of the diagnostics API.
+    #[cfg(test)]
+    pub(crate) fn incoming_dropped_attribution_overflow_for_test(&self) -> u64 {
+        self.diagnostics
+            .incoming_dropped_attribution_overflow
+            .load(Ordering::Relaxed)
     }
     /// Record a DM dropped because the sender's cached cert has expired
     /// (issue #191 runtime expiry gate).
@@ -1744,6 +1987,238 @@ mod tests {
         assert!(
             !inbound_peer_revoked(&set, &clean_agent, &clean_machine),
             "a clean (agent, machine) pair must not be dropped"
+        );
+    }
+
+    #[test]
+    fn treekem_refusal_probed_only_for_a_catchup_request_from_its_requester() {
+        // #1657: the refusal answers a TreeKEM catch-up request alone, and
+        // only when the request's claimed requester IS the authenticated
+        // sender (review round 3: the transport arm now checks what the
+        // serve checks). The probe needs message_type, group_id and
+        // requester_agent_id only; unknown fields of the full request
+        // shape are ignored.
+        let requester = AgentId([9u8; 32]);
+        let group_id = "aa".repeat(32);
+        let request = serde_json::json!({
+            "message_type": "treekem_catchup_request",
+            "group_id": group_id,
+            "requester_agent_id": hex::encode(requester.as_bytes()),
+            "from_revision": 0,
+            "from_treekem_epoch": 0,
+            "current_state_hash": "",
+            "missing_prev_state_hash": null,
+            "limit": 1,
+        })
+        .to_string();
+
+        assert_eq!(
+            treekem_catchup_refusal_probe(request.as_bytes(), &requester)
+                .expect("a catch-up request from its requester gets the probe"),
+            group_id,
+            "the probe returns the validated group id for the refusal"
+        );
+
+        // A request that names another requester gets no refusal: the
+        // reply would echo an id the request chose, not the sender.
+        let mismatched = serde_json::json!({
+            "message_type": "treekem_catchup_request",
+            "group_id": group_id,
+            "requester_agent_id": "bb",
+        })
+        .to_string();
+        assert!(
+            treekem_catchup_refusal_probe(mismatched.as_bytes(), &requester).is_none(),
+            "a request whose claimed requester is not the sender keeps the silent drop"
+        );
+
+        // A payload without the requester field is not the request shape.
+        let no_requester = serde_json::json!({
+            "message_type": "treekem_catchup_request",
+            "group_id": group_id,
+        })
+        .to_string();
+        assert!(
+            treekem_catchup_refusal_probe(no_requester.as_bytes(), &requester).is_none(),
+            "a payload without requester_agent_id is not the request shape"
+        );
+
+        // Anything that is not the request shape gets no refusal: another
+        // catch-up frame, a non-JSON payload, and a JSON frame whose
+        // message_type is not the request tag.
+        let response = serde_json::json!({
+            "message_type": "treekem_catchup_response",
+            "group_id": group_id,
+            "requester_agent_id": hex::encode(requester.as_bytes()),
+        })
+        .to_string();
+        assert!(
+            treekem_catchup_refusal_probe(response.as_bytes(), &requester).is_none(),
+            "a catch-up response must not get the refusal"
+        );
+        assert!(
+            treekem_catchup_refusal_probe(b"\x00\x01not json", &requester).is_none(),
+            "a non-JSON payload must not get the refusal"
+        );
+        let other_type = serde_json::json!({
+            "message_type": "treekem_catchup_refusal",
+            "group_id": group_id,
+            "requester_agent_id": hex::encode(requester.as_bytes()),
+        })
+        .to_string();
+        assert!(
+            treekem_catchup_refusal_probe(other_type.as_bytes(), &requester).is_none(),
+            "a JSON frame that is not a catch-up request must not get the refusal"
+        );
+
+        // Review round 1, finding 1 + the Engineer ruling (29 Oct 22:14
+        // GMT): only an exactly-64-hex group id is echoed. A non-hex,
+        // short, or oversized value declines to the silent drop, so a
+        // revoked device cannot make the listener hold request-sized
+        // strings in the refusal backlog, and no id but the shape every
+        // generator produces is ever named.
+        for group_id in ["not hex!", "aa", &"g".repeat(129), &"ab".repeat(31)] {
+            let malformed = serde_json::json!({
+                "message_type": "treekem_catchup_request",
+                "group_id": group_id,
+                "requester_agent_id": hex::encode(requester.as_bytes()),
+            })
+            .to_string();
+            assert!(
+                treekem_catchup_refusal_probe(malformed.as_bytes(), &requester).is_none(),
+                "a group id that is not exactly 64 hex ({group_id:.8}…) must not get the refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn treekem_refusal_reason_round_trips_and_unknown_is_refused() {
+        // #1657: the two known reasons round-trip through their snake_case
+        // wire tags. A tag this node does not know (#1604 G5) decodes to
+        // Unknown — decoding never fails — and the wire-compat gate refuses
+        // a refusal that holds it before any asker state changes.
+        assert_eq!(
+            serde_json::to_value(TreeKemCatchupRefusalReason::MachineRevoked).unwrap(),
+            serde_json::json!("machine_revoked")
+        );
+        assert_eq!(
+            serde_json::to_value(TreeKemCatchupRefusalReason::BindingRevoked).unwrap(),
+            serde_json::json!("binding_revoked")
+        );
+        assert_eq!(
+            serde_json::from_value::<TreeKemCatchupRefusalReason>(serde_json::json!(
+                "machine_revoked"
+            ),)
+            .unwrap(),
+            TreeKemCatchupRefusalReason::MachineRevoked
+        );
+        assert_eq!(
+            serde_json::from_value::<TreeKemCatchupRefusalReason>(serde_json::json!(
+                "binding_revoked"
+            ),)
+            .unwrap(),
+            TreeKemCatchupRefusalReason::BindingRevoked
+        );
+
+        let future = serde_json::json!({
+            "message_type": "treekem_catchup_refusal",
+            "group_id": "aa",
+            "requester_agent_id": "bb",
+            "reason": "some_future_reason",
+        })
+        .to_string();
+        let refusal = serde_json::from_slice::<TreeKemCatchupRefusal>(future.as_bytes())
+            .expect("an unknown reason tag must decode, not fail");
+        assert_eq!(refusal.reason, TreeKemCatchupRefusalReason::Unknown);
+
+        let holding_unknown = TreeKemCatchupRefusal::new(
+            "aa".to_string(),
+            "bb".to_string(),
+            TreeKemCatchupRefusalReason::Unknown,
+        );
+        assert!(
+            crate::wire_compat::reject_unknown("TreeKemCatchupRefusal", holding_unknown).is_err(),
+            "a refusal holding Unknown must be refused fail-closed"
+        );
+        // Review round 1 (test gap): Unknown never encodes, so it can
+        // never be sent, signed or re-gossiped by this node.
+        assert!(
+            serde_json::to_vec(&TreeKemCatchupRefusal::new(
+                "aa".to_string(),
+                "bb".to_string(),
+                TreeKemCatchupRefusalReason::Unknown
+            ))
+            .is_err(),
+            "a refusal holding Unknown must not be serializable"
+        );
+    }
+
+    #[test]
+    fn treekem_refusal_dedupe_admits_once_per_machine_and_group_window() {
+        // Engineer ruling (29 Oct 22:14 GMT): per-(machine, group) dedupe.
+        // One answer stands for the window, a different group or machine
+        // is answered independently, and an expired window answers again.
+        let replies = TreeKemRefusalReplies::default();
+        let machine = MachineId([3u8; 32]);
+        let other_machine = MachineId([4u8; 32]);
+        let group = "ab".repeat(32);
+        let other_group = "cd".repeat(32);
+        assert!(
+            replies.admit(machine, &group),
+            "the first refusal for a (machine, group) pair is admitted"
+        );
+        assert!(
+            !replies.admit(machine, &group),
+            "the same pair inside the window is deduped"
+        );
+        assert!(
+            replies.admit(machine, &other_group),
+            "another group of the same machine is admitted"
+        );
+        assert!(
+            replies.admit(other_machine, &group),
+            "another machine with the same group is admitted"
+        );
+        replies.expire_for_test(machine, &group);
+        assert!(
+            replies.admit(machine, &group),
+            "an expired window admits the pair again"
+        );
+        // A group id that is not exactly 64 hex is never admitted — the
+        // dedupe holds the same shape rule as the probe.
+        assert!(
+            !replies.admit(machine, "not hex!"),
+            "a malformed group id is never admitted"
+        );
+    }
+
+    #[test]
+    fn treekem_refusal_dedupe_holds_at_capacity() {
+        // Codex rc3 P2: at the bound the window must keep deduping a
+        // recorded pair — neither a full clear nor a fresh-entry drop
+        // may re-admit an immediate repeat. New pairs are suppressed
+        // until rows expire, and one expiry frees the window again.
+        let replies = TreeKemRefusalReplies::default();
+        let machine = MachineId([5u8; 32]);
+        for i in 0..TREEKEM_REFUSAL_DEDUPE_CAP {
+            let group = format!("{i:064x}");
+            assert!(replies.admit(machine, &group), "pair {i} fills the window");
+        }
+        let recorded = format!("{:064x}", 0usize);
+        assert!(
+            !replies.admit(machine, &recorded),
+            "an immediate repeat of a recorded pair stays deduped at capacity"
+        );
+        assert!(
+            !replies.admit(machine, &format!("{:064x}", TREEKEM_REFUSAL_DEDUPE_CAP)),
+            "a new pair is suppressed while the window is full"
+        );
+        // The window drains by TTL, so suppression is not a reset: one
+        // expired row frees a slot and new pairs are answered again.
+        replies.expire_for_test(machine, &recorded);
+        assert!(
+            replies.admit(machine, &format!("{:064x}", TREEKEM_REFUSAL_DEDUPE_CAP + 1)),
+            "after an entry expires the window answers new pairs again"
         );
     }
 

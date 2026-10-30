@@ -854,6 +854,39 @@ pub fn sole_member_in_being(members: &BTreeMap<String, GroupMember>, agent_hex: 
     non_terminal == 1 && hit
 }
 
+/// #1578 rc11 (Claude blocking 1, audit): [`sole_member_in_being`]
+/// skipping the local join's key-only marker rows
+/// (`GroupInfo::join_seat_key_marker_only`) — exactly main's count,
+/// where the joiner holds no roster row before its `MemberAdded`
+/// lands. A marker row must neither make its joiner the sole
+/// member-in-being nor inflate the count and hide a real one (a real
+/// sole member's terminal exit must not turn into a refusal because
+/// the joiner's stub also carries its own key marker). The marker set
+/// is precomputed (`ApplyContext` has no `GroupInfo`), so
+/// `state_commit`'s authority check shares this one definition.
+#[must_use]
+pub fn sole_member_in_being_excluding_join_markers(
+    members: &BTreeMap<String, GroupMember>,
+    agent_hex: &str,
+    join_marker_agents: &BTreeSet<String>,
+) -> bool {
+    let mut non_terminal = 0;
+    let mut hit = false;
+    for m in members.values() {
+        if join_marker_agents.contains(&m.agent_id) {
+            continue;
+        }
+        if matches!(
+            m.state,
+            GroupMemberState::Active | GroupMemberState::Pending
+        ) {
+            non_terminal += 1;
+            hit = hit || m.agent_id == agent_hex;
+        }
+    }
+    non_terminal == 1 && hit
+}
+
 /// The single self-leave routing predicate (#369): classify `leaver_hex`'s
 /// DELETE against the live roster and join-request view.
 ///
@@ -866,7 +899,7 @@ pub fn leave_disposition(info: &GroupInfo, leaver_hex: &str) -> LeaveDisposition
     // seeded Pending entries: reject/cancel clear the roster mirror, and a
     // KEM-less request never seeds one at all (PR #370 r2 blocker 1).
     let has_pending_request = info.has_pending_join_request();
-    if !has_pending_request && sole_member_in_being(&info.members_v2, leaver_hex) {
+    if !has_pending_request && info.sole_member_in_being_excluding_join_markers(leaver_hex) {
         return LeaveDisposition::SoleMemberDelete;
     }
     let mut proposed = info.clone();
@@ -1414,10 +1447,12 @@ impl GroupInfo {
             let signer_hex = hex::encode(keypair.agent_id().as_bytes());
             // #369: withdrawn commits are admin-authored, except by the sole
             // member-in-being — their terminal exit IS the group's unanimous
-            // decision (see `seal_withdrawal`).
+            // decision (see `seal_withdrawal`). #1578 rc11: the join's
+            // key-only marker row is not a seat, so it does not make the
+            // pre-admission joiner a sole member-in-being.
             let authorized =
                 state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex)
-                    || sole_member_in_being(&self.members_v2, &signer_hex);
+                    || self.sole_member_in_being_excluding_join_markers(&signer_hex);
             if !authorized {
                 return Err(state_commit::ApplyError::Unauthorized {
                     signer: signer_hex,
@@ -1979,9 +2014,12 @@ impl GroupInfo {
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
         let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        // #1578 rc11: as in `seal_commit_inner`, the join's key-only
+        // marker row is not a seat — the pre-admission joiner is not a
+        // sole member-in-being.
         let authorized =
             state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex)
-                || sole_member_in_being(&self.members_v2, &signer_hex);
+                || self.sole_member_in_being_excluding_join_markers(&signer_hex);
         if !authorized {
             return Err(state_commit::ApplyError::Unauthorized {
                 signer: signer_hex,
@@ -2029,6 +2067,7 @@ impl GroupInfo {
             current_revision: self.state_revision,
             current_withdrawn: self.withdrawn,
             members_v2: &self.members_v2,
+            join_seat_marker_agents: self.join_seat_key_marker_agents(),
             group_id: self.stable_group_id(),
         };
         state_commit::validate_apply(&ctx, commit, action_kind)?;
@@ -2731,6 +2770,68 @@ impl GroupInfo {
     #[must_use]
     pub fn has_pending_join_request(&self) -> bool {
         self.join_requests.values().any(JoinRequest::is_pending)
+    }
+
+    /// #1578 rc7/rc8, moved from the server layer (rc11): the local
+    /// join's own-key marker row. The join seats the joiner's own
+    /// published KEM key on a Pending row of its own stub (rc7); the
+    /// row carries no admission state — only the key — so every seat
+    /// check must treat it as absent, exactly main's roster, where the
+    /// joiner holds no row before its `MemberAdded` lands. A Pending
+    /// row with a live join request is a real seat marker (the
+    /// request/approve path seats the requester on the authority's
+    /// copy), not the join's key carrier, so it does not match.
+    #[must_use]
+    pub(crate) fn join_seat_key_marker_only(&self, joiner_hex: &str) -> bool {
+        if self.join_requests.values().any(|req| {
+            req.requester_agent_id.eq_ignore_ascii_case(joiner_hex)
+                && req.status == JoinRequestStatus::Pending
+        }) {
+            return false;
+        }
+        matches!(
+            self.members_v2.get(joiner_hex),
+            Some(member)
+                if member.state == GroupMemberState::Pending
+                    && member.kem_public_key_b64.is_some()
+                    && member.certificate.is_none()
+                    && member.certificate_digest.is_none()
+                    && member.treekem_key_package_b64.is_none()
+                    && member.treekem_key_package_hash.is_none()
+                    && member.added_by.is_none()
+                    && member.removed_by.is_none()
+        )
+    }
+
+    /// #1578 rc11 (Claude blocking 1, audit): the agents whose only
+    /// roster row is the local join's key-only marker
+    /// ([`Self::join_seat_key_marker_only`]) — the rows every
+    /// seat-count lookup must treat as absent, exactly main's roster
+    /// before the joiner's `MemberAdded` lands.
+    #[must_use]
+    pub(crate) fn join_seat_key_marker_agents(&self) -> BTreeSet<String> {
+        self.members_v2
+            .keys()
+            .filter(|agent| self.join_seat_key_marker_only(agent))
+            .cloned()
+            .collect()
+    }
+
+    /// #1578 rc11 (Claude blocking 1, audit): [`sole_member_in_being`]
+    /// counting the local join's key-only marker row
+    /// ([`Self::join_seat_key_marker_only`]) diverges from main, where
+    /// the joiner holds no roster row before its `MemberAdded` lands. A
+    /// marker row must neither make its joiner the sole member-in-being
+    /// nor inflate the count and hide a real one (a real sole member's
+    /// terminal exit must not turn into a refusal because the joiner's
+    /// stub also carries its own key marker).
+    #[must_use]
+    pub(crate) fn sole_member_in_being_excluding_join_markers(&self, agent_hex: &str) -> bool {
+        sole_member_in_being_excluding_join_markers(
+            &self.members_v2,
+            agent_hex,
+            &self.join_seat_key_marker_agents(),
+        )
     }
 
     /// Clear the requester's Pending roster mirror when their join request

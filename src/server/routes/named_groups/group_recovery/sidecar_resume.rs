@@ -12,10 +12,12 @@
 //!
 //! 1. **Barrier.** fsync `D` before any read.
 //! 2. **Verify.** Each pending copy is checked against the `h` in its name.
-//!    A copy that fails stays pending and its file shows
-//!    `sidecar_quarantine_failed {step: verify}`.
+//!    While `F` is missing or damaged, a copy that fails stays pending and
+//!    its file shows `sidecar_quarantine_failed {step: verify}`.
 //! 3. **Classify `F`.** Missing: one empty replacement covers the verified
-//!    set `V` (none when `V` is empty). Valid: `F` is kept. Newer or
+//!    set `V` (none when `V` is empty). Valid: `F` is kept, and a copy that
+//!    failed verify becomes history beside it (a WARN log names it), so the
+//!    next load after a replacement finishes the group. Newer or
 //!    unreadable: `F` and every pending copy are left as they are (the
 //!    loader reports the fault). Damaged: `F` is quarantined as its own
 //!    transaction, its `txid` joins `V`, and the missing rule applies.
@@ -91,11 +93,11 @@ async fn resume_file(
 ) -> Result<(), &'static str> {
     let path = dir.join(file);
     let mut verified: Vec<([u8; 16], PathBuf)> = Vec::new();
-    let mut verify_failed = false;
+    let mut unverified: Vec<PathBuf> = Vec::new();
     for (txid, h, copy) in copies {
         match tokio::fs::read(&copy).await {
             Ok(bytes) if s4::quarantine_hash_hex(&bytes) == h => verified.push((txid, copy)),
-            _ => verify_failed = true,
+            _ => unverified.push(copy),
         }
     }
     let missing = match tokio::fs::read(&path).await {
@@ -103,7 +105,24 @@ async fn resume_file(
         // Unreadable: leave `F` and every copy; the loader reports it.
         Err(_) => return Ok(()),
         Ok(bytes) => match s3::decode_sidecar(&bytes) {
-            Ok(_) => false,
+            Ok(_) => {
+                // Valid `F` (§5a "Several pending copies"): a copy that
+                // fails verify needs no rebuild, because `F` already
+                // governs. It becomes history, unchanged, so it no longer
+                // holds the group memory-only on every load.
+                for copy in std::mem::take(&mut unverified) {
+                    tracing::warn!(
+                        file,
+                        copy = %copy.display(),
+                        reason = "verify_failed_beside_valid_file",
+                        "ADR 0109 S3: pending sidecar copy fails its hash; kept as history beside the valid file"
+                    );
+                    if !super::super::revocation_eviction::finalize_quarantine(&copy).await {
+                        return Err("finalize");
+                    }
+                }
+                false
+            }
             // Newer: never touched; a binary that reads it resumes later.
             Err(GroupRecoveryDecodeError::NewerFormat(_)) => return Ok(()),
             Err(GroupRecoveryDecodeError::Damaged(cause)) => {
@@ -149,7 +168,7 @@ async fn resume_file(
             return Err("finalize");
         }
     }
-    if verify_failed {
+    if !unverified.is_empty() {
         return Err("verify");
     }
     Ok(())
@@ -315,5 +334,88 @@ mod tests {
             rebuilt_from(&tokio::fs::read(other.path().join(F)).await.expect("F")),
             covered
         );
+    }
+
+    /// ADR 0108 §5a "Several pending copies" (#1646 review): three pending
+    /// copies, one of which fails verify, and no `F`. The first load writes
+    /// one replacement that lists the two that pass, keeps the failed copy
+    /// pending and shows `verify`. The next load finds a valid `F`, so it
+    /// finalizes the failed copy as history, unchanged, and the group loads
+    /// with no fault. Later loads change nothing.
+    #[tokio::test]
+    async fn a_bad_pending_copy_beside_a_valid_file_becomes_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut good = Vec::new();
+        for (byte, damaged) in [(1u8, &b"first"[..]), (2, &b"second"[..])] {
+            let txid = [byte; 16];
+            let pending = dir
+                .path()
+                .join(s4::quarantine_pending_name(F, &txid, damaged));
+            tokio::fs::write(&pending, damaged).await.expect("write");
+            good.push(txid);
+        }
+        let bad = dir
+            .path()
+            .join(s4::quarantine_pending_name(F, &[3u8; 16], b"original"));
+        tokio::fs::write(&bad, b"bit rot").await.expect("write");
+
+        let (_, faults) = super::super::scan_sidecar_dir(dir.path(), true).await;
+        assert!(matches!(
+            faults.get("abc"),
+            Some(super::super::SidecarFault::QuarantineFailed { step, .. }) if step == "verify"
+        ));
+        assert!(bad.exists(), "the failed copy stays pending");
+        let replacement = tokio::fs::read(dir.path().join(F)).await.expect("F");
+        assert_eq!(rebuilt_from(&replacement), good);
+
+        assert_eq!(loaded_rebuild(dir.path()).await, good);
+        assert!(!bad.exists(), "the next load sets the failed copy aside");
+        let history = dir.path().join(
+            s4::quarantine_history_name(bad.file_name().and_then(|n| n.to_str()).expect("name"))
+                .expect("history name"),
+        );
+        assert_eq!(
+            tokio::fs::read(&history).await.expect("history"),
+            b"bit rot"
+        );
+        assert_eq!(
+            tokio::fs::read(dir.path().join(F)).await.expect("F"),
+            replacement
+        );
+        assert!(names(dir.path())
+            .await
+            .iter()
+            .all(|n| !n.ends_with(".pending")));
+
+        let before = names(dir.path()).await;
+        assert_eq!(loaded_rebuild(dir.path()).await, good);
+        assert_eq!(names(dir.path()).await, before);
+    }
+
+    /// A pending copy with a bad hash beside a healthy `F` from another
+    /// transaction (ADR 0108 §5a "Pending copies"): `F` wins and stays
+    /// byte-identical, the copy becomes history, and the group loads.
+    #[tokio::test]
+    async fn a_bad_pending_copy_beside_a_healthy_file_does_not_hold_the_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        tokio::fs::write(dir.path().join(F), body(6))
+            .await
+            .expect("write");
+        let bad = dir
+            .path()
+            .join(s4::quarantine_pending_name(F, &[9u8; 16], b"original"));
+        tokio::fs::write(&bad, b"bit rot").await.expect("write");
+        let (loaded, faults) = super::super::scan_sidecar_dir(dir.path(), true).await;
+        assert!(faults.is_empty(), "{faults:?}");
+        assert_eq!(loaded.get("abc").map(|b| b.generation), Some(6));
+        assert_eq!(
+            tokio::fs::read(dir.path().join(F)).await.expect("F"),
+            body(6)
+        );
+        assert!(!bad.exists());
+        assert!(names(dir.path())
+            .await
+            .iter()
+            .any(|n| n.starts_with(&format!("{F}.q-")) && !n.ends_with(".pending")));
     }
 }
