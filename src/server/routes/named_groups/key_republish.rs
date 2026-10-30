@@ -177,7 +177,10 @@ pub(super) async fn build_own_republish(
     {
         return None;
     }
-    let key_sequence = member.kem_key_sequence.unwrap_or(0) + 1;
+    // #1663 review round 4 (Claude N1, 30 Oct): the counter is local data
+    // and can sit at its ceiling; a checked add keeps a republish from
+    // wrapping to a sequence every receiver refuses.
+    let key_sequence = member.kem_key_sequence.unwrap_or(0).checked_add(1)?;
     let kem_public_key_b64 =
         base64::engine::general_purpose::STANDARD.encode(&state.agent_kem_keypair.public_bytes);
     let body = kr::MemberKeyRepublishBodyV1 {
@@ -330,7 +333,22 @@ pub(in crate::server) async fn receive(
         }
         staged
     };
-    // The membership guard spans the mutation and the durable persist (the
+    // #1663 review round 4 (Codex controller P1, 30 Oct): arm the share
+    // obligation BEFORE the durable write. The persister installs the
+    // keyed seat inside that write, and the head/round observers read the
+    // roster without the membership guard — a restored head answered in
+    // the gap between the install and a later arm would converge the
+    // now-keyged seat and remove the row this debt holds open. Arming
+    // first makes key visibility and the obligation move together; the
+    // failed save rolls the arm back with the seat below.
+    let armed = super::revocation_eviction::crypto_exclusion::owe_gss_shares_after_republish(
+        state,
+        &body.stable_group_id,
+        &body.actor,
+        &body.kem_public_key_b64,
+    )
+    .await;
+    // The membership guard spans the staging and the durable persist (the
     // house M→P lock order): a removal or a newer-sequence republication
     // that interleaves here serializes on the same guard, so this write's
     // clone can not overwrite it (#1663 review P1).
@@ -338,23 +356,22 @@ pub(in crate::server) async fn receive(
         ng::persist_named_group_info(state, &group_key, next.clone()).await,
         Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
     ) {
-        // A local storage fault, not a sender defect.
+        // A local storage fault, not a sender defect: the seat stays as
+        // the frame found it, and so does the obligation.
+        super::revocation_eviction::crypto_exclusion::retract_gss_shares_after_republish(
+            state, armed,
+        )
+        .await;
         return RepublishOutcome::LocalFailure;
     }
     ng::refresh_group_card_cache_from_info(state, &group_key, &next).await;
     // The seated key may key a survivor this node's delivery rounds could
     // not seal to: the next round must seal the current secret to that
     // seat whatever a restored head already reported, so the delivery can
-    // not complete shareless (#1663 review P1). The republishing actor's
-    // share stays owed — held against its convergence — until the carrier
-    // accepts a sealed share for it (#1663 review P1, Codex controller,
-    // 30 Oct).
-    super::revocation_eviction::crypto_exclusion::owe_gss_shares_after_republish(
-        state,
-        &body.stable_group_id,
-        &body.actor,
-    )
-    .await;
+    // not complete shareless (#1663 review P1). The armed debt — held
+    // against the republisher's convergence until the carrier accepts a
+    // share sealed under the same key — is that obligation; the batch
+    // re-arm rides with it (#1663 review P1, Codex controller, 30 Oct).
     // The republication of the LOCAL seat ends the keyless holds: the
     // withholding reason is gone (this node holds no secret to seal
     // anything under while it waits for the share).

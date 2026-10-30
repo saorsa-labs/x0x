@@ -4829,7 +4829,10 @@ fn restore_local_member_key_material(
         // state hash, so a signed next commit can carry a different
         // non-empty value and still verify. Drop the remote value first.
         // Retained members then take the local value back, including None.
+        // #1663 review round 4 (Claude, 30 Oct): the republication counter
+        // `kem_key_sequence` is local data too.
         member.kem_public_key_b64 = None;
+        member.kem_key_sequence = None;
         member.treekem_key_package_b64 = None;
         member.treekem_key_package_hash = None;
         member.certificate_missing_since_ms = None;
@@ -4839,6 +4842,7 @@ fn restore_local_member_key_material(
         member
             .kem_public_key_b64
             .clone_from(&previous.kem_public_key_b64);
+        member.kem_key_sequence = previous.kem_key_sequence;
         member
             .treekem_key_package_b64
             .clone_from(&previous.treekem_key_package_b64);
@@ -49458,6 +49462,64 @@ pub(in crate::server) mod tests {
             "outside a scope: the given map"
         );
         Ok(())
+    }
+
+    /// #1663 review round 4 (Claude, 30 Oct): the republication counter is
+    /// local data; a catch-up snapshot's value must not land.
+    #[test]
+    fn a_catchup_apply_keeps_the_local_kem_key_sequence() {
+        let admin = AgentId([0x16; 32]);
+        let admin_hex = hex::encode(admin.as_bytes());
+        let member_hex = "63".repeat(32);
+        let newcomer_hex = "77".repeat(32);
+        let mut local = x0x::groups::GroupInfo::new(
+            "Catch-up".to_string(),
+            String::new(),
+            admin,
+            "ab".repeat(32),
+        );
+        local.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let local_member = local.members_v2.get_mut(&member_hex).expect("local member");
+        local_member.kem_public_key_b64 = Some("local-kem".to_string());
+        local_member.kem_key_sequence = Some(2);
+        // The responder's snapshot rows carry a hostile key AND counter.
+        let mut snapshot = local.clone();
+        snapshot.add_member(
+            newcomer_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        for id in [&member_hex, &newcomer_hex] {
+            let hostile = snapshot.members_v2.get_mut(id).expect("snapshot member");
+            hostile.kem_public_key_b64 = Some("remote-kem".to_string());
+            hostile.kem_key_sequence = Some(9);
+        }
+        // The apply's member adoption, then the local-data restore.
+        let mut next = local.clone();
+        next.members_v2.clone_from(&snapshot.members_v2);
+        restore_local_member_key_material(&mut next, &local);
+        let kept = next.members_v2.get(&member_hex).expect("retained member");
+        assert_eq!(
+            kept.kem_key_sequence,
+            Some(2),
+            "the responder's counter must not land"
+        );
+        assert_eq!(kept.kem_public_key_b64.as_deref(), Some("local-kem"));
+        let added = next
+            .members_v2
+            .get(&newcomer_hex)
+            .expect("snapshot-only member");
+        assert_eq!(
+            added.kem_key_sequence, None,
+            "a member with no local row takes no counter"
+        );
+        assert_eq!(added.kem_public_key_b64.as_deref(), None);
     }
 
     /// ADR 0108 §8 (#1575): the notice currently staged for one

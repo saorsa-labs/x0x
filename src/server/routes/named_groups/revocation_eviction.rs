@@ -3931,9 +3931,14 @@ async fn resume_crypto_exclusions(
                     &result_head,
                     next_revision,
                     Arc::new(frame),
-                    recipients,
+                    recipients.clone(),
                     true,
                 );
+                // #1663 review round 4 (Claude, 30 Oct): the in-memory
+                // share debt died with the process; re-arm it for the
+                // republished seats so the resumed delivery still can not
+                // complete on a restored head.
+                crypto_exclusion::arm_resumed_share_debts(ce_state, &key, info, &recipients);
             }
             crypto_exclusion::SavedFrameState::Superseded => {
                 // #1574 item 3: a later commit that kept the rotated
@@ -3958,9 +3963,11 @@ async fn resume_crypto_exclusions(
                         &result_head,
                         next_revision,
                         Arc::new(frame),
-                        recipients,
+                        recipients.clone(),
                         true,
                     );
+                    // As CurrentHead above (#1663 review round 4).
+                    crypto_exclusion::arm_resumed_share_debts(ce_state, &key, info, &recipients);
                 } else {
                     // A later epoch change ended it (the live rule drops
                     // the delivery on the same condition): the frame is

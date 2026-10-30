@@ -159,15 +159,19 @@ pub(super) struct CeDelivery {
     /// P1).
     gss_shares_pending: bool,
     /// #1663 review P1 (Codex controller, 30 Oct): the recipients this
-    /// delivery still owes a sealed share to — armed when a republished
-    /// KEM key (`X0XKR1`) seats a survivor this node's rounds could not
-    /// seal to. The debt ends only when the carrier accepts a sealed
-    /// share for the recipient ([`gss_share_accepted`]), never by a
-    /// spawned batch or a restored head report: while it stands, the
-    /// recipient converges nothing and the delivery stays open, so a
-    /// share batch whose bounded retries failed leaves the obligation
-    /// here to resume each round.
-    gss_shares_owed: BTreeSet<[u8; 32]>,
+    /// delivery still owes a sealed share to, and the base64 KEM key each
+    /// debt was armed under — armed when a republished KEM key (`X0XKR1`)
+    /// seats a survivor this node's rounds could not seal to, and again
+    /// when a restart resumes the delivery (the counter survives in the
+    /// saved roster). The debt ends only when the carrier accepts a share
+    /// sealed under the SAME key for the recipient
+    /// ([`gss_share_accepted`]), never by a spawned batch or a restored
+    /// head report: while it stands, the recipient converges nothing and
+    /// the delivery stays open, so a share batch whose bounded retries
+    /// failed leaves the obligation here to resume each round. A newer
+    /// republication replaces the entry with its own key, so an old-key
+    /// acceptance cannot discharge the newer key's debt.
+    gss_shares_owed: BTreeMap<[u8; 32], String>,
     /// The new secret epoch of a GSS frame. Each send of the frame seals
     /// that secret to the recipient again, and the delivery runs while
     /// that secret is current (#1508 review P1).
@@ -495,7 +499,7 @@ pub(super) fn note_survivor_head(
             continue;
         }
         if delivery.gss_epoch.is_some()
-            && (!sender_seat_keyed || delivery.gss_shares_owed.contains(sender))
+            && (!sender_seat_keyed || delivery.gss_shares_owed.contains_key(sender))
         {
             continue;
         }
@@ -1042,17 +1046,21 @@ fn spawn_gss_share_to(state: &Arc<AppState>, info: &GroupInfo, recipient_hex: &s
         Ok(event) => {
             // #1663 review P1 (Codex controller, 30 Oct): the first
             // carrier-accepted write of this share ends the recipient's
-            // share debt on the group's open deliveries — the completion
-            // evidence that is independent of the restored head.
+            // matching share debt on the group's open deliveries — the
+            // completion evidence that is independent of the restored
+            // head. The key the share was sealed under travels with the
+            // hook, so an acceptance from before a newer republication
+            // cannot discharge the newer key's debt.
             let notified: Option<Box<dyn FnOnce() + Send>> = {
                 let task_state = Arc::clone(state);
                 let stable = info.stable_group_id().to_string();
                 let recipient = recipient_hex.to_string();
                 let epoch = info.secret_epoch;
+                let sealed_under = kem.to_string();
                 Some(Box::new(move || {
                     let state = Arc::clone(&task_state);
                     let _spawned = task_state.spawn_detached(async move {
-                        gss_share_accepted(&state, &stable, &recipient, epoch).await;
+                        gss_share_accepted(&state, &stable, &recipient, epoch, &sealed_under).await;
                     });
                 }))
             };
@@ -1086,6 +1094,17 @@ pub(in crate::server::routes::named_groups) fn own_seat_cannot_take_a_share(
         .any(|member| member.agent_id == own_hex && member.kem_public_key_b64.is_none())
 }
 
+/// What one [`owe_gss_shares_after_republish`] armed, so a failed
+/// persistence can put it back (#1663 review round 4, Codex P1, 30 Oct):
+/// per delivery, the actor whose debt was armed, the entry's previous
+/// value (`None` when the actor owed nothing, `Some(old key)` when a
+/// newer republication superseded an older debt) and whether THIS call
+/// set the batch trigger.
+#[derive(Debug, Default)]
+pub(in crate::server::routes::named_groups) struct ArmedShareDebt {
+    entries: Vec<(EvictionKey, [u8; 32], Option<String>, bool)>,
+}
+
 /// #1663 review P1 (Claude and Codex controller, 29 Oct): the ingest of a
 /// republished KEM key (`X0XKR1`) seats a survivor this node's rounds
 /// could not seal to — no roster key, no sealed share. The next round must
@@ -1096,51 +1115,102 @@ pub(in crate::server::routes::named_groups) fn own_seat_cannot_take_a_share(
 /// hold the secret: the same-epoch seal is a repeat they refuse.
 ///
 /// The republishing `actor`'s share is also owed as a per-recipient debt
-/// (#1663 review P1, Codex controller, 30 Oct): its keyed seat serves the
-/// saved head while no secret installed, so the debt — not the roster key
-/// — holds its convergence until the carrier accepts a sealed share for
-/// it ([`gss_share_accepted`]). The debt arms only on a delivery the
-/// actor is a recipient of; the batch flag keeps its round-2 scope (every
-/// open GSS delivery of the group re-seals, a repeat holders refuse).
+/// under `kem_key` (#1663 review round 3/4, Codex controller, 30 Oct):
+/// its keyed seat serves the saved head while no secret installed, so the
+/// debt — not the roster key — holds its convergence until the carrier
+/// accepts a share sealed under the same key
+/// ([`gss_share_accepted`]). The caller arms BEFORE the seat becomes
+/// visible (the persister installs the key inside the durable write,
+/// observed without the membership guard) and passes the returned token
+/// to [`retract_gss_shares_after_republish`] when that write fails, so
+/// key visibility and the obligation move together, failure included.
 pub(in crate::server::routes::named_groups) async fn owe_gss_shares_after_republish(
     state: &AppState,
     stable_group_id: &str,
     actor: &[u8; 32],
-) {
+    kem_key: &str,
+) -> ArmedShareDebt {
     let runtime = &state.revocation_evictions;
     let mut inner = runtime.inner.lock().await;
-    let mut owed = false;
+    let mut armed = ArmedShareDebt::default();
     for (key, delivery) in inner.ce.deliveries.iter_mut() {
         if key.stable_group_id != stable_group_id || delivery.gss_epoch.is_none() {
             continue;
         }
-        if !delivery.gss_shares_pending {
+        let set_pending = !delivery.gss_shares_pending;
+        if set_pending {
             delivery.gss_shares_pending = true;
-            owed = true;
         }
         if delivery.recipients.contains_key(actor) {
-            owed |= delivery.gss_shares_owed.insert(*actor);
+            let previous = delivery.gss_shares_owed.insert(*actor, kem_key.to_string());
+            armed
+                .entries
+                .push((key.clone(), *actor, previous, set_pending));
+        } else if set_pending {
+            // The batch trigger this call set on a delivery the actor is
+            // not a recipient of still belongs to the rollback.
+            armed.entries.push((key.clone(), *actor, None, set_pending));
         }
     }
-    if owed {
+    if !armed.entries.is_empty() {
+        inner.dirty = true;
+    }
+    armed
+}
+
+/// Put back what [`owe_gss_shares_after_republish`] armed: the durable
+/// write that would have made the keyed seat visible failed, so the
+/// obligation it arms must not survive it (#1663 review round 4, Codex
+/// P1, 30 Oct). The batch trigger this call set clears (a round may
+/// already have consumed it); an older key's debt entry returns.
+pub(in crate::server::routes::named_groups) async fn retract_gss_shares_after_republish(
+    state: &AppState,
+    armed: ArmedShareDebt,
+) {
+    let runtime = &state.revocation_evictions;
+    let mut inner = runtime.inner.lock().await;
+    let mut retracted = false;
+    for (key, actor, previous, set_pending) in armed.entries {
+        let Some(delivery) = inner.ce.deliveries.get_mut(&key) else {
+            continue;
+        };
+        match previous {
+            Some(kem) => {
+                delivery.gss_shares_owed.insert(actor, kem);
+            }
+            None => {
+                delivery.gss_shares_owed.remove(&actor);
+            }
+        }
+        if set_pending {
+            delivery.gss_shares_pending = false;
+        }
+        retracted = true;
+    }
+    if retracted {
         inner.dirty = true;
     }
 }
 
-/// #1663 review P1 (Codex controller, 30 Oct): the carrier accepted a
-/// sealed share of `secret_epoch` for `recipient_hex` — the one
-/// share-possession signal this node can observe that is independent of
-/// the restored head a keyed-but-shareless seat keeps serving. The
-/// recipient's share debt ends on every open GSS delivery of the group
-/// whose secret epoch the accepted share reaches, so its next head report
-/// converges it and the delivery can complete. A share of a later epoch
-/// clears an older epoch's debt: the round drops that delivery at the
-/// epoch change anyway, never resending old crypto material.
+/// #1663 review P1 (Codex controller, 30 Oct; round 4, key binding): the
+/// carrier accepted a sealed share of `secret_epoch`, sealed under
+/// `kem_key`, for `recipient_hex` — the one share-possession signal this
+/// node can observe that is independent of the restored head a
+/// keyed-but-shareless seat keeps serving. The recipient's share debt
+/// ends on every open GSS delivery of the group whose secret epoch the
+/// accepted share reaches AND whose debt is armed under the same key: a
+/// newer republication replaces the debt's key, and an old-key
+/// acceptance (an in-flight share from before the re-key) must not
+/// discharge it. The recipient's next head report then converges it. A
+/// share of a later epoch clears an older epoch's debt: the round drops
+/// that delivery at the epoch change anyway, never resending old crypto
+/// material.
 pub(super) async fn gss_share_accepted(
     state: &Arc<AppState>,
     stable_group_id: &str,
     recipient_hex: &str,
     secret_epoch: u64,
+    kem_key: &str,
 ) {
     let Some(recipient) = agent_bytes(recipient_hex) else {
         return;
@@ -1151,13 +1221,53 @@ pub(super) async fn gss_share_accepted(
     for (key, delivery) in inner.ce.deliveries.iter_mut() {
         if key.stable_group_id == stable_group_id
             && delivery.gss_epoch.is_some_and(|owed| secret_epoch >= owed)
-            && delivery.gss_shares_owed.remove(&recipient)
+            && delivery
+                .gss_shares_owed
+                .get(&recipient)
+                .is_some_and(|armed_under| armed_under == kem_key)
+            && delivery.gss_shares_owed.remove(&recipient).is_some()
         {
             cleared = true;
         }
     }
     if cleared {
         inner.dirty = true;
+    }
+}
+
+/// #1663 review round 4 (Claude, 30 Oct): a restart loses the in-memory
+/// debt, and the survivor's startup re-send of its frame is refused
+/// `StaleKey` by this author, so nothing would re-arm it — yet the
+/// republished seat (the counter survives in the saved roster) still
+/// serves the restored head while its share may never have installed.
+/// Arming the debt again on resume keeps the resumed delivery from
+/// completing shareless: only a seat with a republication counter
+/// (exactly `X0XKR1` sets it) can be keyed-by-republication, and the
+/// debt is armed under the seat's current key so only a share sealed to
+/// that key discharges it.
+pub(super) fn arm_resumed_share_debts(
+    ce_state: &mut CeState,
+    key: &EvictionKey,
+    info: &GroupInfo,
+    recipients: &[[u8; 32]],
+) {
+    let Some(delivery) = ce_state.deliveries.get_mut(key) else {
+        return;
+    };
+    if delivery.gss_epoch.is_none() {
+        return;
+    }
+    for id in recipients {
+        let Some(seat) = info.members_v2.get(&hex::encode(id)) else {
+            continue;
+        };
+        if seat.kem_key_sequence.is_none() {
+            continue;
+        }
+        let Some(kem) = seat.kem_public_key_b64.clone() else {
+            continue;
+        };
+        delivery.gss_shares_owed.insert(*id, kem);
     }
 }
 
@@ -1188,7 +1298,7 @@ pub(super) fn new_delivery(
             next_revision,
             resumed,
             gss_shares_pending,
-            gss_shares_owed: BTreeSet::new(),
+            gss_shares_owed: BTreeMap::new(),
             gss_epoch,
             recipients: recipients
                 .into_iter()
@@ -1482,8 +1592,8 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
             // convergence of a debtor is held in `note_survivor_head`, so
             // `all_converged` can not hold here with a debt outstanding,
             // and the guard keeps the removal honest on its own.
-            stored.gss_shares_owed.retain(|id| active.contains(id));
-            let debtors: Vec<[u8; 32]> = stored.gss_shares_owed.iter().copied().collect();
+            stored.gss_shares_owed.retain(|id, _| active.contains(id));
+            let debtors: Vec<[u8; 32]> = stored.gss_shares_owed.keys().copied().collect();
             if all_converged(&stored.recipients) && stored.gss_shares_owed.is_empty() {
                 inner.ce.deliveries.remove(&key);
                 inner.dirty = true;
@@ -5643,7 +5753,9 @@ mod daemon_tests {
                 .ce
                 .deliveries
                 .get(&key)
-                .is_some_and(|delivery| !delivery.gss_shares_owed.contains(survivor.as_bytes()));
+                .is_some_and(|delivery| {
+                    !delivery.gss_shares_owed.contains_key(survivor.as_bytes())
+                });
             if debt_cleared {
                 break;
             }
@@ -5773,8 +5885,11 @@ mod daemon_tests {
             let delivery = inner.ce.deliveries.get(&key).context("the open delivery")?;
             assert_eq!(
                 delivery.gss_shares_owed,
-                std::collections::BTreeSet::from([*survivor.as_bytes()]),
-                "the key ingest owes the republisher its share"
+                std::collections::BTreeMap::from([(
+                    *survivor.as_bytes(),
+                    own.kem_public_key_b64.clone()
+                )]),
+                "the key ingest owes the republisher its share under its key"
             );
         }
         // HEAD SECOND, SHARE ABSENT: the keyed seat serves its saved head
@@ -5836,8 +5951,8 @@ mod daemon_tests {
                 .context("the delivery survives the failed share batch")?;
             assert!(!delivery.gss_shares_pending, "the batch trigger cleared");
             assert_eq!(
-                delivery.gss_shares_owed,
-                std::collections::BTreeSet::from([*survivor.as_bytes()]),
+                delivery.gss_shares_owed.keys().copied().collect::<Vec<_>>(),
+                vec![*survivor.as_bytes()],
                 "the debt survives the failed share batch"
             );
         }
@@ -6018,6 +6133,454 @@ mod daemon_tests {
             .and_then(|info| info.members_v2.get(&survivor_hex).cloned())
             .context("the sender's own seat")?;
         assert_eq!(seat.kem_key_sequence, Some(1));
+        Ok(())
+    }
+
+    /// #1663 review round 4 (Codex controller P1, 30 Oct): the share debt
+    /// is armed BEFORE the durable write. The persister installs the
+    /// keyed seat inside that write, and the head/round observers read
+    /// the roster without the membership guard — so when a restored head
+    /// answer lands while the ingest still waits on the frozen card
+    /// cache (after the persist, before the ingest returns), the debt
+    /// already holds the survivor's convergence: the keyed seat and the
+    /// obligation became visible together.
+    #[tokio::test]
+    async fn the_share_debt_precedes_the_keyed_seats_visibility() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let decoded = ce::decode_frame(&frame).context("frame")?;
+        let result_head = decoded.body.commit.state_hash.clone();
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        // The survivor installs the frame keyless and republishes its key.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        let mut republished = false;
+        for _ in 0..250 {
+            republished = fx
+                .replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .and_then(|info| info.members_v2.get(&survivor_hex))
+                .is_some_and(|seat| seat.kem_key_sequence.is_some());
+            if republished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            republished,
+            "the keyless install triggered the republication"
+        );
+        let own = ng::key_republish::build_own_republish(&fx.replica, &fx.group_id)
+            .await
+            .context("the survivor builds its next republication")?;
+        // The restored head the survivor serves, captured before the
+        // ingest runs.
+        let served = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
+        assert_eq!(
+            served.as_deref(),
+            Some(result_head.as_str()),
+            "the keyed seat serves its saved head"
+        );
+        // Freeze the card cache the ingest refreshes AFTER its persist:
+        // the ingest installs the key, then waits here.
+        let card = fx.state.group_card_cache.write().await;
+        let payload = own.payload.clone();
+        let ingest = {
+            let author = std::sync::Arc::clone(&fx.state);
+            tokio::spawn(
+                async move { ng::key_republish::receive(&author, survivor, &payload).await },
+            )
+        };
+        let mut seated = false;
+        for _ in 0..500 {
+            seated = fx
+                .state
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .and_then(|info| info.members_v2.get(&survivor_hex))
+                .is_some_and(|seat| seat.kem_public_key_b64.is_some());
+            if seated {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            seated,
+            "the persist installed the keyed seat while the ingest waits"
+        );
+        // The restored head lands in the gap — after the seat is visible,
+        // before the ingest returned. The debt, armed before the persist,
+        // holds the convergence.
+        super::super::note_catchup_head(
+            &fx.state,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
+        assert_ne!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Converged),
+            "the keyed seat converged nothing: the debt armed before it was visible"
+        );
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            assert!(
+                inner
+                    .ce
+                    .deliveries
+                    .get(&key)
+                    .is_some_and(|delivery| delivery
+                        .gss_shares_owed
+                        .contains_key(survivor.as_bytes())),
+                "the debt stands while the ingest waits"
+            );
+        }
+        drop(card);
+        assert_eq!(
+            ingest.await.context("the ingest task")?,
+            ng::key_republish::RepublishOutcome::Installed
+        );
+        // Still held after the ingest returns: only a carrier-accepted
+        // share under the seated key discharges it.
+        assert_ne!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Converged),
+            "no share was accepted: the report still converges nothing"
+        );
+        Ok(())
+    }
+
+    /// #1663 review round 4 (Codex controller P2, 30 Oct): the acceptance
+    /// is bound to the KEM key the share was sealed under. A debt armed
+    /// for a newer republication is not discharged by an old-key
+    /// acceptance — an in-flight share from before the re-key — and the
+    /// acceptance under the armed key clears it.
+    #[tokio::test]
+    async fn an_old_key_acceptance_cannot_discharge_a_newer_keys_debt() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let survivor = state.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let group_id = "d4".repeat(16);
+        let mut info = x0x::groups::GroupInfo::new(
+            "key-binding".into(),
+            String::new(),
+            survivor,
+            group_id.clone(),
+        );
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        // One open GSS delivery that owes the survivor a share.
+        let key = EvictionKey::new(stable.clone(), [0x44; 32]);
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .ce
+            .deliveries
+            .insert(
+                key.clone(),
+                CeDelivery {
+                    bytes: Arc::new(Vec::new()),
+                    result_head: info.state_hash.clone(),
+                    next_revision: 1,
+                    resumed: false,
+                    gss_shares_pending: false,
+                    gss_shares_owed: BTreeMap::new(),
+                    gss_epoch: Some(3),
+                    recipients: [(*survivor.as_bytes(), RecipientDelivery::Due)]
+                        .into_iter()
+                        .collect(),
+                    next_at: Instant::now(),
+                },
+            );
+        let old_key = "b2hvbGRlci1vbGQta2V5".to_string();
+        let new_key = "b2hvbGRlci1uZXcta2V5".to_string();
+        owe_gss_shares_after_republish(&state, &stable, survivor.as_bytes(), &old_key).await;
+        owe_gss_shares_after_republish(&state, &stable, survivor.as_bytes(), &new_key).await;
+        // The old-key acceptance (epoch equal, older key) discharges
+        // nothing; the newer republication's debt stands.
+        gss_share_accepted(&state, &stable, &survivor_hex, 3, &old_key).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner
+                    .ce
+                    .deliveries
+                    .get(&key)
+                    .map(|d| d.gss_shares_owed.clone()),
+                Some(BTreeMap::from([(*survivor.as_bytes(), new_key.clone())])),
+                "an old-key acceptance cannot discharge the newer key's debt"
+            );
+        }
+        // The matching acceptance — same epoch, same key — clears it.
+        gss_share_accepted(&state, &stable, &survivor_hex, 3, &new_key).await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(
+                inner
+                    .ce
+                    .deliveries
+                    .get(&key)
+                    .is_some_and(|delivery| delivery.gss_shares_owed.is_empty()),
+                "the acceptance under the armed key discharges the debt"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1663 review round 4 (Claude, 30 Oct): the share debt is
+    /// memory-only, so a restart loses it — and the survivor's startup
+    /// re-send of its frame is refused `StaleKey` by the restarted
+    /// author, so nothing would re-arm it. The resume pass re-arms the
+    /// debt for every republished seat (the counter survives in the
+    /// saved roster): the resumed delivery still cannot complete on the
+    /// survivor's restored head while the share batch failed, and the
+    /// accepted share, then the head report, complete it.
+    #[tokio::test]
+    async fn a_restart_rebuilds_the_share_debt_of_a_republished_seat() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let decoded = ce::decode_frame(&frame).context("frame")?;
+        let result_head = decoded.body.commit.state_hash.clone();
+        let survivor = fx.replica.agent.agent_id();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        // The survivor installs the frame keyless, republishes, and the
+        // author seats the republished key — the debt arms durably in
+        // the roster (the counter), not yet in any round.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied
+        );
+        let mut republished = false;
+        for _ in 0..250 {
+            republished = fx
+                .replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .and_then(|info| info.members_v2.get(&survivor_hex))
+                .is_some_and(|seat| seat.kem_key_sequence.is_some());
+            if republished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            republished,
+            "the keyless install triggered the republication"
+        );
+        let own = ng::key_republish::build_own_republish(&fx.replica, &fx.group_id)
+            .await
+            .context("the survivor builds its next republication")?;
+        assert_eq!(
+            ng::key_republish::receive(&fx.state, survivor, &own.payload).await,
+            ng::key_republish::RepublishOutcome::Installed,
+            "the author seats the republished key before its restart"
+        );
+        let served = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
+        assert_eq!(
+            served.as_deref(),
+            Some(result_head.as_str()),
+            "the keyed seat serves its saved head"
+        );
+        // The author restarts: the in-memory debt is gone, the saved
+        // roster still seats the republished key with its counter.
+        let mut restarted =
+            ng::tests::secure_endpoint_test_state_at(fx.dir.path(), Arc::clone(&fx.state.agent))
+                .await?;
+        super::super::zero_restart_wait_for_test(&mut restarted);
+        super::super::load_persisted_obligations(&restarted).await;
+        advertise_crypto_exclusion(&restarted, survivor);
+        restarted
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        {
+            let inner = restarted.revocation_evictions.inner.lock().await;
+            let delivery = inner
+                .ce
+                .deliveries
+                .get(&key)
+                .context("the saved frame's delivery resumes")?;
+            let seated_key = fx
+                .state
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .and_then(|info| info.members_v2.get(&survivor_hex))
+                .and_then(|seat| seat.kem_public_key_b64.clone())
+                .context("the seated key")?;
+            assert_eq!(
+                delivery.gss_shares_owed,
+                BTreeMap::from([(*survivor.as_bytes(), seated_key)]),
+                "the resume re-armed the republished seat's share debt under its key"
+            );
+        }
+        // A failed share batch (the parked egress) and the restored head:
+        // the resumed delivery still cannot complete shareless. The pass
+        // drives the resumed delivery's first synced round — the batch and
+        // the debtor re-seal — while the barrier keeps the carrier from
+        // accepting anything.
+        let parked = ng::join_egress_test_barrier::arm(&survivor_hex, "secure_share");
+        super::super::revocation_eviction_pass(&restarted).await;
+        super::super::note_catchup_head(
+            &restarted,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
+        assert_ne!(
+            delivery_status(&restarted, &key, &survivor).await,
+            Some(RecipientDelivery::Converged),
+            "the resumed debt holds the restored head after the restart"
+        );
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&restarted, &key, &survivor).await;
+        let mut arrived = false;
+        for _ in 0..500 {
+            arrived = parked.gate.parked() > 0;
+            if arrived {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            arrived,
+            "the resumed round sealed the owed share; the barrier holds it"
+        );
+        {
+            let inner = restarted.revocation_evictions.inner.lock().await;
+            assert!(
+                inner.ce.deliveries.contains_key(&key),
+                "the delivery stays open across the restart while the share is owed"
+            );
+        }
+        // The accepted share discharges the debt; the same head report
+        // then converges the seat and completes the row.
+        drop(parked);
+        let mut debt_cleared = false;
+        for _ in 0..250 {
+            debt_cleared = restarted
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .get(&key)
+                .is_some_and(|delivery| delivery.gss_shares_owed.is_empty());
+            if debt_cleared {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            debt_cleared,
+            "the carrier's acceptance of the share ends the restarted debt"
+        );
+        super::super::note_catchup_head(
+            &restarted,
+            std::slice::from_ref(&fx.group_id),
+            &survivor_hex,
+            served.as_deref(),
+        )
+        .await;
+        assert_eq!(
+            delivery_status(&restarted, &key, &survivor).await,
+            Some(RecipientDelivery::Converged),
+            "the same head report converges the seat once the share was accepted"
+        );
+        tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
+        delivery_round(&restarted, &key, &survivor).await;
+        super::super::revocation_eviction_pass(&restarted).await;
+        {
+            let inner = restarted.revocation_evictions.inner.lock().await;
+            assert!(
+                !inner.ce.delivering().contains(&key),
+                "the accepted share ends the delivery after the restart"
+            );
+            assert_eq!(
+                inner.store.get(&key).map(|row| row.phase),
+                Some(Phase::Complete),
+                "the obligation completes after the restart"
+            );
+        }
         Ok(())
     }
 
@@ -7194,7 +7757,7 @@ mod daemon_tests {
                     next_revision: 1,
                     resumed: false,
                     gss_shares_pending: false,
-                    gss_shares_owed: BTreeSet::new(),
+                    gss_shares_owed: BTreeMap::new(),
                     gss_epoch: None,
                     recipients: [(*member.as_bytes(), RecipientDelivery::Due)]
                         .into_iter()
@@ -7315,7 +7878,7 @@ mod daemon_tests {
                     next_revision: 1,
                     resumed: false,
                     gss_shares_pending: false,
-                    gss_shares_owed: BTreeSet::new(),
+                    gss_shares_owed: BTreeMap::new(),
                     gss_epoch: None,
                     recipients: [(*member.as_bytes(), RecipientDelivery::Due)]
                         .into_iter()

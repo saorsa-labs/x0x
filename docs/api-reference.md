@@ -1875,9 +1875,10 @@ delivery the S4 row owes. Until one of the two keys the seat again, the
 hold lasts: an installed share of the held epoch, or a later one, or
 the #1663 republication (while the node holds no secret), ends it.
 
-**Wire and capabilities.** The daemon advertises three more ADR 0093
+**Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
-(bit 5) and `owner_recovery_v1` (bit 7). The new frames ride the
+(bit 5), `owner_recovery_v1` (bit 7) and `key_republish_v1` (bit 12,
+the #1663 republication). The new frames ride the
 direct-message carrier only. They are
 not on the metadata topic and not in a legacy-decoded container:
 
@@ -1892,7 +1893,7 @@ not on the metadata topic and not in a legacy-decoded container:
   that asks for TreeKEM catch-up gets held frames on this same carrier.
 
 - `X0XKR1` — `MemberKeyRepublishV1` (#1663, bit 12 `key_republish_v1`).
-  An Active member of an encrypted GSS group republicates its ML-KEM-768
+  An Active member of an encrypted GSS group republishes its ML-KEM-768
   public key on its own seat — the recovery of the keyless survivor state
   above, without a leave and re-join. The body is signed in domain
   `x0x.member-key-republish.v1` by the member's agent key, which the body
