@@ -934,6 +934,12 @@ pub struct Agent {
     /// signing gate instead of re-enabling the pre-0043 exception (state
     /// loss must never resurrect a custodian the durable log moved away).
     move_state_load_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// #1657: shared bookkeeping of the refusal-only reply path (the
+    /// per-(machine, group) dedupe and the test egress recorder), used
+    /// by BOTH refusal senders — the raw-QUIC listener arms and
+    /// [`Agent::send_treekem_refusal_reply`] — so one pair is answered
+    /// once per window across paths. See `direct::TreeKemRefusalReplies`.
+    treekem_refusal_replies: std::sync::Arc<direct::TreeKemRefusalReplies>,
     /// ADR-0043 review-r5: ceremony gate mirrored on the agent so the
     /// LIBRARY API (`move_authorize`/`move_export`/`move_import`/
     /// `move_activate`/`move_abort`/`move_retire`) is unreachable when
@@ -1131,6 +1137,132 @@ impl Drop for ShutdownBodyGuard {
 struct KvSnapshotRegistry {
     closed: bool,
     entries: std::collections::HashMap<std::path::PathBuf, std::sync::Weak<kv::KvStoreSync>>,
+}
+
+/// #1657: gate 2 of the refusal-only reply path — the requester
+/// machine's verified capability advert must carry
+/// `treekem_catchup_refusal_v1` (bit 13). `Some(true)` alone admits: a
+/// peer whose advert lacks the bit, and a peer with no verified
+/// advert, keeps main's silent drop (Engineer rulings, 29 Oct 22:14
+/// and 22:52 GMT — an older peer must never record the refusal as a
+/// durable DM-history row).
+fn treekem_refusal_capability_admits(
+    capability_store: &dm_capability::CapabilityStore,
+    machine_id: &identity::MachineId,
+) -> bool {
+    capability_store.machine_registry_supports(
+        machine_id,
+        dm::CapabilityRegistry::TREEKEM_CATCHUP_REFUSAL_V1,
+    ) == Some(true)
+}
+
+/// #1657: the ADR-0043 signing-gate decision specialised to the typed
+/// TreeKEM catch-up refusal, which is always sent for THIS daemon's
+/// own agent (so `holds_agent_key` is true by definition — an imported
+/// foreign key never sends refusals). Mirrors
+/// [`Agent::signing_gate_allows`] on the pieces the refusal-only reply
+/// path captures: a quiesced (mid-move/retire-pending) or quarantined
+/// machine sends no refusal, exactly as it produces no agent
+/// signature.
+async fn treekem_refusal_signing_gate_allows(
+    identity: &std::sync::Arc<identity::Identity>,
+    move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+    move_state_load_failed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> bool {
+    let agent = identity.agent_id();
+    let holds_key = true;
+    let state = move_state.read().await;
+    if state.log(&agent).is_empty() {
+        // The refusal is sent for the daemon's own agent, so this is
+        // exactly `agent == self.agent_id() && holds_key`.
+        return holds_key;
+    }
+    // A corrupt/undecodable moves.bin fail-closes every empty log.
+    if move_state_load_failed.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    state
+        .fold(&agent)
+        .may_sign(&identity.machine_id(), holds_key)
+}
+
+/// #1657: the shared tail of BOTH typed-refusal senders — the raw-QUIC
+/// listener arms and [`Agent::send_treekem_refusal_reply`]. Dedupes the
+/// (machine, group) pair, builds the refusal, records it at the egress
+/// seam (tests), and sends it machine-addressed over raw QUIC under
+/// [`direct::TREEKEM_REFUSAL_SEND_TIMEOUT`]. The caller has already run
+/// the shape, capability and signing gates.
+async fn send_treekem_refusal_frame(
+    network: Option<&std::sync::Arc<network::NetworkNode>>,
+    replies: &std::sync::Arc<direct::TreeKemRefusalReplies>,
+    local_agent_id: identity::AgentId,
+    requester: identity::AgentId,
+    machine_id: identity::MachineId,
+    group_id: &str,
+    reason: direct::TreeKemCatchupRefusalReason,
+) {
+    if !replies.admit(machine_id, group_id) {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "refusal_reply",
+            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+            outcome = "treekem_refusal_dedupe",
+            "typed TreeKEM catch-up refusal withheld: this (machine, group) pair was answered inside the dedupe window"
+        );
+        return;
+    }
+    let refusal = direct::TreeKemCatchupRefusal::new(
+        group_id.to_string(),
+        hex::encode(requester.as_bytes()),
+        reason,
+    );
+    let payload = match serde_json::to_vec(&refusal) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(
+                target: "x0x::direct",
+                stage = "refusal_reply",
+                "failed to serialize the typed TreeKEM catch-up refusal: {e}"
+            );
+            return;
+        }
+    };
+    #[cfg(test)]
+    if let Ok(mut egress) = replies.egress.lock() {
+        egress.push((machine_id, payload.clone()));
+    }
+    let Some(network) = network else {
+        tracing::debug!(
+            target: "x0x::direct",
+            stage = "refusal_reply",
+            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+            outcome = "treekem_refusal_no_transport",
+            "typed TreeKEM catch-up refusal decided but this node has no network transport"
+        );
+        return;
+    };
+    let peer_id = ant_quic::PeerId(machine_id.0);
+    let send = network.send_direct(&peer_id, local_agent_id.as_bytes(), &payload);
+    match tokio::time::timeout(direct::TREEKEM_REFUSAL_SEND_TIMEOUT, send).await {
+        Err(_) => tracing::warn!(
+            target: "x0x::direct",
+            stage = "refusal_reply",
+            sender_prefix = %network::hex_prefix(&requester.0, 4),
+            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+            outcome = "treekem_refusal_send_timeout",
+            "timed out sending the typed TreeKEM catch-up refusal to the refused requester"
+        ),
+        Ok(Err(e)) => tracing::warn!(
+            target: "x0x::direct",
+            stage = "refusal_reply",
+            sender_prefix = %network::hex_prefix(&requester.0, 4),
+            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+            outcome = "treekem_refusal_send_failed",
+            error = %e,
+            "failed to send the typed TreeKEM catch-up refusal to the refused requester"
+        ),
+        Ok(Ok(())) => {}
+    }
 }
 
 impl std::fmt::Debug for Agent {
@@ -10119,6 +10251,91 @@ impl Agent {
         self.send_direct_with_history(to, payload, config, None, Some(machine))
             .await
             .map(|(receipt, _ingress)| receipt)
+    }
+
+    /// #1657 (Claude round 3, finding 2; Codex P2 2): the refusal-only
+    /// reply path. Sends the typed TreeKEM catch-up refusal to the
+    /// machine whose request this node is refusing — never through
+    /// ordinary DM egress. Ordinary egress ([`Self::send_direct_all_stages`])
+    /// denies exactly the revoked (agent, machine) pairing this refusal
+    /// answers: the ADR-0043 §9 B/P preflight (discovery, capability
+    /// binding and registry resolutions) and `pin_show_machine` all
+    /// reject it, so a refusal sent that way never leaves. This path
+    /// reaches the refused device on its own machine id (the ant-quic
+    /// PeerId IS the machine id) over the authenticated raw-QUIC path
+    /// to that machine, and NOTHING else: it carries
+    /// one refusal frame, it opens no other route, and ordinary and key
+    /// egress denial for the revoked binding is untouched.
+    ///
+    /// Gates, in order — a refusal that fails any of them keeps main's
+    /// silent drop:
+    /// 1. the group id is exactly 64 hex (the shape every generator
+    ///    produces);
+    /// 2. the requester machine's verified capability advert carries
+    ///    `treekem_catchup_refusal_v1` (bit 13) — a peer without the
+    ///    bit, or with no verified advert, would record the refusal as
+    ///    a durable DM-history row (Engineer rulings, 29 Oct 22:14 and
+    ///    22:52 GMT);
+    /// 3. the ADR-0043 signing gate holds for this daemon's own agent
+    ///    (a quiesced or quarantined machine sends no refusal);
+    /// 4. the (machine, group) pair was not answered inside the dedupe
+    ///    window.
+    ///
+    /// The send itself is bounded by
+    /// [`direct::TREEKEM_REFUSAL_SEND_TIMEOUT`].
+    pub(crate) async fn send_treekem_refusal_reply(
+        &self,
+        requester: &identity::AgentId,
+        machine_id: identity::MachineId,
+        group_id: &str,
+        reason: direct::TreeKemCatchupRefusalReason,
+    ) {
+        if !direct::treekem_group_id_echoable(group_id) {
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "refusal_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "treekem_refusal_bad_group_id",
+                "typed TreeKEM catch-up refusal withheld: the group id is not 64 hex"
+            );
+            return;
+        }
+        if !treekem_refusal_capability_admits(&self.capability_store, &machine_id) {
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "refusal_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "treekem_refusal_capability_withheld",
+                "typed TreeKEM catch-up refusal withheld: the requester machine's verified advert lacks bit 13 (silent drop, main's behavior)"
+            );
+            return;
+        }
+        if !treekem_refusal_signing_gate_allows(
+            &self.identity,
+            &self.move_state,
+            &self.move_state_load_failed,
+        )
+        .await
+        {
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "refusal_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "treekem_refusal_signing_gate_withheld",
+                "typed TreeKEM catch-up refusal withheld: the ADR-0043 signing gate refuses this machine"
+            );
+            return;
+        }
+        send_treekem_refusal_frame(
+            self.network.as_ref(),
+            &self.treekem_refusal_replies,
+            self.identity.agent_id(),
+            *requester,
+            machine_id,
+            group_id,
+            reason,
+        )
+        .await;
     }
 
     /// #461: provenance variant for the direct-send HTTP route — identical
@@ -19187,6 +19404,15 @@ impl Agent {
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let announced_for_direct = std::sync::Arc::clone(&self.announced_machine_bindings);
+        // #1657: the refusal-only reply path's pieces — the capability
+        // gate, the signing-gate inputs and the shared dedupe state —
+        // captured so the listener arms run the SAME gates the catch-up
+        // serve handler runs (Engineer rulings, 29 Oct 22:14 and 22:52
+        // GMT), never a bare transport send.
+        let refusal_capability_store = std::sync::Arc::clone(&self.capability_store);
+        let refusal_identity = std::sync::Arc::clone(&self.identity);
+        let refusal_move_state_load_failed = std::sync::Arc::clone(&self.move_state_load_failed);
+        let refusal_replies = std::sync::Arc::clone(&self.treekem_refusal_replies);
         // #1657: the refusing node's agent id, sent with the typed TreeKEM
         // catch-up refusal so the requester knows who refused. AgentId is
         // Copy, so the capture needs no clone.
@@ -19206,38 +19432,60 @@ impl Agent {
             // depth — a revoked device that never grants stream credit
             // cannot make the listener hold unbounded refusal bytes.
             const TREEKEM_REFUSAL_SEND_CAP: usize = 16;
-            const TREEKEM_REFUSAL_SEND_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(5);
             let mut refusal_sends = futures::stream::FuturesUnordered::new();
-            let send_treekem_refusal = |ant_peer_id: ant_quic::PeerId,
-                                        sender: identity::AgentId,
+            let send_treekem_refusal = |sender: identity::AgentId,
                                         machine_id: identity::MachineId,
-                                        refusal: Vec<u8>,
-                                        requester: &'static str| {
+                                        group_id: String,
+                                        reason: direct::TreeKemCatchupRefusalReason| {
                 let network = std::sync::Arc::clone(&network);
+                let capability_store = std::sync::Arc::clone(&refusal_capability_store);
+                let identity = std::sync::Arc::clone(&refusal_identity);
+                let move_state = std::sync::Arc::clone(&move_state_direct);
+                let move_state_load_failed =
+                    std::sync::Arc::clone(&refusal_move_state_load_failed);
+                let replies = std::sync::Arc::clone(&refusal_replies);
                 async move {
-                    let send =
-                        network.send_direct(&ant_peer_id, local_agent_id.as_bytes(), &refusal);
-                    match tokio::time::timeout(TREEKEM_REFUSAL_SEND_TIMEOUT, send).await {
-                        Err(_) => tracing::warn!(
+                    // Gate 2 of the refusal-only reply path (see
+                    // `Agent::send_treekem_refusal_reply`): the requester
+                    // machine's verified advert must carry bit 13, else
+                    // the frame keeps main's silent drop.
+                    if !treekem_refusal_capability_admits(&capability_store, &machine_id) {
+                        tracing::debug!(
                             target: "x0x::direct",
                             stage = "recv",
-                            sender_prefix = %network::hex_prefix(&sender.0, 4),
                             machine_prefix = %network::hex_prefix(&machine_id.0, 4),
-                            outcome = "treekem_refusal_send_timeout",
-                            "timed out sending the typed TreeKEM catch-up refusal to the {requester} requester"
-                        ),
-                        Ok(Err(e)) => tracing::warn!(
-                            target: "x0x::direct",
-                            stage = "recv",
-                            sender_prefix = %network::hex_prefix(&sender.0, 4),
-                            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
-                            outcome = "treekem_refusal_send_failed",
-                            error = %e,
-                            "failed to send the typed TreeKEM catch-up refusal to the {requester} requester"
-                        ),
-                        Ok(Ok(())) => {}
+                            outcome = "treekem_refusal_capability_withheld",
+                            "typed TreeKEM catch-up refusal withheld: the requester machine's verified advert lacks bit 13 (silent drop, main's behavior)"
+                        );
+                        return;
                     }
+                    // Gate 3: the ADR-0043 signing gate.
+                    if !treekem_refusal_signing_gate_allows(
+                        &identity,
+                        &move_state,
+                        &move_state_load_failed,
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            target: "x0x::direct",
+                            stage = "recv",
+                            machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                            outcome = "treekem_refusal_signing_gate_withheld",
+                            "typed TreeKEM catch-up refusal withheld: the ADR-0043 signing gate refuses this machine"
+                        );
+                        return;
+                    }
+                    send_treekem_refusal_frame(
+                        Some(&network),
+                        &replies,
+                        local_agent_id,
+                        sender,
+                        machine_id,
+                        &group_id,
+                        reason,
+                    )
+                    .await;
                 }
             };
             loop {
@@ -19413,18 +19661,14 @@ impl Agent {
                     // machine alone being the cause may be named. The send runs
                     // on `refusal_sends`, never inline (review finding 1).
                     if machine_revoked && !agent_revoked {
-                        if let Some(refusal) = direct::treekem_catchup_refusal_for(
-                            &data,
-                            &sender,
-                            direct::TreeKemCatchupRefusalReason::MachineRevoked,
-                        ) {
+                        if let Some(group_id) = direct::treekem_catchup_refusal_probe(&data, &sender)
+                        {
                             if refusal_sends.len() < TREEKEM_REFUSAL_SEND_CAP {
                                 refusal_sends.push(send_treekem_refusal(
-                                    ant_peer_id,
                                     sender,
                                     machine_id,
-                                    refusal,
-                                    "machine-revoked",
+                                    group_id,
+                                    direct::TreeKemCatchupRefusalReason::MachineRevoked,
                                 ));
                             } else {
                                 tracing::debug!(
@@ -19471,18 +19715,14 @@ impl Agent {
                     // PlacementPinned stays a silent drop: it states a
                     // placement fact, not a revocation.
                     if matches!(denial, key_move::PairingDenial::BindingRevoked) {
-                        if let Some(refusal) = direct::treekem_catchup_refusal_for(
-                            &data,
-                            &sender,
-                            direct::TreeKemCatchupRefusalReason::BindingRevoked,
-                        ) {
+                        if let Some(group_id) = direct::treekem_catchup_refusal_probe(&data, &sender)
+                        {
                             if refusal_sends.len() < TREEKEM_REFUSAL_SEND_CAP {
                                 refusal_sends.push(send_treekem_refusal(
-                                    ant_peer_id,
                                     sender,
                                     machine_id,
-                                    refusal,
-                                    "binding-revoked",
+                                    group_id,
+                                    direct::TreeKemCatchupRefusalReason::BindingRevoked,
                                 ));
                             } else {
                                 tracing::debug!(
@@ -23354,6 +23594,7 @@ impl AgentBuilder {
         Ok(Agent {
             move_state,
             move_state_load_failed,
+            treekem_refusal_replies: std::sync::Arc::new(direct::TreeKemRefusalReplies::default()),
             move_ceremony_enabled: self.move_ceremony_enabled,
             stream_reauth,
             history_service: tokio::sync::Mutex::new(history_service),

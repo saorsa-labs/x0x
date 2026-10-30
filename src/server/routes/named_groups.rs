@@ -12269,20 +12269,31 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
         .is_some()
 }
 
+/// #1657: how long one surfaced refusal note suppresses the warn for
+/// an identical repeat (same peer, same reason, same group). The note
+/// itself is always refreshed; only the operator log line is deduped,
+/// so no verified peer can flood it.
+const TREEKEM_REFUSAL_REWARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the asker's
 /// side of the typed refusal. A peer refused this device's catch-up
 /// request, naming its machine or binding revocation. The refusal stops
-/// the 2 s head-round re-ask of that peer (it answered — exactly like
-/// the keyless disclaimer, it confirms or clears no head evidence) and
-/// the reason is surfaced: an operator log line plus the latest note per
-/// group on `AppState`, readable by tests and a later diagnostics
-/// surface. The gates mirror the response handler — an unverified
-/// sender, a sender this node itself holds revoked, and a pending
-/// revocation resync all change nothing, so a revoked peer cannot forge
-/// a silence — and a refusal addressed to another requester is not
-/// ours. A peer that never sends the refusal (an older peer, or the
-/// gossip-inbox path whose payload is ciphertext at its gate) leaves
-/// main's behavior: the ask cadence keeps counting the peer.
+/// the 2 s head-round re-ask of that peer when it answered a peer this
+/// node asked this round (it answered — exactly like the keyless
+/// disclaimer, it confirms or clears no head evidence) and the reason
+/// is surfaced for EVERY ask kind — head-round, gap, page and
+/// key-package catch-up asks alike (review round 3, finding 3): an
+/// operator log line plus the latest note per group on `AppState`,
+/// readable by tests and a later diagnostics surface. The gates mirror
+/// the response handler — an unverified sender, a sender this node
+/// itself holds revoked, and a pending revocation resync all change
+/// nothing, so a revoked peer cannot forge a silence — and a refusal
+/// addressed to another requester is not ours. The warn states what the
+/// PEER reports, not verified local state, and a repeated identical
+/// note does not re-warn. A peer that never sends the refusal (an
+/// older peer, or the gossip-inbox path whose payload is ciphertext at
+/// its gate) leaves main's behavior: the ask cadence keeps counting
+/// the peer.
 pub(in crate::server) async fn handle_treekem_catchup_refusal(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -12326,10 +12337,13 @@ pub(in crate::server) async fn handle_treekem_catchup_refusal(
         }
     }
     let sender_hex = hex::encode(sender.as_bytes());
-    // Review round 1 (forged-refusal hardening): only a refusal from a
-    // peer this node asked this round is honored — it alone can stop the
-    // re-ask, warn, and hold the note. An unsolicited refusal is logged
-    // and ignored.
+    // Review round 3, finding 3: the asked-peer check now guards the
+    // RE-ASK STOP only. Only a refusal from a peer this node asked this
+    // head round may close that peer's unanswered slot — an unsolicited
+    // refusal still cannot stop a re-ask — but a refusal from any peer
+    // that passed the gates above is surfaced below, because the usual
+    // catch-up asks (gap, page, key package) never write a head round
+    // at all.
     if !revocation_eviction::note_catchup_refused_peer(
         state,
         &[refusal.group_id().to_string()],
@@ -12340,16 +12354,33 @@ pub(in crate::server) async fn handle_treekem_catchup_refusal(
         tracing::debug!(
             group_id = %LogHexId::group(refusal.group_id()),
             peer = %LogHexId::agent(&sender_hex),
-            "ignoring an unsolicited TreeKEM catch-up refusal from a peer this node did not ask"
+            "a TreeKEM catch-up refusal from a peer this node did not ask this round: the reason is surfaced, the head-round re-ask cadence keeps counting the peer"
         );
-        return;
     }
-    tracing::warn!(
-        group_id = %LogHexId::group(refusal.group_id()),
-        peer = %LogHexId::agent(&sender_hex),
-        reason = ?refusal.reason,
-        "TreeKEM catch-up refused: a peer named this device's revocation; the head-round re-ask stops for that peer"
-    );
+    // The surface: warn once per distinct (peer, reason) per group — a
+    // repeated identical refusal refreshes the note but does not re-warn,
+    // so no verified peer can flood the operator log.
+    let repeated = state
+        .treekem_catchup_refusals
+        .lock()
+        .ok()
+        .and_then(|notes| {
+            notes.get(refusal.group_id()).and_then(|note| {
+                (note.peer == *sender.as_bytes()
+                    && note.reason == refusal.reason
+                    && note.at.elapsed() < TREEKEM_REFUSAL_REWARN_AFTER)
+                    .then_some(())
+            })
+        })
+        .is_some();
+    if !repeated {
+        tracing::warn!(
+            group_id = %LogHexId::group(refusal.group_id()),
+            peer = %LogHexId::agent(&sender_hex),
+            reason = ?refusal.reason,
+            "TreeKEM catch-up refused: the peer reports this device's revocation (peer-reported, not locally verified); the head-round re-ask stops for that peer when it was asked this round"
+        );
+    }
     if let Ok(mut notes) = state.treekem_catchup_refusals.lock() {
         notes.insert(
             refusal.group_id().to_string(),
@@ -12366,16 +12397,25 @@ pub(in crate::server) async fn handle_treekem_catchup_refusal(
 /// typed refusal for a machine- or binding-revoked catch-up requester.
 /// The refusal names the revocation so the requester can stop re-asking
 /// and surface the reason; it carries no group data beyond what the
-/// request itself named. It travels on the catch-up DM lane, so its
-/// sender is authenticated exactly like a page (the QUIC ML-DSA-65
-/// handshake on the raw path, the signed envelope on the gossip path).
-/// Review round 1, finding 2: the refusal is MACHINE-bound
-/// (`send_direct_bound_to_machine`) and echoes the authenticated sender
-/// id, so it reaches the revoked device that asked — never a clean
-/// device of the same agent — and never an id the request chose. The
-/// payload is recorded for tests before the egress attempt, exactly as
-/// the page serve does — the recorder observes the decision, not the
-/// transport.
+/// request itself named. It travels machine-addressed on the catch-up
+/// DM lane, so its sender is authenticated exactly like a page (the
+/// QUIC ML-DSA-65 handshake on the raw path, the signed envelope on
+/// the gossip path).
+/// Review round 1, finding 2: the refusal echoes the authenticated
+/// sender id, never an id the request chose (the requester-id check
+/// above already refused a mismatch), and it is MACHINE-addressed, so
+/// it reaches the revoked device that asked — never a clean device of
+/// the same agent.
+/// Review round 3 (Claude finding 2 / Codex P2 2): ordinary DM egress
+/// (`send_direct_bound_to_machine` → `send_direct_all_stages`) cannot
+/// carry it — its ADR-0043 B/P pairing preflight and `pin_show_machine`
+/// deny exactly the revoked pairing this refusal answers, so the frame
+/// never left. The send now runs on the refusal-only reply path
+/// (`Agent::send_treekem_refusal_reply`), which reaches the requesting
+/// machine without opening any other route and keeps ordinary/key
+/// egress denial untouched. The test recorder observes the DECISION
+/// here (exactly as the page serve does); the egress itself is
+/// recorded at the send seam on the agent, after every gate.
 async fn send_treekem_catchup_refusal(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -12383,29 +12423,20 @@ async fn send_treekem_catchup_refusal(
     request: &TreeKemCatchupRequest,
     reason: TreeKemCatchupRefusalReason,
 ) {
-    let refusal = TreeKemCatchupRefusal::new(
+    #[cfg(test)]
+    if let Ok(payload) = serde_json::to_vec(&TreeKemCatchupRefusal::new(
         request.group_id.clone(),
         hex::encode(sender.as_bytes()),
         reason,
-    );
-    let payload = match serde_json::to_vec(&refusal) {
-        Ok(payload) => payload,
-        Err(e) => {
-            tracing::warn!(group_id = %LogHexId::group(&request.group_id), "failed to serialize TreeKEM catch-up refusal: {e}");
-            return;
+    )) {
+        if let Ok(mut recorded) = state.named_group_test_recorders.catchup_refusals.lock() {
+            recorded.push(payload);
         }
-    };
-    #[cfg(test)]
-    if let Ok(mut recorded) = state.named_group_test_recorders.catchup_refusals.lock() {
-        recorded.push(payload.clone());
     }
-    if let Err(e) = state
+    state
         .agent
-        .send_direct_bound_to_machine(sender, *machine_id, payload, direct_message_send_config())
-        .await
-    {
-        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %hex::encode(sender.as_bytes()), "failed to send TreeKEM catch-up refusal: {e}");
-    }
+        .send_treekem_refusal_reply(sender, *machine_id, &request.group_id, reason)
+        .await;
 }
 
 pub(in crate::server) async fn handle_treekem_catchup_request(

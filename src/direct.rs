@@ -195,50 +195,149 @@ pub(crate) enum TreeKemCatchupRefusalReason {
     Unknown,
 }
 
-/// One probe field of a TreeKEM catch-up request: enough to recognise the
-/// frame (and echo its group) without deserialising the whole request.
-/// Unknown JSON fields are ignored, and a payload that is not the
-/// request shape (another catch-up frame, a user DM, an envelope) fails.
+/// One probe field set of a TreeKEM catch-up request: enough to
+/// recognise the frame (and echo its group) without deserialising the
+/// whole request. Unknown JSON fields are ignored, and a payload that
+/// is not the request shape (another catch-up frame, a user DM, an
+/// envelope) fails.
 #[derive(Deserialize)]
 struct TreeKemCatchupRequestPeek {
     message_type: String,
     group_id: String,
+    /// The requester the request names. A request always carries it
+    /// (the serve compares it with the authenticated sender), so a
+    /// payload without it is not the request shape.
+    requester_agent_id: String,
 }
 
-/// The longest group id the transport refusal echoes back. Real ids are
-/// hex hashes (the genesis `group_id` / the MLS group id), far below
-/// this; a longer value is not an id this node asked about, so the
-/// refusal declines and the frame keeps the silent drop — a revoked
-/// device must not be able to make the listener hold request-sized
-/// strings (review round 1, finding 1).
-const TREEKEM_REFUSAL_GROUP_ID_MAX: usize = 128;
+/// The group id shape the catch-up lane uses: exactly 64 hex characters
+/// (every generator is `hex::encode` of a 32-byte id — the REST
+/// creation nonce and the BLAKE3 genesis/stable ids). Anything else
+/// fails closed to the silent drop, so a revoked device cannot make
+/// the listener echo request-sized strings (Engineer ruling, 29 Oct
+/// 2026 22:14 GMT: a 64-hex `group_id` check in the peek).
+const TREEKEM_REFUSAL_GROUP_ID_LEN: usize = 64;
 
-/// A group id of the shape the catch-up lane uses: hex, within the echo
-/// bound. Anything else fails closed to the silent drop.
-fn treekem_group_id_echoable(group_id: &str) -> bool {
-    group_id.len() <= TREEKEM_REFUSAL_GROUP_ID_MAX
+/// A group id of the shape the catch-up lane uses: exactly 64 hex
+/// characters. Anything else fails closed to the silent drop.
+pub(crate) fn treekem_group_id_echoable(group_id: &str) -> bool {
+    group_id.len() == TREEKEM_REFUSAL_GROUP_ID_LEN
         && group_id.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// The transport-layer refusal (#1657): when the raw-QUIC revocation or
-/// pairing gate is about to drop a frame, this builds the typed refusal
-/// for it iff it is a TreeKEM catch-up request. Returns the encoded
-/// refusal bytes, machine-addressed back to `requester`.
-pub(crate) fn treekem_catchup_refusal_for(
-    payload: &[u8],
-    requester: &AgentId,
-    reason: TreeKemCatchupRefusalReason,
-) -> Option<Vec<u8>> {
+/// The transport-layer refusal probe (#1657): when the raw-QUIC
+/// revocation or pairing gate is about to drop a frame, this proves
+/// the frame is a TreeKEM catch-up request FROM `requester` (the
+/// authenticated sender — the request's claimed requester must name
+/// the same agent, exactly as the serve's check does) and returns its
+/// 64-hex group id for the refusal. `None` keeps the silent drop.
+pub(crate) fn treekem_catchup_refusal_probe(payload: &[u8], requester: &AgentId) -> Option<String> {
     let peek = serde_json::from_slice::<TreeKemCatchupRequestPeek>(payload).ok()?;
     if peek.message_type != "treekem_catchup_request" {
+        return None;
+    }
+    if peek.requester_agent_id != hex::encode(requester.as_bytes()) {
         return None;
     }
     if !treekem_group_id_echoable(&peek.group_id) {
         return None;
     }
-    let refusal =
-        TreeKemCatchupRefusal::new(peek.group_id, hex::encode(requester.as_bytes()), reason);
-    serde_json::to_vec(&refusal).ok()
+    Some(peek.group_id)
+}
+
+/// One refusal send is bounded in time (Engineer ruling, 29 Oct 2026
+/// 22:14 GMT: timed-out refusal sends). The raw-QUIC write waits for
+/// stream and flow-control credit the remote peer grants, so an
+/// unbounded send would hold refusal bytes in the listener for as
+/// long as the refused device chooses.
+pub(crate) const TREEKEM_REFUSAL_SEND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// How long one (machine, group) refusal answer stands before the
+/// same requester may be answered again (per-(machine, group) dedupe,
+/// Engineer ruling, 29 Oct 2026 22:14 GMT). A revocation does not
+/// un-apply, so one answer per window is enough for the requester to
+/// stop its re-asks and surface the reason.
+const TREEKEM_REFUSAL_DEDUPE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Bound of the dedupe map: it holds one row per distinct refused
+/// (machine, group) pair inside the TTL window. When the window holds
+/// more rows than this, the whole window is dropped rather than grown
+/// — a revocation flood must not buy unbounded memory.
+const TREEKEM_REFUSAL_DEDUPE_CAP: usize = 512;
+
+/// #1657: the shared bookkeeping of the refusal-only reply path,
+/// owned by the agent and used by BOTH refusal senders — the raw-QUIC
+/// listener arms and the catch-up serve handler — so the per-(machine,
+/// group) dedupe holds across paths, and tests can observe the send
+/// at the egress seam (after every gate, exactly where the frame is
+/// handed to the transport), not at the decision.
+#[derive(Default)]
+pub(crate) struct TreeKemRefusalReplies {
+    /// (machine, group id bytes) -> when its refusal was last sent.
+    recent: std::sync::Mutex<std::collections::HashMap<(MachineId, [u8; 32]), std::time::Instant>>,
+    /// #1657 tests: every refusal that passed every gate and reached
+    /// the send seam, as (requester machine, payload). This records
+    /// the egress attempt itself — a gate that stops the send stops
+    /// the record, so a test cannot pass on a refusal that never
+    /// left (Claude round 3, finding 2).
+    #[cfg(test)]
+    pub(crate) egress: std::sync::Mutex<Vec<(MachineId, Vec<u8>)>>,
+}
+
+impl TreeKemRefusalReplies {
+    /// Admit one (machine, group) refusal answer: `true` when it has
+    /// no fresh entry (and one is now held), `false` when the same
+    /// pair was answered inside the dedupe window. A poisoned lock
+    /// fails open — the dedupe bounds duplicate answers, it is not a
+    /// security gate.
+    pub(crate) fn admit(&self, machine_id: MachineId, group_id: &str) -> bool {
+        let Some(bytes) = treekem_group_id_bytes(group_id) else {
+            return false;
+        };
+        let Ok(mut recent) = self.recent.lock() else {
+            return true;
+        };
+        let now = std::time::Instant::now();
+        recent.retain(|_, at| now.duration_since(*at) < TREEKEM_REFUSAL_DEDUPE_TTL);
+        if recent.len() >= TREEKEM_REFUSAL_DEDUPE_CAP {
+            recent.clear();
+        }
+        use std::collections::hash_map::Entry;
+        match recent.entry((machine_id, bytes)) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(vacant) => {
+                vacant.insert(now);
+                true
+            }
+        }
+    }
+
+    /// The dedupe window of one (machine, group) pair, aged to expire
+    /// on the next admission (tests drive the TTL without waiting).
+    #[cfg(test)]
+    pub(crate) fn expire_for_test(&self, machine_id: MachineId, group_id: &str) {
+        let Some(bytes) = treekem_group_id_bytes(group_id) else {
+            return;
+        };
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.insert(
+                (machine_id, bytes),
+                std::time::Instant::now() - TREEKEM_REFUSAL_DEDUPE_TTL,
+            );
+        }
+    }
+}
+
+/// Decode a 64-hex group id to its 32 bytes. `None` for any other
+/// shape — the caller keeps the silent drop.
+fn treekem_group_id_bytes(group_id: &str) -> Option<[u8; 32]> {
+    if !treekem_group_id_echoable(group_id) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(group_id.as_bytes(), &mut bytes).ok()?;
+    Some(bytes)
 }
 
 #[doc(hidden)]
@@ -1887,15 +1986,19 @@ mod tests {
     }
 
     #[test]
-    fn treekem_refusal_built_only_for_a_catchup_request() {
-        // #1657: the refusal answers a TreeKEM catch-up request alone. The
-        // peek needs message_type and group_id only; unknown fields of the
-        // full request shape are ignored.
+    fn treekem_refusal_probed_only_for_a_catchup_request_from_its_requester() {
+        // #1657: the refusal answers a TreeKEM catch-up request alone, and
+        // only when the request's claimed requester IS the authenticated
+        // sender (review round 3: the transport arm now checks what the
+        // serve checks). The probe needs message_type, group_id and
+        // requester_agent_id only; unknown fields of the full request
+        // shape are ignored.
         let requester = AgentId([9u8; 32]);
+        let group_id = "aa".repeat(32);
         let request = serde_json::json!({
             "message_type": "treekem_catchup_request",
-            "group_id": "aa",
-            "requester_agent_id": "bb",
+            "group_id": group_id,
+            "requester_agent_id": hex::encode(requester.as_bytes()),
             "from_revision": 0,
             "from_treekem_epoch": 0,
             "current_state_hash": "",
@@ -1904,82 +2007,81 @@ mod tests {
         })
         .to_string();
 
-        let refusal_bytes = treekem_catchup_refusal_for(
-            request.as_bytes(),
-            &requester,
-            TreeKemCatchupRefusalReason::MachineRevoked,
-        )
-        .expect("a catch-up request gets the refusal");
-        let refusal = serde_json::from_slice::<TreeKemCatchupRefusal>(&refusal_bytes)
-            .expect("the refusal bytes are one JSON refusal frame");
-        assert_eq!(refusal.message_type, TreeKemCatchupRefusal::MESSAGE_TYPE);
-        assert_eq!(refusal.group_id(), "aa");
         assert_eq!(
-            refusal.requester_agent_id(),
-            hex::encode(requester.as_bytes()),
-            "the refusal echoes the requester it was built for"
+            treekem_catchup_refusal_probe(request.as_bytes(), &requester)
+                .expect("a catch-up request from its requester gets the probe"),
+            group_id,
+            "the probe returns the validated group id for the refusal"
         );
-        assert_eq!(refusal.reason, TreeKemCatchupRefusalReason::MachineRevoked);
+
+        // A request that names another requester gets no refusal: the
+        // reply would echo an id the request chose, not the sender.
+        let mismatched = serde_json::json!({
+            "message_type": "treekem_catchup_request",
+            "group_id": group_id,
+            "requester_agent_id": "bb",
+        })
+        .to_string();
+        assert!(
+            treekem_catchup_refusal_probe(mismatched.as_bytes(), &requester).is_none(),
+            "a request whose claimed requester is not the sender keeps the silent drop"
+        );
+
+        // A payload without the requester field is not the request shape.
+        let no_requester = serde_json::json!({
+            "message_type": "treekem_catchup_request",
+            "group_id": group_id,
+        })
+        .to_string();
+        assert!(
+            treekem_catchup_refusal_probe(no_requester.as_bytes(), &requester).is_none(),
+            "a payload without requester_agent_id is not the request shape"
+        );
 
         // Anything that is not the request shape gets no refusal: another
         // catch-up frame, a non-JSON payload, and a JSON frame whose
         // message_type is not the request tag.
         let response = serde_json::json!({
             "message_type": "treekem_catchup_response",
-            "group_id": "aa",
+            "group_id": group_id,
+            "requester_agent_id": hex::encode(requester.as_bytes()),
         })
         .to_string();
         assert!(
-            treekem_catchup_refusal_for(
-                response.as_bytes(),
-                &requester,
-                TreeKemCatchupRefusalReason::MachineRevoked
-            )
-            .is_none(),
+            treekem_catchup_refusal_probe(response.as_bytes(), &requester).is_none(),
             "a catch-up response must not get the refusal"
         );
         assert!(
-            treekem_catchup_refusal_for(
-                b"\x00\x01not json",
-                &requester,
-                TreeKemCatchupRefusalReason::MachineRevoked
-            )
-            .is_none(),
+            treekem_catchup_refusal_probe(b"\x00\x01not json", &requester).is_none(),
             "a non-JSON payload must not get the refusal"
         );
         let other_type = serde_json::json!({
             "message_type": "treekem_catchup_refusal",
-            "group_id": "aa",
+            "group_id": group_id,
+            "requester_agent_id": hex::encode(requester.as_bytes()),
         })
         .to_string();
         assert!(
-            treekem_catchup_refusal_for(
-                other_type.as_bytes(),
-                &requester,
-                TreeKemCatchupRefusalReason::MachineRevoked
-            )
-            .is_none(),
+            treekem_catchup_refusal_probe(other_type.as_bytes(), &requester).is_none(),
             "a JSON frame that is not a catch-up request must not get the refusal"
         );
 
-        // Review round 1, finding 1: only an id-shaped group id is echoed.
-        // A non-hex or oversized value declines to the silent drop, so a
+        // Review round 1, finding 1 + the Engineer ruling (29 Oct 22:14
+        // GMT): only an exactly-64-hex group id is echoed. A non-hex,
+        // short, or oversized value declines to the silent drop, so a
         // revoked device cannot make the listener hold request-sized
-        // strings in the refusal backlog.
-        for group_id in ["not hex!", &"g".repeat(129)] {
-            let oversized = serde_json::json!({
+        // strings in the refusal backlog, and no id but the shape every
+        // generator produces is ever named.
+        for group_id in ["not hex!", "aa", &"g".repeat(129), &"ab".repeat(31)] {
+            let malformed = serde_json::json!({
                 "message_type": "treekem_catchup_request",
                 "group_id": group_id,
+                "requester_agent_id": hex::encode(requester.as_bytes()),
             })
             .to_string();
             assert!(
-                treekem_catchup_refusal_for(
-                    oversized.as_bytes(),
-                    &requester,
-                    TreeKemCatchupRefusalReason::MachineRevoked
-                )
-                .is_none(),
-                "a group id that is not id-shaped ({group_id:.8}…) must not get the refusal"
+                treekem_catchup_refusal_probe(malformed.as_bytes(), &requester).is_none(),
+                "a group id that is not exactly 64 hex ({group_id:.8}…) must not get the refusal"
             );
         }
     }
@@ -2043,6 +2145,45 @@ mod tests {
             ))
             .is_err(),
             "a refusal holding Unknown must not be serializable"
+        );
+    }
+
+    #[test]
+    fn treekem_refusal_dedupe_admits_once_per_machine_and_group_window() {
+        // Engineer ruling (29 Oct 22:14 GMT): per-(machine, group) dedupe.
+        // One answer stands for the window, a different group or machine
+        // is answered independently, and an expired window answers again.
+        let replies = TreeKemRefusalReplies::default();
+        let machine = MachineId([3u8; 32]);
+        let other_machine = MachineId([4u8; 32]);
+        let group = "ab".repeat(32);
+        let other_group = "cd".repeat(32);
+        assert!(
+            replies.admit(machine, &group),
+            "the first refusal for a (machine, group) pair is admitted"
+        );
+        assert!(
+            !replies.admit(machine, &group),
+            "the same pair inside the window is deduped"
+        );
+        assert!(
+            replies.admit(machine, &other_group),
+            "another group of the same machine is admitted"
+        );
+        assert!(
+            replies.admit(other_machine, &group),
+            "another machine with the same group is admitted"
+        );
+        replies.expire_for_test(machine, &group);
+        assert!(
+            replies.admit(machine, &group),
+            "an expired window admits the pair again"
+        );
+        // A group id that is not exactly 64 hex is never admitted — the
+        // dedupe holds the same shape rule as the probe.
+        assert!(
+            !replies.admit(machine, "not hex!"),
+            "a malformed group id is never admitted"
         );
     }
 

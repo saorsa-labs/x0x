@@ -7709,9 +7709,13 @@ pub(super) mod tests {
             "a revoked sender's refusal overwrites no note"
         );
 
-        // Review round 1 (forged-refusal hardening): an unsolicited
-        // refusal — from a clean holder this node did NOT ask — is
-        // ignored: no peer is marked answered and no note is written.
+        // Review round 1 (forged-refusal hardening) + review round 3,
+        // finding 3: an unsolicited refusal — from a clean holder this
+        // node did NOT ask — stops no re-ask (only a peer asked this
+        // round may close its unanswered slot), but it IS surfaced: the
+        // note records the latest refusal that passed the gates, so a
+        // gap/page ask gets its reason too. The note map stays bounded
+        // by the groups this node holds.
         dispatch_refusal(
             &state,
             &group_id,
@@ -7736,9 +7740,11 @@ pub(super) mod tests {
                 .treekem_catchup_refusals
                 .lock()
                 .expect("refusal notes")
-                .len(),
-            1,
-            "an unsolicited refusal records no note"
+                .get(&group_id)
+                .expect("the unsolicited refusal is surfaced")
+                .peer,
+            other,
+            "an unsolicited refusal refreshes the note (the surface) while stopping no re-ask"
         );
 
         // An unverified refusal, and one addressed to another requester,
