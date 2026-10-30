@@ -1099,7 +1099,9 @@ pub(in crate::server::routes::named_groups) fn own_seat_cannot_take_a_share(
 /// (#1663 review P1, Codex controller, 30 Oct): its keyed seat serves the
 /// saved head while no secret installed, so the debt — not the roster key
 /// — holds its convergence until the carrier accepts a sealed share for
-/// it ([`gss_share_accepted`]).
+/// it ([`gss_share_accepted`]). The debt arms only on a delivery the
+/// actor is a recipient of; the batch flag keeps its round-2 scope (every
+/// open GSS delivery of the group re-seals, a repeat holders refuse).
 pub(in crate::server::routes::named_groups) async fn owe_gss_shares_after_republish(
     state: &AppState,
     stable_group_id: &str,
@@ -1109,14 +1111,14 @@ pub(in crate::server::routes::named_groups) async fn owe_gss_shares_after_republ
     let mut inner = runtime.inner.lock().await;
     let mut owed = false;
     for (key, delivery) in inner.ce.deliveries.iter_mut() {
-        if key.stable_group_id == stable_group_id
-            && delivery.gss_epoch.is_some()
-            && delivery.recipients.contains_key(actor)
-        {
-            if !delivery.gss_shares_pending {
-                delivery.gss_shares_pending = true;
-                owed = true;
-            }
+        if key.stable_group_id != stable_group_id || delivery.gss_epoch.is_none() {
+            continue;
+        }
+        if !delivery.gss_shares_pending {
+            delivery.gss_shares_pending = true;
+            owed = true;
+        }
+        if delivery.recipients.contains_key(actor) {
             owed |= delivery.gss_shares_owed.insert(*actor);
         }
     }
