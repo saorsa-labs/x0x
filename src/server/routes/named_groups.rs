@@ -3045,7 +3045,16 @@ async fn publish_group_card_with_reseal(
 ) -> Option<x0x::groups::GroupStateCommit> {
     let membership_lock = group_membership_lock(state, group_id).await;
     let _membership_guard = membership_lock.lock().await;
-    publish_group_card_to_discovery_inner(state, group_id, true).await
+    let commit = publish_group_card_to_discovery_inner(state, group_id, true).await;
+    // #1570, #1708 review: a reseal that published ends the hold itself,
+    // so its publish settles the owed card. Left set, the next worker
+    // pass published the same card again.
+    if commit.is_some() {
+        if let Some(info) = state.named_groups.read().await.get(group_id) {
+            group_recovery::settle_card_debt(state, info.stable_group_id());
+        }
+    }
+    commit
 }
 
 async fn publish_group_card_to_discovery_inner(
