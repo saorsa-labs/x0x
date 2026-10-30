@@ -205,6 +205,16 @@ async fn a_repeated_no_progress_page_keeps_the_loop_stopped() -> Result<()> {
         "#1685: repeated no-progress truncated pages never re-request; the pair idles instead of spinning"
     );
     assert_eq!(
+        state
+            .named_group_test_recorders
+            .catchup_page_stops
+            .lock()
+            .expect("page-stop recorder")
+            .len(),
+        3,
+        "each repeated page records its own typed stop"
+    );
+    assert_eq!(
         pending_len(&state, &group_id).await,
         1,
         "the pending queue holds its entry across the repeated pages"
