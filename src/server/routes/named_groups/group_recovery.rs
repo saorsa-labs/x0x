@@ -5716,15 +5716,16 @@ pub(super) async fn verify_reseat_mandate_on_receive(
         .filter(|_| !next.join_seat_key_marker_only(subject_hex))
         .map_or(x0x::groups::GroupRole::Guest, |seat| seat.role);
     // §3a check 8 (#1680): the KeyPackage must verify against the
-    // subject's agent key, exactly as an ordinary join's does. The
-    // receiver's evidence is the subject's `MemberJoined` record it holds
-    // for the seat: when that record binds the same package, the
-    // subject's own signature must verify under the certified agent key.
-    // A record for another package (an older incarnation of the seat) is
-    // not evidence about this re-seat, and a receiver that holds no
-    // record yet cannot check the package — the mandate's hash binding
-    // (check 8's first half) still holds, and the attested record rides
-    // beside the commit, so its later arrival must not wedge the re-seat.
+    // subject's agent key, exactly as an ordinary join's does. The root
+    // rule refuses a packageless re-seat on the TreeKEM plane (where
+    // every re-seat has a package) and, for a bound package, asks the
+    // receiver's evidence: the subject's `MemberJoined` record it holds
+    // for the seat. A record for another package (an older incarnation
+    // of the seat) is not evidence about this re-seat, and a receiver
+    // that holds no record yet cannot check the package — the mandate's
+    // hash binding (check 8's first half) still holds, and the attested
+    // record rides beside the commit, so its later arrival must not
+    // wedge the re-seat.
     let key_package_bound_to_subject = held_key_package_bound_to_subject(
         state,
         parent,
@@ -5739,6 +5740,7 @@ pub(super) async fn verify_reseat_mandate_on_receive(
         subject: subject_hex,
         key_package_hash: Some(key_package_hash.unwrap_or_default()),
         key_package_bound_to_subject,
+        treekem_plane: parent.secure_plane == x0x::mls::SecureGroupPlane::TreeKem,
         epoch: Some(epoch.unwrap_or_default()),
         seated_role,
         certificate_digest: digest.as_deref(),
@@ -5774,13 +5776,15 @@ async fn held_key_package_bound_to_subject(
     if bound_hash.is_empty() {
         return true;
     }
+    // The cache keys its member half lower-case, as the ingress does.
+    let member_key = subject_hex.to_ascii_lowercase();
     for group_key in [
         parent.stable_group_id().to_string(),
         parent.mls_group_id.clone(),
     ] {
         let Some(record) = state
             .treekem_member_key_packages
-            .get(&super::join_result_key(&group_key, subject_hex))
+            .get(&super::join_result_key(&group_key, &member_key))
             .await
         else {
             continue;

@@ -40,6 +40,9 @@ struct Stage {
     admin_hex: String,
     subject_hex: String,
     subject_kp: AgentKeypair,
+    /// The second admin of [`stage_with_peer_removal`], with its keypair
+    /// for the D170 control.
+    peer_kp: Option<AgentKeypair>,
     subject_cert: AgentCertificate,
     /// The post-removal record `R` holds (the parent of the re-seat).
     parent: x0x::groups::GroupInfo,
@@ -143,14 +146,21 @@ async fn stage_with_peer_removal(peer_removal: bool) -> Result<Stage> {
         assert!(info
             .set_member_certificate(&peer_hex, peer_cert.clone())
             .is_ok());
-        certs.push((peer_hex, peer_cert));
+        certs.push((peer_hex.clone(), peer_cert));
     }
     // Seating (r1): the subject active on the retained roster.
     sealed(&mut info, admin_kp, &certs, 1_000);
     let seating_hash = info.state_hash.clone();
     // Removal (r2): the admin's own removal commit, the §3a `Removal`
-    // basis — or, for D170, the peer admin's.
-    info.remove_member(&subject_hex, Some(admin_hex.clone()));
+    // basis — or, for D170, the peer admin's, remover and signer alike.
+    info.remove_member(
+        &subject_hex,
+        Some(if peer_removal {
+            peer_hex.clone()
+        } else {
+            admin_hex.clone()
+        }),
+    );
     let removal_signer = if peer_removal { &peer_kp } else { admin_kp };
     sealed(&mut info, removal_signer, &certs, 2_000);
     let removal_hash = info.state_hash.clone();
@@ -172,6 +182,7 @@ async fn stage_with_peer_removal(peer_removal: bool) -> Result<Stage> {
         admin_hex,
         subject_hex,
         subject_kp,
+        peer_kp: peer_removal.then_some(peer_kp),
         subject_cert,
         parent: info,
         seating_hash,
@@ -596,7 +607,8 @@ async fn a_role_raising_mandate_is_refused_with_cause_role_raised() -> Result<()
 /// #1680, ADR 0109 §3a check 5 and D170 at the receiver: a mandate may
 /// re-seat only a removal the signer itself committed. The admin's
 /// mandate binding the peer admin's removal commit is refused with
-/// `removal_mismatch`, byte-identical record and all.
+/// `removal_mismatch`, byte-identical record and all. Control: the
+/// peer's own mandate, on a terminal it committed, passes the rule.
 #[tokio::test]
 async fn a_removal_another_admin_committed_is_refused_with_cause_removal_mismatch() -> Result<()> {
     let stage = stage_with_peer_removal(true).await?;
@@ -606,7 +618,60 @@ async fn a_removal_another_admin_committed_is_refused_with_cause_removal_mismatc
         mandate_fields(&stage),
         stage.admin.agent.identity().agent_keypair(),
     );
-    refused_unchanged(&stage, mandate, "removal_mismatch").await
+    refused_unchanged(&stage, mandate, "removal_mismatch").await?;
+    // Control: the peer re-seats its own removal.
+    let peer_kp = stage.peer_kp.as_ref().expect("the peer admin's key");
+    let peer_hex = hex::encode(peer_kp.agent_id().as_bytes());
+    let peer_terminal = terminal_commit(&stage.parent, &stage.next, peer_kp, 3_600);
+    let mut fields = mandate_fields(&stage);
+    fields.signer = peer_hex;
+    let own = mint(fields, peer_kp);
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &peer_terminal,
+            &own,
+            &stage.subject_cert,
+            None
+        )
+        .await,
+        Ok(()),
+        "the admin that committed the removal may re-seat it"
+    );
+    Ok(())
+}
+
+/// #1680 round 2, ADR 0109 §3a check 8: the TreeKEM plane always seats a
+/// package, so a mandate that binds none (an empty hash) fails the
+/// binding there; the no-package carve-out belongs to the non-package
+/// planes alone.
+#[tokio::test]
+async fn a_packageless_reseat_on_the_treekem_plane_is_refused_with_cause_binding_mismatch(
+) -> Result<()> {
+    let stage = stage().await?;
+    let mut parent = stage.parent.clone();
+    parent.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    let mandate = mint(
+        mandate_fields(&stage),
+        stage.admin.agent.identity().agent_keypair(),
+    );
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            None
+        )
+        .await,
+        Err("binding_mismatch"),
+        "an empty KeyPackage binding cannot seat a TreeKEM re-seat"
+    );
+    Ok(())
 }
 
 /// #1680, ADR 0109 §3a check 5's replay clause at the receiver: a second
