@@ -12872,11 +12872,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         return;
     };
     let was_truncated = response.truncated;
-    // #1685: the catch-up cursor this page was answered against, read
-    // BEFORE the page applies. The responder's page is a pure function
-    // of this cursor (from-revision, from-epoch), so a truncated page
-    // that leaves it unmoved would re-request a byte-identical page —
-    // the loop below must stop instead of paging again.
+    // #1685: the catch-up cursor this page arrived against, read BEFORE
+    // the page applies, plus whether the page carries anything NEW
+    // relative to that cursor. The responder's page is a pure function
+    // of the requester's cursor (from-revision, from-epoch), so a page
+    // that serves a still-new event yet leaves the cursor unmoved would
+    // re-request a byte-identical page — the loop below must stop
+    // instead of paging again. A page whose events all sit at or below
+    // this cursor (a duplicate from a second peer, or a stale page that
+    // lost a race to gossip) does NOT meet that bar: its peer's next
+    // ask carries the moved cursor and can still make progress.
     let cursor_before = (
         response_info.state_revision,
         response_info.secret_epoch,
@@ -12885,6 +12890,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     let reported_head = response.responder_state_hash.clone();
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
+    let page_served_ahead = events.iter().any(|event| {
+        treekem_membership_event_frontier(event).is_some_and(|frontier| {
+            frontier.revision > cursor_before.0
+                || frontier.epoch.unwrap_or_default() > cursor_before.1
+        })
+    });
     let key_package_shaped = !events.is_empty()
         && events
             .iter()
@@ -13044,14 +13055,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         }
     }
     if was_truncated {
-        // #1685: a truncated page that applied nothing leaves the cursor
-        // above unmoved, so the next page request would repeat this
-        // cursor and the responder would re-serve the identical page.
-        // Stop the page loop with a typed reason instead of paging
-        // again: the requeue kept the pending events (no state is
-        // hidden), and the throttled gap path re-arms catch-up on the
-        // next applied event. The peer's page fence stays open, exactly
-        // as it does for a page request that could not be sent.
+        // #1685: stop the page loop only when the page provably cannot
+        // make progress: it served a still-new event, nothing applied,
+        // and the cursor did not move — so the next page request would
+        // repeat this cursor and the responder would re-serve the
+        // identical page. The requeue kept the pending events (no state
+        // is hidden); catch-up re-arms when a later incoming event
+        // queues (the 5 s-throttled gap ask) or an epoch-ahead signal
+        // asks again — there is no timer, a quiet group stays idle. The
+        // peer's page fence stays open, exactly as it does for a page
+        // request that could not be sent.
         let cursor_after = {
             let groups = state.named_groups.read().await;
             groups
@@ -13069,29 +13082,65 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                     )
                 })
         };
-        if cursor_after.is_none_or(|cursor| cursor == cursor_before) {
-            tracing::warn!(
-                group_id = %LogHexId::group(&response.group_id),
-                sender = %LogHexId::agent(&sender_hex),
-                reason = TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS,
-                revision = cursor_before.0,
-                treekem_epoch = cursor_before.1,
-                "TreeKEM catch-up page made no progress: no served event applied, so the \
-                 next page request would re-fetch the identical page; stopping the page \
-                 loop (the pending queue keeps its events; this peer's page fence stays \
-                 open)"
-            );
+        let stop_reason = match cursor_after {
+            None => Some(TREEKEM_CATCHUP_PAGE_STOP_GROUP_MISSING),
+            Some(cursor) if cursor == cursor_before && page_served_ahead => {
+                Some(TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS)
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = stop_reason {
+            // Warn once per (group, peer) per window — any verified
+            // member can send pages, so repeats must not flood the
+            // operator log (the #1657 re-warn precedent).
+            let rewarn_key = format!("{}:{sender_hex}", response.group_id);
+            let repeated = TREEKEM_PAGE_STOP_REWARN
+                .lock()
+                .ok()
+                .and_then(|last| {
+                    last.get(&rewarn_key)
+                        .is_some_and(|at| at.elapsed() < TREEKEM_PAGE_STOP_REWARN_AFTER)
+                        .then_some(())
+                })
+                .is_some();
+            if let Ok(mut last) = TREEKEM_PAGE_STOP_REWARN.lock() {
+                last.insert(rewarn_key, std::time::Instant::now());
+            }
+            if repeated {
+                tracing::debug!(
+                    group_id = %LogHexId::group(&response.group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    reason = reason,
+                    "TreeKEM catch-up page loop stays stopped ({reason}); repeat inside the re-warn window"
+                );
+            } else if reason == TREEKEM_CATCHUP_PAGE_STOP_GROUP_MISSING {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&response.group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    reason = reason,
+                    "the group left the local map while its catch-up page applied; stopping this peer's page loop"
+                );
+            } else {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&response.group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    reason = reason,
+                    revision = cursor_before.0,
+                    treekem_epoch = cursor_before.1,
+                    "TreeKEM catch-up page made no progress: it served a still-new \
+                     event, nothing applied and the cursor did not move, so the next \
+                     page request would re-fetch the identical page; stopping the page \
+                     loop (the pending queue keeps its events; this peer's page fence \
+                     stays open)"
+                );
+            }
             #[cfg(test)]
             state
                 .named_group_test_recorders
                 .catchup_page_stops
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push((
-                    response.group_id.clone(),
-                    sender_hex.clone(),
-                    TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS,
-                ));
+                .push((response.group_id.clone(), sender_hex.clone(), reason));
         } else {
             tracing::debug!(
                 target: "treekem.trace",
@@ -13159,13 +13208,32 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
 const SELF_LEAVE_CATCHUP_PAGE_SENDS: u32 = 3;
 
 /// #1685: the typed stop reason for a truncated catch-up page that made
-/// no progress — no served event applied, so the catch-up cursor
-/// (revision, TreeKEM epoch, state hash) did not move and the next page
-/// request would deterministically re-fetch the identical page. Paging
-/// stops with this reason; the pending TreeKEM queue keeps its events
-/// and the throttled gap path re-arms catch-up on the next applied
-/// event.
+/// no progress — it served an event still ahead of the local cursor,
+/// nothing applied, and the catch-up cursor (revision, TreeKEM epoch,
+/// state hash) did not move, so the next page request would
+/// deterministically re-fetch the identical page. Paging stops with
+/// this reason; the pending TreeKEM queue keeps its events, and
+/// catch-up re-arms when a later incoming event queues (the 5
+/// s-throttled gap ask) or an epoch-ahead signal asks again. There is
+/// no timer: a quiet group stays idle.
 const TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS: &str = "truncated_page_no_progress";
+
+/// #1685: the typed stop reason for a truncated catch-up page whose
+/// group left the local map while the page applied (e.g. a withdrawn
+/// `GroupDeleted` commit inside the page) — paging a group this node no
+/// longer holds cannot make progress.
+const TREEKEM_CATCHUP_PAGE_STOP_GROUP_MISSING: &str = "truncated_page_group_missing";
+
+/// #1685: how long one typed page-loop stop suppresses the warn for an
+/// identical repeat (same group, same peer). The stop itself is not a
+/// #1657 note map — pages carry no peer-attested state — so the dedupe
+/// lives in this map alone; a stop after the window warns again.
+const TREEKEM_PAGE_STOP_REWARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// #1685: the last typed page-loop stop warn per `{group}:{peer}`.
+static TREEKEM_PAGE_STOP_REWARN: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 fn verified_catchup_member_removed_author(
     event: &NamedGroupMetadataEvent,

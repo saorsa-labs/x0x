@@ -9,8 +9,12 @@
 //! paused tokio runtime never parks so virtual time cannot advance).
 //! The page loop must stop with the typed reason
 //! `truncated_page_no_progress` instead: the pending queue keeps its
-//! events (requeue still runs; no state is hidden), and the throttled
-//! gap path re-arms catch-up on the next applied event.
+//! events (requeue still runs; no state is hidden), and catch-up re-arms
+//! when a later incoming event queues (the 5 s-throttled gap ask) or an
+//! epoch-ahead signal asks again — there is no timer; a quiet group
+//! stays idle. A page whose events were all already at or below the
+//! cursor (a duplicate from a second peer, or a stale page) pages on:
+//! the next ask carries a newer cursor and can still make progress.
 
 use super::*;
 use x0x::identity::AgentKeypair;
@@ -353,6 +357,150 @@ async fn a_progressing_truncated_page_still_re_requests_the_next_page() -> Resul
         page_requests(&state),
         1,
         "a truncated page that moved the cursor re-requests the next page at once"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_stops
+            .lock()
+            .expect("page-stop recorder")
+            .is_empty(),
+        "a progressing page never records a stop"
+    );
+    Ok(())
+}
+
+/// Review round 1 blocker (the second-peer duplicate): two peers asked
+/// at the same cursor can both answer with a truncated page for the
+/// same next revision. Whichever page applies first moves the cursor;
+/// the other is then a page of events the local head is already at or
+/// past. That duplicate page must NOT stop the stream — this peer's
+/// next ask carries the NEW cursor and can still make progress, and
+/// only this peer's own last page closes its page fence. The same
+/// shape covers a stale page that lost a race to gossip.
+#[tokio::test]
+async fn a_stale_duplicate_page_keeps_paging() -> Result<()> {
+    let group_id = "6e".repeat(32);
+    let (mut state, _dir) = secure_endpoint_test_state().await?;
+    super::super::revocation_eviction::zero_restart_wait_for_test(&mut state);
+    let admin_id = state.agent.agent_id();
+    let group_id_bytes = hex::decode(&group_id)?;
+    let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+    let mut admin_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
+    let member_kp = AgentKeypair::generate()?;
+    let member_id = member_kp.agent_id();
+    let member_hex = hex::encode(member_id.as_bytes());
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(member_id, &[9u8; 32])?;
+    let kp_bytes = prepared.key_package_bytes().to_vec();
+    let added = admin_group.add_member(member_id, &kp_bytes)?;
+    let _leaver_group = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+    let epoch_before = admin_group.epoch();
+
+    let mut info = x0x::groups::GroupInfo::new(
+        "issue1685-duplicate".to_string(),
+        String::new(),
+        admin_id,
+        group_id.clone(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    info.add_member(
+        member_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(hex::encode(admin_id.as_bytes())),
+        None,
+    );
+    // The second responder: still an Active member after the leaver's
+    // page applies, so its later duplicate page passes the member gate.
+    let other = AgentKeypair::generate()?;
+    let other_id = other.agent_id();
+    info.add_member(
+        hex::encode(other_id.as_bytes()),
+        x0x::groups::GroupRole::Member,
+        Some(hex::encode(admin_id.as_bytes())),
+        None,
+    );
+    info.set_member_treekem_key_package(
+        &member_hex,
+        base64::engine::general_purpose::STANDARD.encode(&kp_bytes),
+    );
+    info.secret_epoch = epoch_before;
+    info.security_binding = Some(format!("treekem:epoch={epoch_before}"));
+    info.recompute_state_hash();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+    state.treekem_groups.write().await.insert(
+        group_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(admin_group)),
+    );
+
+    // The member's linked self-leave — the event both responders would
+    // serve for the ask at the base cursor.
+    let mut leaving = {
+        let groups = state.named_groups.read().await;
+        groups.get(&group_id).cloned().expect("group")
+    };
+    leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+    let revision = leaving.roster_revision;
+    leaving.remove_member(&member_hex, Some(member_hex.clone()));
+    let commit = leaving.seal_commit(&member_kp, now_millis_u64())?;
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: group_id.clone(),
+        revision,
+        actor: member_hex.clone(),
+        agent_id: member_hex,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit),
+    };
+    let cursor_before = cursor(&state, &group_id).await;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Peer A's page applies first and moves the cursor.
+    handle_treekem_catchup_response(
+        &state,
+        &member_id,
+        &clean_sender_machine(),
+        true,
+        truncated_page(&group_id, event.clone()),
+    )
+    .await;
+    assert_ne!(
+        cursor(&state, &group_id).await,
+        cursor_before,
+        "peer A's page applied first"
+    );
+
+    // Peer B's identical page is now a duplicate: nothing applies, the
+    // cursor does not move, and every served event sits at the cursor.
+    // It must still page on — its next ask carries the moved cursor.
+    handle_treekem_catchup_response(
+        &state,
+        &other_id,
+        &clean_sender_machine(),
+        true,
+        truncated_page(&group_id, event),
+    )
+    .await;
+    assert_eq!(
+        page_requests(&state),
+        2,
+        "the duplicate page keeps its peer's stream going (both pages re-request)"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_stops
+            .lock()
+            .expect("page-stop recorder")
+            .is_empty(),
+        "a duplicate page records no stop"
     );
     Ok(())
 }
