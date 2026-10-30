@@ -296,6 +296,21 @@ struct Placeheld {
     /// form (#1570). The group's transition is not published, and the
     /// worker writes again.
     authoritative_failed: bool,
+    /// #1570: a hold skipped the card routes' refresh, so once the hold
+    /// ends the group's card is owed a refresh and publish. Set where a
+    /// hold starts — an encode whose authoritative write failed, and an
+    /// un-placeholdering whose write has not landed (the worker pass's
+    /// step, or a dropped arming's rollback) — and cleared by a publish
+    /// of the card: the worker pass's owed-card loop, or a reseal whose
+    /// own persist ended the hold ([`settle_card_debt`]).
+    card_owed: bool,
+    /// #1570 (Engineer ruling, 29 Oct 2026): the worker pass un-placeheld
+    /// the group, so its legacy entry is the real record again, but no
+    /// Durable legacy write has landed that record yet. Until one does,
+    /// the group stays held back for the card routes
+    /// ([`is_card_held_back`]) and its owed card survives here: the entry
+    /// leaves only with a Durable write, never with the flag.
+    unplacehold_pending: bool,
     /// Load reconciliation kept a placeholder that matches neither end of
     /// its binding: the live record is that placeholder, inert, and no
     /// authoritative write runs for it.
@@ -380,6 +395,10 @@ struct S3Inner {
     /// Test only: where a failed swap's rollback stops (#1645).
     #[cfg(test)]
     swap_rollback_stop: Option<SwapRollbackStop>,
+    /// Test only (#1708): the worker's pending step parks here, after its
+    /// sidecar re-read and before its reset (`reached`, then `release`).
+    #[cfg(test)]
+    pending_reread_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 /// Test only (#1645): a crash point in a failed swap's rollback, or a
@@ -1238,6 +1257,18 @@ fn with_placeheld<R>(state: &AppState, f: impl FnOnce(&mut HashMap<String, Place
     f(&mut placeheld)
 }
 
+/// The sidecar body of `stable` as [`ensure_placeholders`]'s opening
+/// snapshot sees it: present, fault-free, and holding something that arms
+/// (an active ATA or an authoritative record). `None` when the sidecar
+/// arms nothing.
+fn arms_snapshot<'a>(inner: &'a S3Inner, stable: &str) -> Option<&'a GroupRecoveryV1> {
+    inner
+        .sidecars
+        .get(stable)
+        .filter(|_| !inner.sidecar_status.contains_key(stable))
+        .filter(|body| body.active_ata.is_some() || body.authoritative_record.is_some())
+}
+
 /// The S3 placeholder of `info` (§4 "Placeholder"): the #451
 /// `legacy_safe_placeholder` (identity, chain head and containment kept),
 /// with a non-empty, all-Removed roster instead of an empty one.
@@ -1319,6 +1350,25 @@ pub(super) async fn legacy_store_view(
     let frozen = staging_frozen_groups(state).await;
     let mut view: Option<HashMap<String, GroupInfo>> = None;
     for (stable, entry) in placeheld {
+        // #1570 (Engineer ruling, 29 Oct 2026): the pass un-placeheld the
+        // group, so the view holds its real record — no placeholder, no
+        // authoritative write (the sidecar is retired once that write is
+        // Durable). Until it is, the group stays held back for the card
+        // routes ([`is_card_held_back`]). A staged re-seat keeps its
+        // frozen placeholder semantics.
+        if entry.unplacehold_pending && !frozen.contains(&stable) {
+            // #1708 review: the encode puts the group's real record in the
+            // view, so a Durable write of it commits that form. Without
+            // this, a re-arm before the worker's next pass keeps a
+            // `committed` form older than the durable record, and a later
+            // failed authoritative write rolls the legacy views back over
+            // the newer record.
+            let encoded = placeheld_key(groups, &stable, &entry)
+                .and_then(|key| groups.get(key))
+                .map(LegacyForm::real);
+            record_encode_outcome(state, &stable, false, encoded);
+            continue;
+        }
         // A group absent from the view, lost or frozen has no
         // authoritative write in this encode, so nothing of it is held back.
         let Some(canonical) = placeheld_key(groups, &stable, &entry).cloned() else {
@@ -1519,6 +1569,9 @@ fn record_encode_outcome(
         if let Some(entry) = placeheld.get_mut(stable) {
             entry.authoritative_failed = failed;
             entry.legacy_pending |= failed;
+            if failed {
+                entry.card_owed = true;
+            }
             entry.encoded = encoded;
         }
     });
@@ -1638,6 +1691,37 @@ pub(super) fn is_held_back(state: &AppState, stable: &str) -> bool {
     })
 }
 
+/// #1570 (Engineer ruling, 29 Oct 2026): the card routes and card
+/// publishing may act only on `stable`'s committed record. Two states put
+/// a group here: its authoritative write failed ([`is_held_back`]), and
+/// its un-placeholdering write has not landed (the worker pass's step, or
+/// a dropped arming's rollback, [`finish_arm`]) — until it lands, the
+/// live record is not the known-durable form, so no card is signed or
+/// published from it. Roster mutations and save outcomes use the narrower
+/// [`is_held_back`] and keep their pre-#1570 behaviour for a pending
+/// un-placeholdering: its view already holds the real record, so a
+/// Durable save of a change to it commits that change.
+pub(super) fn is_card_held_back(state: &AppState, stable: &str) -> bool {
+    with_placeheld(state, |placeheld| {
+        placeheld
+            .get(stable)
+            .is_some_and(|entry| entry.authoritative_failed || entry.unplacehold_pending)
+    })
+}
+
+/// #1570, #1708 review: a publish of `stable`'s card settled the owed
+/// card, so the worker pass no longer owes one. The reseal path calls
+/// this: its own persist can end the hold (Engineer ruling, 29 Oct 2026
+/// 19:56) and its publish then covers the debt, or the next pass would
+/// publish the same card again.
+pub(super) fn settle_card_debt(state: &AppState, stable: &str) {
+    with_placeheld(state, |placeheld| {
+        if let Some(entry) = placeheld.get_mut(stable) {
+            entry.card_owed = false;
+        }
+    });
+}
+
 /// #1570 rc4, the one commit check for a roster mutation from `before`
 /// to `after`, run after its encode ([`legacy_store_view`]) and before its
 /// legacy write: some group that the mutation touches (a key added,
@@ -1753,15 +1837,20 @@ async fn needs_placeholder(state: &AppState, info: &GroupInfo, body: &GroupRecov
 pub(super) fn begin_placehold(state: &AppState, key: &str, info: &GroupInfo) {
     let stable = info.stable_group_id().to_string();
     with_placeheld(state, |placeheld| {
-        placeheld.entry(stable).or_insert_with(|| Placeheld {
+        let entry = placeheld.entry(stable).or_insert_with(|| Placeheld {
             key: key.to_string(),
             committed: LegacyForm::real(info),
             encoded: None,
             durable_digest: None,
             authoritative_failed: false,
+            card_owed: false,
+            unplacehold_pending: false,
             lost: false,
             legacy_pending: true,
         });
+        // A new arming re-claims the placeholder: an un-placeholdering
+        // whose write never landed is superseded.
+        entry.unplacehold_pending = false;
     });
 }
 
@@ -1788,8 +1877,13 @@ impl LegacyWrite {
 /// `ReplacedNotDurable` the record stays contained (the placeholder is on
 /// disk, the group stays placeheld) and the worker writes again. On
 /// `Dropped` nothing is published and the candidate is dropped: the group
-/// is no longer placeheld and the sidecar's arming (the ATA and the
-/// authoritative record) is rolled back. Returns whether it is published.
+/// no longer needs the placeholder and the sidecar's arming (the ATA and
+/// the authoritative record) is rolled back. #1570 (29 Oct 2026): the
+/// entry stays as a pending un-placeholdering, so an owed card survives it
+/// and the group stays held back for the card routes until the real
+/// record's write lands; the worker pass decides whether the group still
+/// needs the placeholder, and re-claims it if it does.
+/// Returns whether it is published.
 async fn finish_arm(
     state: &AppState,
     stable: &str,
@@ -1810,12 +1904,32 @@ async fn finish_arm(
             false
         }
         LegacyWrite::Dropped => {
-            with_placeheld(state, |placeheld| placeheld.remove(stable));
-            // #1533 r11: a reply can record a conflict against the armed
-            // ATA, or replace it, while the legacy write runs. Only this
-            // arming's ATA is withdrawn, and never under a conflict: the
-            // conflict keeps its ATA, or its bound is lost.
+            // #1570 (Engineer ruling, 29 Oct 2026): the entry stays, so an
+            // owed card survives it. It turns pending un-placeholdering at
+            // once, before the rollback below: a save before the next
+            // worker pass then encodes the group's real record, never a
+            // placeholder whose sidecar record the rollback clears (#1708
+            // review — the arming's digest still matched, so such a save
+            // wrote an orphan placeholder). The next pass decides with the
+            // full sidecar state: a group that still needs the placeholder
+            // (a recorded conflict, another arming) is re-claimed by the
+            // supersede branch; otherwise the pass un-placeholds it, keeps
+            // it held back for the card routes until its write lands, and
+            // publishes the owed card.
+            with_placeheld(state, |placeheld| {
+                if let Some(entry) = placeheld.get_mut(stable) {
+                    entry.unplacehold_pending = true;
+                    entry.durable_digest = None;
+                    entry.legacy_pending = true;
+                    entry.authoritative_failed = false;
+                    entry.card_owed = true;
+                }
+            });
             let _ = update_sidecar(state, stable, |body| {
+                // #1533 r11: a reply can record a conflict against the armed
+                // ATA, or replace it, while the legacy write runs. Only this
+                // arming's ATA is withdrawn, and never under a conflict: the
+                // conflict keeps its ATA, or its bound is lost.
                 if body.attestation_conflict.is_none() && body.active_ata.as_ref() == Some(armed) {
                     body.active_ata = None;
                 }
@@ -1981,10 +2095,16 @@ async fn resave_legacy(state: &AppState) -> LegacyWrite {
 ///   placeheld (`lost`), and the node shows
 ///   `readmission_required {local_state_lost}` (§4 rebuild table).
 /// - A group that no longer needs it is un-placeheld: the real record is
-///   written to the legacy views, and only once that is durable is the
-///   authoritative record dropped from the sidecar.
+///   written to the legacy views, and only once that is durable are the
+///   authoritative record dropped from the sidecar and the entry itself
+///   removed — until then the group stays held back for the card routes
+///   (#1570, 29 Oct 2026 ruling) and its owed card survives on the entry.
 /// - A placeholder write that was not durable is written again.
-async fn ensure_placeholders(state: &AppState) {
+///
+/// The pass also retries the sidecar write of every held-back group
+/// (#1570) and publishes each group's owed card once its hold has ended,
+/// whichever save ended the hold.
+pub(super) async fn ensure_placeholders(state: &Arc<AppState>) {
     let bodies: Vec<(String, GroupRecoveryV1)> = {
         let inner = state.group_recovery.inner.lock().await;
         inner
@@ -1998,6 +2118,15 @@ async fn ensure_placeholders(state: &AppState) {
             .collect()
     };
     let registered = placeheld_snapshot(state);
+    // #1570: the groups whose card a hold left owed. A hold can end in
+    // any save's encode — every encode retries the sidecar write — so
+    // the pass publishes every owed card whose hold has ended, not only
+    // the holds this pass itself cleared.
+    let owed_cards: Vec<String> = registered
+        .iter()
+        .filter(|(_, entry)| entry.card_owed)
+        .map(|(stable, _)| stable.clone())
+        .collect();
     if bodies.is_empty() && registered.is_empty() {
         return;
     }
@@ -2057,6 +2186,8 @@ async fn ensure_placeholders(state: &AppState) {
                                 encoded: None,
                                 durable_digest,
                                 authoritative_failed: false,
+                                card_owed: false,
+                                unplacehold_pending: false,
                                 lost,
                                 legacy_pending: true,
                             },
@@ -2064,7 +2195,16 @@ async fn ensure_placeholders(state: &AppState) {
                     });
                     resave = true;
                 }
-                Some(entry) => resave |= entry.legacy_pending,
+                Some(entry) => {
+                    // The group needs the placeholder again: an
+                    // un-placeholdering that never landed is superseded.
+                    with_placeheld(state, |placeheld| {
+                        if let Some(entry) = placeheld.get_mut(stable) {
+                            entry.unplacehold_pending = false;
+                        }
+                    });
+                    resave |= entry.legacy_pending;
+                }
             }
             if lost {
                 set_view(
@@ -2091,24 +2231,122 @@ async fn ensure_placeholders(state: &AppState) {
         }
     }
     if !unplacehold.is_empty() {
-        with_placeheld(state, |placeheld| {
-            for stable in &unplacehold {
-                placeheld.remove(stable);
+        // #1570 (Engineer ruling, 29 Oct 2026): the entry stays, its
+        // un-placeholdering pending, until this pass's write makes the
+        // real record Durable. Until then the group stays held back for
+        // the card routes and its owed card survives on the entry — the
+        // flag is never lost with the entry. A group with no entry (only
+        // a sidecar authoritative record) keeps the pre-#1570 behaviour:
+        // nothing of it was ever held back.
+        //
+        // #1708 review (Codex P1, the two-save interleaving): the reset
+        // joins the persistence transaction. Every save holds
+        // `named_groups_persistence_lock` from its encode to its
+        // `commit_legacy_write`, and a save between the two has already
+        // recorded the group's newer real form in `encoded`. Resetting
+        // that field outside the lock dropped the form, so the save's
+        // Durable completion left `committed` at the older form and a
+        // later held-back write could roll it over the newer durable
+        // record. Under the lock the reset runs only between saves: the
+        // parked save's commit consumes its own form first.
+        //
+        // #1708 review (Claude, REQUEST-CHANGES): the snapshot above can
+        // be stale by now. An arming that started after it writes its
+        // ATA, claims the placeholder ([`begin_placehold`]) and saves
+        // under this same lock; resetting that group to pending here
+        // would undo the arming. The resave would land the real record,
+        // the retain would drop the entry, and the sidecar clear below
+        // would strip the authoritative record while the ATA stays
+        // armed. So under the lock each listed stable's sidecar is read
+        // again: one whose body differs from the snapshot (an arming, a
+        // conflict, a retirement, any sidecar transition) is left wholly
+        // to the next pass, which decides on the fresh body.
+        //
+        // #1708 review (Codex P1, the post-reread arming): the re-read
+        // and the reset are one step under the sidecar `inner` guard.
+        // An arming's pre-save steps do not take the persistence lock:
+        // it installs its ATA (under `inner`) and only then claims the
+        // placeholder. With the guard released between the re-read and
+        // the reset, both steps could land in that gap, and the reset
+        // undid the new claim. Under the guard, an install either lands
+        // before the re-read (the body differs, so the group is skipped)
+        // or after the reset (its claim then supersedes the reset). Lock
+        // order: persistence lock, `inner`, placeheld map.
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        for stable in &unplacehold {
+            let snapshot = bodies
+                .iter()
+                .find(|(held, _)| held == stable)
+                .map(|(_, body)| body);
+            let inner = state.group_recovery.inner.lock().await;
+            if arms_snapshot(&inner, stable) != snapshot {
+                continue;
             }
-        });
+            #[cfg(test)]
+            let mut inner = inner;
+            #[cfg(test)]
+            if let Some((reached, release)) = inner.pending_reread_pause.take() {
+                reached.notify_one();
+                release.notified().await;
+            }
+            with_placeheld(state, |placeheld| {
+                if let Some(entry) = placeheld.get_mut(stable) {
+                    entry.unplacehold_pending = true;
+                    entry.authoritative_failed = false;
+                    entry.card_owed = true;
+                    entry.legacy_pending = true;
+                    entry.encoded = None;
+                }
+            });
+            drop(inner);
+        }
         resave = true;
     }
-    if !resave {
-        return;
-    }
-    let write = resave_legacy(state).await;
-    if write == LegacyWrite::Durable {
+    let write = if resave {
+        Some(resave_legacy(state).await)
+    } else {
+        // Nothing to write this pass. Owed cards can still be due: a
+        // hold that an earlier save ended leaves its card owed until a
+        // pass publishes it (#1570).
+        None
+    };
+    // #1708 review: an entry the retain below completes while it still
+    // owes a card must not lose the flag with the entry; those stables
+    // join the owed-card list below.
+    let mut removed_owed: Vec<String> = Vec::new();
+    if write == Some(LegacyWrite::Durable) {
+        // #1708 review: a staged re-seat can freeze a group after the
+        // pass's snapshot above. The retain and the sidecar clear below
+        // must see it, or a frozen group's entry is dropped and its
+        // authoritative record cleared on a stale set.
+        let frozen = staging_frozen_groups(state).await;
         with_placeheld(state, |placeheld| {
             for entry in placeheld.values_mut() {
                 if !entry.authoritative_failed {
                     entry.legacy_pending = false;
                 }
             }
+            // #1570: the write landed the real record of every group
+            // whose un-placeholdering is pending (this pass's view held
+            // it), so those entries complete and go; the owed-card loop
+            // below publishes their cards. A group armed again meanwhile
+            // or frozen for a staged re-seat keeps its entry.
+            // #1708 review: the completed test also requires the
+            // committed form to be the real record. The flag alone says
+            // the pass wanted the real record; `committed` says a
+            // Durable write landed it. A group whose real record is not
+            // the durable form yet (its write is still in flight, or it
+            // turned pending only after this pass's encode) keeps its
+            // entry for the pass whose write does land it.
+            placeheld.retain(|stable, entry| {
+                let completed = entry.unplacehold_pending
+                    && !entry.committed.placeholder
+                    && !frozen.contains(stable);
+                if completed && entry.card_owed {
+                    removed_owed.push(stable.clone());
+                }
+                !completed
+            });
         });
         for stable in unplacehold {
             // The real record is durable in the legacy views. A group that
@@ -2121,6 +2359,59 @@ async fn ensure_placeholders(state: &AppState) {
             })
             .await;
         }
+    }
+    // #1570: a hold kept the card routes on the group's last committed
+    // form. Whichever save ended the hold, that form is durable now, so
+    // the owed card is refreshed and published from the live record, as
+    // a state change would refresh it. The check and the clear are one
+    // step under the placeheld map, so a hold that starts again keeps
+    // its own owed flag. A group whose un-placeholdering write has not
+    // landed keeps its flag on the entry. A group missing from the live
+    // map owes nothing: no card of it can be signed or published, so the
+    // debt is cleared, not retried on every tick (#1708 review).
+    // Detached: the publish's gossip egress must not stall the tick.
+    // #1708 review: the pass's own un-placehold step (or a dropped
+    // arming, [`finish_arm`]) can set the owed flag and the retain above
+    // remove the entry in this same pass — the pre-pass snapshot cannot
+    // hold those, so the completed entries join the list here.
+    let mut owed_cards = owed_cards;
+    owed_cards.extend(removed_owed);
+    owed_cards.sort();
+    owed_cards.dedup();
+    for stable in owed_cards {
+        let Some((key, _)) = live.get(&stable) else {
+            with_placeheld(state, |placeheld| {
+                if let Some(entry) = placeheld.get_mut(&stable) {
+                    entry.card_owed = false;
+                }
+            });
+            continue;
+        };
+        let publish_now = with_placeheld(state, |placeheld| match placeheld.get_mut(&stable) {
+            Some(entry) if !entry.authoritative_failed && !entry.unplacehold_pending => {
+                entry.card_owed = false;
+                true
+            }
+            // A new hold started, or the un-placeholdering write has not
+            // landed; its own owed flag stays set.
+            Some(_) => false,
+            // Un-placeheld by this pass's Durable write above; the same
+            // write committed the real record, so the card is published
+            // from it.
+            None => write == Some(LegacyWrite::Durable),
+        });
+        if !publish_now {
+            continue;
+        }
+        let state_for_card = Arc::clone(state);
+        let key_for_card = key.clone();
+        state.spawn_detached(async move {
+            super::maybe_publish_group_card_after_state_change(
+                state_for_card.as_ref(),
+                &key_for_card,
+            )
+            .await;
+        });
     }
 }
 
@@ -5674,6 +5965,7 @@ fn authorisation_refused_cause(check: &str) -> &str {
         | "signer_revoked" => "signer",
         "subject_mismatch" => "subject",
         "basis_not_live" | "basis_unknown" => "basis",
+        "record_key_divergent" => "group_mismatch",
         other => other,
     }
 }
@@ -5735,6 +6027,26 @@ fn check_reseat_authority(
         }
     }
     Ok(())
+}
+
+/// #1689 review: the live record's map key, its `mls_group_id` and the
+/// re-seat invite's `group_id` must be one key. The staging slot opens at
+/// the map key, the staged join seats the record at the invite's
+/// `group_id`, and the promote and the discard close the slot by one key.
+/// A legacy record keyed apart from its `mls_group_id` (a pre-pin genesis
+/// id) would leave a slot open under the other key, so it is refused
+/// (`record_key_divergent`, cause `group_mismatch`) before anything is
+/// journalled or moved.
+fn check_reseat_keys(
+    group_key: &str,
+    info: &GroupInfo,
+    invite: &x0x::groups::invite::SignedInvite,
+) -> Result<(), &'static str> {
+    if group_key == info.mls_group_id && invite.group_id == group_key {
+        Ok(())
+    } else {
+        Err("record_key_divergent")
+    }
 }
 
 /// The subject's checks on an invite paired with an authorisation (§3).
@@ -5854,7 +6166,9 @@ async fn consume_reseat(
         refuse_authorisation(state, &stable, info.state_revision, cause).await;
         return;
     }
-    if let Err(cause) = check_reseat_invite(&invite, &authorisation, &stable, &local) {
+    if let Err(cause) = check_reseat_invite(&invite, &authorisation, &stable, &local)
+        .and_then(|()| check_reseat_keys(group_key, &info, &invite))
+    {
         drop(membership_guard);
         refuse_authorisation(state, &stable, info.state_revision, cause).await;
         return;
@@ -6028,11 +6342,19 @@ async fn open_staging(state: &Arc<AppState>, group_key: &str, info: &GroupInfo) 
 /// live map. Returns whether a staging was open.
 async fn discard_staging(state: &AppState, key: &str, stable: &str) -> bool {
     let closed = state.reseat_stagings.close(key);
-    state
-        .named_groups
-        .staging_write()
-        .await
-        .retain(|staged_key, info| staged_key != key && info.stable_group_id() != stable);
+    {
+        // #1689 review: `refresh_group_rosters_for_gossip` reads the slot
+        // under this lock. Emptying it under the same lock narrows the race
+        // with a rollback but does not close it: a refresh that read the
+        // slot before this point can still publish the abandoned staged
+        // roster once, and the next refresh replaces it.
+        let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+        state
+            .named_groups
+            .staging_write()
+            .await
+            .retain(|staged_key, info| staged_key != key && info.stable_group_id() != stable);
+    }
     state.treekem_groups.staging_write().await.remove(key);
     state.mls_groups.staging_write().await.remove(key);
     if closed {
@@ -6353,6 +6675,15 @@ async fn swap_if_seated(state: &AppState, stable: &str) -> bool {
     let Some((key, source)) = seated else {
         return false;
     };
+    // The slot is opened at the original's key ([`open_staging`]), and the
+    // promote and discard below close it by that key. [`consume_reseat`]
+    // refuses a record whose keys differ, so this is a backstop that
+    // should not run: a staged record at another key is never promoted,
+    // and the journal stays open and rolls back.
+    if key != journal.live_key {
+        tracing::warn!(group_id = %LogHexId::group(stable), "ADR 0109 S3: the staged key is not the journalled live key (unexpected); the swap is refused");
+        return false;
+    }
     let expected = journal.record_digest;
     // §3 step 3 (#1533 review): `Swapping` lifts the legacy overlay and the
     // marker hold, then one durable roster write puts the staged record in
@@ -12982,7 +13313,15 @@ mod tests {
         state.named_groups_save_fault.store(1, Ordering::SeqCst);
         assert!(!arm_in_place(&state, &key, &info, ata).await);
         state.named_groups_save_fault.store(0, Ordering::SeqCst);
-        assert!(!is_placeheld(&state, &stable), "the candidate is dropped");
+        // #1570 (29 Oct 2026 ruling): a dropped arming keeps the entry —
+        // the candidate is dropped, but any owed card survives. The
+        // worker pass then decides the un-placeholdering with the full
+        // sidecar state and holds the card routes back until its write
+        // lands the real record.
+        assert!(
+            is_placeheld(&state, &stable),
+            "the candidate is dropped; the entry stays"
+        );
         let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
         assert!(body.active_ata.is_none());
         assert!(body.authoritative_record.is_none());
@@ -12991,7 +13330,856 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
         assert!(!s3::is_s3_placeholder(&legacy));
         assert!(legacy.has_active_member(&local));
+        // The worker pass lands the real record and completes the
+        // un-placeholdering.
+        ensure_placeholders(&state).await;
+        assert!(!is_placeheld(&state, &stable));
+        // Await the pass's detached card publishes so the test leaks
+        // no task.
+        let pending: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in pending {
+            let _ = task.await;
+        }
         Ok(())
+    }
+
+    /// #1708 review, the blocking finding: a save between a dropped arming
+    /// and the next worker pass must encode the group's real record. The
+    /// `Dropped` rollback clears the sidecar's authoritative record and
+    /// ATA, so a placeholder written in that window has nothing behind it:
+    /// an orphan that load reconciliation never repairs. Red at 4ca3d176 —
+    /// the rolled-back arming's digest still matched, so the window save
+    /// wrote the placeholder Durable.
+    #[tokio::test]
+    async fn a_save_between_a_dropped_arming_and_the_pass_writes_the_real_record(
+    ) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+
+        // The arming's encode writes the sidecar record; the legacy write
+        // is NotReplaced, so the arming is dropped and rolled back.
+        state.named_groups_save_fault.store(1, Ordering::SeqCst);
+        assert!(!arm_in_place(&state, &key, &info, ata).await);
+        state.named_groups_save_fault.store(0, Ordering::SeqCst);
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert!(body.active_ata.is_none() && body.authoritative_record.is_none());
+        // The entry stays, pending its un-placeholdering: held back for
+        // the card routes, not for roster saves.
+        assert!(is_placeheld(&state, &stable), "the entry stays");
+        assert!(is_card_held_back(&state, &stable));
+        assert!(!is_held_back(&state, &stable));
+
+        // The save in the window, before any worker pass: the real record
+        // goes Durable, and no orphan placeholder is written.
+        let outcome = super::super::save_named_groups_checked(&state).await;
+        assert!(
+            matches!(outcome, Ok(super::super::AtomicWriteOutcome::Durable)),
+            "the window save must be durable: {outcome:?}"
+        );
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("window legacy entry"))?;
+        assert!(!s3::is_s3_placeholder(&legacy), "no orphan placeholder");
+        assert!(legacy.has_active_member(&local));
+
+        // The pass completes the un-placeholdering and publishes the owed
+        // card the dropped arming left.
+        ensure_placeholders(&state).await;
+        assert!(!is_placeheld(&state, &stable));
+        let pending: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in pending {
+            let _ = task.await;
+        }
+        Ok(())
+    }
+
+    /// #1708 review (Claude finding 2, the Codex P1): a Durable write that
+    /// lands a pending un-placeholdering's real record must also commit
+    /// that form. The entry survives another group's save until the
+    /// worker's next pass; a re-arm in that window used to keep the older
+    /// placeholder as the `committed` form, so a later failed
+    /// authoritative write rolled the legacy views back over the newer
+    /// durable record. Red at 4ca3d176.
+    #[tokio::test]
+    async fn a_rearm_after_a_durable_unplacehold_keeps_the_newer_durable_form() -> anyhow::Result<()>
+    {
+        use super::super::AtomicWriteOutcome;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+        let durable = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("armed legacy entry"))?;
+        assert!(s3::is_s3_placeholder(&durable));
+
+        // The ATA retires and the live record moves ahead of the durable
+        // form. The pass un-placeholds the group, but its own legacy write
+        // fails, so the entry stays pending with the real record not
+        // committed.
+        assert!(update_sidecar(&state, &stable, |body| body.active_ata = None).await);
+        {
+            let mut groups = state.named_groups.write().await;
+            if let Some(live) = groups.get_mut(&key) {
+                live.description = "newer durable form".to_string();
+            }
+        }
+        let legacy_path = state.named_groups_path.clone();
+        tokio::fs::remove_file(&legacy_path).await?;
+        tokio::fs::create_dir_all(legacy_path.join("blocked")).await?;
+        ensure_placeholders(&state).await;
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(|entry| entry.unplacehold_pending)));
+
+        // The legacy file is writable again: ANOTHER group's save lands the
+        // group's real record Durable. The entry survives until the next
+        // pass, and the Durable write commits the form it landed.
+        tokio::fs::remove_dir_all(&legacy_path).await?;
+        let other_admin = x0x::identity::AgentKeypair::generate()?;
+        let mut other = GroupInfo::new(
+            "adr0109-other-1708".to_string(),
+            String::new(),
+            other_admin.agent_id(),
+            "4571".repeat(16),
+        );
+        other.seal_commit(&other_admin, 1_000)?;
+        let other_key = other.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(other_key.clone(), other);
+        let outcome = super::super::save_named_groups_checked(&state).await;
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "the other group's save must be durable: {outcome:?}"
+        );
+        assert!(
+            legacy_entry(&state.named_groups_path, &other_key)
+                .await?
+                .is_some(),
+            "the other group is saved"
+        );
+        let landed = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("landed legacy entry"))?;
+        assert!(!s3::is_s3_placeholder(&landed));
+        assert_eq!(landed.description, "newer durable form");
+
+        // A re-arm claims the placeholder again before the worker's pass,
+        // and its authoritative write then fails (the sidecar cannot be
+        // written). The group keeps its last COMMITTED form — the newer
+        // durable record the other group's save landed, not the superseded
+        // placeholder.
+        let current = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("current live record"))?;
+        begin_placehold(&state, &key, &current);
+        let sidecar = sidecar_path(&state, &stable);
+        tokio::fs::remove_file(&sidecar).await?;
+        tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+        let outcome = super::super::save_named_groups_checked(&state).await;
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "the re-armed save itself lands: {outcome:?}"
+        );
+        assert!(is_held_back(&state, &stable));
+        let kept = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("kept legacy entry"))?;
+        assert!(
+            !s3::is_s3_placeholder(&kept),
+            "a failed authoritative write rolls no placeholder back over the newer durable record"
+        );
+        assert_eq!(kept.description, "newer durable form");
+        assert!(kept.has_active_member(&local));
+
+        // The sidecar is writable again: the pass retries the write and
+        // completes the un-placeholdering.
+        tokio::fs::remove_dir_all(&sidecar).await?;
+        ensure_placeholders(&state).await;
+        assert!(!is_placeheld(&state, &stable));
+        let pending: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in pending {
+            let _ = task.await;
+        }
+        let final_entry = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("final legacy entry"))?;
+        assert!(!s3::is_s3_placeholder(&final_entry));
+        assert_eq!(final_entry.description, "newer durable form");
+        assert!(
+            sidecar_snapshot(&state, &stable)
+                .await
+                .is_none_or(|body| body.authoritative_record.is_none()),
+            "the retired record leaves the sidecar"
+        );
+        Ok(())
+    }
+
+    /// #1708 review (Codex controller P1, the two-save interleaving): a
+    /// save parked after its encode — holding
+    /// `named_groups_persistence_lock`, its Durable commit still to come —
+    /// has recorded the pending group's newer real form in `encoded`. The
+    /// worker's pending step must not reset that form while the save is
+    /// parked: the unfixed step ran outside the lock, so the save's
+    /// Durable completion left `committed` at the older placeholder, and
+    /// the worker's failed retry kept that stale rollback target — a
+    /// re-arm plus a failed authoritative write then wrote the placeholder
+    /// over the newer durable record. Red at 2e878ec7.
+    #[tokio::test]
+    async fn a_parked_save_commits_its_form_across_the_workers_pending_step() -> anyhow::Result<()>
+    {
+        use super::super::AtomicWriteOutcome;
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata).await);
+
+        // The ATA retires and the live record moves ahead of the durable
+        // placeholder. The pass decides the un-placeholdering, but its own
+        // legacy write fails, so the entry stays pending with the real
+        // record not committed.
+        assert!(update_sidecar(&state, &stable, |body| body.active_ata = None).await);
+        {
+            let mut groups = state.named_groups.write().await;
+            if let Some(live) = groups.get_mut(&key) {
+                live.description = "newer durable form".to_string();
+            }
+        }
+        let legacy_path = state.named_groups_path.clone();
+        tokio::fs::remove_file(&legacy_path).await?;
+        tokio::fs::create_dir_all(legacy_path.join("blocked")).await?;
+        ensure_placeholders(&state).await;
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(
+                |entry| entry.unplacehold_pending && entry.encoded.is_none()
+            )));
+
+        // The first save parks after its encode (the #470 interleave hook),
+        // holding the persistence lock with the group's real form recorded.
+        tokio::fs::remove_dir_all(&legacy_path).await?;
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("save race hook poisoned") = Some((
+            std::sync::Arc::clone(&reached),
+            std::sync::Arc::clone(&release),
+        ));
+        let parked_state = std::sync::Arc::clone(&state);
+        let parked =
+            tokio::spawn(
+                async move { super::super::save_named_groups_checked(&parked_state).await },
+            );
+        reached.notified().await;
+        *state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("save race hook poisoned") = None;
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(|entry| entry
+                .encoded
+                .as_ref()
+                .is_some_and(|form| !form.placeholder))));
+
+        // The worker's pending step runs while the save is parked. The
+        // serialized transition waits for the save's commit, so the
+        // recorded form survives; the unfixed step cleared it here.
+        let worker_state = std::sync::Arc::clone(&state);
+        let worker = tokio::spawn(async move { ensure_placeholders(&worker_state).await });
+        let mut cleared = false;
+        for _ in 0..256 {
+            tokio::task::yield_now().await;
+            if with_placeheld(&state, |placeheld| {
+                placeheld
+                    .get(&stable)
+                    .is_some_and(|entry| entry.encoded.is_none())
+            }) {
+                cleared = true;
+                break;
+            }
+        }
+        // #1708 review: the negative check above is no proof on its own;
+        // a worker that stalled before the pending step also keeps
+        // `encoded`. The pass cannot run while the parked save holds the
+        // persistence lock, so a worker that reached the step's lock (its
+        // every earlier await is uncontended here) is still mid-pass.
+        assert!(
+            !worker.is_finished(),
+            "the worker pass reached the pending step and waits on the parked save's lock"
+        );
+        assert!(
+            !cleared,
+            "the pending step must not clear a parked save's encoded form"
+        );
+
+        // The parked save completes Durable and commits the real form it
+        // landed. The worker's own retry then fails (variant 6 leaves this
+        // save unfaulted and degrades the next legacy write to
+        // not-durable) and must not move the committed form.
+        state.named_groups_save_fault.store(6, Ordering::SeqCst);
+        release.notify_one();
+        let outcome = parked.await.expect("parked save task panicked");
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "the parked save must be durable: {outcome:?}"
+        );
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(
+                |entry| entry.committed.record.description == "newer durable form"
+            )));
+        worker.await.expect("worker pass panicked");
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(|entry| entry.unplacehold_pending
+                && entry.committed.record.description
+                    == "newer durable form")));
+        state.named_groups_save_fault.store(0, Ordering::SeqCst);
+        let landed = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("parked legacy entry"))?;
+        assert!(!s3::is_s3_placeholder(&landed));
+        assert_eq!(landed.description, "newer durable form");
+
+        // A re-arm whose authoritative write fails keeps the newer durable
+        // record — the committed form the parked save committed — never
+        // the superseded placeholder.
+        let current = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("current live record"))?;
+        begin_placehold(&state, &key, &current);
+        let sidecar = sidecar_path(&state, &stable);
+        tokio::fs::remove_file(&sidecar).await?;
+        tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+        let outcome = super::super::save_named_groups_checked(&state).await;
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "the re-armed save itself lands: {outcome:?}"
+        );
+        assert!(is_held_back(&state, &stable));
+        let kept = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("kept legacy entry"))?;
+        assert!(
+            !s3::is_s3_placeholder(&kept),
+            "a failed authoritative write rolls no placeholder back over the newer durable record"
+        );
+        assert_eq!(kept.description, "newer durable form");
+        assert!(kept.has_active_member(&local));
+
+        // The sidecar is writable again: the pass retries the write and
+        // completes the un-placeholdering.
+        tokio::fs::remove_dir_all(&sidecar).await?;
+        ensure_placeholders(&state).await;
+        assert!(!is_placeheld(&state, &stable));
+        let pending: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in pending {
+            let _ = task.await;
+        }
+        let final_entry = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("final legacy entry"))?;
+        assert!(!s3::is_s3_placeholder(&final_entry));
+        assert_eq!(final_entry.description, "newer durable form");
+        assert!(
+            sidecar_snapshot(&state, &stable)
+                .await
+                .is_none_or(|body| body.authoritative_record.is_none()),
+            "the retired record leaves the sidecar"
+        );
+        Ok(())
+    }
+
+    /// Await the detached tasks the worker pass spawned (the owed-card
+    /// publishes), so assertions below see their effects.
+    async fn drain_detached(state: &Arc<AppState>) {
+        let pending: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in pending {
+            let _ = task.await;
+        }
+    }
+
+    /// #1708 review (Claude REQUEST-CHANGES, the arming race): the pass
+    /// snapshots the sidecars, then waits for the persistence lock before
+    /// it resets its un-placehold list. An arming that starts in between
+    /// installs its ATA, claims the placeholder and saves under the same
+    /// lock. The unfixed reset flipped that armed group to pending: the
+    /// pass's resave landed the real record, the retain dropped the
+    /// entry, and the sidecar clear stripped the authoritative record
+    /// while the ATA stayed armed, so the pass published a card for a
+    /// contained group. The fixed reset re-reads each listed stable's
+    /// sidecar under the lock and leaves a group whose body changed since
+    /// the snapshot to the next pass. Inert.
+    #[tokio::test]
+    async fn an_arming_across_the_pending_step_is_not_undone() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata.clone()).await);
+
+        // A dropped arming: the sidecar no longer arms anything and the
+        // entry stays as a pending un-placeholdering that owes a card,
+        // the state whose next pass races the re-arm below.
+        assert!(!finish_arm(&state, &stable, LegacyWrite::Dropped, &ata).await);
+        assert!(sidecar_snapshot(&state, &stable).await.is_none_or(|body| {
+            body.active_ata.is_none() && body.authoritative_record.is_none()
+        }));
+
+        // The test holds the persistence lock, so the worker pass
+        // snapshots the disarmed sidecar and then waits at its pending
+        // step. The re-arm cannot pass the lock, so its pre-save steps
+        // (the ATA install and the placeholder claim) land between the
+        // pass's snapshot and its reset.
+        let guard = state.named_groups_persistence_lock.lock().await;
+        let worker_state = std::sync::Arc::clone(&state);
+        let worker = tokio::spawn(async move { ensure_placeholders(&worker_state).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The re-arm: a second ATA from the same admin for the same head.
+        let ata_two = AdminTerminalAttestation::sign(
+            AtaFields {
+                group: stable.clone(),
+                subject: local_hex(&state),
+                attested_by: hex::encode(admin.agent_id().as_bytes()),
+                signer_public_key: hex::encode(admin.public_key().as_bytes()),
+                from_revision: info.state_revision,
+                from_state_hash: info.state_hash.clone(),
+                sequence: vec!["b1".to_string(), "b2".to_string()],
+                segment_terminal_revision: info.state_revision + 2,
+                segment_terminal_epoch: None,
+                issued_at_ms: now_ms(),
+            },
+            &admin,
+        )?;
+        let arming_state = std::sync::Arc::clone(&state);
+        let arming_key = key.clone();
+        let arming_info = info.clone();
+        let arming = tokio::spawn(async move {
+            arm_in_place(&arming_state, &arming_key, &arming_info, ata_two).await
+        });
+        let mut claimed = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if sidecar_snapshot(&state, &stable)
+                .await
+                .is_some_and(|body| body.active_ata.is_some())
+                && with_placeheld(&state, |placeheld| {
+                    placeheld
+                        .get(&stable)
+                        .is_some_and(|entry| !entry.unplacehold_pending)
+                })
+            {
+                claimed = true;
+                break;
+            }
+        }
+        assert!(
+            claimed,
+            "the re-arm installed its ATA and claimed the placeholder before its save"
+        );
+
+        // The arming's save parks (the #470 interleave hook) across the
+        // worker's pending step. Whichever save parks first, it holds the
+        // persistence lock, so the armed group must not be flipped to
+        // pending while it is parked.
+        let reached = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("save race hook poisoned") = Some((
+            std::sync::Arc::clone(&reached),
+            std::sync::Arc::clone(&release),
+        ));
+        drop(guard);
+        reached.notified().await;
+        *state
+            .named_groups_save_after_snapshot_notify
+            .lock()
+            .expect("save race hook poisoned") = None;
+        assert!(
+            with_placeheld(&state, |placeheld| placeheld
+                .get(&stable)
+                .is_some_and(|entry| !entry.unplacehold_pending)),
+            "the pending step must not flip a concurrently armed group"
+        );
+        release.notify_one();
+        let published = arming.await.expect("arming task panicked");
+        assert!(published, "the re-arm published");
+        worker.await.expect("worker pass panicked");
+
+        // The armed group keeps its containment: the entry survives with
+        // the armed placeholder as its committed form, the sidecar keeps
+        // the authoritative record and the ATA, and the legacy view holds
+        // the placeholder.
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(|entry| !entry.unplacehold_pending
+                && !entry.authoritative_failed
+                && entry.committed.placeholder)));
+        let body = sidecar_on_disk(&state, &stable).await?;
+        assert!(body.active_ata.is_some(), "the re-arm's ATA stays armed");
+        assert!(
+            body.authoritative_record.is_some(),
+            "the sidecar keeps the authoritative record of the armed group"
+        );
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("armed legacy entry"))?;
+        assert!(
+            s3::is_s3_placeholder(&legacy),
+            "the legacy view keeps the placeholder of the armed group"
+        );
+        Ok(())
+    }
+
+    /// #1708 review (Codex P1 at 3bed4e49, the post-reread arming): the
+    /// worker holds the persistence lock and its sidecar re-read finds the
+    /// group unchanged. An arming's pre-save steps (the ATA install and
+    /// the placeholder claim) do not take the persistence lock, so at
+    /// 3bed4e49 they could land after the re-read released its guard and
+    /// before the reset, and the reset undid the claim. The fixed step
+    /// holds the sidecar guard from the re-read through the reset, so the
+    /// install waits and the claim comes after the reset. Red at
+    /// 3bed4e49 (the hook then parks with the guard released). Inert.
+    #[tokio::test]
+    async fn an_arming_after_the_pending_reread_is_not_undone() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata.clone()).await);
+        assert!(!finish_arm(&state, &stable, LegacyWrite::Dropped, &ata).await);
+
+        // The worker parks after its re-read of the disarmed sidecar,
+        // holding the persistence lock.
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        state.group_recovery.inner.lock().await.pending_reread_pause =
+            Some((Arc::clone(&reached), Arc::clone(&release)));
+        let worker_state = Arc::clone(&state);
+        let worker = tokio::spawn(async move { ensure_placeholders(&worker_state).await });
+        reached.notified().await;
+        assert!(
+            state.named_groups_persistence_lock.try_lock().is_err(),
+            "the worker holds the persistence lock at its pending step"
+        );
+
+        // The re-arm runs its pre-save steps in the gap.
+        let ata_two = AdminTerminalAttestation::sign(
+            AtaFields {
+                group: stable.clone(),
+                subject: local_hex(&state),
+                attested_by: hex::encode(admin.agent_id().as_bytes()),
+                signer_public_key: hex::encode(admin.public_key().as_bytes()),
+                from_revision: info.state_revision,
+                from_state_hash: info.state_hash.clone(),
+                sequence: vec!["b1".to_string(), "b2".to_string()],
+                segment_terminal_revision: info.state_revision + 2,
+                segment_terminal_epoch: None,
+                issued_at_ms: now_ms(),
+            },
+            &admin,
+        )?;
+        let arming_state = Arc::clone(&state);
+        let arming_key = key.clone();
+        let arming_info = info.clone();
+        let arming = tokio::spawn(async move {
+            arm_in_place(&arming_state, &arming_key, &arming_info, ata_two).await
+        });
+        // Give the arming every chance to claim the placeholder in the gap.
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if with_placeheld(&state, |placeheld| {
+                placeheld
+                    .get(&stable)
+                    .is_some_and(|entry| !entry.unplacehold_pending)
+            }) {
+                break;
+            }
+        }
+        release.notify_one();
+        worker.await.expect("worker pass panicked");
+        assert!(
+            arming.await.expect("arming task panicked"),
+            "the re-arm published"
+        );
+
+        // The re-arm's claim stands: the armed group keeps its entry, the
+        // sidecar keeps the ATA and the authoritative record, and the
+        // legacy view holds the placeholder.
+        assert!(
+            with_placeheld(&state, |placeheld| placeheld
+                .get(&stable)
+                .is_some_and(|entry| !entry.unplacehold_pending)),
+            "the pending reset must not undo a later arming's claim"
+        );
+        let body = sidecar_on_disk(&state, &stable).await?;
+        assert!(body.active_ata.is_some(), "the re-arm's ATA stays armed");
+        assert!(
+            body.authoritative_record.is_some(),
+            "the sidecar keeps the authoritative record of the armed group"
+        );
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("armed legacy entry"))?;
+        assert!(
+            s3::is_s3_placeholder(&legacy),
+            "the legacy view keeps the placeholder of the armed group"
+        );
+        Ok(())
+    }
+
+    /// #1708 review: a dropped arming leaves its owed card on the entry.
+    /// The pass that un-placeholds the group lands the real record
+    /// durably, completes the entry and must then actually publish the
+    /// owed card. No test showed that end state for a dropped arming.
+    /// Inert.
+    #[tokio::test]
+    async fn a_dropped_armings_owed_card_is_published() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata, _admin) = listable_armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        assert!(arm_in_place(&state, &key, &info, ata.clone()).await);
+        assert!(!finish_arm(&state, &stable, LegacyWrite::Dropped, &ata).await);
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(
+                |entry| entry.unplacehold_pending && entry.card_owed
+            )));
+
+        // The next pass completes the un-placeholdering with a Durable
+        // write of the real record and publishes the owed card.
+        ensure_placeholders(&state).await;
+        drain_detached(&state).await;
+        assert!(
+            with_placeheld(&state, |placeheld| placeheld.get(&stable).is_none()),
+            "the completed entry goes"
+        );
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("recovered legacy entry"))?;
+        assert!(!s3::is_s3_placeholder(&legacy));
+        let directory = state.directory_cache.read().await;
+        let published = directory
+            .get(&stable)
+            .ok_or_else(|| anyhow::anyhow!("the owed card was published"))?;
+        assert_eq!(
+            published.name, "issue1570 owed card fixture",
+            "the publish put the committed card in the shard cache"
+        );
+        Ok(())
+    }
+
+    /// #1708 review: a reseal whose persist ends the hold publishes the
+    /// card itself, so it also settles the owed card. Left set, the next
+    /// pass published the same card again. Inert.
+    #[tokio::test]
+    async fn a_reseal_that_ends_the_hold_settles_the_owed_card() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        // A listable group owned by this node, like the card-route
+        // fixtures.
+        let key = "61".repeat(16);
+        let policy = x0x::groups::GroupPolicy {
+            discoverability: x0x::groups::GroupDiscoverability::PublicDirectory,
+            ..Default::default()
+        };
+        let info = x0x::groups::GroupInfo::with_policy(
+            "Issue1570ResealOwed".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            key.clone(),
+            policy,
+        );
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        let durable = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("fixture group"))?;
+
+        // Placehold the group, then block the sidecar so the next change
+        // is held back and owes a card.
+        begin_placehold(&state, &key, &durable);
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let sidecar = sidecar_path(&state, &stable);
+        tokio::fs::remove_file(&sidecar).await?;
+        tokio::fs::create_dir_all(sidecar.join("blocked")).await?;
+        let mut bumped = durable.clone();
+        bumped.roster_revision = bumped.roster_revision.saturating_add(1);
+        bumped.seal_commit(state.agent.identity().agent_keypair(), now_ms())?;
+        let outcome = super::super::persist_named_group_info(&state, &key, bumped).await;
+        assert!(
+            !matches!(outcome, Ok(super::super::AtomicWriteOutcome::Durable)),
+            "the change is held back: {outcome:?}"
+        );
+        assert!(is_held_back(&state, &stable));
+        assert!(with_placeheld(&state, |placeheld| placeheld
+            .get(&stable)
+            .is_some_and(|entry| entry.card_owed)));
+
+        // The sidecar is writable again: the reseal's own persist retries
+        // it, ends the hold, commits and publishes (Engineer ruling,
+        // 29 Oct 2026 19:56), and the publish settles the owed card.
+        tokio::fs::remove_dir_all(&sidecar).await?;
+        let resp = super::super::seal_group_state(
+            State(std::sync::Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path(key.clone()),
+        )
+        .await
+        .into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the seal ends the hold itself: {body}"
+        );
+        assert!(!is_held_back(&state, &stable));
+        assert!(
+            with_placeheld(&state, |placeheld| placeheld
+                .get(&stable)
+                .is_none_or(|entry| !entry.card_owed)),
+            "the reseal's publish settled the owed card"
+        );
+        let committed_revision = state
+            .named_groups
+            .read()
+            .await
+            .get(&key)
+            .map(|current| current.state_revision)
+            .ok_or_else(|| anyhow::anyhow!("group after the seal"))?;
+        let directory = state.directory_cache.read().await;
+        let published = directory
+            .get(&stable)
+            .ok_or_else(|| anyhow::anyhow!("the reseal published its card"))?;
+        assert_eq!(
+            published.revision, committed_revision,
+            "the reseal published the card of the record it committed"
+        );
+        Ok(())
+    }
+
+    /// [`armed_fixture`], with a `PublicDirectory` policy: a published
+    /// card of the group reaches the discovery caches.
+    async fn listable_armed_fixture(
+        state: &Arc<AppState>,
+    ) -> anyhow::Result<(
+        String,
+        GroupInfo,
+        AdminTerminalAttestation,
+        x0x::identity::AgentKeypair,
+    )> {
+        let local = local_hex(state);
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let policy = x0x::groups::GroupPolicy {
+            discoverability: x0x::groups::GroupDiscoverability::PublicDirectory,
+            ..Default::default()
+        };
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "issue1570 owed card fixture".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "5157".repeat(16),
+            policy,
+        );
+        info.add_member(
+            local.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        info.seal_commit(&admin, 1_000)?;
+        let key = info.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), info.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let ata = AdminTerminalAttestation::sign(
+            AtaFields {
+                group: info.stable_group_id().to_string(),
+                subject: local,
+                attested_by: hex::encode(admin.agent_id().as_bytes()),
+                signer_public_key: hex::encode(admin.public_key().as_bytes()),
+                from_revision: info.state_revision,
+                from_state_hash: info.state_hash.clone(),
+                sequence: vec!["c1".to_string()],
+                segment_terminal_revision: info.state_revision + 1,
+                segment_terminal_epoch: None,
+                issued_at_ms: now_ms(),
+            },
+            &admin,
+        )?;
+        Ok((key, info, ata, admin))
     }
 
     /// ADR 0109 §4 "sidecar, then legacy view": when the authoritative
@@ -13879,6 +15067,7 @@ mod tests {
             ("expired", "expired"),
             ("group_mismatch", "group_mismatch"),
             ("reseat_invite_unpaired", "reseat_invite_unpaired"),
+            ("record_key_divergent", "group_mismatch"),
         ] {
             assert_eq!(authorisation_refused_cause(check), cause, "{check}");
         }
@@ -13964,6 +15153,87 @@ mod tests {
             "the staged join ran: {refusal:?}"
         );
         original_kept(&state, &key, &info).await
+    }
+
+    /// #1689 review: [`check_reseat_keys`] needs the map key, the record's
+    /// `mls_group_id` and the invite's `group_id` to be one key; any one
+    /// apart is `record_key_divergent`.
+    #[test]
+    fn check_reseat_keys_needs_one_key() -> anyhow::Result<()> {
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let key = "1689".repeat(16);
+        let other = "a1".repeat(32);
+        let info = GroupInfo::new("keys".into(), String::new(), admin.agent_id(), key.clone());
+        let invite = |group_id: &str| {
+            x0x::groups::invite::SignedInvite::new(
+                group_id.to_string(),
+                "keys".into(),
+                &admin.agent_id(),
+                3600,
+            )
+        };
+        assert_eq!(check_reseat_keys(&key, &info, &invite(&key)), Ok(()));
+        for (map_key, invite_id) in [(&other, &key), (&key, &other)] {
+            assert_eq!(
+                check_reseat_keys(map_key, &info, &invite(invite_id)),
+                Err("record_key_divergent")
+            );
+        }
+        Ok(())
+    }
+
+    /// #1689 review (Engineer ruling, 29 Oct): a legacy record whose map
+    /// key (its pre-pin genesis id) differs from its `mls_group_id` is
+    /// refused with `record_key_divergent` (cause `group_mismatch`) before
+    /// anything is journalled or moved. Before the guard this valid offer
+    /// from a local admin reached the staged join. Inert.
+    #[tokio::test]
+    async fn a_reseat_of_a_record_keyed_apart_from_its_mls_group_id_is_refused(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let member = x0x::identity::AgentKeypair::generate()?;
+        let (key, mut info) = authority_fixture(&state, &admin, &member, None).await?;
+        let legacy = "1689".repeat(16);
+        assert_ne!(legacy, info.mls_group_id);
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            legacy.clone(),
+            hex::encode(admin.agent_id().as_bytes()),
+            1_000,
+            String::new(),
+        ));
+        info.fork_quarantine = Some(original_marker(&state, &info));
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.remove(&key);
+            groups.insert(legacy.clone(), info.clone());
+        }
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        assert_eq!(info.stable_group_id(), legacy);
+        let (basis, revision, hash) = unseen_removal(&info);
+        // A v4 invite signs `group_id` equal to `stable_group_id` (E1), so
+        // the admin mints it at the record's stable (legacy) id.
+        let mut minted_view = info.clone();
+        minted_view.mls_group_id = legacy.clone();
+        let offer = reseat_offer(
+            &minted_view,
+            &admin,
+            state.agent.agent_id(),
+            basis,
+            (revision, &hash),
+        )?;
+        let refusal = deliver_offer(&state, &info, &admin, offer).await;
+        assert_eq!(
+            refusal.as_deref(),
+            Some("authorisation_refused:group_mismatch")
+        );
+        for open_key in [&legacy, &info.mls_group_id] {
+            assert!(state.reseat_stagings.scope_for(open_key).is_none());
+        }
+        original_kept(&state, &legacy, &info).await
     }
 
     /// A `Removal` basis is checked against this node's own chain: a

@@ -4639,7 +4639,20 @@ mod tests {
         assert_eq!(committed.state_revision, info.state_revision + 1);
         let bytes = {
             let mut inner = state.revocation_evictions.inner.lock().await;
-            let bytes = inner.orc.deliveries[&stable].bytes.to_vec();
+            // The expected frame is read from the durable log, not from
+            // `deliveries`: this fixture's survivor set is empty (the
+            // revoked admin is removed and the promotee is local), so
+            // the delivery is born converged (`all_converged` holds
+            // vacuously) and a delivery pass may legitimately remove it
+            // before this lock. The log is the commit's own record and
+            // is never swept, so the bytes this test compares against
+            // after the restart are the bytes the commit wrote.
+            let planned = inner
+                .orc
+                .log
+                .catchup_frames(std::slice::from_ref(&stable), info.state_revision);
+            assert_eq!(planned.len(), 1, "the commit wrote exactly one frame");
+            let bytes = planned[0].2.as_ref().clone();
             inner.orc = OrcState::default();
             bytes
         };
@@ -6812,6 +6825,183 @@ mod restart_tests {
             "a live recovery delivery's ask counts survive the worker pass"
         );
         state.agent.shutdown().await;
+    }
+
+    /// #1633: a GSS owner recovery aimed at a survivor whose seat this
+    /// author's roster shows with no KEM public key, so no share can be
+    /// sealed to it. ADR 0110 §3 L228 holds: survivor convergence, not a
+    /// transport ACK, proves delivery. The carrier takes the frame each
+    /// round, but that closes no seat — the close call of 25 Oct (an
+    /// author-side skip record) lived under a day, 27 Oct 23:42 UTC to
+    /// 28 Oct 00:18 UTC — and a keyless
+    /// survivor claims no head while it is keyless (#1627, 28 Oct 02:09
+    /// GMT), so it converges no author's row: the obligation stays open.
+    /// The KEM key is local data, not in the roster root (#1578), so the
+    /// recovery is the re-seated key, the resealed share, and the report
+    /// the survivor makes after it installs head and secret together.
+    #[tokio::test]
+    async fn a_keyless_seat_stays_pending_until_the_reseated_key_installs_the_share() -> Result<()>
+    {
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let (author, survivor, info, committed, frame, _admin) =
+            committed_gss_recovery(author_dir.path(), survivor_dir.path(), None, None).await?;
+        let stable = info.stable_group_id().to_string();
+        let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
+        let new_secret = committed.shared_secret.clone().context("new secret")?;
+        // The seat's KEM key is local data (#1578): keep it, then remove
+        // the author's view of it, so no share can be sealed to the seat.
+        let saved_kem = author
+            .named_groups
+            .read()
+            .await
+            .get(&stable)
+            .context("group")?
+            .members_v2
+            .get(&survivor_hex)
+            .context("survivor seat")?
+            .kem_public_key_b64
+            .clone()
+            .context("the fixture seats a KEM key")?;
+        author
+            .named_groups
+            .write()
+            .await
+            .get_mut(&stable)
+            .context("group")?
+            .members_v2
+            .get_mut(&survivor_hex)
+            .context("survivor seat")?
+            .kem_public_key_b64 = None;
+        // The survivor holds the frame Retained: it has its key, but the
+        // share that must land with the head did not come.
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Retained { verified: true },
+            "the frame waits for its share"
+        );
+
+        // Pending phase: the author's rounds run. The carrier takes the
+        // frame every round, but no ACK closes a seat (ADR 0110 §3), so
+        // the obligation stays open while the seat cannot take a share.
+        let shares_to_survivor = |author: &Arc<AppState>| {
+            scheduled_shares(author)
+                .into_iter()
+                .filter(|(to, _)| to == &survivor_hex)
+                .count()
+        };
+        let sealed = shares_to_survivor(&author);
+        for _ in 0..25 {
+            if let Some(delivery) = author
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .deliveries
+                .get_mut(&stable)
+            {
+                delivery.next_at = Instant::now();
+            }
+            worker_tick(&author).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The carrier really took the frame in those rounds: the seat's
+        // status is Sent — the acceptance that must close nothing. The
+        // last round's send completes asynchronously, so poll for it,
+        // and only then check the row: a close made when the send
+        // completes must not slip through between the two checks.
+        let mut accepted = false;
+        for _ in 0..250 {
+            let seat = author
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .orc
+                .deliveries
+                .get(&stable)
+                .and_then(|delivery| {
+                    delivery
+                        .recipients
+                        .get(survivor.agent.agent_id().as_bytes())
+                        .copied()
+                });
+            if seat == Some(RecipientDelivery::Sent) {
+                accepted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            accepted,
+            "the carrier took the frame: its acceptance is Sent, and it closes nothing"
+        );
+        assert!(
+            still_delivering(&author, &stable, &survivor).await,
+            "the carrier's acceptance of the frame closes no keyless seat"
+        );
+        assert_eq!(
+            shares_to_survivor(&author),
+            sealed,
+            "no new share is sealed while the seat has no KEM key"
+        );
+        assert_eq!(
+            head_of(&survivor, &stable).await.as_ref(),
+            Some(&info.state_hash),
+            "the survivor stays below the recovery, Retained frame and no share"
+        );
+
+        // Recovery: the seat re-joins keyed. The author's next round seals
+        // the share again; the parked share and the Retained frame make
+        // head and secret install together, and only the report of that
+        // installed head ends the delivery.
+        author
+            .named_groups
+            .write()
+            .await
+            .get_mut(&stable)
+            .context("group")?
+            .members_v2
+            .get_mut(&survivor_hex)
+            .context("survivor seat")?
+            .kem_public_key_b64 = Some(saved_kem);
+        let share = next_share(&author, &stable, &survivor_hex, sealed).await?;
+        let early = super::super::super::apply_named_group_metadata_event(
+            &survivor,
+            share,
+            author.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(!early.accepted, "the share is parked until its recovery");
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Applied,
+            "the share makes head and secret install together"
+        );
+        let held = survivor.named_groups.read().await[&stable].clone();
+        assert_eq!(held.state_hash, committed.state_hash);
+        assert_eq!(held.secret_epoch, committed.secret_epoch);
+        assert_eq!(held.shared_secret.as_deref(), Some(new_secret.as_slice()));
+        // The author's next round's ask leaves after the re-seal (#1660,
+        // Engineer ruling, 29 Oct 17:12 GMT); the survivor's answer to
+        // that ask ends the delivery.
+        {
+            let mut inner = author.revocation_evictions.inner.lock().await;
+            *inner
+                .head_ask_seq
+                .entry((stable.clone(), *survivor.agent.agent_id().as_bytes()))
+                .or_insert(0) += 1;
+        }
+        report_head(&author, &survivor, &stable).await?;
+        assert!(
+            !still_delivering(&author, &stable, &survivor).await,
+            "only the installed share's report ends the delivery"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
     }
 
     /// Codex P1 (#1508 rc12), receiver restart: the survivor gets the GSS

@@ -1267,6 +1267,14 @@ pub(super) struct AppState {
     /// task runs; each later observation updates the entry.
     pub(super) treekem_epoch_ahead_targets:
         Mutex<HashMap<String, crate::server::routes::named_groups::EpochAheadTarget>>,
+    /// #1657 (ADR 0110 §3): the latest typed TreeKEM catch-up refusal
+    /// this daemon received, per group, keyed by the group id its own
+    /// request used. Surfaced in the operator log at receive time and
+    /// kept here so tests (and a later diagnostics surface) can read
+    /// which revocation a peer named, from which peer, and when. A
+    /// refusal for a group this node does not hold records nothing
+    /// (review finding 2), so the map is bounded by the local groups.
+    pub(super) treekem_catchup_refusals: StdMutex<HashMap<String, TreeKemCatchupRefusalNote>>,
     /// Per-group serialization for authoritative membership mutations. The
     /// owner-side `MemberJoined`→`MemberAdded` add (and every other membership
     /// apply) is a read-modify-write that loads `info`, mutates a clone, mutates
@@ -1542,6 +1550,20 @@ impl AppState {
 pub(super) type JoinArtifactEgressRegistry =
     HashMap<(String, String), Vec<tokio::task::JoinHandle<()>>>;
 
+/// #1657 (ADR 0110 §3): one typed TreeKEM catch-up refusal this daemon
+/// received — which revocation the refusing peer named, from which peer,
+/// and when (see `AppState::treekem_catchup_refusals`). Read by the
+/// #1657 tests today; a diagnostics surface is the follow-up owner.
+#[derive(Debug, Clone)]
+pub(crate) struct TreeKemCatchupRefusalNote {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) reason: crate::direct::TreeKemCatchupRefusalReason,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) peer: [u8; 32],
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) at: std::time::Instant,
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct NamedGroupTestRecorders {
@@ -1611,6 +1633,10 @@ pub(super) struct NamedGroupTestRecorders {
         StdMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Pages `handle_treekem_catchup_request` built, including a cold log.
     pub(super) catchup_responses: StdMutex<Vec<Vec<u8>>>,
+    /// #1657: every typed catch-up refusal `handle_treekem_catchup_request`
+    /// built, as the exact serialized payload, recorded at the refusal
+    /// DECISION (before any egress). Tests read the payload here.
+    pub(super) catchup_refusals: StdMutex<Vec<Vec<u8>>>,
 }
 
 #[cfg(test)]
