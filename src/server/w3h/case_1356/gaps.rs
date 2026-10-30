@@ -85,7 +85,7 @@ async fn pre_s3(sim: &Sim, labels: &[&str], observer: &str) -> Result<()> {
 /// Returns once `observer` holds a current verified advert from `label`
 /// that sets bit 8 (a node restarted on the candidate); it asks for a
 /// fresh advert each round, as S3 itself does for unknown support.
-async fn sees_s3(sim: &Sim, observer: &str, label: &str) -> Result<()> {
+pub(super) async fn sees_s3(sim: &Sim, observer: &str, label: &str) -> Result<()> {
     let bit = crate::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1;
     let agent = sim.ids(label)?.0;
     sim.until(
@@ -114,7 +114,12 @@ async fn sees_s3(sim: &Sim, observer: &str, label: &str) -> Result<()> {
 /// M2; with `skew`, A makes the four policy changes. `pre` names the
 /// nodes that run as the previous release from the start. Returns the
 /// group and A's view at the mint.
-async fn s0(sim: &Sim, labels: &[&str], skew: bool, pre: &[&str]) -> Result<(String, View)> {
+pub(super) async fn s0(
+    sim: &Sim,
+    labels: &[&str],
+    skew: bool,
+    pre: &[&str],
+) -> Result<(String, View)> {
     mesh(sim, labels).await?;
     if !pre.is_empty() {
         pre_s3(sim, pre, "J").await?;
@@ -235,7 +240,7 @@ fn sidecars(sim: &Sim, label: &str) -> Vec<String> {
 
 /// `GET /groups/:id/recovery` on `label` (`Null` when absent, as on the
 /// base).
-async fn recovery_route(sim: &Sim, label: &str, group: &str) -> Result<Value> {
+pub(super) async fn recovery_route(sim: &Sim, label: &str, group: &str) -> Result<Value> {
     let (code, body) = sim
         .request(
             label,

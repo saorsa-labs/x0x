@@ -8,7 +8,7 @@ fn reply(signature: &str, value: Value) -> Vec<u8> {
 fn refused(property: &str, bytes: &[u8]) {
     let error = parse_property(property, bytes).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert_eq!(error.to_string(), "invalid execution-context reply");
+    assert_eq!(error.to_string(), "invalid systemd property reply");
 }
 
 #[test]
@@ -254,6 +254,220 @@ fn unknown_properties_fail_and_debug_or_errors_never_echo_values() {
         for truth in [true, false] {
             let value = parse_property(property, &reply("b", json!(truth))).unwrap();
             assert_eq!(format!("{value:?}"), format!("{property}(<redacted>)"));
+        }
+    }
+}
+
+fn unit_refused(property: &str, bytes: &[u8]) {
+    let error = parse_unit_property(property, bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "invalid systemd property reply");
+    assert!(!format!("{error:?}").contains("PRIVATE-UNIT"));
+}
+
+// Constructed raw replies follow the systemd v255 dbus-unit.c Unit vtable.
+// These are get-property variant bodies, not GetAll or call return envelopes.
+#[test]
+fn unit_metadata_retains_source_paths_states_and_reload_projections() {
+    for (property, bytes, expected) in [
+        ("FragmentPath", br#"{"type":"s","data":"/usr/lib/systemd/system/x0xd.service"}"#.as_slice(),
+         UnitProperty::FragmentPath("/usr/lib/systemd/system/x0xd.service".into())),
+        ("SourcePath", br#"{"type":"s","data":"/etc/init.d/x0xd"}"#,
+         UnitProperty::SourcePath("/etc/init.d/x0xd".into())),
+        ("DropInPaths", br#"{"type":"as","data":["/run/systemd/system/x0xd.service.d/20-b.conf","/etc/systemd/system/x0xd.service.d/10-a.conf","/run/systemd/system/x0xd.service.d/20-b.conf"]}"#,
+         UnitProperty::DropInPaths(vec!["/run/systemd/system/x0xd.service.d/20-b.conf".into(), "/etc/systemd/system/x0xd.service.d/10-a.conf".into(), "/run/systemd/system/x0xd.service.d/20-b.conf".into()])),
+        ("LoadState", br#"{"type":"s","data":"loaded"}"#,
+         UnitProperty::LoadState("loaded".into())),
+        ("UnitFileState", br#"{"type":"s","data":"generated"}"#,
+         UnitProperty::UnitFileState("generated".into())),
+        ("Transient", br#"{"type":"b","data":false}"#,
+         UnitProperty::Transient(false)),
+        ("NeedDaemonReload", br#"{"type":"b","data":true}"#,
+         UnitProperty::NeedDaemonReload(true)),
+    ] {
+        assert_eq!(parse_unit_property(property, bytes).unwrap(), expected);
+        // The Service entry point must not accept Unit property names.
+        refused(property, bytes);
+    }
+}
+
+#[test]
+fn unit_metadata_preserves_empty_or_unresolved_values_without_inference() {
+    for value in ["", "../raw path", "%i", "$HOME", "名前\t\n", "PRIVATE-UNIT"] {
+        for (property, expected) in [
+            ("FragmentPath", UnitProperty::FragmentPath(value.into())),
+            ("SourcePath", UnitProperty::SourcePath(value.into())),
+        ] {
+            assert_eq!(
+                parse_unit_property(property, &reply("s", json!(value))).unwrap(),
+                expected
+            );
+        }
+    }
+    for value in [
+        "",
+        "loaded",
+        "masked",
+        "not-found",
+        "bad-setting",
+        "error",
+        "merged",
+        "stub",
+        "enabled-runtime",
+        "transient",
+        "generated",
+        "future-state",
+    ] {
+        for (property, expected) in [
+            ("LoadState", UnitProperty::LoadState(value.into())),
+            ("UnitFileState", UnitProperty::UnitFileState(value.into())),
+        ] {
+            assert_eq!(
+                parse_unit_property(property, &reply("s", json!(value))).unwrap(),
+                expected
+            );
+        }
+    }
+    for values in [vec![], vec!["../raw", "%i", "$HOME", "名前", "/a b"]] {
+        assert_eq!(
+            parse_unit_property("DropInPaths", &reply("as", json!(values))).unwrap(),
+            UnitProperty::DropInPaths(values.into_iter().map(String::from).collect())
+        );
+    }
+    for value in [true, false] {
+        for (property, expected) in [
+            ("Transient", UnitProperty::Transient(value)),
+            ("NeedDaemonReload", UnitProperty::NeedDaemonReload(value)),
+        ] {
+            assert_eq!(
+                parse_unit_property(property, &reply("b", json!(value))).unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn unit_metadata_refuses_wrong_shapes_signatures_and_partial_lists() {
+    for (properties, signature, valid) in [
+        (
+            &["FragmentPath", "SourcePath", "LoadState", "UnitFileState"][..],
+            "s",
+            json!("PRIVATE-UNIT"),
+        ),
+        (&["DropInPaths"][..], "as", json!(["PRIVATE-UNIT"])),
+        (&["Transient", "NeedDaemonReload"][..], "b", json!(true)),
+    ] {
+        for property in properties {
+            for bad_signature in ["", "o", "u", "a{sv}", "v", "S"] {
+                unit_refused(property, &reply(bad_signature, valid.clone()));
+            }
+            for bad_value in [
+                json!(null),
+                json!(0),
+                json!({"value":valid}),
+                json!([valid]),
+                json!([null]),
+                json!([1]),
+            ] {
+                unit_refused(property, &reply(signature, bad_value));
+            }
+            for other_signature in ["s", "as", "b"] {
+                if other_signature != signature {
+                    unit_refused(property, &reply(other_signature, valid.clone()));
+                }
+            }
+        }
+    }
+    for property in ["Transient", "NeedDaemonReload"] {
+        unit_refused(property, &reply("b", json!("true")));
+    }
+    unit_refused("DropInPaths", &reply("as", json!("PRIVATE-UNIT")));
+    for bad in ["", "\0", "PRIVATE-UNIT\0suffix"] {
+        unit_refused("DropInPaths", &reply("as", json!(["valid", bad, "last"])));
+    }
+    for property in ["FragmentPath", "SourcePath", "LoadState", "UnitFileState"] {
+        unit_refused(property, &reply("s", json!("PRIVATE-UNIT\0suffix")));
+    }
+}
+
+#[test]
+fn unit_metadata_refuses_ambiguous_or_malformed_envelopes() {
+    for bytes in [
+        b"".as_slice(),
+        b"[]",
+        br#"["s","PRIVATE-UNIT"]"#,
+        br#"{"type":"s"}"#,
+        br#"{"data":"PRIVATE-UNIT"}"#,
+        br#"{"type":"s","type":"s","data":"PRIVATE-UNIT"}"#,
+        br#"{"type":"s","data":"PRIVATE-UNIT","data":"PRIVATE-UNIT"}"#,
+        br#"{"type":"s","data":"PRIVATE-UNIT","extra":0}"#,
+        br#"{"type":"s","data":"PRIVATE-UNIT"}{}"#,
+        br#"{"type":"s","data":["PRIVATE-UNIT"]}"#,
+        b"\xff",
+        b"\0{}",
+        b"\x0b{}",
+        br#"{"type":"s","data":"\ud800"}"#,
+    ] {
+        unit_refused("FragmentPath", bytes);
+    }
+    assert_eq!(
+        parse_unit_property("FragmentPath", b" \n\t{\"data\":\"\",\"type\":\"s\"}\r\n").unwrap(),
+        UnitProperty::FragmentPath(String::new())
+    );
+}
+
+#[test]
+fn unit_metadata_bounds_entire_reply_and_drop_in_count_inclusively() {
+    for (property, signature, value) in [
+        ("FragmentPath", "s", json!("PRIVATE-UNIT")),
+        ("DropInPaths", "as", json!([])),
+        ("Transient", "b", json!(false)),
+    ] {
+        let mut bytes = reply(signature, value);
+        bytes.resize(MAX_BYTES, b' ');
+        assert!(parse_unit_property(property, &bytes).is_ok());
+        bytes.push(b' ');
+        unit_refused(property, &bytes);
+    }
+    let paths = vec!["/a"; MAX_ENTRIES];
+    assert_eq!(
+        parse_unit_property("DropInPaths", &reply("as", json!(paths))).unwrap(),
+        UnitProperty::DropInPaths(paths.into_iter().map(String::from).collect())
+    );
+    unit_refused(
+        "DropInPaths",
+        &reply("as", json!(vec!["/a"; MAX_ENTRIES + 1])),
+    );
+}
+
+#[test]
+fn unit_metadata_refuses_service_or_unknown_properties_and_redacts_all_variants() {
+    for property in [
+        "",
+        "User",
+        "WorkingDirectory",
+        "Environment",
+        "DynamicUser",
+        "ExecStart",
+        "fragmentpath",
+        "Unit.FragmentPath",
+        "PRIVATE-UNIT",
+    ] {
+        unit_refused(property, &reply("s", json!("PRIVATE-UNIT")));
+    }
+    for (properties, signature, value) in [
+        (
+            &["FragmentPath", "SourcePath", "LoadState", "UnitFileState"][..],
+            "s",
+            json!("PRIVATE-UNIT"),
+        ),
+        (&["DropInPaths"][..], "as", json!(["PRIVATE-UNIT"])),
+        (&["Transient", "NeedDaemonReload"][..], "b", json!(true)),
+    ] {
+        for property in properties {
+            let parsed = parse_unit_property(property, &reply(signature, value.clone())).unwrap();
+            assert_eq!(format!("{parsed:?}"), format!("{property}(<redacted>)"));
         }
     }
 }

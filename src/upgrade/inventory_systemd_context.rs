@@ -1,11 +1,16 @@
-//! Supplied systemd v255 execution-context properties for dormant inventory.
+//! Supplied systemd v255 context and Unit properties for dormant inventory.
 //!
-//! Decode one Service `busctl --json=short get-property` reply. The collector
+//! Decode one `busctl --json=short get-property` reply. Separate entry points
+//! accept Service context properties and Unit metadata. The collector
 //! must bind it to its manager, unit, interface and property. These values do
 //! not establish effective accounts, roots, environment or launch authority.
 //! Empty strings, special working-directory spellings and unresolved paths
 //! remain literal evidence. Boolean properties are the manager's projection,
-//! not proof of which setting was explicitly configured. No I/O or caller here.
+//! not proof of which setting was explicitly configured. Unit state and source
+//! paths do not prove that on-disk files match loaded configuration, that a
+//! unit is persistent, or that all launch authorities have been found. Unknown
+//! state spellings remain evidence; no state implies approval. No I/O or caller.
+//! Unit signatures: systemd v255 `src/core/dbus-unit.c` Unit vtable.
 #![cfg(unix)]
 #![allow(dead_code)]
 
@@ -50,6 +55,32 @@ impl fmt::Debug for ContextProperty {
     }
 }
 
+/// Raw metadata from `org.freedesktop.systemd1.Unit`, not Service.
+#[derive(PartialEq, Eq)]
+pub(crate) enum UnitProperty {
+    FragmentPath(String),
+    SourcePath(String),
+    DropInPaths(Vec<String>),
+    LoadState(String),
+    UnitFileState(String),
+    Transient(bool),
+    NeedDaemonReload(bool),
+}
+
+impl fmt::Debug for UnitProperty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::FragmentPath(_) => "FragmentPath(<redacted>)",
+            Self::SourcePath(_) => "SourcePath(<redacted>)",
+            Self::DropInPaths(_) => "DropInPaths(<redacted>)",
+            Self::LoadState(_) => "LoadState(<redacted>)",
+            Self::UnitFileState(_) => "UnitFileState(<redacted>)",
+            Self::Transient(_) => "Transient(<redacted>)",
+            Self::NeedDaemonReload(_) => "NeedDaemonReload(<redacted>)",
+        })
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Envelope<T> {
@@ -60,11 +91,7 @@ struct Envelope<T> {
 }
 
 pub(crate) fn parse_property(property: &str, bytes: &[u8]) -> io::Result<ContextProperty> {
-    if bytes.len() > MAX_BYTES
-        || bytes.iter().find(|byte| !b" \t\r\n".contains(byte)) != Some(&b'{')
-    {
-        return Err(refusal());
-    }
+    check_reply(bytes)?;
     Ok(match property {
         "User" => ContextProperty::User(text(bytes)?),
         "Group" => ContextProperty::Group(text(bytes)?),
@@ -79,6 +106,30 @@ pub(crate) fn parse_property(property: &str, bytes: &[u8]) -> io::Result<Context
         "ExecSearchPath" => ContextProperty::ExecSearchPath(strings(bytes)?),
         _ => return Err(refusal()),
     })
+}
+
+/// The caller must bind these supplied bytes to a Unit-interface property read.
+pub(crate) fn parse_unit_property(property: &str, bytes: &[u8]) -> io::Result<UnitProperty> {
+    check_reply(bytes)?;
+    Ok(match property {
+        "FragmentPath" => UnitProperty::FragmentPath(text(bytes)?),
+        "SourcePath" => UnitProperty::SourcePath(text(bytes)?),
+        "DropInPaths" => UnitProperty::DropInPaths(strings(bytes)?),
+        "LoadState" => UnitProperty::LoadState(text(bytes)?),
+        "UnitFileState" => UnitProperty::UnitFileState(text(bytes)?),
+        "Transient" => UnitProperty::Transient(decode(bytes, "b")?),
+        "NeedDaemonReload" => UnitProperty::NeedDaemonReload(decode(bytes, "b")?),
+        _ => return Err(refusal()),
+    })
+}
+
+fn check_reply(bytes: &[u8]) -> io::Result<()> {
+    if bytes.len() > MAX_BYTES
+        || bytes.iter().find(|byte| !b" \t\r\n".contains(byte)) != Some(&b'{')
+    {
+        return Err(refusal());
+    }
+    Ok(())
 }
 
 fn decode<T: DeserializeOwned>(bytes: &[u8], signature: &str) -> io::Result<T> {
@@ -111,10 +162,7 @@ fn strings(bytes: &[u8]) -> io::Result<Vec<String>> {
 }
 
 fn refusal() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "invalid execution-context reply",
-    )
+    io::Error::new(io::ErrorKind::InvalidData, "invalid systemd property reply")
 }
 
 #[cfg(test)]
