@@ -863,12 +863,13 @@ pub(in crate::server) async fn seal_probe_for_test(
 }
 
 /// §2: the catch-up response handler calls this for each verified,
-/// applied, non-truncated page that carries the responder's saved head
-/// (`responder_state_hash`). The handler checked the sender when the
-/// answer arrived. #1660 (ADR 0110 §3: no mid-send exception) makes the
-/// delivery completion step re-check the live roster before it closes a
-/// seat as delivered. The handler's checks ran before the page applied,
-/// and a removal or revocation can land inside that window.
+/// applied, non-truncated catch-up page, with or without the responder's
+/// saved head (`responder_state_hash`). The handler checked the sender
+/// when the answer arrived — an active, unrevoked member. #1660 (ADR
+/// 0110 §3: no mid-send exception) makes the delivery completion step
+/// re-check the live roster before it closes a seat as delivered. The
+/// handler's checks ran before the page applied, and a removal or
+/// revocation can land inside that window.
 ///
 /// A sender that is no longer an Active member, or that D60 refuses,
 /// closes no seat. A GSS row's report closes a seat only when a sealed
@@ -924,11 +925,12 @@ pub(in crate::server) async fn note_catchup_head(
                         )
                     }),
                     seat,
+                    reported.is_none() && hashless_answer_is_a_keyless_disclaimer(info, sender),
                 )
             })
         })
     };
-    let Some((stable, head, classified, seat)) = current else {
+    let Some((stable, head, classified, seat, keyless_disclaimer)) = current else {
         return;
     };
     // #1660: D60 entitlement is not fixed at commit — the completion step
@@ -936,13 +938,17 @@ pub(in crate::server) async fn note_catchup_head(
     // A disclaimed answer closes no seat, so it needs no verdict.
     let mut sender_seat = if classified.is_some() {
         match seat {
-            Some(seat) if crypto_exclusion::write_allowed(state, &sender).await => Some(seat),
+            Some(seat)
+                if crypto_exclusion::write_allowed(state, &x0x::identity::AgentId(sender))
+                    .await =>
+            {
+                Some(seat)
+            }
             _ => None,
         }
     } else {
         None
     };
-    let mut inner = state.revocation_evictions.inner.lock().await;
     let Some((report, installed)) = classified else {
         if !keyless_disclaimer {
             // Not a keyless survivor: main's reply. An old peer's or any
@@ -1000,13 +1006,7 @@ pub(in crate::server) async fn note_catchup_head(
     }
     // §3: the answer is also the sender's convergence evidence for the
     // S4 deliveries of this group whose result it holds.
-    crypto_exclusion::note_survivor_head(
-        &mut inner,
-        &stable,
-        sender.as_bytes(),
-        &installed,
-        sender_seat,
-    );
+    crypto_exclusion::note_survivor_head(&mut inner, &stable, &sender, &installed, sender_seat);
     // Only groups with S4 work keep a round (the worker pass creates it).
     if !inner.head_rounds.contains_key(&stable) {
         return;
