@@ -22,7 +22,7 @@ const FINAL: &str = "certificate_only_admin_seals_an_owner_certified_group";
 
 /// Start `label` with an owner-issued agent certificate; with `user_key`
 /// the install also holds the owner's USER key.
-async fn start_certified(
+pub(super) async fn start_certified(
     sim: &mut Sim,
     label: &str,
     owner: &crate::identity::UserKeypair,
@@ -48,7 +48,7 @@ async fn start_certified(
 }
 
 /// Each of `labels` announces its identity with its certificate.
-async fn announce_all(sim: &Sim, labels: &[&str]) -> Result<()> {
+pub(super) async fn announce_all(sim: &Sim, labels: &[&str]) -> Result<()> {
     for label in labels {
         let body = json!({"include_user_identity": true, "human_consent": true});
         let (code, answer) = sim
@@ -62,7 +62,7 @@ async fn announce_all(sim: &Sim, labels: &[&str]) -> Result<()> {
 /// `admin` seals a rename. A seal checks every member's certificate and the
 /// first try may start the fetches it needs; the creator's seat carries no
 /// certificate, so each retry refreshes O's certificate announce.
-async fn seal_rename(sim: &Sim, admin: &str, group: &str, name: &str) -> Result<()> {
+pub(super) async fn seal_rename(sim: &Sim, admin: &str, group: &str, name: &str) -> Result<()> {
     let path = format!("/groups/{group}");
     let mut last = String::new();
     sim.until(
@@ -88,7 +88,10 @@ async fn seal_rename(sim: &Sim, admin: &str, group: &str, name: &str) -> Result<
 /// An OwnerCertified TreeKEM group that is not the Home policy: admin-only
 /// writes keep it off ADR 0109 §4's Home gate (`home_gate_closed`) and out
 /// of Home adoption (#1687). Hidden + MlsEncrypted keeps the TreeKEM plane.
-async fn create_group(sim: &Sim, owner: &crate::identity::UserKeypair) -> Result<String> {
+pub(super) async fn create_group(
+    sim: &Sim,
+    owner: &crate::identity::UserKeypair,
+) -> Result<String> {
     let policy = crate::groups::GroupPolicy {
         admission: crate::groups::GroupAdmission::OwnerCertified(owner.user_id()),
         write_access: crate::groups::GroupWriteAccess::AdminOnly,
@@ -125,7 +128,7 @@ async fn redeem(
 }
 
 /// `member` redeems a fresh invite from O and is seated.
-async fn join_owner(
+pub(super) async fn join_owner(
     sim: &Sim,
     member: &str,
     group: &str,
@@ -270,7 +273,7 @@ async fn reaches(sim: &Sim, label: &str, group: &str, hash: &str, budget: Durati
     .is_ok()
 }
 
-async fn all_reach(sim: &Sim, labels: &[&str], group: &str, hash: &str) -> Result<()> {
+pub(super) async fn all_reach(sim: &Sim, labels: &[&str], group: &str, hash: &str) -> Result<()> {
     for label in labels {
         if !reaches(sim, label, group, hash, SETUP).await {
             let seen = try_view_now(sim, label, group).await?;

@@ -863,6 +863,8 @@ jobs:
           --expect w3h_1356_red_s3_t_deferred_until_host_commit=GREEN
           --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
           --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
+          --require w3h_1356_control_s3_d4_reseat_route_refusals
+          --expect w3h_1356_control_s3_d4_reseat_route_refusals=GREEN
           --require w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node
           --expect w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node=GREEN
           --require w3h_1356_red_s3_c2_reseat_retires_marker_and_gap
