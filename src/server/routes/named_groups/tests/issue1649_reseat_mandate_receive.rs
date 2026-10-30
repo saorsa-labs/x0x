@@ -94,6 +94,13 @@ fn sealed(
 }
 
 async fn stage() -> Result<Stage> {
+    stage_with_peer_removal(false).await
+}
+
+/// [`stage`] with the removal committed by a second admin (D170's shape):
+/// a peer is seated as an Admin beside the receiver and the subject, and
+/// the peer — not the group's creator — seals the removal commit.
+async fn stage_with_peer_removal(peer_removal: bool) -> Result<Stage> {
     let (receiver, dir_r) = secure_endpoint_test_state_with_key(AgentKeypair::generate()?).await?;
     let (admin, dir_a) = secure_endpoint_test_state_with_key(AgentKeypair::generate()?).await?;
     let owner = UserKeypair::generate()?;
@@ -105,6 +112,9 @@ async fn stage() -> Result<Stage> {
     let admin_cert = AgentCertificate::issue(&owner, admin_kp)?;
     let receiver_cert = AgentCertificate::issue(&owner, receiver.agent.identity().agent_keypair())?;
     let subject_cert = AgentCertificate::issue(&owner, &subject_kp)?;
+    let peer_kp = AgentKeypair::generate()?;
+    let peer_hex = hex::encode(peer_kp.agent_id().as_bytes());
+    let peer_cert = AgentCertificate::issue(&owner, &peer_kp)?;
     let group_id = "a9".repeat(32);
     let mut info = x0x::groups::GroupInfo::with_policy(
         "issue 1649 reseat receiver".to_string(),
@@ -118,17 +128,31 @@ async fn stage() -> Result<Stage> {
     assert!(info
         .set_member_certificate(&admin_hex, admin_cert.clone())
         .is_ok());
-    let certs = vec![
+    let mut certs = vec![
         (admin_hex.clone(), admin_cert),
         (receiver_hex, receiver_cert),
         (subject_hex.clone(), subject_cert.clone()),
     ];
+    if peer_removal {
+        info.add_member(
+            peer_hex.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(admin_hex.clone()),
+            None,
+        );
+        assert!(info
+            .set_member_certificate(&peer_hex, peer_cert.clone())
+            .is_ok());
+        certs.push((peer_hex, peer_cert));
+    }
     // Seating (r1): the subject active on the retained roster.
     sealed(&mut info, admin_kp, &certs, 1_000);
     let seating_hash = info.state_hash.clone();
-    // Removal (r2): the admin's own removal commit, the §3a `Removal` basis.
+    // Removal (r2): the admin's own removal commit, the §3a `Removal`
+    // basis — or, for D170, the peer admin's.
     info.remove_member(&subject_hex, Some(admin_hex.clone()));
-    sealed(&mut info, admin_kp, &certs, 2_000);
+    let removal_signer = if peer_removal { &peer_kp } else { admin_kp };
+    sealed(&mut info, removal_signer, &certs, 2_000);
     let removal_hash = info.state_hash.clone();
     receiver
         .named_groups
@@ -267,6 +291,7 @@ fn member_added(
     stage: &Stage,
     mandate: ReseatMandateV1,
     commit: &x0x::groups::GroupStateCommit,
+    key_package_hash: Option<&str>,
 ) -> NamedGroupMetadataEvent {
     use base64::Engine as _;
     NamedGroupMetadataEvent::MemberAdded {
@@ -280,7 +305,7 @@ fn member_added(
         treekem_welcome_b64: None,
         welcome_ref: None,
         treekem_epoch: None,
-        treekem_key_package_hash: None,
+        treekem_key_package_hash: key_package_hash.map(str::to_string),
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
         certificate_b64: Some(
@@ -333,14 +358,37 @@ async fn receiver_cause(
     mandate: &ReseatMandateV1,
     certificate: &AgentCertificate,
 ) -> Result<(), &'static str> {
-    group_recovery::verify_reseat_mandate_on_receive(
-        stage.receiver.as_ref(),
+    receiver_cause_over(
+        stage,
         &stage.parent,
         &stage.next,
         &stage.terminal,
         mandate,
-        &stage.subject_hex,
+        certificate,
         None,
+    )
+    .await
+}
+
+/// [`receiver_cause`] over an explicit parent, seat-write and terminal
+/// commit, with the event's KeyPackage hash supplied.
+async fn receiver_cause_over(
+    stage: &Stage,
+    parent: &x0x::groups::GroupInfo,
+    next: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::GroupStateCommit,
+    mandate: &ReseatMandateV1,
+    certificate: &AgentCertificate,
+    key_package_hash: Option<&str>,
+) -> Result<(), &'static str> {
+    group_recovery::verify_reseat_mandate_on_receive(
+        stage.receiver.as_ref(),
+        parent,
+        next,
+        commit,
+        mandate,
+        &stage.subject_hex,
+        key_package_hash,
         None,
         Some(certificate),
     )
@@ -358,7 +406,7 @@ async fn refused_unchanged(stage: &Stage, mandate: ReseatMandateV1, expected: &s
     let before = record_json(stage).await;
     let applied = apply_listener_metadata_event(
         &stage.receiver,
-        member_added(stage, mandate, &stage.terminal),
+        member_added(stage, mandate, &stage.terminal, None),
         stage.admin.agent.agent_id(),
         true,
         None,
@@ -420,7 +468,7 @@ async fn a_valid_mandate_reseats_the_subject_over_the_dm_lane() -> Result<()> {
         Arc::clone(&stage.receiver),
         stage.receiver.agent.subscribe_direct(),
     ));
-    inject(&stage, &member_added(&stage, valid, &stage.terminal)).await?;
+    inject(&stage, &member_added(&stage, valid, &stage.terminal, None)).await?;
     wait_seated(&stage, "the valid re-seat must apply over the DM lane").await?;
     let live = live(&stage).await;
     assert_eq!(live.state_revision, stage.parent.state_revision + 1);
@@ -457,9 +505,9 @@ async fn bad_mandates_are_refused_over_the_dm_lane_and_only_the_valid_reseat_app
         .into_iter()
         .zip(bad_terminals)
     {
-        inject(&stage, &member_added(&stage, mandate, &commit)).await?;
+        inject(&stage, &member_added(&stage, mandate, &commit, None)).await?;
     }
-    inject(&stage, &member_added(&stage, valid, &stage.terminal)).await?;
+    inject(&stage, &member_added(&stage, valid, &stage.terminal, None)).await?;
     wait_seated(
         &stage,
         "the valid re-seat must apply after the refused mandates",
@@ -528,6 +576,261 @@ async fn a_wrong_owner_certificate_mandate_is_refused_with_cause_certificate_inv
         receiver_cause(&stage, &wrong_owner_cert, &foreign_cert).await,
         Err("certificate_invalid"),
         "the real owner verification must refuse the foreign certificate"
+    );
+    Ok(())
+}
+
+/// #1680, ADR 0109 §3a check 7 at the receiver: the bound role may not
+/// exceed the subject's role before its removal. A mandate properly
+/// re-signed by the admin but binding the Admin role for a subject that
+/// held Member is refused with `role_raised`.
+#[tokio::test]
+async fn a_role_raising_mandate_is_refused_with_cause_role_raised() -> Result<()> {
+    let stage = stage().await?;
+    let mut fields = mandate_fields(&stage);
+    fields.role = x0x::groups::GroupRole::Admin;
+    let raised = mint(fields, stage.admin.agent.identity().agent_keypair());
+    refused_unchanged(&stage, raised, "role_raised").await
+}
+
+/// #1680, ADR 0109 §3a check 5 and D170 at the receiver: a mandate may
+/// re-seat only a removal the signer itself committed. The admin's
+/// mandate binding the peer admin's removal commit is refused with
+/// `removal_mismatch`, byte-identical record and all.
+#[tokio::test]
+async fn a_removal_another_admin_committed_is_refused_with_cause_removal_mismatch() -> Result<()> {
+    let stage = stage_with_peer_removal(true).await?;
+    // `mandate_fields` binds the peer's removal commit; the mandate is
+    // the admin's own (the re-seater).
+    let mandate = mint(
+        mandate_fields(&stage),
+        stage.admin.agent.identity().agent_keypair(),
+    );
+    refused_unchanged(&stage, mandate, "removal_mismatch").await
+}
+
+/// #1680, ADR 0109 §3a check 5's replay clause at the receiver: a second
+/// mandate on the same removal fails, because the first re-seat's
+/// terminal — a commit between the removal and the new parent — seats
+/// the subject again. The first re-seat applies; the replay is refused
+/// and the record keeps the first terminal.
+#[tokio::test]
+async fn a_replay_of_the_same_removal_is_refused_with_cause_removal_mismatch() -> Result<()> {
+    let stage = stage().await?;
+    let (valid, _, _, _) = mandates(&stage);
+    let applied = apply_listener_metadata_event(
+        &stage.receiver,
+        member_added(&stage, valid, &stage.terminal, None),
+        stage.admin.agent.agent_id(),
+        true,
+        None,
+    )
+    .await
+    .expect("the shielded apply completes");
+    assert!(applied.accepted, "the first re-seat must apply");
+    let parent = live(&stage).await;
+    let next = parent.clone();
+    let admin_kp = stage.admin.agent.identity().agent_keypair();
+    let replay_terminal = terminal_commit(&parent, &next, admin_kp, 3_500);
+    let mut fields = mandate_fields(&stage);
+    fields.parent_commit_hash = parent.state_hash.clone();
+    fields.terminal_roster_hash = x0x::groups::state_commit::compute_roster_root(&next.members_v2);
+    let replay = mint(fields, admin_kp);
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &parent,
+            &next,
+            &replay_terminal,
+            &replay,
+            &stage.subject_cert,
+            None
+        )
+        .await,
+        Err("removal_mismatch"),
+        "the seated-again subject must fail check 5, not re-seat twice"
+    );
+    let before = record_json(&stage).await;
+    let refused = apply_listener_metadata_event(
+        &stage.receiver,
+        member_added(&stage, replay, &replay_terminal, None),
+        stage.admin.agent.agent_id(),
+        true,
+        None,
+    )
+    .await
+    .expect("the shielded apply completes");
+    assert!(!refused.accepted, "the replay must be refused");
+    assert_eq!(
+        before,
+        record_json(&stage).await,
+        "the refused replay leaves the committed record byte-identical"
+    );
+    Ok(())
+}
+
+/// A `MemberJoined` binding `package` for the subject, self-signed by
+/// `signer` over the canonical join bytes — the ordinary join's KeyPackage
+/// binding. With `signer` the subject it authenticates; with another key
+/// it claims the subject while signing as someone else, which
+/// `verify_member_joined_key_package_event` refuses.
+fn member_joined_record(
+    stage: &Stage,
+    signer: &AgentKeypair,
+    package: &str,
+    ts_ms: u64,
+) -> NamedGroupMetadataEvent {
+    let member_public_key_b64 = BASE64.encode(signer.public_key().as_bytes());
+    let canonical = canonical_member_joined_bytes(
+        &stage.group_id,
+        Some(&stage.group_id),
+        &stage.subject_hex,
+        &member_public_key_b64,
+        x0x::groups::GroupRole::Member,
+        None,
+        &stage.admin_hex,
+        "issue-1680-invite",
+        ts_ms,
+        Some(package),
+    );
+    let signature =
+        ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(signer.secret_key(), &canonical)
+            .expect("sign MemberJoined record");
+    NamedGroupMetadataEvent::MemberJoined {
+        group_id: stage.group_id.clone(),
+        stable_group_id: Some(stage.group_id.clone()),
+        member_agent_id: stage.subject_hex.clone(),
+        member_public_key_b64,
+        role: x0x::groups::GroupRole::Member,
+        display_name: None,
+        inviter_agent_id: stage.admin_hex.clone(),
+        invite_secret: "issue-1680-invite".to_string(),
+        ts_ms,
+        treekem_key_package_b64: Some(package.to_string()),
+        kem_public_key_b64: None,
+        kem_signature_b64: None,
+        certificate_b64: None,
+        recovery_authority_agent_id: None,
+        recovery_authority_public_key_b64: None,
+        recovery_authority_signature_b64: None,
+        recovery_authority_commit: None,
+        signature_b64: BASE64.encode(signature.as_bytes()),
+    }
+}
+
+/// Make `signer`'s record (see [`member_joined_record`]) the receiver's
+/// held evidence for the subject's seat. The record is planted straight
+/// into the cache state, past the cache's own ingress gate (which would
+/// refuse a foreign-signed record): the persisted cache file is restored
+/// verbatim at startup, so the §3a rule must not trust a held record
+/// blindly. The subject-signed control goes through the real gate below.
+async fn hold_subject_record(stage: &Stage, signer: &AgentKeypair, package: &str) {
+    let event = member_joined_record(stage, signer, package, 4_000);
+    let key = join_result_key(&stage.group_id, &stage.subject_hex);
+    let encoded_bytes = cache_entry_encoded_bytes(&key, &event).expect("encode cache entry");
+    let mut cache = stage
+        .receiver
+        .treekem_member_key_packages
+        .state
+        .write()
+        .await;
+    if let Some(previous) = cache.entries.remove(&key) {
+        cache.encoded_bytes = cache.encoded_bytes.saturating_sub(previous.encoded_bytes);
+    }
+    cache.encoded_bytes = cache.encoded_bytes.saturating_add(encoded_bytes);
+    cache.entries.insert(
+        key,
+        TreeKemMemberKeyPackageCacheEntry {
+            event,
+            encoded_bytes,
+        },
+    );
+}
+
+/// Seat the subject's own record for `package` through the cache's real
+/// ingress gate (its self-signature verifies, so the gate accepts it).
+async fn admit_subject_record(stage: &Stage, package: &str) {
+    cache_treekem_member_key_package(
+        &stage.receiver,
+        join_result_key(&stage.group_id, &stage.subject_hex),
+        member_joined_record(stage, &stage.subject_kp, package, 4_100),
+        true,
+    )
+    .await;
+}
+
+/// #1680, ADR 0109 §3a check 8 at the receiver: the re-seat KeyPackage
+/// must verify against the subject's agent key, exactly as an ordinary
+/// join's does. The receiver holds the subject's `MemberJoined` record
+/// for the bound package; when that record is signed by another key the
+/// mandate is refused with `binding_mismatch`, the committed record stays
+/// byte-identical and the subject stays unseated. The subject's own
+/// record for the same package passes (control).
+#[tokio::test]
+async fn a_key_package_signed_by_another_key_is_refused_with_cause_binding_mismatch() -> Result<()>
+{
+    let stage = stage().await?;
+    let package = BASE64.encode([7u8; 96]);
+    let hash = blake3::hash(package.as_bytes()).to_hex().to_string();
+    let mut fields = mandate_fields(&stage);
+    fields.key_package_hash = hash.clone();
+    let mandate = mint(fields, stage.admin.agent.identity().agent_keypair());
+    // The receiver's held record for that package is signed by another
+    // key: the package does not verify against the subject's agent key.
+    let impostor = AgentKeypair::generate()?;
+    hold_subject_record(&stage, &impostor, &package).await;
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash)
+        )
+        .await,
+        Err("binding_mismatch")
+    );
+    let before = record_json(&stage).await;
+    let applied = apply_listener_metadata_event(
+        &stage.receiver,
+        member_added(&stage, mandate.clone(), &stage.terminal, Some(&hash)),
+        stage.admin.agent.agent_id(),
+        true,
+        None,
+    )
+    .await
+    .expect("the shielded apply completes");
+    assert!(
+        !applied.accepted,
+        "the foreign-signed package must be refused"
+    );
+    assert_eq!(
+        before,
+        record_json(&stage).await,
+        "a refused re-seat leaves the committed record byte-identical"
+    );
+    assert!(
+        !live(&stage).await.has_active_member(&stage.subject_hex),
+        "the subject stays unseated"
+    );
+    // Control: the subject's own signature over the same package binds
+    // it to the subject's certified agent key, so check 8 passes —
+    // through the cache's real ingress gate.
+    admit_subject_record(&stage, &package).await;
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash)
+        )
+        .await,
+        Ok(())
     );
     Ok(())
 }

@@ -5715,11 +5715,30 @@ pub(super) async fn verify_reseat_mandate_on_receive(
         .get(subject_hex)
         .filter(|_| !next.join_seat_key_marker_only(subject_hex))
         .map_or(x0x::groups::GroupRole::Guest, |seat| seat.role);
+    // §3a check 8 (#1680): the KeyPackage must verify against the
+    // subject's agent key, exactly as an ordinary join's does. The
+    // receiver's evidence is the subject's `MemberJoined` record it holds
+    // for the seat: when that record binds the same package, the
+    // subject's own signature must verify under the certified agent key.
+    // A record for another package (an older incarnation of the seat) is
+    // not evidence about this re-seat, and a receiver that holds no
+    // record yet cannot check the package — the mandate's hash binding
+    // (check 8's first half) still holds, and the attested record rides
+    // beside the commit, so its later arrival must not wedge the re-seat.
+    let key_package_bound_to_subject = held_key_package_bound_to_subject(
+        state,
+        parent,
+        subject_hex,
+        &mandate.fields.key_package_hash,
+        certificate,
+    )
+    .await;
     let check = x0x::groups::recovery::ReseatMandateCheck {
         parent,
         commit,
         subject: subject_hex,
         key_package_hash: Some(key_package_hash.unwrap_or_default()),
+        key_package_bound_to_subject,
         epoch: Some(epoch.unwrap_or_default()),
         seated_role,
         certificate_digest: digest.as_deref(),
@@ -5727,6 +5746,65 @@ pub(super) async fn verify_reseat_mandate_on_receive(
         subject_revoked,
     };
     x0x::groups::recovery::verify_reseat_mandate(mandate, &check).map_err(|cause| cause.as_str())
+}
+
+/// §3a check 8 (#1680): whether the receiver's held evidence binds the
+/// re-seat's KeyPackage to the subject's agent key, as an ordinary join's
+/// `MemberJoined` does. The evidence is the subject-signed `MemberJoined`
+/// recovery record cached for the seat:
+///
+/// - a record for a DIFFERENT package is an older incarnation of the
+///   seat, not evidence about this re-seat's package, so it decides
+///   nothing (the mandate's signed hash binding stands on its own);
+/// - a record for the SAME package must be the subject's own: its
+///   self-signature verifies and its member key is the agent key the
+///   owner's certificate names for the subject;
+/// - a receiver that holds no record at all keeps judging the package by
+///   the mandate's hash binding, exactly as before — the authority
+///   attests the original `MemberJoined` beside the commit, so requiring
+///   the record here would refuse every honest re-seat whose attestation
+///   is still in flight.
+async fn held_key_package_bound_to_subject(
+    state: &AppState,
+    parent: &GroupInfo,
+    subject_hex: &str,
+    bound_hash: &str,
+    certificate: Option<&x0x::identity::AgentCertificate>,
+) -> bool {
+    if bound_hash.is_empty() {
+        return true;
+    }
+    for group_key in [
+        parent.stable_group_id().to_string(),
+        parent.mls_group_id.clone(),
+    ] {
+        let Some(record) = state
+            .treekem_member_key_packages
+            .get(&super::join_result_key(&group_key, subject_hex))
+            .await
+        else {
+            continue;
+        };
+        let super::NamedGroupMetadataEvent::MemberJoined {
+            member_public_key_b64,
+            treekem_key_package_b64: Some(package),
+            ..
+        } = &record
+        else {
+            continue;
+        };
+        if blake3::hash(package.as_bytes()).to_hex().as_str() != bound_hash {
+            continue;
+        }
+        use base64::Engine as _;
+        return super::verify_member_joined_key_package_event(&record)
+            && certificate.is_some_and(|cert| {
+                super::BASE64
+                    .decode(member_public_key_b64.as_str())
+                    .is_ok_and(|key| key == cert.agent_public_key())
+            });
+    }
+    true
 }
 
 /// §3a route checks after §3's, in order, for a promoted admin. `Ok(())`
