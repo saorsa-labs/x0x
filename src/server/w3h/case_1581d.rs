@@ -77,6 +77,8 @@ const CAUSE_SECOND_ROTATION: &str = "the exclusion was not exactly one rotation:
                                      A";
 const CAUSE_DATA_PLANE: &str = "the exclusion committed, but the data plane did not follow: A or \
                                 C did not decrypt the new traffic, or B still could";
+const CAUSE_PREMISE_DRIFT: &str = "premise drift, not one of the row's named failures: the \
+                                   parked-send premise or the package premise did not hold";
 
 /// `label`'s view of `group`; `None` when it holds no record of it.
 #[derive(Debug, Clone)]
@@ -335,6 +337,12 @@ async fn await_holders(sim: &Sim, holders: &[&str], b_hex: &str) -> Result<()> {
         if !expired(&error) {
             return Err(error);
         }
+        // The budget ran out before every holder held the record: the
+        // trigger never reached its target, which is INFRA, not a
+        // later RED for a missing typed state.
+        return Err(anyhow!(
+            "INFRA: {what}: the budget ran out with a holder still missing the record"
+        ));
     }
     seen.verify(what)
 }
@@ -786,11 +794,13 @@ async fn scenario(
             holds_package(sim, "A", &group, &b_hex),
         )
         .await??;
-    // The typed wait itself is judged in `passed` with its named cause,
-    // not asserted here, so a silent wait is the row's RED, not INFRA.
+    // `held_quiet` and the typed wait are judged in `passed` with their
+    // named causes, not asserted here, so an early seal or a silent
+    // wait is the row's RED, not INFRA. Only the premise (A still
+    // cannot resolve the package itself) is an evidence stage.
     receipt.evidence(
-        "a_seals_nothing_and_still_lacks_the_package_through_the_hold",
-        held_quiet && a_still_lacks,
+        "a_still_lacks_the_package_through_the_hold",
+        a_still_lacks,
         format!(
             "at t=W+Δ (W {w:?}, Δ {delta:?}): A {}; C {}; A's row {held_row:?}; A still lacks the \
              package: {a_still_lacks}",
@@ -812,15 +822,27 @@ async fn scenario(
             connected_to(s, "D", "A").await || connected_to(s, "D", "C").await
         })
         .await?;
-        let mut d_record = Observations::default();
         let d_holds_record = sim
             .until("D holds B's revocation", EVIDENCE, async |s: &Sim| {
-                d_record.observe(holds_revocation(s, "D", &b_hex)).await == Some(true)
+                holds_revocation(s, "D", &b_hex).await.unwrap_or(false)
             })
             .await
             .is_ok();
+        // The row's release: the holder's answer (or its roster state)
+        // reaches A, so the remove route's own lookup can resolve B's
+        // KeyPackage again. Kept as a note — A's completion below is
+        // the judged outcome.
+        let a_got_package = sim
+            .until(
+                "A holds B's KeyPackage again after D's return",
+                EVIDENCE,
+                async |s: &Sim| holds_package(s, "A", &group, &b_hex).await.unwrap_or(false),
+            )
+            .await
+            .is_ok();
         receipt.note(format!(
-            "D reconnected and holds B's revocation record after its return: {d_holds_record}"
+            "D reconnected and holds B's revocation record after its return: {d_holds_record}; A \
+             resolves B's KeyPackage again: {a_got_package}"
         ));
 
         // H on every survivor, signed by the designated A, within the
@@ -893,8 +915,8 @@ async fn scenario(
         };
         let data_plane = a_after.0 && c_after.0 && !b_after.0;
         receipt.note(format!(
-            "after the resume: completed {completed}; A's row {final_row:?}; {}; A decrypt: {}; C \
-             decrypt: {}; B decrypt: {}",
+            "after the resume: completed {completed}; A's row {final_row:?}; A resolves the \
+             package again: {a_got_package}; {}; A decrypt: {}; C decrypt: {}; B decrypt: {}",
             describe_all(&end),
             a_after.1,
             c_after.1,
@@ -912,18 +934,28 @@ async fn scenario(
             && signed_by_a
             && data_plane;
         if !passed {
-            // Only the named failures of the row make a RED; anything
-            // else stays ok=false (INFRA), so an unrelated regression
+            // Only the named failures of the row make a RED; premise
+            // drift stays ok=false (INFRA), so an unrelated regression
             // cannot satisfy a --expect=RED pin.
-            let (cause, ok, observed) = if typed_seen_at.is_none() {
+            let (cause, ok, observed) = if !reached || !a_still_lacks {
+                (
+                    CAUSE_PREMISE_DRIFT,
+                    false,
+                    format!(
+                        "the parked-send premise held: {reached}; A still lacked the package at \
+                         the release point: {a_still_lacks}"
+                    ),
+                )
+            } else if typed_seen_at.is_none() || !held_typed {
                 (
                     CAUSE_NO_TYPED_STATE,
                     true,
-                    "A never exposed the typed waiting_for_member_key_package while its holder \
-                     was offline"
-                        .to_string(),
+                    format!(
+                        "A's row at the release point {held_row:?}; the typed wait was first seen \
+                         {typed_seen_at:?} after t=0"
+                    ),
                 )
-            } else if !held_quiet || !held_typed {
+            } else if !held_quiet {
                 (
                     CAUSE_EARLY_SEAL,
                     true,
@@ -937,7 +969,10 @@ async fn scenario(
                 (
                     CAUSE_NO_COMPLETION,
                     true,
-                    format!("A's row {final_row:?}; {}", describe_all(&end)),
+                    format!(
+                        "A resolves the package again: {a_got_package}; A's row {final_row:?}; {}",
+                        describe_all(&end)
+                    ),
                 )
             } else if !h_once || !signed_by_a {
                 (CAUSE_SECOND_ROTATION, true, describe_all(&end))
@@ -1045,8 +1080,17 @@ async fn scenario(
             && still_open
             && still_quiet;
         if !passed {
-            let (cause, ok, observed) = if typed_seen_at.is_none() || !typed_retained || !still_open
-            {
+            // As the resume arm: the named failures RED, premise drift
+            // INFRA. A row that ended while nothing sealed is the fake
+            // absent-leaf completion the row names, so it is an early
+            // seal, not a typed-state failure.
+            let (cause, ok, observed) = if !reached {
+                (
+                    CAUSE_PREMISE_DRIFT,
+                    false,
+                    "the parked-send premise did not hold".to_string(),
+                )
+            } else if typed_seen_at.is_none() || !held_typed || !typed_retained || !still_open {
                 (
                     CAUSE_NO_TYPED_STATE,
                     true,
@@ -1055,7 +1099,7 @@ async fn scenario(
                          re-read {recheck_row:?}"
                     ),
                 )
-            } else if !held_quiet || !nothing_sealed || !still_quiet {
+            } else if !held_quiet || !row_open || !nothing_sealed || !still_quiet {
                 (
                     CAUSE_EARLY_SEAL,
                     true,
@@ -1068,8 +1112,8 @@ async fn scenario(
                 )
             } else {
                 (
-                    CAUSE_NO_TYPED_STATE,
-                    true,
+                    CAUSE_PREMISE_DRIFT,
+                    false,
                     format!("A's row past every bound {late_row:?}"),
                 )
             };
