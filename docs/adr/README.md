@@ -302,7 +302,9 @@ the exact merged head of PR #1586.
 | 9 | `group_reseat_mandate_v1` | Verifies and applies promoted-admin `ReseatMandateV1` commits | ADR 0109 §3a (accepted 2026-10-20) |
 | 10 | `gui_show_v1` | Understands remote GUI show typed direct messages | ADR 0083 slice 3 (lowest free bit on 2026-10-23) |
 | 11 | `join_pending_notice_v1` | Serves and understands `JoinPendingNotice` on the join-result poll | ADR 0108 §8 (accepted 2026-10-05; wire half ruled by David 2026-10-25, D-ruling 05:14 GMT; next free bit in acceptance order) |
-| 12–63 | unallocated | Must not be advertised until allocated | — |
+| 12 | `key_republish_v1` | Verifies and seats signed `MemberKeyRepublishV1` (`X0XKR1`) key republications on an Active seat | #1663 (David's ruling, 28 Oct 2026 02:25 GMT; lowest free bit) |
+| 13 | `treekem_catchup_refusal_v1` | Sends and understands the typed `treekem_catchup_refusal` that answers a machine- or binding-revoked TreeKEM catch-up request | #1657 (David's approval, 28 Oct 2026 02:08 GMT; bit ruled by the Engineer 29 Oct 2026 22:14 GMT; next free bit) |
+| 14–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Rejected
 
