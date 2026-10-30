@@ -790,40 +790,45 @@ async fn scenario(
         .mark("fault: B offline (the revoked target's device)");
     drop(pause);
     receipt.evidence(
-        "b_offline_before_any_catchup_round_could_reach_it",
+        "b_offline_before_the_parked_catchup_send_was_released",
         reached,
-        "A's first member-keyed catch-up send was parked by the production seam, B left the \
-         fabric, then the send was released; B is a catch-up candidate while its seat is Active"
+        "the first member-keyed catch-up send for B (the seam key names the member, not the \
+         asker) was parked by the production seam, B left the fabric, then the send was \
+         released; B is a catch-up candidate while its seat is Active"
             .to_string(),
         at(sim),
     );
 
     // The typed wait (D64) while the package is missing: a silent wait
-    // or a bare timeout fails the row.
+    // or a bare timeout fails the row. A failed read is not a silent
+    // wait — it stops the poll and is INFRA (`verify` below), never a
+    // typed-state RED.
     let mut typed_seen_at: Option<Duration> = None;
+    let mut typed_reads = Observations::default();
+    let typed_what = "A's row waits for B's KeyPackage";
     let waited = sim
-        .until(
-            "A's row waits for B's KeyPackage",
-            w,
-            async |s: &Sim| match s4_row(s, "A", &group, &b_hex).await {
-                Ok(Some(row)) => {
-                    if row["waiting"]["cause"].as_str() == Some("waiting_for_member_key_package") {
-                        typed_seen_at.get_or_insert(s.fabric().now().saturating_sub(t0));
-                        true
-                    } else {
-                        false
-                    }
+        .until(typed_what, w, async |s: &Sim| {
+            let Some(row) = typed_reads.observe(s4_row(s, "A", &group, &b_hex)).await else {
+                return true;
+            };
+            match row {
+                Some(row)
+                    if row["waiting"]["cause"].as_str()
+                        == Some("waiting_for_member_key_package") =>
+                {
+                    typed_seen_at.get_or_insert(s.fabric().now().saturating_sub(t0));
+                    true
                 }
-                Ok(None) => false,
-                Err(_) => false,
-            },
-        )
+                _ => false,
+            }
+        })
         .await;
     if let Err(error) = waited {
         if !expired(&error) {
             return Err(error);
         }
     }
+    typed_reads.verify(typed_what)?;
     receipt.note(format!(
         "A's typed waiting_for_member_key_package first seen {typed_seen_at:?} after t=0"
     ));
@@ -978,7 +983,9 @@ async fn scenario(
 
         // H on every survivor, signed by the designated A, within the
         // one completion budget above: this wait gets what is left of
-        // it, nothing more.
+        // it, nothing more. With nothing left it still runs its first
+        // poll; a read error there stops the wait and is INFRA
+        // (`seen.verify` below), never a late pass.
         let mut seen = Observations::default();
         let mut completed = false;
         let waited = sim
@@ -989,11 +996,11 @@ async fn scenario(
                     let Some(now) = seen.observe(views_now(s, &survivors, &group, &b)).await else {
                         return true;
                     };
+                    let Some(row) = seen.observe(s4_row(s, "A", &group, &b_hex)).await else {
+                        return true;
+                    };
                     let done = excluded(&now, e0, leaves0)
-                        && matches!(
-                            s4_row(s, "A", &group, &b_hex).await,
-                            Ok(Some(row)) if row["phase"].as_str() == Some("complete")
-                        );
+                        && row.is_some_and(|row| row["phase"].as_str() == Some("complete"));
                     if done {
                         completed = true;
                     }
@@ -1014,12 +1021,10 @@ async fn scenario(
         let end = views(sim, &survivors, &group, &b).await?;
         let final_row = sim
             .at_instant("read A's completed row", s4_row(sim, "A", &group, &b_hex))
-            .await?;
-        let row_ok = final_row.as_ref().is_ok_and(|row| {
-            row.as_ref().is_some_and(|row| {
-                row["phase"].as_str() == Some("complete")
-                    && row["result_epoch"].as_u64() == Some(e0 + 1)
-            })
+            .await??;
+        let row_ok = final_row.as_ref().is_some_and(|row| {
+            row["phase"].as_str() == Some("complete")
+                && row["result_epoch"].as_u64() == Some(e0 + 1)
         });
         let h_once = excluded(&end, e0, leaves0) && all_at(&end, e0 + 1);
         let signed_by_a = end.iter().all(|(_, seen)| {
@@ -1059,6 +1064,30 @@ async fn scenario(
              decrypt ({b_class:?}): {b_detail}",
             describe_all(&end)
         ));
+
+        // The controls' own premise stages: the corrupt ask must come
+        // after a real completion, and the slow completion must land —
+        // only late. They keep the control pins honest: a collapsed run
+        // cannot satisfy them, so its INFRA or RED is not the pin's.
+        if controls.corrupt_b_decrypt {
+            receipt.evidence(
+                "the_exclusion_completed_before_the_corrupt_decrypt_ask",
+                completed && row_ok,
+                format!("completed {completed}; A's row {final_row:?}"),
+                at(sim),
+            );
+        }
+        if controls.slow_completion {
+            receipt.evidence(
+                "the_exclusion_landed_only_after_the_budget",
+                h_once && row_ok,
+                format!(
+                    "the late completion past the budget: {}; A's row {final_row:?}",
+                    describe_all(&end)
+                ),
+                at(sim),
+            );
+        }
 
         let passed = reached
             && typed_seen_at.is_some()
@@ -1320,6 +1349,81 @@ async fn expect(
     Ok(())
 }
 
+/// The first stage of `kind` in a serialized receipt.
+fn stage<'a>(receipt: &'a serde_json::Value, kind: &str) -> Option<&'a serde_json::Value> {
+    receipt["stages"]
+        .as_array()
+        .and_then(|stages| stages.iter().find(|stage| stage["stage"] == kind))
+}
+
+/// A control must fail for the named reason only: the verdict matches,
+/// no harness error, the setup finished, every precondition holds, the
+/// trigger was delivered, exactly one cause is recorded and it is
+/// `want_cause` with the ok its verdict needs (false for INFRA, true
+/// for RED), and the final did not pass. A collapsed run (a boot
+/// failure, a timeout, premise drift) cannot satisfy this, so the
+/// `--expect` pin cannot pass for the wrong reason.
+async fn expect_control(
+    case: &str,
+    seed: u64,
+    controls: Controls,
+    want: Verdict,
+    want_cause: &str,
+) -> Result<()> {
+    let receipt = run(case, seed, LABELS, true, controls).await;
+    ensure!(
+        receipt.verdict() == Some(want),
+        "{case}: expected {want:?}, got {:?}",
+        receipt.verdict()
+    );
+    let value = serde_json::to_value(&receipt).context("receipt json")?;
+    ensure!(
+        stage(&value, "infra").is_none(),
+        "{case}: harness error stage: {value}"
+    );
+    ensure!(
+        stage(&value, "setup_done").is_some(),
+        "{case}: setup did not finish"
+    );
+    let stages = value["stages"].as_array().context("stages")?;
+    let evidence: Vec<_> = stages
+        .iter()
+        .filter(|stage| stage["stage"] == "evidence")
+        .collect();
+    ensure!(
+        !evidence.is_empty() && evidence.iter().all(|stage| stage["ok"] == true),
+        "{case}: a precondition did not hold: {evidence:?}"
+    );
+    let request = stage(&value, "request_delivered").context("no request stage")?;
+    ensure!(
+        request["ok"] == true,
+        "{case}: the trigger did not reach its target: {request}"
+    );
+    let causes: Vec<_> = stages
+        .iter()
+        .filter(|stage| stage["stage"] == "cause")
+        .collect();
+    ensure!(causes.len() == 1, "{case}: causes: {causes:?}");
+    let cause = causes[0];
+    ensure!(
+        cause["expected"].as_str() == Some(want_cause),
+        "{case}: cause {:?}, expected {want_cause:?}",
+        cause["expected"]
+    );
+    let cause_ok = want == Verdict::Red;
+    ensure!(
+        cause["ok"] == cause_ok,
+        "{case}: cause ok {}, expected {cause_ok}: {cause}",
+        cause["ok"]
+    );
+    let final_stage = stage(&value, "final").context("no final stage")?;
+    ensure!(
+        final_stage["passed"] == false,
+        "{case}: the final passed: {final_stage}"
+    );
+    Ok(())
+}
+
 const LABELS: &[&str] = &["A", "D", "B", "C"];
 
 /// ADR 0110 `s4_evidence_holder`, the resume arm: A, the designated
@@ -1401,16 +1505,15 @@ fn w3h_1581d_red_evidence_holder_all_holders_offline() -> Result<()> {
 )]
 fn w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion() -> Result<()> {
     super::block_on_paused(async move {
-        expect(
+        expect_control(
             "w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion",
             0x1581_0008,
-            LABELS,
-            true,
             Controls {
                 corrupt_b_decrypt: true,
                 ..Controls::default()
             },
             Verdict::Infra,
+            CAUSE_UNTYPED_EXCLUSION,
         )
         .await
     })
@@ -1434,16 +1537,15 @@ fn w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion() -> Result<()> {
 )]
 fn w3h_1581d_control_completion_past_the_budget_is_red() -> Result<()> {
     super::block_on_paused(async move {
-        expect(
+        expect_control(
             "w3h_1581d_control_completion_past_the_budget_is_red",
             0x1581_0009,
-            LABELS,
-            true,
             Controls {
                 slow_completion: true,
                 ..Controls::default()
             },
             Verdict::Red,
+            CAUSE_NO_COMPLETION,
         )
         .await
     })
