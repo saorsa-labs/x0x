@@ -46,8 +46,15 @@ const EPHEMERAL_TYPE_TAGS: &[&str] = &[
 /// JSON `"type"` tag values recorded as the durable record of a transfer.
 const DURABLE_FILE_TAGS: &[&str] = &["file-offer", "file-accept", "file-reject", "file-complete"];
 
-/// `"message_type"` values for TreeKEM catch-up anti-entropy frames.
-const EPHEMERAL_MESSAGE_TYPES: &[&str] = &["treekem_catchup_request", "treekem_catchup_response"];
+/// `"message_type"` values for TreeKEM catch-up anti-entropy frames:
+/// requests, responses, and the #1657 typed refusal that answers a
+/// request from a revoked device. All are plumbing on the catch-up
+/// lane, never DM history.
+const EPHEMERAL_MESSAGE_TYPES: &[&str] = &[
+    "treekem_catchup_request",
+    "treekem_catchup_response",
+    "treekem_catchup_refusal",
+];
 
 /// Classification outcome for one DM payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
