@@ -259,6 +259,38 @@ fn sidecar_atas(sim: &Sim, label: &str) -> Result<(Option<Ata>, Option<Ata>)> {
     Ok(out)
 }
 
+// DIAG (temporary, CI timeout diagnosis; not for merge).
+static DIAG_LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static DIAG_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_WALL: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+fn diag(sim: &Sim, what: &str) {
+    let wall = DIAG_WALL.get_or_init(std::time::Instant::now).elapsed();
+    let line = format!(
+        "DIAG wall {:.1}s virt {:.1}s n {}: {what}",
+        wall.as_secs_f64(),
+        at(sim) as f64 / 1e6,
+        DIAG_N.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    eprintln!("{line}");
+    if let Ok(mut last) = DIAG_LAST.lock() {
+        *last = line;
+    }
+}
+fn diag_heartbeat() {
+    let start = *DIAG_WALL.get_or_init(std::time::Instant::now);
+    let _ = std::thread::Builder::new()
+        .name("diag-heartbeat".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            let last = DIAG_LAST.lock().map(|l| l.clone()).unwrap_or_default();
+            eprintln!(
+                "DIAG heartbeat wall {:.0}s n {}; last: {last}",
+                start.elapsed().as_secs_f64(),
+                DIAG_N.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        });
+}
+
 /// What the case saw of J from step 4 on.
 #[derive(Default)]
 struct Seen {
@@ -278,6 +310,20 @@ impl Seen {
             .map(|st| st.recovery)
             .unwrap_or(Value::Null);
         let text = recovery_text(&recovery);
+        let n = DIAG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % 100 == 0 || self.states.last() != Some(&text) {
+            diag(
+                sim,
+                &format!(
+                    "J rev {} {} {text} retry_in_ms {:?} asked {}",
+                    j.state_revision,
+                    short(&j.state_hash),
+                    recovery["next_retry_at_ms"].as_u64().map(|ms| ms as i64
+                        - crate::server::routes::named_groups::now_millis_u64() as i64),
+                    recovery["asked"]
+                ),
+            );
+        }
         if self.states.last() != Some(&text) {
             self.states.push(text.clone());
         }
@@ -364,7 +410,9 @@ async fn fresh_advert(sim: &Sim, observer: &str, label: &str) -> Result<()> {
 }
 
 async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+    diag_heartbeat();
     start_ranked(sim, LABELS, &["B", "C"]).await?;
+    diag(sim, "started");
     let (group, _) = s0(sim, LABELS, true, &["A"]).await?;
     for admin in ["B", "C"] {
         seat(sim, "A", admin, &group).await?;
@@ -383,6 +431,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     )
     .await?;
     let minted = view(sim, "A", &group).await?;
+    diag(sim, "s0 seated promoted settled");
     let link = invite(sim, "A", &group).await?;
     remove(sim, "A", "M2", &group).await?;
     settled(
@@ -397,6 +446,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     })
     .await?;
     let hold = Hold::install(sim)?;
+    diag(sim, "removal resends done");
     hold.set(sim, Phase::Fence);
     let sealed = seal_j(sim, &link, &group).await?;
     settled(sim, &["M1", "B", "C"], &group, "M1, B and C hold J's seal").await?;
@@ -408,6 +458,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     })
     .await?;
     let j_marked = view(sim, "J", &group).await?;
+    diag(sim, "J marked");
     sim.within("the seal resends end", RESENDS_DONE + secs(2), async {
         tokio::time::sleep(RESENDS_DONE).await;
     })
@@ -418,6 +469,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     rename(sim, "A", &group, "w3h x A").await?;
     settled(sim, &["M1", "C"], &group, "M1 and C hold A's r+3").await?;
     let main = view(sim, "A", &group).await?;
+    diag(sim, "partition renames settled");
     sim.within("B's resends end", RESENDS_DONE + secs(2), async {
         tokio::time::sleep(RESENDS_DONE).await;
     })
@@ -460,6 +512,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         .fabric()
         .mark_indexed("case: J reaches B and C; their replies are late");
     hold.set(sim, Phase::Late);
+    diag(sim, "late");
     // J's adverts from B and C may have expired while B and C were held
     // (15 min TTL), and only a current one makes a target (§2). J asks for
     // fresh ones; the answers are late too.
@@ -467,6 +520,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         fresh_advert(sim, "J", admin).await?;
     }
     let hashes = (main.state_hash.as_str(), fork.state_hash.as_str());
+    diag(sim, "adverts fresh");
     let mut seen = Seen::default();
     seen.watch(
         sim,
@@ -478,6 +532,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     )
     .await?;
     let j_at_conflict = view(sim, "J", &group).await?;
+    diag(sim, "watch 1 done");
     let atas = sidecar_atas(sim, "J")?;
     let j_recovery = status(sim, "J", &group)
         .await?
@@ -510,6 +565,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     )
     .await?;
     let j_end = view(sim, "J", &group).await?;
+    diag(sim, "heal done");
     let j_status = status(sim, "J", &group).await?;
     let end_text = j_status
         .as_ref()
