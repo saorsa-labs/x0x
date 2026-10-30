@@ -12840,6 +12840,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         return;
     };
     let was_truncated = response.truncated;
+    // #1685: the catch-up cursor this page was answered against, read
+    // BEFORE the page applies. The responder's page is a pure function
+    // of this cursor (from-revision, from-epoch), so a truncated page
+    // that leaves it unmoved would re-request a byte-identical page —
+    // the loop below must stop instead of paging again.
+    let cursor_before = (
+        response_info.state_revision,
+        response_info.secret_epoch,
+        response_info.state_hash.clone(),
+    );
     let reported_head = response.responder_state_hash.clone();
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
@@ -13002,26 +13012,76 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         }
     }
     if was_truncated {
-        tracing::debug!(
-            target: "treekem.trace",
-            group_id = %response.group_id,
-            sender = %hex::encode(sender.as_bytes()),
-            "TreeKEM catch-up response was truncated; requesting next page"
-        );
-        let mut sent = false;
-        for _ in 0..SELF_LEAVE_CATCHUP_PAGE_SENDS {
-            if request_treekem_catchup_page(state, &response.group_id, sender).await {
-                sent = true;
-                break;
-            }
-        }
-        if !sent {
+        // #1685: a truncated page that applied nothing leaves the cursor
+        // above unmoved, so the next page request would repeat this
+        // cursor and the responder would re-serve the identical page.
+        // Stop the page loop with a typed reason instead of paging
+        // again: the requeue kept the pending events (no state is
+        // hidden), and the throttled gap path re-arms catch-up on the
+        // next applied event. The peer's page fence stays open, exactly
+        // as it does for a page request that could not be sent.
+        let cursor_after = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&response.group_id)
+                .or_else(|| {
+                    groups
+                        .values()
+                        .find(|info| info.stable_group_id() == response.group_id)
+                })
+                .map(|info| {
+                    (
+                        info.state_revision,
+                        info.secret_epoch,
+                        info.state_hash.clone(),
+                    )
+                })
+        };
+        if cursor_after.is_none_or(|cursor| cursor == cursor_before) {
             tracing::warn!(
                 group_id = %LogHexId::group(&response.group_id),
                 sender = %LogHexId::agent(&sender_hex),
-                sends = SELF_LEAVE_CATCHUP_PAGE_SENDS,
-                "TreeKEM catch-up next page was not sent; this peer's page fence stays open"
+                reason = TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS,
+                revision = cursor_before.0,
+                treekem_epoch = cursor_before.1,
+                "TreeKEM catch-up page made no progress: no served event applied, so the \
+                 next page request would re-fetch the identical page; stopping the page \
+                 loop (the pending queue keeps its events; this peer's page fence stays \
+                 open)"
             );
+            #[cfg(test)]
+            state
+                .named_group_test_recorders
+                .catchup_page_stops
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((
+                    response.group_id.clone(),
+                    sender_hex.clone(),
+                    TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS,
+                ));
+        } else {
+            tracing::debug!(
+                target: "treekem.trace",
+                group_id = %response.group_id,
+                sender = %hex::encode(sender.as_bytes()),
+                "TreeKEM catch-up response was truncated; requesting next page"
+            );
+            let mut sent = false;
+            for _ in 0..SELF_LEAVE_CATCHUP_PAGE_SENDS {
+                if request_treekem_catchup_page(state, &response.group_id, sender).await {
+                    sent = true;
+                    break;
+                }
+            }
+            if !sent {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&response.group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    sends = SELF_LEAVE_CATCHUP_PAGE_SENDS,
+                    "TreeKEM catch-up next page was not sent; this peer's page fence stays open"
+                );
+            }
         }
     } else if self_leave_key_package_reply(&fence_ids, &sender_hex, key_package_shaped) {
         // A KeyPackage reply carries no proof that a membership page stream
@@ -13065,6 +13125,15 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
 /// The send stays inside this bound. A failed send does not seal. The page
 /// fence stays open until that peer's terminal page arrives.
 const SELF_LEAVE_CATCHUP_PAGE_SENDS: u32 = 3;
+
+/// #1685: the typed stop reason for a truncated catch-up page that made
+/// no progress — no served event applied, so the catch-up cursor
+/// (revision, TreeKEM epoch, state hash) did not move and the next page
+/// request would deterministically re-fetch the identical page. Paging
+/// stops with this reason; the pending TreeKEM queue keeps its events
+/// and the throttled gap path re-arms catch-up on the next applied
+/// event.
+const TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS: &str = "truncated_page_no_progress";
 
 fn verified_catchup_member_removed_author(
     event: &NamedGroupMetadataEvent,
@@ -49822,6 +49891,7 @@ pub(in crate::server) mod tests {
     mod issue1622_binding_revoked_catchup;
     mod issue1649_reseat_mandate_receive;
     mod issue1657_typed_refusal_catchup;
+    mod issue1685_catchup_page_no_progress;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;

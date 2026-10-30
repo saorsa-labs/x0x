@@ -1637,6 +1637,11 @@ pub(super) struct NamedGroupTestRecorders {
     /// built, as the exact serialized payload, recorded at the refusal
     /// DECISION (before any egress). Tests read the payload here.
     pub(super) catchup_refusals: StdMutex<Vec<Vec<u8>>>,
+    /// #1685: every typed stop of the truncated-page re-request loop, as
+    /// `(group, peer, reason)` — the page applied nothing, the catch-up
+    /// cursor did not move, and the identical next page request was
+    /// deliberately not sent. Tests read the reason here.
+    pub(super) catchup_page_stops: StdMutex<Vec<(String, String, &'static str)>>,
 }
 
 #[cfg(test)]
