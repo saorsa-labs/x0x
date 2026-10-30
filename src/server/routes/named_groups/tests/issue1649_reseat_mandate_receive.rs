@@ -304,6 +304,19 @@ fn member_added(
     commit: &x0x::groups::GroupStateCommit,
     key_package_hash: Option<&str>,
 ) -> NamedGroupMetadataEvent {
+    member_added_with(stage, mandate, commit, key_package_hash, None, None)
+}
+
+/// [`member_added`] with the carried recovery record and the event's
+/// TreeKEM commit supplied.
+fn member_added_with(
+    stage: &Stage,
+    mandate: ReseatMandateV1,
+    commit: &x0x::groups::GroupStateCommit,
+    key_package_hash: Option<&str>,
+    member_joined_recovery: Option<NamedGroupMetadataEvent>,
+    treekem_commit_b64: Option<&str>,
+) -> NamedGroupMetadataEvent {
     use base64::Engine as _;
     NamedGroupMetadataEvent::MemberAdded {
         roster_certificates_b64: Vec::new(),
@@ -312,12 +325,12 @@ fn member_added(
         actor: stage.admin_hex.clone(),
         agent_id: stage.subject_hex.clone(),
         display_name: None,
-        treekem_commit_b64: None,
+        treekem_commit_b64: treekem_commit_b64.map(str::to_string),
         treekem_welcome_b64: None,
         welcome_ref: None,
         treekem_epoch: None,
         treekem_key_package_hash: key_package_hash.map(str::to_string),
-        member_joined_recovery: None,
+        member_joined_recovery: member_joined_recovery.map(Box::new),
         member_recovery_history: Vec::new(),
         certificate_b64: Some(
             BASE64.encode(bincode::serialize(&stage.subject_cert).expect("cert")),
@@ -377,12 +390,16 @@ async fn receiver_cause(
         mandate,
         certificate,
         None,
+        None,
+        None,
     )
     .await
 }
 
 /// [`receiver_cause`] over an explicit parent, seat-write and terminal
-/// commit, with the event's KeyPackage hash supplied.
+/// commit, with the event's KeyPackage hash, carried recovery record and
+/// TreeKEM commit supplied.
+#[allow(clippy::too_many_arguments)]
 async fn receiver_cause_over(
     stage: &Stage,
     parent: &x0x::groups::GroupInfo,
@@ -391,6 +408,8 @@ async fn receiver_cause_over(
     mandate: &ReseatMandateV1,
     certificate: &AgentCertificate,
     key_package_hash: Option<&str>,
+    member_joined_recovery: Option<&NamedGroupMetadataEvent>,
+    treekem_commit_b64: Option<&str>,
 ) -> Result<(), &'static str> {
     group_recovery::verify_reseat_mandate_on_receive(
         stage.receiver.as_ref(),
@@ -402,6 +421,8 @@ async fn receiver_cause_over(
         key_package_hash,
         None,
         Some(certificate),
+        member_joined_recovery,
+        treekem_commit_b64,
     )
     .await
 }
@@ -634,6 +655,8 @@ async fn a_removal_another_admin_committed_is_refused_with_cause_removal_mismatc
             &peer_terminal,
             &own,
             &stage.subject_cert,
+            None,
+            None,
             None
         )
         .await,
@@ -665,6 +688,8 @@ async fn a_packageless_reseat_on_the_treekem_plane_is_refused_with_cause_binding
             &stage.terminal,
             &mandate,
             &stage.subject_cert,
+            None,
+            None,
             None
         )
         .await,
@@ -709,6 +734,8 @@ async fn a_replay_of_the_same_removal_is_refused_with_cause_removal_mismatch() -
             &replay_terminal,
             &replay,
             &stage.subject_cert,
+            None,
+            None,
             None
         )
         .await,
@@ -745,11 +772,26 @@ fn member_joined_record(
     package: &str,
     ts_ms: u64,
 ) -> NamedGroupMetadataEvent {
+    member_joined_record_as(stage, signer, &stage.subject_hex, package, ts_ms)
+}
+
+/// [`member_joined_record`] claiming `member_agent_id` instead of the
+/// subject: with `signer` and `member_agent_id` both the impostor's, the
+/// record is internally consistent (it passes self-verification) while
+/// belonging to another agent — the certificate-key comparison's own
+/// negative shape.
+fn member_joined_record_as(
+    stage: &Stage,
+    signer: &AgentKeypair,
+    member_agent_id: &str,
+    package: &str,
+    ts_ms: u64,
+) -> NamedGroupMetadataEvent {
     let member_public_key_b64 = BASE64.encode(signer.public_key().as_bytes());
     let canonical = canonical_member_joined_bytes(
         &stage.group_id,
         Some(&stage.group_id),
-        &stage.subject_hex,
+        member_agent_id,
         &member_public_key_b64,
         x0x::groups::GroupRole::Member,
         None,
@@ -764,7 +806,7 @@ fn member_joined_record(
     NamedGroupMetadataEvent::MemberJoined {
         group_id: stage.group_id.clone(),
         stable_group_id: Some(stage.group_id.clone()),
-        member_agent_id: stage.subject_hex.clone(),
+        member_agent_id: member_agent_id.to_string(),
         member_public_key_b64,
         role: x0x::groups::GroupRole::Member,
         display_name: None,
@@ -783,6 +825,40 @@ fn member_joined_record(
     }
 }
 
+/// The authority-only shape: the subject's seat evidence with NO member
+/// half (empty member key and signature), as a direct-add attestation
+/// carries. It binds no member key to the package.
+fn authority_only_record(stage: &Stage, package: &str) -> NamedGroupMetadataEvent {
+    let mut record = member_joined_record(stage, &stage.subject_kp, package, 4_250);
+    if let NamedGroupMetadataEvent::MemberJoined {
+        member_public_key_b64,
+        signature_b64,
+        ..
+    } = &mut record
+    {
+        *member_public_key_b64 = String::new();
+        *signature_b64 = String::new();
+    }
+    record
+}
+
+/// A real one-member TreeKEM group and the commit that adds a second
+/// member's prepared package, through the production codecs:
+/// (the joiner's package b64, the commit b64).
+fn real_treekem_add_commit(tag: u8) -> Result<(String, String)> {
+    let creator = crate::identity::AgentId([tag; 32]);
+    let joiner = crate::identity::AgentId([tag ^ 0xff; 32]);
+    let mut group = crate::mls::treekem::TreeKemMlsGroup::create(
+        b"issue-1680-leaf-binding".to_vec(),
+        creator,
+        &[tag; 32],
+    )?;
+    let prepared = crate::mls::treekem::TreeKemMlsGroup::prepare_member(joiner, &[tag ^ 0xff; 32])?;
+    let package = BASE64.encode(prepared.key_package_bytes());
+    let out = group.add_member(joiner, prepared.key_package_bytes())?;
+    Ok((package, BASE64.encode(out.commit)))
+}
+
 /// Make `signer`'s record (see [`member_joined_record`]) the receiver's
 /// held evidence for the subject's seat. The record is planted straight
 /// into the cache state, past the cache's own ingress gate (which would
@@ -790,7 +866,13 @@ fn member_joined_record(
 /// verbatim at startup, so the §3a rule must not trust a held record
 /// blindly. The subject-signed control goes through the real gate below.
 async fn hold_subject_record(stage: &Stage, signer: &AgentKeypair, package: &str) {
-    let event = member_joined_record(stage, signer, package, 4_000);
+    hold_record_under_subject_key(stage, member_joined_record(stage, signer, package, 4_000)).await;
+}
+
+/// [`hold_subject_record`] for a ready-made event planted under the
+/// subject's cache key (the greptile P2 shape: an internally consistent
+/// record of ANOTHER agent, which the ingress gate would never seat).
+async fn hold_record_under_subject_key(stage: &Stage, event: NamedGroupMetadataEvent) {
     let key = join_result_key(&stage.group_id, &stage.subject_hex);
     let encoded_bytes = cache_entry_encoded_bytes(&key, &event).expect("encode cache entry");
     let mut cache = stage
@@ -824,6 +906,84 @@ async fn admit_subject_record(stage: &Stage, package: &str) {
     .await;
 }
 
+/// #1680 round 3 (Engineer ruling 30 Oct 2026, PR comment 6528069544):
+/// ADR 0109 §3a check 8 fails closed, as the Accepted ADR reads. A
+/// re-seat that binds a KeyPackage must carry the subject's own signed
+/// `MemberJoined` for it in `member_joined_recovery`; a receiver that
+/// gets no record at all — the shape every sender before the ruling
+/// emits — refuses with `binding_mismatch`, the committed record stays
+/// byte-identical and the subject stays unseated.
+#[tokio::test]
+async fn a_reseat_without_the_subject_signed_record_is_refused_with_cause_binding_mismatch(
+) -> Result<()> {
+    let stage = stage().await?;
+    let package = BASE64.encode([7u8; 96]);
+    let hash = blake3::hash(package.as_bytes()).to_hex().to_string();
+    let mut fields = mandate_fields(&stage);
+    fields.key_package_hash = hash.clone();
+    let mandate = mint(fields, stage.admin.agent.identity().agent_keypair());
+    // The receiver holds nothing and the event carries nothing: the
+    // mandate's signed hash binding alone must not seat the package.
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash),
+            None,
+            None
+        )
+        .await,
+        Err("binding_mismatch"),
+        "a bound package with no carried subject-signed record must fail check 8"
+    );
+    // An authority-only carried record fails the same way: with no member
+    // half it binds no member key to the package.
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash),
+            Some(&authority_only_record(&stage, &package)),
+            None
+        )
+        .await,
+        Err("binding_mismatch"),
+        "an authority-only carried record has no member binding and must fail check 8"
+    );
+    let before = record_json(&stage).await;
+    let applied = apply_listener_metadata_event(
+        &stage.receiver,
+        member_added(&stage, mandate, &stage.terminal, Some(&hash)),
+        stage.admin.agent.agent_id(),
+        true,
+        None,
+    )
+    .await
+    .expect("the shielded apply completes");
+    assert!(
+        !applied.accepted,
+        "the recordless re-seat must be refused (old senders are refused, per the ruling)"
+    );
+    assert_eq!(
+        before,
+        record_json(&stage).await,
+        "a refused re-seat leaves the committed record byte-identical"
+    );
+    assert!(
+        !live(&stage).await.has_active_member(&stage.subject_hex),
+        "the subject stays unseated"
+    );
+    Ok(())
+}
+
 /// #1680, ADR 0109 §3a check 8 at the receiver: the re-seat KeyPackage
 /// must verify against the subject's agent key, exactly as an ordinary
 /// join's does. The receiver holds the subject's `MemberJoined` record
@@ -840,8 +1000,11 @@ async fn a_key_package_signed_by_another_key_is_refused_with_cause_binding_misma
     let mut fields = mandate_fields(&stage);
     fields.key_package_hash = hash.clone();
     let mandate = mint(fields, stage.admin.agent.identity().agent_keypair());
-    // The receiver's held record for that package is signed by another
-    // key: the package does not verify against the subject's agent key.
+    // The event carries the subject's valid record (round 3: check 8's
+    // evidence), and the receiver's held record for that package is
+    // signed by another key claiming the subject: the poisoned cache
+    // contradicts the carried evidence and refuses the re-seat.
+    let carried = member_joined_record(&stage, &stage.subject_kp, &package, 4_050);
     let impostor = AgentKeypair::generate()?;
     hold_subject_record(&stage, &impostor, &package).await;
     assert_eq!(
@@ -852,7 +1015,9 @@ async fn a_key_package_signed_by_another_key_is_refused_with_cause_binding_misma
             &stage.terminal,
             &mandate,
             &stage.subject_cert,
-            Some(&hash)
+            Some(&hash),
+            Some(&carried),
+            None
         )
         .await,
         Err("binding_mismatch")
@@ -860,7 +1025,14 @@ async fn a_key_package_signed_by_another_key_is_refused_with_cause_binding_misma
     let before = record_json(&stage).await;
     let applied = apply_listener_metadata_event(
         &stage.receiver,
-        member_added(&stage, mandate.clone(), &stage.terminal, Some(&hash)),
+        member_added_with(
+            &stage,
+            mandate.clone(),
+            &stage.terminal,
+            Some(&hash),
+            Some(carried.clone()),
+            None,
+        ),
         stage.admin.agent.agent_id(),
         true,
         None,
@@ -892,10 +1064,269 @@ async fn a_key_package_signed_by_another_key_is_refused_with_cause_binding_misma
             &stage.terminal,
             &mandate,
             &stage.subject_cert,
-            Some(&hash)
+            Some(&hash),
+            Some(&carried),
+            None
         )
         .await,
         Ok(())
+    );
+    Ok(())
+}
+
+/// #1680 round 3: a carried record that is itself foreign-signed —
+/// another key signing while claiming the subject — fails check 8 even
+/// though the receiver holds nothing at all.
+#[tokio::test]
+async fn a_carried_record_signed_by_another_key_is_refused_with_cause_binding_mismatch(
+) -> Result<()> {
+    let stage = stage().await?;
+    let package = BASE64.encode([7u8; 96]);
+    let hash = blake3::hash(package.as_bytes()).to_hex().to_string();
+    let mut fields = mandate_fields(&stage);
+    fields.key_package_hash = hash.clone();
+    let mandate = mint(fields, stage.admin.agent.identity().agent_keypair());
+    let impostor = AgentKeypair::generate()?;
+    let record = member_joined_record(&stage, &impostor, &package, 4_300);
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash),
+            Some(&record),
+            None
+        )
+        .await,
+        Err("binding_mismatch"),
+        "a carried record the subject did not sign must fail check 8"
+    );
+    Ok(())
+}
+
+/// Round-2 review thread (greptile P2): the certificate-key comparison
+/// has its own coverage. The receiver holds, under the subject's cache
+/// key, a record that belongs to ANOTHER agent but is internally
+/// consistent — its member id, key and signature all match the impostor,
+/// so it passes self-verification — while the event carries the
+/// subject's valid record. Only the comparison of the record's member
+/// key against the certificate's agent key refuses, with
+/// `binding_mismatch`; seating the subject's own record under the same
+/// key passes (control).
+#[tokio::test]
+async fn a_held_record_of_another_agent_fails_only_the_certificate_comparison() -> Result<()> {
+    let stage = stage().await?;
+    let package = BASE64.encode([7u8; 96]);
+    let hash = blake3::hash(package.as_bytes()).to_hex().to_string();
+    let mut fields = mandate_fields(&stage);
+    fields.key_package_hash = hash.clone();
+    let mandate = mint(fields, stage.admin.agent.identity().agent_keypair());
+    let carried = member_joined_record(&stage, &stage.subject_kp, &package, 4_400);
+    let impostor = AgentKeypair::generate()?;
+    let impostor_hex = hex::encode(impostor.agent_id().as_bytes());
+    hold_record_under_subject_key(
+        &stage,
+        member_joined_record_as(&stage, &impostor, &impostor_hex, &package, 4_410),
+    )
+    .await;
+    assert!(
+        verify_member_joined_key_package_event(&member_joined_record_as(
+            &stage,
+            &impostor,
+            &impostor_hex,
+            &package,
+            4_410
+        )),
+        "precondition: the impostor's record passes self-verification"
+    );
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash),
+            Some(&carried),
+            None
+        )
+        .await,
+        Err("binding_mismatch"),
+        "the certificate-key comparison alone must refuse the impostor's record"
+    );
+    // Control: the subject's own record under the same key passes. The
+    // cache replaces an entry only on a strictly later timestamp, so the
+    // control is seated with one newer than the planted impostor record.
+    cache_treekem_member_key_package(
+        &stage.receiver,
+        join_result_key(&stage.group_id, &stage.subject_hex),
+        member_joined_record(&stage, &stage.subject_kp, &package, 4_600),
+        true,
+    )
+    .await;
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash),
+            Some(&carried),
+            None
+        )
+        .await,
+        Ok(())
+    );
+    Ok(())
+}
+
+/// #1680 round 3: the honest re-seat — the event carries the subject's
+/// own signed, authority-countersigned record for the bound package
+/// (exactly what the seal path now puts in `member_joined_recovery`), and
+/// it applies end to end: the §3a rule accepts, the receiver's
+/// authority-attestation gate verifies the record against the terminal
+/// commit's recovery security binding, the subject is seated and the
+/// record reaches the member-key-package cache.
+#[tokio::test]
+async fn an_honest_reseat_with_the_carried_record_applies() -> Result<()> {
+    let stage = stage().await?;
+    let package = BASE64.encode([7u8; 96]);
+    let hash = blake3::hash(package.as_bytes()).to_hex().to_string();
+    let original = member_joined_record(&stage, &stage.subject_kp, &package, 4_200);
+    // The seal's terminal commit carries the recovery security binding
+    // (`treekem:epoch=…;member-recovery=…`), exactly as the TreeKEM seal
+    // sets it before `seal_commit_owner_certified`. The receiver's parent
+    // already runs under that binding, so the state the apply rebuilds
+    // hashes to the commit the seal signed.
+    let binding =
+        treekem_recovery_security_binding(3, &original).expect("the member record binds a package");
+    let mut parent = stage.parent.clone();
+    parent.security_binding = Some(binding.clone());
+    let mut next = stage.next.clone();
+    next.security_binding = Some(binding);
+    stage
+        .receiver
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), parent.clone());
+    let admin_kp = stage.admin.agent.identity().agent_keypair();
+    let terminal = terminal_commit(&parent, &next, admin_kp, 3_000);
+    let recovery = attest_member_joined_recovery_event(&original, admin_kp, &terminal)?;
+    let mut fields = mandate_fields(&stage);
+    fields.key_package_hash = hash.clone();
+    let mandate = mint(fields, admin_kp);
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &parent,
+            &next,
+            &terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash),
+            Some(&recovery),
+            None
+        )
+        .await,
+        Ok(()),
+        "the carried subject-signed record for the bound package passes check 8"
+    );
+    let applied = apply_listener_metadata_event(
+        &stage.receiver,
+        member_added_with(
+            &stage,
+            mandate,
+            &terminal,
+            Some(&hash),
+            Some(recovery.clone()),
+            None,
+        ),
+        stage.admin.agent.agent_id(),
+        true,
+        None,
+    )
+    .await
+    .expect("the shielded apply completes");
+    assert!(applied.accepted, "the honest re-seat must apply");
+    assert!(
+        live(&stage).await.has_active_member(&stage.subject_hex),
+        "the subject is seated"
+    );
+    assert!(
+        stage
+            .receiver
+            .treekem_member_key_packages
+            .get(&join_result_key(&stage.group_id, &stage.subject_hex))
+            .await
+            .is_some_and(|record| record == recovery),
+        "the carried record reaches the member-key-package cache"
+    );
+    Ok(())
+}
+
+/// #1680 round 3 (round-1 review finding 3): §3a check 8's commit half —
+/// the TreeKEM commit a re-seat carries must add exactly the bound
+/// package. Built through the real codecs: a real TreeKEM group, a real
+/// prepared joiner package, and the commit its add produces. The mandate
+/// and the carried record bind a DIFFERENT package, so checks 1-8 pass
+/// and only the leaf the commit adds refuses; binding the package the
+/// commit actually adds passes (control, which also proves the package
+/// hash round-trips through the commit's postcard codecs).
+#[tokio::test]
+async fn a_treekem_commit_adding_another_package_is_refused_with_cause_binding_mismatch(
+) -> Result<()> {
+    let stage = stage().await?;
+    let (package, commit_b64) = real_treekem_add_commit(0x11)?;
+    let (other, _) = real_treekem_add_commit(0x22)?;
+    let admin_kp = stage.admin.agent.identity().agent_keypair();
+    let other_hash = blake3::hash(other.as_bytes()).to_hex().to_string();
+    let carried = member_joined_record(&stage, &stage.subject_kp, &other, 4_500);
+    let mut fields = mandate_fields(&stage);
+    fields.key_package_hash = other_hash.clone();
+    let mandate = mint(fields, admin_kp);
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&other_hash),
+            Some(&carried),
+            Some(&commit_b64)
+        )
+        .await,
+        Err("binding_mismatch"),
+        "a commit adding a leaf other than the bound package must fail check 8"
+    );
+    let hash = blake3::hash(package.as_bytes()).to_hex().to_string();
+    let carried = member_joined_record(&stage, &stage.subject_kp, &package, 4_510);
+    let mut fields = mandate_fields(&stage);
+    fields.key_package_hash = hash.clone();
+    let mandate = mint(fields, admin_kp);
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash),
+            Some(&carried),
+            Some(&commit_b64)
+        )
+        .await,
+        Ok(()),
+        "a commit adding exactly the bound package passes check 8's commit half"
     );
     Ok(())
 }

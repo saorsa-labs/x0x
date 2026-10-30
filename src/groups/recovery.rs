@@ -1366,12 +1366,14 @@ pub struct ReseatMandateCheck<'a> {
     pub key_package_hash: Option<&'a str>,
     /// The event's KeyPackage verifies against the subject's agent key,
     /// as an ordinary join's does (§3a check 8). The caller runs the
-    /// member-signed package check over the evidence it holds — the
-    /// subject's signed `MemberJoined` record binding the same package —
-    /// so a package another key signed fails here. A re-seat with no
-    /// package (an empty bound hash) binds nothing on a non-package
-    /// plane; on the TreeKEM plane every re-seat has a package, so an
-    /// empty bound hash fails the binding on its own.
+    /// member-signed package check over the evidence the re-seat event
+    /// carries — the subject's signed `MemberJoined` record binding the
+    /// same package — and the receiver's held record for that package
+    /// must not contradict it, so a package another key signed, or a
+    /// re-seat that carries no subject-signed record at all, fails here.
+    /// A re-seat with no package (an empty bound hash) binds nothing on a
+    /// non-package plane; on the TreeKEM plane every re-seat has a
+    /// package, so an empty bound hash fails the binding on its own.
     pub key_package_bound_to_subject: bool,
     /// The group runs on the TreeKEM plane (§3a check 8): a re-seat there
     /// always carries a KeyPackage, the one the mandate preimage's item 8
@@ -1489,9 +1491,10 @@ pub fn verify_reseat_mandate(
     // 8. The KeyPackage half of (8) follows the ordinary join's rule
     // (#1680): a re-seat with no package (an empty bound hash) binds
     // nothing on a non-package plane, a TreeKEM-plane re-seat always has
-    // a package so an empty bound hash fails outright, and a package the
-    // receiver holds a subject-signed record for must verify against the
-    // subject's agent key.
+    // a package so an empty bound hash fails outright, and the package
+    // must be the subject's own — the subject-signed `MemberJoined` the
+    // event carries (Engineer ruling 30 Oct 2026) must verify against
+    // the subject's agent key.
     if check.commit.prev_state_hash.as_deref() != Some(fields.parent_commit_hash.as_str())
         || parent.state_hash != fields.parent_commit_hash
         || check.key_package_hash != Some(fields.key_package_hash.as_str())
