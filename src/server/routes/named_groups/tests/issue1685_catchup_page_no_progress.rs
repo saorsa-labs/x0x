@@ -1720,6 +1720,118 @@ async fn a_machine_revoked_stopped_peer_is_retired_by_the_shared_gate() -> Resul
     Ok(())
 }
 
+/// #1685 round 7 (Claude review at 40455742, finding 1; Engineer
+/// ruling, 30 Oct 2026): the departed retire closes the stopped peer's
+/// page fence — here the group's LAST open one. Every rekey check that
+/// ran before the retire saw that fence open (the replay's own pass is
+/// batch-held inside the page handler; the terminal page's pass sees
+/// this fence), so without a re-check AT the retire the responsive
+/// rekey for the two applied self-leaves waits for the next trigger.
+/// The retire must re-check, as the terminal page does after it closes
+/// a peer fence. The fresh-attempt counter is the observation: the
+/// rekey pass reached a fresh commit attempt at the retire. Whether
+/// that attempt then seals at once or defers to its own rules (a
+/// self-leaver's seal waits for the S4 row the periodic pass opens,
+/// ADR 0110 §2) is the pass's decision at EVERY trigger — not this
+/// fix's.
+#[tokio::test]
+async fn a_departed_retire_rechecks_the_self_leave_rekey_its_fence_close_released() -> Result<()> {
+    let group_id = "16".repeat(32);
+    let device = x0x::identity::MachineKeypair::generate()?;
+    let pair = issue1685_chain_pair(&group_id, Some(device)).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        responder_device,
+        helper,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let epoch_before = cursor(&state, &group_id).await.1;
+
+    // 1. The responder stops on E2, paged from its own device; its page
+    //    fence opens.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "CONTROL: the stopped responder's page fence is open"
+    );
+
+    // 2. D70: revoke the device only, so the shared gate (not the
+    //    roster) is what retires the responder.
+    revoke_machine(&state, responder_device.as_ref().expect("device")).await;
+
+    // 3. The helper's terminal page delivers E1; the replay applies E2.
+    //    Both leavers are Removed with tree leaves outstanding, so a
+    //    responsive rekey is due — but no earlier trigger can run it:
+    //    the applies sit inside the replay batch, the replay's own pass
+    //    is batch-held, and the terminal page's pass sees the
+    //    responder's fence still open.
+    handle_treekem_catchup_response(
+        &state,
+        &helper,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    assert_eq!(
+        pending_len(&state, &group_id).await,
+        0,
+        "the replay drained the queue"
+    );
+    assert_eq!(
+        cursor(&state, &group_id).await.1,
+        epoch_before,
+        "CONTROL: no rekey committed yet — the responder's open fence defers every pass"
+    );
+    assert_eq!(
+        take_fresh_self_leave_rekey_attempts(),
+        0,
+        "CONTROL: no rekey pass has reached a fresh commit attempt yet"
+    );
+
+    // 4. The detached retire closes the last fence and must re-check:
+    //    the responsive rekey pass runs at the retire, not at the next
+    //    trigger.
+    assert!(
+        eventually(|| {
+            !state
+                .named_group_test_recorders
+                .catchup_page_departed
+                .lock()
+                .expect("departed recorder")
+                .is_empty()
+        })
+        .await,
+        "the detached re-arm retired the machine-revoked responder"
+    );
+    assert!(
+        take_fresh_self_leave_rekey_attempts() > 0,
+        "#1685 round 7: the retire's re-check ran the responsive rekey pass its fence close released"
+    );
+    assert!(
+        !self_leave_rekey_fence_any_open(&fence_ids),
+        "the retire closed the group's last open fence"
+    );
+    Ok(())
+}
+
 /// Review round 5, finding 4: no duplicate ask to the sender. The
 /// responder stops on the gapped E2; its own next truncated page then
 /// delivers E1, which applies, and the page handler's replay applies

@@ -13479,15 +13479,33 @@ fn treekem_page_stopped_peers_clear(group_ids: &[String], peer: &str) {
 /// be asked or satisfied — the same retirement main gives a departed
 /// peer's catch-up rows (retain against the authenticated roster,
 /// [`self_leave_startup_drop_inactive`]).
-fn treekem_page_stopped_peers_drop_departed(group_ids: &[String], peer: &str) {
+///
+/// #1685 round 7 (Claude review at 40455742, finding 1; Engineer
+/// ruling, 30 Oct 2026): the fence close above may release the group's
+/// last open fence, and no later check is guaranteed. The replay that
+/// spawned this retire ran its own pass batch-held inside the page
+/// handler, and the page handler's pass saw this fence still open, so
+/// the retire itself re-checks the responsive rekey — the same
+/// re-check the terminal page makes after it closes a peer fence.
+async fn treekem_page_stopped_peers_drop_departed(
+    state: &Arc<AppState>,
+    ask_group_id: &str,
+    group_ids: &[String],
+    peer: &str,
+) {
     treekem_page_stopped_peers_clear(group_ids, peer);
     self_leave_rekey_fence_catchup_peer(group_ids, peer, false);
-    let mut rewarn = TREEKEM_PAGE_STOP_REWARN
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for group_id in group_ids {
-        rewarn.remove(&format!("{group_id}:{peer}"));
+    // The re-warn guard stays in its own block: a std MutexGuard must
+    // not live across the await below (the future has to stay Send).
+    {
+        let mut rewarn = TREEKEM_PAGE_STOP_REWARN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for group_id in group_ids {
+            rewarn.remove(&format!("{group_id}:{peer}"));
+        }
     }
+    schedule_self_leave_rekey_if_idle(state, ask_group_id).await;
 }
 
 /// #1685 round 5 (review nit): a group that withdrew or left the local
@@ -13710,7 +13728,9 @@ fn spawn_stopped_treekem_catchup_rearms(
 /// its fence (the page handler drops its pages before any fence work),
 /// so it is retired by
 /// [`treekem_page_stopped_peers_drop_departed`] instead of re-armed:
-/// row dropped, fence closed, never left open. The ask stays inside
+/// row dropped, fence closed, never left open — and the retire
+/// re-checks the responsive rekey, because the fence it closes may be
+/// the group's last open one (round 7). The ask stays inside
 /// [`SELF_LEAVE_CATCHUP_PAGE_SENDS`] sends, and the row is cleared only
 /// once a send SUCCEEDED (review finding 2): a failed re-arm keeps the
 /// row armed, so the next replay that moves the cursor retries it.
@@ -13739,7 +13759,7 @@ async fn rearm_one_stopped_treekem_catchup_page(
     let current_member =
         roster.is_some_and(|info| !info.withdrawn && info.has_active_member(&peer_hex));
     if sender_revoked || !current_member {
-        treekem_page_stopped_peers_drop_departed(aliases, &peer_hex);
+        treekem_page_stopped_peers_drop_departed(state, group_id, aliases, &peer_hex).await;
         tracing::warn!(
             group_id = %LogHexId::group(group_id),
             sender = %LogHexId::agent(&peer_hex),
