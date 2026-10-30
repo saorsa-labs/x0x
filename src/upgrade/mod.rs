@@ -4,6 +4,7 @@
 //! verified with ML-DSA-65 signatures, and propagated symmetrically via gossip.
 //! Nodes download, verify, and atomically replace their own binary with rollback
 //! support.
+//! Upgrade parsers must not derive Debug for values that can hold argv, environment or credentials.
 
 pub mod apply;
 #[cfg(unix)]
