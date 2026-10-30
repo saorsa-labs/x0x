@@ -872,3 +872,274 @@ async fn a_replay_that_applies_nothing_does_not_rearm_any_stopped_peer() -> Resu
     );
     Ok(())
 }
+
+/// Review round 4 (Engineer ruling, 30 Oct 2026): the re-arm pre-check.
+/// A stopped peer that leaves the authenticated roster before the
+/// dependency clears can never deliver the terminal page that closes
+/// its fence — the page handler drops a non-member's pages at the
+/// member gate — so a re-arm ask for it would leave a page fence open
+/// with no exit (ADR 0088 L2). The removal itself arrives as a retained
+/// event (the responder's roster-only self-leave R, chained after the
+/// stuck E2), and the replay that clears the dependency applies E2 and
+/// R in one pass. That pass must retire the departed responder — no
+/// re-arm ask, stopped-loop row dropped, page fence closed, the typed
+/// `peer_departed` reason — while the still-member helper IS re-armed:
+/// the retirement main gives a departed peer's catch-up rows (retain
+/// against the authenticated roster) applied to the re-arm. At baf2d7ae
+/// the replay re-arms the removed responder too, so its fence stays
+/// open for ever.
+#[tokio::test]
+async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
+    let group_id = "72".repeat(32);
+    let (mut state, _dir) = secure_endpoint_test_state().await?;
+    super::super::revocation_eviction::zero_restart_wait_for_test(&mut state);
+    let admin_id = state.agent.agent_id();
+    let admin_hex = hex::encode(admin_id.as_bytes());
+    let group_id_bytes = hex::decode(&group_id)?;
+    let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+    let mut admin_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
+    // Two leavers whose self-leaves chain: E1 (v1) is the dependency E2
+    // (v2) waits for.
+    let mut leavers = Vec::new();
+    for seed in 0u8..2 {
+        let kp = AgentKeypair::generate()?;
+        let id = kp.agent_id();
+        let hex_id = hex::encode(id.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(id, &[9u8 + seed; 32])?;
+        let kp_bytes = prepared.key_package_bytes().to_vec();
+        let added = admin_group.add_member(id, &kp_bytes)?;
+        let _leaver_group = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+        leavers.push((kp, hex_id, kp_bytes));
+    }
+    let epoch_before = admin_group.epoch();
+    let (v1_kp, v1_hex, _) = &leavers[0];
+    let (v2_kp, v2_hex, _) = &leavers[1];
+
+    let mut info = x0x::groups::GroupInfo::new(
+        "issue1685-departed".to_string(),
+        String::new(),
+        admin_id,
+        group_id.clone(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    for (_, hex_id, kp_bytes) in &leavers {
+        info.add_member(
+            hex_id.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.set_member_treekem_key_package(
+            hex_id,
+            base64::engine::general_purpose::STANDARD.encode(kp_bytes),
+        );
+    }
+    // The responder the re-arm pre-check must retire, plus the helper
+    // that delivers the chain — the contrast proving the pre-check
+    // separates a departed peer from a current member.
+    let responder = AgentKeypair::generate()?;
+    let responder_id = responder.agent_id();
+    let responder_hex = hex::encode(responder_id.as_bytes());
+    let helper = AgentKeypair::generate()?;
+    let helper_id = helper.agent_id();
+    let helper_hex = hex::encode(helper_id.as_bytes());
+    for peer_hex in [&responder_hex, &helper_hex] {
+        info.add_member(
+            peer_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+    }
+    info.secret_epoch = epoch_before;
+    info.security_binding = Some(format!("treekem:epoch={epoch_before}"));
+    info.recompute_state_hash();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+    state.treekem_groups.write().await.insert(
+        group_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(admin_group)),
+    );
+    let fence_ids = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group");
+        [
+            group_id.clone(),
+            info.mls_group_id.clone(),
+            info.stable_group_id().to_string(),
+        ]
+    };
+
+    // The three-link chain, sealed on one clone (the round 3 shape, one
+    // link further): E2 waits for E1's head, and R — the responder's
+    // own roster-only self-leave — waits for E2's head.
+    let mut leaving = {
+        let groups = state.named_groups.read().await;
+        groups.get(&group_id).cloned().expect("group")
+    };
+    leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+    let revision1 = leaving.roster_revision;
+    leaving.remove_member(v1_hex, Some(v1_hex.clone()));
+    let commit1 = leaving.seal_commit(v1_kp, now_millis_u64())?;
+    let event1 = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: group_id.clone(),
+        revision: revision1,
+        actor: v1_hex.clone(),
+        agent_id: v1_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit1),
+    };
+    leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+    let revision2 = leaving.roster_revision;
+    leaving.remove_member(v2_hex, Some(v2_hex.clone()));
+    let commit2 = leaving.seal_commit(v2_kp, now_millis_u64())?;
+    let event2 = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: group_id.clone(),
+        revision: revision2,
+        actor: v2_hex.clone(),
+        agent_id: v2_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit2),
+    };
+    leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+    let revision3 = leaving.roster_revision;
+    leaving.remove_member(&responder_hex, Some(responder_hex.clone()));
+    let commit3 = leaving.seal_commit(&responder, now_millis_u64())?;
+    let removal = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: group_id.clone(),
+        revision: revision3,
+        actor: responder_hex.clone(),
+        agent_id: responder_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit3.clone()),
+    };
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder's truncated page serves E2 before its
+    //    predecessor: E2 queues as a revision gap, nothing applies, the
+    //    cursor does not move — the typed stop. The responder's page
+    //    fence stays open and its stopped-loop row is armed.
+    handle_treekem_catchup_response(
+        &state,
+        &responder_id,
+        &clean_sender_machine(),
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        page_requests(&state),
+        0,
+        "the stopped loop asks for no next page at the unmoved cursor"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "CONTROL: the stopped peer's page fence is open before the removal"
+    );
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the stopped peer's row is armed before the removal"
+    );
+
+    // 2. The removal reaches this node before the dependency clears: the
+    //    helper's truncated page serves R, which also gaps on E2's
+    //    missing head. R is retained, the helper's loop stops too, and
+    //    the responder is still on the roster — only the events are
+    //    queued, nothing has applied yet.
+    handle_treekem_catchup_response(
+        &state,
+        &helper_id,
+        &clean_sender_machine(),
+        true,
+        truncated_page(&group_id, removal),
+    )
+    .await;
+    let mut stopped_before = vec![helper_hex.clone(), responder_hex.clone()];
+    stopped_before.sort();
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        stopped_before,
+        "both responders stopped while their gaps are outstanding"
+    );
+    assert_eq!(
+        pending_len(&state, &group_id).await,
+        2,
+        "E2 and the responder's removal R stay queued behind E1"
+    );
+
+    // 3. The dependency clears: the helper's TERMINAL page delivers E1,
+    //    and the page handler's replay applies the retained E2 and then
+    //    R in one pass — the re-arm pass really runs, and the roster it
+    //    consults no longer has the responder. The departed responder
+    //    must NOT be re-armed; its row and fence are retired with the
+    //    typed reason instead. The helper is still a member, so it IS
+    //    re-armed — the pre-check separates the two.
+    handle_treekem_catchup_response(
+        &state,
+        &helper_id,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    let head = cursor(&state, &group_id).await;
+    assert_eq!(
+        head.0, revision3,
+        "CONTROL: the replay applied E2 and R, so the re-arm pass ran against a roster without the responder"
+    );
+    assert_eq!(
+        head.2, commit3.state_hash,
+        "the chain reached the head R sealed — the responder's removal really applied"
+    );
+    assert_eq!(
+        pending_len(&state, &group_id).await,
+        0,
+        "the queue drained through the applied replay"
+    );
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "#1685 round 4: only the helper is re-armed; the removed responder is not asked again (at baf2d7ae the replay re-armed it too)"
+    );
+    assert_eq!(
+        rearm_requests(&state),
+        vec![(group_id.clone(), helper_hex.clone(), "replay_applied")],
+        "the one re-arm names the still-member helper, never the departed responder"
+    );
+    assert_eq!(
+        state
+            .named_group_test_recorders
+            .catchup_page_departed
+            .lock()
+            .expect("departed recorder")
+            .clone(),
+        vec![(group_id.clone(), responder_hex.clone(), "peer_departed")],
+        "the retirement is typed and names the departed peer"
+    );
+    assert!(
+        !self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "#1685 round 4: the departed peer's page fence is closed, never left open"
+    );
+    assert!(
+        !self_leave_rekey_fence_any_open(&fence_ids),
+        "no page fence of the group stays open: the helper's terminal page closed its own, the responder's was retired"
+    );
+    assert!(
+        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        "no stopped-loop row is left: the helper's cleared on its re-arm, the responder's on its retirement"
+    );
+    Ok(())
+}
