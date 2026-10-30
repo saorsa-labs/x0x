@@ -172,18 +172,20 @@ pub(super) struct OrcState {
 }
 
 impl OrcState {
+    /// #1660 (Claude round 5): the stable group IDs of the live commit
+    /// deliveries — fresh or resumed. The worker pass keeps their
+    /// groups' head-ask counts through its retain; only the ask counts,
+    /// not the §2 head rounds, which stay with the open work
+    /// ([`head_round_groups`]).
+    pub(super) fn delivery_groups(&self) -> impl Iterator<Item = &str> {
+        self.deliveries.keys().map(String::as_str)
+    }
+
     /// §2: the groups that need a head catch-up round, each with the
     /// agents that are not head holders. A held mandate needs one before
     /// its seal (its named, revoked admins are excluded). A delivery that
     /// a restart restored needs one before any resend of its frame or its
     /// GSS shares (its removed seats are excluded).
-    /// #1660 (Claude round 5): the stable group IDs of the live commit
-    /// deliveries — fresh or resumed. The worker pass keeps their
-    /// groups' head-ask counts through its open-group retain.
-    pub(super) fn delivery_groups(&self) -> impl Iterator<Item = &str> {
-        self.deliveries.keys().map(String::as_str)
-    }
-
     pub(super) fn head_round_groups(&self) -> BTreeMap<String, BTreeSet<[u8; 32]>> {
         let mut groups: BTreeMap<String, BTreeSet<[u8; 32]>> = BTreeMap::new();
         for (stable, pending) in &self.pending {
@@ -1761,12 +1763,12 @@ async fn drive_deliveries(state: &Arc<AppState>) {
         for (recipient, attempt) in started {
             spawn_commit_send(state, &stable, &delivery, AgentId(recipient), attempt);
         }
-        // #1660 (Engineer ruling, 29 Oct 17:12 GMT): this round's seal
-        // is recorded inside its send task, after this ask — so this
-        // round's own answers close nothing. The rounds seal again every
-        // pass, and each seal to the same key keeps the earliest count,
-        // so the ask past that earliest seal is the first whose answers
-        // close the seat.
+        // #1660 (Engineer ruling, 29 Oct 17:12 GMT): this ask is
+        // dispatched after this round's send tasks, and its count lands
+        // only when its request went out, so this round's own answers
+        // close nothing. The rounds seal again every pass, and each seal
+        // to the same key keeps the earliest count, so the ask past that
+        // earliest seal is the first whose answers close the seat.
         ask_heads(state, &stable, head_asks).await;
         for agent in refreshes {
             let task_state = Arc::clone(state);
@@ -3959,17 +3961,31 @@ mod tests {
             "a seal to a different key resets the count to that seal"
         );
         // The rounds of a live row seal again every pass. A later seal to
-        // the SAME key keeps the EARLIEST count: the bar stays the first
-        // seal's (3), and a count past the later seal but not past the
-        // earliest closes nothing.
+        // the SAME key keeps the EARLIEST count — the bar stays the first
+        // seal's (3), not the later seal's (5): an answer at the earliest
+        // bar itself (3) closes nothing, and one past the earliest but
+        // below the later seal (4) closes the seat. A replacing record
+        // would keep the bar at 5 and refuse the 4.
         note_share_went_to(&mut orc, "g", 4, &survivor, "key-now", 5);
         note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), Some(3));
         assert_eq!(
             seat(&orc),
             RecipientDelivery::Sent,
-            "a later seal to the same key keeps the earliest count"
+            "an answer at the earliest seal's own count closes nothing"
         );
-        // Back to the base record: a rotation away and a seal at count 0.
+        note_survivor_head(&mut orc, "g", &survivor, &installed, keyed(), Some(4));
+        assert_eq!(
+            seat(&orc),
+            RecipientDelivery::Converged,
+            "an answer past the EARLIEST seal closes the seat: the later same-key seal raised no bar"
+        );
+        // Back to the base record and an open seat: a rotation away and
+        // a seal at count 0.
+        orc.deliveries
+            .get_mut("g")
+            .expect("the delivery row")
+            .recipients
+            .insert(survivor, RecipientDelivery::Sent);
         note_share_went_to(&mut orc, "g", 4, &survivor, "key-rotated", 0);
         note_share_went_to(&mut orc, "g", 4, &survivor, "key-now", 0);
         // The share went to the seat's current key — the round's record —
@@ -5161,6 +5177,7 @@ mod tests {
                     resumed: false,
                     removed: BTreeSet::new(),
                     reshare_epoch: None,
+                    share_went_to: BTreeMap::new(),
                 },
             );
         }
@@ -6435,10 +6452,12 @@ mod restart_tests {
     /// #1660 round 5 (Claude blocking at ccd7389): a LIVE owner-recovery
     /// delivery — never restarted, so no resumed row keeps its group in
     /// the worker's open set — converges through the real worker pass.
-    /// The delivery keeps its group's head-ask counts through the pass,
-    /// and the rounds' repeated seals to the same key keep the earliest
-    /// seal's count, so the ask past that seal closes the seat on the
-    /// survivor's answer. No ask count is raised by hand.
+    /// The rounds' page asks are sent through the recorder (the offline
+    /// fixture has no transport), so each one that went out advances the
+    /// seat's count; the counts survive the pass, and the rounds'
+    /// repeated seals to the same key keep the earliest seal's count, so
+    /// the ask past that seal closes the seat on the survivor's answer.
+    /// No ask count is raised by hand.
     #[tokio::test]
     async fn a_live_gss_recovery_delivery_converges_on_a_post_seal_answer() -> Result<()> {
         let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
@@ -6447,6 +6466,13 @@ mod restart_tests {
         let stable = info.stable_group_id().to_string();
         let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
         let new_secret = committed.shared_secret.clone().context("new secret")?;
+        // The fixture daemons share no transport: the head asks count
+        // only when their page request went out (Codex P2, 29 Oct), so
+        // the recorder carries the sends and records each one.
+        author
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         // The share arrives first and parks; the frame installs with it.
         let share = next_share(&author, &stable, &survivor_hex, 0).await?;
         let early = super::super::super::apply_named_group_metadata_event(
@@ -6487,6 +6513,100 @@ mod restart_tests {
         author.agent.shutdown().await;
         survivor.agent.shutdown().await;
         Ok(())
+    }
+
+    /// #1660 round 6 (Claude blocking at bf01e28): a live recovery
+    /// delivery's group is in no open row, held mandate or restored
+    /// delivery, so before round 5's fix the worker pass's retain wiped
+    /// its head-ask counts every second and the gate's anchor was gone.
+    /// The group here owns a live delivery and nothing else — no
+    /// revocation row keeps it in the open set — and a real dispatched
+    /// ask built its count. The pass alone — no delivery drive after it
+    /// — must keep that count. Red at ccd7389, where the retain dropped
+    /// live delivery groups: the entry comes back `None`.
+    #[tokio::test]
+    async fn a_live_recovery_delivery_keeps_its_ask_counts_through_the_worker_pass() {
+        let (state, _dir) = super::super::super::tests::secure_endpoint_test_state()
+            .await
+            .unwrap();
+        let survivor = AgentId([0x72; 32]);
+        let group_id = "e9".repeat(16);
+        let admin = state.agent.agent_id();
+        let mut info = GroupInfo::new("s4".into(), String::new(), admin, group_id.clone());
+        info.add_member(
+            hex::encode(survivor.as_bytes()),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        let stable = info.stable_group_id().to_string();
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.orc.deliveries.insert(
+                stable.clone(),
+                CommitDelivery {
+                    bytes: Arc::new(vec![1, 2, 3]),
+                    result_head: info.state_hash.clone(),
+                    next_revision: info.state_revision.saturating_add(1),
+                    recipients: BTreeMap::from([(*survivor.as_bytes(), RecipientDelivery::Sent)]),
+                    next_at: Instant::now(),
+                    resumed: false,
+                    removed: BTreeSet::new(),
+                    reshare_epoch: None,
+                    share_went_to: BTreeMap::new(),
+                },
+            );
+        }
+        // Asks count only when their request went out (Codex P2): the
+        // recorder carries the fixture's sends.
+        state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // The delivery's round dispatched a head ask to the survivor and
+        // it went out: the count exists.
+        let mut asked = None;
+        for _ in 0..100 {
+            {
+                let mut inner = state.revocation_evictions.inner.lock().await;
+                if let Some(delivery) = inner.orc.deliveries.get_mut(&stable) {
+                    delivery.next_at = Instant::now();
+                }
+                asked = inner
+                    .head_ask_seq
+                    .get(&(stable.clone(), *survivor.as_bytes()))
+                    .copied();
+            }
+            if asked.is_some() {
+                break;
+            }
+            worker_tick(&state).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let asked = asked.expect("a round dispatched a head ask that went out");
+        // The pass alone — the step whose retain dropped live delivery
+        // groups before round 5's fix. The count it built must survive
+        // it.
+        super::super::revocation_eviction_pass(&state).await;
+        let kept = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            inner
+                .head_ask_seq
+                .get(&(stable.clone(), *survivor.as_bytes()))
+                .copied()
+        };
+        assert_eq!(
+            kept,
+            Some(asked),
+            "a live recovery delivery's ask counts survive the worker pass"
+        );
+        state.agent.shutdown().await;
     }
 
     /// Codex P1 (#1508 rc12), receiver restart: the survivor gets the GSS

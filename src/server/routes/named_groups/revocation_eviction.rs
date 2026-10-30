@@ -871,10 +871,11 @@ pub(in crate::server) async fn seal_probe_for_test(
 /// handler's checks ran before the page applied, and a removal or
 /// revocation can land inside that window.
 ///
-/// A sender that is no longer an Active member, or that D60 refuses,
-/// closes no seat. A GSS row's report closes a seat only when a sealed
-/// share went to the key the sender's seat carries now, and a head ask
-/// went to the seat after that seal (Engineer ruling, 29 Oct 17:12 GMT).
+/// A sender that is no longer an Active member, or that the revocation
+/// verdict refuses, closes no seat. A GSS row's report closes a seat
+/// only when a sealed share went to the key the sender's seat carries
+/// now, and a head ask went to the seat after that seal (Engineer
+/// ruling, 29 Oct 17:12 GMT).
 /// The report itself is still a verified, applied page, so it keeps
 /// counting for the §2 head round (chain agreement). Only the
 /// seat-closing is gated.
@@ -980,15 +981,20 @@ pub(in crate::server) async fn note_catchup_head(
     // seam form: `try_*` locks that refuse on contention — a retryable
     // withhold, like every egress seam.
     if sender_seat.is_some() {
+        // #1660 (Claude round 6): match the entry the first read judged
+        // this answer against — the one whose stable id is `stable`, not
+        // the first of `group_ids` that resolves.
         let fresh_seat = match state.named_groups.try_read() {
             Ok(groups) => group_ids.iter().find_map(|id| {
-                crate::server::resolve_group_entry_locked(&groups, id).and_then(|(_, info)| {
-                    info.active_members()
-                        .find(|member| member.agent_id == sender_hex)
-                        .map(|member| crypto_exclusion::SenderSeat {
-                            key: member.kem_public_key_b64.clone(),
-                        })
-                })
+                crate::server::resolve_group_entry_locked(&groups, id)
+                    .filter(|(_, info)| info.stable_group_id() == stable)
+                    .and_then(|(_, info)| {
+                        info.active_members()
+                            .find(|member| member.agent_id == sender_hex)
+                            .map(|member| crypto_exclusion::SenderSeat {
+                                key: member.kem_public_key_b64.clone(),
+                            })
+                    })
             }),
             Err(_) => None,
         };
@@ -1260,10 +1266,16 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .iter()
         .map(|key| key.stable_group_id.clone())
         .chain(extra_rounds.keys().cloned())
-        // #1660 (Claude round 5): a live owner-recovery delivery keeps
-        // its group's head-ask counts too. Its rounds ask and seal
-        // again, and the ask gate compares counts that must survive
-        // this pass.
+        .collect();
+    // #1660 (Claude round 6): a live owner-recovery delivery keeps its
+    // group's head-ask counts too — its rounds ask and seal again, and
+    // the ask gate compares counts that must survive this pass. Only
+    // the counts: the §2 head rounds stay with the open work above, so
+    // a live delivery group gains no periodic round of catch-up asks to
+    // every holder.
+    let ask_count_groups: BTreeSet<String> = open_groups
+        .iter()
+        .cloned()
         .chain(inner.orc.delivery_groups().map(str::to_string))
         .collect();
     inner
@@ -1274,7 +1286,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .retain(|stable, _| open_groups.contains(stable));
     inner
         .head_ask_seq
-        .retain(|(stable, _), _| open_groups.contains(stable));
+        .retain(|(stable, _), _| ask_count_groups.contains(stable));
     for stable in &open_groups {
         let Some((group_key, info)) = by_stable.get(stable.as_str()) else {
             continue;

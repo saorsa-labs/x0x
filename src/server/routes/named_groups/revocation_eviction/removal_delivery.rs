@@ -1469,6 +1469,13 @@ mod daemon_tests {
         use base64::Engine as _;
         for resumed in [false, true] {
             let (state, _dir) = state_past_restart_wait().await?;
+            // The fixture has no transport: a head ask counts only when
+            // its request went out (#1660 Codex P2), so the recorder
+            // carries the rounds' sends.
+            state
+                .named_group_test_recorders
+                .catchup_page_force_ok
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             let survivor = AgentId([0x55; 32]);
             let survivor_hex = hex::encode(survivor.as_bytes());
             let target = [0x56; 32];
@@ -1545,6 +1552,30 @@ mod daemon_tests {
                 "resumed={resumed}"
             );
             // The survivor converges: the delivery ends and no share follows.
+            // A head ask counts only when its request went out (#1660
+            // Codex P2): wait until one of the rounds' dispatched asks
+            // landed past the record's seal count — the report below
+            // closes the seat only against that.
+            for _ in 0..250 {
+                let past = {
+                    let inner = state.revocation_evictions.inner.lock().await;
+                    inner.removals.get(&key).is_some_and(|delivery| {
+                        delivery
+                            .share_went_to
+                            .get(survivor.as_bytes())
+                            .is_some_and(|record| {
+                                inner
+                                    .head_ask_seq
+                                    .get(&(stable.clone(), *survivor.as_bytes()))
+                                    .is_some_and(|now| *now > record.ask_seq_at_seal)
+                            })
+                    })
+                };
+                if past {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+            }
             {
                 let mut inner = state.revocation_evictions.inner.lock().await;
                 let installed: std::collections::BTreeSet<String> =

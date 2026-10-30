@@ -457,8 +457,8 @@ pub(super) fn note_converged(
 /// delivered.
 ///
 /// `None` — the sender is no longer an Active member of the live roster,
-/// or D60 refuses it (a revoked agent, machine or binding). Its report is
-/// not a survivor's, so it closes no seat. A member removed or revoked
+/// or the revocation verdict refuses it (a revoked agent, machine or
+/// binding). Its report is not a survivor's, so it closes no seat. A member removed or revoked
 /// mid-send keeps the seat it had. The round drops a removed seat and
 /// withholds a revoked one. Neither is closed as delivered: §3 has no
 /// mid-send exception, and entitlement is not fixed at commit (D60).
@@ -659,27 +659,28 @@ pub(super) async fn note_share_went_to(
 /// Ask each of `peers` for a catch-up page of `stable_group_id`, on the
 /// existing request path, detached (an offline peer must not hold the
 /// worker). The answer reports the peer's head ([`note_survivor_head`]).
-/// #1660 (Engineer ruling, 29 Oct 17:12 GMT): each dispatch counts, per
-/// seat, as a head ask. A delivery row's share record keeps the count at
-/// its seal, and a report closes a GSS seat only after the count moved
-/// past that — only answers that could answer an ask sent after the
-/// seal close the seat. No caller holds the S4 lock; this function takes
-/// it.
+/// #1660 (Engineer ruling, 29 Oct 17:12 GMT): a request that went out
+/// counts, per seat, as a head ask. The count advances inside the task,
+/// after the send succeeded — a refused admission, a task still parked
+/// at the send boundary and a failed send count nothing, so no answer
+/// can ride a count for an ask that never left this node (Codex P2,
+/// 29 Oct). A delivery row's share record keeps the count at its seal,
+/// and a report closes a GSS seat only after the count moved past that
+/// — only answers that could answer an ask sent after the seal close
+/// the seat. No caller holds the S4 lock; the task takes it only for
+/// the count.
 pub(super) async fn ask_heads(state: &Arc<AppState>, group_id: &str, peers: Vec<AgentId>) {
-    {
-        let mut inner = state.revocation_evictions.inner.lock().await;
-        for peer in &peers {
-            *inner
-                .head_ask_seq
-                .entry((group_id.to_string(), *peer.as_bytes()))
-                .or_insert(0) += 1;
-        }
-    }
     for peer in peers {
         let task_state = Arc::clone(state);
         let group_id = group_id.to_string();
         let _spawned = state.spawn_detached(async move {
-            super::super::request_treekem_catchup_page(&task_state, &group_id, &peer).await;
+            if super::super::request_treekem_catchup_page(&task_state, &group_id, &peer).await {
+                let mut inner = task_state.revocation_evictions.inner.lock().await;
+                *inner
+                    .head_ask_seq
+                    .entry((group_id, *peer.as_bytes()))
+                    .or_insert(0) += 1;
+            }
         });
     }
 }
@@ -7471,6 +7472,40 @@ mod daemon_tests {
                 .or_insert(0) += 1;
         }
 
+        /// The seat's live head-ask count — `None` until an ask that went
+        /// out advanced it.
+        async fn ask_count(&self) -> Option<u64> {
+            self.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .head_ask_seq
+                .get(&(self.key.stable_group_id.clone(), *self.survivor.as_bytes()))
+                .copied()
+        }
+
+        /// Wait until the round's send task recorded the sealed share
+        /// for the sender ([`note_share_went_to`]) — the record a report
+        /// closes against. The seat proves nothing meanwhile.
+        async fn await_share_recorded(&self) {
+            for _ in 0..250 {
+                let recorded = {
+                    let inner = self.state.revocation_evictions.inner.lock().await;
+                    inner.ce.deliveries.get(&self.key).is_some_and(|delivery| {
+                        delivery
+                            .share_went_to
+                            .contains_key(self.survivor.as_bytes())
+                    })
+                };
+                if recorded {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("the round's sealed share was never recorded");
+        }
+
         /// How many sealed shares were scheduled to the sender.
         async fn shares_to_sender(&self) -> usize {
             self.state
@@ -7706,23 +7741,20 @@ mod daemon_tests {
             1,
             "the round sealed the share to the keyed seat: it gets its share"
         );
-        // The round's send completes as Sent (the carrier's acceptance).
-        let mut settled = false;
-        for _ in 0..250 {
-            if fx.seat().await == Some(RecipientDelivery::Sent) {
-                settled = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(settled, "the round's send completed as Sent");
+        // The round's send task seals the share and records it; the
+        // report below converges only against that record, so wait for
+        // it to land. The seat itself proves nothing meanwhile: only a
+        // report closes it (ADR 0110 §3).
+        fx.await_share_recorded().await;
         assert_ne!(
             fx.seat().await,
             Some(RecipientDelivery::Converged),
             "the share alone closes no seat: only a report does (ADR 0110 §3)"
         );
-        // The post-key report — the share-proof of a keyed survivor —
-        // converges the seat, and the next round completes the row.
+        // The post-key report — the share-proof of a keyed survivor, on
+        // an ask past that seal — converges the seat, and the next round
+        // completes the row.
+        fx.record_post_seal_ask().await;
         fx.feed_report(Some(&fx.result_head)).await;
         assert_eq!(
             fx.seat().await,
@@ -7763,13 +7795,16 @@ mod daemon_tests {
         );
         assert!(fx.row_open().await, "the delivery row stays open");
         // The next round seals the share to the key the seat carries
-        // now, and the report after that converges the seat.
+        // now; its send task records the seal, and the report after that
+        // — on an ask past it — converges the seat.
         fx.round_now().await;
         assert_eq!(
             fx.shares_to_sender().await,
             1,
             "the round sealed the share: the seat gets its share"
         );
+        fx.await_share_recorded().await;
+        fx.record_post_seal_ask().await;
         fx.feed_report(Some(&fx.result_head)).await;
         assert_eq!(
             fx.seat().await,
@@ -7834,6 +7869,96 @@ mod daemon_tests {
         );
         fx.round_now().await;
         assert!(!fx.row_open().await, "the converged row completes");
+        Ok(())
+    }
+
+    /// #1660 (Codex P2, 29 Oct): a head ask counts only when its page
+    /// request went out. The ask task is parked at the send boundary
+    /// while a delayed answer to an earlier ask arrives: the count has
+    /// not moved, so the answer — which could only answer a pre-seal
+    /// ask — closes nothing. Released, the send fails (the fixture peer
+    /// has no route) and still counts nothing: no answer can ride a
+    /// count for an ask that never left this node.
+    #[tokio::test]
+    async fn a_parked_or_failed_head_ask_counts_nothing() -> Result<()> {
+        let fx = seat_report_fixture(true).await?;
+        fx.record_share_to_seat_key().await;
+        let pause = ng::detached_send_test_seam::arm(&format!(
+            "treekem-catchup-page:{}",
+            fx.key.stable_group_id
+        ));
+        ask_heads(&fx.state, &fx.key.stable_group_id, vec![fx.survivor]).await;
+        for _ in 0..250 {
+            if pause.reached() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+        }
+        assert!(pause.reached(), "the ask task parked at the send boundary");
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Sent),
+            "a delayed answer while the ask is parked closes nothing: it counts only when its request went out"
+        );
+        drop(pause);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Sent),
+            "a failed send counts no ask: the count stays at the seal's"
+        );
+        assert_eq!(
+            fx.ask_count().await,
+            None,
+            "no ask that went out, no count (Codex P2, 29 Oct)"
+        );
+        assert!(fx.row_open().await, "the delivery row stays open");
+        Ok(())
+    }
+
+    /// #1660 (Codex P2): the same ask path with its request sent (the
+    /// test recorder's forced success — the offline fixture has no
+    /// transport): the count advances inside the task, and only then
+    /// does the survivor's answer converge the seat. The entry-point
+    /// gate driven end to end through a real dispatch.
+    #[tokio::test]
+    async fn a_sent_head_ask_advances_the_count_and_its_answer_converges() -> Result<()> {
+        let fx = seat_report_fixture(true).await?;
+        fx.record_share_to_seat_key().await;
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        ask_heads(&fx.state, &fx.key.stable_group_id, vec![fx.survivor]).await;
+        for _ in 0..250 {
+            if fx.ask_count().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+        }
+        assert_eq!(
+            fx.ask_count().await,
+            Some(1),
+            "the ask that went out advanced the seat's count to 1"
+        );
+        let sent_asks = {
+            let recorded = fx
+                .state
+                .named_group_test_recorders
+                .catchup_responses
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            recorded.len()
+        };
+        assert_eq!(sent_asks, 1, "the ask's page request went out");
+        fx.feed_report(Some(&fx.result_head)).await;
+        assert_eq!(
+            fx.seat().await,
+            Some(RecipientDelivery::Converged),
+            "the answer to the sent ask converges the seat"
+        );
         Ok(())
     }
 
