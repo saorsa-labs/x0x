@@ -23,6 +23,13 @@
 //! arms catch, and the PR body records the neutralisation run that
 //! showed them RED.
 //!
+//! The review-round-2 controls pin the two re-review findings: an
+//! unrelated B decrypt error must not pass as exclusion evidence (only
+//! the typed missing-epoch-secret refusal does; the control expects
+//! INFRA), and one completion budget — measured from the release point,
+//! not reset by the release or the diagnostic waits — bounds the
+//! completion (a completion past it is RED, not Green).
+//!
 //! Before t = 0 the ordinary `private_secure` (TreeKEM) group is
 //! settled (every node at A's state revision r0 and epoch e0, four
 //! leaves) and a data-plane probe opens on B and C; every node is past
@@ -79,6 +86,8 @@ const CAUSE_DATA_PLANE: &str = "the exclusion committed, but the data plane did 
                                 C did not decrypt the new traffic, or B still could";
 const CAUSE_PREMISE_DRIFT: &str = "premise drift, not one of the row's named failures: the \
                                    parked-send premise or the package premise did not hold";
+const CAUSE_UNTYPED_EXCLUSION: &str = "B's decrypt reply was neither the probe nor the typed \
+                                       missing-epoch-secret refusal, so the exclusion is unproven";
 
 /// `label`'s view of `group`; `None` when it holds no record of it.
 #[derive(Debug, Clone)]
@@ -410,6 +419,61 @@ async fn decrypts(sim: &Sim, label: &str, group: &str, ciphertext: &str) -> Resu
     Ok((ok, format!("{label} decrypt: {status} {body}")))
 }
 
+/// B's decrypt reply after the resume, classified against the settled
+/// epoch `e0`. Only the typed refusal proves the exclusion: B's tree is
+/// still at `e0` while the survivors' ciphertext is exactly one
+/// rotation ahead, so B lacks the new epoch secret. A decrypt is the
+/// row's named data-plane failure; any other shape (a roster 403, a
+/// malformed-ciphertext 400, a 500) is not exclusion evidence.
+#[derive(Debug, PartialEq, Eq)]
+enum BDecrypt {
+    /// The route's own epoch guard answered `400 treekem decrypt
+    /// failed: decryption error: Invalid epoch: expected {e0}, got
+    /// {e0 + 1}`.
+    LacksNewEpochSecret,
+    /// B decrypted the probe.
+    Decrypted,
+    /// Another reply shape: not exclusion evidence (INFRA, not a pass).
+    Other,
+}
+
+/// B decrypts `ciphertext` — the probe's, or garbage in the
+/// unrelated-error control — and the reply is classified against `e0`.
+async fn b_decrypt_reply(
+    sim: &Sim,
+    group: &str,
+    ciphertext: &str,
+    e0: u64,
+) -> Result<(BDecrypt, String)> {
+    let (status, body) = sim
+        .api(
+            "B",
+            Method::POST,
+            &format!("/groups/{group}/secure/decrypt"),
+            Some(json!({"ciphertext_b64": ciphertext})),
+        )
+        .await?;
+    let decrypted = status.is_success()
+        && body["payload_b64"]
+            .as_str()
+            .and_then(|payload| BASE64.decode(payload).ok())
+            .is_some_and(|payload| payload == PROBE);
+    let typed_refusal = format!(
+        "treekem decrypt failed: decryption error: Invalid epoch: expected {e0}, got {}",
+        e0 + 1
+    );
+    let classified = if decrypted {
+        BDecrypt::Decrypted
+    } else if status == StatusCode::BAD_REQUEST
+        && body["error"].as_str() == Some(typed_refusal.as_str())
+    {
+        BDecrypt::LacksNewEpochSecret
+    } else {
+        BDecrypt::Other
+    };
+    Ok((classified, format!("B decrypt: {status} {body}")))
+}
+
 /// Whether `label` has a live fabric link to `other`.
 async fn connected_to(sim: &Sim, label: &str, other: &str) -> bool {
     let (Ok(state), Ok(other)) = (sim.state(label), sim.peer(other)) else {
@@ -639,6 +703,21 @@ async fn setup(
     Ok((group, internal, b, r0, e0, leaves0))
 }
 
+/// The review-round-2 controls. The two named arms run with neither;
+/// each control leaves the production path untouched and injects one
+/// fault into the case itself.
+#[derive(Default)]
+struct Controls {
+    /// B's post-resume decrypt is asked with garbage, so its refusal is
+    /// an unrelated decrypt error. Accepted as exclusion it is a false
+    /// pass; the control expects INFRA.
+    corrupt_b_decrypt: bool,
+    /// D's data is blacked out (non-hello frames to and from D dropped)
+    /// until the package wait gives up, so the exclusion can only
+    /// complete past the completion budget. The control expects RED.
+    slow_completion: bool,
+}
+
 /// Both arms share one body: the holder D offline before t = 0, B's
 /// self-revocation, B off the fabric once A's first catch-up round has
 /// begun, the typed wait through the hold, and then per `resume`
@@ -649,6 +728,7 @@ async fn scenario(
     receipt: &mut Receipt,
     labels: &[&str],
     resume: bool,
+    controls: Controls,
 ) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
     let timing = S4Timing::default();
@@ -815,17 +895,61 @@ async fn scenario(
         // existing catch-up finishes, and A — the designated admin —
         // completes the exclusion by itself. No remove or seal API is
         // called after t = 0.
+        //
+        // One completion budget covers the whole completion phase, from
+        // the release point above: the ADR bound for this shape (the
+        // release at W + Δ, then the completion bound, then the
+        // catch-up throttle margin). The reconnect, record and package
+        // reads below and the completion wait itself all draw on what
+        // is left of it; none of them can extend it, and a completion
+        // past it is the row's RED, not a fresh budget.
+        let completion_deadline = release_at
+            .saturating_add(timing.completion_bound)
+            .saturating_add(secs(15));
+        let completion_left = |sim: &Sim| completion_deadline.saturating_sub(sim.fabric().now());
+        // The slow-completion control blacks D out at the data level
+        // while the flag is set: every non-hello frame to or from D is
+        // dropped (the link itself stays up, so D is back on the
+        // fabric), so B's KeyPackage cannot reach A by any path — the
+        // member-keyed round, the pubsub sync on reconnect, a catch-up
+        // page. The blackout lifts right after the package wait below,
+        // so whatever completes from there is past the budget.
+        let blackout = if controls.slow_completion {
+            use crate::network::sim::{Fault, LaneClass};
+            use std::sync::atomic::Ordering;
+            let machine = sim.peer("D")?.0;
+            let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let rule_held = std::sync::Arc::clone(&held);
+            sim.fabric().add_rule(move |write| {
+                let hello = matches!(write.lane.class, LaneClass::PlaneHello);
+                if rule_held.load(Ordering::SeqCst)
+                    && !hello
+                    && (write.lane.src == machine || write.lane.dst == machine)
+                {
+                    Fault::Drop
+                } else {
+                    Fault::Pass
+                }
+            });
+            Some(held)
+        } else {
+            None
+        };
         sim.set_online("D", true)?;
         sim.fabric()
             .mark("case: D returns at t = W + delta (the holder)");
-        sim.until("D reconnects", SETUP, async |s: &Sim| {
-            connected_to(s, "D", "A").await || connected_to(s, "D", "C").await
-        })
+        sim.until(
+            "D reconnects",
+            SETUP.min(completion_left(sim)),
+            async |s: &Sim| connected_to(s, "D", "A").await || connected_to(s, "D", "C").await,
+        )
         .await?;
         let d_holds_record = sim
-            .until("D holds B's revocation", EVIDENCE, async |s: &Sim| {
-                holds_revocation(s, "D", &b_hex).await.unwrap_or(false)
-            })
+            .until(
+                "D holds B's revocation",
+                EVIDENCE.min(completion_left(sim)),
+                async |s: &Sim| holds_revocation(s, "D", &b_hex).await.unwrap_or(false),
+            )
             .await
             .is_ok();
         // The row's release: the holder's answer (or its roster state)
@@ -835,28 +959,32 @@ async fn scenario(
         let a_got_package = sim
             .until(
                 "A holds B's KeyPackage again after D's return",
-                EVIDENCE,
+                EVIDENCE.min(completion_left(sim)),
                 async |s: &Sim| holds_package(s, "A", &group, &b_hex).await.unwrap_or(false),
             )
             .await
             .is_ok();
+        // Lift the blackout (only the slow-completion control set it):
+        // whatever completes from here is past the budget.
+        if let Some(held) = &blackout {
+            held.store(false, std::sync::atomic::Ordering::SeqCst);
+            sim.fabric()
+                .mark("case: the D data blackout lifts (the completion budget is spent)");
+        }
         receipt.note(format!(
             "D reconnected and holds B's revocation record after its return: {d_holds_record}; A \
              resolves B's KeyPackage again: {a_got_package}"
         ));
 
         // H on every survivor, signed by the designated A, within the
-        // ADR bound for this shape: the holder's release at W + Δ, then
-        // the completion bound, then the catch-up throttle margin.
-        let bound = w
-            .saturating_add(delta)
-            .saturating_add(timing.completion_bound);
+        // one completion budget above: this wait gets what is left of
+        // it, nothing more.
         let mut seen = Observations::default();
         let mut completed = false;
         let waited = sim
             .until(
                 "the survivors reach H",
-                bound + secs(15),
+                completion_left(sim),
                 async |s: &Sim| {
                     let Some(now) = seen.observe(views_now(s, &survivors, &group, &b)).await else {
                         return true;
@@ -900,27 +1028,36 @@ async fn scenario(
         });
 
         // Data plane after the resume: a survivor's new ciphertext opens
-        // on A and C, and not on B.
-        let (a_after, c_after, b_after) = match encrypt(sim, "C", &group).await? {
-            Ok(ciphertext) => (
-                decrypts(sim, "A", &group, &ciphertext).await?,
-                decrypts(sim, "C", &group, &ciphertext).await?,
-                decrypts(sim, "B", &group, &ciphertext).await?,
-            ),
+        // on A and C, and B is refused by the typed missing-epoch-secret
+        // error — the specific refusal that proves the exclusion. An
+        // arbitrary B decrypt failure is not that proof, so the
+        // unrelated-error control asks B with garbage and must come out
+        // INFRA, never a pass.
+        let encrypted = encrypt(sim, "C", &group).await?;
+        let ((a_ok, a_detail), (c_ok, c_detail), (b_class, b_detail)) = match &encrypted {
+            Ok(ciphertext) => {
+                let a = decrypts(sim, "A", &group, ciphertext).await?;
+                let c = decrypts(sim, "C", &group, ciphertext).await?;
+                let asked = if controls.corrupt_b_decrypt {
+                    "w3h-1581d control: not the ciphertext"
+                } else {
+                    ciphertext.as_str()
+                };
+                let b = b_decrypt_reply(sim, &group, asked, e0).await?;
+                (a, c, b)
+            }
             Err(error) => (
                 (false, error.clone()),
                 (false, error.clone()),
-                (false, error),
+                (BDecrypt::Other, format!("C encrypt: {error}")),
             ),
         };
-        let data_plane = a_after.0 && c_after.0 && !b_after.0;
+        let data_plane = a_ok && c_ok && b_class == BDecrypt::LacksNewEpochSecret;
         receipt.note(format!(
             "after the resume: completed {completed}; A's row {final_row:?}; A resolves the \
-             package again: {a_got_package}; {}; A decrypt: {}; C decrypt: {}; B decrypt: {}",
-            describe_all(&end),
-            a_after.1,
-            c_after.1,
-            b_after.1
+             package again: {a_got_package}; {}; A decrypt: {a_detail}; C decrypt: {c_detail}; B \
+             decrypt ({b_class:?}): {b_detail}",
+            describe_all(&end)
         ));
 
         let passed = reached
@@ -976,11 +1113,20 @@ async fn scenario(
                 )
             } else if !h_once || !signed_by_a {
                 (CAUSE_SECOND_ROTATION, true, describe_all(&end))
+            } else if b_class == BDecrypt::Other {
+                (
+                    CAUSE_UNTYPED_EXCLUSION,
+                    false,
+                    format!(
+                        "B's decrypt reply was not the typed missing-epoch-secret refusal, so the \
+                         exclusion is unproven: {b_detail}"
+                    ),
+                )
             } else {
                 (
                     CAUSE_DATA_PLANE,
                     true,
-                    format!("{}; {}; {}", a_after.1, c_after.1, b_after.1),
+                    format!("{a_detail}; {c_detail}; {b_detail}"),
                 )
             };
             receipt.cause(cause, Some(observed), ok, at(sim));
@@ -1124,16 +1270,19 @@ async fn scenario(
     Ok(())
 }
 
-async fn run(case: &str, seed: u64, labels: &[&str], resume: bool) -> Receipt {
+async fn run(case: &str, seed: u64, labels: &[&str], resume: bool, controls: Controls) -> Receipt {
     let mut receipt = Receipt::new(case, seed);
     receipt.note(format!(
         "#1581 / ADR 0110 S4 `s4_evidence_holder`. Timing from S4Timing::default() (measured; D69, \
-         D73): {:?}; the holder returns at t = W + Δ.",
-        S4Timing::default()
+         D73): {:?}; the holder returns at t = W + Δ. Controls: corrupt_b_decrypt {}, \
+         slow_completion {}.",
+        S4Timing::default(),
+        controls.corrupt_b_decrypt,
+        controls.slow_completion
     ));
     match start(case, seed, labels).await {
         Ok(mut sim) => {
-            if let Err(error) = scenario(&mut sim, &mut receipt, labels, resume).await {
+            if let Err(error) = scenario(&mut sim, &mut receipt, labels, resume, controls).await {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
             }
             if let Err(error) = sim.finish().await {
@@ -1154,8 +1303,15 @@ async fn run(case: &str, seed: u64, labels: &[&str], resume: bool) -> Receipt {
     receipt
 }
 
-async fn expect(case: &str, seed: u64, labels: &[&str], resume: bool, want: Verdict) -> Result<()> {
-    let receipt = run(case, seed, labels, resume).await;
+async fn expect(
+    case: &str,
+    seed: u64,
+    labels: &[&str],
+    resume: bool,
+    controls: Controls,
+    want: Verdict,
+) -> Result<()> {
+    let receipt = run(case, seed, labels, resume, controls).await;
     ensure!(
         receipt.verdict() == Some(want),
         "{case}: expected {want:?}, got {:?}",
@@ -1188,6 +1344,7 @@ fn w3h_1581d_control_evidence_holder_resume_after_holder_returns() -> Result<()>
             0x1581_0006,
             LABELS,
             true,
+            Controls::default(),
             Verdict::Green,
         )
         .await
@@ -1218,7 +1375,75 @@ fn w3h_1581d_red_evidence_holder_all_holders_offline() -> Result<()> {
             0x1581_0007,
             LABELS,
             false,
+            Controls::default(),
             Verdict::Green,
+        )
+        .await
+    })
+}
+
+/// The review-round-2 control for the arbitrary-refusal finding: B's
+/// post-resume decrypt is asked with garbage, so its refusal is an
+/// unrelated decrypt error. Only the typed missing-epoch-secret refusal
+/// proves the exclusion, so the control expects INFRA — at the review
+/// head the unrelated error passed as exclusion and the arm came out
+/// GREEN.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
+)]
+fn w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion",
+            0x1581_0008,
+            LABELS,
+            true,
+            Controls {
+                corrupt_b_decrypt: true,
+                ..Controls::default()
+            },
+            Verdict::Infra,
+        )
+        .await
+    })
+}
+
+/// The review-round-2 control for the reset-deadline finding: D's data
+/// stays blacked out until the one completion budget is spent, so the
+/// exclusion can only complete past it. Past the budget the arm must be
+/// RED (no completion), not GREEN under a deadline the release and the
+/// diagnostic waits silently extended.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
+)]
+fn w3h_1581d_control_completion_past_the_budget_is_red() -> Result<()> {
+    super::block_on_paused(async move {
+        expect(
+            "w3h_1581d_control_completion_past_the_budget_is_red",
+            0x1581_0009,
+            LABELS,
+            true,
+            Controls {
+                slow_completion: true,
+                ..Controls::default()
+            },
+            Verdict::Red,
         )
         .await
     })

@@ -885,6 +885,10 @@ jobs:
           --expect w3h_1581d_control_evidence_holder_resume_after_holder_returns=GREEN
           --require w3h_1581d_red_evidence_holder_all_holders_offline
           --expect w3h_1581d_red_evidence_holder_all_holders_offline=GREEN
+          --require w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion
+          --expect w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion=INFRA
+          --require w3h_1581d_control_completion_past_the_budget_is_red
+          --expect w3h_1581d_control_completion_past_the_budget_is_red=RED
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable
