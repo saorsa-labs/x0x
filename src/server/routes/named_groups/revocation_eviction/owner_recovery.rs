@@ -1524,9 +1524,10 @@ async fn finish_commit(
     // #1574 item 1: both non-durable shapes below are treated as
     // committed, and that evidence is enough for the drops after them.
     // `ReplacedNotDurable` keeps the installed candidate in the map (the
-    // persist rolls back only `NotReplaced` and hard errors), so this
-    // process never sees the install revert — except the preflight
-    // refusal, which stages nothing; the installed check separates it.
+    // persist rolls back only refusal outcomes and hard errors), so this
+    // process never sees the install revert — the preflight refusal
+    // stages nothing and reports its own outcomes, so it never reaches
+    // these committed arms.
     // The epoch-installed error is committed state: the journal it leaves
     // is already the commit point, which a restart replays, and its
     // non-durable roster arm converges memory to the candidate and sets
@@ -5718,14 +5719,15 @@ mod restart_tests {
         Ok(())
     }
 
-    /// #1574 item 1: the plain roster persist also returns
-    /// `ReplacedNotDurable` from its durability preflight — an earlier
-    /// write is still unconfirmed and its re-save fails again — and that
-    /// outcome stages no candidate. The author keeps its held mandate and
-    /// schedules no delivery; the roster keeps the parent. Before the
-    /// fix the author retired its mandate — here the owner's own agent is
-    /// the promoted member, so no owner wait existed to re-send it — and
-    /// scheduled a delivery for a roster the map never installed.
+    /// #1574 item 1: the plain roster persist also refuses while an
+    /// earlier write is still unconfirmed and its re-save fails again —
+    /// that refusal stages no candidate. The author keeps its held
+    /// mandate and schedules no delivery; the roster keeps the parent.
+    /// Before the root fix the refusal read as `ReplacedNotDurable` —
+    /// staged — and the author retired its mandate — here the owner's own
+    /// agent is the promoted member, so no owner wait existed to re-send
+    /// it — and scheduled a delivery for a roster the map never
+    /// installed.
     #[tokio::test]
     async fn a_recovery_whose_confirming_resave_fails_keeps_its_mandate() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -5821,14 +5823,13 @@ mod restart_tests {
         Ok(())
     }
 
-    /// #1574 item 1: the durability preflight's `ReplacedNotDurable`
-    /// stages nothing, so the receiver keeps the frame (`Retained`) and
-    /// the roster keeps the parent. Before the fix the receiver returned
-    /// `Applied` and dropped its mandate waits for an install that never
-    /// happened.
+    /// #1574 item 1: the durability preflight's refusal stages nothing,
+    /// so the receiver keeps the frame (`Retained`) and the roster keeps
+    /// the parent. Before the root fix the refusal read as
+    /// `ReplacedNotDurable` — staged — so the receiver returned `Applied`
+    /// and dropped its mandate waits for an install that never happened.
     #[tokio::test]
-    async fn a_received_recovery_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()>
-    {
+    async fn a_received_recovery_refuses_a_durability_preflight_refusal() -> Result<()> {
         let (author_dir, receiver_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
         let (receiver, info, bytes, _result_head, _admin) =
             received_recovery(author_dir.path(), receiver_dir.path()).await?;

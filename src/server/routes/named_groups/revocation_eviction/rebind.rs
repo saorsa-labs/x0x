@@ -484,7 +484,12 @@ async fn commit_locked(
             tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: certificate rebind persisted without a durability confirmation");
             Ok(())
         }
-        Ok(ng::AtomicWriteOutcome::NotReplaced) => Err("not replaced".to_string()),
+        // The preflight refusal (either shape) staged nothing, so the
+        // commit does not stand.
+        Ok(
+            ng::AtomicWriteOutcome::NotReplaced
+            | ng::AtomicWriteOutcome::PreflightRefusedAfterRename,
+        ) => Err("not replaced".to_string()),
         Err(error) => Err(error.to_string()),
     };
     if let Err(error) = persisted {
@@ -3667,14 +3672,15 @@ pub(super) mod restart_tests {
         Ok(())
     }
 
-    /// #1574 item 1: the durability preflight's `ReplacedNotDurable`
-    /// stages nothing (the confirming re-save failed again), so a
-    /// receiver reports a local failure, not `Applied`: the frame stays
-    /// durable for the retry and the roster keeps the parent. Before the
-    /// fix the receiver returned `Applied` and dropped the seat's waits
-    /// for an install that never happened.
+    /// #1574 item 1: the durability preflight's refusal stages nothing
+    /// (the confirming re-save failed again), so a receiver reports a
+    /// local failure, not `Applied`: the frame stays durable for the
+    /// retry and the roster keeps the parent. Before the root fix the
+    /// refusal read as `ReplacedNotDurable` — staged — so the receiver
+    /// returned `Applied` and dropped the seat's waits for an install
+    /// that never happened.
     #[tokio::test]
-    async fn a_received_rebind_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()> {
+    async fn a_received_rebind_refuses_a_durability_preflight_refusal() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let receiver = offline_daemon(dir.path(), None).await?;
         let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
@@ -3710,8 +3716,8 @@ pub(super) mod restart_tests {
 
     /// #1574 item 1, the other arm: a received rebind still applies a
     /// `ReplacedNotDurable` that staged its candidate (the #1508 r6
-    /// rule). The installed check refuses only the preflight outcome that
-    /// stages nothing.
+    /// rule). A preflight refusal reports its own non-staged outcomes
+    /// and never reaches this arm.
     #[tokio::test]
     async fn a_received_rebind_still_applies_a_staged_replaced_not_durable() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -4283,16 +4289,16 @@ pub(super) mod restart_tests {
         Ok(())
     }
 
-    /// #1574 item 1: the plain roster persist also returns
-    /// `ReplacedNotDurable` from its durability preflight — an earlier
-    /// write is still unconfirmed and its re-save fails again — and that
-    /// outcome stages no candidate. The admin rebind must not treat it as
-    /// an install: nothing landed, so the renewal is kept, the wait stays
-    /// and no delivery is scheduled. Before the fix the commit dropped
-    /// the renewal and the wait and scheduled a delivery for a roster the
-    /// map never installed.
+    /// #1574 item 1: the plain roster persist also refuses while an
+    /// earlier write is still unconfirmed and its re-save fails again —
+    /// that refusal stages no candidate. The admin rebind must not treat
+    /// it as an install: nothing landed, so the renewal is kept, the wait
+    /// stays and no delivery is scheduled. Before the root fix the
+    /// refusal read as `ReplacedNotDurable` — staged — and the commit
+    /// dropped the renewal and the wait and scheduled a delivery for a
+    /// roster the map never installed.
     #[tokio::test]
-    async fn an_admin_rebind_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()> {
+    async fn an_admin_rebind_refuses_a_durability_preflight_refusal() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let owner = UserKeypair::generate()?;
         let seat = AgentKeypair::generate()?;
@@ -4381,8 +4387,9 @@ pub(super) mod restart_tests {
     }
 
     /// #1574 item 1, the other arm: a `ReplacedNotDurable` that did stage
-    /// its candidate still commits. The installed check must not
-    /// over-refuse the non-durable install the #1508 r6 rule keeps.
+    /// its candidate still commits — the non-durable install the #1508
+    /// r6 rule keeps. A preflight refusal reports its own non-staged
+    /// outcomes and never reaches this arm.
     #[tokio::test]
     async fn an_admin_rebind_still_commits_a_staged_replaced_not_durable() -> Result<()> {
         let dir = tempfile::tempdir()?;

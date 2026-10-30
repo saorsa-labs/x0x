@@ -3546,18 +3546,19 @@ mod daemon_tests {
     }
 
     /// #1574 slice 3, the root: the durability preflight inside
-    /// `persist_named_group_info_inner` reports its refusal as
-    /// `NotReplaced`, not `ReplacedNotDurable`. The refusal stages
-    /// nothing of the caller's candidate (the confirming re-save of the
-    /// earlier replacement failed again), so it must not read as "the
-    /// candidate is visible, only its fsync is unconfirmed" — the arm
-    /// every commit site uses to keep the candidate and proceed. Before
-    /// the fix the refusal returned `ReplacedNotDurable` with nothing
+    /// `persist_named_group_info_inner` never reports its refusal as
+    /// `ReplacedNotDurable`. The refusal stages nothing of the caller's
+    /// candidate (the confirming re-save of the earlier replacement
+    /// failed again), so it must not read as "the candidate is visible,
+    /// only its fsync is unconfirmed" — the arm every commit site uses
+    /// to keep the candidate and proceed. A refusal whose re-save
+    /// renamed the current map gets its own outcome (S3 maps it to its
+    /// contained path); a refusal before any rename stays `NotReplaced`.
+    /// Before the fix both read as `ReplacedNotDurable` with nothing
     /// staged, and the commit sites dropped held state on an install
     /// that never happened.
     #[tokio::test]
-    async fn a_durability_preflight_refusal_reports_not_replaced_and_stages_nothing() -> Result<()>
-    {
+    async fn a_durability_preflight_refusal_never_reads_as_a_staged_replacement() -> Result<()> {
         let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
         let admin = state.agent.agent_id();
         let group_id = "cf".repeat(16);
@@ -3580,41 +3581,49 @@ mod daemon_tests {
         );
         let mut candidate = info.clone();
         candidate.seal_commit(state.agent.identity().agent_keypair(), ng::now_millis_u64())?;
-        // The preflight refuses: an earlier replacement is unconfirmed
-        // and its re-save fails again, before this candidate is staged.
-        state
-            .named_groups_requires_durability_confirmation
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let fault = ng::set_save_fault(&state, ng::SaveFault::ReplacedNotDurableAfterWrite);
-        assert_eq!(
-            ng::persist_named_group_info(&state, &group_id, candidate.clone()).await?,
-            ng::AtomicWriteOutcome::NotReplaced,
-            "the refusal staged nothing, so it must not read as a visible replacement"
-        );
-        assert_eq!(
+        async fn head_is(state: &AppState, group_id: &str, info: &GroupInfo) -> bool {
             state
                 .named_groups
                 .read()
                 .await
-                .get(&group_id)
-                .map(|stored| stored.state_hash.clone()),
-            Some(info.state_hash.clone()),
+                .get(group_id)
+                .is_some_and(|stored| stored.state_hash == info.state_hash)
+        }
+        // A refusal whose re-save renamed the current map (the re-save's
+        // fsync failed again): its own outcome, never a staged one, and
+        // nothing of the candidate is staged.
+        state
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let after_rename = ng::set_save_fault(&state, ng::SaveFault::ReplacedNotDurableAfterWrite);
+        assert_eq!(
+            ng::persist_named_group_info(&state, &group_id, candidate.clone()).await?,
+            ng::AtomicWriteOutcome::PreflightRefusedAfterRename,
+            "the refusal staged nothing, so it must not read as a visible replacement"
+        );
+        assert!(
+            head_is(&state, &group_id, &info).await,
+            "nothing was staged for the refused candidate"
+        );
+        // A refusal before any rename: plain `NotReplaced`.
+        let no_rename = ng::set_save_fault(&state, ng::SaveFault::NotReplaced);
+        assert_eq!(
+            ng::persist_named_group_info(&state, &group_id, candidate.clone()).await?,
+            ng::AtomicWriteOutcome::NotReplaced
+        );
+        assert!(
+            head_is(&state, &group_id, &info).await,
             "nothing was staged for the refused candidate"
         );
         // Once the re-save is durable the same write lands.
-        drop(fault);
+        drop(after_rename);
+        drop(no_rename);
         assert_eq!(
             ng::persist_named_group_info(&state, &group_id, candidate.clone()).await?,
             ng::AtomicWriteOutcome::Durable
         );
-        assert_eq!(
-            state
-                .named_groups
-                .read()
-                .await
-                .get(&group_id)
-                .map(|stored| stored.state_hash.clone()),
-            Some(candidate.state_hash.clone()),
+        assert!(
+            head_is(&state, &group_id, &candidate).await,
             "the retry installs the candidate once the preflight is durable"
         );
         Ok(())
@@ -3628,8 +3637,7 @@ mod daemon_tests {
     /// `committed_delivery_pending`, started its delivery and sealed
     /// shares of a rotation no roster installed.
     #[tokio::test]
-    async fn a_gss_crypto_exclusion_refuses_a_preflight_replaced_not_durable_that_staged_nothing(
-    ) -> Result<()> {
+    async fn a_gss_crypto_exclusion_refuses_a_durability_preflight_refusal() -> Result<()> {
         let fx = gss_leave_fixture().await?;
         let applied = ng::apply_named_group_metadata_event(
             &fx.state,
@@ -3719,8 +3727,7 @@ mod daemon_tests {
     /// `ReplacedNotDurable` (staged), the install reported `Applied` and
     /// released holds for an install that never happened.
     #[tokio::test]
-    async fn a_received_gss_exclusion_refuses_a_preflight_replaced_not_durable_that_staged_nothing(
-    ) -> Result<()> {
+    async fn a_received_gss_exclusion_refuses_a_durability_preflight_refusal() -> Result<()> {
         let fx = gss_leave_fixture().await?;
         let applied = ng::apply_named_group_metadata_event(
             &fx.state,
@@ -3875,6 +3882,17 @@ mod daemon_tests {
             .insert(fx.group_id.clone(), info.clone());
         drop(guard);
         driven.await?;
+        assert!(
+            fx.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .contains_key(&key),
+            "the committed roster's delivery survives its round"
+        );
         assert_ne!(
             delivery_status(&fx.state, &key, &survivor).await,
             Some(RecipientDelivery::Due),
