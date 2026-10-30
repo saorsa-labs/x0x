@@ -719,6 +719,19 @@ pub struct GroupInfo {
     /// equality. Slice 2 records only — no grace/`Refusing` derivation.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mandate_capability: BTreeMap<String, owner_mandate::MandateCapabilityState>,
+    /// #1650 (ADR 0110 §4a): certificates displaced by an applied
+    /// `CertificateRebindV1`, keyed by the displaced certificate's BLAKE3
+    /// digest — the digest the parent roster signed. Local evidence
+    /// retention: a node that applied one sibling rebind keeps the parent
+    /// certificate it displaced, so a later competing sibling on the same
+    /// parent stays fully verifiable and records as fork evidence instead
+    /// of stalling on `waiting_for_certificate_evidence`. Strictly local
+    /// like [`Self::mandate_capability`] (stripped outbound, rejected
+    /// inbound on bootstrap snapshots); participates in the #470
+    /// full-record equality. See
+    /// [`crate::groups::cert_rebind::install_certificate`].
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub displaced_certificates: BTreeMap<String, crate::identity::AgentCertificate>,
 
     /// Retained, applied state-commit history (issue #111, follow-up to
     /// ADR-0016). Each entry pairs a signed
@@ -1097,6 +1110,7 @@ impl GroupInfo {
             members_v2,
             join_requests: BTreeMap::new(),
             discovery_card_topic,
+            displaced_certificates: BTreeMap::new(),
             commit_log: Vec::new(),
             shared_secret,
             secret_epoch: 0,

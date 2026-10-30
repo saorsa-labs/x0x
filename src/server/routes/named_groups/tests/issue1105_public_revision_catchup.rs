@@ -5,7 +5,7 @@
 use super::super::{
     apply_signed_public_revision_catchup, now_millis_u64, owner_axis_catchup_block,
     signed_public_bootstrap_snapshot, signed_public_catchup_decide,
-    signed_public_catchup_extend_failure, OwnerAxisCatchupBlock,
+    signed_public_catchup_extend_failure, validate_public_group_bootstrap, OwnerAxisCatchupBlock,
 };
 
 fn apply_catchup(
@@ -1045,4 +1045,58 @@ async fn blocked_admin_cannot_catch_up() {
         "public-group bootstrap sender is not a known contact"
     );
     assert_eq!(installed_hash(&state, &group_id).await, behind_hash);
+}
+
+/// #1650: displaced rebind certificates are strictly local. An outbound
+/// bootstrap snapshot never carries them, and an inbound snapshot that
+/// does is refused by both validators, like the mandate-capability map.
+#[test]
+fn catchup_refuses_a_snapshot_that_carries_displaced_certificates() {
+    let authority = crate::identity::AgentKeypair::generate().expect("authority");
+    let member = crate::identity::AgentKeypair::generate().expect("member");
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    let sender = hex::encode(authority.agent_id().as_bytes());
+    let behind = owner_axis_pair(&authority, &member_hex);
+    // A metadata-only head that would otherwise catch up.
+    let mut metadata = behind.clone();
+    metadata.description = "renamed".to_string();
+    seal_owner_certified(
+        &mut metadata,
+        &authority,
+        now_millis_u64().saturating_add(1),
+    );
+    let mut lagging = behind.clone();
+    lagging.description = "stale".to_string();
+    let displaced = crate::identity::UserKeypair::generate()
+        .and_then(|owner| crate::identity::AgentCertificate::issue(&owner, &authority))
+        .expect("a displaced certificate");
+    metadata
+        .displaced_certificates
+        .insert("0".repeat(64), displaced);
+    let snapshot = signed_public_bootstrap_snapshot(metadata).expect("metadata snapshot");
+    assert!(
+        snapshot.displaced_certificates.is_empty(),
+        "a bootstrap snapshot strips the retained displaced certificates"
+    );
+    assert!(
+        apply_catchup(&lagging, &snapshot, &sender, &member_hex).is_some(),
+        "the stripped snapshot still catches up"
+    );
+    // The same snapshot carrying the map — a foreign mint or a probe — is
+    // refused wholesale by both inbound validators.
+    let mut foreign = snapshot.clone();
+    foreign.displaced_certificates.insert(
+        "0".repeat(64),
+        crate::identity::UserKeypair::generate()
+            .and_then(|owner| crate::identity::AgentCertificate::issue(&owner, &authority))
+            .expect("a second certificate"),
+    );
+    assert!(
+        apply_catchup(&lagging, &foreign, &sender, &member_hex).is_none(),
+        "catch-up must not install a snapshot that carries displaced certificates"
+    );
+    assert!(
+        !validate_public_group_bootstrap(&foreign, &sender, &member_hex),
+        "a bootstrap snapshot that carries displaced certificates is not legitimate"
+    );
 }

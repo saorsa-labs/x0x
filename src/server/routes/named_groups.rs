@@ -4572,6 +4572,9 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
     // ADR-0064 (§1b): the per-agent mandate-capability map is local
     // observation state — it never rides an outbound snapshot.
     group.mandate_capability.clear();
+    // #1650: displaced rebind certificates are local evidence retention —
+    // they never ride an outbound snapshot.
+    group.displaced_certificates.clear();
     group.join_requests.clear();
     group.shared_secret = None;
     group.secret_epoch = 0;
@@ -4611,6 +4614,10 @@ pub(in crate::server) fn validate_public_group_bootstrap(
         // local per-agent observation state, never legitimately minted
         // into an outbound snapshot.
         || !group.mandate_capability.is_empty()
+        // #1650: same rule for displaced rebind certificates — local
+        // evidence retention, never legitimately minted into an outbound
+        // snapshot.
+        || !group.displaced_certificates.is_empty()
         || !group.has_active_member(local_agent_hex)
         || !group
             .caller_role(sender_hex)
@@ -4900,6 +4907,9 @@ pub(in crate::server) fn apply_signed_public_revision_catchup(
         || snapshot.invite_lineage.is_some()
         || snapshot.fork_quarantine.is_some()
         || !snapshot.mandate_capability.is_empty()
+        // #1650: displaced rebind certificates are local evidence
+        // retention — an inbound snapshot never legitimately carries them.
+        || !snapshot.displaced_certificates.is_empty()
         || snapshot.stable_group_id() != local.stable_group_id()
         || snapshot.state_revision != local.state_revision.saturating_add(1)
         || snapshot.prev_state_hash.as_deref() != Some(local.state_hash.as_str())
