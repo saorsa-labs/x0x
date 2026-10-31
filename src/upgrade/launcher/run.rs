@@ -232,8 +232,12 @@ mod tests {
     fn exec_failures_exhaust_attempts_and_restore_previous_bytes() {
         let (dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
         let path = root.join("trial.json");
-        let mut trial =
-            Trial::new(host.binding().unwrap(), "alice".into(), &Clock::now().unwrap()).unwrap();
+        let mut trial = Trial::new(
+            host.binding().unwrap(),
+            "alice".into(),
+            &Clock::now().unwrap(),
+        )
+        .unwrap();
         trial.phase = Phase::Authorized;
         trial.save(&path).unwrap();
         let boot = trial.boot.clone();
@@ -266,8 +270,12 @@ mod tests {
     fn an_intentional_stop_before_the_first_spawn_spends_no_attempt() {
         let (dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
         let path = root.join("trial.json");
-        let mut trial =
-            Trial::new(host.binding().unwrap(), "alice".into(), &Clock::now().unwrap()).unwrap();
+        let mut trial = Trial::new(
+            host.binding().unwrap(),
+            "alice".into(),
+            &Clock::now().unwrap(),
+        )
+        .unwrap();
         trial.phase = Phase::Authorized;
         trial.save(&path).unwrap();
         let clock = Clock::now().unwrap();

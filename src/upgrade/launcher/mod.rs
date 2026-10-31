@@ -246,12 +246,13 @@ fn invalid(reason: impl std::fmt::Display) -> io::Error {
     io::Error::other(reason.to_string())
 }
 
-/// A recorded Failed cause is final: a launcher restart re-entering
-/// rollback keeps it instead of downgrading to Interrupted, which would
-/// reopen backoff and reapply of a known-bad release (ADR 0094 S4).
+/// A recorded final `failed:` verdict is kept when a launcher restart
+/// re-enters rollback; the last per-attempt error (no prefix) and an
+/// `interrupted:` cause never mask it, which would reopen backoff and
+/// reapply of a known-bad release (ADR 0094 S4).
 fn retained_cause<'a>(existing: Option<&'a str>, incoming: &'a str) -> std::borrow::Cow<'a, str> {
     match existing {
-        Some(existing) if !existing.starts_with("interrupted:") => existing.into(),
+        Some(existing) if existing.starts_with("failed:") => existing.into(),
         _ => incoming.into(),
     }
 }
@@ -279,6 +280,27 @@ mod tests {
         assert_eq!(
             retained_cause(None, "failed: total trial deadline reached"),
             "failed: total trial deadline reached"
+        );
+    }
+
+    /// The last per-attempt error carries no `failed:` prefix, so a
+    /// rollback that re-enters after a launcher restart must replace it
+    /// with the trial's final verdict instead of keeping it.
+    #[test]
+    fn a_per_attempt_error_never_poses_as_a_final_verdict() {
+        assert_eq!(
+            retained_cause(
+                Some("candidate exited before commit"),
+                "failed: launch attempts exhausted"
+            ),
+            "failed: launch attempts exhausted"
+        );
+        assert_eq!(
+            retained_cause(
+                Some("candidate exited before commit"),
+                "interrupted: launcher lost child custody"
+            ),
+            "interrupted: launcher lost child custody"
         );
     }
 

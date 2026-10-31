@@ -9,7 +9,12 @@ use std::collections::BTreeMap;
 /// canonical fixture root, a Host bound to the record, and the record.
 pub(super) fn fixture(
     phase: journal::Phase,
-) -> (tempfile::TempDir, PathBuf, recovery::Host, journal::JournalRecord) {
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    recovery::Host,
+    journal::JournalRecord,
+) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let artifact = |name: &str| {

@@ -1,5 +1,7 @@
 //! A live flush reply and a waited OLD child together permit start. Neither
 //! a record read nor a PID supplied by a caller can construct this receipt.
+//! The reply is bound to the frozen plan; the socket peer itself is not
+//! authenticated (SO_PEERCRED is an S3c prerequisite).
 use super::*;
 use std::io::{BufRead, Read, Write};
 use std::os::unix::net::UnixStream;
