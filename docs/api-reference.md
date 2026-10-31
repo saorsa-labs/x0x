@@ -3207,9 +3207,13 @@ stays disabled until the response, including when the home view redraws the
 banner from its cached upgrade status.
 
 Bare `x0x upgrade` and `x0x upgrade --force` stay read-only and refuse
-installation. `x0x upgrade --check` is a standalone GitHub release check and
-needs **no running daemon**. `--check` takes precedence over `--apply`;
-`--check --force` fetches the current manifest regardless of version.
+installation. `x0x upgrade --check` prints this CLI version and, when the
+selected daemon answers, that daemon's version. `x0x --name <instance>`
+selects that instance. A CLI in another directory that is older than the
+daemon is reported as not upgraded, with a command that installs only the
+CLI. `--check` takes precedence over `--apply`;
+`--check --force` fetches the current manifest and reports an update only
+when that release is strictly newer.
 `--force` does not bypass any daemon apply check. `x0xd --check-updates` also
 reports only and does not install binaries or SKILL.md. See
 [docs/upgrade-system.md](upgrade-system.md).

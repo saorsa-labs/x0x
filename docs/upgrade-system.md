@@ -120,6 +120,37 @@ Complete host inventory and transaction-bound guide installation remain
 separate M2 work. These staging controls do not establish a protected host
 transaction or authorize guide promotion at host commit.
 
+### CLI check and a split install (#1104)
+
+`x0x upgrade --check` prints this CLI version. When the selected daemon
+answers `GET /health`, the check also prints that daemon version.
+`x0x --name <instance> upgrade --check` and `--apply` use that instance.
+They do not read the default instance's `api.port`. `--check` still completes
+when no daemon answers. `--check --force` fetches the current release and
+compares semver. It prints "Update available" only when that release is
+strictly newer than this CLI. An equal, older or unparseable release is not
+an update.
+
+The daemon apply replaces `x0x` only when that file is in the same directory
+as `x0xd`. After `x0x upgrade --apply`, this CLI prints "CLI not upgraded"
+and a reinstall hint when its own file is in another directory and its
+version is older than the version the daemon applied. The CLI prints that
+notice on stderr, after the unchanged apply response. The hint is:
+
+```text
+cargo install x0x --bin x0x --force
+```
+
+That command installs only the `x0x` CLI. It does not replace `x0xd`.
+`scripts/install.sh` has no CLI-only mode, so the hint does not call it.
+The same check prints that hint only for an older split CLI. It does not
+also print `x0x upgrade --apply`. A CLI beside `x0xd` at a different version
+does not get the hint. Apply still replaces that sibling.
+
+A daemon apply that finds no sibling `x0x` records that the file is missing
+at debug level. It does not warn. `POST /upgrade/apply` and `x0x doctor` do
+not carry a companion status field. The CLI does not replace itself.
+
 ### Candidate execution probes (M2 S2d)
 
 Both packaged binaries accept `--upgrade-probe` as their first argument.

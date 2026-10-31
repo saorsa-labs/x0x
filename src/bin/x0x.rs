@@ -2264,7 +2264,7 @@ async fn run(
             force,
             ..
         } if *check || !*apply => {
-            return commands::upgrade::run(*check, *force).await;
+            return commands::upgrade::run(*check, *force, name).await;
         }
         Commands::Instances => return commands::daemon::instances().await,
         Commands::Doctor => {
@@ -3342,6 +3342,11 @@ async fn run(
             };
             let response = client.post_empty(path).await?;
             x0x::cli::print_value(client.format(), &response);
+            // #1104: the apply response stays unchanged. This process reports
+            // when it sits apart from the daemon it just upgraded.
+            if let Some(notice) = commands::upgrade::split_cli_notice_after_apply(&response) {
+                eprintln!("{notice}");
+            }
             Ok(())
         }
         Commands::Ws { sub } => match sub {

@@ -23,11 +23,13 @@ use super::{UpgradeError, UpgradeResult, Upgrader};
 pub(crate) const HTTP_DEFERRED_RESTART_DELAY: std::time::Duration =
     std::time::Duration::from_millis(750);
 
-/// Reinstall instructions for a CLI this apply did not replace (#1104).
+/// CLI-only reinstall for a binary this apply did not replace (#1104).
+///
+/// `scripts/install.sh` has no CLI-only mode: it stops the daemon and
+/// installs `x0xd` as well. This command installs only the `x0x` binary.
 pub(crate) const CLI_REINSTALL_HINT: &str = "\
-Reinstall the CLI through its package or install owner:
-  curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.sh | sh
-  cargo install x0x --force";
+This command installs only the x0x CLI. It does not replace x0xd:
+  cargo install x0x --bin x0x --force";
 
 /// Packaged CLI file name for this platform.
 pub(crate) fn cli_file_name() -> &'static str {
@@ -79,6 +81,18 @@ pub(crate) fn cli_upgrade_report(daemon_binary: &Path, cli_binary: &Path) -> Cli
                 daemon_binary.display()
             ),
         }
+    }
+}
+
+/// `Some` when no sibling CLI file exists. Callers log it at debug, not warn.
+pub(crate) fn missing_sibling_cli_message(cli_binary: &Path) -> Option<String> {
+    if cli_binary.is_file() {
+        None
+    } else {
+        Some(format!(
+            "sibling CLI file is missing: {}",
+            cli_binary.display()
+        ))
     }
 }
 
@@ -1509,34 +1523,39 @@ impl AutoApplyUpgrader {
                 .ok_or_else(|| UpgradeError::Other("target has no parent directory".to_string()))?;
             let x0x_name = cli_file_name();
             let x0x_path = parent_dir.join(x0x_name);
-            // #1104: a CLI in another directory is outside this transaction.
-            // Report it as not upgraded. Do not search the rest of the host.
-            match cli_upgrade_report(&target_path, &x0x_path) {
-                CliUpgradeReport::BesideDaemon => {
-                    info!("Found x0x CLI companion in same directory, upgrading it too...");
-                    #[cfg(unix)]
-                    {
-                        companion = Some((
-                            Upgrader::new(x0x_path, current_version.clone()),
-                            probe_cli.clone(),
-                        ));
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let extracted_x0x = temp_dir.join("extracted-x0x");
-                        if let Err(e) =
-                            extract_binary_from_archive(&archive_path, &extracted_x0x, x0x_name)
+            // #1104: replace only a sibling x0x. A missing file is not a split
+            // install. Do not search the rest of the host. The CLI process
+            // reports a binary that lives in another directory.
+            if let Some(message) = missing_sibling_cli_message(&x0x_path) {
+                debug!("{message}");
+            } else {
+                match cli_upgrade_report(&target_path, &x0x_path) {
+                    CliUpgradeReport::BesideDaemon => {
+                        info!("Found x0x CLI companion in same directory, upgrading it too...");
+                        #[cfg(unix)]
                         {
-                            warn!("Failed to extract companion x0x binary: {e}");
-                        } else {
                             companion = Some((
                                 Upgrader::new(x0x_path, current_version.clone()),
-                                extracted_x0x,
+                                probe_cli.clone(),
                             ));
                         }
+                        #[cfg(not(unix))]
+                        {
+                            let extracted_x0x = temp_dir.join("extracted-x0x");
+                            if let Err(e) =
+                                extract_binary_from_archive(&archive_path, &extracted_x0x, x0x_name)
+                            {
+                                warn!("Failed to extract companion x0x binary: {e}");
+                            } else {
+                                companion = Some((
+                                    Upgrader::new(x0x_path, current_version.clone()),
+                                    extracted_x0x,
+                                ));
+                            }
+                        }
                     }
+                    CliUpgradeReport::NotUpgraded { message } => warn!("{message}"),
                 }
-                CliUpgradeReport::NotUpgraded { message } => warn!("{message}"),
             }
         }
 
@@ -4788,27 +4807,11 @@ mod tests {
         );
     }
 
-    fn issue_1104_scratch(name: &str) -> PathBuf {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/issue-1104-tests");
-        std::fs::create_dir_all(&root).unwrap();
-        let dir = root.join(format!(
-            "{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
-    fn split_directories_apply_reports_cli_not_upgraded() {
-        let root = issue_1104_scratch("split-apply");
-        let dir_a = root.join("A");
-        let dir_b = root.join("B");
+    fn issue1104_split_directories_apply_reports_cli_not_upgraded() {
+        let root = tempfile::tempdir().unwrap();
+        let dir_a = root.path().join("A");
+        let dir_b = root.path().join("B");
         std::fs::create_dir_all(&dir_a).unwrap();
         std::fs::create_dir_all(&dir_b).unwrap();
         let daemon = dir_a.join(daemon_file_name());
@@ -4824,12 +4827,20 @@ mod tests {
                     "apply result must say the CLI was not upgraded: {message}"
                 );
                 assert!(
-                    message.contains("Reinstall the CLI"),
-                    "apply result must print the reinstall hint: {message}"
+                    message.contains("only the x0x CLI"),
+                    "apply result must say the hint installs only the CLI: {message}"
                 );
                 assert!(
-                    message.contains(CLI_REINSTALL_HINT),
-                    "hint text drifted: {message}"
+                    message.contains("cargo install x0x --bin x0x --force"),
+                    "hint must be the CLI-only cargo command: {message}"
+                );
+                assert!(
+                    !message.contains("install.sh"),
+                    "hint must not run the installer: {message}"
+                );
+                assert!(
+                    !message.contains("cargo install x0x --force"),
+                    "hint must not install every bin: {message}"
                 );
             }
             CliUpgradeReport::BesideDaemon => {
@@ -4846,5 +4857,21 @@ mod tests {
             "a CLI beside x0xd stays in the daemon apply"
         );
         assert!(!cli_installed_apart_from_daemon(&sibling));
+
+        let missing = dir_a.join(cli_file_name());
+        let _ = std::fs::remove_file(&missing);
+        let note = missing_sibling_cli_message(&missing).expect("missing sibling");
+        assert!(
+            note.contains("missing"),
+            "a missing sibling must say the file is missing: {note}"
+        );
+        assert!(
+            !note.contains("not beside") && !note.contains("CLI not upgraded"),
+            "a missing sibling is not a split-install warning: {note}"
+        );
+        assert!(
+            !note.contains(CLI_REINSTALL_HINT),
+            "a missing sibling must not print the reinstall hint: {note}"
+        );
     }
 }
