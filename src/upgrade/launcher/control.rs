@@ -107,16 +107,15 @@ pub(super) fn flush_and_reap(
             old,
         })
     })();
-    if let Err(error) = result {
-        // The flush failure is the cause; a reap failure must not mask it.
-        if let Err(reap) = child::stop_and_reap(child) {
-            return Err(io::Error::other(format!(
-                "{error}; reap also failed: {reap}"
-            )));
-        }
-        return Err(error);
+    result.map_err(|error| keep_cause(error, child::stop_and_reap(child)))
+}
+
+/// The flush failure is the cause; a reap failure must not mask it.
+fn keep_cause(error: io::Error, reap: io::Result<()>) -> io::Error {
+    match reap {
+        Ok(()) => error,
+        Err(reap) => io::Error::other(format!("{error}; reap also failed: {reap}")),
     }
-    result
 }
 
 /// The reply must name this transaction, generation and participant plan,
@@ -288,5 +287,197 @@ mod tests {
         old.wait().unwrap();
         assert!(error.contains("does not bind"), "{error}");
         assert_eq!(trial.phase, Phase::Armed);
+    }
+
+    #[test]
+    fn a_reap_failure_does_not_hide_the_flush_cause() {
+        let flush = || io::Error::new(io::ErrorKind::ConnectionRefused, "flush refused");
+        let kept = keep_cause(flush(), Ok(()));
+        assert_eq!(kept.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(kept.to_string(), "flush refused");
+        let both = keep_cause(flush(), Err(invalid("child reap timeout"))).to_string();
+        assert_eq!(both, "flush refused; reap also failed: child reap timeout");
+    }
+
+    fn refused(result: io::Result<Reaped>) -> io::Error {
+        match result {
+            Ok(_) => panic!("flush_and_reap must refuse"),
+            Err(error) => error,
+        }
+    }
+
+    /// Without /proc the launcher cannot prove custody of the OLD child, so
+    /// it refuses before it persists the budget or sends the token.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn flush_and_reap_refuses_without_linux_process_custody() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let clock = Clock::now().unwrap();
+        let trial = Trial::new(host.binding().unwrap(), "alice".into(), &clock).unwrap();
+        let mut old = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let result = flush_and_reap(&host, &trial, &path, &mut old, "inert launcher fixture");
+        old.kill().unwrap();
+        old.wait().unwrap();
+        assert_eq!(refused(result).kind(), io::ErrorKind::Unsupported);
+        assert!(!path.exists());
+    }
+
+    /// A real OLD child whose identity the frozen plan names.
+    #[cfg(target_os = "linux")]
+    mod custody {
+        use super::super::super::testkit::fixture_with;
+        use super::*;
+        use std::os::unix::net::UnixListener;
+        use std::process::Command;
+        use std::thread::JoinHandle;
+
+        const TOKEN: &str = "inert launcher fixture";
+
+        fn owned(
+            edit: impl FnOnce(&mut journal::Participant),
+        ) -> (tempfile::TempDir, PathBuf, recovery::Host, Trial, Child) {
+            let old = Command::new("sleep").arg("30").spawn().unwrap();
+            let live = child::identity(old.id()).unwrap();
+            let (dir, root, host, _record) = fixture_with(journal::Phase::SwappedCli, |record| {
+                let p = &mut record.plan.participants[0];
+                p.old_pid = Some(live.pid);
+                p.process_start = Some(live.start);
+                p.boot_id = live.boot;
+                edit(p);
+            });
+            let clock = Clock::now().unwrap();
+            let trial = Trial::new(host.binding().unwrap(), "alice".into(), &clock).unwrap();
+            (dir, root, host, trial, old)
+        }
+
+        /// The daemon side: answers one flush request with the fixture
+        /// receipt (after `edit`), then, if `exit` names it, kills the OLD
+        /// child as a daemon that exits after its flush. Returns the request.
+        fn serve(
+            root: &Path,
+            edit: fn(&mut serde_json::Value),
+            exit: Option<u32>,
+        ) -> JoinHandle<serde_json::Value> {
+            let listener = UnixListener::bind(root.join("upgrade-flush.sock")).unwrap();
+            std::thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                std::io::BufReader::new(&socket)
+                    .read_until(b'\n', &mut request)
+                    .unwrap();
+                let mut receipt = fixture_receipt(&request).unwrap();
+                edit(&mut receipt);
+                let mut reply =
+                    serde_json::to_vec(&serde_json::json!({ "receipt": receipt })).unwrap();
+                reply.push(b'\n');
+                (&socket).write_all(&reply).unwrap();
+                if let Some(pid) = exit {
+                    let status = Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                }
+                serde_json::from_slice(&request).unwrap()
+            })
+        }
+
+        fn stop(mut old: Child) {
+            old.kill().unwrap();
+            old.wait().unwrap();
+        }
+
+        #[test]
+        fn flush_and_reap_refuses_an_old_child_the_plan_does_not_name() {
+            let (_dir, root, host, trial, mut old) = owned(|p| {
+                p.old_pid = p.old_pid.map(|pid| pid + 1);
+            });
+            let path = root.join("trial.json");
+            let error = refused(flush_and_reap(&host, &trial, &path, &mut old, TOKEN));
+            assert!(
+                error.to_string().contains("differs from frozen ownership"),
+                "{error}"
+            );
+            // An unrelated process is never killed, and no budget is spent.
+            assert!(old.try_wait().unwrap().is_none());
+            assert!(!path.exists());
+            stop(old);
+        }
+
+        #[test]
+        fn flush_and_reap_refuses_a_trial_that_is_not_armed() {
+            let (_dir, root, host, mut trial, mut old) = owned(|_| {});
+            trial.phase = Phase::Authorized;
+            let path = root.join("trial.json");
+            let error = refused(flush_and_reap(&host, &trial, &path, &mut old, TOKEN));
+            assert!(
+                error.to_string().contains("differs from frozen ownership"),
+                "{error}"
+            );
+            assert!(old.try_wait().unwrap().is_none());
+            assert!(!path.exists());
+            stop(old);
+        }
+
+        #[test]
+        fn a_flush_without_a_daemon_socket_persists_the_budget_and_reaps() {
+            let (_dir, root, host, trial, mut old) = owned(|_| {});
+            let path = root.join("trial.json");
+            let error = refused(flush_and_reap(&host, &trial, &path, &mut old, TOKEN));
+            assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+            assert!(old.try_wait().unwrap().is_some());
+            let saved = Trial::load(&path, &trial.binding, "alice").unwrap();
+            assert_eq!(saved.phase, Phase::Armed);
+        }
+
+        #[test]
+        fn a_flush_reply_for_another_generation_or_transaction_reaps_and_refuses() {
+            let edits: [fn(&mut serde_json::Value); 2] = [
+                |r| r["binding"]["generation"] = 2.into(),
+                |r| r["binding"]["transaction_id"] = "another".into(),
+            ];
+            for edit in edits {
+                let (_dir, root, host, trial, mut old) = owned(|_| {});
+                let path = root.join("trial.json");
+                let server = serve(&root, edit, None);
+                let error = refused(flush_and_reap(&host, &trial, &path, &mut old, TOKEN));
+                server.join().unwrap();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("flush reply does not bind this participant"),
+                    "{error}"
+                );
+                assert!(old.try_wait().unwrap().is_some());
+            }
+        }
+
+        /// The daemon flushes, replies and exits: the waited OLD child and
+        /// the bound reply together let `authorize` permit the start.
+        #[test]
+        fn a_bound_flush_and_a_waited_old_child_authorize_the_start() {
+            let (_dir, root, host, mut trial, mut old) = owned(|_| {});
+            let path = root.join("trial.json");
+            let server = serve(&root, |_| {}, Some(old.id()));
+            let reaped = match flush_and_reap(&host, &trial, &path, &mut old, TOKEN) {
+                Ok(reaped) => reaped,
+                Err(error) => panic!("{error}"),
+            };
+            let request = server.join().unwrap();
+            assert_eq!(request["token"], TOKEN);
+            assert_eq!(request["instance_id"], "alice");
+            assert_eq!(request["generation"], trial.binding.generation);
+            assert_eq!(request["plan"], serde_json::to_value(host.plan()).unwrap());
+            assert!(old.try_wait().unwrap().is_some());
+            assert_eq!(reaped.binding, trial.binding);
+            authorize(&host, &mut trial, &path, &[reaped]).unwrap();
+            assert_eq!(trial.phase, Phase::Authorized);
+            let saved = Trial::load(&path, &trial.binding, "alice").unwrap();
+            assert_eq!(saved.phase, Phase::Authorized);
+        }
     }
 }
