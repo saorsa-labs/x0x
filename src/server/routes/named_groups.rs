@@ -6986,7 +6986,20 @@ where
             Ok(AtomicWriteOutcome::Durable) => state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release),
-            outcome => return outcome,
+            // #1574: a refusal here reports the confirming re-save of the
+            // EARLIER unconfirmed replacement, not this caller's write.
+            // The clear below never ran; nothing of its candidate is
+            // staged. Sent on as `ReplacedNotDurable` (the behaviour
+            // before this fix), it claimed the #759 shape — "the clear's
+            // replacement is visible, only its directory fsync is
+            // unconfirmed" — for a clear that did not occur. Report the
+            // refusal as `NotReplaced`. The flag stays set (the re-save's
+            // own handling keeps it), so the next save retries this
+            // preflight; a hard error stays an error.
+            Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::ReplacedNotDurable) => {
+                return Ok(AtomicWriteOutcome::NotReplaced)
+            }
+            Err(error) => return Err(error),
         }
     }
     persist_named_groups_quarantine_clear_gated_unlocked(
@@ -7195,7 +7208,21 @@ where
             Ok(AtomicWriteOutcome::Durable) => state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release),
-            outcome => return outcome,
+            // #1574: a refusal here reports the confirming re-save of the
+            // EARLIER unconfirmed replacement, not this caller's write.
+            // The mutation below never ran; nothing of its candidate is
+            // staged. Sent on as `ReplacedNotDurable` (the behaviour
+            // before this fix), it claimed the #759 shape — "the
+            // mutation's replacement is visible, only its directory
+            // fsync is unconfirmed" — the arm a caller uses to keep its
+            // candidate and proceed, for a mutation that did not occur.
+            // Report the refusal as `NotReplaced`. The flag stays set
+            // (the re-save's own handling keeps it), so the next save
+            // retries this preflight; a hard error stays an error.
+            Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::ReplacedNotDurable) => {
+                return Ok(AtomicWriteOutcome::NotReplaced)
+            }
+            Err(error) => return Err(error),
         }
     }
     let (before, after) = {
@@ -49893,6 +49920,7 @@ pub(in crate::server) mod tests {
     mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
     mod issue1570_held_back_tombstone;
+    mod issue1574_persist_preflight_refusal;
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
