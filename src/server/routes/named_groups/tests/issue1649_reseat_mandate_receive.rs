@@ -775,6 +775,19 @@ fn member_joined_record(
     member_joined_record_as(stage, signer, &stage.subject_hex, package, ts_ms)
 }
 
+/// The subject's own record for `package`, self-signed as a join of
+/// `group_id` (see [`member_joined_record`]): a valid record that
+/// belongs to another group.
+fn member_joined_record_in_group(
+    stage: &Stage,
+    signer: &AgentKeypair,
+    group_id: &str,
+    package: &str,
+    ts_ms: u64,
+) -> NamedGroupMetadataEvent {
+    member_joined_record_in_group_as(stage, signer, &stage.subject_hex, group_id, package, ts_ms)
+}
+
 /// [`member_joined_record`] claiming `member_agent_id` instead of the
 /// subject: with `signer` and `member_agent_id` both the impostor's, the
 /// record is internally consistent (it passes self-verification) while
@@ -787,10 +800,32 @@ fn member_joined_record_as(
     package: &str,
     ts_ms: u64,
 ) -> NamedGroupMetadataEvent {
+    member_joined_record_in_group_as(
+        stage,
+        signer,
+        member_agent_id,
+        &stage.group_id,
+        package,
+        ts_ms,
+    )
+}
+
+/// [`member_joined_record_as`] with the record's group ids supplied: a
+/// join of another group names that group in both its own ids and the
+/// bytes the member signs, so the record stays self-consistent while
+/// belonging to a different group.
+fn member_joined_record_in_group_as(
+    stage: &Stage,
+    signer: &AgentKeypair,
+    member_agent_id: &str,
+    group_id: &str,
+    package: &str,
+    ts_ms: u64,
+) -> NamedGroupMetadataEvent {
     let member_public_key_b64 = BASE64.encode(signer.public_key().as_bytes());
     let canonical = canonical_member_joined_bytes(
-        &stage.group_id,
-        Some(&stage.group_id),
+        group_id,
+        Some(group_id),
         member_agent_id,
         &member_public_key_b64,
         x0x::groups::GroupRole::Member,
@@ -804,8 +839,8 @@ fn member_joined_record_as(
         ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(signer.secret_key(), &canonical)
             .expect("sign MemberJoined record");
     NamedGroupMetadataEvent::MemberJoined {
-        group_id: stage.group_id.clone(),
-        stable_group_id: Some(stage.group_id.clone()),
+        group_id: group_id.to_string(),
+        stable_group_id: Some(group_id.to_string()),
         member_agent_id: member_agent_id.to_string(),
         member_public_key_b64,
         role: x0x::groups::GroupRole::Member,
@@ -1182,6 +1217,100 @@ async fn a_held_record_of_another_agent_fails_only_the_certificate_comparison() 
         )
         .await,
         Ok(())
+    );
+    Ok(())
+}
+
+/// #1680 follow-up (Engineer ruling 31 Oct 2026): a valid
+/// subject-signed `MemberJoined` from ANOTHER group — every other
+/// check-8 clause of it passes — is evidence about that group's seat,
+/// not this re-seat, so §3a check 8 refuses it with the typed
+/// `binding_mismatch` cause; the same record for the parent group
+/// passes (control).
+#[tokio::test]
+async fn a_carried_member_joined_from_another_group_is_refused_with_cause_binding_mismatch(
+) -> Result<()> {
+    let stage = stage().await?;
+    let package = BASE64.encode([7u8; 96]);
+    let hash = blake3::hash(package.as_bytes()).to_hex().to_string();
+    let mut fields = mandate_fields(&stage);
+    fields.key_package_hash = hash.clone();
+    let mandate = mint(fields, stage.admin.agent.identity().agent_keypair());
+    let foreign_group_id = "6c".repeat(32);
+    let foreign = member_joined_record_in_group(
+        &stage,
+        &stage.subject_kp,
+        &foreign_group_id,
+        &package,
+        4_060,
+    );
+    assert!(
+        verify_member_joined_key_package_event(&foreign),
+        "precondition: the foreign-group record passes self-verification"
+    );
+    // The typed clause: check 8's carried-record evidence must name the
+    // parent group, and a foreign-group record does not. The clause
+    // runs in the §3a receive wiring beside the mandate rule (the
+    // rule's own file is fenced to open PRs), and refuses with
+    // `binding_mismatch` before the later attestation gate's plain
+    // rejection.
+    assert!(
+        !carried_member_joined_recovery_binds_parent_group(&mandate, &stage.parent, Some(&foreign)),
+        "a carried record from another group must not bind to the parent group"
+    );
+    let before = record_json(&stage).await;
+    let applied = apply_listener_metadata_event(
+        &stage.receiver,
+        member_added_with(
+            &stage,
+            mandate.clone(),
+            &stage.terminal,
+            Some(&hash),
+            Some(foreign.clone()),
+            None,
+        ),
+        stage.admin.agent.agent_id(),
+        true,
+        None,
+    )
+    .await
+    .expect("the shielded apply completes");
+    assert!(
+        !applied.accepted,
+        "a carried record from another group must be refused"
+    );
+    assert_eq!(
+        before,
+        record_json(&stage).await,
+        "a refused re-seat leaves the committed record byte-identical"
+    );
+    assert!(
+        !live(&stage).await.has_active_member(&stage.subject_hex),
+        "the subject stays unseated"
+    );
+    // Control: the same subject-signed record for the parent group
+    // binds the package to this re-seat, so check 8 passes it.
+    let carried = member_joined_record(&stage, &stage.subject_kp, &package, 4_050);
+    assert!(carried_member_joined_recovery_binds_parent_group(
+        &mandate,
+        &stage.parent,
+        Some(&carried)
+    ));
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &stage.parent,
+            &stage.next,
+            &stage.terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash),
+            Some(&carried),
+            None
+        )
+        .await,
+        Ok(()),
+        "the parent-group record passes check 8"
     );
     Ok(())
 }

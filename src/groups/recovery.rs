@@ -1508,6 +1508,23 @@ pub fn verify_reseat_mandate(
     Ok(())
 }
 
+/// §3a check 8, the carried-record group half (#1680, Engineer ruling
+/// 31 Oct 2026): the subject-signed `MemberJoined` a re-seat carries
+/// must name the parent group — the joiner signs the ids it knows (the
+/// local MLS id, the stable id, or both). A self-verifying record from
+/// another group is evidence about that group's seat, not this
+/// re-seat: the receiver refuses it with
+/// [`ReseatMandateCause::BindingMismatch`].
+pub(crate) fn carried_member_joined_binds_parent_group(
+    record_group_id: &str,
+    record_stable_group_id: Option<&str>,
+    parent: &GroupInfo,
+) -> bool {
+    record_group_id == parent.mls_group_id
+        || record_group_id == parent.stable_group_id()
+        || record_stable_group_id == Some(parent.stable_group_id())
+}
+
 // ─── §4 The S3 sidecar ─────────────────────────────────────────────────────
 
 /// The sidecar directory under the data directory (§4).
