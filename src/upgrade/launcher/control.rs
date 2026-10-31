@@ -57,7 +57,7 @@ pub(super) fn fixture_receipt(bytes: &[u8]) -> io::Result<serde_json::Value> {
 /// an unrelated PID. It persists the original budget before requesting stop.
 pub(super) fn flush_and_reap(
     host: &recovery::Host,
-    trial: &Trial,
+    trial: &mut Trial,
     trial_path: &Path,
     child: &mut Child,
     token: &str,
@@ -109,10 +109,10 @@ pub(super) fn flush_and_reap(
     })();
     if let Err(error) = result {
         // The flush failure is the cause; a reap failure must not mask it.
+        // An unreaped OLD child is unowned: mark the trial RecoveryFailed.
         if let Err(reap) = child::stop_and_reap(child) {
-            return Err(io::Error::other(format!(
-                "{error}; reap also failed: {reap}"
-            )));
+            let error = invalid(format!("{error}; reap also failed: {reap}"));
+            return Err(trial.recovery_failed(trial_path, error));
         }
         return Err(error);
     }
