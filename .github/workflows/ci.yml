@@ -871,6 +871,8 @@ jobs:
           --expect w3h_1356_control_s3_attestation_touches_only_the_subject=GREEN
           --require w3h_1356_control_s3_d7_request_flood_rate_limited
           --expect w3h_1356_control_s3_d7_request_flood_rate_limited=GREEN
+          --require w3h_1356_control_s3_s64_segment_boundary
+          --expect w3h_1356_control_s3_s64_segment_boundary=GREEN
           --require w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix
           --expect w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix=GREEN
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
