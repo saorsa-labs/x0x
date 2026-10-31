@@ -20,6 +20,9 @@ use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+#[cfg(unix)]
+#[path = "../upgrade/launcher/mod.rs"]
+mod launcher;
 #[path = "../upgrade/log_flush.rs"]
 mod log_flush;
 
@@ -80,6 +83,8 @@ fn main() -> anyhow::Result<()> {
     if let Some(result) = x0x::upgrade::verification_probe::run_if_requested() {
         return result;
     }
+    #[cfg(unix)]
+    launcher::candidate_boot(env!("CARGO_PKG_VERSION"))?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(DAEMON_THREAD_STACK_BYTES)
