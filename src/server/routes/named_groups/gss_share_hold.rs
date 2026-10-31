@@ -685,6 +685,53 @@ pub(super) async fn release_exclusions(state: &AppState, group_key: &str, secret
     }
 }
 
+/// #1663: the own-seat key republication ends the keyless survivor's
+/// holds. A node that holds no group secret can not seal anything under a
+/// stale secret — the no-secret refusal answers its sends until the
+/// re-sealed share installs — so the withholding reason is gone once the
+/// seat can take a share again. Two scopes keep the S4 invariants: a node
+/// that still holds a secret keeps every hold (the old secret must never
+/// be reused; only the share installs ends its wait), and a hold that
+/// still carries `removed` evidence (the #1533 share-actor gates) keeps
+/// waiting for its ordinary end. See [`republish_releases`].
+pub(super) async fn release_keyless_on_republish(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) {
+    ensure_loaded(state).await;
+    let removed = {
+        let mut lot = state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(list) = lot.get_mut(group_key) else {
+            return;
+        };
+        let before = list.len();
+        list.retain(|hold| !republish_releases(info, hold));
+        let removed = list.len() != before;
+        if list.is_empty() {
+            lot.remove(group_key);
+        }
+        removed
+    };
+    if removed {
+        persist_logged(state, group_key).await;
+    }
+}
+
+/// Whether the #1663 key republication ends this hold on a node whose
+/// group state is `info`: yes only when the hold is live, the node holds
+/// no secret and the hold carries no removal evidence; no when the node
+/// still holds a secret (the old secret must never be reused) or the
+/// hold still gates share actors. A dead hold waits for the ordinary
+/// [`prune_exclusions`], which a share install runs.
+fn republish_releases(info: &x0x::groups::GroupInfo, hold: &ExclusionHold) -> bool {
+    holds(info, Some(hold.secret_epoch)) && info.shared_secret.is_none() && hold.removed.is_empty()
+}
+
 /// The group is gone from this node: drop its holds and their files.
 pub(super) async fn forget_group<'a>(
     state: &AppState,
@@ -789,6 +836,53 @@ pub(in crate::server) mod test_seam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1663: the key republication ends exactly the keyless survivor's
+    /// holds. A node that holds no secret and no removal evidence drops
+    /// the hold (it can not seal anything under a stale secret — the
+    /// no-secret refusal answers its sends until the share installs); a
+    /// node that still holds the old secret keeps every hold (the old
+    /// secret must never be reused), and a hold that still gates share
+    /// actors keeps waiting for its ordinary end.
+    #[test]
+    fn the_key_republication_ends_only_the_secretless_evidence_free_holds() {
+        let mut keyless = x0x::groups::GroupInfo::new(
+            "g".to_string(),
+            "d".to_string(),
+            crate::identity::AgentId([1u8; 32]),
+            "ab".repeat(16),
+        );
+        keyless.secret_epoch = 2;
+        keyless.shared_secret = None;
+        let live = ExclusionHold {
+            parent_state_hash: "parent".to_string(),
+            secret_epoch: 2,
+            removed: Vec::new(),
+        };
+        assert!(
+            republish_releases(&keyless, &live),
+            "the keyless install's hold ends with the republication"
+        );
+        let with_evidence = ExclusionHold {
+            removed: vec!["aa".repeat(32)],
+            ..live.clone()
+        };
+        assert!(
+            !republish_releases(&keyless, &with_evidence),
+            "a hold that still gates share actors keeps waiting"
+        );
+        keyless.shared_secret = Some(vec![7u8; 32]);
+        assert!(
+            !republish_releases(&keyless, &live),
+            "a node that still holds a secret keeps withholding it"
+        );
+        keyless.shared_secret = None;
+        keyless.secret_epoch = 3;
+        assert!(
+            !republish_releases(&keyless, &live),
+            "a dead hold waits for the ordinary prune"
+        );
+    }
 
     /// #1578 rc3 (review finding 1): the keyless claim is derived from
     /// the group state, not from the hold file. A hold write that fails

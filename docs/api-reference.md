@@ -1808,7 +1808,7 @@ every wait. A wait always names its cause; it does not stop silently.
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
 | `POST /groups/:id/secure/encrypt` (GSS plane) | `424 Failed Dependency` | `{"ok": false, "error": "no shared secret available — await welcome or ask admin to re-share"}`. The caller is an active member that holds no group secret and no verified-removal hold: an encrypted-group joiner still waiting for its welcome share. The keyless survivor of the 409 row below is not this state — its hold is what separates the two answers.
-| `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold lasts until the seat is keyed again — a sealed share of the held epoch (or a later one) installs, or the key republication of #1663 seats the seat's KEM key again. It has no timer of its own. |
+| `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold lasts until the seat is keyed again — a sealed share of the held epoch (or a later one) installs, or the key republication of #1663 seats the seat's KEM key again while the node holds no secret. It has no timer of its own. Between that republication and the share install the endpoint answers the no-secret `424` of the row above: the node still holds no secret to encrypt under. |
 
 The same hold refuses group ciphertext on the paths that make no HTTP
 response of their own, and each refusal carries the same reason text: a
@@ -1834,21 +1834,61 @@ superseded intermediate head included — serves the field exactly as
 before); and the author's removal obligation stays open — a keyless
 install never proves delivery. The state ends when the seat is keyed
 again. One exit: the seat leaves and re-joins with a verified KEM
-binding — no wire event today seats a KEM key on an already-Active
-seat — and a holder then seals the current secret to it and the sealed
-share installs; the S4 delivery's own re-seal (its author resends each
-round until the seat can take the share) or the next rotation do this
-on their own, and `POST /groups/:id/secure/reseal` only builds the
+binding — and a holder then seals the current secret to it and the
+sealed share installs; the S4 delivery's own re-seal (its author resends
+each round until the seat can take the share) or the next rotation do
+this on their own, and `POST /groups/:id/secure/reseal` only builds the
 envelope, which must still be delivered and installed. The second exit
-is the key republication planned in #1663 (David's 28 Oct 02:25 GMT
-ruling): it seats the seat's KEM key again without a leave and
-re-join, and the re-sealed share then ends the hold. Until one of the
-two keys the seat again, the hold lasts: an installed share of the
-held epoch, or a later one, or the #1663 republication, ends it.
+is the key republication of #1663 (David's 28 Oct 02:25 GMT ruling):
+the member signs its live ML-KEM-768 public key — the key its daemon
+can open sealed shares under — in the domain
+`x0x.member-key-republish.v1` and sends the typed `X0XKR1` frame to
+its group peers; each peer that verifies the signature, the signer's
+Active seat, the encrypted GSS plane and the frame's per-seat monotonic
+counter seats the key on the member's row (replays, stale keys, and
+unsigned or wrong-signer frames are refused). The republication is
+automatic: the keyless install itself sends it, and a node that boots
+into the keyless state — or into the keyed state whose share never
+installed — sends it at startup. A send the carrier does not accept is
+not done: a recipient whose verified advert is missing or expired, or
+whose send failed, keeps the frame owed, and the daemon retries it
+until the advert sets the bit or rules the frame out. A send the carrier
+accepts is not proof that the peer seated the key, so the daemon sends
+the frame again to each owed Active recipient, up to 6 carrier-accepted
+sends. The sweep interval starts at 5 s and doubles to a maximum of
+80 s. A newer republication for the same group resets the count. A
+recipient that leaves the group's Active roster, or is revoked, is no
+longer owed. The receiver refuses a repeat of a seated key as
+`stale_key`, so a repeat does no harm. The startup pass keeps the seat
+selected until the share installs, so a restart sends it again. Once
+the seat is keyed — on the survivor's own copy and on the authors' copies — the next S4
+delivery round seals the current secret to it and the share installs
+through the existing path, which ends the hold and returns the served
+head. Share completion stays distinct from that head: a catch-up answer
+from a seat an author's roster leaves keyless is not share-possession
+evidence (such a seat cannot hold the epoch secret), and the frame's
+ingest owes the republisher its sealed share on the author's open S4
+rows. That debt — not the roster key — holds the row open whatever a
+restored head already reported: it ends only when the carrier accepts a
+sealed share for the member, and a share batch whose bounded retries
+fail leaves the obligation in place, re-sealed each delivery round. If
+the member republishes while the author's GSS delivery is open, the
+author resets the member's earlier convergence: the member converges
+again only after the new-key share is accepted and the member reports
+its head. A peer whose verified advert lacks
+`key_republish_v1` (bit 12) keeps the pre-#1663 behavior, so the seat
+stays keyless in that peer's view until it upgrades or the member
+re-joins. The window between the
+keyed seat and the installed share is the same superseded-intermediate
+shape the 02:09 ruling keeps as main's answer, bounded by the share
+delivery the S4 row owes. Until one of the two keys the seat again, the
+hold lasts: an installed share of the held epoch, or a later one, or
+the #1663 republication (while the node holds no secret), ends it.
 
-**Wire and capabilities.** The daemon advertises three more ADR 0093
+**Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
-(bit 5) and `owner_recovery_v1` (bit 7). The new frames ride the
+(bit 5), `owner_recovery_v1` (bit 7) and `key_republish_v1` (bit 12,
+the #1663 republication). The new frames ride the
 direct-message carrier only. They are
 not on the metadata topic and not in a legacy-decoded container:
 
@@ -1861,6 +1901,21 @@ not on the metadata topic and not in a legacy-decoded container:
   current verified advert sets bit 5, and it checks the recipient's agent,
   machine and binding revocations just before each send. A capable member
   that asks for TreeKEM catch-up gets held frames on this same carrier.
+
+- `X0XKR1` — `MemberKeyRepublishV1` (#1663, bit 12 `key_republish_v1`).
+  An Active member of an encrypted GSS group republishes its ML-KEM-768
+  public key on its own seat — the recovery of the keyless survivor state
+  above, without a leave and re-join. The body is signed in domain
+  `x0x.member-key-republish.v1` by the member's agent key, which the body
+  carries, and which must derive the member's agent ID. It rides the
+  direct-message carrier only. Receivers verify the signature, the
+  signer's Active seat, the encrypted GSS plane and the frame's per-seat
+  monotonic counter (`key_sequence`). Refusals are typed; for example, a
+  replay or stale key is refused as `stale_key`, a wrong signer as
+  `bad_signature`, and an unseated signer as `actor_ineligible`. A daemon
+  sends it only to a member whose current verified advert sets bit 12.
+  A member that is removed and then admitted again starts a new counter:
+  its `kem_key_sequence` resets when its seat returns to Active.
 
 - `X0XORC1` — owner recovery (ADR 0110 §4b(1), bit 7
   `owner_recovery_v1`). One postcard frame type with two variants: the
