@@ -7,17 +7,46 @@
 //! network peers, waits [`wait`] (past v0.46.1's 90 s
 //! `HOME_POINTER_SYNC_WAIT`), stops, starts again, waits, and stops.
 //!
-//! A variant passes only if, in both runs: the binary starts; the group-ID
-//! set stays the same; `home.json` stays byte-identical, or stays absent;
-//! the Home group has no Active and no admin seat in either view; its state
-//! revision does not move; `POST /groups/:id/invite` and `POST /home/seat`
-//! are refused; and the S3 sidecar bytes do not change.
+//! A variant passes only if, in both runs: the binary starts and stays up;
+//! the API answers; the group-ID set stays the same; `home.json` stays
+//! byte-identical, or stays absent; the Home group has no Active seat in
+//! either file or in `GET /groups/:id/members`; its state revision does not
+//! move; `POST /groups/:id/invite` and `POST /home/seat` get an HTTP
+//! refusal; and the S3 sidecar bytes do not change.
 //!
-//! ADR 0109 §4 "Risk" predicts that the owner-install variants fail
-//! (released `find_home` needs an Active seat, so provisioning creates a
-//! fresh Home). The manifest pins them as expected failures (Engineer
-//! ruling, 29 Oct 2026). An expected failure that passes fails the test, so
-//! the pin is revisited. Home activation stays off while any variant fails.
+//! # What the released binaries do (measured 31 Oct 2026)
+//!
+//! The gate also asserts these measured steps, so a change in them fails
+//! the gate and somebody must look again:
+//!
+//! 1. Run 1 strips the placeholder's Home metadata. Released
+//!    `verify_restored_home_records` logs "restored Home metadata is
+//!    unsigned ... stripping", because the all-Removed roster does not
+//!    match the sealed state hash. After each run the
+//!    `home-suite-groups.json` entry has no `home` field.
+//! 2. An owner install (`owner_install` in the manifest) seals no fresh
+//!    Home. The now unstamped group matches `is_home_candidate`, so the
+//!    crash-recovery adoption step calls `stamp_and_seal_home`. That fails
+//!    the zero-active-admins invariant ("Home metadata seal failed:
+//!    invariant violation ... zero active admins") in each run, and the
+//!    step returns `Done` before the fresh-create step. The device install
+//!    makes no seal attempt. `home.json` does not change in any variant.
+//! 3. A released save rewrites the `named_groups.json` entry in its #451
+//!    form (an empty roster and the default admission). A released load
+//!    lets the `home-suite-groups.json` entry win. Run 2 loads that #451
+//!    form, and `GET /groups/:id/members` still shows no Active member, so
+//!    the rewrite is inert. The gate requires the #451 form after each run.
+//!
+//! # Divergence from ADR 0109 §4
+//!
+//! ADR 0109 §4 "Risk" predicted that the owner-install variants fail:
+//! released `find_home` needs an Active seat, so provisioning would create
+//! a fresh Home. The 29 Oct 2026 ruling pinned that failure only "if the
+//! test confirms this". The test does not confirm it: the released adoption
+//! step fails closed (step 2), so no fresh Home is created. The Engineer
+//! ruled on 31 Oct 2026 to remove the pin and to assert steps 1 to 3. The
+//! gate pins no expected failure, and a manifest `expected_failure: true`
+//! fails it.
 //!
 //! The binaries are installed by `scripts/ci/prepare-released-h-s3-home.sh`
 //! before the loopback-only test namespace starts. The tests are ignored
@@ -103,14 +132,32 @@ fn tail(path: &Path) -> String {
     buf
 }
 
+/// The form of the Home group's entry in `named_groups.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedForm {
+    /// The file has no entry for the group.
+    Absent,
+    /// A non-empty roster with no Active member (the candidate's form).
+    SeatsNoOne,
+    /// The released #451 form: an empty roster and the default admission.
+    Released451,
+    /// Any other roster: a released load can seat someone from it.
+    SeatsSomeone,
+}
+
 /// What the files of one data directory say about the Home group.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct DiskView {
     group_ids: BTreeSet<String>,
     home_json: Option<String>,
     sidecars: BTreeSet<(String, String)>,
     /// Per legacy view: the group's state revision.
     revisions: Vec<Option<u64>>,
+    /// The `home-suite-groups.json` entry seats no one.
+    suite_inert: bool,
+    /// The `home-suite-groups.json` entry still has `home` metadata.
+    suite_home: bool,
+    named: NamedForm,
 }
 
 fn load_map(path: &Path) -> serde_json::Map<String, Value> {
@@ -138,24 +185,16 @@ fn is_released_451_form(entry: &Value) -> bool {
         && entry["policy"]["admission"].is_string()
 }
 
-fn disk_view(data: &Path, group_key: &str, problems: &mut Vec<String>) -> DiskView {
+fn disk_view(data: &Path, group_key: &str) -> DiskView {
     let named = load_map(&data.join("named_groups.json"));
     let suite = load_map(&data.join("home-suite-groups.json"));
-    let suite_inert = suite.get(group_key).is_some_and(seats_no_one);
-    if !suite_inert {
-        problems.push("home-suite-groups.json: the Home group seats someone".to_string());
-    }
-    // A released save writes the #451 form (empty roster) into
-    // `named_groups.json` for every OwnerCertified group. A released load
-    // lets the `home-suite-groups.json` entry win, so that form seats no
-    // one while the Home-Suite entry is inert. Any other roster that seats
-    // someone fails.
-    if let Some(entry) = named.get(group_key) {
-        let inert = seats_no_one(entry) || (suite_inert && is_released_451_form(entry));
-        if !inert {
-            problems.push("named_groups.json: the Home group seats someone".to_string());
-        }
-    }
+    let suite_entry = suite.get(group_key);
+    let named_form = match named.get(group_key) {
+        None => NamedForm::Absent,
+        Some(entry) if seats_no_one(entry) => NamedForm::SeatsNoOne,
+        Some(entry) if is_released_451_form(entry) => NamedForm::Released451,
+        Some(_) => NamedForm::SeatsSomeone,
+    };
     let revisions = [&named, &suite]
         .iter()
         .map(|map| {
@@ -175,7 +214,88 @@ fn disk_view(data: &Path, group_key: &str, problems: &mut Vec<String>) -> DiskVi
         home_json: file_sha(&data.join("home.json")),
         sidecars,
         revisions,
+        suite_inert: suite_entry.is_some_and(seats_no_one),
+        suite_home: suite_entry.is_some_and(|entry| !entry["home"].is_null()),
+        named: named_form,
     }
+}
+
+/// The fixture form: both entries seat no one and the Home-Suite entry
+/// has the S3 placeholder's `home` metadata.
+fn fixture_problems(view: &DiskView) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !view.suite_inert {
+        problems.push("home-suite-groups.json: the Home group seats someone".to_string());
+    }
+    if !view.suite_home {
+        problems.push("home-suite-groups.json: no Home metadata to strip".to_string());
+    }
+    if view.named != NamedForm::SeatsNoOne {
+        problems.push(format!("named_groups.json: {:?}", view.named));
+    }
+    problems
+}
+
+/// The files after a released run: step 1 (Home metadata stripped) and
+/// step 3 (the #451 rewrite, inert behind an inert Home-Suite entry).
+fn after_run_problems(view: &DiskView, run: usize) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !view.suite_inert {
+        problems.push(format!(
+            "run {run}: home-suite-groups.json: the Home group seats someone"
+        ));
+    }
+    if view.suite_home {
+        problems.push(format!(
+            "run {run}: home-suite-groups.json kept the unsigned Home metadata (step 1)"
+        ));
+    }
+    if view.named != NamedForm::Released451 {
+        problems.push(format!(
+            "run {run}: named_groups.json is {:?}, not the released #451 form (step 3)",
+            view.named
+        ));
+    }
+    problems
+}
+
+/// The released log lines of one run: step 1 (strip, run 1 only; run 2
+/// loads the stripped entry) and step 2 (an owner install fails the
+/// adoption seal; a device install does not try it).
+fn log_problems(home: &Path, run: usize, owner_install: bool, group_key: &str) -> Vec<String> {
+    let mut log = fs::read_to_string(home.join(format!("stdout-{run}.log"))).unwrap_or_default();
+    log.push_str(&fs::read_to_string(home.join(format!("stderr-{run}.log"))).unwrap_or_default());
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(group_key))
+        .collect();
+    let stripped = lines.iter().any(|line| {
+        line.contains("restored Home metadata is unsigned") && line.contains("stripping")
+    });
+    let seal_failed = lines.iter().any(|line| {
+        line.contains("Home metadata seal failed: invariant violation")
+            && line.contains("zero active admins")
+    });
+    let seal_tried = lines
+        .iter()
+        .any(|line| line.contains("Home metadata seal") || line.contains("adopting unstamped"));
+    let mut problems = Vec::new();
+    if run == 1 && !stripped {
+        problems.push(format!(
+            "run {run}: no \"restored Home metadata is unsigned ... stripping\" line (step 1)"
+        ));
+    }
+    if owner_install && !seal_failed {
+        problems.push(format!(
+            "run {run}: owner install: no zero-active-admins seal failure (step 2)"
+        ));
+    }
+    if !owner_install && seal_tried {
+        problems.push(format!(
+            "run {run}: device install tried the Home adoption seal (step 2)"
+        ));
+    }
+    problems
 }
 
 struct Daemon {
@@ -298,28 +418,35 @@ async fn request(daemon: &Daemon, post: Option<Value>, path: &str) -> (u16, Valu
     }
 }
 
-/// The group IDs that the running daemon lists.
-async fn api_group_ids(daemon: &Daemon) -> BTreeSet<String> {
-    let (_, body) = request(daemon, None, "/groups").await;
-    body["groups"]
+/// The group IDs that the running daemon lists. A daemon that does not
+/// answer `200` with a `groups` array fails the check.
+async fn api_group_ids(daemon: &Daemon) -> Result<BTreeSet<String>, String> {
+    let (status, body) = request(daemon, None, "/groups").await;
+    let groups = body["groups"]
         .as_array()
-        .map(|groups| {
-            groups
-                .iter()
-                .filter_map(|group| {
-                    group["group_id"]
-                        .as_str()
-                        .or_else(|| group["id"].as_str())
-                        .map(str::to_string)
-                })
-                .collect()
+        .filter(|_| status == 200)
+        .ok_or_else(|| format!("GET /groups: {status} {body}"))?;
+    Ok(groups
+        .iter()
+        .filter_map(|group| {
+            group["group_id"]
+                .as_str()
+                .or_else(|| group["id"].as_str())
+                .map(str::to_string)
         })
-        .unwrap_or_default()
+        .collect())
 }
 
-/// The live checks of one run: no new group, invite mint and Home seat
-/// refused.
-async fn live_checks(daemon: &Daemon, group_key: &str, run: usize, problems: &mut Vec<String>) {
+/// A mutating request must get an HTTP refusal. Status `0` means that no
+/// daemon answered, which is not a refusal.
+fn refused(status: u16) -> bool {
+    (400..600).contains(&status)
+}
+
+/// The live checks of one run: the API answers, no new group, invite mint
+/// and Home seat refused, the daemon stays up through the wait, and the
+/// members view seats no one (step 3: the Home-Suite entry wins the load).
+async fn live_checks(daemon: &mut Daemon, group_key: &str, run: usize, problems: &mut Vec<String>) {
     let before = api_group_ids(daemon).await;
     let (status, body) = request(
         daemon,
@@ -327,8 +454,8 @@ async fn live_checks(daemon: &Daemon, group_key: &str, run: usize, problems: &mu
         &format!("/groups/{group_key}/invite"),
     )
     .await;
-    if (200..300).contains(&status) {
-        problems.push(format!("run {run}: invite minted: {body}"));
+    if !refused(status) {
+        problems.push(format!("run {run}: invite not refused: {status} {body}"));
     }
     let (status, body) = request(
         daemon,
@@ -336,43 +463,74 @@ async fn live_checks(daemon: &Daemon, group_key: &str, run: usize, problems: &mu
         "/home/seat",
     )
     .await;
-    if (200..300).contains(&status) {
-        problems.push(format!("run {run}: POST /home/seat accepted: {body}"));
+    if !refused(status) {
+        problems.push(format!(
+            "run {run}: POST /home/seat not refused: {status} {body}"
+        ));
     }
     tokio::time::sleep(wait()).await;
-    let after = api_group_ids(daemon).await;
-    if after != before {
+    if !matches!(daemon.child.try_wait(), Ok(None)) {
         problems.push(format!(
-            "run {run}: the group set moved while running: {before:?} -> {after:?}"
+            "run {run}: the daemon exited during the wait\n{}",
+            tail(&daemon.stderr)
+        ));
+        return;
+    }
+    let after = api_group_ids(daemon).await;
+    match (&before, &after) {
+        (Ok(before), Ok(after)) if before == after => {}
+        _ => problems.push(format!(
+            "run {run}: the group set moved or did not answer: {before:?} -> {after:?}"
+        )),
+    }
+    let (status, body) = request(daemon, None, &format!("/groups/{group_key}/members")).await;
+    let active = body["members"].as_array().map(|members| {
+        members
+            .iter()
+            .filter(|member| member["state"] == "active")
+            .count()
+    });
+    if status != 200 || active != Some(0) {
+        problems.push(format!(
+            "run {run}: GET /groups/:id/members seats someone or did not answer: {status} {body}"
         ));
     }
 }
 
 /// One variant on one binary: the list of failed checks.
-async fn run_variant(bin: PathBuf, tag: &str, name: String, group_key: String) -> Vec<String> {
+async fn run_variant(
+    bin: PathBuf,
+    tag: &str,
+    name: String,
+    group_key: String,
+    owner_install: bool,
+) -> Vec<String> {
     let home = root().join("target/h-s3-home").join(tag).join(&name);
     let _ = fs::remove_dir_all(&home);
     let data = home.join("data");
     copy_dir(&fixture().join(&name), &data);
-    let mut problems = Vec::new();
-    let baseline = disk_view(&data, &group_key, &mut problems);
+    let baseline = disk_view(&data, &group_key);
+    let problems = fixture_problems(&baseline);
     if !problems.is_empty() {
         return problems
             .into_iter()
             .map(|p| format!("fixture: {p}"))
             .collect();
     }
+    let mut problems = Vec::new();
     for run in 1..=2 {
-        let daemon = match start(&bin, &home, run) {
+        let mut daemon = match start(&bin, &home, run) {
             Ok(daemon) => daemon,
             Err(error) => {
                 problems.push(format!("run {run}: the binary did not start: {error}"));
                 break;
             }
         };
-        live_checks(&daemon, &group_key, run, &mut problems).await;
+        live_checks(&mut daemon, &group_key, run, &mut problems).await;
         daemon.stop();
-        let view = disk_view(&data, &group_key, &mut problems);
+        let view = disk_view(&data, &group_key);
+        problems.extend(after_run_problems(&view, run));
+        problems.extend(log_problems(&home, run, owner_install, &group_key));
         if view.group_ids != baseline.group_ids {
             problems.push(format!(
                 "run {run}: group-ID set {:?} -> {:?}",
@@ -404,28 +562,28 @@ async fn gate(tag: &str, env: &str) {
     let variants = manifest.as_object().expect("manifest: variant -> entry");
     let mut tasks = tokio::task::JoinSet::new();
     for (name, variant) in variants {
+        // Engineer ruling, 31 Oct 2026: the gate pins no expected failure.
+        assert!(
+            !variant["expected_failure"].as_bool().unwrap_or(false),
+            "manifest pins {name} as an expected failure; the gate pins none"
+        );
         let group_key = variant["group_key"]
             .as_str()
             .expect("group_key")
             .to_string();
-        let expected_failure = variant["expected_failure"].as_bool().unwrap_or(false);
+        let owner_install = variant["owner_install"].as_bool().expect("owner_install");
         let (bin, tag, name) = (bin.clone(), tag.to_string(), name.clone());
         tasks.spawn(async move {
-            let problems = run_variant(bin, &tag, name.clone(), group_key).await;
-            (name, expected_failure, problems)
+            let problems = run_variant(bin, &tag, name.clone(), group_key, owner_install).await;
+            (name, problems)
         });
     }
     let mut report = serde_json::Map::new();
-    let mut verdicts = Vec::new();
+    let mut all_pass = true;
     while let Some(joined) = tasks.join_next().await {
-        let (name, expected_failure, problems) = joined.expect("variant task");
-        let verdict = match (problems.is_empty(), expected_failure) {
-            (true, false) => "pass",
-            (false, true) => "expected failure",
-            (true, true) => "UNEXPECTED PASS",
-            (false, false) => "FAIL",
-        };
-        verdicts.push((name.clone(), verdict));
+        let (name, problems) = joined.expect("variant task");
+        let verdict = if problems.is_empty() { "pass" } else { "FAIL" };
+        all_pass &= problems.is_empty();
         report.insert(name, json!({ "verdict": verdict, "problems": problems }));
     }
     let report = Value::Object(report);
@@ -435,9 +593,7 @@ async fn gate(tag: &str, env: &str) {
     let _ = fs::write(&out, serde_json::to_vec_pretty(&report).unwrap_or_default());
     println!("H-S3-home {tag}: {report:#}");
     assert!(
-        verdicts
-            .iter()
-            .all(|(_, verdict)| matches!(*verdict, "pass" | "expected failure")),
+        all_pass,
         "H-S3-home {tag} (Home activation stays off): {report:#}"
     );
 }

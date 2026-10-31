@@ -529,9 +529,13 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: h-s3-home-released
+          # The reports and the released daemon logs only; the run data
+          # directories hold identity keys and the API token.
           path: |
             ${{ runner.temp }}/x0x-metadata-*/
             ${{ runner.temp }}/x0x-isolation-*/
+            target/h-s3-home/*-report.json
+            target/h-s3-home/*/*/std*-*.log
           if-no-files-found: warn
 
   linux-systemd-policy:
