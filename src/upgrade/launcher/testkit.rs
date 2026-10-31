@@ -1,6 +1,7 @@
 //! Shared inert fixtures for the refusal and run-loop tests. Canonical
 //! paths, real bytes and a real journal record, with no live process: only
 //! paths that need no process custody may use this builder.
+#![cfg(test)]
 use super::filesystem::hash;
 use super::*;
 use std::collections::BTreeMap;
