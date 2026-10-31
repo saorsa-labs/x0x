@@ -13455,9 +13455,12 @@ impl Agent {
         // it can delete the just-disclosed certificate (see
         // `upsert_discovered_agent`). Storing first means every
         // announcement built after this line carries the certificate. The
-        // restore below keeps the old guarantee that a disclosure which
-        // never propagated does not flip heartbeats to including the user
-        // identity.
+        // restore below keeps the old guarantee for the steady state: once
+        // a failed disclosure returns, consent is back to its prior value,
+        // so heartbeats do not keep including the identity. (One beat
+        // published during the in-flight attempt may still carry it — the
+        // human did consent, and the next anonymous beat in a later second
+        // withdraws it again.)
         let consented_before = self
             .user_identity_consented
             .load(std::sync::atomic::Ordering::Acquire);
@@ -35149,8 +35152,15 @@ mod tests {
     #[tokio::test]
     async fn failed_disclosure_does_not_leave_consent_recorded() {
         // No network config: the gossip runtime is absent, so the publish
-        // path errors before anything leaves this process.
-        let agent = Agent::builder().build().await.unwrap();
+        // path errors before anything leaves this process. Key files stay
+        // in a temp dir, not ~/.x0x.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .build()
+            .await
+            .unwrap();
 
         let err = agent.announce_identity(true, true).await.unwrap_err();
         assert!(
@@ -35171,7 +35181,15 @@ mod tests {
     /// read the flag.
     #[tokio::test]
     async fn concurrent_disclosures_serialize_on_the_announce_lock() {
-        let agent = std::sync::Arc::new(Agent::builder().build().await.unwrap());
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = std::sync::Arc::new(
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .build()
+                .await
+                .unwrap(),
+        );
         let held = agent.announce_identity_lock.lock().await;
 
         let clone = std::sync::Arc::clone(&agent);
@@ -41186,9 +41204,37 @@ async fn same_second_anonymous_announce_keeps_a_disclosed_certificate() {
         assert_eq!(entry.user_id, Some(user_id));
     }
 
-    // ADR-0038 freshness is intact: a strictly fresher anonymous beat
-    // still drops the cached certificate. There the beat provably postdates
-    // the disclosure, so the digest change reads as a withdrawal.
+    // A same-second beat committing to a DIFFERENT non-anonymous digest (a
+    // re-key inside one second) still drops: the blob fetch can repair it.
+    let mut rekeyed = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    rekeyed.agent_id = id;
+    rekeyed.agent_certificate = Some(cert.clone());
+    rekeyed.cert_digest = Some(digest);
+    upsert_discovered_agent(&cache, &cert_events, rekeyed).await;
+    let mut same_second_rekey = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    same_second_rekey.agent_id = id;
+    same_second_rekey.cert_digest = Some([0xAA; 32]);
+    upsert_discovered_agent(&cache, &cert_events, same_second_rekey).await;
+    {
+        let guard = cache.read().await;
+        let entry = guard.get(&id).expect("entry present");
+        assert!(
+            entry.agent_certificate.is_none(),
+            "a same-second non-anonymous re-key digest still drops the certificate"
+        );
+        assert_eq!(entry.cert_digest, Some([0xAA; 32]));
+    }
+
+    // Restore the disclosed state, then ADR-0038 freshness is intact: a
+    // strictly fresher anonymous beat still drops the cached certificate.
+    // There the beat provably postdates the disclosure, so the digest
+    // change reads as a withdrawal.
+    let mut again = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    again.agent_id = id;
+    again.agent_certificate = Some(cert.clone());
+    again.cert_not_after = cert.not_after();
+    again.cert_digest = Some(digest);
+    upsert_discovered_agent(&cache, &cert_events, again).await;
     let mut fresher_anonymous = discovered_agent_fixture(9, 1_005, &["1.2.3.4:5483"], None);
     fresher_anonymous.agent_id = id;
     fresher_anonymous.cert_digest = Some(announce_v3::anonymous_cert_digest());
@@ -41203,6 +41249,45 @@ async fn same_second_anonymous_announce_keeps_a_disclosed_certificate() {
         entry.cert_digest,
         Some(announce_v3::anonymous_cert_digest())
     );
+}
+
+/// #1643, fetch-pending variant: the peer's entry holds only the DIGEST of
+/// a disclosure whose blob fetch is still in flight. A same-second
+/// pre-consent anonymous beat must not move the entry to the anonymous
+/// digest — `patch_discovery_entry_when_blob_lands` only attaches a
+/// certificate while the entry still commits to the fetched digest, so the
+/// old behavior stranded the in-flight repair and left the peer without
+/// evidence until the agent's next cert-carrying beat.
+#[tokio::test]
+async fn same_second_anonymous_announce_keeps_a_pending_fetch_digest() {
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let cert_events = test_cert_events();
+    let user = identity::UserKeypair::generate().unwrap();
+    let member = identity::AgentKeypair::generate().unwrap();
+    let cert = identity::AgentCertificate::issue(&user, &member).unwrap();
+    let id = member.agent_id();
+    let digest = announce_v3::cert_digest(&Some(user.user_id()), &Some(cert));
+
+    // The disclosure's V3 beat landed: digest known, certificate still
+    // behind the async blob fetch.
+    let mut pending = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    pending.agent_id = id;
+    pending.cert_digest = Some(digest);
+    upsert_discovered_agent(&cache, &cert_events, pending).await;
+
+    let mut anonymous = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    anonymous.agent_id = id;
+    anonymous.cert_digest = Some(announce_v3::anonymous_cert_digest());
+    upsert_discovered_agent(&cache, &cert_events, anonymous).await;
+
+    let guard = cache.read().await;
+    let entry = guard.get(&id).expect("entry present");
+    assert_eq!(
+        entry.cert_digest,
+        Some(digest),
+        "the entry keeps the digest the in-flight fetch will resolve"
+    );
+    assert!(entry.agent_certificate.is_none());
 }
 
 #[test]

@@ -145,10 +145,10 @@ async fn remote_show_opens_on_the_other_owner_daemon() {
     // #1643: consent is recorded before the disclosure is built, and a
     // same-second anonymous beat (built before consent) no longer drops a
     // cached certificate on the peer, so one disclosure per daemon is
-    // enough. The second disclosure in a later second stays as
-    // belt-and-braces: it also covers a beat that was already built when
-    // consent landed, and exercises the strictly-fresher announce peers
-    // see from the 3 s re-announce.
+    // enough — a beat already built when consent landed is the same-second
+    // case the merge rule itself now covers. The second disclosure in a
+    // later second stays as pure belt-and-braces and exercises the
+    // strictly-fresher announce peers see from the 3 s re-announce.
     for state in [&state_a, &state_b] {
         state
             .agent
