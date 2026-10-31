@@ -618,31 +618,43 @@ impl SenderBlackout {
 /// The sibling watch (ADR 0110's "publish no saved sibling", watched on
 /// A's side): while armed, it counts — passing, never dropping — every
 /// frame A sends toward D or C on the direct carrier whose bytes carry
-/// the saved exclusion event, a `member_removed` or `member_banned`
-/// naming B. The count is A publishing its saved sibling whatever the
-/// receivers then do with it: a refused event still left A. A non-zero
-/// count feeds `CAUSE_SIBLING_PUBLISHED`, so the fork arm cannot go
-/// GREEN on the receivers' backstop alone. Count-only, like
-/// [`SenderBlackout`]: no frame is changed. The oversized-event
-/// reference egress is out of scope — the saved event of this row is a
-/// few KB, far under the reference threshold.
+/// A's saved exclusion event: a `member_removed` or `member_banned`
+/// naming B whose commit `state_hash` is the saved event's own result
+/// head. The count is A publishing its saved sibling whatever the
+/// receivers then do with it: a refused event still left A, and a
+/// legitimate forward or serve of D's competing event — a different
+/// head — never counts. A non-zero count feeds
+/// `CAUSE_SIBLING_PUBLISHED`, so the fork arm cannot go GREEN on the
+/// receivers' backstop alone. Count-only, like [`SenderBlackout`]: no
+/// frame is changed. The oversized-event reference egress is out of
+/// scope — the saved event of this row is a few KB, far under the
+/// reference threshold.
 struct SiblingWatch {
     seen: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Whether `bytes` carry a removal or ban event whose subject is
-/// `target_hex`: the direct carrier frames the JSON event verbatim, so
-/// the serde tag and the 64-hex subject id are both present.
-fn carries_removal_of(bytes: &[u8], target_hex: &str) -> bool {
+/// Whether `bytes` carry A's saved exclusion event: the direct carrier
+/// frames the JSON event verbatim, so the serde tag, the subject's
+/// 64-hex id and the commit's `state_hash` (the saved event's result
+/// head) are all present. An unknown result head (an empty marker)
+/// matches nothing rather than counting every removal of the subject.
+fn carries_saved_removal(bytes: &[u8], subject_hex: &str, result_head: &str) -> bool {
     fn carries(bytes: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle)
     }
     (carries(bytes, b"member_removed") || carries(bytes, b"member_banned"))
-        && carries(bytes, target_hex.as_bytes())
+        && carries(bytes, subject_hex.as_bytes())
+        && carries(bytes, result_head.as_bytes())
 }
 
 impl SiblingWatch {
-    fn install(sim: &Sim, target: &str, others: &[&str], subject_hex: &str) -> Result<Self> {
+    fn install(
+        sim: &Sim,
+        target: &str,
+        others: &[&str],
+        subject_hex: &str,
+        result_head: &str,
+    ) -> Result<Self> {
         use crate::network::sim::{Fault, LaneClass};
         use std::sync::atomic::Ordering;
         let machine = sim.peer(target)?.0;
@@ -651,12 +663,16 @@ impl SiblingWatch {
             peers.push(sim.peer(label)?.0);
         }
         let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (rule_seen, subject) = (Arc::clone(&seen), subject_hex.to_string());
+        let (rule_seen, subject, head) = (
+            Arc::clone(&seen),
+            subject_hex.to_string(),
+            result_head.to_string(),
+        );
         sim.fabric().add_rule(move |write| {
             if write.lane.src == machine
                 && peers.contains(&write.lane.dst)
                 && matches!(write.lane.class, LaneClass::Direct)
-                && carries_removal_of(&write.bytes, &subject)
+                && carries_saved_removal(&write.bytes, &subject, &head)
             {
                 rule_seen.fetch_add(1, Ordering::SeqCst);
             }
@@ -1044,6 +1060,25 @@ async fn scenario(
                     |seen| seen.is_some_and(|seen| seen.epoch == Some(e0 + 1) && !seen.lists_b),
                 );
                 if committed {
+                    // The commit may have landed after this poll's gate
+                    // read, so the gate is read once more at the exit: a
+                    // commit that slipped between the two reads is still
+                    // judged by the server's own budget, and the exit
+                    // re-read sits at most one poll cadence past the
+                    // commit instant.
+                    if let Ok(Some((phase, elapsed_ms))) =
+                        gate_probe(watched, "A", &group, &b_hex).await
+                    {
+                        if phase == "committed_delivery_pending"
+                            && elapsed_ms.is_some_and(|elapsed| elapsed < w_ms)
+                            && early.is_none()
+                        {
+                            early = Some(format!(
+                                "the row was committed_delivery_pending at {elapsed_ms:?} ms of \
+                                     budget since T_obs (exit re-read), short of W ({w_ms} ms)"
+                            ));
+                        }
+                    }
                     if a_commit_at.is_none() {
                         a_commit_at = Some(watched.fabric().now().saturating_sub(t0));
                     }
@@ -1073,6 +1108,17 @@ async fn scenario(
             .as_ref()
             .is_some_and(|row| row["phase"].as_str() == Some("committed_delivery_pending"));
     let not_early = early.is_none();
+    // The saved sibling's own name: the commit `state_hash` its event
+    // carries (the row's result_head). The sibling watch matches it, so
+    // a frame counts only when it is A's saved event — a legitimate
+    // forward or serve of D's competing event names a different head.
+    // A row that never named one leaves this empty, and an empty marker
+    // matches nothing; that shape already fails the durable premise.
+    let a_result_head = a_row_committed
+        .as_ref()
+        .and_then(|row| row["result_head"].as_str())
+        .unwrap_or_default()
+        .to_string();
     receipt.evidence(
         "a_commits_durably_into_the_blackout",
         durable && not_early && blackout.dropped() > 0,
@@ -1171,11 +1217,11 @@ async fn scenario(
     // frames toward D and C — the resend itself, refused or not.
     blackout.set(false);
     let sibling_watch = if competing {
-        let watch = SiblingWatch::install(sim, "A", &["D", "C"], &b_hex)?;
-        sim.fabric().mark(
-            "case: the sibling watch armed — A's outbound removal-event frames toward D and C \
-             are counted from its restart on",
-        );
+        let watch = SiblingWatch::install(sim, "A", &["D", "C"], &b_hex, &a_result_head)?;
+        sim.fabric().mark(format!(
+            "case: the sibling watch armed — A's outbound frames toward D and C carrying its \
+             saved event (head {a_result_head}) are counted from its restart on"
+        ));
         Some(watch)
     } else {
         None
@@ -1364,6 +1410,20 @@ async fn scenario(
                 return Err(error);
             }
         }
+        // A's second boot gets the coverage window its first had: a
+        // resumed resend cannot start before the restart sync wait has
+        // passed, so the final watch read and every end view below are
+        // taken only after that window (plus the completion bound) has
+        // run — a second boot that resends its saved sibling is counted,
+        // not just the first boot's.
+        sim.within(
+            "the second boot's coverage window",
+            sync_wait + timing.completion_bound + secs(2),
+            async {
+                tokio::time::sleep(sync_wait + timing.completion_bound).await;
+            },
+        )
+        .await?;
         let row_again = sim
             .at_instant(
                 "read A's public S4 row after the second restart",
@@ -1375,14 +1435,15 @@ async fn scenario(
                 && row["waiting"]["cause"].as_str() == Some("waiting_for_fork_resolution")
         }) && fork_quarantine_present(sim, "A", &group).await?;
         receipt.note(format!(
-            "after A's second restart: row {row_again:?}; the typed cause and the public \
-             fork-quarantine marker survived: {survives}"
+            "after A's second restart and its coverage window: row {row_again:?}; the typed \
+             cause and the public fork-quarantine marker survived: {survives}"
         ));
     }
 
     // The sibling watch's final read: frames A sent after the watch
-    // loop's exit — through the settle and A's second restart — still
-    // count, so a late resend cannot slip past the loop's cadence.
+    // loop's exit — through the settle and A's second boot's coverage
+    // window — still count, so a late or second-boot resend cannot slip
+    // past the loop's cadence.
     if let Some(watch) = &sibling_watch {
         let sent = watch.seen();
         if sent > 0 {
@@ -1760,13 +1821,18 @@ async fn expect(
 
 const LABELS: &[&str] = &["A", "D", "B", "C"];
 
-/// Run `f` on a thread with a 16 MiB stack. This case's scenario is the
-/// family's largest single state machine, and a default libtest thread
-/// (2 MiB) overflows it while a nextest process (main thread, 8 MiB)
-/// does not — the arm's outcome must not depend on the runner's stack
-/// size, so both tests run their paused runtime on a wide stack.
-fn on_wide_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+/// Run `f` on a named thread with a 16 MiB stack. This case's scenario
+/// is the family's largest single state machine, and a default libtest
+/// thread (2 MiB) overflows it while a nextest process (main thread,
+/// 8 MiB) does not — the arm's outcome must not depend on the runner's
+/// stack size, so both tests run their paused runtime on a wide stack.
+/// The thread is named per arm because the W3-H entropy shim keys a
+/// non-main thread's stream by its name (and first-draw ordinal): a
+/// fixed, distinct name per arm keeps the two arms' streams apart; the
+/// first shimmed CI stress run must still print `entropy=controlled`.
+fn on_wide_stack<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
+        .name(name.to_string())
         .stack_size(16 * 1024 * 1024)
         .spawn(f)
         .expect("spawn the wide-stack runner")
@@ -1796,7 +1862,7 @@ fn on_wide_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T
               observation"
 )]
 fn w3h_1581e_red_crash_commit_fork_contained() -> Result<()> {
-    on_wide_stack(|| {
+    on_wide_stack("w3h-1581e-fork", || {
         super::block_on_paused(async move {
             expect(
                 "w3h_1581e_red_crash_commit_fork_contained",
@@ -1828,7 +1894,7 @@ fn w3h_1581e_red_crash_commit_fork_contained() -> Result<()> {
               observation"
 )]
 fn w3h_1581e_control_crash_commit_same_chain_resume() -> Result<()> {
-    on_wide_stack(|| {
+    on_wide_stack("w3h-1581e-resume", || {
         super::block_on_paused(async move {
             expect(
                 "w3h_1581e_control_crash_commit_same_chain_resume",
@@ -1840,4 +1906,56 @@ fn w3h_1581e_control_crash_commit_same_chain_resume() -> Result<()> {
             .await
         })
     })
+}
+
+/// The sibling watch's matcher, pinned against today's frame format with
+/// literal bytes: a serde rename of the event tag or of the commit's
+/// `state_hash` field would silently turn the watch into a permanent
+/// zero, so the fixtures are not re-serialised through the same types
+/// the watch reads. The positive control for the count itself is the
+/// injected-resend red run (see the PR body and the receipts).
+#[test]
+fn sibling_watch_matches_only_as_saved_event() {
+    let subject = "e490dda93bc645405ed9280193336c4ed97aa93413a3a1b0f940be5a56087596";
+    let actor = "f40671618ddb7c2afa540f8de91adccd933ecbef4ca1a4cd2036d83e3be8b561";
+    let saved_head = "df900d53d9f6cbdc6c9fb97a3fb72a308a4a05ecca97fcd3ca4edf366c97cc8e";
+    let competing_head = "5fd2f2c9443ec53ff634a760e2b2ac42b976e83071cb259a16650166bebf3542";
+    let event = |head: &str| {
+        format!(
+            "{{\"event\":\"member_removed\",\"group_id\":\"g\",\"revision\":6,\
+             \"actor\":\"{actor}\",\"agent_id\":\"{subject}\",\"commit\":\
+             {{\"state_hash\":\"{head}\",\"committed_by\":\"{actor}\"}}}}"
+        )
+    };
+    let frame = |body: &str| {
+        let mut bytes = vec![crate::network::DIRECT_MESSAGE_STREAM_TYPE];
+        bytes.extend_from_slice(&[0u8; 32]);
+        bytes.extend_from_slice(body.as_bytes());
+        bytes
+    };
+    let saved = frame(&event(saved_head));
+    assert!(carries_saved_removal(&saved, subject, saved_head));
+    // D's competing event names another head: a forward or a serve of it
+    // is not A's saved sibling.
+    assert!(!carries_saved_removal(
+        &frame(&event(competing_head)),
+        subject,
+        saved_head
+    ));
+    // Another subject, or bytes with no event at all, never counts.
+    assert!(!carries_saved_removal(
+        &frame(&format!(
+            "{{\"event\":\"member_removed\",\"agent_id\":\"{actor}\"}}"
+        )),
+        subject,
+        saved_head
+    ));
+    assert!(!carries_saved_removal(
+        b"\x10a control-blob reference names no event bytes",
+        subject,
+        saved_head
+    ));
+    // An unknown result head disables the watch rather than counting
+    // every removal of the subject.
+    assert!(!carries_saved_removal(&saved, subject, ""));
 }

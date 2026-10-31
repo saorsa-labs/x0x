@@ -956,8 +956,8 @@ pub(in crate::server) async fn s4_gate_probe_for_test(
     }?;
     let target = super::parse_agent_id_hex(target_hex).ok()?;
     let key = EvictionKey::new(stable, *target.as_bytes());
-    let now = Instant::now();
     let inner = state.revocation_evictions.inner.lock().await;
+    let now = Instant::now();
     let phase = inner
         .store
         .get(&key)
