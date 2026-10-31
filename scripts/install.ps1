@@ -7,17 +7,19 @@
 #
 # What it does:
 #   1. Resolves the latest release (or -Version)
-#   2. Downloads x0x-windows-x64.zip and verifies its SHA-256 checksum and its
-#      GPG signature against the pinned Saorsa Labs release key
+#   2. Downloads x0x-windows-x64.zip and verifies its SHA-256 checksum, the
+#      signed ML-DSA-65 release manifest (through the release's own x0x.exe,
+#      the updater's verify path) and, when gpg is present, the GPG signature
+#      against the pinned Saorsa Labs release key
 #   3. Stops any running x0xd, installs x0xd.exe + x0x.exe to
 #      %LOCALAPPDATA%\x0x\bin (or -InstallDir)
 #   4. Adds that directory to the user PATH (idempotent)
 #   5. Optionally starts x0xd (-Start)
 #
 # Signature verification needs gpg.exe (Gpg4win, or the copy bundled with Git
-# for Windows). As in install.sh, the SHA-256 checksum is always verified; if
-# gpg is absent the installer prints a loud warning and continues on the
-# checksum alone.
+# for Windows). As in install.sh, the SHA-256 checksum and the signed ML-DSA
+# manifest are always verified; if gpg is absent the installer prints a loud
+# warning and continues without the independent GPG signature.
 
 param(
     [string]$Version = "latest",
@@ -133,20 +135,59 @@ try {
         Test-ReleaseSignature $gpg $zip "$zip.asc" (Join-Path $Tmp "SAORSA_PUBLIC_KEY.asc") $Tmp
         Write-Host "  GPG signature verified ($TrustedFingerprint)" -ForegroundColor Green
     } else {
-        # Same policy and wording as install.sh: warn loudly, continue on checksum.
+        # Same policy and wording as install.sh: warn loudly, continue on the
+        # checksum and the signed ML-DSA manifest, without the GPG signature.
         Write-Host ""
         Write-Host "################################################################" -ForegroundColor Yellow
         Write-Host "# WARNING: gpg NOT FOUND - the GPG signature was NOT verified. #" -ForegroundColor Yellow
-        Write-Host "# Only the SHA-256 checksum was checked, and that checksum was #" -ForegroundColor Yellow
-        Write-Host "# downloaded from the same place as the archive. Install gpg   #" -ForegroundColor Yellow
-        Write-Host "# and re-run to verify this release was signed by Saorsa Labs. #" -ForegroundColor Yellow
+        Write-Host "# The checksum and the signed ML-DSA release manifest were     #" -ForegroundColor Yellow
+        Write-Host "# verified, but not the independent GPG signature. Install gpg #" -ForegroundColor Yellow
+        Write-Host "# and re-run for that second signature.                        #" -ForegroundColor Yellow
         Write-Host "################################################################" -ForegroundColor Yellow
         Write-Host ""
     }
 
+    # ── Signed release manifest (ML-DSA-65, as the updater checks it) ──────
+    #
+    # The updater refuses a release whose manifest signature fails against
+    # the release key compiled into the binary (src/upgrade/signature.rs).
+    # This installer reuses that verify path instead of adding a second
+    # implementation. Two checks, in this order:
+    #
+    #   1. Bind: the manifest's archive_sha256 entry for this platform must
+    #      name the downloaded zip, before any of the archive's bytes run.
+    #   2. Sign: the release's own x0x.exe runs the inert
+    #      --verify-release-manifest probe
+    #      (src/upgrade/verification_probe.rs), which reads only the two
+    #      files before any initialization.
+    #
+    # A missing manifest or signature, a bad signature, or a hash that
+    # differs from the manifest entry stops the install.
+
+    $manifest = Join-Path $Tmp "release-manifest.json"
+    $manifestSig = Join-Path $Tmp "release-manifest.json.sig"
+    Get-Download "$BaseUrl/release-manifest.json" $manifest
+    Get-Download "$BaseUrl/release-manifest.json.sig" $manifestSig
+
+    # The manifest's archive_sha256 must name this zip before extraction:
+    # this refuses a swapped archive without executing any of its content.
+    $releaseManifest = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+    $assetEntry = @($releaseManifest.assets | Where-Object { $_.target -eq "x86_64-pc-windows-msvc" })
+    if ($assetEntry.Count -ne 1 -or -not $assetEntry[0].archive_sha256) {
+        throw "The signed manifest has no archive_sha256 entry for x86_64-pc-windows-msvc."
+    }
+    $manifestSha = ([string]$assetEntry[0].archive_sha256).ToLowerInvariant()
+    if ($manifestSha -notmatch "^[0-9a-f]{64}$" -or $manifestSha -ne $actual) {
+        throw "SHA-256 mismatch between $Asset and the manifest (expected $manifestSha, got $actual)."
+    }
+    Write-Host "  Archive hash matches the manifest entry" -ForegroundColor Green
+
     # ── Extract ─────────────────────────────────────────────────────────────
 
     # The Windows zip is flat: x0xd.exe and x0x.exe sit at the archive root.
+    # Extraction precedes installation because manifest verification runs
+    # the release's own x0x.exe. The binding above already proved this zip
+    # is the one the manifest names; the signature now proves the manifest.
     $extract = Join-Path $Tmp "extract"
     Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
     foreach ($bin in @("x0xd.exe", "x0x.exe")) {
@@ -154,6 +195,21 @@ try {
             throw "Release archive is missing $bin at its root; the release layout may have changed."
         }
     }
+
+    # Like Test-ReleaseSignature: the probe may write to stderr, and Windows
+    # PowerShell 5.1 turns redirected native stderr into a terminating error
+    # under "Stop", so relax around the invocation. $LASTEXITCODE is cleared
+    # first: if x0x.exe fails to launch at all, a stale success from an
+    # earlier native call must not read as "verified".
+    $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = $null
+    & (Join-Path $extract "x0x.exe") --verify-release-manifest $manifest $manifestSig 2>$null
+    $probeExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($null -eq $probeExit -or $probeExit -ne 0) {
+        throw "ML-DSA manifest signature FAILED for release-manifest.json. The download may have been tampered with."
+    }
+    Write-Host "  ML-DSA-65 manifest signature verified" -ForegroundColor Green
 
     # ── Stop any running instance ───────────────────────────────────────────
 

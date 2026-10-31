@@ -10,15 +10,18 @@
 # What it does:
 #   1. Detects platform (Linux/macOS, x64/arm64)
 #   2. Downloads latest release from GitHub
-#   3. Verifies its SHA-256 and, when gpg is present, its GPG signature against
-#      the pinned Saorsa Labs release key (fails closed on any mismatch)
+#   3. Verifies its SHA-256, the sidecar checksum and the signed ML-DSA-65
+#      release manifest (through the release's own x0x binary, the updater's
+#      verify path), and, when gpg is present, its GPG signature against the
+#      pinned Saorsa Labs release key (fails closed on any mismatch)
 #   4. Stops any running x0xd instance
 #   5. Installs x0xd (daemon) + x0x (CLI) to ~/.local/bin
 #   6. Starts the daemon
 #   7. Optionally configures autostart on boot (--autostart)
 #
 # Requirements: curl or wget, tar, sh, sha256sum or shasum. gpg is strongly
-# recommended; without it only the checksum is verified (with a warning).
+# recommended; without it the checksum and the signed ML-DSA manifest are
+# verified but not the independent GPG signature (with a warning).
 # No root/sudo required (except --autostart on Linux uses systemd).
 
 set -e
@@ -90,17 +93,18 @@ fi
 
 OS=$(uname -s)
 ARCH=$(uname -m)
+TARGET_TRIPLE=""
 case "$OS" in
     Linux)
         case "$ARCH" in
-            x86_64)  PLATFORM="linux-x64-gnu" ;;
-            aarch64) PLATFORM="linux-arm64-gnu" ;;
+            x86_64)  PLATFORM="linux-x64-gnu"; TARGET_TRIPLE="x86_64-unknown-linux-gnu" ;;
+            aarch64) PLATFORM="linux-arm64-gnu"; TARGET_TRIPLE="aarch64-unknown-linux-gnu" ;;
             *) echo "Unsupported: $OS $ARCH"; exit 1 ;;
         esac ;;
     Darwin)
         case "$ARCH" in
-            arm64)  PLATFORM="macos-arm64" ;;
-            x86_64) PLATFORM="macos-x64" ;;
+            arm64)  PLATFORM="macos-arm64"; TARGET_TRIPLE="aarch64-apple-darwin" ;;
+            x86_64) PLATFORM="macos-x64"; TARGET_TRIPLE="x86_64-apple-darwin" ;;
             *) echo "Unsupported: $OS $ARCH"; exit 1 ;;
         esac ;;
     *) echo "Unsupported: $OS"; exit 1 ;;
@@ -158,6 +162,8 @@ verify_failed() {
 echo "Downloading..."
 fetch "$URL/$ARCHIVE" "$TMP/$ARCHIVE"
 fetch "$URL/$ARCHIVE.sha256" "$TMP/$ARCHIVE.sha256"
+fetch "$URL/release-manifest.json" "$TMP/release-manifest.json"
+fetch "$URL/release-manifest.json.sig" "$TMP/release-manifest.json.sig"
 
 # SHA-256: always required.
 if command -v sha256sum >/dev/null 2>&1; then
@@ -213,12 +219,72 @@ else
     echo "" >&2
     echo "################################################################" >&2
     echo "# WARNING: gpg NOT FOUND - the GPG signature was NOT verified. #" >&2
-    echo "# Only the SHA-256 checksum was checked, and that checksum was #" >&2
-    echo "# downloaded from the same place as the archive. Install gpg   #" >&2
-    echo "# and re-run to verify this release was signed by Saorsa Labs. #" >&2
+    echo "# The checksum and the signed ML-DSA release manifest were     #" >&2
+    echo "# verified, but not the independent GPG signature. Install gpg #" >&2
+    echo "# and re-run for that second signature.                        #" >&2
     echo "################################################################" >&2
     echo "" >&2
 fi
+
+# ── Signed release manifest (ML-DSA-65, as the updater checks it) ───────────
+#
+# The updater refuses a release whose manifest signature fails against the
+# release key compiled into the binary (src/upgrade/signature.rs). This
+# installer reuses that verify path instead of adding a second
+# implementation. Two checks, in this order:
+#
+#   1. Bind: the manifest's archive_sha256 entry for this platform must name
+#      the downloaded archive, before any of the archive's bytes run.
+#   2. Sign: the release's own x0x runs the inert --verify-release-manifest
+#      probe (src/upgrade/verification_probe.rs), which reads only the two
+#      files before any initialization.
+#
+# A missing manifest or signature, a bad signature, or a hash that differs
+# from the manifest entry stops the install before anything is installed.
+
+# The manifest's archive_sha256 must name this archive before extraction:
+# this refuses a swapped archive without executing any of its content. The
+# release pipeline emits pretty-printed JSON with a stable field order
+# (target, archive_url, archive_sha256); newlines are stripped so the same
+# match works on a compact manifest.
+MANIFEST_SHA=$(tr -d '\n\r' < "$TMP/release-manifest.json" | awk -v t="$TARGET_TRIPLE" '{
+    if (match($0, "\"target\": *\"" t "\"[^}]*\"archive_sha256\": *\"[0-9a-fA-F]+\"")) {
+        asset = substr($0, RSTART, RLENGTH)
+        if (match(asset, /"archive_sha256": *"[0-9a-fA-F]+"/)) {
+            field = substr(asset, RSTART, RLENGTH)
+            sub(/"archive_sha256": *"/, "", field)
+            sub(/"$/, "", field)
+            print tolower(field)
+            exit
+        }
+    }
+}')
+case "$MANIFEST_SHA" in
+    *[!0-9a-f]*|"")
+        verify_failed "manifest has no archive_sha256 entry for $TARGET_TRIPLE"
+        ;;
+esac
+[ ${#MANIFEST_SHA} -eq 64 ] || verify_failed "malformed archive_sha256 entry for $TARGET_TRIPLE"
+if [ "$MANIFEST_SHA" != "$ACTUAL_SHA" ]; then
+    verify_failed "archive SHA-256 does not match the manifest entry for $TARGET_TRIPLE (expected $MANIFEST_SHA, got $ACTUAL_SHA)"
+fi
+echo "  Archive hash matches the manifest entry ($TARGET_TRIPLE)"
+
+# Extract now: verification runs the release's own x0x before anything is
+# installed. The binding above already proved this archive is the one the
+# manifest names; the signature now proves the manifest itself.
+tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
+
+PROBE="$TMP/x0x-${PLATFORM}/x0x"
+if [ ! -f "$PROBE" ] || [ -L "$PROBE" ] || [ ! -x "$PROBE" ]; then
+    echo "Error: release archive missing executable x0x" >&2
+    exit 1
+fi
+if ! "$PROBE" --verify-release-manifest \
+        "$TMP/release-manifest.json" "$TMP/release-manifest.json.sig"; then
+    verify_failed "release-manifest.json failed ML-DSA signature verification"
+fi
+echo "  ML-DSA-65 manifest signature verified"
 
 if [ "$VERIFY_ONLY" = true ]; then
     echo "Verify-only: $ARCHIVE verified; nothing installed."
@@ -258,7 +324,6 @@ http_get_auth() {
 }
 
 mkdir -p "$BIN"
-tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
 for bin in x0xd x0x; do
     SRC="$TMP/x0x-${PLATFORM}/$bin"
