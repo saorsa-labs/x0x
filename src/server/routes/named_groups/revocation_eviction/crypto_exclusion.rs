@@ -2412,7 +2412,7 @@ pub(in crate::server) async fn receive(
         "ADR 0110 S4: crypto-only exclusion installed"
     );
     // Later commits that queued behind this gap can now chain.
-    ng::replay_pending_treekem_events(state, &group_key).await;
+    ng::replay_pending_treekem_events(state, &group_key, None).await;
     state.agent.s4_revocation_intake().request_reconcile();
     ReceiveOutcome::Applied
 }

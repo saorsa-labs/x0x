@@ -3532,7 +3532,7 @@ async fn receive_commit(
     );
     match kind {
         orc::RecoveryCryptoKind::TreeKem => {
-            ng::replay_pending_treekem_events(state, &group_key).await;
+            ng::replay_pending_treekem_events(state, &group_key, None).await;
         }
         orc::RecoveryCryptoKind::Gss => {
             replay_after_gss_install(state, &body.stable_group_id).await;
