@@ -581,8 +581,9 @@ jobs:
   w3h-plan:
     # Names the case groups for the matrix. A case is in exactly one group.
     # S3 (`w3h_1356_`) and S4 (`w3h_1357_`) each have a group, so more of
-    # those cases extend that shard only. The group is omitted when the
-    # tree has no matching test (main has no S3 cases yet).
+    # those cases extend that shard only. The H-S3-c/c2/c3 rows each have
+    # their own S3 group (`s3-c`, `s3-c2`, `s3-c3`). A group is omitted
+    # when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -609,17 +610,18 @@ jobs:
     name: W3-H shard (${{ matrix.group }})
     needs: w3h-plan
     runs-on: ubuntu-latest
-    # S3 runs the H-S3-c/c2 owner-cert rows at 15 min each (#1689) and the
-    # H-S3-d7 flood row (#1717), so its group gets 185 min (Engineer ruling,
-    # 30 Oct, 165 min; no shard split; raised by option (b) of the 31 Oct
-    # ruling, #1727). Every other group keeps 120 min. The isolated test
-    # phase has its own deadline (`X0X_RUNTIME_TIMEOUT_SECONDS` below), which
-    # must also fit inside this limit with room for setup and upload. The
-    # one-job lib build below takes about 20 min (19m 32s in job
-    # 124482285010, against 10m 20s with parallel jobs in job 124477009427),
-    # so 165 min no longer held setup, build, the 155-min test deadline and
-    # upload.
-    timeout-minutes: ${{ matrix.group == 's3' && 185 || 120 }}
+    # Every S3 group (`s3`, and `s3-c`, `s3-c2`, `s3-c3` for the H-S3-c/c2/c3
+    # owner-axis rows) gets 185 min (Engineer ruling, 30 Oct, 165 min;
+    # raised by option (b) of the 31 Oct ruling, #1727). Every other group
+    # keeps 120 min. The isolated test phase has its own deadline
+    # (`X0X_RUNTIME_TIMEOUT_SECONDS` below), which must also fit inside this
+    # limit with room for setup and upload. The one-job lib build below
+    # takes about 20 min (19m 32s in job 124482285010, against 10m 20s with
+    # parallel jobs in job 124477009427), so 165 min no longer held setup,
+    # build, the 155-min test deadline and upload. The 31 Oct ruling on
+    # #1733 keeps this budget: when an S3 group no longer fits, split it.
+    # Do not raise the budget.
+    timeout-minutes: ${{ startsWith(matrix.group, 's3') && 185 || 120 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.w3h-plan.outputs.matrix) }}
@@ -670,10 +672,12 @@ jobs:
         env:
           X0X_ISOLATION_ROLE: w3h-harness
           # The deadline of the isolated test phase only (the build runs
-          # before it). S3 needs about 135 min for 20 reruns, so it gets
-          # 9300 s (155 min) inside its 185-min job; every other group keeps
-          # 6600 s. `isolated-runtime.py` caps the value at 21600 s.
-          X0X_RUNTIME_TIMEOUT_SECONDS: ${{ matrix.group == 's3' && 9300 || 6600 }}
+          # before it). Every S3 group gets 9300 s (155 min) inside its
+          # 185-min job; every other group keeps 6600 s. The PR body of
+          # #1733 has the measured time of each S3 group. One rerun is as
+          # long as its longest case, so each H-S3-c/c2/c3 row has its own
+          # group. `isolated-runtime.py` caps the value at 21600 s.
+          X0X_RUNTIME_TIMEOUT_SECONDS: ${{ startsWith(matrix.group, 's3') && 9300 || 6600 }}
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
         # `#[ignore]` (ADR 0025 §3–4; e.g. w3h_system_time_follows_pull_callback_via_shim).
         # The profile default-filter still intersects this expression, so

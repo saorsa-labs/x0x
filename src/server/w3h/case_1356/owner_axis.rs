@@ -338,6 +338,8 @@ struct Prefix {
     j_hex: String,
     /// O's head when invite I was minted (r).
     minted: View,
+    /// The owner's (O's) ML-DSA-65 USER public key bytes.
+    owner_key: Vec<u8>,
     /// X's r+1′ head, which J holds.
     fork: View,
     /// The fabric write index when J redeemed invite I.
@@ -352,8 +354,14 @@ struct Prefix {
 
 /// The H-S3-c setup up to J on X's fork r+1′ (ADR 0109 §10), shared by the
 /// owner-axis rows; with `both`, H-S3-c2's canonical r+1 also reaches J.
-/// `None` when a prerequisite is missing: the receipt is then finished.
-async fn fork_prefix(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result<Option<Prefix>> {
+/// `None` when a prerequisite is missing: the receipt is then finished
+/// under the row's final step `last`.
+async fn fork_prefix(
+    sim: &mut Sim,
+    receipt: &mut Receipt,
+    both: bool,
+    last: &str,
+) -> Result<Option<Prefix>> {
     let owner = crate::identity::UserKeypair::from_seed(&[0x13; 32])?;
     start_certified(sim, "O", &owner, true).await?;
     for label in ["A", "X", "J"] {
@@ -712,13 +720,14 @@ async fn fork_prefix(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result
             .collect();
         receipt.note(format!("WARN logs since J's join: {}", logs.join(" | ")));
         receipt.note("J's gate did not arm before the window: the row's prerequisite is missing");
-        receipt.finish(FINAL_C, false, at(sim));
+        receipt.finish(last, false, at(sim));
         return Ok(None);
     }
     Ok(Some(Prefix {
         group,
         j_hex,
         minted,
+        owner_key: owner.public_key().as_bytes().to_vec(),
         fork,
         joined_at,
         o_to_j_held,
@@ -742,12 +751,13 @@ struct Advanced {
 
 /// H-S3-c's "Advance 30 min" on `p`: J must show `reseat_required
 /// {not_on_chain, ..}`, unchanged to the end. `None` when H-S3-c2's
-/// prerequisite is missing: the receipt is then finished.
+/// prerequisite is missing: the receipt is then finished under `last`.
 async fn advance(
     sim: &mut Sim,
     receipt: &mut Receipt,
     p: &Prefix,
     both: bool,
+    last: &str,
 ) -> Result<Option<Advanced>> {
     let Prefix {
         fork, held_to_j, ..
@@ -794,7 +804,7 @@ async fn advance(
         );
         if !held {
             receipt.note("J lacks the marker or the gap record: the row's prerequisite is missing");
-            receipt.finish(FINAL_C, false, at(sim));
+            receipt.finish(last, false, at(sim));
             return Ok(None);
         }
     }
@@ -868,19 +878,21 @@ struct Swap {
     reseat_mandate: bool,
     owner_mandate: bool,
     /// The re-seat invite the issuer stored, read right after the call
-    /// (the issuer prunes it once J is seated).
+    /// (the issuer prunes it once J is seated). H-S3-c3 only.
     invite: Option<crate::groups::invite::SignedInvite>,
 }
 
 /// `issuer` calls the re-seat route for J with basis `Removal(j_removal)`;
 /// J's live record is sampled until the keyed swap (ADR 0109 §3), each
-/// sample checked against J's record after the advance.
+/// sample checked against J's record after the advance. With `read_invite`
+/// (H-S3-c3 only), the issuer's stored re-seat invite is read right after
+/// the call; rows C and C2 do not read it.
 async fn reseat_and_swap(
     sim: &Sim,
     receipt: &mut Receipt,
     p: &Prefix,
     adv: &Advanced,
-    issuer: &str,
+    (issuer, read_invite): (&str, bool),
     j_removal: &View,
 ) -> Result<Swap> {
     let (group, j_hex) = (p.group.clone(), p.j_hex.clone());
@@ -890,7 +902,10 @@ async fn reseat_and_swap(
     let (reseat_code, answer) = sim
         .api(issuer, Method::POST, &path, Some(reseat_body(j_removal)))
         .await?;
-    let invite = issued_invite(sim, issuer, &j_hex)?;
+    let invite = match read_invite {
+        true => issued_invite(sim, issuer, &j_hex)?,
+        false => None,
+    };
     // Contained until the keyed swap (ADR 0109 §3): every sample is checked.
     let base_membership = j_status.as_ref().and_then(|st| st.membership.clone());
     let mut early_active = None;
@@ -926,7 +941,7 @@ async fn reseat_and_swap(
                         let j = jv
                             .as_ref()
                             .map_or_else(|| "no record".into(), View::describe);
-                        format!("J {j} membership {membership:?}; A {}", a.describe())
+                        format!("J {j} membership {membership:?}; {issuer} {}", a.describe())
                     });
                     false
                 }
@@ -974,10 +989,10 @@ async fn reseat_and_swap(
 /// H-S3-c, or with `both` H-S3-c2 (ADR 0109 §10). Each candidate step is a
 /// named sub-check; a red run lists the ones that fail.
 async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result<()> {
-    let Some(p) = fork_prefix(sim, receipt, both).await? else {
+    let Some(p) = fork_prefix(sim, receipt, both, FINAL_C).await? else {
         return Ok(());
     };
-    let Some(adv) = advance(sim, receipt, &p, both).await? else {
+    let Some(adv) = advance(sim, receipt, &p, both, FINAL_C).await? else {
         return Ok(());
     };
     let (group, j_hex, o_to_j_held) = (p.group.clone(), p.j_hex.clone(), &p.o_to_j_held);
@@ -1016,7 +1031,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     })
     .await?;
     let j_removal = view(sim, "A", &group).await?;
-    let swap = reseat_and_swap(sim, receipt, &p, &adv, "A", &j_removal).await?;
+    let swap = reseat_and_swap(sim, receipt, &p, &adv, ("A", false), &j_removal).await?;
     let mut checks = advance_checks(&p, &adv, both);
     checks.extend([
         ("a_holds_o_mandate_advert_before_o_stops", floor),
@@ -1139,10 +1154,10 @@ const CAUSE_C3: &str = "the row's main observation: O's re-seat route returns 40
 /// H-S3-c3 (owner path): H-S3-c with O online throughout. O removes J
 /// (r+3) and calls reseat with basis `Removal(r+3)`.
 async fn owner_path_reseat(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
-    let Some(p) = fork_prefix(sim, receipt, false).await? else {
+    let Some(p) = fork_prefix(sim, receipt, false, FINAL_C3).await? else {
         return Ok(());
     };
-    let Some(adv) = advance(sim, receipt, &p, false).await? else {
+    let Some(adv) = advance(sim, receipt, &p, false, FINAL_C3).await? else {
         return Ok(());
     };
     let (group, j_hex) = (&p.group, &p.j_hex);
@@ -1159,15 +1174,16 @@ async fn owner_path_reseat(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     })
     .await?;
     let j_removal = view(sim, "O", group).await?;
-    let swap = reseat_and_swap(sim, receipt, &p, &adv, "O", &j_removal).await?;
-    let invite = &swap.invite;
-    let countersigned = invite.as_ref().is_some_and(|i| {
-        i.version == crate::groups::invite::INVITE_VERSION_V4
-            && i.owner_countersignature_b64.is_some()
-    });
+    let swap = reseat_and_swap(sim, receipt, &p, &adv, ("O", true), &j_removal).await?;
+    let invite = swap.invite.as_ref();
+    let countersignature = invite.map(|i| owner_countersignature(i, &p.owner_key));
+    let countersigned = invite
+        .is_some_and(|i| i.version == crate::groups::invite::INVITE_VERSION_V4)
+        && countersignature == Some(Ok(()));
     receipt.note(format!(
-        "O's issued re-seat invite: version {:?}, owner countersignature {countersigned}",
-        invite.as_ref().map(|i| i.version)
+        "O's issued re-seat invite: version {:?}, owner countersignature verified under O's \
+         USER key {countersigned} ({countersignature:?})",
+        invite.map(|i| i.version)
     ));
     let mut checks = advance_checks(&p, &adv, false);
     checks.extend([
@@ -1197,6 +1213,31 @@ async fn owner_path_reseat(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         red,
     );
     Ok(())
+}
+
+/// The owner countersignature on `invite`, checked as production checks it
+/// (`SignedInvite::verify_v4_owner_countersignature`: the canonical v4
+/// bytes under the inline owner key, bound to the policy's owner id). The
+/// inline key must also be `owner_key` (O's), and the countersignature
+/// must be present: the production check is a no-op without an owner axis.
+fn owner_countersignature(
+    invite: &crate::groups::invite::SignedInvite,
+    owner_key: &[u8],
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let inline = invite
+        .owner_public_key_b64
+        .as_deref()
+        .and_then(|k| base64::engine::general_purpose::STANDARD.decode(k).ok());
+    if inline.as_deref() != Some(owner_key) {
+        return Err("the inline owner key is not O's USER key".to_string());
+    }
+    if invite.owner_countersignature_b64.is_none() {
+        return Err("no owner countersignature".to_string());
+    }
+    invite
+        .verify_v4_owner_countersignature()
+        .map_err(|refusal| format!("{refusal:?}"))
 }
 
 /// The newest re-seat invite `issuer` issued for `subject`, read from the
@@ -1229,7 +1270,7 @@ fn issued_invite(
                 .issued_reseats
                 .iter()
                 .rev()
-                .find(|i| i.authorisation.fields.subject == subject);
+                .find(|i| i.authorisation.fields.subject.eq_ignore_ascii_case(subject));
             if let Some(issued) = issued {
                 return crate::groups::invite::SignedInvite::from_link(&issued.invite)
                     .map(Some)
@@ -1566,7 +1607,7 @@ fn w3h_1356_staging_containment_mutation_proof() {
     let mut receipt = prepared();
     conclude(
         &mut receipt,
-        &["a_reseat_head_at_r_plus_4"],
+        &["reseat_head_at_r_plus_4"],
         String::new(),
         false,
         4,
