@@ -41342,6 +41342,163 @@ async fn same_second_anonymous_announce_keeps_a_disclosed_certificate() {
     );
 }
 
+/// #1643, announced-binding store: the binding carries the certificate
+/// evidence the owner-trust and revocation gates read, and its expiry
+/// feeds [`identity::is_expired`] — a CLEARED expiry fails open (`None` is
+/// never expired). The store therefore takes the same equal-second rule as
+/// the discovery cache: an anonymous beat built in the SAME second as the
+/// disclosure, delivered after it, must not replace the binding's
+/// `cert_digest` or clear its `cert_not_after`. A one-second timestamp
+/// cannot order the two beats, and no blob ever fetches for the anonymous
+/// digest, so the drop has no repair path — it only deletes the disclosed
+/// evidence and opens the expiry until the next cert-carrying beat.
+/// Everything else still replaces, pinned by the controls below.
+#[tokio::test]
+async fn same_second_anonymous_announce_keeps_a_disclosed_binding_certificate() {
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+        dm_inbox::AuthenticatedMachineBindingCache::default(),
+    ));
+    let discovery = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let cert_events = test_cert_events();
+    let user = identity::UserKeypair::generate().unwrap();
+    let member = identity::AgentKeypair::generate().unwrap();
+    // A PRESENT expiry: the fail-open this test guards is the None clear.
+    let not_after = 2_000_000_000u64;
+    let cert =
+        identity::AgentCertificate::issue_with_expiry(&user, &member, Some(not_after)).unwrap();
+    let user_id = user.user_id();
+    let id = member.agent_id();
+    let digest = announce_v3::cert_digest(&Some(user_id), &Some(cert.clone()));
+
+    // The disclosure lands first, through the identity listener's real
+    // cache step: the binding commits to the certificate's digest and
+    // carries its expiry.
+    let mut disclosed = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], Some(user_id));
+    disclosed.agent_id = id;
+    disclosed.agent_certificate = Some(cert.clone());
+    disclosed.cert_not_after = cert.not_after();
+    disclosed.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        disclosed,
+    )
+    .await;
+
+    // The pre-consent anonymous beat, built in the SAME second and from a
+    // different machine, delivered after the disclosure (reverse order).
+    let mut anonymous = discovered_agent_fixture(8, 1_000, &["1.2.3.4:5483"], None);
+    anonymous.agent_id = id;
+    anonymous.cert_digest = Some(announce_v3::anonymous_cert_digest());
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        anonymous,
+    )
+    .await;
+
+    {
+        let store = bindings.read().await;
+        let binding = store.peek(&id).expect("binding present");
+        assert_eq!(
+            binding.cert_digest,
+            Some(digest),
+            "a same-second anonymous beat must not replace the binding's cert_digest"
+        );
+        assert_eq!(
+            binding.cert_not_after,
+            Some(not_after),
+            "a same-second anonymous beat must not clear the binding's expiry — a cleared \
+             expiry fails open in identity::is_expired"
+        );
+        assert_eq!(
+            binding.machine_id,
+            identity::MachineId([8u8; 32]),
+            "the keep protects only the certificate fields; the machine still replaces"
+        );
+    }
+
+    // A same-second beat committing to a DIFFERENT non-anonymous digest (a
+    // re-key inside one second) still re-keys: the blob fetch repairs the
+    // expiry when its certificate lands.
+    let mut same_second_rekey = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    same_second_rekey.agent_id = id;
+    same_second_rekey.cert_digest = Some([0xAA; 32]);
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        same_second_rekey,
+    )
+    .await;
+    {
+        let store = bindings.read().await;
+        let binding = store.peek(&id).expect("binding present");
+        assert_eq!(
+            binding.cert_digest,
+            Some([0xAA; 32]),
+            "a same-second non-anonymous re-key digest still replaces the binding's digest"
+        );
+        assert_eq!(
+            binding.cert_not_after, None,
+            "a re-key's expiry lands when its blob fetch completes"
+        );
+    }
+
+    // Restore the disclosed state, then a STRICTLY fresher anonymous beat
+    // still withdraws: there the beat provably postdates the disclosure,
+    // so the digest change reads as a withdrawal.
+    let mut again = discovered_agent_fixture(9, 1_002, &["1.2.3.4:5483"], Some(user_id));
+    again.agent_id = id;
+    again.agent_certificate = Some(cert);
+    again.cert_not_after = Some(not_after);
+    again.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        again,
+    )
+    .await;
+    let mut fresher_anonymous = discovered_agent_fixture(9, 1_005, &["1.2.3.4:5483"], None);
+    fresher_anonymous.agent_id = id;
+    fresher_anonymous.cert_digest = Some(announce_v3::anonymous_cert_digest());
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        fresher_anonymous,
+    )
+    .await;
+    {
+        let store = bindings.read().await;
+        let binding = store.peek(&id).expect("binding present");
+        assert_eq!(
+            binding.cert_digest,
+            Some(announce_v3::anonymous_cert_digest()),
+            "a strictly fresher anonymous beat still replaces the binding's digest"
+        );
+        assert_eq!(
+            binding.cert_not_after, None,
+            "a strictly fresher anonymous beat still clears the binding's expiry"
+        );
+    }
+}
+
 /// #1643, fetch-pending variant: the peer's entry holds only the DIGEST of
 /// a disclosure whose blob fetch is still in flight. A same-second
 /// pre-consent anonymous beat must not move the entry to the anonymous
