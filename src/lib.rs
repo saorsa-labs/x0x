@@ -10366,13 +10366,15 @@ impl Agent {
     /// dispatches any DM of the same type. No new wire message.
     ///
     /// Gates: the ADR-0043 signing gate (the same egress refusal as every
-    /// DM path) and the raw payload bound. The revocation decision is the
-    /// CALLER's — every caller has already run the #1657 ladder (agent,
-    /// machine, binding, resync) on this exact (requester, machine) pair
-    /// under the revocation-set lock, so a clean pair never loses egress
-    /// here and a revoked pair never reaches this send. A reply addressed
-    /// to this daemon's own (agent, machine) pair is delivered through
-    /// the same loopback path an ordinary self-addressed DM takes.
+    /// DM path), the raw payload bound, and — review round 1 — the same
+    /// B/P pairing evaluation ordinary egress runs, re-read HERE at the
+    /// send. The caller ran the #1657 ladder (agent, machine, binding,
+    /// resync) when it decided to answer, but a chunk serve can park and
+    /// read the blob after releasing the revocation-set lock, so a
+    /// revocation landing in that window still finds this send closed. A
+    /// reply addressed to this daemon's own (agent, machine) pair is
+    /// delivered through the same loopback path an ordinary self-addressed
+    /// DM takes.
     pub(crate) async fn send_machine_addressed_dm(
         &self,
         requester: &identity::AgentId,
@@ -10393,16 +10395,16 @@ impl Agent {
                 max: direct::MAX_DIRECT_PAYLOAD_SIZE,
             });
         }
-        #[cfg(test)]
-        if let Ok(mut egress) = self.machine_reply_egress.lock() {
-            egress.push((machine_id, payload.to_vec()));
-        }
         if *requester == self.identity.agent_id() {
             if machine_id != self.identity.machine_id() {
                 self.direct_messaging.record_outgoing_failed(*requester);
                 return Err(dm::DmError::NoConnectivity(
                     "a machine-addressed reply names another machine of this agent".to_string(),
                 ));
+            }
+            #[cfg(test)]
+            if let Ok(mut egress) = self.machine_reply_egress.lock() {
+                egress.push((machine_id, payload.to_vec()));
             }
             self.direct_messaging
                 .record_outgoing_started(*requester, None);
@@ -10426,7 +10428,32 @@ impl Agent {
             );
             return Ok(receipt);
         }
-        let Some(network) = self.network.as_ref() else {
+        let network = self.network.as_ref();
+        // Review round 1: re-evaluate the pairing for the exact
+        // (requester, machine) pair at the send — the caller's ladder
+        // decision can predate the chunk read that followed it.
+        if let Some(denial) = self.recipient_pairing_denied(requester, &machine_id).await {
+            self.direct_messaging.record_outgoing_failed(*requester);
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "machine_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "machine_reply_pairing_denied",
+                denial = ?denial,
+                "machine-addressed data reply withheld: the pairing was denied at the send"
+            );
+            return Err(dm::DmError::EnvelopeConstruction(format!(
+                "recipient pairing denied (ADR-0043 B/P): {denial:?}"
+            )));
+        }
+        // The addressing decision — recorded at the seam exactly as the
+        // refusal lane records its decision, before the transport handoff
+        // (an offline agent has no transport; the decision is the fact).
+        #[cfg(test)]
+        if let Ok(mut egress) = self.machine_reply_egress.lock() {
+            egress.push((machine_id, payload.to_vec()));
+        }
+        let Some(network) = network else {
             self.direct_messaging.record_outgoing_failed(*requester);
             tracing::debug!(
                 target: "x0x::direct",

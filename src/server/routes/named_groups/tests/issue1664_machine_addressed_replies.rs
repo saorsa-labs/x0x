@@ -4,14 +4,16 @@
 //! device that still holds the portable agent key can occupy (discovery
 //! cache, capability binding, newest connection). The catch-up page and
 //! the control-blob chunk now ride the machine-addressed raw-QUIC reply
-//! lane (the #1657 refusal lane's delivery shape for data), and the
-//! control-blob and seat-cert serves refuse a machine- or
-//! binding-revoked requester with the #1657 typed refusal. The seat-cert
-//! lane carries no machine identity, so its machine check resolves the
-//! requester's own capability binding (ADR-0043 §9 evidence semantics:
-//! present fails closed, absent fails open). Every addressing decision
-//! is recorded at the send seam (`machine_reply_egress`), so a test
-//! cannot pass on an answer that never left or went to the wrong device.
+//! lane (the #1657 refusal lane's delivery shape for data), the
+//! JoinResult chunk exchange pins the same machine, and the control-blob
+//! serve refuses a machine- or binding-revoked fetcher with the #1657
+//! typed refusal. The seat-cert lane rides the gossip topic, which
+//! carries no authenticated requester machine: its ladder is the
+//! envelope's agent only — a binding-based refusal there would be a
+//! revoked device's denial-of-service lever over the clean device of the
+//! same agent (review round 1). Every addressing decision is recorded at
+//! the send seam (`machine_reply_egress`), so a test cannot pass on an
+//! answer that never left or went to the wrong device.
 
 use super::*;
 use x0x::identity::AgentKeypair;
@@ -220,11 +222,42 @@ async fn a_catchup_page_goes_to_the_requesting_machine_and_a_revoked_asker_gets_
         serde_json::from_slice(&egress[0].1).expect("the egress payload is a catch-up page");
     assert_eq!(page.group_id, group_id);
 
-    // The revoked device of the SAME agent key holder asks: the #1657
-    // refusal answers it and no second page egress exists — the revoked
-    // machine never receives an answer it can read.
+    // A device is revoked but keeps the portable agent key of ANOTHER
+    // member; it is the machine the next block's newest advert names.
     let device = x0x::identity::MachineKeypair::generate()?;
     revoke_machine(&state, &device).await;
+
+    // Review round 1, the attack itself: the revoked device holds the
+    // agent key, so it can publish the NEWEST advert for the clean asker's
+    // agent, naming ITSELF — every agent-level resolution (discovery
+    // cache, capability binding, newest connection) then points at the
+    // revoked device. The clean machine asks again and its page is STILL
+    // addressed to the clean machine: the reply lane ignores the binding.
+    advertise_refusal_bit(&state, &active.agent_id(), &device.machine_id());
+    handle_treekem_catchup_request(
+        &state,
+        &active.agent_id(),
+        &clean_sender_machine(),
+        true,
+        catchup_request(&group_id, &active.agent_id()),
+    )
+    .await;
+    assert_eq!(
+        recorded_pages(&state),
+        2,
+        "the clean asker is served even while a revoked device holds its agent's newest advert"
+    );
+    let egress = machine_reply_egress(&state);
+    assert_eq!(egress.len(), 2, "exactly one more machine-addressed reply");
+    assert_eq!(
+        egress[1].0,
+        clean_sender_machine(),
+        "the page still goes to the machine that asked, never to the revoked device the newest advert names"
+    );
+
+    // The revoked device asks in its own name: the #1657 refusal answers
+    // it and no further page egress exists — the revoked machine never
+    // receives an answer it can read.
     advertise_refusal_bit(&state, &device_agent.agent_id(), &device.machine_id());
     handle_treekem_catchup_request(
         &state,
@@ -236,12 +269,12 @@ async fn a_catchup_page_goes_to_the_requesting_machine_and_a_revoked_asker_gets_
     .await;
     assert_eq!(
         recorded_pages(&state),
-        1,
-        "a machine-revoked asker gets no second page"
+        2,
+        "a machine-revoked asker gets no further page"
     );
     assert_eq!(
         machine_reply_egress(&state).len(),
-        1,
+        2,
         "no data reply is addressed to the revoked machine"
     );
     let refusals = recorded_refusals(&state);
@@ -428,15 +461,20 @@ async fn control_blob_answers_go_to_the_requesting_machine_and_revoked_fetchers_
     Ok(())
 }
 
-/// The seat-cert handler: the ask rides the gossip topic, so the machine
-/// identity is the requester's own capability binding. A binding that
-/// names a machine- or binding-revoked device gets the typed refusal and
-/// no answer; an agent-revoked requester keeps the silent drop; a clean
-/// requester (no advert held: absent evidence fails open, ADR-0043 §9.3)
-/// is still answered.
+/// The seat-cert handler: the ask rides the gossip topic, which carries no
+/// authenticated requester machine, so the lane's whole revocation ladder
+/// is the envelope's agent. An agent-revoked ROSTER MEMBER gets the silent
+/// drop (the roster itself would still admit it — a revoked target keeps
+/// its Active seat until the S4 eviction commits), while a clean requester
+/// is answered exactly as before. Review round 1 also pins that a revoked
+/// device holding the portable agent key CANNOT weaponise the lane: a
+/// newest advert naming a machine-revoked device changes nothing — the
+/// clean requester of the same agent is still answered (a binding-based
+/// refusal would be that device's denial-of-service lever over the clean
+/// device, and the topic broadcast leaks nothing it protects).
 #[tokio::test]
-async fn seat_cert_refuses_a_binding_resolved_revoked_requester_and_serves_a_clean_one(
-) -> Result<()> {
+async fn seat_cert_drops_an_agent_revoked_member_and_cannot_be_weaponised_by_adverts() -> Result<()>
+{
     let (state, _dir) = secure_endpoint_test_state().await?;
     let owner = x0x::identity::UserKeypair::generate()?;
     let remote = AgentKeypair::generate()?;
@@ -496,8 +534,15 @@ async fn seat_cert_refuses_a_binding_resolved_revoked_requester_and_serves_a_cle
         requester: remote_hex.clone(),
     })?;
 
-    // CONTROL: a clean requester with no advert this node holds keeps
-    // main's answer (absent evidence fails open).
+    // Review round 1, the weaponisation attempt, run FIRST so the C5
+    // answer slot is free: a revoked device holds the remote agent's key
+    // and publishes the NEWEST advert for it, naming the machine-revoked
+    // device. The clean requester of that same agent is STILL answered —
+    // the lane keeps no binding-based refusal such an advert could turn
+    // against the clean device.
+    let device = x0x::identity::MachineKeypair::generate()?;
+    revoke_machine(&state, &device).await;
+    advertise_refusal_bit(&state, &remote.agent_id(), &device.machine_id());
     assert!(
         seat_cert_fetch::handle_group_cert_fetch_request(
             &state,
@@ -507,95 +552,104 @@ async fn seat_cert_refuses_a_binding_resolved_revoked_requester_and_serves_a_cle
             &group_key
         )
         .await,
-        "a clean requester with no binding evidence is still answered"
+        "a clean requester is still answered while a revoked device holds its agent's newest advert"
     );
 
-    // An agent-revoked requester: the silent drop (no answer, no refusal).
-    let revoked_agent = AgentKeypair::generate()?;
-    revoke_agent(&state, &revoked_agent).await;
-    assert!(
-        !seat_cert_fetch::handle_group_cert_fetch_request(
-            &state,
-            &request,
-            Some(&revoked_agent.agent_id()),
-            true,
-            &group_key
-        )
-        .await,
-        "an agent-revoked requester gets no answer"
-    );
-    assert!(
-        recorded_refusals(&state).is_empty(),
-        "the agent-revocation refusal stays a silent drop"
-    );
-
-    // A requester whose own capability binding names a machine-revoked
-    // device: the typed refusal answers that machine, and no answer is
-    // published for the ask.
-    let device = x0x::identity::MachineKeypair::generate()?;
-    revoke_machine(&state, &device).await;
-    advertise_refusal_bit(&state, &remote.agent_id(), &device.machine_id());
-    assert!(
-        !seat_cert_fetch::handle_group_cert_fetch_request(
-            &state,
-            &request,
-            Some(&remote.agent_id()),
-            true,
-            &group_key
-        )
-        .await,
-        "a requester whose binding names a machine-revoked device is not answered"
-    );
-    let refusals = await_refusal_count(&state, 1).await;
-    assert_eq!(refusals.len(), 1, "the refusal decision is recorded");
-    assert_eq!(
-        refusals[0].reason,
-        TreeKemCatchupRefusalReason::MachineRevoked
-    );
-    assert_eq!(
-        refusals[0].group_id(),
-        state
-            .named_groups
-            .read()
-            .await
-            .get(&group_key)
-            .expect("fixture")
-            .stable_group_id()
-    );
-
-    // A binding-revoked pairing of the same shape is refused the same way.
-    let holder = AgentKeypair::generate()?;
-    let owner_two = x0x::identity::UserKeypair::generate()?;
-    let retired = x0x::identity::MachineKeypair::generate()?.machine_id();
-    retire_binding(&state, &owner_two, &holder, &retired).await;
-    advertise_refusal_bit(&state, &holder.agent_id(), &retired);
-    // The holder must be an active roster member for the serve to reach
-    // the machine check; seat it on the same group.
+    // An agent-revoked requester that IS an active roster member (so the
+    // roster check alone would admit it — and the C5 answer slot above is
+    // already taken, so only the revocation gate can explain this drop):
+    // the silent drop — no answer and no refusal, exactly as the
+    // control-blob lane's agent gate.
+    let revoked_member = AgentKeypair::generate()?;
     {
         let mut groups = state.named_groups.write().await;
         groups.get_mut(&group_key).expect("fixture").add_member(
-            hex::encode(holder.agent_id().as_bytes()),
+            hex::encode(revoked_member.agent_id().as_bytes()),
             x0x::groups::GroupRole::Member,
             None,
             None,
         );
     }
+    revoke_agent(&state, &revoked_member).await;
     assert!(
         !seat_cert_fetch::handle_group_cert_fetch_request(
             &state,
             &request,
-            Some(&holder.agent_id()),
+            Some(&revoked_member.agent_id()),
             true,
             &group_key
         )
         .await,
-        "a requester whose binding names a binding-revoked pairing is not answered"
+        "an agent-revoked roster member gets no answer"
     );
-    let refusals = await_refusal_count(&state, 2).await;
-    assert_eq!(refusals.len(), 2);
+    assert!(
+        recorded_refusals(&state).is_empty(),
+        "the agent-revocation refusal stays a silent drop"
+    );
+    Ok(())
+}
+
+/// Review round 1, finding 2: the machine-pinned JoinResult chunk
+/// exchange addresses the chunk to the requesting machine. An admitted
+/// exchange egresses to that machine (offline: the in-process stand-in
+/// runs both admission phases exactly where the transport runs them), and
+/// an admission that withholds records NO egress — a withheld chunk is no
+/// answer, wherever it was addressed.
+#[tokio::test]
+async fn a_join_result_chunk_exchange_targets_the_requesting_machine() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let joiner = AgentKeypair::generate()?;
+    let machine = clean_sender_machine();
+    let admitted: x0x::dm::ArtifactAdmission = std::sync::Arc::new(|| {
+        Box::pin(async { Some(Box::new(|| true) as x0x::dm::SeamAdmission) })
+    });
+    let payload = b"join-result-chunk-frame".to_vec();
+    let group_id = "68".repeat(32);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let outcome = send_join_artifact_to_machine(
+        &state,
+        &joiner.agent_id(),
+        machine,
+        &payload,
+        &group_id,
+        "join_result_chunk",
+        admitted,
+        deadline,
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "the offline stand-in reports an admitted exchange through its marker error"
+    );
+    let egress = machine_reply_egress(&state);
+    assert_eq!(egress.len(), 1, "the admitted chunk exchange egressed");
     assert_eq!(
-        refusals[1].reason,
-        TreeKemCatchupRefusalReason::BindingRevoked
+        egress[0].0, machine,
+        "the chunk targets the requesting machine, not a binding resolution"
+    );
+    assert_eq!(egress[0].1, payload);
+
+    // An admission whose pre-phase refuses records no egress at all.
+    let withheld: x0x::dm::ArtifactAdmission = std::sync::Arc::new(|| Box::pin(async { None }));
+    let outcome = send_join_artifact_to_machine(
+        &state,
+        &joiner.agent_id(),
+        machine,
+        &payload,
+        &group_id,
+        "join_result_chunk",
+        withheld,
+        deadline,
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "a withheld admission refuses the exchange"
+    );
+    assert_eq!(
+        machine_reply_egress(&state).len(),
+        1,
+        "a withheld admission is no egress"
     );
     Ok(())
 }
