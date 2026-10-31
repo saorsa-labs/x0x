@@ -18,29 +18,34 @@
 //!   `waiting_for_fork_resolution` (D64) with the manual-resolution
 //!   quarantine marker, and publish no saved sibling (D and C stay on
 //!   D's single commit, unquarantined; A's divergent key cannot claim H
-//!   across the real fork). On `main` the containment half is green —
-//!   the stale-replica protection (an unknown holder head conflicts the
-//!   round) withholds the resend — but the typed half is RED: A's row
-//!   silently completes across the real fork, no fork evidence is
-//!   persisted and no `waiting_for_fork_resolution` is shown, which
-//!   ADR 0110 §3 (L225–L227) forbids. The arm is wired as an expected
-//!   RED with `CAUSE_NO_TYPED_FORK` — the only cause this arm accepts
-//!   as its RED (the test checks the cause, not only the verdict) — and
-//!   it turns GREEN with that fix. The gap is recorded on #1581 by
-//!   name. A sibling that a receiver keeps fails the end-state
-//!   evidence (INFRA); a sibling sighting the receivers refuse names
+//!   across the real fork). The containment is watched on A's side, not
+//!   only through the receivers: from A's restart on, a count-only
+//!   fabric rule counts every direct-carrier frame A sends toward D or
+//!   C that carries the saved exclusion event (a `member_removed` or
+//!   `member_banned` naming B), and a non-zero count names
+//!   `CAUSE_SIBLING_PUBLISHED` — the arm cannot go GREEN while A
+//!   resends its saved sibling, however firmly the receivers refuse it.
+//!   On `main` that count is zero (the stale-replica protection — an
+//!   unknown holder head conflicts the round — withholds the resend; an
+//!   injected resend, never committed, is caught by the count and names
+//!   exactly that cause), but the typed half is RED: A's row silently
+//!   completes across the real fork, no fork evidence is persisted and
+//!   no `waiting_for_fork_resolution` is shown, which ADR 0110 §3 L225
+//!   forbids. The arm is wired as an expected RED with
+//!   `CAUSE_NO_TYPED_FORK` — the only cause this arm accepts as its RED
+//!   (the test checks the cause, not only the verdict) — and it turns
+//!   GREEN with that fix. The gap is recorded on #1581 by name. A
+//!   sibling that a receiver keeps fails the end-state evidence
+//!   (INFRA); a sibling A sends — kept or refused — names
 //!   `CAUSE_SIBLING_PUBLISHED`, which also fails the arm's cause
-//!   check. A neutralisation of the conflicting-report protection
-//!   (never committed) does not change the outcome on main: the
-//!   receivers' own validation still refuses the stale-rotation event,
-//!   so the observed RED is anchored in the typed-state gap itself.
+//!   check.
 //! - the resume arm: no competing commit exists (D stays down). A
 //!   restarts and finishes the eligible delivery of its saved event
 //!   without another rekey; once D returns onto the compatible chain,
 //!   A's and D's rows close and every survivor converges on A's commit.
 //!   GREEN on `main`.
 //!
-//! Harness honesty, six departures stated plainly:
+//! Harness honesty, seven departures stated plainly:
 //!
 //! - The committer that crashes is the rank-1 fallback, not the
 //!   designated admin the row's cast names, and the designated seat is
@@ -79,11 +84,18 @@
 //!   D's own wait-past-W fallback flow is 1581c's D path and is not
 //!   duplicated here.
 //! - The resume arm restarts D only after A's saved delivery has
-//!   converged with C: a committed row stays open while a survivor is
-//!   down, so D's return is what closes the rows. D's own row is not
-//!   this arm's outcome — the restarted D may first wait for B's
-//!   KeyPackage (`waiting_for_member_key_package`, the #1567 cache
-//!   loss) before its row closes on its own.
+//!   converged with C — the first wait ends when C holds A's commit,
+//!   recorded as evidence before D boots — because a committed row
+//!   stays open while a survivor is down, so D's return is what closes
+//!   the rows. D's own row is not this arm's outcome — the restarted D
+//!   may first wait for B's KeyPackage
+//!   (`waiting_for_member_key_package`, the #1567 cache loss) before
+//!   its row closes on its own.
+//! - The row's "public manual remove reaches the same pre-publication
+//!   barrier" is checked only through the typed reply: the case asserts
+//!   the remove call's `202 waiting_for_designated_admin` naming the
+//!   down designated D with `local_rank 1`, not the barrier's own gate
+//!   state, which no public API or probe exposes.
 //! - The fork arm crash-stops A a second time once the outcome has
 //!   settled, and takes its final reads after that restart, so §3's
 //!   "fork evidence and typed manual-resolution exit survive" is
@@ -141,9 +153,10 @@ const CAUSE_NO_D_COMMIT: &str = "D never committed the competing exclusion while
 const CAUSE_NO_TYPED_FORK: &str = "no typed waiting_for_fork_resolution: after D's competing \
                                    commit reached the restarted A, its public S4 row exposed no \
                                    cause while it held an undelivered saved exclusion";
-const CAUSE_SIBLING_PUBLISHED: &str = "a competing sibling was published across the restart: a \
-                                       node took the other admin's commit, or left the one \
-                                       exclusion it had settled on";
+const CAUSE_SIBLING_PUBLISHED: &str = "a competing sibling was published across the restart: A \
+                                       sent its saved exclusion toward D or C, or a node took \
+                                       the other admin's commit or left the one exclusion it \
+                                       had settled on";
 const CAUSE_SECOND_ROTATION: &str = "the exclusion was not exactly one rotation: a node moved \
                                      past e0 + 1 after the outcome";
 const CAUSE_NO_RESUME: &str = "A never finished the saved delivery on the same chain: its row \
@@ -518,8 +531,16 @@ async fn encrypt(
     })
 }
 
-/// Whether `label` recovers the probe from `ciphertext`, with the reply.
-async fn decrypts(sim: &Sim, label: &str, group: &str, ciphertext: &str) -> Result<(bool, String)> {
+/// Whether `label` recovers the probe from `ciphertext`, with the reply
+/// status and body. The status tells a typed refusal apart from a dead
+/// path: B's exclusion is its daemon answering with the group layer's
+/// refusal ([`refused_typed`]), not any failure at all.
+async fn decrypts(
+    sim: &Sim,
+    label: &str,
+    group: &str,
+    ciphertext: &str,
+) -> Result<(bool, StatusCode, String)> {
     let (status, body) = sim
         .api(
             label,
@@ -533,7 +554,16 @@ async fn decrypts(sim: &Sim, label: &str, group: &str, ciphertext: &str) -> Resu
             .as_str()
             .and_then(|payload| BASE64.decode(payload).ok())
             .is_some_and(|payload| payload == PROBE);
-    Ok((ok, format!("{label} decrypt: {status} {body}")))
+    Ok((ok, status, format!("{label} decrypt: {status} {body}")))
+}
+
+/// A typed group-layer refusal (`400 Bad Request` or `404 Not Found`):
+/// the daemon answered and the group's roster or crypto refused. B's
+/// decrypt failing this way is exclusion evidence, where `!ok` alone
+/// would be weak — B revoked itself and could fail to decrypt for
+/// unrelated reasons.
+fn refused_typed(status: StatusCode) -> bool {
+    status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND
 }
 
 /// The publication blackout: while set, every frame `target` sends
@@ -582,6 +612,61 @@ impl SenderBlackout {
 
     fn dropped(&self) -> usize {
         self.dropped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The sibling watch (ADR 0110's "publish no saved sibling", watched on
+/// A's side): while armed, it counts — passing, never dropping — every
+/// frame A sends toward D or C on the direct carrier whose bytes carry
+/// the saved exclusion event, a `member_removed` or `member_banned`
+/// naming B. The count is A publishing its saved sibling whatever the
+/// receivers then do with it: a refused event still left A. A non-zero
+/// count feeds `CAUSE_SIBLING_PUBLISHED`, so the fork arm cannot go
+/// GREEN on the receivers' backstop alone. Count-only, like
+/// [`SenderBlackout`]: no frame is changed. The oversized-event
+/// reference egress is out of scope — the saved event of this row is a
+/// few KB, far under the reference threshold.
+struct SiblingWatch {
+    seen: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Whether `bytes` carry a removal or ban event whose subject is
+/// `target_hex`: the direct carrier frames the JSON event verbatim, so
+/// the serde tag and the 64-hex subject id are both present.
+fn carries_removal_of(bytes: &[u8], target_hex: &str) -> bool {
+    fn carries(bytes: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle)
+    }
+    (carries(bytes, b"member_removed") || carries(bytes, b"member_banned"))
+        && carries(bytes, target_hex.as_bytes())
+}
+
+impl SiblingWatch {
+    fn install(sim: &Sim, target: &str, others: &[&str], subject_hex: &str) -> Result<Self> {
+        use crate::network::sim::{Fault, LaneClass};
+        use std::sync::atomic::Ordering;
+        let machine = sim.peer(target)?.0;
+        let mut peers = Vec::with_capacity(others.len());
+        for label in others {
+            peers.push(sim.peer(label)?.0);
+        }
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (rule_seen, subject) = (Arc::clone(&seen), subject_hex.to_string());
+        sim.fabric().add_rule(move |write| {
+            if write.lane.src == machine
+                && peers.contains(&write.lane.dst)
+                && matches!(write.lane.class, LaneClass::Direct)
+                && carries_removal_of(&write.bytes, &subject)
+            {
+                rule_seen.fetch_add(1, Ordering::SeqCst);
+            }
+            Fault::Pass
+        });
+        Ok(Self { seen })
+    }
+
+    fn seen(&self) -> usize {
+        self.seen.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -707,7 +792,10 @@ async fn setup(
             decrypts(sim, "B", &group, ciphertext).await?,
             decrypts(sim, "C", &group, ciphertext).await?,
         ),
-        Err(error) => ((false, error.clone()), (false, error.clone())),
+        Err(error) => (
+            (false, StatusCode::BAD_GATEWAY, error.clone()),
+            (false, StatusCode::BAD_GATEWAY, error.clone()),
+        ),
     };
     // D, the author of the competing exclusion after its restart in the
     // fork arm, must hold B's KeyPackage by the remove route's own
@@ -751,7 +839,7 @@ async fn setup(
     receipt.evidence(
         "b_and_c_decrypt_at_e0_before_the_trigger",
         b_before.0 && c_before.0,
-        format!("{}; {}", b_before.1, c_before.1),
+        format!("{}; {}", b_before.2, c_before.2),
         at(sim),
     );
     let mut ranked: Vec<(String, &str)> = ["A", "D"]
@@ -870,10 +958,15 @@ async fn scenario(
     blackout.set(true);
     sim.fabric()
         .mark("fault: every frame A sends toward B or C dropped (the publication blackout)");
+    // The stage observes the round at the fault itself, not only at the
+    // arming check above: once confirmed, the round stays confirmed
+    // until a new head or a conflicting report restarts it, so a false
+    // re-read here is a real regression, not a vacuous pass.
+    let probe_at_fault = seal_probe(sim, "A", &group, &b_hex).await?;
     receipt.evidence(
         "a_round_confirmed_before_the_blackout",
-        probe_at_arm.contains("confirmed=true"),
-        format!("A's seal probe at the blackout: {probe_at_arm}"),
+        probe_at_arm.contains("confirmed=true") && probe_at_fault.contains("confirmed=true"),
+        format!("A's seal probe at the arm: {probe_at_arm}; at the blackout: {probe_at_fault}"),
         at(sim),
     );
 
@@ -1073,8 +1166,21 @@ async fn scenario(
 
     // A restarts with the blackout released: nothing fabric-side holds
     // A's resend back, so any sibling it publishes lands on D and C and
-    // fails the containment watch below.
+    // fails the containment watch below. The fork arm's sibling watch
+    // is armed at the restart and counts A's own outbound removal-event
+    // frames toward D and C — the resend itself, refused or not.
     blackout.set(false);
+    let sibling_watch = if competing {
+        let watch = SiblingWatch::install(sim, "A", &["D", "C"], &b_hex)?;
+        sim.fabric().mark(
+            "case: the sibling watch armed — A's outbound removal-event frames toward D and C \
+             are counted from its restart on",
+        );
+        Some(watch)
+    } else {
+        None
+    };
+    let watched_frames = sibling_watch.as_ref().map(|watch| Arc::clone(&watch.seen));
     sim.fabric().mark(format!(
         "case: blackout released for A's restart ({} frames had been dropped); A restarts on \
          its saved delivery-pending row",
@@ -1095,6 +1201,7 @@ async fn scenario(
     let mut sibling: Option<String> = None;
     let mut second_rotation: Option<String> = None;
     let mut converged = false;
+    let mut c_holds_commit = false;
     let waited = sim
         .until(
             "A restarts onto the branch the row names",
@@ -1130,13 +1237,19 @@ async fn scenario(
                         }
                     }
                 }
+                if let Some(frames) = watched_frames.as_ref() {
+                    let sent = frames.load(std::sync::atomic::Ordering::SeqCst);
+                    if sent > 0 {
+                        sibling.get_or_insert(format!(
+                            "A sent its saved exclusion toward D/C after its restart: {sent} \
+                             direct-carrier removal-event frames"
+                        ));
+                    }
+                }
                 if let Ok(Some(row)) = s4_row(s, "A", &group, &b_hex).await {
                     if competing {
                         typed_fork |=
                             row["waiting"]["cause"].as_str() == Some("waiting_for_fork_resolution");
-                    } else {
-                        converged |= row["phase"].as_str() == Some("complete")
-                            && row["result_epoch"].as_u64() == Some(e0 + 1);
                     }
                 }
                 if competing {
@@ -1144,15 +1257,21 @@ async fn scenario(
                         && matches!(try_view_now(s, "A", &group, &b).await, Ok(Some(seen))
                             if seen.epoch == Some(e0 + 1) && seen.quarantined)
                 } else {
-                    converged
-                        && matches!(
-                            views_now(s, &["A", "C"], &group, &b).await,
-                            Ok(now) if excluded(&now, e0, leaves0) && now.iter().all(|(_, seen)| {
-                                seen.as_ref().is_some_and(|seen| {
-                                    seen.head_committed_by.as_deref() == Some(a_hex.as_str())
-                                })
-                            })
-                        )
+                    // The resume arm's first wait ends when C — the only
+                    // survivor that is up — holds A's commit: A's row
+                    // itself cannot close while D is down, so waiting for
+                    // it here would only burn the budget and restart D on
+                    // an unconverged chain. The sighting is recorded as
+                    // evidence below, before D boots.
+                    c_holds_commit = matches!(
+                        try_view_now(s, "C", &group, &b).await,
+                        Ok(Some(seen))
+                            if seen.epoch == Some(e0 + 1)
+                                && !seen.lists_b
+                                && !seen.quarantined
+                                && seen.head_committed_by.as_deref() == Some(a_hex.as_str())
+                    );
+                    c_holds_commit
                 }
             },
         )
@@ -1161,6 +1280,22 @@ async fn scenario(
         if !expired(&error) {
             return Err(error);
         }
+    }
+
+    // The resume arm's handover evidence: C holds A's commit before D
+    // restarts, so D boots onto a chain that already carries the
+    // exclusion and cannot race a sibling of its own.
+    if !competing {
+        let c_view = view_now(sim, "C", &group, &b).await?;
+        receipt.evidence(
+            "c_holds_as_commit_before_d_returns",
+            c_holds_commit
+                && c_view.epoch == Some(e0 + 1)
+                && !c_view.lists_b
+                && c_view.head_committed_by.as_deref() == Some(a_hex.as_str()),
+            format!("C at D's restart: {}", c_view.describe()),
+            at(sim),
+        );
     }
 
     // Resume arm, second phase: D returns after A's saved delivery has
@@ -1221,7 +1356,7 @@ async fn scenario(
             .until(
                 "A's second restart reloads its row",
                 sync_wait + secs(5),
-                async |s: &Sim| s4_row(s, "A", &group, &b_hex).await.is_ok(),
+                async |s: &Sim| matches!(s4_row(s, "A", &group, &b_hex).await, Ok(Some(_))),
             )
             .await;
         if let Err(error) = waited {
@@ -1243,6 +1378,19 @@ async fn scenario(
             "after A's second restart: row {row_again:?}; the typed cause and the public \
              fork-quarantine marker survived: {survives}"
         ));
+    }
+
+    // The sibling watch's final read: frames A sent after the watch
+    // loop's exit — through the settle and A's second restart — still
+    // count, so a late resend cannot slip past the loop's cadence.
+    if let Some(watch) = &sibling_watch {
+        let sent = watch.seen();
+        if sent > 0 {
+            sibling.get_or_insert(format!(
+                "A sent its saved exclusion toward D/C after its restart: {sent} \
+                 direct-carrier removal-event frames (final read)"
+            ));
+        }
     }
 
     let survivors: &[&str] = if competing {
@@ -1276,9 +1424,9 @@ async fn scenario(
             decrypts(sim, "A", &group, &ciphertext).await?,
         ),
         Err(error) => (
-            (false, error.clone()),
-            (false, error.clone()),
-            (false, error),
+            (false, StatusCode::BAD_GATEWAY, error.clone()),
+            (false, StatusCode::BAD_GATEWAY, error.clone()),
+            (false, StatusCode::BAD_GATEWAY, error),
         ),
     };
 
@@ -1304,8 +1452,8 @@ async fn scenario(
         });
         // The end-state control only: a sibling sighting is judged in the
         // cause ladder (a published sibling is a named RED, not an INFRA
-        // premise), including the refused-send shape where D and C stay
-        // clean because the receivers are the backstop.
+        // premise) — including a sibling the receivers refuse, which the
+        // sibling watch counts on A's side and folds in above.
         let d_c_hold_ds_commit = end.iter().all(|(_, seen)| {
             seen.as_ref().is_some_and(|seen| {
                 seen.epoch == Some(e0 + 1)
@@ -1318,36 +1466,43 @@ async fn scenario(
             d_c_hold_ds_commit,
             format!(
                 "{}; first sibling sighting: {:?}; first past-e0+1 sighting: {:?}; frames A sent \
-                 toward B/C before its crash: {}",
+                 toward B/C before its crash: {}; removal-event frames A sent toward D/C after \
+                 its restart: {}",
                 describe_all(&end),
                 sibling,
                 second_rotation,
-                blackout.dropped()
+                blackout.dropped(),
+                sibling_watch.as_ref().map_or(0, SiblingWatch::seen)
             ),
             at(sim),
         );
+        let a_evs_t_obs = persisted_t_obs(sim, "A", b.as_bytes())?;
         let a_keeps_own = a_end.epoch == Some(e0 + 1)
             && a_end.state_revision == r0 + 1
             && a_end.head_committed_by.as_deref() == Some(a_hex.as_str())
-            && persisted_t_obs(sim, "A", b.as_bytes())?.is_some();
+            && a_evs_t_obs.is_some();
         receipt.evidence(
             "a_keeps_its_own_commit_and_saved_row_across_the_restart",
             a_keeps_own,
             format!(
-                "A after the restarts: {}; its persisted .evs row for B is still on disk: {}",
+                "A after the restarts: {}; its persisted .evs row for B is still on disk (T_obs \
+                 {:?}): {}",
                 a_end.describe(),
-                persisted_t_obs(sim, "A", b.as_bytes())?.is_some()
+                a_evs_t_obs,
+                a_evs_t_obs.is_some()
             ),
             at(sim),
         );
         // A cannot claim H across the real fork: its divergent e0 + 1
-        // key does not open D's new traffic, while C's does and B's
-        // retained keys cannot.
-        let fork_data_plane = c_after.0 && !b_after.0 && !a_after.0;
+        // key does not open D's new traffic, while C's does and B —
+        // answered by its own daemon with the group layer's typed
+        // refusal, not a dead path — cannot.
+        let b_refused_typed = !b_after.0 && refused_typed(b_after.1);
+        let fork_data_plane = c_after.0 && b_refused_typed && !a_after.0;
         receipt.evidence(
             "the_fork_is_real_on_the_data_plane",
             fork_data_plane,
-            format!("{}; {}; {}", c_after.1, b_after.1, a_after.1),
+            format!("{}; {}; {}", c_after.2, b_after.2, a_after.2),
             at(sim),
         );
         let d_row_complete = d_row.as_ref().is_ok_and(|row| {
@@ -1415,7 +1570,7 @@ async fn scenario(
             } else if !fork_data_plane {
                 (
                     CAUSE_DATA_PLANE,
-                    format!("{}; {}; {}", c_after.1, b_after.1, a_after.1),
+                    format!("{}; {}; {}", c_after.2, b_after.2, a_after.2),
                 )
             } else {
                 (
@@ -1433,8 +1588,13 @@ async fn scenario(
             // failure (no durable commit, no D commit, a leak, a broken
             // data plane) stays INFRA, so the gate's `--expect=RED` pin
             // cannot be satisfied by an unrelated regression while the
-            // §3 fix waits.
-            let named = matches!(cause, CAUSE_SIBLING_PUBLISHED | CAUSE_NO_TYPED_FORK);
+            // §3 fix waits. A published sibling and a second rotation
+            // are regressions of the row's own outcome, not premise
+            // failures, so they classify RED too.
+            let named = matches!(
+                cause,
+                CAUSE_SIBLING_PUBLISHED | CAUSE_SECOND_ROTATION | CAUSE_NO_TYPED_FORK
+            );
             receipt.cause(cause, Some(observed), named, at(sim));
         }
         receipt.finish(FINAL_FORK, passed, at(sim));
@@ -1464,11 +1624,14 @@ async fn scenario(
             ),
             at(sim),
         );
-        let resume_data_plane = a_after.0 && c_after.0 && !b_after.0;
+        // B's refusal must be typed (its daemon answered; the group layer
+        // refused): B revoked itself, so a decrypt failing for any other
+        // reason is not exclusion evidence.
+        let resume_data_plane = a_after.0 && c_after.0 && !b_after.0 && refused_typed(b_after.1);
         receipt.evidence(
             "the_data_plane_follows_the_resumed_delivery",
             resume_data_plane,
-            format!("{}; {}; {}", a_after.1, c_after.1, b_after.1),
+            format!("{}; {}; {}", a_after.2, c_after.2, b_after.2),
             at(sim),
         );
         let passed = durable
@@ -1523,7 +1686,7 @@ async fn scenario(
             } else {
                 (
                     CAUSE_DATA_PLANE,
-                    format!("{}; {}; {}", a_after.1, c_after.1, b_after.1),
+                    format!("{}; {}; {}", a_after.2, c_after.2, b_after.2),
                 )
             };
             // Premise failures stay INFRA like the fork arm's; only the
@@ -1597,6 +1760,20 @@ async fn expect(
 
 const LABELS: &[&str] = &["A", "D", "B", "C"];
 
+/// Run `f` on a thread with a 16 MiB stack. This case's scenario is the
+/// family's largest single state machine, and a default libtest thread
+/// (2 MiB) overflows it while a nextest process (main thread, 8 MiB)
+/// does not — the arm's outcome must not depend on the runner's stack
+/// size, so both tests run their paused runtime on a wide stack.
+fn on_wide_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn the wide-stack runner")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 /// ADR 0110 `s4_crash_commit_fallback`, the fork arm: A's rank-1
 /// fallback commits the exclusion durably into the publication
 /// blackout and is crash-stopped; the restarted designated D commits
@@ -1619,18 +1796,20 @@ const LABELS: &[&str] = &["A", "D", "B", "C"];
               observation"
 )]
 fn w3h_1581e_red_crash_commit_fork_contained() -> Result<()> {
-    super::block_on_paused(async move {
-        expect(
-            "w3h_1581e_red_crash_commit_fork_contained",
-            0x1581_0007,
-            LABELS,
-            true,
-            // RED on main: CAUSE_NO_TYPED_FORK — the saved delivery
-            // completes across the real fork with no fork evidence and
-            // no typed waiting_for_fork_resolution (ADR 0110 §3 L225).
-            Verdict::Red,
-        )
-        .await
+    on_wide_stack(|| {
+        super::block_on_paused(async move {
+            expect(
+                "w3h_1581e_red_crash_commit_fork_contained",
+                0x1581_0007,
+                LABELS,
+                true,
+                // RED on main: CAUSE_NO_TYPED_FORK — the saved delivery
+                // completes across the real fork with no fork evidence and
+                // no typed waiting_for_fork_resolution (ADR 0110 §3 L225).
+                Verdict::Red,
+            )
+            .await
+        })
     })
 }
 
@@ -1649,14 +1828,16 @@ fn w3h_1581e_red_crash_commit_fork_contained() -> Result<()> {
               observation"
 )]
 fn w3h_1581e_control_crash_commit_same_chain_resume() -> Result<()> {
-    super::block_on_paused(async move {
-        expect(
-            "w3h_1581e_control_crash_commit_same_chain_resume",
-            0x1581_0008,
-            LABELS,
-            false,
-            Verdict::Green,
-        )
-        .await
+    on_wide_stack(|| {
+        super::block_on_paused(async move {
+            expect(
+                "w3h_1581e_control_crash_commit_same_chain_resume",
+                0x1581_0008,
+                LABELS,
+                false,
+                Verdict::Green,
+            )
+            .await
+        })
     })
 }
