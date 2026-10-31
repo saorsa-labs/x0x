@@ -31,6 +31,8 @@ pub(crate) fn fixture_receipt(request: &[u8]) -> io::Result<serde_json::Value> {
     control::fixture_receipt(request)
 }
 mod run;
+#[cfg(all(test, unix))]
+mod testkit;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -244,9 +246,41 @@ fn invalid(reason: impl std::fmt::Display) -> io::Error {
     io::Error::other(reason.to_string())
 }
 
+/// A recorded Failed cause is final: a launcher restart re-entering
+/// rollback keeps it instead of downgrading to Interrupted, which would
+/// reopen backoff and reapply of a known-bad release (ADR 0094 S4).
+fn retained_cause<'a>(existing: Option<&'a str>, incoming: &'a str) -> std::borrow::Cow<'a, str> {
+    match existing {
+        Some(existing) if !existing.starts_with("interrupted:") => existing.into(),
+        _ => incoming.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_cause_is_never_downgraded_to_interrupted() {
+        assert_eq!(
+            retained_cause(
+                Some("failed: launch attempts exhausted"),
+                "interrupted: launcher lost child custody"
+            ),
+            "failed: launch attempts exhausted"
+        );
+        assert_eq!(
+            retained_cause(
+                Some("interrupted: launcher died during exec"),
+                "failed: readiness deadline reached"
+            ),
+            "failed: readiness deadline reached"
+        );
+        assert_eq!(
+            retained_cause(None, "failed: total trial deadline reached"),
+            "failed: total trial deadline reached"
+        );
+    }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, Trial, Clock) {
         let dir = tempfile::tempdir().unwrap();

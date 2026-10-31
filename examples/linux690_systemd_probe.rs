@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x0x::upgrade::restart::{readback_systemd_policy, SupervisionSignals, SystemdPolicyReadback};
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[path = "../src/upgrade/launcher/mod.rs"]
 mod launcher;
 
@@ -178,7 +178,7 @@ fn run() -> io::Result<()> {
     }
     // Every invocation, including respawns, admits itself before fixture work.
     let isolation = sample_isolation()?;
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     if let Some(mode) = std::env::args()
         .nth(1)
         .filter(|arg| arg.starts_with("--launcher-"))
@@ -262,7 +262,7 @@ fn run() -> io::Result<()> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn launcher_fixture(mode: &str) -> io::Result<()> {
     use std::io::{BufRead, Read};
     if mode == "--launcher-child" && std::env::var_os("X0X_M2_BOOT_FD").is_some() {
