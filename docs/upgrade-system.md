@@ -274,6 +274,12 @@ check runs before argument parsing, so `--help` and `--check` refuse too. The
 error names the variable. This is a fail-closed guard against a half-armed
 launcher. Remove the variable from the unit or shell to start `x0xd`.
 
+The `x0x-launcher` binary builds only with the non-default `m2-launcher`
+cargo feature. Default builds and `cargo install` of the published crate do
+not build it until the activation slice. The launcher gives a candidate its boot
+permit as one JSON line on descriptor 3 (`X0X_M2_BOOT_FD=3`). This contract is
+provisional and dormant; it is frozen before `ENABLED = true`.
+
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes
 again before mutation. It copies each old binary beside its target, using that
@@ -520,7 +526,8 @@ The launcher sits outside the daemon/CLI swap set; the daemon updater never
 replaces it. `x0xd` also refuses to start while `X0X_M2_BOOT_FD` is set
 (see [Dormant pair transaction](#dormant-pair-transaction-m2-s2e)).
 
-No tracked unit binds the launcher yet. ADR 0094 §5 lists four
+No tracked unit binds the launcher yet, and default builds do not build it
+(it needs the `m2-launcher` feature). ADR 0094 §5 lists four
 preconditions for binding a fleet unit: the separately signed launcher
 artifact in the release payload, `install.sh` shipping it beside `x0xd`,
 the authority-inventory check accepting a launcher-owned `ExecStart`, and

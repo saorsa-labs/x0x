@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "m2-launcher"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! Dormant-passthrough checks for the installed launcher binary. These tests
