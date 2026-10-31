@@ -1315,6 +1315,200 @@ async fn a_carried_member_joined_from_another_group_is_refused_with_cause_bindin
     Ok(())
 }
 
+/// The tracing text `f` produces at WARN or above, beside `f`'s own
+/// output. These tests run on the current-thread runtime, so the
+/// thread-local default subscriber sees every event of the awaited
+/// future (the shielded apply included) and no other test's events land
+/// in the buffer.
+async fn captured_warnings<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let out = f.await;
+    drop(guard);
+    let bytes = std::mem::take(&mut *sink.0.lock().expect("sink"));
+    (out, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// #1680 fix round (Greptile P2, 31 Oct 2026): the carried-record
+/// refusal is asserted ON the receive path, by its typed cause, not
+/// only by the not-accepted outcome. The fixture is the honest re-seat
+/// of [`an_honest_reseat_with_the_carried_record_applies`] — the
+/// subject's self-signed record for the bound package, countersigned by
+/// the inviter authority over the terminal commit whose security
+/// binding names the record, so every authority field is valid — with
+/// one delta: the record is signed for ANOTHER group, leaving its group
+/// ids the only defect. The receiver's own warning is captured: check 8
+/// refuses with `reseat_mandate_invalid` / `cause=binding_mismatch` and
+/// the later attestation gate's plain rejection never runs, so the test
+/// goes red if the route stops issuing the typed refusal; the same
+/// fixture with the parent-group record applies (control), proving
+/// nothing but the group ids refuses it.
+#[tokio::test]
+async fn the_receive_path_refuses_a_foreign_group_record_with_cause_binding_mismatch() -> Result<()>
+{
+    let stage = stage().await?;
+    let package = BASE64.encode([7u8; 96]);
+    let hash = blake3::hash(package.as_bytes()).to_hex().to_string();
+    let foreign_group_id = "6c".repeat(32);
+    let foreign = member_joined_record_in_group(
+        &stage,
+        &stage.subject_kp,
+        &foreign_group_id,
+        &package,
+        4_060,
+    );
+    assert!(
+        verify_member_joined_key_package_event(&foreign),
+        "precondition: the foreign-group record passes self-verification"
+    );
+    // The graft the honest re-seat carries: the parent's terminal commit
+    // binds the record's recovery hash, and the countersignature over the
+    // record's canonical bytes makes every authority field of it valid —
+    // for the foreign group too, because the authority signs the bytes
+    // the member signed.
+    let binding =
+        treekem_recovery_security_binding(3, &foreign).expect("the member record binds a package");
+    let mut parent = stage.parent.clone();
+    parent.security_binding = Some(binding.clone());
+    let mut next = stage.next.clone();
+    next.security_binding = Some(binding);
+    stage
+        .receiver
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), parent.clone());
+    let admin_kp = stage.admin.agent.identity().agent_keypair();
+    let terminal = terminal_commit(&parent, &next, admin_kp, 3_000);
+    let foreign = attest_member_joined_recovery_event(&foreign, admin_kp, &terminal)?;
+    let mut fields = mandate_fields(&stage);
+    fields.key_package_hash = hash.clone();
+    let mandate = mint(fields, admin_kp);
+    assert!(
+        !carried_member_joined_recovery_binds_parent_group(&mandate, &parent, Some(&foreign)),
+        "the authority-attested foreign-group record still does not bind the parent group"
+    );
+    assert_eq!(
+        receiver_cause_over(
+            &stage,
+            &parent,
+            &next,
+            &terminal,
+            &mandate,
+            &stage.subject_cert,
+            Some(&hash),
+            Some(&foreign),
+            None
+        )
+        .await,
+        Ok(()),
+        "the §3a rule itself accepts the record: the wiring's clause is the refusal"
+    );
+    let before = record_json(&stage).await;
+    let (applied, captured) = captured_warnings(apply_listener_metadata_event(
+        &stage.receiver,
+        member_added_with(
+            &stage,
+            mandate.clone(),
+            &terminal,
+            Some(&hash),
+            Some(foreign.clone()),
+            None,
+        ),
+        stage.admin.agent.agent_id(),
+        true,
+        None,
+    ))
+    .await;
+    let applied = applied.expect("the shielded apply completes");
+    assert!(
+        !applied.accepted,
+        "a carried record from another group must be refused"
+    );
+    assert!(
+        captured.contains("MemberAdded: reseat_mandate_invalid"),
+        "the receive path itself reports the check-8 refusal\n captured: {captured}"
+    );
+    assert!(
+        captured.contains("cause=\"binding_mismatch\""),
+        "the refusal carries check 8's typed binding_mismatch cause\n captured: {captured}"
+    );
+    assert!(
+        !captured.contains("invalid inviter recovery attestation"),
+        "the later attestation gate never runs: check 8 refuses first\n captured: {captured}"
+    );
+    assert_eq!(
+        before,
+        record_json(&stage).await,
+        "a refused re-seat leaves the committed record byte-identical"
+    );
+    assert!(
+        !live(&stage).await.has_active_member(&stage.subject_hex),
+        "the subject stays unseated"
+    );
+    // Control: the identical fixture with the record signed for the
+    // parent group — same authority fields, same terminal, same mandate —
+    // applies, so the record's group ids are the only reason the foreign
+    // record is refused.
+    let honest = member_joined_record(&stage, &stage.subject_kp, &package, 4_200);
+    let binding =
+        treekem_recovery_security_binding(3, &honest).expect("the member record binds a package");
+    let mut parent = stage.parent.clone();
+    parent.security_binding = Some(binding.clone());
+    let mut next = stage.next.clone();
+    next.security_binding = Some(binding);
+    stage
+        .receiver
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), parent.clone());
+    let terminal = terminal_commit(&parent, &next, admin_kp, 3_000);
+    let honest = attest_member_joined_recovery_event(&honest, admin_kp, &terminal)?;
+    let applied = apply_listener_metadata_event(
+        &stage.receiver,
+        member_added_with(&stage, mandate, &terminal, Some(&hash), Some(honest), None),
+        stage.admin.agent.agent_id(),
+        true,
+        None,
+    )
+    .await
+    .expect("the shielded apply completes");
+    assert!(
+        applied.accepted,
+        "the parent-group record applies: nothing but the group ids refuses the foreign one"
+    );
+    assert!(
+        live(&stage).await.has_active_member(&stage.subject_hex),
+        "the subject is seated"
+    );
+    Ok(())
+}
+
 /// #1680 round 3: the honest re-seat — the event carries the subject's
 /// own signed, authority-countersigned record for the bound package
 /// (exactly what the seal path now puts in `member_joined_recovery`), and
