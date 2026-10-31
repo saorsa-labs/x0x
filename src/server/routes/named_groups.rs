@@ -3045,7 +3045,16 @@ async fn publish_group_card_with_reseal(
 ) -> Option<x0x::groups::GroupStateCommit> {
     let membership_lock = group_membership_lock(state, group_id).await;
     let _membership_guard = membership_lock.lock().await;
-    publish_group_card_to_discovery_inner(state, group_id, true).await
+    let commit = publish_group_card_to_discovery_inner(state, group_id, true).await;
+    // #1570, #1708 review: a reseal that published ends the hold itself,
+    // so its publish settles the owed card. Left set, the next worker
+    // pass published the same card again.
+    if commit.is_some() {
+        if let Some(info) = state.named_groups.read().await.get(group_id) {
+            group_recovery::settle_card_debt(state, info.stable_group_id());
+        }
+    }
+    commit
 }
 
 async fn publish_group_card_to_discovery_inner(
@@ -3070,6 +3079,20 @@ async fn publish_group_card_to_discovery_inner(
         // member-scoped withdrawal signal needs it, and that is not a leak
         // because members already know the group.
         if !group_card_is_listable(info) {
+            return None;
+        }
+        // #1570: a held-back group's live record is ahead of its durable
+        // form, so no card is signed or published from it — not by the
+        // republish worker, a create fan-out or a state-change hook. The
+        // worker pass publishes the owed card once the hold ends,
+        // whichever save ended the hold. "Held back" here includes a
+        // group whose un-placeholdering write has not landed
+        // (Engineer ruling, 29 Oct 2026). The reseal path
+        // (`seal_group_state`) keeps main's behaviour: its persist must
+        // land Durable before this point publishes, and that persist
+        // retries the sidecar write, so a seal may itself end the hold
+        // and succeed (Engineer ruling, 29 Oct 2026, 19:56).
+        if !reseal && group_recovery::is_card_held_back(state, info.stable_group_id()) {
             return None;
         }
         let mut candidate = info.clone();
@@ -3526,7 +3549,8 @@ async fn emit_shard_digest(state: &AppState, kind: x0x::groups::ShardKind, shard
 /// routing key or the D.3 stable id. #1570 (ZCode on 8ac7036f): a held-back
 /// group's live record is ahead of its durable form, so no card is signed
 /// from it; the Pull falls back to a cached card, as for a group this node
-/// does not own.
+/// does not own. #1570 (29 Oct 2026): "held back" includes a group whose
+/// un-placeholdering write has not landed.
 pub(super) fn pull_card_record<'a>(
     state: &AppState,
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
@@ -3535,7 +3559,7 @@ pub(super) fn pull_card_record<'a>(
     groups
         .get(gid)
         .or_else(|| groups.values().find(|info| info.stable_group_id() == gid))
-        .filter(|info| !group_recovery::is_held_back(state, info.stable_group_id()))
+        .filter(|info| !group_recovery::is_card_held_back(state, info.stable_group_id()))
 }
 
 async fn respond_to_pull(
@@ -6682,6 +6706,14 @@ pub(in crate::server) async fn refresh_group_card_cache_from_info(
     if !group_card_is_listable(info) {
         cache.remove(key);
         cache.remove(&stable_key);
+        return;
+    }
+    // #1570: a held-back group's live record is ahead of its durable form,
+    // so no fresh card is signed from it into the cache `GET /groups/discover`
+    // and card-by-id serve. The cache keeps the card of the last durable
+    // form until the hold clears; a group whose un-placeholdering write
+    // has not landed is held back too (29 Oct 2026 ruling).
+    if group_recovery::is_card_held_back(state, info.stable_group_id()) {
         return;
     }
     match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
@@ -13148,6 +13180,10 @@ async fn request_treekem_catchup_page(
             if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
                 recorded.push(group_id.as_bytes().to_vec());
             }
+            // The request is out; the return the ask task waits on is the
+            // ACK. A test that parks here holds that send in flight across
+            // a later seal (#1660 round 7/8, Codex P2 30 Oct).
+            detached_send_test_seam::park(&format!("treekem-catchup-page-ack:{group_id}")).await;
             return true;
         }
     }
@@ -14994,7 +15030,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-                let Some(commit_b64) = treekem_commit_b64 else {
+                // #1680 round 3: borrow, not move — the §3a gate below
+                // re-reads `treekem_commit_b64` to bind the commit's added
+                // leaf to the mandate's bound hash.
+                let Some(commit_b64) = treekem_commit_b64.as_ref() else {
                     return ApplyMetadataResult::REJECTED;
                 };
                 if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
@@ -15003,7 +15042,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 let Some(epoch) = treekem_epoch else {
                     return ApplyMetadataResult::REJECTED;
                 };
-                Some((commit_b64, treekem_welcome_b64, welcome_ref, epoch))
+                Some((commit_b64.clone(), treekem_welcome_b64, welcome_ref, epoch))
             } else {
                 None
             };
@@ -15271,6 +15310,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // `ReseatMandateV1` in place of the owner mandate. It is
             // accepted only under the §3a rule; a failure refuses with the
             // committed state unchanged, as `owner_mandate_missing` does.
+            // Check 8 reads the subject-signed `MemberJoined` the event
+            // carries in `member_joined_recovery` (Engineer ruling
+            // 30 Oct 2026) and binds the TreeKEM commit's added leaf to
+            // the mandate's bound hash.
             let reseat_accepted = match (
                 info.policy.admission.owner_certified_user_id(),
                 owner_mandate.as_ref(),
@@ -15287,6 +15330,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         treekem_key_package_hash.as_deref(),
                         treekem_epoch,
                         owner_certified_certificate.as_ref(),
+                        member_joined_recovery.as_deref(),
+                        treekem_commit_b64.as_deref(),
                     )
                     .await
                     {
@@ -18095,6 +18140,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         && verify_authority_attested_member_joined_recovery(&next, recovery)
                 })
                 .await;
+            // Engineer ruling 30 Oct 2026 (PR #1728, comment 6528069544):
+            // a re-seat that binds a KeyPackage carries the subject's own
+            // signed, non-authority-only `MemberJoined` for it inside the
+            // event, so every receiver can enforce ADR 0109 §3a check 8
+            // fail-closed instead of trusting the mandate's hash binding
+            // alone. Only the re-seat add carries it (an ordinary add keeps
+            // the record on its own delivery lane below), and only when a
+            // package is bound — a packageless re-seat has no check-8
+            // evidence to carry. Old receivers ignore the field; old
+            // senders omit it and are refused (accepted, #1659 precedent).
+            let reseat_recovery = reseat_mandate
+                .as_ref()
+                .filter(|mandate| !mandate.fields.key_package_hash.is_empty())
+                .and(member_joined_recovery.clone());
             let mut event = NamedGroupMetadataEvent::MemberAdded {
                 roster_certificates_b64: Vec::new(),
                 group_id: event_group_id.clone(),
@@ -18110,7 +18169,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     .members_v2
                     .get(&member_agent_id)
                     .and_then(|member| member.treekem_key_package_hash.clone()),
-                member_joined_recovery: None,
+                member_joined_recovery: reseat_recovery,
                 member_recovery_history: Vec::new(),
                 certificate_b64: owner_certified_admission.as_ref().map(|cert| {
                     use base64::Engine as _;
@@ -34004,6 +34063,14 @@ pub(in crate::server) async fn discover_groups(
         if !group_card_is_listable(info) {
             continue;
         }
+        // #1570: a held-back group's live record is ahead of its durable
+        // form, so no card is signed from it. Its cached card (merged
+        // above) is served, as for a group this node does not own; a
+        // group whose un-placeholdering write has not landed is held
+        // back too (29 Oct 2026 ruling).
+        if group_recovery::is_card_held_back(&state, info.stable_group_id()) {
+            continue;
+        }
         if let Ok(Some(card)) = info.to_signed_group_card(signing_kp) {
             merge_card(&card);
         }
@@ -34185,7 +34252,15 @@ pub(in crate::server) async fn get_group_card(
         }
     }
     let groups = state.named_groups.read().await;
-    if let Some(info) = groups.get(&id) {
+    // #1570: a held-back group's live record is ahead of its durable form,
+    // so no card is signed from it. The cached card (checked above) is
+    // served, as for a group this node does not own; a group whose
+    // un-placeholdering write has not landed is held back too (29 Oct
+    // 2026 ruling).
+    if let Some(info) = groups
+        .get(&id)
+        .filter(|info| !group_recovery::is_card_held_back(&state, info.stable_group_id()))
+    {
         match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
             Ok(Some(card)) => {
                 return Json(serde_json::to_value(&card).unwrap_or(serde_json::Value::Null))
@@ -49815,6 +49890,7 @@ pub(in crate::server) mod tests {
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
     mod issue1569_owner_certified_placeholder;
+    mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
     mod issue1570_held_back_tombstone;
     mod issue1577_revoked_catchup_request;
