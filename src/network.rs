@@ -349,6 +349,10 @@ const ONE_SIDED_REDIAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// and still fit inside the 5 s health-refresher tick.
 const ONE_SIDED_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How many both-stale liveness probes one health tick may start (#1419).
+/// Candidates beyond the cap keep their turn on the next tick.
+const ONE_SIDED_PROBES_PER_TICK: usize = 4;
+
 /// Send and receive ages for one connected peer (#1419).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LinkTrafficAge {
@@ -443,20 +447,40 @@ pub(crate) fn both_stale_candidate_indexes(samples: &[LinkAgeSample]) -> Vec<usi
 /// broken (#1419).
 ///
 /// Only outcomes that name the link count: the probe timed out with no
-/// answer, the connection was closed, or the send was refused. A busy
-/// endpoint (`ProbeOverBudget`), a shutdown, a peer that left the table,
-/// and a peer without probe support are inconclusive. An inconclusive
-/// peer is neither degraded nor re-dialled on that evidence; the probe
-/// runs again after the window.
+/// answer, or the connection was closed, including a superseded
+/// connection. A generic send error is not counted, because ant-quic
+/// also uses it for local failures. A busy endpoint (`ProbeOverBudget`),
+/// a shutdown, a peer that left the table, and a peer without probe
+/// support are inconclusive. An inconclusive peer is neither degraded
+/// nor re-dialled on that evidence; the probe runs again after the
+/// window.
 fn one_sided_probe_confirms_broken(error: &ant_quic::NodeError) -> bool {
     matches!(
         error,
         ant_quic::NodeError::Endpoint(
             ant_quic::EndpointError::ProbeTimeout
-                | ant_quic::EndpointError::ConnectionClosed { .. }
-                | ant_quic::EndpointError::Connection(_),
+                | ant_quic::EndpointError::ConnectionClosed { .. },
         )
     )
+}
+
+/// Record one both-stale probe outcome (#1419).
+///
+/// The probe timestamp always moves, so the window restarts. A failure
+/// that names the link confirms; a success clears. An inconclusive
+/// outcome keeps the earlier verdict: a confirmed failure stays degraded
+/// and an unconfirmed peer stays quiet.
+fn apply_one_sided_probe(
+    entry: &mut OneSidedRepair,
+    now: Instant,
+    result: &Result<std::time::Duration, ant_quic::NodeError>,
+) {
+    entry.both_stale_probe_at = Some(now);
+    match result {
+        Ok(_) => entry.both_stale_confirmed = false,
+        Err(error) if one_sided_probe_confirms_broken(error) => entry.both_stale_confirmed = true,
+        Err(_) => {}
+    }
 }
 
 /// One re-dial episode for a peer that is one-sided (#1419).
@@ -3634,13 +3658,15 @@ impl NetworkNode {
     /// degraded set and is then re-dialled once by
     /// [`Self::repair_one_sided_links`]. Only a probe failure that names
     /// the link degrades the peer ([`one_sided_probe_confirms_broken`]).
-    /// A busy endpoint or a probe-incapable peer is inconclusive. A peer
-    /// stays in the degraded set while its probe verdict is inside the
-    /// window and its sample stays both-directions stale, even when other
-    /// peers go quiet; it is probed again when the window ends. Each peer
-    /// is probed at most once per [`ONE_SIDED_REDIAL_BACKOFF`], so this
-    /// waits no longer than [`ONE_SIDED_PROBE_TIMEOUT`] and only while a
-    /// probe is due.
+    /// A busy endpoint or a probe-incapable peer is inconclusive, and an
+    /// inconclusive probe keeps the earlier verdict. A peer stays in the
+    /// degraded set while its probe verdict is inside the window and its
+    /// sample stays both-directions stale, even when other peers go
+    /// quiet; it is probed again when the window ends. Each peer is
+    /// probed at most once per [`ONE_SIDED_REDIAL_BACKOFF`], at most
+    /// [`ONE_SIDED_PROBES_PER_TICK`] probes run per tick, and each probe
+    /// is under an outer [`ONE_SIDED_PROBE_TIMEOUT`] bound because
+    /// ant-quic's own bound starts at the reply wait.
     pub(crate) async fn resolve_one_sided_peers(
         &self,
         samples: &[LinkAgeSample],
@@ -3684,10 +3710,28 @@ impl NetworkNode {
                 }
             }
         }
+        // One tick probes at most this many peers, so a large quiet set
+        // cannot spend the whole tick on probes.
+        to_probe.truncate(ONE_SIDED_PROBES_PER_TICK);
         if !to_probe.is_empty() {
-            let probes = to_probe
-                .iter()
-                .map(|peer| self.probe_peer(*peer, ONE_SIDED_PROBE_TIMEOUT));
+            // ant-quic's own probe bound starts at the reply wait. The
+            // send before it can park on stream credit until the QUIC
+            // idle timeout, so an outer tokio bound keeps the refresher
+            // tick inside one probe budget. The elapsed case counts as a
+            // probe timeout.
+            let probes = to_probe.iter().map(|peer| async move {
+                match tokio::time::timeout(
+                    ONE_SIDED_PROBE_TIMEOUT,
+                    self.probe_peer(*peer, ONE_SIDED_PROBE_TIMEOUT),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Some(Err(ant_quic::NodeError::Endpoint(
+                        ant_quic::EndpointError::ProbeTimeout,
+                    ))),
+                }
+            });
             let results = futures::future::join_all(probes).await;
             let mut map = match self.one_sided_repairs.lock() {
                 Ok(map) => map,
@@ -3696,14 +3740,9 @@ impl NetworkNode {
             for (peer, result) in to_probe.iter().zip(results) {
                 // `None` means the node is gone: inconclusive, not fresh.
                 let Some(result) = result else { continue };
-                let confirmed = match result {
-                    Ok(_) => false,
-                    Err(error) => one_sided_probe_confirms_broken(&error),
-                };
                 let entry = map.entry(*peer).or_default();
-                entry.both_stale_probe_at = Some(now);
-                entry.both_stale_confirmed = confirmed;
-                if confirmed {
+                apply_one_sided_probe(entry, now, &result);
+                if entry.both_stale_confirmed {
                     degraded.push(*peer);
                 }
             }
@@ -3866,7 +3905,11 @@ impl NetworkNode {
     ///
     /// A successful re-dial spends the verdict: the next resolver pass
     /// probes the new link instead of reusing the old failure, so a healed
-    /// peer leaves the degraded set at once. The warning flag stays.
+    /// peer leaves the degraded set at once. The warning flag is not
+    /// cleared here. A later sample that carries traffic is recovery and
+    /// clears it. A later quiet sample can also clear it before the next
+    /// probe, so a link that breaks again without carrying traffic can
+    /// warn again inside the window.
     fn spend_one_sided_probe_verdict(&self, peer: &AntPeerId) {
         let mut map = match self.one_sided_repairs.lock() {
             Ok(map) => map,
@@ -3925,11 +3968,11 @@ impl NetworkNode {
         };
         match tokio::time::timeout(ONE_SIDED_REDIAL_TIMEOUT, dial).await {
             Ok(Ok(_)) => {
-                // The dial spent the probe verdict: a new connection is up,
-                // so the old both-stale confirmation must not keep the
-                // peer degraded for the rest of the window. The warning
-                // stays, so a link that breaks again does not warn twice
-                // for one episode.
+                // The dial spent the probe verdict: a new connection is
+                // up, so the old both-stale confirmation must not keep
+                // the peer degraded for the rest of the window. The
+                // warning flag is not cleared here; see
+                // [`Self::spend_one_sided_probe_verdict`].
                 self.spend_one_sided_probe_verdict(peer);
                 info!(
                     target: "x0x::connect",
@@ -10877,8 +10920,8 @@ mod tests {
 
     /// #1419: only a probe failure that names the link confirms a
     /// both-directions-stale peer. A busy endpoint, a probe-incapable
-    /// peer and a peer that left the table are inconclusive, so a healthy
-    /// quiet link is never degraded by them.
+    /// peer, a peer that left the table and a generic send error are
+    /// inconclusive, so a healthy quiet link is never degraded by them.
     #[test]
     fn both_stale_probe_failure_is_classified_by_cause() {
         use ant_quic::EndpointError;
@@ -10891,9 +10934,20 @@ mod tests {
                 reason: ant_quic::ConnectionCloseReason::LifecycleCleanup
             }
         )));
-        assert!(confirms(ant_quic::NodeError::Endpoint(
-            EndpointError::Connection("send refused".to_string())
-        )));
+        assert!(
+            confirms(ant_quic::NodeError::Endpoint(
+                EndpointError::ConnectionClosed {
+                    reason: ant_quic::ConnectionCloseReason::Superseded
+                }
+            )),
+            "the sim's moved-winner refusal names the link"
+        );
+        assert!(
+            !confirms(ant_quic::NodeError::Endpoint(EndpointError::Connection(
+                "failed to reserve unique probe tag".to_string()
+            ))),
+            "a generic send error can be a local failure"
+        );
         assert!(
             !confirms(ant_quic::NodeError::Connection(
                 "a generic connection error".to_string()
@@ -10917,6 +10971,55 @@ mod tests {
             "a peer that left the table is inconclusive"
         );
         assert!(!confirms(ant_quic::NodeError::ShuttingDown));
+    }
+
+    /// #1419: an inconclusive probe outcome keeps the earlier verdict, so
+    /// a confirmed failure cannot leave the degraded set on a busy
+    /// endpoint, and a quiet peer stays unconfirmed.
+    #[test]
+    fn both_stale_probe_outcome_keeps_the_earlier_verdict_when_inconclusive() {
+        use ant_quic::EndpointError;
+        let now = Instant::now();
+        let confirmed = || OneSidedRepair {
+            warned: true,
+            both_stale_probe_at: Some(now),
+            both_stale_confirmed: true,
+            ..OneSidedRepair::default()
+        };
+        let mut entry = confirmed();
+        apply_one_sided_probe(
+            &mut entry,
+            now,
+            &Err(ant_quic::NodeError::Endpoint(
+                EndpointError::ProbeOverBudget,
+            )),
+        );
+        assert!(
+            entry.both_stale_confirmed,
+            "a busy endpoint keeps the confirmed failure degraded"
+        );
+        assert_eq!(entry.both_stale_probe_at, Some(now), "the window restarts");
+
+        let mut entry = confirmed();
+        apply_one_sided_probe(
+            &mut entry,
+            now,
+            &Err(ant_quic::NodeError::Endpoint(EndpointError::ProbeTimeout)),
+        );
+        assert!(entry.both_stale_confirmed, "a timeout re-confirms");
+        apply_one_sided_probe(&mut entry, now, &Ok(Duration::ZERO));
+        assert!(!entry.both_stale_confirmed, "a success clears");
+
+        let mut entry = OneSidedRepair::default();
+        apply_one_sided_probe(
+            &mut entry,
+            now,
+            &Err(ant_quic::NodeError::Endpoint(EndpointError::NotSupported)),
+        );
+        assert!(
+            !entry.both_stale_confirmed,
+            "an unsupported peer stays unconfirmed"
+        );
     }
 
     /// #1419: a confirmed both-stale episode warns once across passes, an
@@ -11332,6 +11435,17 @@ mod tests {
             1,
             "a second pass inside the episode does not warn again"
         );
+        {
+            let repairs = a.one_sided_repairs.lock().unwrap();
+            assert!(
+                !repairs[&peer_b].both_stale_confirmed,
+                "the successful re-dial spends the probe verdict"
+            );
+            assert!(
+                repairs[&peer_b].both_stale_probe_at.is_none(),
+                "the spent verdict is probed fresh on the next pass"
+            );
+        }
         assert_eq!(
             fabric.one_sided_winner_for_test(&peer_a, &peer_b),
             None,
