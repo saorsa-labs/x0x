@@ -41,6 +41,8 @@ fn localhost_config(known_peers: Vec<SocketAddr>) -> P2pConfig {
             enable_relay_fallback: false,
             ..Default::default()
         })
+        .mdns_enabled(false)
+        .port_mapping_enabled(false)
         .pqc(PqcConfig::default())
         .build()
         .expect("P2pConfig::build")
@@ -68,7 +70,7 @@ async fn quiet_healthy_loopback_link_answers_the_probe() {
     let receiver_id = receiver.peer_id();
     let _r_accept = spawn_accept_loop(Arc::clone(&receiver));
 
-    let sender = make_endpoint(vec![receiver_addr]).await;
+    let sender = make_endpoint(vec![]).await;
     let _s_accept = spawn_accept_loop(Arc::clone(&sender));
 
     sender
@@ -102,7 +104,7 @@ async fn one_sided_torn_loopback_link_probe_receipt() {
     let receiver_id = receiver.peer_id();
     let _r_accept = spawn_accept_loop(Arc::clone(&receiver));
 
-    let sender = make_endpoint(vec![receiver_addr]).await;
+    let sender = make_endpoint(vec![]).await;
     let sender_id = sender.peer_id();
     let _s_accept = spawn_accept_loop(Arc::clone(&sender));
 
@@ -148,11 +150,16 @@ async fn one_sided_torn_loopback_link_probe_receipt() {
         ),
         Err(error) => {
             // The receipt the PR body cites: the holding end sees an
-            // error naming the link.
-            let is_timeout = matches!(error, ant_quic::EndpointError::ProbeTimeout);
-            let is_closed = matches!(error, ant_quic::EndpointError::ConnectionClosed { .. });
+            // error naming the link. A propagated close can also drop the
+            // peer from the table, which is PeerNotFound.
+            let names_link = matches!(
+                error,
+                ant_quic::EndpointError::ProbeTimeout
+                    | ant_quic::EndpointError::ConnectionClosed { .. }
+                    | ant_quic::EndpointError::PeerNotFound(_)
+            );
             assert!(
-                is_timeout || is_closed,
+                names_link,
                 "receipt: unexpected probe error class on a torn real link: {error:?}"
             );
         }

@@ -434,22 +434,40 @@ pub(crate) fn one_sided_peer_ids_from(samples: &[LinkAgeSample]) -> Vec<AntPeerI
 /// These peers are candidates for the liveness probe in
 /// [`NetworkNode::resolve_one_sided_peers`], not one-sided by their ages
 /// alone: a quiet link and a broken link share this shape. A node whose
-/// every peer is quiet selects nobody, so its quiet peers stay up. The
-/// resolver adds two gates on top: a peer this node probed successfully
-/// inside [`ONE_SIDED_FLOWING`] does not count as the flowing peer.
-#[cfg(test)]
-pub(crate) fn both_stale_candidate_indexes(samples: &[LinkAgeSample]) -> Vec<usize> {
+/// every peer is quiet selects nobody, so its quiet peers stay up. A peer
+/// in `probe_fresh`, one this node probed successfully inside
+/// [`ONE_SIDED_FLOWING`], does not count as the flowing peer, so probing
+/// cannot bootstrap probing on a quiet node.
+pub(crate) fn both_stale_candidate_indexes(
+    samples: &[LinkAgeSample],
+    probe_fresh: &std::collections::HashSet<AntPeerId>,
+) -> Vec<usize> {
     samples
         .iter()
         .enumerate()
         .filter(|(index, sample)| {
             sample.age.both_directions_stale()
                 && samples.iter().enumerate().any(|(other, other_sample)| {
-                    other != *index && other_sample.age.fresh_direction()
+                    other != *index
+                        && other_sample.age.fresh_direction()
+                        && !probe_fresh.contains(&other_sample.peer)
                 })
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Order one tick's both-stale probe list (#1419): never-probed peers
+/// first, then the longest since their last probe. The per-tick cap then
+/// cannot starve the tail of a large quiet set. The sort is stable, so
+/// peers with the same key keep sample order.
+fn order_one_sided_probes(to_probe: &mut [AntPeerId], probe_ats: &HashMap<AntPeerId, Instant>) {
+    to_probe.sort_by(|a, b| match (probe_ats.get(a), probe_ats.get(b)) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => x.cmp(y),
+    });
 }
 
 /// Whether a failed liveness probe is evidence that the link itself is
@@ -534,10 +552,15 @@ fn plan_one_sided_repairs(
     now: Instant,
 ) -> Vec<AntPeerId> {
     for sample in samples {
-        if sample.age.one_sided() {
-            continue;
-        }
         if let Some(entry) = map.get_mut(&sample.peer) {
+            if sample.age.one_sided() {
+                // A fresh direction ends the both-stale episode. The
+                // immediate rule owns the peer, so its WARN must not say
+                // both directions are idle.
+                entry.both_stale_confirmed = false;
+                entry.both_stale_confirmed_at = None;
+                continue;
+            }
             if sample.age.fresh_direction() || !entry.both_stale_confirmed {
                 entry.warned = false;
             }
@@ -3702,8 +3725,8 @@ impl NetworkNode {
     /// node. Each peer is probed at most once per
     /// [`ONE_SIDED_REDIAL_BACKOFF`], never-probed candidates go first,
     /// at most [`ONE_SIDED_PROBES_PER_TICK`] probes run per tick, and
-    /// each probe is under an outer [`ONE_SIDED_PROBE_TIMEOUT`] bound
-    /// because ant-quic's own bound starts at the reply wait.
+    /// each probe is under an outer [`ONE_SIDED_PROBE_OUTER_TIMEOUT`]
+    /// bound because ant-quic's own bound starts at the reply wait.
     pub(crate) async fn resolve_one_sided_peers(
         &self,
         samples: &[LinkAgeSample],
@@ -3711,7 +3734,7 @@ impl NetworkNode {
         let now = Instant::now();
         let mut degraded = one_sided_peer_ids_from(samples);
         let mut to_probe = Vec::new();
-        let mut previously_probed = std::collections::HashSet::new();
+        let mut probe_ats: HashMap<AntPeerId, Instant> = HashMap::new();
         {
             let map = match self.one_sided_repairs.lock() {
                 Ok(map) => map,
@@ -3730,13 +3753,10 @@ impl NetworkNode {
                 })
                 .map(|(peer, _)| *peer)
                 .collect();
-            let candidate_flows = |index: usize| {
-                samples.iter().enumerate().any(|(other, other_sample)| {
-                    other != index
-                        && other_sample.age.fresh_direction()
-                        && !probe_fresh.contains(&other_sample.peer)
-                })
-            };
+            let candidates: std::collections::HashSet<usize> =
+                both_stale_candidate_indexes(samples, &probe_fresh)
+                    .into_iter()
+                    .collect();
             for (index, sample) in samples.iter().enumerate() {
                 if !sample.age.both_directions_stale() {
                     continue;
@@ -3766,31 +3786,32 @@ impl NetworkNode {
                 // peer. A peer a probe once named broken stays watched
                 // when that traffic stops, so a known failure cannot hide
                 // from the view, but only a confirming probe degrades it.
-                if candidate_flows(index) || confirmed_before {
+                if candidates.contains(&index) || confirmed_before {
                     to_probe.push(peer);
-                    if map
-                        .get(&peer)
-                        .is_some_and(|entry| entry.both_stale_probe_at.is_some())
-                    {
-                        previously_probed.insert(peer);
+                    if let Some(at) = map.get(&peer).and_then(|entry| entry.both_stale_probe_at) {
+                        probe_ats.insert(peer, at);
                     }
                 }
             }
         }
-        // One tick probes at most this many peers, never-probed candidates
-        // first, so a large quiet set cannot starve its tail and cannot
-        // spend the whole tick on probes.
-        to_probe.sort_by_key(|peer| previously_probed.contains(peer));
+        // One tick probes at most this many peers: never-probed candidates
+        // first, then the longest since their last probe, so a large quiet
+        // set cannot starve its tail and cannot spend the whole tick on
+        // probes.
+        order_one_sided_probes(&mut to_probe, &probe_ats);
         to_probe.truncate(ONE_SIDED_PROBES_PER_TICK);
         if !to_probe.is_empty() {
             // ant-quic's own probe bound starts at the reply wait. The
             // send before it can park on stream credit until the QUIC
             // idle timeout, so an outer tokio bound keeps the refresher
-            // tick inside the probe budget. The outer bound is one
-            // second longer, so ant-quic's own verdict decides whenever
-            // it can; only a stall before the reply wait elapses here
-            // and counts as a probe timeout.
+            // tick inside the probe budget. The node handle is taken
+            // before that bound, so a lock wait spends no probe budget.
+            // The outer bound is one second longer, so ant-quic's own
+            // verdict decides whenever it can; only a stall before the
+            // reply wait elapses here and counts as a probe timeout.
             let probes = to_probe.iter().map(|peer| async move {
+                // `None` means the node is gone: inconclusive, not fresh.
+                let node = self.node.read().await.as_ref().cloned()?;
                 let probe = async {
                     #[cfg(test)]
                     {
@@ -3803,10 +3824,10 @@ impl NetworkNode {
                             tokio::time::sleep(pause).await;
                         }
                     }
-                    self.probe_peer(*peer, ONE_SIDED_PROBE_TIMEOUT).await
+                    node.probe_peer(peer, ONE_SIDED_PROBE_TIMEOUT).await
                 };
                 match tokio::time::timeout(ONE_SIDED_PROBE_OUTER_TIMEOUT, probe).await {
-                    Ok(result) => result,
+                    Ok(result) => Some(result),
                     Err(_) => Some(Err(ant_quic::NodeError::Endpoint(
                         ant_quic::EndpointError::ProbeTimeout,
                     ))),
@@ -4013,6 +4034,7 @@ impl NetworkNode {
         };
         if let Some(entry) = map.get_mut(peer) {
             entry.both_stale_confirmed = false;
+            entry.both_stale_confirmed_at = None;
             entry.both_stale_probe_at = None;
         }
     }
@@ -10991,26 +11013,55 @@ mod tests {
         };
         let stale_peer = sample(1, observed);
         let fresh_peer = sample(2, fresh);
+        let nobody = std::collections::HashSet::new();
         assert_eq!(
-            both_stale_candidate_indexes(&[stale_peer, fresh_peer]),
+            both_stale_candidate_indexes(&[stale_peer, fresh_peer], &nobody),
             vec![0],
             "the observed both-stale shape next to a flowing peer is a probe candidate"
         );
         assert!(
-            both_stale_candidate_indexes(&[stale_peer]).is_empty(),
+            both_stale_candidate_indexes(&[stale_peer], &nobody).is_empty(),
             "a node whose every peer is quiet selects nobody"
         );
         assert!(
-            both_stale_candidate_indexes(&[stale_peer, sample(3, observed)]).is_empty(),
+            both_stale_candidate_indexes(&[stale_peer, sample(3, observed)], &nobody).is_empty(),
             "two quiet peers without flowing traffic select nobody"
         );
         assert!(
-            both_stale_candidate_indexes(&[sample(1, one_sided), fresh_peer]).is_empty(),
+            both_stale_candidate_indexes(&[sample(1, one_sided), fresh_peer], &nobody).is_empty(),
             "a fresh direction on the same peer is the immediate rule, not a probe candidate"
         );
         assert!(
-            both_stale_candidate_indexes(&[sample(1, missing), fresh_peer]).is_empty(),
+            both_stale_candidate_indexes(&[sample(1, missing), fresh_peer], &nobody).is_empty(),
             "a missing timestamp is neither stale nor fresh"
+        );
+        // The flowing peer was probed successfully inside the last 10 s:
+        // its freshness is this node's own probe, not traffic, so it does
+        // not qualify another quiet peer.
+        let probe_fresh: std::collections::HashSet<AntPeerId> =
+            [fresh_peer.peer].into_iter().collect();
+        assert!(
+            both_stale_candidate_indexes(&[stale_peer, fresh_peer], &probe_fresh).is_empty(),
+            "a peer this node probed does not qualify another quiet peer"
+        );
+    }
+
+    /// #1419: one tick's probe order puts never-probed peers first, then
+    /// the longest since their last probe, and keeps sample order between
+    /// equals. The per-tick cap then cannot starve the tail.
+    #[test]
+    fn both_stale_probe_order_prefers_never_probed_then_oldest() {
+        let now = Instant::now();
+        let peers: Vec<AntPeerId> = (1..=4).map(test_ant_peer).collect();
+        let mut probe_ats = HashMap::new();
+        probe_ats.insert(peers[0], now - Duration::from_secs(50));
+        probe_ats.insert(peers[1], now - Duration::from_secs(10));
+        let mut to_probe = vec![peers[0], peers[1], peers[2], peers[3]];
+        order_one_sided_probes(&mut to_probe, &probe_ats);
+        assert_eq!(
+            to_probe,
+            vec![peers[2], peers[3], peers[0], peers[1]],
+            "never-probed first, then oldest-probed, sample order between equals"
         );
     }
 
@@ -11177,6 +11228,24 @@ mod tests {
         assert!(
             map[&peer].warned,
             "the second pass still does not re-arm the warning"
+        );
+
+        // The peer moves to the same-peer rule: one direction fresh again.
+        // The confirmation ends, so the immediate rule owns the peer and
+        // its WARN names one direction, not both.
+        let one_sided = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(90)),
+            received_ago: Some(Duration::from_secs(1)),
+        };
+        let one_sided_samples = [sample(peer, one_sided)];
+        assert_eq!(
+            plan_one_sided_repairs(&mut map, &one_sided_samples, now),
+            vec![peer],
+            "the immediate rule takes over"
+        );
+        assert!(
+            !map[&peer].both_stale_confirmed,
+            "a fresh direction ends the both-stale confirmation"
         );
 
         let recovered = [sample(peer, fresh)];
