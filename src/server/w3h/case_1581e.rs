@@ -24,21 +24,23 @@
 //!   silently completes across the real fork, no fork evidence is
 //!   persisted and no `waiting_for_fork_resolution` is shown, which
 //!   ADR 0110 §3 (L225–L227) forbids. The arm is wired as an expected
-//!   RED with `CAUSE_NO_TYPED_FORK` and turns GREEN with that fix (the
-//!   gap is recorded on #1581 by name). A sibling a receiver accepts is
-//!   the arm's other named RED (`CAUSE_SIBLING_PUBLISHED`), caught by a
-//!   live watch from A's restart on; a neutralisation of the
-//!   conflicting-report protection (never committed) does not change
-//!   the arm's outcome on main — the receivers' own validation still
-//!   refuses the stale-rotation event — so the observed RED is anchored
-//!   in the typed-state gap itself.
+//!   RED with `CAUSE_NO_TYPED_FORK` — the only cause this arm accepts
+//!   as its RED (the test checks the cause, not only the verdict) — and
+//!   it turns GREEN with that fix. The gap is recorded on #1581 by
+//!   name. A sibling that a receiver keeps fails the end-state
+//!   evidence (INFRA); a sibling sighting the receivers refuse names
+//!   `CAUSE_SIBLING_PUBLISHED`, which also fails the arm's cause
+//!   check. A neutralisation of the conflicting-report protection
+//!   (never committed) does not change the outcome on main: the
+//!   receivers' own validation still refuses the stale-rotation event,
+//!   so the observed RED is anchored in the typed-state gap itself.
 //! - the resume arm: no competing commit exists (D stays down). A
 //!   restarts and finishes the eligible delivery of its saved event
 //!   without another rekey; once D returns onto the compatible chain,
 //!   A's and D's rows close and every survivor converges on A's commit.
 //!   GREEN on `main`.
 //!
-//! Harness honesty, four departures stated plainly:
+//! Harness honesty, six departures stated plainly:
 //!
 //! - The committer that crashes is the rank-1 fallback, not the
 //!   designated admin the row's cast names, and the designated seat is
@@ -921,7 +923,7 @@ async fn scenario(
     let not_early = a_commit_at.is_some_and(|at| at >= w);
     receipt.evidence(
         "a_commits_durably_into_the_blackout",
-        durable && not_early,
+        durable && not_early && blackout.dropped() > 0,
         format!(
             "A at the crash window: {}; A's public row for B: {a_row_committed:?}; first durable \
              commit {:?} after t=0 (W is {w:?}, so the window was waited out: {not_early}); \
@@ -1033,7 +1035,8 @@ async fn scenario(
             "A restarts onto the branch the row names",
             converge_bound + secs(10),
             async |s: &Sim| {
-                if let Ok(now) = views_now(s, &["D", "C"], &group, &b).await {
+                let watched: &[&str] = if competing { &["D", "C"] } else { &["C"] };
+                if let Ok(now) = views_now(s, watched, &group, &b).await {
                     for (label, seen) in now {
                         let Some(seen) = seen else {
                             continue;
@@ -1166,15 +1169,11 @@ async fn scenario(
                 "read A's public S4 row after the second restart",
                 s4_row(sim, "A", &group, &b_hex),
             )
-            .await?;
-        survives = row_again.as_ref().is_ok_and(|row| {
-            row.as_ref().is_some_and(|row| {
-                row["phase"].as_str() != Some("complete")
-                    && row["waiting"]["cause"].as_str() == Some("waiting_for_fork_resolution")
-            })
-        }) && fork_quarantine_present(sim, "A", &group)
-            .await
-            .unwrap_or(false);
+            .await??;
+        survives = row_again.as_ref().is_some_and(|row| {
+            row["phase"].as_str() != Some("complete")
+                && row["waiting"]["cause"].as_str() == Some("waiting_for_fork_resolution")
+        }) && fork_quarantine_present(sim, "A", &group).await?;
         receipt.note(format!(
             "after A's second restart: row {row_again:?}; the typed cause and the public \
              fork-quarantine marker survived: {survives}"
@@ -1296,9 +1295,7 @@ async fn scenario(
             format!("D's row for B: {d_row:?}"),
             at(sim),
         );
-        let marker_present = fork_quarantine_present(sim, "A", &group)
-            .await
-            .unwrap_or(false);
+        let marker_present = fork_quarantine_present(sim, "A", &group).await?;
         let typed_outcome = row_open && typed_fork && a_end.quarantined && marker_present;
         let passed = durable
             && not_early
@@ -1499,6 +1496,17 @@ async fn expect(
         "{case}: expected {want:?}, got {:?}",
         receipt.verdict()
     );
+    // While the §3 fix waits, this arm's RED must be exactly the
+    // typed-state cause: the CI gate checks only the verdict, so the
+    // test itself names the cause, and any other RED (a containment
+    // regression) fails here instead of satisfying the pin.
+    if competing {
+        ensure!(
+            receipt.named_causes() == [CAUSE_NO_TYPED_FORK],
+            "{case}: expected the RED cause {CAUSE_NO_TYPED_FORK:?}, got {:?}",
+            receipt.named_causes()
+        );
+    }
     Ok(())
 }
 
