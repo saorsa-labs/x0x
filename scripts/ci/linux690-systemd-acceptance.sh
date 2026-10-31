@@ -31,12 +31,12 @@ case "$manager" in user|system) ;; *) usage;; esac
 command -v timeout >/dev/null 2>&1 || { echo "GNU timeout is required" >&2; exit 69; }
 
 run_id="x0x-690-$(date +%s)-$$"
-if [ -z "$artifact_root" ]; then artifact_root="$HOME/x0x-codex/evidence/1375/$run_id"; fi
+if [ -z "$artifact_root" ]; then artifact_root="/tmp/$run_id"; fi
 if [ -e "$artifact_root" ]; then
   [ -d "$artifact_root" ] && [ ! -L "$artifact_root" ] || { echo "artifact root is not a plain directory" >&2; exit 65; }
   chmod 700 "$artifact_root"
 else
-  mkdir -m 700 -p "$artifact_root"
+  mkdir -m 700 "$artifact_root"
 fi
 artifact_root=$(cd "$artifact_root" && pwd -P)
 probe=$(cd "$(dirname "$probe")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$probe")")

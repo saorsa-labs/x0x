@@ -139,7 +139,14 @@ impl Host {
             }
             let result = (|| {
                 record.phase = journal::Phase::RollingBack;
-                record.cause = Some(cause);
+                // A recorded Failed cause is never downgraded to Interrupted
+                // by a later launcher restart (ADR 0094 S4).
+                if !matches!(
+                    &record.cause,
+                    Some(existing) if existing.class == journal::CauseClass::Failed
+                ) {
+                    record.cause = Some(cause);
+                }
                 self.save(record)?;
                 // The cause remains in the journal through Restored. An
                 // unresolved M2 record already blocks all apply ingress.
@@ -179,5 +186,70 @@ impl Host {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testkit::fixture;
+    use super::*;
+
+    #[test]
+    fn locked_refuses_a_journal_that_differs_from_the_independent_plan() {
+        let (dir, root, _host, mut other) = fixture(journal::Phase::SwappedCli);
+        other.transaction_id = "another-transaction".into();
+        let host = Host::new(root.clone(), other).unwrap();
+        let error = host.locked(|_| Ok(())).unwrap_err().to_string();
+        assert!(error.contains("differs"), "{error}");
+        drop(dir);
+    }
+
+    #[test]
+    fn authorize_refuses_without_host_agreement_and_reap_receipts() {
+        let (dir, root, host, _record) = fixture(journal::Phase::Staged);
+        let path = root.join("trial.json");
+        let mut trial = Trial::new(host.binding().unwrap(), "alice".into(), &Clock::now().unwrap())
+            .unwrap();
+        trial.save(&path).unwrap();
+        let error = super::super::control::authorize(&host, &mut trial, &path, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not ready"), "{error}");
+        assert_eq!(trial.attempts, 0);
+        drop(dir);
+
+        let (dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = Trial::new(host.binding().unwrap(), "alice".into(), &Clock::now().unwrap())
+            .unwrap();
+        trial.save(&path).unwrap();
+        let error = super::super::control::authorize(&host, &mut trial, &path, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reap receipts"), "{error}");
+        assert_eq!(trial.attempts, 0);
+        drop(dir);
+    }
+
+    #[test]
+    fn restore_refuses_in_a_terminal_phase_and_keeps_the_journal() {
+        let (dir, root, host, _record) = fixture(journal::Phase::RecoveryFailed);
+        let trial = Trial::new(host.binding().unwrap(), "alice".into(), &Clock::now().unwrap())
+            .unwrap();
+        let cause = journal::Cause {
+            class: journal::CauseClass::Failed,
+            reason: "fixture cause".into(),
+        };
+        let error = host
+            .restore(&[(root.join("trial.json"), trial)], cause)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("forbidden"), "{error}");
+        let journal::RecordRead::Journal(record) = journal::read_boot_records(&root).journal
+        else {
+            panic!("journal record missing");
+        };
+        assert_eq!(record.phase, journal::Phase::RecoveryFailed);
+        drop(dir);
     }
 }
