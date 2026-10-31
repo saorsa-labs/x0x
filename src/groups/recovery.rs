@@ -1332,8 +1332,8 @@ pub enum ReseatMandateCause {
     CertificateInvalid,
     /// (7) The role is higher than before the removal.
     RoleRaised,
-    /// (8) The parent, KeyPackage, epoch or roster binding differs from the
-    /// commit.
+    /// (8) The parent, KeyPackage, epoch or roster binding differs from
+    /// the commit, or the KeyPackage is not the subject's own.
     BindingMismatch,
 }
 
@@ -1364,6 +1364,21 @@ pub struct ReseatMandateCheck<'a> {
     pub subject: &'a str,
     /// The event's KeyPackage hash.
     pub key_package_hash: Option<&'a str>,
+    /// The event's KeyPackage verifies against the subject's agent key,
+    /// as an ordinary join's does (§3a check 8). The caller runs the
+    /// member-signed package check over the evidence the re-seat event
+    /// carries — the subject's signed `MemberJoined` record binding the
+    /// same package — and the receiver's held record for that package
+    /// must not contradict it, so a package another key signed, or a
+    /// re-seat that carries no subject-signed record at all, fails here.
+    /// A re-seat with no package (an empty bound hash) binds nothing on a
+    /// non-package plane; on the TreeKEM plane every re-seat has a
+    /// package, so an empty bound hash fails the binding on its own.
+    pub key_package_bound_to_subject: bool,
+    /// The group runs on the TreeKEM plane (§3a check 8): a re-seat there
+    /// always carries a KeyPackage, the one the mandate preimage's item 8
+    /// names.
+    pub treekem_plane: bool,
     /// The event's TreeKEM epoch.
     pub epoch: Option<u64>,
     /// The role the commit seats the subject with.
@@ -1473,12 +1488,20 @@ pub fn verify_reseat_mandate(
     if raised {
         return Err(ReseatMandateCause::RoleRaised);
     }
-    // 8.
+    // 8. The KeyPackage half of (8) follows the ordinary join's rule
+    // (#1680): a re-seat with no package (an empty bound hash) binds
+    // nothing on a non-package plane, a TreeKEM-plane re-seat always has
+    // a package so an empty bound hash fails outright, and the package
+    // must be the subject's own — the subject-signed `MemberJoined` the
+    // event carries (Engineer ruling 30 Oct 2026) must verify against
+    // the subject's agent key.
     if check.commit.prev_state_hash.as_deref() != Some(fields.parent_commit_hash.as_str())
         || parent.state_hash != fields.parent_commit_hash
         || check.key_package_hash != Some(fields.key_package_hash.as_str())
         || check.epoch != Some(fields.epoch)
         || check.commit.roster_root != fields.terminal_roster_hash
+        || (check.treekem_plane && fields.key_package_hash.is_empty())
+        || (!fields.key_package_hash.is_empty() && !check.key_package_bound_to_subject)
     {
         return Err(ReseatMandateCause::BindingMismatch);
     }
@@ -3315,6 +3338,8 @@ mod tests {
             commit: &commit,
             subject: &fixture.subject_hex,
             key_package_hash: Some("kp"),
+            key_package_bound_to_subject: true,
+            treekem_plane: false,
             epoch: Some(0),
             seated_role: GroupRole::Member,
             certificate_digest: Some(&fixture.subject_cert_digest),
@@ -3407,12 +3432,66 @@ mod tests {
             commit,
             subject: &fixture.subject_hex,
             key_package_hash: Some("kp"),
+            key_package_bound_to_subject: true,
+            treekem_plane: false,
             epoch: Some(0),
             seated_role: GroupRole::Member,
             certificate_digest: Some(&fixture.subject_cert_digest),
             certificate_valid: true,
             subject_revoked: false,
         }
+    }
+
+    /// #1680, ADR 0109 §3a check 8: the re-seat KeyPackage must verify
+    /// against the subject's agent key, exactly as an ordinary join's
+    /// does. A mandate whose package the receiver's evidence does not
+    /// bind to the subject — a package another key signed — is refused
+    /// `binding_mismatch`. A re-seat with no package at all (an empty
+    /// bound hash) keeps the ordinary join's symmetry on a non-package
+    /// plane; on the TreeKEM plane every re-seat has a package, so the
+    /// same mandate fails the binding outright.
+    #[test]
+    fn reseat_mandate_refuses_a_key_package_not_bound_to_the_subject() {
+        let fixture = owner_axis_group();
+        let commit = reseat_commit(&fixture, &fixture.admin);
+        let mandate = mandate_for(&fixture, &commit, GroupRole::Member);
+        let check = check_for(&fixture, &commit);
+        // Control: the subject's own package passes check 8.
+        assert_eq!(verify_reseat_mandate(&mandate, &check), Ok(()));
+        // A package another key signed does not verify against the
+        // subject's agent key: §3a check 8's second clause refuses it.
+        let other_signer = ReseatMandateCheck {
+            key_package_bound_to_subject: false,
+            ..check
+        };
+        assert_eq!(
+            verify_reseat_mandate(&mandate, &other_signer),
+            Err(ReseatMandateCause::BindingMismatch)
+        );
+        // No package at all, off the TreeKEM plane: the ordinary join's
+        // rule has nothing to verify, so the binding is not required.
+        let packageless = mandate_by(&fixture, &commit, GroupRole::Member, &fixture.admin, |f| {
+            f.key_package_hash = String::new();
+        });
+        let packageless_check = ReseatMandateCheck {
+            key_package_hash: Some(""),
+            key_package_bound_to_subject: false,
+            ..check
+        };
+        assert_eq!(
+            verify_reseat_mandate(&packageless, &packageless_check),
+            Ok(())
+        );
+        // The same packageless mandate on the TreeKEM plane: every re-seat
+        // there has a package, so the empty binding fails by itself.
+        let treekem_check = ReseatMandateCheck {
+            treekem_plane: true,
+            ..packageless_check
+        };
+        assert_eq!(
+            verify_reseat_mandate(&packageless, &treekem_check),
+            Err(ReseatMandateCause::BindingMismatch)
+        );
     }
 
     /// #1533 review (ZCode), ADR 0109 §3a check 5 and D170: a promoted
