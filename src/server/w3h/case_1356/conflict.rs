@@ -30,8 +30,12 @@
 //!    [`AFTER_HEAL`].
 //!
 //! Desired (§2): J's sidecar holds C's ATA as the active one and B's ATA
-//! as the recorded conflict. They diverge after the seal (r+3 against
-//! r+3′), so nothing past the common prefix (r+2) applies: J's state
+//! as the recorded conflict, or (in 1 of 74 CI iterations, when B's answer
+//! from r arrives first) B's as the active one and C's as the conflict.
+//! The delays do not fix the order, and §2 records the second diverging
+//! ATA as the conflict whichever admin signed it, so the row accepts
+//! both. The ATAs diverge after the seal (r+3 against r+3′), so nothing
+//! past the common prefix (r+2) applies: J's state
 //! revision never passes r+2, and J never holds r+3 or r+3′. J shows
 //! `reseat_required {attestation_conflict}` to the end. The ATAs are read
 //! from J's sidecar file with the production decoder.
@@ -525,13 +529,21 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let conflict = seen.conflict_at.is_some()
         && seen.left_conflict.is_none()
         && end_text == "reseat_required{attestation_conflict}";
-    // §2: C's ATA is the active one and B's is the recorded conflict; C's
-    // sequence holds r+3 and B's holds r+3′.
+    // §2: J's sidecar holds one ATA as the active one and the other as the
+    // recorded conflict. C's sequence holds r+3 and B's holds r+3′. The
+    // step 4 delays make C's ATA arrive first in most runs, but they do
+    // not fix the order: in 1 of 74 CI iterations (run 41182384539, job
+    // 124482285010) B's answer from r arrived first and armed, and C's
+    // answer from r+1 became the conflict. That run met every other
+    // check. §2 records the second diverging ATA as the conflict whichever
+    // admin signed it, so the check accepts either order.
     let signed = |ata: &Option<Ata>, by: &str, hash: &str| {
         ata.as_ref()
             .is_some_and(|(signer, _, sequence)| signer == by && sequence.iter().any(|h| h == hash))
     };
-    let recorded = signed(&atas.0, "C", &main.state_hash) && signed(&atas.1, "B", &fork.state_hash);
+    let c_active = signed(&atas.0, "C", &main.state_hash) && signed(&atas.1, "B", &fork.state_hash);
+    let b_active = signed(&atas.0, "B", &fork.state_hash) && signed(&atas.1, "C", &main.state_hash);
+    let recorded = c_active || b_active;
     let short_ata = |ata: &Option<Ata>| {
         ata.as_ref().map(|(by, from, sequence)| {
             let hashes: Vec<&str> = sequence.iter().map(|h| short(h)).collect();
@@ -539,11 +551,19 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         })
     };
     receipt.note(format!(
-        "J's sidecar at the conflict: active {:?}, conflict {:?}; r+3 {} r+3' {}",
+        "J's sidecar at the conflict: active {:?}, conflict {:?}; r+3 {} r+3' {}; active \
+         signer {}",
         short_ata(&atas.0),
         short_ata(&atas.1),
         short(&main.state_hash),
-        short(&fork.state_hash)
+        short(&fork.state_hash),
+        if b_active {
+            "B"
+        } else if c_active {
+            "C"
+        } else {
+            "neither"
+        }
     ));
     receipt.note(format!(
         "J at the conflict {}; J at the end {}; J states {:?}; J max revision {}; J held r+3 \
