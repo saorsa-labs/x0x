@@ -41,4 +41,9 @@ python3 scripts/ci/nextest-reuse.py record "$scratch"
 case $(<"$scratch/binaries.json") in
   *file_v047_interop*) bash scripts/ci/prepare-v047-pinned.sh ;;
 esac
+# h_s3_home_released (ADR 0109 H-S3-home, #1571) runs the published
+# v0.45.0 and v0.46.1 daemons. Fetch them here for the same reason.
+case $(<"$scratch/binaries.json") in
+  *h_s3_home_released*) bash scripts/ci/prepare-released-h-s3-home.sh ;;
+esac
 X0X_CUSTODY_SCRATCH="$scratch" python3 scripts/ci/isolated-runtime.py python3 scripts/ci/nextest-reuse.py run "$scratch" "$@"
