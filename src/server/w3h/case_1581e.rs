@@ -1500,7 +1500,7 @@ async fn expect(
     // typed-state cause: the CI gate checks only the verdict, so the
     // test itself names the cause, and any other RED (a containment
     // regression) fails here instead of satisfying the pin.
-    if competing {
+    if want == Verdict::Red {
         ensure!(
             receipt.named_causes() == [CAUSE_NO_TYPED_FORK],
             "{case}: expected the RED cause {CAUSE_NO_TYPED_FORK:?}, got {:?}",
