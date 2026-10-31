@@ -268,6 +268,18 @@ pub(in crate::server) async fn handle_group_cert_fetch_request(
     let Some(sender) = sender else {
         return false;
     };
+    // #1664: the serve is guarded egress. The gossip lane carries no
+    // machine identity, so the ladder runs on what it CAN authenticate:
+    // the envelope's agent. An agent revocation and a pending revocation
+    // resync keep main's silent drop (no answer, no suppression slot
+    // spent), exactly as the control-blob lane's entry gate.
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(sender) || revoked.revocation_resync_required() {
+            return false;
+        }
+    }
     let Ok(request) = serde_json::from_slice::<GroupCertFetchRequest>(raw) else {
         return false;
     };
@@ -331,6 +343,22 @@ pub(in crate::server) async fn handle_group_cert_fetch_request(
             seat.and_then(|seat| seat.certificate.clone()),
         )
     };
+    // #1664, review round 1 (Claude REQUEST-CHANGES finding 1): this lane
+    // deliberately has NO machine- or binding-revocation refusal. It rides
+    // the gossip topic, which carries no authenticated requester machine;
+    // the only machine identity available is the sender's capability
+    // binding, and that advert is signed by the AGENT key — a revoked
+    // device still holding the portable agent key can keep publishing
+    // newer adverts naming itself, so a binding-based refusal would let it
+    // lock the CLEAN device of the same agent out of its own certificate
+    // fetches (and be told about a revocation it already knows) while the
+    // answer's topic broadcast still reaches every subscriber regardless.
+    // A refusal with no security gain and that denial-of-service lever is
+    // worse than main's behavior. Machine-addressing the ANSWER (closing
+    // the broadcast residual for real) needs the request to carry a
+    // machine route over the DM lane — a wire change, raised as FOR
+    // ENGINEER in the PR body. Until then the entry gate above (agent
+    // revocation, pending resync) is this lane's whole revocation ladder.
     // C5: a recent answer or miss for this (group, digest) suppresses the
     // request BEFORE any hash scan of the cache.
     let key = responder_key(&stable_group_id, &request.cert_digest);
