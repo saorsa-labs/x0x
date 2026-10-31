@@ -97,6 +97,33 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8], what: &str) -> Result<T> {
     postcard::from_bytes(bytes).map_err(|e| MlsError::MlsOperation(format!("decode {what}: {e}")))
 }
 
+/// The roster's `treekem_key_package_hash`-form hash (BLAKE3 of the
+/// base64 string of the encoded package) of every KeyPackage this commit
+/// adds. ADR 0109 §3a check 8's commit half uses these to bind a re-seat
+/// commit's added leaves to the mandate's bound hash.
+///
+/// # Errors
+/// Returns [`MlsError`] if the commit bytes do not decode.
+pub fn commit_added_key_package_hashes(commit_bytes: &[u8]) -> Result<Vec<String>> {
+    use base64::Engine as _;
+
+    let commit: TreeKemCommit = decode(commit_bytes, "commit")?;
+    commit
+        .added
+        .iter()
+        .map(|(_, package)| {
+            let encoded = encode(package, "added key package")?;
+            Ok(blake3::hash(
+                base64::engine::general_purpose::STANDARD
+                    .encode(encoded)
+                    .as_bytes(),
+            )
+            .to_hex()
+            .to_string())
+        })
+        .collect()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedTreeKemSnapshot {
     version: u8,
