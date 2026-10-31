@@ -11910,7 +11910,8 @@ impl Agent {
     }
 
     /// The seam check for a pinned send to `(agent, machine)`: this agent's
-    /// own revocation (agent AND resolved machine) and ADR-0043 B/P pairing
+    /// own revocation (agent AND resolved machine AND a pending revocation
+    /// resync, #1664 review round 3) and ADR-0043 B/P pairing
     /// checks, then (with `check_binding`, r7b) that the recipient's verified
     /// binding still names `machine`, then the caller's. Synchronous;
     /// contention refuses.
@@ -11929,7 +11930,14 @@ impl Agent {
                 let Ok(revoked) = revocation.try_read() else {
                     return false;
                 };
-                if revoked.is_agent_revoked(&agent) || revoked.is_machine_revoked(&machine) {
+                // #1664 review round 3, finding 5: a pending revocation
+                // resync keeps every other lane silent (the control-blob
+                // entry ladder and the machine-addressed reply seam both
+                // check it), so the pinned seam refuses for it too.
+                if revoked.is_agent_revoked(&agent)
+                    || revoked.is_machine_revoked(&machine)
+                    || revoked.revocation_resync_required()
+                {
                     return false;
                 }
                 let Ok(placements) = moves.try_read() else {

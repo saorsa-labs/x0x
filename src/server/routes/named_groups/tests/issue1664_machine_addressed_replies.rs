@@ -189,6 +189,21 @@ fn recorded_pages(state: &AppState) -> usize {
         .len()
 }
 
+/// Every control-blob frame the handler dropped for a machine- or
+/// binding-revoked sender, as `(arm, group, requester)` — the HANDLER's
+/// drop decision, independent of the send seam's write-time re-check
+/// (review round 3, finding 3: with this recorder, deleting the
+/// handler's drop alone fails the test even though the seam would still
+/// withhold the bytes).
+fn recorded_control_blob_drops(state: &AppState) -> Vec<(&'static str, String, String)> {
+    state
+        .named_group_test_recorders
+        .control_blob_revoked_drops
+        .lock()
+        .expect("control-blob drop recorder")
+        .clone()
+}
+
 /// The catch-up handler: a page a clean device asked for is addressed to
 /// THAT machine at the send seam, and a machine-revoked device that asks
 /// for the same group gets the #1657 typed refusal and no page — so the
@@ -464,6 +479,75 @@ async fn control_blob_answers_go_to_the_requesting_machine_and_revoked_fetchers_
     assert!(
         recorded_refusals(&state).is_empty(),
         "no refusal decision exists for the binding-revoked pairing either"
+    );
+
+    // Review round 3, finding 3: the HANDLER's own drop is recorded, so
+    // the gate above is pinned independently of the send seam — both
+    // revoked FETCH drops are on the recorder, in order.
+    let drops = recorded_control_blob_drops(&state);
+    assert_eq!(drops.len(), 2, "both revoked fetch drops are recorded");
+    assert_eq!(drops[0].0, "fetch");
+    assert_eq!(drops[0].1, group_id);
+    assert_eq!(
+        drops[0].2,
+        hex::encode(fetcher.agent_id().as_bytes()),
+        "the first drop names the machine-revoked fetcher"
+    );
+    assert_eq!(drops[1].0, "fetch");
+    assert_eq!(
+        drops[1].2,
+        hex::encode(other.agent_id().as_bytes()),
+        "the second drop names the binding-revoked fetcher"
+    );
+
+    // Review round 3, finding 4: the Chunk and Release arms keep the same
+    // drop for the same revoked device — and a revoked RECIPIENT cannot
+    // release its staged blob (#876: only the recipient may release, so
+    // the revoked device is exactly the one that must not be able to).
+    let revoked_hex = hex::encode(fetcher.agent_id().as_bytes());
+    let chunk_fetch = staged_fetch(&state, &group_id, &revoked_hex)?;
+    let chunk_reference = match &chunk_fetch {
+        control_blob::ControlBlobMessage::Fetch { reference, .. } => reference.clone(),
+        _ => anyhow::bail!("staged_fetch builds a Fetch"),
+    };
+    control_blob::handle_control_blob_message(
+        &state,
+        &fetcher.agent_id(),
+        &device.machine_id(),
+        true,
+        control_blob::ControlBlobMessage::Chunk {
+            reference: chunk_reference.clone(),
+            sequence: 0,
+            data_b64: String::new(),
+        },
+    )
+    .await;
+    control_blob::handle_control_blob_message(
+        &state,
+        &fetcher.agent_id(),
+        &device.machine_id(),
+        true,
+        control_blob::ControlBlobMessage::Release {
+            reference: chunk_reference.clone(),
+        },
+    )
+    .await;
+    let drops = recorded_control_blob_drops(&state);
+    assert_eq!(drops.len(), 4, "the chunk and release drops are recorded");
+    assert_eq!(
+        drops[2].0, "chunk",
+        "the chunk from the revoked device is dropped"
+    );
+    assert_eq!(
+        drops[3].0, "release",
+        "the release from the revoked device is dropped"
+    );
+    assert!(
+        state
+            .control_blobs
+            .staged_chunk(&chunk_reference, 0)
+            .is_some(),
+        "the dropped release left the revoked device's staged blob in place"
     );
 
     // The agent-revoked gate keeps main's silent drop: no chunk.

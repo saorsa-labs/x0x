@@ -956,6 +956,25 @@ fn exact_blob_matches_ref(reference: &ControlBlobRef, bytes: &[u8]) -> bool {
         && hex::encode(blake3::hash(bytes).as_bytes()) == reference.digest
 }
 
+/// #1664 review round 3: record the handler's drop decision for a
+/// machine- or binding-revoked sender (test builds only), so a test pins
+/// the HANDLER gate independently of the send seam's write-time re-check.
+#[cfg(test)]
+fn record_revoked_control_blob_drop(
+    state: &AppState,
+    arm: &'static str,
+    reference: &ControlBlobRef,
+    sender_hex: &str,
+) {
+    if let Ok(mut drops) = state
+        .named_group_test_recorders
+        .control_blob_revoked_drops
+        .lock()
+    {
+        drops.push((arm, reference.group_id.clone(), sender_hex.to_string()));
+    }
+}
+
 async fn reference_admitted(state: &AppState, reference: &ControlBlobRef) -> bool {
     let known_group = {
         let groups = state.named_groups.read().await;
@@ -1083,6 +1102,8 @@ pub(in crate::server) async fn handle_control_blob_message(
             // `reference.recipient`, so the withheld blob is exactly the
             // one the revoked device asked for.
             if machine_refused || binding_refused {
+                #[cfg(test)]
+                record_revoked_control_blob_drop(state, "fetch", &reference, &sender_hex);
                 tracing::debug!(
                     group_id = %LogHexId::group(&reference.group_id),
                     requester = %LogHexId::agent(&sender_hex),
@@ -1267,6 +1288,8 @@ pub(in crate::server) async fn handle_control_blob_message(
             data_b64,
         } => {
             if machine_refused || binding_refused {
+                #[cfg(test)]
+                record_revoked_control_blob_drop(state, "chunk", &reference, &sender_hex);
                 return;
             }
             if !incoming_reference_header_valid(&reference, &sender_hex, &local_hex, verified)
@@ -1299,6 +1322,8 @@ pub(in crate::server) async fn handle_control_blob_message(
             // and local == reference.source, and the exact reference
             // (digest + length) keys the removal.
             if machine_refused || binding_refused {
+                #[cfg(test)]
+                record_revoked_control_blob_drop(state, "release", &reference, &sender_hex);
                 return;
             }
             if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
