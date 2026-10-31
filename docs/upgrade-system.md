@@ -679,6 +679,21 @@ change. The API token is checked even for a connection queued during bind.
 A very long data-directory path can exceed the Unix socket path limit (104 bytes on macOS); the bind then fails and supervised
 apply is disabled with a WARN in the log.
 
+An arm request for a participant whose frozen restart mode is
+`TransactionalHandoff` is refused before the shutdown (issue #1670). The
+error reply names the missing restart-capable owner, and the daemon keeps
+serving. A completed flush ends the old participant with exit 0, and no
+supervisor restarts it. The durable receipt proves the flush only. Reaping
+the old participant and starting the candidate need an owner outside the
+stopped process. No such owner exists today: the arm-and-flush path spawns
+no helper, and the launcher is not implemented. Supervised-exit arm requests
+are not affected. The ordinary in-process transactional handoff, which
+spawns the detached helper, is not affected. The transactional socket flush
+may be activated only when a restart owner is established and retained,
+verified against the frozen transaction, generation, participant identity
+and restart binding. That owner arrives with the #1375 launcher and #1376
+recovery work.
+
 #### Stale flush records
 
 If the daemon is killed mid-flush (for example SIGTERM during the flush
