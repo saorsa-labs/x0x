@@ -122,6 +122,19 @@ raise SystemExit(3)
         )
         return result, root / "artifacts"
 
+    def test_launcher_binary_must_be_absolute_and_executable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="linux690-launcher-admission-") as temporary:
+            root = Path(temporary)
+            env, probe = self.fixture(root)
+            for path in ("relative", str(root / "absent")):
+                result = subprocess.run(
+                    [str(RUNNER), "--probe", str(probe), "--launcher-tests", path,
+                     "--artifact-root", str(root / "artifacts")],
+                    env=env, capture_output=True, text=True, check=False, timeout=5,
+                )
+                self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
+                self.assertFalse((root / "artifacts").exists())
+
     def test_inert_success_reaches_all_cases_and_cleans(self) -> None:
         result, artifact = self.run_fixture(False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
