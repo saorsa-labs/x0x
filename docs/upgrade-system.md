@@ -268,6 +268,12 @@ keeps the first rollback cause, and starts only a missing restored child, at
 most 3 times. A failed reap or a failed restored start stops automatic
 recovery (`RecoveryFailed`) until an operator repairs the host.
 
+While launcher activation is held, `x0xd` refuses to start if the
+`X0X_M2_BOOT_FD` environment variable is set, even to an empty value. The
+check runs before argument parsing, so `--help` and `--check` refuse too. The
+error names the variable. This is a fail-closed guard against a half-armed
+launcher. Remove the variable from the unit or shell to start `x0xd`.
+
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes
 again before mutation. It copies each old binary beside its target, using that
