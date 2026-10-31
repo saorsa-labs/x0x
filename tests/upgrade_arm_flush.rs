@@ -51,11 +51,11 @@ macro_rules! arm_flush_regression_tests {
 
             #[test]
             fn arm_flush_auth_and_frozen_binding_precede_the_actual_flush() {
+                // The base request stays on the supervised owner, where a
+                // correct arm succeeds: each mutated field below is then the
+                // only reason its request refuses.
                 let (dir, mut journal, mut request, state) = fixture();
                 let root = dir.path().canonicalize().unwrap();
-                journal["plan"]["participants"][0]["restart"]["mode"] = json!("TransactionalHandoff");
-                request["plan"] = journal["plan"].clone();
-                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
                 let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let counted = Arc::clone(&calls);
                 let owner = shutdown_flush::register(root.clone(), Arc::new(move |_, _| {
@@ -88,6 +88,10 @@ macro_rules! arm_flush_regression_tests {
                 // passed, the transactional arm still refuses — no
                 // restart-capable owner exists — so the flush is never
                 // armed and the shutdown hook never runs.
+                journal["plan"]["participants"][0]["restart"]["mode"] = json!("TransactionalHandoff");
+                journal["plan"]["participants"][0]["restart"]["supervised_exit_code"] = json!(null);
+                request["plan"] = journal["plan"].clone();
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
                 let failure =
                     arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
                 assert_eq!(failure.kind(), io::ErrorKind::Unsupported);
@@ -99,6 +103,7 @@ macro_rules! arm_flush_regression_tests {
                 // The supervised owner still arms; the receipt, handoff and
                 // durable binding machinery are unchanged on that path.
                 journal["plan"]["participants"][0]["restart"]["mode"] = json!("SupervisedExit");
+                journal["plan"]["participants"][0]["restart"]["supervised_exit_code"] = json!(75);
                 request["plan"] = journal["plan"].clone();
                 journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
                 let receipt = arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap().receipt;
