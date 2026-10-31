@@ -364,7 +364,38 @@ mod tests {
         let clock = fast_clock(&trial);
         let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
         assert_previous_pair(&host);
-        assert_eq!(journal_record(&root).phase, journal::Phase::Restored);
+        let record = journal_record(&root);
+        assert_eq!(record.phase, journal::Phase::Restored);
+        let cause = record.cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Interrupted, "{cause:?}");
+    }
+
+    /// The first verdict wins: a launcher restart that re-enters rollback
+    /// after a Failed verdict keeps Failed, not Interrupted.
+    #[test]
+    fn a_resumed_rollback_keeps_a_failed_verdict() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = trial_in(&host, &path, Phase::RollingBack, MAX_ATTEMPTS);
+        trial.verdict = Some(cause(
+            journal::CauseClass::Failed,
+            "launch attempts exhausted",
+        ));
+        trial.save(&path).unwrap();
+        let mut trial = Trial::load(&path, &trial.binding, "alice").unwrap();
+        let clock = fast_clock(&trial);
+        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
+        assert_previous_pair(&host);
+        let record = journal_record(&root);
+        assert_eq!(record.phase, journal::Phase::Restored);
+        let cause = record.cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
+        assert!(
+            cause.reason.contains("launch attempts exhausted"),
+            "{cause:?}"
+        );
+        let verdict = trial.verdict.unwrap();
+        assert_eq!(verdict.class, journal::CauseClass::Failed);
     }
 
     /// A service stop during the trial never wedges the host: the next
