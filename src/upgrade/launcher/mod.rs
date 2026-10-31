@@ -1,14 +1,34 @@
 //! Private, dormant S3b engine. No installer or daemon apply path calls it.
-//! The complete inventory issuer and host coordinator remain separate gates.
+//! The only live call is `candidate_boot` at x0xd start, which refuses while
+//! `X0X_M2_BOOT_FD` is set and activation is held. The complete inventory
+//! issuer and host coordinator remain separate gates.
 #![allow(dead_code)]
 
 mod child;
+mod control;
 mod filesystem;
 #[path = "../journal.rs"]
 mod journal;
 #[path = "../probe.rs"]
 mod probe;
+mod recovery;
+mod run;
+
+pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
+    child::candidate_boot(version)
+}
+pub(crate) fn candidate_boot_for_fixture(version: &str) -> io::Result<()> {
+    child::candidate_boot_owned(version)
+}
+pub(crate) fn fixture_receipt(request: &[u8]) -> io::Result<serde_json::Value> {
+    control::fixture_receipt(request)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod lifecycle;
+
 const ENABLED: bool = false;
+
 impl Clock {
     fn now() -> io::Result<Self> {
         let clock = probe::ProbeClock::now()?;
@@ -19,20 +39,9 @@ impl Clock {
     }
 }
 
-pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
-    child::candidate_boot(version)
-}
-pub(crate) fn candidate_boot_for_fixture(version: &str) -> io::Result<()> {
-    child::candidate_boot_owned(version)
-}
-mod control;
-mod recovery;
 #[cfg(all(test, unix))]
 mod testkit;
-pub(crate) fn fixture_receipt(request: &[u8]) -> io::Result<serde_json::Value> {
-    control::fixture_receipt(request)
-}
-mod run;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -382,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_and_stable_health_are_both_bounded() {
+    fn stable_health_after_readiness_commits_provisional() {
         let (_dir, path, mut trial, clock) = fixture();
         trial.phase = Phase::Authorized;
         trial.reserve(&path, &clock).unwrap();
@@ -420,6 +429,29 @@ mod tests {
             Trial::load(&path, &trial.binding, "alice").unwrap().phase,
             Phase::Provisional
         );
+    }
+
+    /// Per-attempt failures are plain errors; they never carry a cause
+    /// class (the rollback verdict is typed, set by `run::rollback`).
+    #[test]
+    fn readiness_deadline_and_lost_health_fail_the_attempt() {
+        let (_dir, path, mut trial, clock) = fixture();
+        trial.phase = Phase::Authorized;
+        trial.reserve(&path, &clock).unwrap();
+        trial.child = Some(Identity {
+            pid: 2,
+            start: 3,
+            boot: clock.boot.clone(),
+        });
+        let late = Clock {
+            ms: clock.ms + READY_MS,
+            ..clock.clone()
+        };
+        let error = trial.observe_health(&path, &late, false).unwrap_err();
+        assert_eq!(error.to_string(), "readiness deadline reached");
+        assert!(!trial.observe_health(&path, &clock, true).unwrap());
+        let error = trial.observe_health(&path, &clock, false).unwrap_err();
+        assert_eq!(error.to_string(), "stable health lost");
     }
 
     #[test]

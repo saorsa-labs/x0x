@@ -217,7 +217,10 @@ pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
         return Ok(());
     }
     if !super::ENABLED {
-        return Err(invalid("M2 launcher activation is held"));
+        return Err(invalid(format!(
+            "{BOOT_FD} is set, but M2 launcher activation is held; \
+             unset {BOOT_FD} to start x0xd"
+        )));
     }
     candidate_boot_owned(version)
 }
@@ -439,9 +442,12 @@ mod tests {
     #[test]
     fn launcher_child_boot_fd_env_is_taken_once_and_must_be_3() {
         // The only test that touches X0X_M2_BOOT_FD: env is process-global.
+        // While activation is held, x0xd refuses a launcher boot descriptor
+        // and the refusal names the variable the operator must remove.
         std::env::set_var(BOOT_FD, "3");
-        let held = candidate_boot("0.49.0").unwrap_err();
-        assert_eq!(held.to_string(), "M2 launcher activation is held");
+        let held = candidate_boot("0.49.0").unwrap_err().to_string();
+        assert!(held.contains("X0X_M2_BOOT_FD"), "{held}");
+        assert!(held.contains("activation is held"), "{held}");
         std::env::set_var(BOOT_FD, "4");
         let error = take_boot_fd().unwrap_err();
         assert_eq!(error.to_string(), "invalid private boot descriptor");

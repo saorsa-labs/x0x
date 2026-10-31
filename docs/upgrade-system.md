@@ -268,6 +268,12 @@ keeps the first rollback cause, and starts only a missing restored child, at
 most 3 times. A failed reap or a failed restored start stops automatic
 recovery (`RecoveryFailed`) until an operator repairs the host.
 
+While launcher activation is held, `x0xd` refuses to start if the
+`X0X_M2_BOOT_FD` environment variable is set, even to an empty value. The
+check runs before argument parsing, so `--help` and `--check` refuse too. The
+error names the variable. This is a fail-closed guard against a half-armed
+launcher. Remove the variable from the unit or shell to start `x0xd`.
+
 The `x0x-launcher` binary builds only with the non-default `m2-launcher`
 cargo feature. Default builds and `cargo install` of the published crate do
 not build it until the activation slice. The launcher gives a candidate its boot
