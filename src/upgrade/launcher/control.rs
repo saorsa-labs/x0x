@@ -115,8 +115,14 @@ pub(super) fn flush_and_reap(
             old,
         })
     })();
-    if result.is_err() {
-        child::stop_and_reap(child)?;
+    if let Err(error) = result {
+        // The flush failure is the cause; a reap failure must not mask it.
+        if let Err(reap) = child::stop_and_reap(child) {
+            return Err(io::Error::other(format!(
+                "{error}; reap also failed: {reap}"
+            )));
+        }
+        return Err(error);
     }
     result
 }
