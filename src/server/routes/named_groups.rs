@@ -15041,7 +15041,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-                let Some(commit_b64) = treekem_commit_b64 else {
+                // #1680 round 3: borrow, not move — the §3a gate below
+                // re-reads `treekem_commit_b64` to bind the commit's added
+                // leaf to the mandate's bound hash.
+                let Some(commit_b64) = treekem_commit_b64.as_ref() else {
                     return ApplyMetadataResult::REJECTED;
                 };
                 if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
@@ -15050,7 +15053,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 let Some(epoch) = treekem_epoch else {
                     return ApplyMetadataResult::REJECTED;
                 };
-                Some((commit_b64, treekem_welcome_b64, welcome_ref, epoch))
+                Some((commit_b64.clone(), treekem_welcome_b64, welcome_ref, epoch))
             } else {
                 None
             };
@@ -15318,6 +15321,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // `ReseatMandateV1` in place of the owner mandate. It is
             // accepted only under the §3a rule; a failure refuses with the
             // committed state unchanged, as `owner_mandate_missing` does.
+            // Check 8 reads the subject-signed `MemberJoined` the event
+            // carries in `member_joined_recovery` (Engineer ruling
+            // 30 Oct 2026) and binds the TreeKEM commit's added leaf to
+            // the mandate's bound hash.
             let reseat_accepted = match (
                 info.policy.admission.owner_certified_user_id(),
                 owner_mandate.as_ref(),
@@ -15334,6 +15341,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         treekem_key_package_hash.as_deref(),
                         treekem_epoch,
                         owner_certified_certificate.as_ref(),
+                        member_joined_recovery.as_deref(),
+                        treekem_commit_b64.as_deref(),
                     )
                     .await
                     {
@@ -18142,6 +18151,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         && verify_authority_attested_member_joined_recovery(&next, recovery)
                 })
                 .await;
+            // Engineer ruling 30 Oct 2026 (PR #1728, comment 6528069544):
+            // a re-seat that binds a KeyPackage carries the subject's own
+            // signed, non-authority-only `MemberJoined` for it inside the
+            // event, so every receiver can enforce ADR 0109 §3a check 8
+            // fail-closed instead of trusting the mandate's hash binding
+            // alone. Only the re-seat add carries it (an ordinary add keeps
+            // the record on its own delivery lane below), and only when a
+            // package is bound — a packageless re-seat has no check-8
+            // evidence to carry. Old receivers ignore the field; old
+            // senders omit it and are refused (accepted, #1659 precedent).
+            let reseat_recovery = reseat_mandate
+                .as_ref()
+                .filter(|mandate| !mandate.fields.key_package_hash.is_empty())
+                .and(member_joined_recovery.clone());
             let mut event = NamedGroupMetadataEvent::MemberAdded {
                 roster_certificates_b64: Vec::new(),
                 group_id: event_group_id.clone(),
@@ -18157,7 +18180,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     .members_v2
                     .get(&member_agent_id)
                     .and_then(|member| member.treekem_key_package_hash.clone()),
-                member_joined_recovery: None,
+                member_joined_recovery: reseat_recovery,
                 member_recovery_history: Vec::new(),
                 certificate_b64: owner_certified_admission.as_ref().map(|cert| {
                     use base64::Engine as _;
