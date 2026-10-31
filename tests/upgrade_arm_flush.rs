@@ -95,6 +95,7 @@ macro_rules! arm_flush_regression_tests {
                 owner.join_workers();
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 assert!(!root.join(shutdown_flush::RECORD).exists());
+                assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
                 // The supervised owner still arms; the receipt, handoff and
                 // durable binding machinery are unchanged on that path.
                 journal["plan"]["participants"][0]["restart"]["mode"] = json!("SupervisedExit");
@@ -872,7 +873,7 @@ macro_rules! arm_flush_regression_tests {
 
             // #1665: use the production socket, owner, durability hook and
             // restart callback. No external supervisor or candidate is started.
-            async fn socket_success_completion(mode: &str, lost_requester: bool, parked_tail: bool) {
+            async fn socket_success_completion(lost_requester: bool, parked_tail: bool) {
                 use std::io::Write;
                 use tracing_subscriber::prelude::*;
                 struct Sink;
@@ -884,7 +885,7 @@ macro_rules! arm_flush_regression_tests {
                 let root = dir.path().canonicalize().unwrap();
                 // An injected status distinct from both the clean-stop default
                 // and failure status proves the frozen supervisor value is used.
-                record["plan"]["participants"][0]["restart"]["mode"] = json!(mode);
+                record["plan"]["participants"][0]["restart"]["mode"] = json!("SupervisedExit");
                 record["plan"]["participants"][0]["restart"]["supervised_exit_code"] = json!(42);
                 request["plan"] = record["plan"].clone();
                 journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
@@ -980,7 +981,7 @@ macro_rules! arm_flush_regression_tests {
                 assert!(!root.join(shutdown_flush::HOLD_RECORD).exists());
                 let _ = guard.shutdown_until(Instant::now() + Duration::from_secs(1));
                 assert!(completed, "successful socket receipt left the stopped participant alive");
-                assert_eq!(code, if mode == "SupervisedExit" { 42 } else { 0 },
+                assert_eq!(code, 42,
                     "completion must respect the frozen restart owner, not reuse failed-flush exit 75");
                 assert_eq!(exit_calls.load(Ordering::SeqCst), 1);
             }
@@ -988,13 +989,13 @@ macro_rules! arm_flush_regression_tests {
             #[cfg_attr(not(target_os = "linux"), ignore = "requires isolated Linux network namespace")]
             #[tokio::test]
             async fn socket_success_receipt_completes_while_shutdown_tail_is_parked() {
-                socket_success_completion("SupervisedExit", false, true).await;
+                socket_success_completion(false, true).await;
             }
 
             #[cfg_attr(not(target_os = "linux"), ignore = "requires isolated Linux network namespace")]
             #[tokio::test]
             async fn socket_success_receipt_completes_after_requester_disappears() {
-                socket_success_completion("SupervisedExit", true, false).await;
+                socket_success_completion(true, false).await;
             }
 
             // #1670: over the production socket, an authenticated
