@@ -2507,6 +2507,44 @@ mod tests {
         assert_eq!(roster_root_of_projection(&round_trip), root_with_bytes);
     }
 
+    /// #1023: the digest-only projection variant (what the DM-budgeted
+    /// invite link embeds) strips every byte but keeps each committed
+    /// digest, so the root the invite recomputes is unchanged — and a
+    /// malformed snapshot certificate fails the WHOLE link decode
+    /// (fail-closed), never a partial seat.
+    #[test]
+    fn digest_only_projection_strips_bytes_and_bad_certificate_fails_closed() {
+        let user = crate::identity::UserKeypair::generate().unwrap();
+        let agent = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&user, &agent).unwrap();
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+
+        let mut members = BTreeMap::new();
+        let mut m = make_member(&agent_hex, GroupRole::Member);
+        m.certificate = Some(cert.clone());
+        m.certificate_digest = Some(crate::groups::owner_cert::certificate_digest_hex(&cert));
+        members.insert(agent_hex.clone(), m);
+
+        let with_bytes = roster_projection(&members);
+        let digest_only = roster_projection_digest_only(&members);
+        assert!(digest_only[&agent_hex].certificate.is_none());
+        assert_eq!(
+            digest_only[&agent_hex].certificate_digest,
+            with_bytes[&agent_hex].certificate_digest
+        );
+        assert_eq!(
+            roster_root_of_projection(&digest_only),
+            roster_root_of_projection(&with_bytes)
+        );
+
+        // A malformed certificate string is a whole-link decode failure —
+        // an adopter never sees a partially-decoded roster.
+        let mut payload = serde_json::to_value(&with_bytes[&agent_hex]).expect("encodes");
+        payload["certificate"] = serde_json::json!("not base64!");
+        let decoded: Result<RosterMemberSnapshot, _> = serde_json::from_value(payload);
+        assert!(decoded.is_err(), "a malformed certificate fails closed");
+    }
+
     /// #1023: snapshot equality is COMMITTED-STATE equality — the fields
     /// the signed root covers. Carriage bytes never participate: a mixed
     /// roster (one byte-bearing seat, one digest-only) equals its

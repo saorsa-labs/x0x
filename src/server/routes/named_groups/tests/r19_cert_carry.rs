@@ -2418,17 +2418,15 @@ async fn creator_offline_chain_carrier_scenario(
         .insert(group_id.clone(), base.clone());
 
     // (2) The admin's stub: the base revision with every seat digest-only
-    // (a joiner's key-stripped view). It never cached the creator's
-    // announce; no sidecar and no JoinResult ever arrive. In the legacy
-    // variant the stub's retained history is also pre-#1023 wire form, so
-    // no link the admin holds ever carried bytes.
+    // (a joiner's key-stripped view) and NO retained history — a real
+    // joiner stub carries no commit log, so the served link below is the
+    // only place the creator's bytes could ever come from. It never cached
+    // the creator's announce; no sidecar and no JoinResult ever arrive.
     let mut stub = base.clone();
     for seat in stub.members_v2.values_mut() {
         seat.certificate = None;
     }
-    if legacy_chain {
-        stub.commit_log = stub.commit_log.into_iter().map(legacy_wire_link).collect();
-    }
+    stub.commit_log.clear();
     admin
         .named_groups
         .write()
