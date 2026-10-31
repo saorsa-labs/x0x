@@ -1829,10 +1829,23 @@ impl AuthenticatedMachineBindingCache {
     /// - a certificate's known expiry is recorded with its digest;
     /// - an unchanged digest without a certificate keeps the known expiry;
     /// - a different (verified, signed) digest clears it until its
-    ///   certificate lands ([`Self::record_certificate_landed`]);
+    ///   certificate lands ([`Self::record_certificate_landed`]), except
+    ///   for an equal-second anonymous digest (below);
     /// - a digest-less legacy announcement keeps what is known.
     ///
     /// An older announcement never rolls the binding back.
+    ///
+    /// #1643, the same tie-break as the discovery merge
+    /// (`upsert_discovered_agent`), a narrow exception to ADR 0115 §1's
+    /// equal-or-newer replace rule: an announcement with an EQUAL
+    /// `announced_at` that commits to the anonymous digest keeps the known
+    /// digest and expiry. A one-second timestamp proves no order, so the
+    /// beat may be a pre-consent build racing the disclosure. No blob ever
+    /// fetches for the anonymous digest, so a clear has no repair path, and
+    /// a cleared expiry fails open in [`crate::identity::is_expired`]. The
+    /// machine still replaces. A strictly fresher anonymous beat, or a
+    /// same-second beat for a different non-anonymous digest, still
+    /// replaces as described above.
     pub(crate) fn record_announcement(
         &mut self,
         agent_id: AgentId,
@@ -1843,13 +1856,18 @@ impl AuthenticatedMachineBindingCache {
     ) {
         let existing = self.entries.get(&agent_id).copied();
         let known_digest = existing.and_then(|b| b.cert_digest);
+        let known_not_after = existing.and_then(|b| b.cert_not_after);
+        let equal_second = existing.is_some_and(|b| b.announced_at == announced_at);
         let (digest, not_after) = match (cert_digest, cert_not_after) {
             (digest, Some(not_after)) => (digest.or(known_digest), Some(not_after)),
-            (Some(digest), None) if known_digest == Some(digest) => {
-                (Some(digest), existing.and_then(|b| b.cert_not_after))
+            (Some(digest), None) if known_digest == Some(digest) => (Some(digest), known_not_after),
+            (Some(digest), None)
+                if equal_second && digest == crate::announce_v3::anonymous_cert_digest() =>
+            {
+                (known_digest, known_not_after)
             }
             (Some(digest), None) => (Some(digest), None),
-            (None, None) => (known_digest, existing.and_then(|b| b.cert_not_after)),
+            (None, None) => (known_digest, known_not_after),
         };
         // The announced-binding store uses this writer. It keeps the
         // retained binding and does not take an attribution slot. The

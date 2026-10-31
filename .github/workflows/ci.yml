@@ -610,11 +610,16 @@ jobs:
     needs: w3h-plan
     runs-on: ubuntu-latest
     # S3 runs the H-S3-c/c2 owner-cert rows at 15 min each (#1689) and the
-    # H-S3-d7 flood row (#1717), so its group gets 165 min (Engineer ruling,
-    # 30 Oct; no shard split). Every other group keeps 120 min. The isolated test
+    # H-S3-d7 flood row (#1717), so its group gets 185 min (Engineer ruling,
+    # 30 Oct, 165 min; no shard split; raised by option (b) of the 31 Oct
+    # ruling, #1727). Every other group keeps 120 min. The isolated test
     # phase has its own deadline (`X0X_RUNTIME_TIMEOUT_SECONDS` below), which
-    # must also fit inside this limit with room for setup and upload.
-    timeout-minutes: ${{ matrix.group == 's3' && 165 || 120 }}
+    # must also fit inside this limit with room for setup and upload. The
+    # one-job lib build below takes about 20 min (19m 32s in job
+    # 124482285010, against 10m 20s with parallel jobs in job 124477009427),
+    # so 165 min no longer held setup, build, the 155-min test deadline and
+    # upload.
+    timeout-minutes: ${{ matrix.group == 's3' && 185 || 120 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.w3h-plan.outputs.matrix) }}
@@ -666,7 +671,7 @@ jobs:
           X0X_ISOLATION_ROLE: w3h-harness
           # The deadline of the isolated test phase only (the build runs
           # before it). S3 needs about 135 min for 20 reruns, so it gets
-          # 9300 s (155 min) inside its 165-min job; every other group keeps
+          # 9300 s (155 min) inside its 185-min job; every other group keeps
           # 6600 s. `isolated-runtime.py` caps the value at 21600 s.
           X0X_RUNTIME_TIMEOUT_SECONDS: ${{ matrix.group == 's3' && 9300 || 6600 }}
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
@@ -676,6 +681,25 @@ jobs:
         # `--cfg tokio_unstable` is this job only. Release binaries and the
         # other CI jobs do not set it (#1245). `CARGO_ENCODED_RUSTFLAGS`
         # replaces `RUSTFLAGS` when it is set, so append to whichever is live.
+        # `--build-jobs 1` applies only to the host `cargo nextest list` of
+        # this lib test unit. The isolated run reuses that binary and does
+        # not compile again. On image ubuntu24/20261025.353 the runner stops
+        # that build with exit 143 and "The runner has received a shutdown
+        # signal", with no "exceeded the maximum execution time" line.
+        # #1704 run 41011145001 rest jobs 123917553873 and 123947546006, and
+        # all three rest attempts of #1719 run 40996713847, died about 10 min
+        # into the job in the silent rustc after tikv-jemalloc. There was no
+        # "Finished" line and no "Isolation evidence" line, so no test had
+        # started. The 300 s w3h-gate slow-timeout and the 6600 s isolation
+        # deadline were not in force. The same cold build finishes on main
+        # (7m27s in run 41010602403, 11m34s in run 40993619879, 11m43s in run
+        # 41029213415) and on the sibling shards of those pull requests.
+        # #1597 long-1023 job 123955870023 died the same way, so the rest
+        # filter is not the cause. Property tests already pass
+        # `--build-jobs 1` after the same 143 on this image during
+        # `cargo nextest list` (run 40530790509). One build job does not
+        # change the test binary. The 120 min job budget stays; the s3 budget
+        # rises to 185 min for the longer build (see `timeout-minutes`).
         run: |
           if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
             export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}"$'\x1f'"--cfg"$'\x1f'"tokio_unstable"
@@ -685,7 +709,7 @@ jobs:
           filter="$(python3 -B scripts/ci/w3h-shards.py --filter "${{ matrix.group }}")"
           echo "W3H-SHARD-START group=${{ matrix.group }} filter=${filter}"
           python3 -B scripts/ci/w3h-shards.py --list "${{ matrix.group }}"
-          bash scripts/ci/nextest-isolated.sh --all-features --lib -- \
+          bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 1 --lib -- \
             --profile w3h-gate --run-ignored all --stress-count 20 -E "$filter"
           echo "W3H-SHARD-END group=${{ matrix.group }}"
 
