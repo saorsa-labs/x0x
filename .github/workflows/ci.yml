@@ -676,6 +676,24 @@ jobs:
         # `--cfg tokio_unstable` is this job only. Release binaries and the
         # other CI jobs do not set it (#1245). `CARGO_ENCODED_RUSTFLAGS`
         # replaces `RUSTFLAGS` when it is set, so append to whichever is live.
+        # `--build-jobs 1` applies only to the host `cargo nextest list` of
+        # this lib test unit. The isolated run reuses that binary and does
+        # not compile again. On image ubuntu24/20261025.353 the runner stops
+        # that build with exit 143 and "The runner has received a shutdown
+        # signal", with no "exceeded the maximum execution time" line.
+        # #1704 run 41011145001 rest jobs 123917553873 and 123947546006, and
+        # all three rest attempts of #1719 run 40996713847, died about 10 min
+        # into the job in the silent rustc after tikv-jemalloc. There was no
+        # "Finished" line and no "Isolation evidence" line, so no test had
+        # started. The 300 s w3h-gate slow-timeout and the 6600 s isolation
+        # deadline were not in force. The same cold build finishes on main
+        # (7m27s in run 41010602403, 11m34s in run 40993619879, 11m43s in run
+        # 41029213415) and on the sibling shards of those pull requests.
+        # #1597 long-1023 job 123955870023 died the same way, so the rest
+        # filter is not the cause. Property tests already pass
+        # `--build-jobs 1` after the same 143 on this image during
+        # `cargo nextest list` (run 40530790509). One build job does not
+        # change the test binary. The 120 min and 165 min job budgets stay.
         run: |
           if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
             export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}"$'\x1f'"--cfg"$'\x1f'"tokio_unstable"
@@ -685,7 +703,7 @@ jobs:
           filter="$(python3 -B scripts/ci/w3h-shards.py --filter "${{ matrix.group }}")"
           echo "W3H-SHARD-START group=${{ matrix.group }} filter=${filter}"
           python3 -B scripts/ci/w3h-shards.py --list "${{ matrix.group }}"
-          bash scripts/ci/nextest-isolated.sh --all-features --lib -- \
+          bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 1 --lib -- \
             --profile w3h-gate --run-ignored all --stress-count 20 -E "$filter"
           echo "W3H-SHARD-END group=${{ matrix.group }}"
 
