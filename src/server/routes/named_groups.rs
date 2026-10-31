@@ -14563,6 +14563,38 @@ fn role_update_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
     }
 }
 
+/// §3a check 8, the carried-record group half (#1680, Engineer ruling
+/// 31 Oct 2026): a re-seat that binds a KeyPackage carries the
+/// subject's signed `MemberJoined` as the package's evidence, and that
+/// record must name the parent group (the predicate lives in
+/// `x0x::groups::recovery`). The clause runs after the §3a rule, so
+/// every earlier cause still refuses first, and refuses here with
+/// check 8's typed `binding_mismatch` cause. A packageless re-seat
+/// binds no package, so a carried record is not §3a evidence for it; a
+/// re-seat that carries no record already fails the rule's own
+/// evidence check.
+fn carried_member_joined_recovery_binds_parent_group(
+    mandate: &x0x::groups::recovery::ReseatMandateV1,
+    parent: &x0x::groups::GroupInfo,
+    member_joined_recovery: Option<&NamedGroupMetadataEvent>,
+) -> bool {
+    if mandate.fields.key_package_hash.is_empty() {
+        return true;
+    }
+    match member_joined_recovery {
+        Some(NamedGroupMetadataEvent::MemberJoined {
+            group_id,
+            stable_group_id,
+            ..
+        }) => x0x::groups::recovery::carried_member_joined_binds_parent_group(
+            group_id,
+            stable_group_id.as_deref(),
+            parent,
+        ),
+        _ => true,
+    }
+}
+
 async fn apply_named_group_metadata_event_inner(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
@@ -15313,7 +15345,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // Check 8 reads the subject-signed `MemberJoined` the event
             // carries in `member_joined_recovery` (Engineer ruling
             // 30 Oct 2026) and binds the TreeKEM commit's added leaf to
-            // the mandate's bound hash.
+            // the mandate's bound hash. The carried record must also
+            // name the parent group (ruling 31 Oct 2026), refused with
+            // the same typed cause, not the attestation gate's plain
+            // rejection.
             let reseat_accepted = match (
                 info.policy.admission.owner_certified_user_id(),
                 owner_mandate.as_ref(),
@@ -15335,7 +15370,26 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     )
                     .await
                     {
-                        Ok(()) => true,
+                        Ok(())
+                            if carried_member_joined_recovery_binds_parent_group(
+                                mandate,
+                                &info,
+                                member_joined_recovery.as_deref(),
+                            ) =>
+                        {
+                            true
+                        }
+                        Ok(()) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&agent_id),
+                                cause =
+                                    x0x::groups::recovery::ReseatMandateCause::BindingMismatch
+                                        .as_str(),
+                                "MemberAdded: reseat_mandate_invalid; rejecting with state byte-identical (ADR 0109 §3a)"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
                         Err(cause) => {
                             tracing::warn!(
                                 group_id = %LogHexId::group(&resolved_group_key),
