@@ -326,10 +326,12 @@ const PRE_SEND_RECONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Age at which one direction of a connected peer is stale (#1419).
 ///
-/// The peer is one-sided only when this direction is stale and the other
+/// The peer is one-sided when this direction is stale and the other
 /// direction on that same peer is still within [`ONE_SIDED_FLOWING`].
-/// ant-quic 0.27.60 records application data only, so a quiet peer can show
-/// a large age on both directions and must stay up.
+/// ant-quic 0.27.60 records application data only, so a quiet peer can
+/// show a large age on both directions. Such a peer is a liveness-probe
+/// candidate in [`NetworkNode::resolve_one_sided_peers`] while other
+/// sampled peers have traffic; the probe, not the age, decides.
 pub(crate) const ONE_SIDED_STALE: Duration = Duration::from_secs(60);
 
 /// Age at which one direction of the same peer still counts as fresh.
@@ -340,6 +342,11 @@ const ONE_SIDED_REDIAL_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Bound on one one-sided re-dial (disconnect plus dial).
 const ONE_SIDED_REDIAL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bound on the liveness probe that decides a both-directions-stale peer
+/// (#1419). The probe succeeds quickly on a quiet link; only a broken
+/// link spends this budget.
+const ONE_SIDED_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Send and receive ages for one connected peer (#1419).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,6 +363,21 @@ impl LinkTrafficAge {
         let recv_stale = direction_stale(self.received_ago);
         let recv_fresh = direction_flowing(self.received_ago);
         (send_stale && recv_fresh) || (recv_stale && send_fresh)
+    }
+
+    /// Both directions on this peer are stale.
+    ///
+    /// Ages alone cannot tell this quiet link from a broken one (#1419):
+    /// ant-quic records application data only, so a healthy idle pair and
+    /// a superseded link look the same. The liveness probe in
+    /// [`NetworkNode::resolve_one_sided_peers`] decides between them.
+    fn both_directions_stale(self) -> bool {
+        direction_stale(self.sent_ago) && direction_stale(self.received_ago)
+    }
+
+    /// At least one direction on this peer is fresh.
+    fn fresh_direction(self) -> bool {
+        direction_flowing(self.sent_ago) || direction_flowing(self.received_ago)
     }
 }
 
@@ -395,11 +417,38 @@ pub(crate) fn one_sided_peer_ids_from(samples: &[LinkAgeSample]) -> Vec<AntPeerI
         .collect()
 }
 
+/// Indexes of peers whose two directions are both stale while another
+/// sampled peer still has fresh traffic (#1419).
+///
+/// These peers are candidates for the liveness probe in
+/// [`NetworkNode::resolve_one_sided_peers`], not one-sided by their ages
+/// alone: a quiet link and a broken link share this shape. A node whose
+/// every peer is quiet selects nobody, so its quiet peers stay up.
+pub(crate) fn both_stale_candidate_indexes(samples: &[LinkAgeSample]) -> Vec<usize> {
+    samples
+        .iter()
+        .enumerate()
+        .filter(|(index, sample)| {
+            sample.age.both_directions_stale()
+                && samples.iter().enumerate().any(|(other, other_sample)| {
+                    other != *index && other_sample.age.fresh_direction()
+                })
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// One re-dial episode for a peer that is one-sided (#1419).
 #[derive(Debug, Default)]
 struct OneSidedRepair {
     last_attempt: Option<Instant>,
     warned: bool,
+    /// When the last both-directions-stale liveness probe ran, and whether
+    /// it failed. A failed probe keeps the peer in the degraded set inside
+    /// the window without probing again; a sample with traffic on either
+    /// direction clears the flag.
+    both_stale_probe_at: Option<Instant>,
+    both_stale_confirmed: bool,
     /// Scheduler attempt armed across the discovery-cache wait and both
     /// dials. A repair claim cancels it so that attempt cannot also dial.
     scheduler_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -411,7 +460,9 @@ struct OneSidedRepair {
 /// [`ONE_SIDED_REDIAL_BACKOFF`]. Recovery means the peer is still connected
 /// and is not one-sided, including a quiet peer whose two directions are
 /// both stale. Recovery clears the warning. The timestamp still blocks a
-/// dial inside the backoff.
+/// dial inside the backoff. A probe-confirmed peer keeps its confirmation
+/// while its sample stays both-directions stale; traffic on either
+/// direction clears it.
 fn plan_one_sided_repairs(
     map: &mut HashMap<AntPeerId, OneSidedRepair>,
     samples: &[LinkAgeSample],
@@ -423,6 +474,9 @@ fn plan_one_sided_repairs(
         }
         if let Some(entry) = map.get_mut(&sample.peer) {
             entry.warned = false;
+            if sample.age.fresh_direction() {
+                entry.both_stale_confirmed = false;
+            }
         }
     }
     map.retain(|peer, entry| {
@@ -432,9 +486,27 @@ fn plan_one_sided_repairs(
         let still_one_sided = samples
             .iter()
             .any(|sample| sample.peer == *peer && sample.age.one_sided());
-        in_backoff || still_one_sided
+        let still_confirmed = entry.both_stale_confirmed
+            && samples
+                .iter()
+                .any(|sample| sample.peer == *peer && sample.age.both_directions_stale());
+        in_backoff || still_one_sided || still_confirmed
     });
-    one_sided_peer_ids_from(samples)
+    let mut peers = one_sided_peer_ids_from(samples);
+    peers.extend(samples.iter().filter_map(|sample| {
+        if !sample.age.both_directions_stale() {
+            return None;
+        }
+        let entry = map.get(&sample.peer)?;
+        let confirmed = entry.both_stale_confirmed
+            && entry
+                .both_stale_probe_at
+                .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF);
+        confirmed.then_some(sample.peer)
+    }));
+    peers.sort_unstable();
+    peers.dedup();
+    peers
 }
 
 /// Minimum interval between successful app-level liveness checks for a peer.
@@ -3526,14 +3598,82 @@ impl NetworkNode {
         }
     }
 
+    /// The degraded peer set for the stored health view (#1419).
+    ///
+    /// Peers selected by the same-peer rule are degraded at once. A peer
+    /// whose two directions are both stale while other sampled peers still
+    /// have traffic is decided by a bounded liveness probe: a quiet link
+    /// answers and stays up, a broken link fails the probe, joins the
+    /// degraded set and is then re-dialled once by
+    /// [`Self::repair_one_sided_links`]. Each peer is probed at most once
+    /// per [`ONE_SIDED_REDIAL_BACKOFF`], so this waits no longer than
+    /// [`ONE_SIDED_PROBE_TIMEOUT`] and only while a candidate exists.
+    pub(crate) async fn resolve_one_sided_peers(
+        &self,
+        samples: &[LinkAgeSample],
+    ) -> Vec<AntPeerId> {
+        let now = Instant::now();
+        let mut degraded = one_sided_peer_ids_from(samples);
+        let mut to_probe = Vec::new();
+        {
+            let mut map = match self.one_sided_repairs.lock() {
+                Ok(map) => map,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for index in both_stale_candidate_indexes(samples) {
+                let peer = samples[index].peer;
+                let entry = map.entry(peer).or_default();
+                let probed_inside_window = entry
+                    .both_stale_probe_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF);
+                if probed_inside_window {
+                    if entry.both_stale_confirmed {
+                        degraded.push(peer);
+                    }
+                    continue;
+                }
+                to_probe.push(peer);
+            }
+        }
+        if !to_probe.is_empty() {
+            let probes = to_probe
+                .iter()
+                .map(|peer| self.probe_peer(*peer, ONE_SIDED_PROBE_TIMEOUT));
+            let results = futures::future::join_all(probes).await;
+            let mut map = match self.one_sided_repairs.lock() {
+                Ok(map) => map,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for (peer, result) in to_probe.iter().zip(results) {
+                // `None` means the node is gone: inconclusive, not fresh.
+                let Some(result) = result else { continue };
+                let entry = map.entry(*peer).or_default();
+                entry.both_stale_probe_at = Some(now);
+                entry.both_stale_confirmed = result.is_err();
+                if result.is_err() {
+                    degraded.push(*peer);
+                }
+            }
+        }
+        let degraded: std::collections::HashSet<AntPeerId> = degraded.into_iter().collect();
+        samples
+            .iter()
+            .map(|sample| sample.peer)
+            .filter(|peer| degraded.contains(peer))
+            .collect()
+    }
+
     /// Re-dial each one-sided peer at most once per [`ONE_SIDED_REDIAL_BACKOFF`].
     ///
     /// `samples` is the connected-peer observation, not only the one-sided
     /// subset. A sample that omits the peer keeps its backoff and its
     /// warning. A quiet connected peer is not one-sided, so that sample
-    /// clears the warning. This path disconnects, then dials. A suppressed
-    /// peer is not dialled. The proactive reconnect scheduler waits out the
-    /// same backoff ([`Self::one_sided_repair_backoff_remaining`]).
+    /// clears the warning. A peer whose failed liveness probe confirmed a
+    /// both-directions-stale link in
+    /// [`Self::resolve_one_sided_peers`] is re-dialled on the same bound.
+    /// This path disconnects, then dials. A suppressed peer is not dialled.
+    /// The proactive reconnect scheduler waits out the same backoff
+    /// ([`Self::one_sided_repair_backoff_remaining`]).
     ///
     /// The health refresher must not await this. [`Self::spawn_one_sided_repair`]
     /// runs it off that tick so peer counts stay current.
@@ -3547,6 +3687,15 @@ impl NetworkNode {
         };
         for peer in peers {
             let suppressed = self.is_reconnect_suppressed(peer.0);
+            let both_stale = match self.one_sided_repairs.lock() {
+                Ok(map) => map
+                    .get(&peer)
+                    .is_some_and(|entry| entry.both_stale_confirmed),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .get(&peer)
+                    .is_some_and(|entry| entry.both_stale_confirmed),
+            };
             if self.mark_one_sided_warned(&peer) {
                 #[cfg(test)]
                 self.one_sided_warnings.fetch_add(1, Ordering::Relaxed);
@@ -3554,7 +3703,12 @@ impl NetworkNode {
                     target: "x0x::connect",
                     peer_id_prefix = %hex_prefix(&peer.0, 4),
                     suppressed,
-                    "one-sided peer link: one direction is idle while the other direction still has traffic"
+                    "one-sided peer link: {}",
+                    if both_stale {
+                        "both directions are idle while other peers have traffic and the liveness probe failed"
+                    } else {
+                        "one direction is idle while the other direction still has traffic"
+                    }
                 );
             }
             if suppressed || !self.claim_one_sided_redial(&peer) {
@@ -10595,6 +10749,57 @@ mod tests {
         assert_eq!(one_sided_link_indexes(&[recv_stale]), vec![0]);
     }
 
+    /// #1419: a both-directions-stale peer is a probe candidate only while
+    /// another sampled peer has fresh traffic. The eph `r0481pre-e2e`
+    /// observation (610 s sent / 725 s received against sub-2 s peers) is
+    /// this shape; ages alone do not make it one-sided.
+    #[test]
+    fn both_stale_link_is_a_probe_candidate_only_while_other_peers_flow() {
+        let observed = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(610)),
+            received_ago: Some(Duration::from_secs(725)),
+        };
+        let fresh = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(1)),
+            received_ago: Some(Duration::from_secs(1)),
+        };
+        let one_sided = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(90)),
+            received_ago: Some(Duration::from_secs(1)),
+        };
+        let missing = LinkTrafficAge {
+            sent_ago: None,
+            received_ago: Some(Duration::from_secs(610)),
+        };
+        let sample = |byte: u8, age: LinkTrafficAge| LinkAgeSample {
+            peer: test_ant_peer(byte),
+            age,
+        };
+        let stale_peer = sample(1, observed);
+        let fresh_peer = sample(2, fresh);
+        assert_eq!(
+            both_stale_candidate_indexes(&[stale_peer, fresh_peer]),
+            vec![0],
+            "the observed both-stale shape next to a flowing peer is a probe candidate"
+        );
+        assert!(
+            both_stale_candidate_indexes(&[stale_peer]).is_empty(),
+            "a node whose every peer is quiet selects nobody"
+        );
+        assert!(
+            both_stale_candidate_indexes(&[stale_peer, sample(3, observed)]).is_empty(),
+            "two quiet peers without flowing traffic select nobody"
+        );
+        assert!(
+            both_stale_candidate_indexes(&[sample(1, one_sided), fresh_peer]).is_empty(),
+            "a fresh direction on the same peer is the immediate rule, not a probe candidate"
+        );
+        assert!(
+            both_stale_candidate_indexes(&[sample(1, missing), fresh_peer]).is_empty(),
+            "a missing timestamp is neither stale nor fresh"
+        );
+    }
+
     /// #1419: a quiet peer stays connected. One direction stale and the other
     /// fresh on that same peer is one-sided, and the repair dials once.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -10643,6 +10848,11 @@ mod tests {
         assert!(
             one_sided_peer_ids_from(&quiet).is_empty(),
             "B is quiet on both directions while C is fresh, so B stays up"
+        );
+        let resolved = a.resolve_one_sided_peers(&quiet).await;
+        assert!(
+            resolved.is_empty(),
+            "a quiet link answers the liveness probe, so B stays up"
         );
         a.repair_one_sided_links(&quiet).await;
         assert_eq!(
@@ -10817,6 +11027,129 @@ mod tests {
 
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
+    }
+
+    /// #1419: the original eph `r0481pre-e2e` shape — both directions of
+    /// one peer stale (610 s / 725 s against sub-2 s peers) after a
+    /// relay superseded the winner on this side only. The pure rule alone
+    /// cannot see it; the liveness probe fails on the moved winner, the
+    /// peer is degraded, and one bounded re-dial restores both directions.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_both_directions_stale_link_is_probed_degraded_and_repaired_once() {
+        let plane = "issue1419-both-stale";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let c = NetworkNode::new(config(3), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        let peer_c = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 3], 5483)))
+            .await
+            .unwrap();
+        assert_eq!(peer_b, b.peer_id());
+        assert_eq!(peer_c, c.peer_id());
+        let a_link = Arc::clone(a.sim_link.as_ref().expect("sim link"));
+        let b_link = Arc::clone(b.sim_link.as_ref().expect("sim link"));
+        let c_link = Arc::clone(c.sim_link.as_ref().expect("sim link"));
+        let peer_a = a.peer_id();
+        a_link.send(&peer_b, b"\x7fab").unwrap();
+        b_link.send(&peer_a, b"\x7fba").unwrap();
+        a_link.send(&peer_c, b"\x7fac").unwrap();
+        c_link.send(&peer_a, b"\x7fca").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (old, new) = fabric
+            .supersede_one_sided_for_test(&peer_a, &peer_b)
+            .expect("the A-B link exists");
+        assert_ne!(old, new);
+        assert!(
+            a_link.send(&peer_b, b"\x7fab-blocked").is_err(),
+            "A cannot send on the moved winner"
+        );
+
+        // Neither A nor B touches the A-B link again, so both directions go
+        // stale together while A-C keeps flowing.
+        tokio::time::sleep(ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        a_link.send(&peer_c, b"\x7fac2").unwrap();
+        c_link.send(&peer_a, b"\x7fca2").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let samples = a.connected_link_ages().await;
+        assert!(
+            one_sided_peer_ids_from(&samples).is_empty(),
+            "the pure rule cannot see a both-directions-stale link"
+        );
+        let degraded = a.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            degraded,
+            vec![peer_b],
+            "the failed liveness probe degrades the both-directions-stale link"
+        );
+
+        a.repair_one_sided_links(&samples).await;
+        assert_eq!(
+            a.one_sided_warnings.load(Ordering::Relaxed),
+            1,
+            "one WARN for the episode"
+        );
+        assert_eq!(
+            a.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "the repair dials once"
+        );
+        a.repair_one_sided_links(&samples).await;
+        assert_eq!(
+            a.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "a second pass inside the backoff does not dial"
+        );
+        assert_eq!(
+            fabric.one_sided_winner_for_test(&peer_a, &peer_b),
+            None,
+            "the re-dial installs one shared winner"
+        );
+        assert_eq!(
+            a.try_connection_generation(&peer_b).unwrap(),
+            b.try_connection_generation(&peer_a).unwrap(),
+            "both ends agree on that winner"
+        );
+
+        let since = fabric.now();
+        a_link
+            .send(&peer_b, b"\x7fhealed-ab")
+            .expect("A to B is admitted after the re-dial");
+        b_link
+            .send(&peer_a, b"\x7fhealed-ba")
+            .expect("B to A is admitted after the re-dial");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let a_to_b = fabric.delivered_from_since(&peer_a, since);
+        let b_to_a = fabric.delivered_from_since(&peer_b, since);
+        assert!(
+            a_to_b.iter().any(|(dst, _, _)| *dst == peer_b.0),
+            "A's bytes reach B after the re-dial (deliveries: {})",
+            a_to_b.len()
+        );
+        assert!(
+            b_to_a.iter().any(|(dst, _, _)| *dst == peer_a.0),
+            "B's bytes reach A after the re-dial (deliveries: {})",
+            b_to_a.len()
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+        c.try_shutdown().await.unwrap();
     }
 
     /// #1419: a sample that omits the peer is not recovery. A quiet

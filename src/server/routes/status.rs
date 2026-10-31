@@ -226,16 +226,19 @@ impl HealthSnapshot {
 
 /// Sample one-sided links, store the snapshot, then start a repair task.
 ///
-/// The store runs before the repair is spawned. A re-dial may wait 3 s per
-/// peer. This function does not wait, so the next refresher tick can store
-/// new peer and send-ready counts (#1419, #600).
+/// A both-directions-stale peer is decided by a bounded liveness probe
+/// here, so a quiet peer stays up and a broken link is degraded (#1419).
+/// The probe wait is bounded by the resolver and happens before the store;
+/// the store still runs before the repair is spawned. A re-dial may wait
+/// 3 s per peer. This function does not wait for it, so the next refresher
+/// tick can store new peer and send-ready counts (#1419, #600).
 pub(in crate::server) async fn publish_one_sided_health(
     network: &Arc<x0x::network::NetworkNode>,
     snapshot: &HealthSnapshot,
     peers: usize,
 ) {
     let samples = network.connected_link_ages().await;
-    let one_sided = x0x::network::one_sided_peer_ids_from(&samples);
+    let one_sided = network.resolve_one_sided_peers(&samples).await;
     let ids: Vec<[u8; 32]> = one_sided.iter().map(|peer| peer.0).collect();
     let send_ready = network.send_ready_peers().await.len();
     snapshot.store_one_sided(peers, send_ready, &ids);
@@ -292,7 +295,9 @@ fn one_sided_reason(count: usize) -> String {
         "peer links are"
     };
     format!(
-        "{count} connected {noun} one-sided (one direction idle > {}s while the other direction still has traffic)",
+        "{count} connected {noun} one-sided (one direction idle > {}s while the other direction still has traffic, \
+         or both directions idle > {}s while other peers have traffic and the liveness probe failed)",
+        crate::network::ONE_SIDED_STALE.as_secs(),
         crate::network::ONE_SIDED_STALE.as_secs()
     )
 }
@@ -1141,6 +1146,102 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_secs(4)).await;
         task.await.unwrap();
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+        c.try_shutdown().await.unwrap();
+    }
+
+    /// #1419, the deferred acceptance case: a link whose two directions
+    /// are both stale while other peers flow — the eph `r0481pre-e2e`
+    /// shape — is degraded by the publish path, then re-dialled once.
+    /// `publish_one_sided_health` resolves the liveness probe before the
+    /// store, so the stored count is visible while the re-dial is paused,
+    /// and the re-dial clears the moved winner.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_both_directions_stale_link_is_published_degraded_then_repaired() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let plane = "issue1419-both-stale-publish";
+        let fabric = x0x::network::sim::SimFabric::new(1419);
+        x0x::network::sim::register(plane, &fabric);
+        let config = |host: u8| x0x::network::NetworkConfig {
+            bind_addr: Some(std::net::SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        };
+        let a = Arc::new(
+            x0x::network::NetworkNode::new(config(1), None, None)
+                .await
+                .unwrap(),
+        );
+        let b = x0x::network::NetworkNode::new(config(2), None, None)
+            .await
+            .unwrap();
+        let c = x0x::network::NetworkNode::new(config(3), None, None)
+            .await
+            .unwrap();
+        let peer_b = a
+            .connect_addr(std::net::SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        let peer_c = a
+            .connect_addr(std::net::SocketAddr::from(([198, 18, 0, 3], 5483)))
+            .await
+            .unwrap();
+        assert_eq!(peer_c, c.peer_id());
+        let a_link = a.sim_link_for_test().expect("sim link");
+        let b_link = b.sim_link_for_test().expect("sim link");
+        let c_link = c.sim_link_for_test().expect("sim link");
+        let peer_a = a.peer_id();
+        a_link.send(&peer_b, b"\x7fab").unwrap();
+        b_link.send(&peer_a, b"\x7fba").unwrap();
+        a_link.send(&peer_c, b"\x7fac").unwrap();
+        c_link.send(&peer_a, b"\x7fca").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        fabric
+            .supersede_one_sided_for_test(&peer_a, &peer_b)
+            .expect("the A-B link exists");
+        // B sends nothing after the fault, so both A-B directions go stale
+        // together while A-C keeps flowing.
+        tokio::time::sleep(x0x::network::ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        a_link.send(&peer_c, b"\x7fac2").unwrap();
+        c_link.send(&peer_a, b"\x7fca2").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        a.pause_one_sided_redial_for_test(Duration::from_secs(3));
+
+        let snapshot = Arc::new(HealthSnapshot::default());
+        let published = Arc::clone(&snapshot);
+        let repair_node = Arc::clone(&a);
+        let task = tokio::spawn(async move {
+            super::publish_one_sided_health(&repair_node, &published, 2).await;
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            snapshot.load().2,
+            1,
+            "the both-directions-stale link is degraded before the re-dial wait finishes"
+        );
+        assert_eq!(
+            snapshot.one_sided_ids(),
+            vec![peer_b.0],
+            "the stored set is the same peer the count names"
+        );
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        task.await.unwrap();
+        assert_eq!(
+            fabric.one_sided_winner_for_test(&peer_a, &peer_b),
+            None,
+            "the one bounded re-dial installs a shared winner"
+        );
+        assert_eq!(
+            a.try_connection_generation(&peer_b).unwrap(),
+            b.try_connection_generation(&peer_a).unwrap(),
+            "both ends agree on that winner"
+        );
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
         c.try_shutdown().await.unwrap();
