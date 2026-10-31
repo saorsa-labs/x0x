@@ -1040,6 +1040,11 @@ pub(in crate::server) async fn handle_control_blob_message(
     match message {
         ControlBlobMessage::Reference { reference } => {
             if machine_refused || binding_refused {
+                // Review of 4d40b3bf, finding 2: the handler's drop is
+                // recorded here too, so the Reference gate is provable
+                // alone, exactly as the Fetch, Chunk and Release gates.
+                #[cfg(test)]
+                record_revoked_control_blob_drop(state, "reference", &reference, &sender_hex);
                 return;
             }
             if !incoming_reference_header_valid(&reference, &sender_hex, &local_hex, verified)

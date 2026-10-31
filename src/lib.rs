@@ -10374,6 +10374,20 @@ impl Agent {
     /// reply addressed to this daemon's own (agent, machine) pair is
     /// delivered through the same loopback path an ordinary self-addressed
     /// DM takes.
+    ///
+    /// #1664: send one machine-addressed DATA answer (a TreeKEM catch-up
+    /// page, a control-blob chunk) to `machine_id` — the
+    /// QUIC-authenticated machine the answered request came from. The
+    /// answer rides the SAME pinned exchange a join-result chunk uses
+    /// ([`Self::send_direct_pinned_admitted_machine_inner`]): the connect
+    /// ladder (repair, then the pinned redial of exactly the asking
+    /// machine), then one `send_direct_pinned` write, with this agent's
+    /// revocation sentences and the ADR-0043 B/P pairing re-checked at
+    /// the stream seam, AFTER the dial (Engineer ruling, 31 Oct 2026
+    /// 09:00 GMT). A lost exchange is the requester's own re-ask (the
+    /// backstop), never a gossip fallback: a fallback can reach the wrong
+    /// device. The entry re-reads below are the fast-fail half; the seam
+    /// re-reads them at the write.
     pub(crate) async fn send_machine_addressed_dm(
         &self,
         requester: &identity::AgentId,
@@ -10427,12 +10441,14 @@ impl Agent {
             );
             return Ok(receipt);
         }
-        let network = self.network.as_ref();
         // Review round 2, finding 1: re-read EVERY revocation sentence for
         // the exact (requester, machine) pair at the send — the caller's
         // ladder decision can predate the chunk read that followed it.
         // `recipient_pairing_denied` below covers the binding and placement
         // only; the agent, machine and resync sentences are read here.
+        // r4: this is now the fast-fail half only — the pinned exchange's
+        // seam re-reads the same sentences at the stream write, AFTER the
+        // dial, so a revocation landing during the connect still refuses.
         {
             let revocation_set = self.revocation_set.read().await;
             if revocation_set.is_agent_revoked(requester)
@@ -10467,41 +10483,29 @@ impl Agent {
                 "recipient pairing denied (ADR-0043 B/P): {denial:?}"
             )));
         }
-        // The addressing decision — recorded at the seam exactly as the
-        // refusal lane records its decision, before the transport handoff
-        // (an offline agent has no transport; the decision is the fact).
-        #[cfg(test)]
-        if let Ok(mut egress) = self.machine_reply_egress.lock() {
-            egress.push((machine_id, payload.to_vec()));
-        }
-        let Some(network) = network else {
-            self.direct_messaging.record_outgoing_failed(*requester);
-            tracing::debug!(
-                target: "x0x::direct",
-                stage = "machine_reply",
-                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
-                outcome = "machine_reply_no_transport",
-                "machine-addressed data reply decided but this node has no network transport"
-            );
-            return Err(dm::DmError::NoConnectivity(
-                "machine-addressed data reply has no network transport".to_string(),
-            ));
-        };
+        // #1664 r4 (Engineer ruling, 31 Oct 2026 09:00 GMT): the answer
+        // rides the SAME pinned exchange a join-result chunk uses — the
+        // connect ladder (repair, then the pinned redial of exactly the
+        // asking machine), then one `send_direct_pinned` write, with this
+        // agent's revocation sentences and the ADR-0043 B/P pairing
+        // re-checked at the stream seam, AFTER the dial. A lost exchange
+        // is the requester's own re-ask (the backstop), never a gossip
+        // fallback: a fallback can reach the wrong device.
         self.direct_messaging
             .record_outgoing_started(*requester, None);
-        let sender_agent_id = self.identity.agent_id();
-        let peer_id = ant_quic::PeerId(machine_id.0);
-        let send = network.send_direct(&peer_id, sender_agent_id.as_bytes(), payload);
-        match tokio::time::timeout(direct::MACHINE_ADDRESSED_REPLY_TIMEOUT, send).await {
-            Ok(Ok(())) => {
-                let receipt = dm_send::raw_quic_receipt_for_path(dm::DmPath::RawQuic);
+        let admission: dm::ArtifactAdmission = std::sync::Arc::new(|| {
+            Box::pin(async { Some(Box::new(|| true) as dm::SeamAdmission) })
+        });
+        let exchange = self
+            .send_direct_pinned_admitted_machine_inner(requester, machine_id, payload, &admission);
+        match tokio::time::timeout(direct::MACHINE_ADDRESSED_EXCHANGE_TIMEOUT, exchange).await {
+            Ok(Ok(receipt)) => {
                 self.direct_messaging
                     .record_outgoing_succeeded(*requester, receipt.path);
                 Ok(receipt)
             }
-            Ok(Err(e)) => {
+            Ok(Err(error)) => {
                 self.direct_messaging.record_outgoing_failed(*requester);
-                let error = Self::map_raw_quic_dm_error(e);
                 tracing::debug!(
                     target: "x0x::direct",
                     stage = "machine_reply",
@@ -10522,7 +10526,7 @@ impl Agent {
                     "timed out sending the machine-addressed data reply to the requesting machine"
                 );
                 Err(dm::DmError::NoConnectivity(
-                    "machine-addressed data reply timed out".to_string(),
+                    "machine-addressed data reply exchange timed out".to_string(),
                 ))
             }
         }
@@ -10576,6 +10580,37 @@ impl Agent {
         result
     }
 
+    /// #1664 r4: the connect ladder of a machine-pinned exchange — is the
+    /// asking machine connected, then the send-readiness repair, then the
+    /// pinned redial of exactly that machine (never the general connector,
+    /// whose reconciliation can land on a different machine of the agent).
+    /// Shared by the network path and the offline test stand-in, so the
+    /// rotated-connection case runs the same code either way. The caller's
+    /// exchange deadline bounds the whole future this runs inside.
+    async fn pinned_machine_connect_ladder(
+        &self,
+        transport: &RawQuicTransport<'_>,
+        to: &identity::AgentId,
+        machine_id: identity::MachineId,
+    ) -> bool {
+        let ant_peer_id = ant_quic::PeerId(machine_id.0);
+        let mut connected = transport.is_connected(&ant_peer_id).await;
+        if !connected {
+            const MACHINE_REPLY_REPAIR_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(3);
+            let _ = tokio::time::timeout(
+                MACHINE_REPLY_REPAIR_TIMEOUT,
+                transport.ensure_peer_send_ready(&ant_peer_id),
+            )
+            .await;
+            connected = transport.is_connected(&ant_peer_id).await;
+            if !connected && transport.pinned_redial(self, to, machine_id).await {
+                connected = true;
+            }
+        }
+        connected
+    }
+
     async fn send_direct_pinned_admitted_machine_inner(
         &self,
         to: &identity::AgentId,
@@ -10590,6 +10625,21 @@ impl Agent {
                     dm::PINNED_ADMISSION_REFUSED.to_string(),
                 ))
             };
+            // r4: the connect ladder runs here too, over the scripted
+            // transport, so a rotated connection (the repair misses, the
+            // pinned redial of exactly the asking machine reconnects) runs
+            // the SAME ladder code offline, not a second copy.
+            let transport =
+                RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+            let connected = self
+                .pinned_machine_connect_ladder(&transport, to, machine_id)
+                .await;
+            if !connected {
+                return Err(dm::DmError::NoConnectivity(
+                    "machine-pinned exchange found no live connection after repair; the fetcher's retry re-asks"
+                        .to_string(),
+                ));
+            }
             let Some(seam) = admission().await else {
                 return refused();
             };
@@ -10618,32 +10668,18 @@ impl Agent {
         // run the resolver's connect ladder first — repair, then the
         // pinned redial — bounded by the repair budget the resolver uses;
         // the CALLER's exchange deadline bounds this whole inner future.
-        let ant_peer_id = ant_quic::PeerId(machine_id.0);
-        {
-            let transport = RawQuicTransport::Network(network);
-            let mut connected = transport.is_connected(&ant_peer_id).await;
-            if !connected {
-                const MACHINE_REPLY_REPAIR_TIMEOUT: std::time::Duration =
-                    std::time::Duration::from_secs(3);
-                let _ = tokio::time::timeout(
-                    MACHINE_REPLY_REPAIR_TIMEOUT,
-                    transport.ensure_peer_send_ready(&ant_peer_id),
-                )
-                .await;
-                connected = transport.is_connected(&ant_peer_id).await;
-                if !connected && transport.pinned_redial(self, to, machine_id).await {
-                    connected = true;
-                }
-            }
-            if !connected {
-                tracing::debug!(
-                    target: "x0x::direct",
-                    stage = "machine_reply",
-                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
-                    outcome = "machine_reply_pinned_no_connection",
-                    "machine-pinned exchange found no live connection after repair; the fetcher's retry re-asks"
-                );
-            }
+        let transport = RawQuicTransport::Network(network);
+        let connected = self
+            .pinned_machine_connect_ladder(&transport, to, machine_id)
+            .await;
+        if !connected {
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "machine_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "machine_reply_pinned_no_connection",
+                "machine-pinned exchange found no live connection after repair; the fetcher's retry re-asks"
+            );
         }
         let Some(seam) = admission().await else {
             return Err(dm::DmError::NoConnectivity(

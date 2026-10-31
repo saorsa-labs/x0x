@@ -2,20 +2,23 @@
 //! MACHINE that asked — the DM's QUIC-authenticated sender — never to
 //! "whichever device currently resolves for the agent", which a revoked
 //! device that still holds the portable agent key can occupy (discovery
-//! cache, capability binding, newest connection). The catch-up page and
-//! the control-blob chunk now ride the machine-addressed raw-QUIC reply
-//! lane (the #1657 refusal lane's delivery shape for data), the JoinResult
-//! chunk exchange pins the same machine, and a machine- or
-//! binding-revoked control-blob fetcher gets NO answer — the blob is
-//! withheld and no frame is sent: bit 13 (`treekem_catchup_refusal_v1`)
-//! stays TreeKEM catch-up only, as on main since #1714, unreleased
-//! (Engineer ruling, 31 Oct 2026 03:40 GMT). The seat-cert lane rides the gossip topic,
+//! cache, capability binding, newest connection). Since round 4 the
+//! catch-up page and the control-blob chunk ride the SAME pinned
+//! exchange a join-result chunk uses (Engineer ruling, 31 Oct 2026
+//! 09:00 GMT): the connect ladder — repair, then the pinned redial of
+//! exactly the asking machine — then one `send_direct_pinned` write
+//! with the revocation and pairing sentences re-checked at the stream
+//! seam, after the dial. A machine- or binding-revoked control-blob
+//! fetcher gets NO answer — the blob is withheld and no frame is sent:
+//! bit 13 (`treekem_catchup_refusal_v1`) stays TreeKEM catch-up only,
+//! as on main since #1714, unreleased (Engineer ruling, 31 Oct 2026
+//! 03:40 GMT). The seat-cert lane rides the gossip topic,
 //! which carries no authenticated requester machine: its ladder is the
 //! envelope's agent only — a binding-based refusal there would be a
 //! revoked device's denial-of-service lever over the clean device of the
 //! same agent (review round 1). Every addressing decision is recorded at
-//! the send seam (`machine_reply_egress`), so a test cannot pass on an
-//! answer that never left or went to the wrong device.
+//! the admitted write (`machine_reply_egress`), so a test cannot pass on
+//! an answer that never left or went to the wrong device.
 
 use super::*;
 use x0x::identity::AgentKeypair;
@@ -325,6 +328,120 @@ async fn a_catchup_page_goes_to_the_requesting_machine_and_a_revoked_asker_gets_
     Ok(())
 }
 
+/// #1664 r4 (Engineer ruling, 31 Oct 2026 09:00 GMT): the page rides the
+/// pinned exchange, so a rotated connection is no lost answer. The asking
+/// machine's connection is GONE when the serve runs (the transport script
+/// lists no connected machine) and the repair is slower than its 3 s
+/// budget; the pinned redial of exactly that machine reconnects it — and
+/// the page egresses to the asking machine. A machine-revoked asker under
+/// the same script gets nothing: the revocation gates refuse before the
+/// ladder runs (and the seam would refuse again at the write), so the
+/// redial is never a revoked device's delivery.
+#[tokio::test]
+async fn a_page_reaches_the_asking_machine_after_its_connection_rotated() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "6b".repeat(32);
+    let member = AgentKeypair::generate()?;
+    seat_members(&state, &group_id, &[&member]).await;
+    let asker = x0x::identity::MachineKeypair::generate()?.machine_id();
+
+    // The rotated-connection script: nothing is connected, the repair
+    // outlives its budget, and only the pinned redial (repair_connects)
+    // reconnects the asking machine.
+    state.agent.script_pinned_standin_transport_for_testing(
+        x0x::PinnedTransportScript::connected_only(&[], true)
+            .with_repair_delay(Duration::from_secs(4)),
+    );
+
+    handle_treekem_catchup_request(
+        &state,
+        &member.agent_id(),
+        &asker,
+        true,
+        catchup_request(&group_id, &member.agent_id()),
+    )
+    .await;
+    assert_eq!(
+        recorded_pages(&state),
+        1,
+        "the page decision is served although the asker's connection had rotated away"
+    );
+    let egress = machine_reply_egress(&state);
+    assert_eq!(egress.len(), 1, "exactly one machine-addressed reply left");
+    assert_eq!(
+        egress[0].0, asker,
+        "the page still reaches the asking machine after the pinned redial reconnected it"
+    );
+    let page: TreeKemCatchupResponse =
+        serde_json::from_slice(&egress[0].1).expect("the egress payload is a catch-up page");
+    assert_eq!(page.group_id, group_id);
+
+    // A machine-revoked asker under the same script: the typed refusal
+    // answers it, no page egress exists for it, and the ladder it would
+    // have ridden never becomes its delivery.
+    let revoked_member = AgentKeypair::generate()?;
+    seat_members(&state, &group_id, &[&revoked_member]).await;
+    let device = x0x::identity::MachineKeypair::generate()?;
+    revoke_machine(&state, &device).await;
+    advertise_refusal_bit(&state, &revoked_member.agent_id(), &device.machine_id());
+    handle_treekem_catchup_request(
+        &state,
+        &revoked_member.agent_id(),
+        &device.machine_id(),
+        true,
+        catchup_request(&group_id, &revoked_member.agent_id()),
+    )
+    .await;
+    assert_eq!(
+        recorded_pages(&state),
+        1,
+        "a machine-revoked asker gets no further page, rotated connection or not"
+    );
+    assert!(
+        !machine_reply_egress(&state)
+            .iter()
+            .any(|(machine, _)| *machine == device.machine_id()),
+        "no data reply is addressed to the revoked machine"
+    );
+    assert_eq!(
+        recorded_refusals(&state).len(),
+        1,
+        "the revoked asker gets the typed refusal"
+    );
+
+    // The other half of the ruling: when the rotated connection CANNOT be
+    // re-established (the repair and the pinned redial both fail), no
+    // bytes leave — the requester's re-ask is the backstop, never a
+    // gossip fallback. This also pins the ladder itself: a stand-in (or
+    // path) that skipped the connect requirement would egress here.
+    state.agent.script_pinned_standin_transport_for_testing(
+        x0x::PinnedTransportScript::connected_only(&[], false),
+    );
+    let stranded_member = AgentKeypair::generate()?;
+    seat_members(&state, &group_id, &[&stranded_member]).await;
+    let stranded_asker = x0x::identity::MachineKeypair::generate()?.machine_id();
+    handle_treekem_catchup_request(
+        &state,
+        &stranded_member.agent_id(),
+        &stranded_asker,
+        true,
+        catchup_request(&group_id, &stranded_member.agent_id()),
+    )
+    .await;
+    assert_eq!(
+        recorded_pages(&state),
+        2,
+        "the page decision is served for the stranded asker too"
+    );
+    assert!(
+        !machine_reply_egress(&state)
+            .iter()
+            .any(|(machine, _)| *machine == stranded_asker),
+        "an unconnectable machine gets no bytes: its own re-ask is the backstop"
+    );
+    Ok(())
+}
+
 /// Review round 2, finding 1: a revocation that lands BETWEEN the
 /// handler's ladder decision and the send still closes the send. The
 /// serve's test seam parks the page send after the decision; the machine
@@ -549,6 +666,26 @@ async fn control_blob_answers_go_to_the_requesting_machine_and_revoked_fetchers_
             .is_some(),
         "the dropped release left the revoked device's staged blob in place"
     );
+
+    // Review of 4d40b3bf, finding 2: the Reference arm keeps the same
+    // recorded drop as the other arms, so its gate is provable alone.
+    control_blob::handle_control_blob_message(
+        &state,
+        &fetcher.agent_id(),
+        &device.machine_id(),
+        true,
+        control_blob::ControlBlobMessage::Reference {
+            reference: chunk_reference.clone(),
+        },
+    )
+    .await;
+    let drops = recorded_control_blob_drops(&state);
+    assert_eq!(
+        drops.len(),
+        5,
+        "the reference from the revoked device is dropped and recorded"
+    );
+    assert_eq!(drops[4].0, "reference");
 
     // The agent-revoked gate keeps main's silent drop: no chunk.
     let third = AgentKeypair::generate()?;
@@ -842,6 +979,46 @@ async fn a_join_result_chunk_exchange_targets_the_requesting_machine() -> Result
         machine_reply_egress(&state).len(),
         1,
         "a withheld admission is no egress"
+    );
+
+    // Review of 4d40b3bf, finding 1: a pending revocation resync refuses
+    // the exchange AT THE SEAM — the same quarantine every other lane
+    // obeys. Deleting the seam's resync sentence alone fails this case.
+    state.agent.revocation_set().write().await.merge_v2(
+        x0x::revocation::RevocationSet::quarantined_carrier(x0x::revocation::REVOCATION_CARRIER_V1),
+    );
+    assert!(
+        state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .revocation_resync_required(),
+        "the quarantined carrier keeps admission closed"
+    );
+    let admitted: x0x::dm::ArtifactAdmission = std::sync::Arc::new(|| {
+        Box::pin(async { Some(Box::new(|| true) as x0x::dm::SeamAdmission) })
+    });
+    let outcome = send_join_artifact_to_machine(
+        &state,
+        &joiner.agent_id(),
+        machine,
+        &payload,
+        &group_id,
+        "join_result_chunk",
+        admitted,
+        deadline,
+    )
+    .await;
+    let reason = outcome.expect_err("the quarantined revocation set refuses the exchange");
+    assert!(
+        reason.contains(x0x::dm::PINNED_ADMISSION_REFUSED),
+        "the refusal is the seam's withhold, not the stand-in's admitted marker: {reason}"
+    );
+    assert_eq!(
+        machine_reply_egress(&state).len(),
+        1,
+        "a quarantined revocation set egresses nothing"
     );
     Ok(())
 }
