@@ -74,7 +74,7 @@ impl Owned {
             }
         };
         drop(channel);
-        let setup = (|| {
+        let setup = (|| -> io::Result<Identity> {
             let child_identity = identity(child.id())?;
             trial.child = Some(child_identity.clone());
             trial.save(path)?;
@@ -114,9 +114,17 @@ impl Owned {
                 channel: Some(parent),
                 booted: false,
             })),
+            // A candidate that dies before it takes its permit (EPIPE) or
+            // that this OS cannot hold in custody is a failed attempt: the
+            // caller charges it and retries. Only a failed reap is final.
             Err(error) => {
-                stop_and_reap(&mut child)?;
-                Err(error)
+                if let Err(reap) = stop_and_reap(&mut child) {
+                    let error = invalid(format!("{error}; reap also failed: {reap}"));
+                    return Err(trial.recovery_failed(path, error));
+                }
+                trial.child = None;
+                trial.cause = Some(format!("boot setup failed: {error}"));
+                Ok(None)
             }
         }
     }

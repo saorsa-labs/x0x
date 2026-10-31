@@ -39,10 +39,15 @@ impl Host {
             }
         }
         // `data_root` decides where the flush token is sent and where the
-        // candidate boot record lands, so it must be canonical as well.
+        // candidate boot record lands. The boot check compares the child's
+        // resolved executable and cwd with these paths, so all must be
+        // canonical, and every participant must run the hashed daemon.
         for participant in &expected.plan.participants {
-            if participant.data_root.canonicalize()? != participant.data_root {
-                return Err(invalid("non-canonical participant data root"));
+            if participant.data_root.canonicalize()? != participant.data_root
+                || participant.cwd.canonicalize()? != participant.cwd
+                || participant.executable != expected.plan.daemon.target_path
+            {
+                return Err(invalid("non-canonical participant paths"));
             }
         }
         Ok(Self { root, expected })
@@ -196,118 +201,180 @@ impl Host {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
-    use super::testkit::fixture;
+    use super::super::testkit::fixture;
     use super::*;
+
+    fn trial(host: &Host) -> Trial {
+        Trial::new(
+            host.binding().unwrap(),
+            "alice".into(),
+            &Clock::now().unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn cause(class: journal::CauseClass) -> journal::Cause {
+        journal::Cause {
+            class,
+            reason: "fixture cause".into(),
+        }
+    }
+
+    fn journal_record(root: &Path) -> journal::JournalRecord {
+        match journal::read_boot_records(root).journal {
+            journal::RecordRead::Journal(record) => *record,
+            _ => panic!("journal record missing"),
+        }
+    }
+
+    #[test]
+    fn new_refuses_non_canonical_install_and_participant_paths() {
+        let (_dir, root, _host, record) = fixture(journal::Phase::SwappedCli);
+        // `Path` equality ignores `.` components, so alias through a symlink.
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let aliased = |path: &Path| link.join(path.file_name().unwrap());
+        let edits: [&dyn Fn(&mut journal::JournalRecord); 5] = [
+            &|r| r.plan.daemon.target_path = aliased(&r.plan.daemon.target_path),
+            &|r| r.plan.cli.backup_path = aliased(&r.plan.cli.backup_path),
+            &|r| r.plan.participants[0].data_root = link.clone(),
+            &|r| r.plan.participants[0].cwd = link.clone(),
+            &|r| r.plan.participants[0].executable = r.plan.cli.target_path.clone(),
+        ];
+        for edit in edits {
+            let mut changed = record.clone();
+            edit(&mut changed);
+            let error = Host::new(root.clone(), changed).err().unwrap().to_string();
+            assert!(error.contains("non-canonical"), "{error}");
+        }
+    }
 
     #[test]
     fn locked_refuses_a_journal_that_differs_from_the_independent_plan() {
-        let (dir, root, _host, mut other) = fixture(journal::Phase::SwappedCli);
+        let (_dir, root, _host, mut other) = fixture(journal::Phase::SwappedCli);
         other.transaction_id = "another-transaction".into();
-        let host = Host::new(root.clone(), other).unwrap();
+        let host = Host::new(root, other).unwrap();
         let error = host.locked(|_| Ok(())).unwrap_err().to_string();
         assert!(error.contains("differs"), "{error}");
-        drop(dir);
     }
 
     #[test]
     fn authorize_refuses_without_host_agreement_and_reap_receipts() {
-        let (dir, root, host, _record) = fixture(journal::Phase::Staged);
-        let path = root.join("trial.json");
-        let mut trial = Trial::new(
-            host.binding().unwrap(),
-            "alice".into(),
-            &Clock::now().unwrap(),
-        )
-        .unwrap();
-        trial.save(&path).unwrap();
-        let error = super::super::control::authorize(&host, &mut trial, &path, &[])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("not ready"), "{error}");
-        assert_eq!(trial.attempts, 0);
-        drop(dir);
-
-        let (dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
-        let path = root.join("trial.json");
-        let mut trial = Trial::new(
-            host.binding().unwrap(),
-            "alice".into(),
-            &Clock::now().unwrap(),
-        )
-        .unwrap();
-        trial.save(&path).unwrap();
-        let error = super::super::control::authorize(&host, &mut trial, &path, &[])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("reap receipts"), "{error}");
-        assert_eq!(trial.attempts, 0);
-        drop(dir);
+        for (phase, refusal) in [
+            (journal::Phase::Staged, "not ready"),
+            (journal::Phase::SwappedCli, "reap receipts"),
+        ] {
+            let (_dir, root, host, _record) = fixture(phase);
+            let path = root.join("trial.json");
+            let mut trial = trial(&host);
+            trial.save(&path).unwrap();
+            let error = super::super::control::authorize(&host, &mut trial, &path, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(refusal), "{error}");
+            assert_eq!(trial.phase, Phase::Armed);
+        }
     }
 
     #[test]
     fn restore_refuses_in_a_terminal_phase_and_keeps_the_journal() {
-        let (dir, root, host, _record) = fixture(journal::Phase::RecoveryFailed);
-        let trial = Trial::new(
-            host.binding().unwrap(),
-            "alice".into(),
-            &Clock::now().unwrap(),
-        )
-        .unwrap();
-        let cause = journal::Cause {
-            class: journal::CauseClass::Failed,
-            reason: "fixture cause".into(),
-        };
-        let error = host
-            .restore(&[(root.join("trial.json"), trial)], cause)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("forbidden"), "{error}");
-        let journal::RecordRead::Journal(record) = journal::read_boot_records(&root).journal else {
-            panic!("journal record missing");
-        };
-        assert_eq!(record.phase, journal::Phase::RecoveryFailed);
-        drop(dir);
+        for phase in [
+            journal::Phase::RecoveryFailed,
+            journal::Phase::HostCommitted,
+        ] {
+            let (_dir, root, host, _record) = fixture(phase);
+            let trials = [(root.join("trial.json"), trial(&host))];
+            let error = host
+                .restore(&trials, cause(journal::CauseClass::Failed))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("forbidden"), "{error}");
+            assert_eq!(journal_record(&root).phase, phase);
+            assert_eq!(
+                filesystem::hash(&host.plan().daemon.target_path).unwrap(),
+                host.plan().daemon.candidate_sha256
+            );
+        }
     }
-}
 
-#[cfg(test)]
-mod extra_tests {
-    use super::testkit::fixture;
-    use super::*;
-
-    /// A damaged rollback copy must never replace the candidate: restore
-    /// refuses before any byte moves and the journal keeps its phase.
+    /// A damaged rollback copy or unrelated target bytes never replace the
+    /// installed file: restore refuses before any byte moves and the journal
+    /// marks RecoveryFailed.
     #[test]
-    fn restore_refuses_a_changed_rollback_copy() {
-        let (dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
-        std::fs::write(host.plan().daemon.backup_path.clone(), b"damaged").unwrap();
-        let trial = Trial::new(
-            host.binding().unwrap(),
-            "alice".into(),
-            &Clock::now().unwrap(),
-        )
-        .unwrap();
-        let cause = journal::Cause {
-            class: journal::CauseClass::Failed,
-            reason: "fixture cause".into(),
-        };
-        let error = host
-            .restore(&[(root.join("trial.json"), trial)], cause)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("rollback copy changed"), "{error}");
-        // Fail-closed: the journal marks RecoveryFailed and the installed
-        // candidate bytes are untouched.
-        let journal::RecordRead::Journal(record) = journal::read_boot_records(&root).journal else {
-            panic!("journal record missing");
-        };
-        assert_eq!(record.phase, journal::Phase::RecoveryFailed);
-        assert_eq!(
-            filesystem::hash(&host.plan().daemon.target_path).unwrap(),
-            host.plan().daemon.candidate_sha256
-        );
-        drop(dir);
+    fn restore_refuses_a_changed_rollback_copy_or_unrelated_bytes() {
+        for (damaged, refusal) in [(true, "rollback copy changed"), (false, "unrelated bytes")] {
+            let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+            let daemon = &host.plan().daemon;
+            let file = if damaged {
+                &daemon.backup_path
+            } else {
+                &daemon.target_path
+            };
+            std::fs::write(file, b"unrelated").unwrap();
+            let before = filesystem::hash(&daemon.target_path).unwrap();
+            let trials = [(root.join("trial.json"), trial(&host))];
+            let error = host
+                .restore(&trials, cause(journal::CauseClass::Failed))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(refusal), "{error}");
+            assert_eq!(journal_record(&root).phase, journal::Phase::RecoveryFailed);
+            assert_eq!(filesystem::hash(&daemon.target_path).unwrap(), before);
+        }
+    }
+
+    /// Restore moves both files back and keeps its cause through Restored.
+    #[test]
+    fn restore_returns_the_previous_pair_and_keeps_the_cause() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let trials = [(root.join("trial.json"), trial(&host))];
+        host.restore(&trials, cause(journal::CauseClass::Interrupted))
+            .unwrap();
+        let record = journal_record(&root);
+        assert_eq!(record.phase, journal::Phase::Restored);
+        let kept = record.cause.unwrap();
+        assert_eq!(kept.class, journal::CauseClass::Interrupted);
+        assert_eq!(kept.reason, "fixture cause");
+        for a in [&host.plan().daemon, &host.plan().cli] {
+            assert_eq!(filesystem::hash(&a.target_path).unwrap(), a.previous_sha256);
+        }
+        assert!(record.daemon_progress.restored && record.cli_progress.restored);
+    }
+
+    /// Restore never runs while an OLD or candidate process still exists.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_refuses_while_an_old_or_candidate_process_lives() {
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let identity = child::identity(live.id()).unwrap();
+        for old_is_live in [true, false] {
+            let (_dir, root, _host, mut record) = fixture(journal::Phase::SwappedCli);
+            if old_is_live {
+                let p = &mut record.plan.participants[0];
+                p.old_pid = Some(identity.pid);
+                p.process_start = Some(identity.start);
+                p.boot_id = identity.boot.clone();
+            }
+            journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+            let host = Host::new(root.clone(), record).unwrap();
+            let mut candidate = trial(&host);
+            candidate.child = (!old_is_live).then(|| identity.clone());
+            let error = host
+                .restore(
+                    &[(root.join("trial.json"), candidate)],
+                    cause(journal::CauseClass::Failed),
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("still exists"), "{error}");
+            assert_eq!(journal_record(&root).phase, journal::Phase::SwappedCli);
+        }
+        live.kill().unwrap();
+        live.wait().unwrap();
     }
 }

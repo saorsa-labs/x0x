@@ -185,7 +185,8 @@ fn prepare(root: &Path, case: &str) -> (recovery::Host, Trial) {
     assert!(control::authorize(&host, &mut trial, &path, &[]).is_err());
     assert_eq!(trial.attempts, 0);
     let reaped =
-        control::flush_and_reap(&host, &trial, &path, &mut old, "inert launcher fixture").unwrap();
+        control::flush_and_reap(&host, &mut trial, &path, &mut old, "inert launcher fixture")
+            .unwrap();
     control::authorize(&host, &mut trial, &path, &[reaped]).unwrap();
     (host, trial)
 }
