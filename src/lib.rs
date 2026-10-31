@@ -778,14 +778,10 @@ pub struct Agent {
     /// Presence system wrapper for beacons, FOAF discovery, and events.
     presence: Option<std::sync::Arc<presence::PresenceWrapper>>,
     /// Whether the user has consented to disclosing their identity in
-    /// announcements.  Set by `announce_identity(true, true)` and respected
-    /// by the heartbeat so it doesn't erase a consented disclosure.
+    /// announcements.  Set by a successful `announce_identity(true, true)`
+    /// and respected by the heartbeat so it doesn't erase a consented
+    /// disclosure.
     user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Serializes [`Agent::announce_identity`]: the consent flip and its
-    /// restore on failure run as one step per call, so a failed publish
-    /// cannot clear a consent a concurrent successful disclosure recorded
-    /// (#1643).
-    announce_identity_lock: tokio::sync::Mutex<()>,
     /// Capability store populated by the advert service and consulted by
     /// `send_direct` to choose between gossip and raw-QUIC paths.
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
@@ -7659,32 +7655,6 @@ async fn run_strict_capability_refresh(
     }
 }
 
-/// Restores `user_identity_consented` to its pre-grant value when a
-/// disclosure fails or is dropped, unless [`ConsentGrant::keep`] disarmed
-/// it (#1643): the `POST /announce` handler's future can be dropped
-/// mid-publish (a client disconnect aborts it), and consent must not stay
-/// on when nothing was published.
-struct ConsentGrant {
-    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    prior: bool,
-}
-
-impl ConsentGrant {
-    fn new(flag: std::sync::Arc<std::sync::atomic::AtomicBool>, prior: bool) -> Self {
-        Self { flag, prior }
-    }
-
-    /// The publish finished: consent stands.
-    fn keep(self) {}
-}
-
-impl Drop for ConsentGrant {
-    fn drop(&mut self) {
-        self.flag
-            .store(self.prior, std::sync::atomic::Ordering::Release);
-    }
-}
-
 /// Whether a cached binding can satisfy a strict send.
 ///
 /// Requires both a v2 capability *and* a real machine binding: the ACK waiter
@@ -13452,9 +13422,13 @@ impl Agent {
     ///
     /// By default, announcements include agent + machine identity only.
     /// Human identity disclosure is opt-in and requires explicit consent.
-    /// Consent is recorded before the announcement is built and restored
-    /// when the publish fails or is cancelled, so every announcement raced
-    /// by this call carries the disclosure (#1643).
+    /// Consent is recorded only after the disclosure publishes
+    /// successfully, so a failed or cancelled call never leaves it on, and
+    /// a successful disclosure keeps it recorded for the announcements
+    /// that follow (the 3 s delayed beat, the 600 s heartbeat, the ADR
+    /// 0110 §4a renewal re-announce), which then carry the identity
+    /// instead of publishing a strictly-fresher anonymous digest that
+    /// would drop it on every peer (#1643).
     ///
     /// # Arguments
     ///
@@ -13473,51 +13447,28 @@ impl Agent {
         include_user_identity: bool,
         human_consent: bool,
     ) -> error::Result<()> {
-        // Serialize concurrent disclosures (a double-submitted
-        // `POST /announce`): the restore below must not clear a consent a
-        // concurrent successful call recorded between this call's load and
-        // its failure (#1643).
-        let _serialize = self.announce_identity_lock.lock().await;
-        // #1643: record consent BEFORE the disclosure is built and
-        // published. `announced_at` has one-second precision, so an
-        // announcement this call races (the 3 s delayed beat, a heartbeat
-        // tick, the owner-connect re-announce) that reads consent as false
-        // is anonymous in the SAME second as the disclosure, and on a peer
-        // it can delete the just-disclosed certificate (see
-        // `upsert_discovered_agent`). Storing first means every
-        // announcement built after this line carries the certificate. The
-        // grant restores the prior value when the publish fails AND when
-        // the caller drops the disclosure mid-publish (a client disconnect
-        // aborts the `POST /announce` handler), so heartbeats do not keep
-        // including the identity. (One beat published during the in-flight
-        // attempt may still carry it — the human did consent, and the next
-        // anonymous beat in a later second withdraws it again.)
-        let consented_before = self
-            .user_identity_consented
-            .load(std::sync::atomic::Ordering::Acquire);
-        let grant = if include_user_identity && human_consent {
-            self.user_identity_consented
-                .store(true, std::sync::atomic::Ordering::Release);
-            Some(ConsentGrant::new(
-                std::sync::Arc::clone(&self.user_identity_consented),
-                consented_before,
-            ))
-        } else {
-            None
-        };
         let result = self
             .publish_identity_announcement(include_user_identity, human_consent)
             .await;
-        if result.is_ok() {
-            if let Some(grant) = grant {
-                grant.keep();
-            }
+        // #1643: record consent only after the disclosure actually
+        // published (as on main). A publish that fails, or whose future is
+        // dropped mid-await (a client disconnect aborts the
+        // `POST /announce` handler), never reaches this line, so consent
+        // cannot turn on without a published disclosure and heartbeats
+        // never escalate to identity beats on their own. There is nothing
+        // to restore on failure, so concurrent disclosures need no lock:
+        // the only write is this monotone `true`, and a failed call never
+        // touches the flag.
+        if result.is_ok() && include_user_identity && human_consent {
+            self.user_identity_consented
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         result
     }
 
     /// Build and publish the identity announcement on behalf of
-    /// [`Agent::announce_identity`], which owns the consent flip.
+    /// [`Agent::announce_identity`], which records consent after a
+    /// successful publish.
     async fn publish_identity_announcement(
         &self,
         include_user_identity: bool,
@@ -23742,7 +23693,6 @@ impl AgentBuilder {
             observed_prefix_enabled,
             presence,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            announce_identity_lock: tokio::sync::Mutex::new(()),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             #[cfg(test)]
@@ -35182,10 +35132,10 @@ mod tests {
         assert_eq!(entry.user_id, agent.user_id());
     }
 
-    /// #1643: consent is recorded BEFORE the disclosure is built, so no
-    /// announcement built during the call reads consent as false. The flip
-    /// must not survive a failed publish — heartbeats would otherwise keep
-    /// including a user identity that never propagated.
+    /// #1643: consent is recorded only after the disclosure publishes
+    /// successfully, so a failed publish never turns it on — heartbeats
+    /// would otherwise keep including a user identity that never
+    /// propagated.
     #[tokio::test]
     async fn failed_disclosure_does_not_leave_consent_recorded() {
         // No network config: the gossip runtime is absent, so the publish
@@ -35212,78 +35162,7 @@ mod tests {
         );
     }
 
-    /// #1643: concurrent disclosures serialize on the announce lock, so a
-    /// failed publish cannot clear (or wait behind) a consent another call
-    /// is recording. While the lock is held the second call must not even
-    /// read the flag.
-    #[tokio::test]
-    async fn concurrent_disclosures_serialize_on_the_announce_lock() {
-        let dir = tempfile::tempdir().expect("tmpdir");
-        let agent = std::sync::Arc::new(
-            Agent::builder()
-                .with_machine_key(dir.path().join("machine.key"))
-                .with_agent_key_path(dir.path().join("agent.key"))
-                .build()
-                .await
-                .unwrap(),
-        );
-        let held = agent.announce_identity_lock.lock().await;
-
-        let clone = std::sync::Arc::clone(&agent);
-        let mut second = tokio::spawn(async move { clone.announce_identity(true, true).await });
-        // The spawned disclosure waits for the lock: it must not settle
-        // while it is held.
-        tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
-            .await
-            .expect_err("a disclosure must wait for the announce lock");
-        drop(held);
-        let err = tokio::time::timeout(std::time::Duration::from_secs(10), second)
-            .await
-            .expect("the disclosure settles once the lock frees")
-            .expect("join")
-            .expect_err("no gossip runtime: the publish must fail");
-        assert!(
-            err.to_string().contains("gossip runtime not initialized"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            !agent
-                .user_identity_consented
-                .load(std::sync::atomic::Ordering::Acquire),
-            "the serialized failed disclosure restored the prior consent value"
-        );
-    }
-
-    /// #1643 review r2: the consent grant restores the prior value when a
-    /// disclosure is dropped without finishing — a client disconnect aborts
-    /// the `POST /announce` handler mid-publish — and stands when kept.
-    #[test]
-    fn consent_grant_restores_on_drop_and_keeps_on_success() {
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            // What announce_identity does: store, then arm the grant.
-            flag.store(true, std::sync::atomic::Ordering::Release);
-            let _grant = ConsentGrant::new(std::sync::Arc::clone(&flag), false);
-            assert!(
-                flag.load(std::sync::atomic::Ordering::Acquire),
-                "consent is on while the grant is armed"
-            );
-        }
-        assert!(
-            !flag.load(std::sync::atomic::Ordering::Acquire),
-            "a dropped grant restores the prior value"
-        );
-        flag.store(true, std::sync::atomic::Ordering::Release);
-        {
-            ConsentGrant::new(std::sync::Arc::clone(&flag), true).keep();
-        }
-        assert!(
-            flag.load(std::sync::atomic::Ordering::Acquire),
-            "a kept grant leaves consent on"
-        );
-    }
-
-    /// #1643 review r2: cancelling the disclosure task (the disconnect
+    /// #1643 review r3: cancelling the disclosure task (the disconnect
     /// case) must leave consent off, whatever point it reached.
     #[tokio::test]
     async fn cancelled_disclosure_does_not_leave_consent_recorded() {
@@ -35309,6 +35188,122 @@ mod tests {
                 .user_identity_consented
                 .load(std::sync::atomic::Ordering::Acquire),
             "a cancelled disclosure must not leave consent on"
+        );
+    }
+
+    /// Waits for the unix second to tick over and returns the new second,
+    /// so an announcement published afterwards is strictly fresher than
+    /// everything published before the call.
+    async fn next_second_boundary() -> u64 {
+        let start = Agent::unix_timestamp_secs();
+        while Agent::unix_timestamp_secs() == start {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Agent::unix_timestamp_secs()
+    }
+
+    /// Reads the next X0A3 identity announce frame a local publish put on
+    /// the identity announce topic. The v3 `payload_version` is
+    /// `announced_at` for an identity announce and `0` for an anonymous
+    /// one, so it distinguishes the two without a peer.
+    async fn next_v3_announcement(
+        wire: &mut gossip::pubsub::Subscription,
+    ) -> announce_v3::IdentityAnnouncementV3 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, wire.recv())
+                .await
+                .expect("an identity announcement was published")
+                .expect("the wire subscription stays open");
+            if !announce_v3::is_v3_payload(&msg.payload) {
+                continue;
+            }
+            return announce_v3::deserialize_v3(&msg.payload)
+                .expect("the identity announce wire frame decodes");
+        }
+    }
+
+    /// #1643 review r3: a successful consented disclosure records consent,
+    /// so every beat that follows it — the 3 s delayed beat and the 600 s
+    /// heartbeat, both `HeartbeatContext::announce` — is an identity beat
+    /// (v3 `payload_version` = `announced_at`, not the anonymous `0`) and
+    /// not a strictly-fresher anonymous digest that would drop the
+    /// certificate on every peer, and the ADR 0110 §4a renewal re-announce
+    /// (`reannounce_identity_if_consented`) fires. Red at 4c97e71b, where
+    /// the `ConsentGrant` keep bug left consent off after every
+    /// successful disclosure.
+    #[tokio::test]
+    async fn consented_disclosure_is_followed_by_identity_beats_and_renewal_reannounce() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_user_key(identity::UserKeypair::generate().unwrap())
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_dir(dir.path().join("peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("networked agent with a user identity");
+        // The real announce path, observed on the wire: the disclosure and
+        // the beats each publish an X0A3 frame on the identity announce
+        // topic, and a local subscriber receives every publish.
+        let runtime = agent
+            .gossip_runtime
+            .as_ref()
+            .expect("a networked agent has a gossip runtime");
+        let mut wire = runtime
+            .pubsub()
+            .subscribe(IDENTITY_ANNOUNCE_TOPIC.to_string())
+            .await;
+
+        // The consented disclosure.
+        agent
+            .announce_identity(true, true)
+            .await
+            .expect("the disclosure publishes");
+        assert!(
+            agent
+                .user_identity_consented
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a successful disclosure records consent"
+        );
+        let disclosure = next_v3_announcement(&mut wire).await;
+        assert_ne!(
+            disclosure.payload_version, 0,
+            "the disclosure carries the identity, not the anonymous digest"
+        );
+
+        // The beat after the disclosure, in a strictly later second so an
+        // anonymous beat cannot hide behind the equal-second keep rule.
+        // `reannounce_identity` runs the same `HeartbeatContext::announce`
+        // the 3 s delayed beat and the 600 s heartbeat run.
+        let beat_second = next_second_boundary().await;
+        agent
+            .reannounce_identity()
+            .await
+            .expect("the beat publishes");
+        let beat = next_v3_announcement(&mut wire).await;
+        assert_ne!(
+            beat.payload_version, 0,
+            "the beat after consent is an identity beat, not an anonymous one"
+        );
+        assert!(
+            beat.payload_version >= beat_second,
+            "the identity beat is the strictly fresher announcement peers see"
+        );
+
+        // The ADR 0110 §4a renewal re-announce fires on the recorded
+        // consent instead of returning as a no-op.
+        let renewal_second = next_second_boundary().await;
+        agent
+            .reannounce_identity_if_consented()
+            .await
+            .expect("the renewal re-announce publishes");
+        let renewal = next_v3_announcement(&mut wire).await;
+        assert!(
+            renewal.payload_version >= renewal_second,
+            "the renewal re-announce published a fresh identity announcement"
         );
     }
 
