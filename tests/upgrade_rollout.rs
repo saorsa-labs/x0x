@@ -4,6 +4,8 @@
 //! These tests only construct configuration values, serialize them, and hash
 //! bytes. They start no daemon, task, process, store, socket or service.
 //! They do not claim that apply triggers already honor the rollout deadline.
+//! The `*_today` tests pin the current hash construction, including its
+//! input collisions, so a later construction change has a red baseline here.
 
 use std::time::Duration;
 
@@ -46,6 +48,8 @@ fn explicit_longer_configured_window_is_preserved() {
 }
 
 // Independent integer quotient for the specified leading-64-bit hash fraction.
+// The digest input mirrors the production construction exactly: the raw
+// concatenation of machine bytes and version bytes, with no length prefixes.
 // Dividing by 2^64 keeps the fraction in [0, 1), including the largest prefix.
 fn reference_seconds(machine: &[u8], version: &str, window_seconds: u64) -> u64 {
     let digest = Sha256::digest([machine, version.as_bytes()].concat());
@@ -119,4 +123,49 @@ fn explicit_zero_calculator_window_remains_compatible() {
     let rollout = StagedRollout::new(&MACHINE, 0);
     assert_eq!(rollout.calculate_delay(), Duration::ZERO);
     assert_eq!(rollout.calculate_delay_for_version("1.2.3"), Duration::ZERO);
+}
+
+#[test]
+fn positive_window_delays_stay_strictly_below_the_window() {
+    for minutes in [1, 60, 1440] {
+        let window = Duration::from_secs(minutes * 60);
+        let rollout = StagedRollout::new(&MACHINE, minutes);
+        assert!(rollout.calculate_delay() < window);
+        for version in ["", "1.2.3", "9.9.9"] {
+            assert!(rollout.calculate_delay_for_version(version) < window);
+        }
+    }
+}
+
+// The three tests below pin today's construction, `SHA-256(node || version)`
+// with no length prefixes. They document input collisions of the general
+// byte-slice API. The wired path cannot reach them: staging always passes a
+// fixed 32-byte machine ID and a bounded canonical semver version, so the
+// node width pins the field boundary. A length-prefixed construction must
+// flip each `assert_eq!` to `assert_ne!`; see the module docs in
+// src/upgrade/rollout.rs for why that change waits for David's ruling.
+
+#[test]
+fn variable_width_boundary_shifts_share_one_delay_today() {
+    let pair = StagedRollout::new(b"ab", 1440).calculate_delay_for_version("c");
+    let shifted = StagedRollout::new(b"a", 1440).calculate_delay_for_version("bc");
+    assert_eq!(pair, shifted);
+}
+
+#[test]
+fn unsalted_delay_matches_node_bytes_sent_as_the_version_today() {
+    let node = b"AAAAAAAA";
+    let unsalted = StagedRollout::new(node, 1440).calculate_delay();
+    let salted = StagedRollout::new(b"", 1440).calculate_delay_for_version("AAAAAAAA");
+    assert_eq!(unsalted, salted);
+}
+
+#[test]
+fn boundary_shift_collision_breaks_both_wired_invariants_today() {
+    // `[42; 32] || "9.9.9"` and `[42; 31] || "*9.9.9"` are the same byte
+    // stream, because `*` is 0x2a. Each colliding partner breaks a wired
+    // invariant: the node is 31 bytes, and "*9.9.9" is not canonical semver.
+    let wired = StagedRollout::new(&[42u8; 32], 1440).calculate_delay_for_version("9.9.9");
+    let shifted = StagedRollout::new(&[42u8; 31], 1440).calculate_delay_for_version("*9.9.9");
+    assert_eq!(wired, shifted);
 }
