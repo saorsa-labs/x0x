@@ -8,8 +8,8 @@
 //! chunk exchange pins the same machine, and a machine- or
 //! binding-revoked control-blob fetcher gets NO answer — the blob is
 //! withheld and no frame is sent: bit 13 (`treekem_catchup_refusal_v1`)
-//! stays TreeKEM catch-up only, as shipped in v0.48.1 (Engineer ruling,
-//! 31 Oct 2026 03:40 GMT). The seat-cert lane rides the gossip topic,
+//! stays TreeKEM catch-up only, as on main since #1714, unreleased
+//! (Engineer ruling, 31 Oct 2026 03:40 GMT). The seat-cert lane rides the gossip topic,
 //! which carries no authenticated requester machine: its ladder is the
 //! envelope's agent only — a binding-based refusal there would be a
 //! revoked device's denial-of-service lever over the clean device of the

@@ -1003,10 +1003,10 @@ pub(in crate::server) async fn handle_control_blob_message(
     // refuse either. A machine- or binding-revoked device gets NO answer:
     // the blob is withheld and NO frame is sent (Engineer ruling,
     // 31 Oct 2026 03:40 GMT — `treekem_catchup_refusal_v1`, bit 13, stays
-    // TreeKEM catch-up only, as shipped in v0.48.1; a typed control-blob
-    // refusal would be a separate wire question). The agent revocation
-    // and a pending revocation resync keep main's silent drop, as they
-    // always did.
+    // TreeKEM catch-up only, as on main since #1714, unreleased; a typed
+    // control-blob refusal would be a separate wire question). The agent
+    // revocation and a pending revocation resync keep main's silent
+    // drop, as they always did.
     let (machine_refused, binding_refused) = {
         let revocation_set = state.agent.revocation_set();
         let guard = revocation_set.read().await;
@@ -1075,7 +1075,8 @@ pub(in crate::server) async fn handle_control_blob_message(
             }
             // #1664: bit 13 (`treekem_catchup_refusal_v1`) is NOT widened
             // to this lane (Engineer ruling, 31 Oct 2026 03:40 GMT) — it
-            // stays TreeKEM catch-up only, as shipped in v0.48.1. A
+            // stays TreeKEM catch-up only, as on main since #1714,
+            // unreleased. A
             // machine- or binding-revoked fetcher gets the silent drop:
             // the blob is withheld and no frame is sent. The header check
             // above bound the authenticated sender to
