@@ -472,6 +472,17 @@ esac
             (),
             ("failed ML-DSA signature verification",),
             True,
+            None,
+        ),
+        # Manifest bytes unchanged, but signed by an unrelated key: the
+        # probe must reject the key, not just the bytes.
+        (
+            "signature_by_wrong_key",
+            manifest_bytes,
+            None,
+            (),
+            ("failed ML-DSA signature verification",),
+            True,
             "wrong_key",
         ),
         # Valid signature naming another archive's hash: refused by the hash

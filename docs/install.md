@@ -58,6 +58,9 @@ The current installer:
    `x0x` binary — an already-installed one when available, else the release's
    own — and, when `gpg` is present, the GPG signature against the pinned
    Saorsa Labs release key. A failed or missing check stops the install.
+   On a first install without `gpg`, the manifest check is made by the
+   downloaded binary itself, so it does not bind the release to a key you
+   already trust.
 4. Installs both `x0x` and `x0xd` into `~/.local/bin`
 5. Ensures the shared x0x data directory exists
 6. Starts the daemon
