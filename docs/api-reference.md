@@ -3207,11 +3207,12 @@ stays disabled until the response, including when the home view redraws the
 banner from its cached upgrade status.
 
 Bare `x0x upgrade` and `x0x upgrade --force` stay read-only and refuse
-installation. `x0x upgrade --check` prints this CLI version and, when the
-selected daemon answers, that daemon's version. `x0x --name <instance>`
-selects that instance. A CLI in another directory that is older than the
-daemon is reported as not upgraded, with a command that installs only the
-CLI. `--check` takes precedence over `--apply`;
+installation. `x0x upgrade --check` prints this CLI version and calls local
+`GET /health` on the daemon selected by `--api` or `--name` (the default
+instance when neither is set). A CLI that is older than that running daemon
+and does not sit beside its executable is reported as not upgraded, with a
+command that installs only the CLI. When that executable cannot be read, the
+check says that it cannot tell. `--check` takes precedence over `--apply`;
 `--check --force` fetches the current manifest and reports an update only
 when that release is strictly newer.
 `--force` does not bypass any daemon apply check. `x0xd --check-updates` also

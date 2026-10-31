@@ -49,42 +49,10 @@ pub(crate) fn daemon_file_name() -> &'static str {
     }
 }
 
-/// Whether a daemon apply replaces this CLI.
-///
-/// The apply replaces `x0x` only when that file is in the same directory as
-/// `x0xd`. A CLI in another directory stays on its old bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CliUpgradeReport {
-    /// The CLI file is the sibling of this daemon and can be replaced with it.
-    BesideDaemon,
-    /// This apply did not replace the CLI. `message` includes the reinstall hint.
-    NotUpgraded { message: String },
-}
-
-/// Report a CLI installed apart from `daemon_binary`.
-///
-/// [`CliUpgradeReport::BesideDaemon`] only when `cli_binary` is the sibling
-/// file. Directory A for `x0xd` and directory B for `x0x` is [`CliUpgradeReport::NotUpgraded`].
-pub(crate) fn cli_upgrade_report(daemon_binary: &Path, cli_binary: &Path) -> CliUpgradeReport {
-    let same_dir =
-        daemon_binary.parent().is_some() && daemon_binary.parent() == cli_binary.parent();
-    let named_cli = cli_binary
-        .file_name()
-        .is_some_and(|name| name == cli_file_name());
-    if same_dir && named_cli && cli_binary.is_file() {
-        CliUpgradeReport::BesideDaemon
-    } else {
-        CliUpgradeReport::NotUpgraded {
-            message: format!(
-                "CLI not upgraded: {} is not beside {}. {CLI_REINSTALL_HINT}",
-                cli_binary.display(),
-                daemon_binary.display()
-            ),
-        }
-    }
-}
-
 /// `Some` when no sibling CLI file exists. Callers log it at debug, not warn.
+///
+/// A CLI in another directory is not visible on this path. The CLI process
+/// reports that case (#1104).
 pub(crate) fn missing_sibling_cli_message(cli_binary: &Path) -> Option<String> {
     if cli_binary.is_file() {
         None
@@ -93,14 +61,6 @@ pub(crate) fn missing_sibling_cli_message(cli_binary: &Path) -> Option<String> {
             "sibling CLI file is missing: {}",
             cli_binary.display()
         ))
-    }
-}
-
-/// True when no `x0xd` file is installed in the same directory as this CLI.
-pub(crate) fn cli_installed_apart_from_daemon(cli_binary: &Path) -> bool {
-    match cli_binary.parent() {
-        Some(parent) => !parent.join(daemon_file_name()).is_file(),
-        None => true,
     }
 }
 
@@ -1529,32 +1489,29 @@ impl AutoApplyUpgrader {
             if let Some(message) = missing_sibling_cli_message(&x0x_path) {
                 debug!("{message}");
             } else {
-                match cli_upgrade_report(&target_path, &x0x_path) {
-                    CliUpgradeReport::BesideDaemon => {
-                        info!("Found x0x CLI companion in same directory, upgrading it too...");
-                        #[cfg(unix)]
-                        {
-                            companion = Some((
-                                Upgrader::new(x0x_path, current_version.clone()),
-                                probe_cli.clone(),
-                            ));
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let extracted_x0x = temp_dir.join("extracted-x0x");
-                            if let Err(e) =
-                                extract_binary_from_archive(&archive_path, &extracted_x0x, x0x_name)
-                            {
-                                warn!("Failed to extract companion x0x binary: {e}");
-                            } else {
-                                companion = Some((
-                                    Upgrader::new(x0x_path, current_version.clone()),
-                                    extracted_x0x,
-                                ));
-                            }
-                        }
+                // The path is this daemon's sibling CLI file. Apply replaces
+                // that file only. It does not search the rest of the host.
+                info!("Found x0x CLI companion in same directory, upgrading it too...");
+                #[cfg(unix)]
+                {
+                    companion = Some((
+                        Upgrader::new(x0x_path, current_version.clone()),
+                        probe_cli.clone(),
+                    ));
+                }
+                #[cfg(not(unix))]
+                {
+                    let extracted_x0x = temp_dir.join("extracted-x0x");
+                    if let Err(e) =
+                        extract_binary_from_archive(&archive_path, &extracted_x0x, x0x_name)
+                    {
+                        warn!("Failed to extract companion x0x binary: {e}");
+                    } else {
+                        companion = Some((
+                            Upgrader::new(x0x_path, current_version.clone()),
+                            extracted_x0x,
+                        ));
                     }
-                    CliUpgradeReport::NotUpgraded { message } => warn!("{message}"),
                 }
             }
         }
@@ -4808,58 +4765,9 @@ mod tests {
     }
 
     #[test]
-    fn issue1104_split_directories_apply_reports_cli_not_upgraded() {
+    fn missing_sibling_cli_is_a_debug_note_not_a_split_warning() {
         let root = tempfile::tempdir().unwrap();
-        let dir_a = root.path().join("A");
-        let dir_b = root.path().join("B");
-        std::fs::create_dir_all(&dir_a).unwrap();
-        std::fs::create_dir_all(&dir_b).unwrap();
-        let daemon = dir_a.join(daemon_file_name());
-        let cli = dir_b.join(cli_file_name());
-        std::fs::write(&daemon, b"daemon").unwrap();
-        std::fs::write(&cli, b"cli").unwrap();
-
-        let report = cli_upgrade_report(&daemon, &cli);
-        match report {
-            CliUpgradeReport::NotUpgraded { message } => {
-                assert!(
-                    message.contains("CLI not upgraded"),
-                    "apply result must say the CLI was not upgraded: {message}"
-                );
-                assert!(
-                    message.contains("only the x0x CLI"),
-                    "apply result must say the hint installs only the CLI: {message}"
-                );
-                assert!(
-                    message.contains("cargo install x0x --bin x0x --force"),
-                    "hint must be the CLI-only cargo command: {message}"
-                );
-                assert!(
-                    !message.contains("install.sh"),
-                    "hint must not run the installer: {message}"
-                );
-                assert!(
-                    !message.contains("cargo install x0x --force"),
-                    "hint must not install every bin: {message}"
-                );
-            }
-            CliUpgradeReport::BesideDaemon => {
-                panic!("a CLI in another directory must stay outside the daemon apply")
-            }
-        }
-        assert!(cli_installed_apart_from_daemon(&cli));
-
-        let sibling = dir_a.join(cli_file_name());
-        std::fs::write(&sibling, b"cli").unwrap();
-        assert_eq!(
-            cli_upgrade_report(&daemon, &sibling),
-            CliUpgradeReport::BesideDaemon,
-            "a CLI beside x0xd stays in the daemon apply"
-        );
-        assert!(!cli_installed_apart_from_daemon(&sibling));
-
-        let missing = dir_a.join(cli_file_name());
-        let _ = std::fs::remove_file(&missing);
+        let missing = root.path().join(cli_file_name());
         let note = missing_sibling_cli_message(&missing).expect("missing sibling");
         assert!(
             note.contains("missing"),
@@ -4873,5 +4781,7 @@ mod tests {
             !note.contains(CLI_REINSTALL_HINT),
             "a missing sibling must not print the reinstall hint: {note}"
         );
+        std::fs::write(&missing, b"cli").unwrap();
+        assert!(missing_sibling_cli_message(&missing).is_none());
     }
 }

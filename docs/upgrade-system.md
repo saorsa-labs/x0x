@@ -122,20 +122,29 @@ transaction or authorize guide promotion at host commit.
 
 ### CLI check and a split install (#1104)
 
-`x0x upgrade --check` prints this CLI version. When the selected daemon
-answers `GET /health`, the check also prints that daemon version.
-`x0x --name <instance> upgrade --check` and `--apply` use that instance.
-They do not read the default instance's `api.port`. `--check` still completes
+`x0x upgrade --check` prints this CLI version. It calls `GET /health` on
+the local daemon selected by `--api`, or by `--name`, or on the default
+instance when neither is set. The address is the same discovery other CLI
+commands use, including `127.0.0.1:12700` when no port file exists. The
+request stays on loopback and does not use a proxy. `--check` still completes
 when no daemon answers. `--check --force` fetches the current release and
 compares semver. It prints "Update available" only when that release is
 strictly newer than this CLI. An equal, older or unparseable release is not
 an update.
 
+The check compares this CLI with the executable of that running daemon.
+It canonicalizes both paths, so a symlink to the CLI is not a split install.
+A CLI in `~/.cargo/bin` is reported when the running `x0xd` is in another
+directory, even if `~/.cargo/bin` also contains `x0xd`. The executable is
+read from that instance's process. The daemon does not report its path.
+When the executable cannot be read, the check says that it cannot tell.
+It does not warn in that case.
+
 The daemon apply replaces `x0x` only when that file is in the same directory
-as `x0xd`. After `x0x upgrade --apply`, this CLI prints "CLI not upgraded"
-and a reinstall hint when its own file is in another directory and its
-version is older than the version the daemon applied. The CLI prints that
-notice on stderr, after the unchanged apply response. The hint is:
+as the running `x0xd`. After `x0x upgrade --apply`, this CLI prints
+"CLI not upgraded" and a reinstall hint when its own file is not beside that
+daemon and its version is older than the version the daemon applied. The CLI
+prints that notice on stderr, after the unchanged apply response. The hint is:
 
 ```text
 cargo install x0x --bin x0x --force
@@ -143,9 +152,11 @@ cargo install x0x --bin x0x --force
 
 That command installs only the `x0x` CLI. It does not replace `x0xd`.
 `scripts/install.sh` has no CLI-only mode, so the hint does not call it.
-The same check prints that hint only for an older split CLI. It does not
-also print `x0x upgrade --apply`. A CLI beside `x0xd` at a different version
-does not get the hint. Apply still replaces that sibling.
+The same check prints that hint only for an older CLI that is apart from the
+running daemon. It does not also print `x0x upgrade --apply`. A CLI beside
+that daemon at a different version does not get the hint. Apply still
+replaces that sibling. `x0x --name <instance>` and `x0x --api <address>`
+select that daemon for `--check` and `--apply`.
 
 A daemon apply that finds no sibling `x0x` records that the file is missing
 at debug level. It does not warn. `POST /upgrade/apply` and `x0x doctor` do
