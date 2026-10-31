@@ -209,24 +209,32 @@ try {
     #
     # Prefer an already-installed x0x.exe as the verifier: its key was
     # trusted by an earlier install, so the check does not depend on this
-    # download. Installed binaries from v0.46.5 answer the inert
-    # --upgrade-probe flag; older ones reject it and first installs have no
-    # binary yet, so both fall back to the release's own x0x.exe. Limit,
-    # stated plainly: on a first install the manifest is checked by the
-    # downloaded binary itself, so an attacker controlling the whole origin
-    # could self-attest; the pinned GPG signature stays the independent
-    # check there.
+    # download. Installed binaries from v0.46.5 know
+    # --verify-release-manifest and exit 0 (valid) or 1 (invalid); a
+    # pre-probe installed binary rejects the unknown argument with exit
+    # code 2, and first installs have no binary yet, so both fall back to
+    # the release's own x0x.exe. Limit, stated plainly: on a first install
+    # the manifest is checked by the downloaded binary itself, so an
+    # attacker controlling the whole origin could self-attest; the pinned
+    # GPG signature stays the independent check there.
     $ErrorActionPreference = "Continue"
     $verifyBin = Join-Path $extract "x0x.exe"
+    $probeExit = $null
     $installedCli = Join-Path $InstallDir "x0x.exe"
     if (Test-Path -LiteralPath $installedCli -PathType Leaf) {
         $global:LASTEXITCODE = $null
-        & $installedCli --upgrade-probe --version *> $null
-        if ($LASTEXITCODE -eq 0) { $verifyBin = $installedCli }
+        & $installedCli --verify-release-manifest $manifest $manifestSig *> $null
+        $installedExit = $LASTEXITCODE
+        if ($null -ne $installedExit -and $installedExit -ne 2) {
+            $verifyBin = $installedCli
+            $probeExit = $installedExit
+        }
     }
-    $global:LASTEXITCODE = $null
-    & $verifyBin --verify-release-manifest $manifest $manifestSig 2>$null
-    $probeExit = $LASTEXITCODE
+    if ($null -eq $probeExit) {
+        $global:LASTEXITCODE = $null
+        & $verifyBin --verify-release-manifest $manifest $manifestSig 2>$null
+        $probeExit = $LASTEXITCODE
+    }
     $ErrorActionPreference = "Stop"
     if ($null -eq $probeExit -or $probeExit -ne 0) {
         throw "ML-DSA manifest signature FAILED for release-manifest.json. The download may have been tampered with."

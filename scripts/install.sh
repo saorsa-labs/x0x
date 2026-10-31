@@ -286,20 +286,29 @@ fi
 
 # Prefer an already-installed x0x as the verifier: its key was trusted by an
 # earlier install, so the check does not depend on this download. Installed
-# binaries from v0.46.5 answer the inert --upgrade-probe flag; older ones
-# reject it and first installs have no binary yet, so both fall back to the
-# release's own x0x. Limit, stated plainly: on a first install the manifest
-# is checked by the downloaded binary itself, so an attacker controlling the
-# whole origin could self-attest; the pinned GPG signature stays the
-# independent check there. This is the updater's verify path, so
+# binaries from v0.46.5 know --verify-release-manifest and exit 0 (valid) or
+# 1 (invalid); a pre-probe installed binary rejects the unknown argument
+# with exit code 2, and first installs have no binary yet, so both fall back
+# to the release's own x0x. Limit, stated plainly: on a first install the
+# manifest is checked by the downloaded binary itself, so an attacker
+# controlling the whole origin could self-attest; the pinned GPG signature
+# stays the independent check there. This is the updater's verify path, so
 # --verify-only also executes the release binary.
-VERIFY_BIN="$PROBE"
-if [ -x "$BIN/x0x" ] && "$BIN/x0x" --upgrade-probe --version >/dev/null 2>&1; then
-    VERIFY_BIN="$BIN/x0x"
-fi
+MANIFEST="$TMP/release-manifest.json"
+MANIFEST_SIG="$TMP/release-manifest.json.sig"
+VERIFY_BIN=""
 PROBE_RC=0
-"$VERIFY_BIN" --verify-release-manifest \
-    "$TMP/release-manifest.json" "$TMP/release-manifest.json.sig" || PROBE_RC=$?
+if [ -x "$BIN/x0x" ]; then
+    "$BIN/x0x" --verify-release-manifest "$MANIFEST" "$MANIFEST_SIG" >/dev/null 2>&1 || PROBE_RC=$?
+    if [ "$PROBE_RC" -ne 2 ]; then
+        VERIFY_BIN="$BIN/x0x"
+    fi
+fi
+if [ -z "$VERIFY_BIN" ]; then
+    VERIFY_BIN="$PROBE"
+    PROBE_RC=0
+    "$VERIFY_BIN" --verify-release-manifest "$MANIFEST" "$MANIFEST_SIG" || PROBE_RC=$?
+fi
 if [ "$PROBE_RC" -eq 126 ]; then
     echo "Error: cannot execute $VERIFY_BIN to verify the release (noexec mount?); nothing installed." >&2
     exit 1

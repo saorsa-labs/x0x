@@ -537,23 +537,20 @@ esac
             tmp = Path(tmpdir)
             bin_dir = tmp / "home" / ".local" / "bin"
             bin_dir.mkdir(parents=True)
-            # An installed, probe-capable x0x that really verifies; the
-            # release's own x0x is lenient (accepts any manifest). The
-            # installer must use the installed one, so a manifest signed by
-            # the wrong key is refused even though the downloaded binary
-            # would have accepted it.
+            # An installed x0x like a real v0.48 one: unknown arguments are
+            # rejected, the probe really verifies. The release's own x0x is
+            # lenient (accepts any manifest). The installer must use the
+            # installed one, so a manifest signed by the wrong key is refused
+            # even though the downloaded binary would have accepted it.
             write_executable(
                 bin_dir / "x0x",
                 "#!/usr/bin/env sh\n"
-                'if [ "$1" = "--upgrade-probe" ]; then\n'
-                '    printf \'%s\\n\' \'{"version":"0.48.1"}\'\n'
-                "    exit 0\n"
-                "fi\n"
-                'if [ "$1" = "--verify-release-manifest" ]; then\n'
+                'if [ "$1" = "--verify-release-manifest" ] && [ $# -eq 3 ]; then\n'
                 '    printf \'%s\\n\' installed-probe >> "$PROBE_CALLS"\n'
                 f'    exec "{self.verifier}" verify "$2" "$3"\n'
                 "fi\n"
-                "exit 0\n",
+                'echo "error: unexpected argument" >&2\n'
+                "exit 2\n",
             )
             installed_x0x = (bin_dir / "x0x").read_bytes()
             rc, output, probe_calls, bin_dir = self.run_installer(
@@ -571,6 +568,34 @@ esac
             self.assertEqual(
                 probe_calls.read_text(encoding="utf-8").splitlines(),
                 ["installed-probe"],
+            )
+
+    def test_pre_probe_installed_binary_falls_back_to_the_release_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "home" / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            # An installed x0x from before v0.46.5: it rejects the unknown
+            # argument with exit 2, as clap does. The installer must fall
+            # back to the release's own binary and still complete a good
+            # install (this mirrors the real receipt from a host with a
+            # pre-probe ~/.local/bin/x0x).
+            write_executable(
+                bin_dir / "x0x",
+                '#!/usr/bin/env sh\necho "error: unexpected argument" >&2\nexit 2\n',
+            )
+            installed_x0x = (bin_dir / "x0x").read_bytes()
+            rc, output, probe_calls, bin_dir = self.run_installer(tmp, manifest_bytes)
+            self.assertEqual(rc, 0, output)
+            self.assertIn("ML-DSA-65 manifest signature verified", output)
+            self.assertNotIn("by the installed x0x", output)
+            self.assertIn("Installed:", output)
+            # The good release replaces the pre-probe binary, as an upgrade
+            # should, and the release's x0x did the verifying.
+            self.assertNotEqual((bin_dir / "x0x").read_bytes(), installed_x0x)
+            self.assertTrue((bin_dir / "x0xd").exists())
+            self.assertEqual(
+                probe_calls.read_text(encoding="utf-8").splitlines(), ["probe"]
             )
 
 
