@@ -25,10 +25,13 @@
 //!   persisted and no `waiting_for_fork_resolution` is shown, which
 //!   ADR 0110 §3 (L225–L227) forbids. The arm is wired as an expected
 //!   RED with `CAUSE_NO_TYPED_FORK` and turns GREEN with that fix (the
-//!   gap is recorded on #1581 by name). The neutralised red proof
-//!   (never committed) removes the conflicting-report protection and
-//!   shows the saved sibling itself going on the wire to D and C, so
-//!   the containment assertions are not vacuous.
+//!   gap is recorded on #1581 by name). A sibling a receiver accepts is
+//!   the arm's other named RED (`CAUSE_SIBLING_PUBLISHED`), caught by a
+//!   live watch from A's restart on; a neutralisation of the
+//!   conflicting-report protection (never committed) does not change
+//!   the arm's outcome on main — the receivers' own validation still
+//!   refuses the stale-rotation event — so the observed RED is anchored
+//!   in the typed-state gap itself.
 //! - the resume arm: no competing commit exists (D stays down). A
 //!   restarts and finishes the eligible delivery of its saved event
 //!   without another rekey; once D returns onto the compatible chain,
@@ -67,12 +70,24 @@
 //!   the resend gate would open blind (that shape is exactly what the
 //!   neutralised proof shows). The blackout is released at A's
 //!   restart, so nothing fabric-side stops a resend.
+//! - The row's "advance D past W" is carried by A, not D: A is the
+//!   rank-1 admin that waits out the designated window before its
+//!   fallback commits, while the restarted D — the designated admin —
+//!   commits straight after its own boot gate, which is its §2 right.
+//!   D's own wait-past-W fallback flow is 1581c's D path and is not
+//!   duplicated here.
 //! - The resume arm restarts D only after A's saved delivery has
 //!   converged with C: a committed row stays open while a survivor is
 //!   down, so D's return is what closes the rows. D's own row is not
 //!   this arm's outcome — the restarted D may first wait for B's
 //!   KeyPackage (`waiting_for_member_key_package`, the #1567 cache
 //!   loss) before its row closes on its own.
+//! - The fork arm crash-stops A a second time once the outcome has
+//!   settled, and takes its final reads after that restart, so §3's
+//!   "fork evidence and typed manual-resolution exit survive" is
+//!   asserted across a restart, not only in memory: the typed
+//!   `waiting_for_fork_resolution` and the public `fork_quarantine`
+//!   marker must both still be there.
 //!
 //! Before t = 0 the ordinary `private_secure` (TreeKEM) group is
 //! settled (every node at A's state revision r0 and epoch e0, four
@@ -430,6 +445,21 @@ async fn s4_row(
             .find(|row| row["target"].as_str() == Some(target_hex))
             .cloned()
     }))
+}
+
+/// Whether `label`'s public group status carries the fork-quarantine
+/// marker — the persisted fork evidence and ADR 0088 §2 item 7's
+/// manual-resolution exit, surfaced as `fork_quarantine` in
+/// `GET /groups/:id`.
+async fn fork_quarantine_present(sim: &Sim, label: &str, group: &str) -> Result<bool> {
+    let (status, body) = sim
+        .request(label, Method::GET, &format!("/groups/{group}"), None)
+        .await?;
+    ensure!(
+        status.is_success(),
+        "{label} GET /groups/{group}: {status} {body}"
+    );
+    Ok(!body["fork_quarantine"].is_null())
 }
 
 /// The production S4 seal-probe diagnostic for `target` on `label`
@@ -833,6 +863,14 @@ async fn scenario(
         && rm_body["waiting"]["designated_admin"]
             .as_str()
             .is_some_and(|named| named.eq_ignore_ascii_case(&d_hex));
+    // A premise of the arm, recorded as evidence so its failure is INFRA,
+    // not a RED the gate's expected-verdict pin would satisfy.
+    receipt.evidence(
+        "a_manual_remove_queues_typed_naming_the_down_designated",
+        queued_typed,
+        format!("A DELETE members/{b_hex}: {rm_status} {rm_body} ({rm_retries} typed 424 retries)"),
+        at(sim),
+    );
     let remove_reply = format!(
         "A DELETE members/{b_hex}: {rm_status} {rm_body} ({rm_retries} typed 424 retries); the \
          typed queue names the down designated D: {queued_typed}"
@@ -1102,6 +1140,47 @@ async fn scenario(
     })
     .await?;
 
+    // Fork arm: ADR 0110 §3's "fork evidence and typed manual-resolution
+    // exit survive" is proven across a second crash restart — the final
+    // reads below are taken after it, so a marker or a typed wait that
+    // did not persist fails the arm.
+    let mut survives = !competing;
+    if competing {
+        sim.restart("A", RestartMode::Crash).await?;
+        sim.fabric()
+            .mark("case: A crash-stopped a second time, onto its fork evidence");
+        let waited = sim
+            .until(
+                "A's second restart reloads its row",
+                sync_wait + secs(5),
+                async |s: &Sim| s4_row(s, "A", &group, &b_hex).await.is_ok(),
+            )
+            .await;
+        if let Err(error) = waited {
+            if !expired(&error) {
+                return Err(error);
+            }
+        }
+        let row_again = sim
+            .at_instant(
+                "read A's public S4 row after the second restart",
+                s4_row(sim, "A", &group, &b_hex),
+            )
+            .await?;
+        survives = row_again.as_ref().is_ok_and(|row| {
+            row.as_ref().is_some_and(|row| {
+                row["phase"].as_str() != Some("complete")
+                    && row["waiting"]["cause"].as_str() == Some("waiting_for_fork_resolution")
+            })
+        }) && fork_quarantine_present(sim, "A", &group)
+            .await
+            .unwrap_or(false);
+        receipt.note(format!(
+            "after A's second restart: row {row_again:?}; the typed cause and the public \
+             fork-quarantine marker survived: {survives}"
+        ));
+    }
+
     let survivors: &[&str] = if competing {
         &["D", "C"]
     } else {
@@ -1159,23 +1238,20 @@ async fn scenario(
                     && row["waiting"]["cause"].as_str() == Some("waiting_for_fork_resolution")
             })
         });
-        let contained = sibling.is_none()
-            && second_rotation.is_none()
-            && end.iter().all(|(_, seen)| {
-                seen.as_ref().is_some_and(|seen| {
-                    seen.epoch == Some(e0 + 1)
-                        && !seen.quarantined
-                        && seen.head_committed_by.as_deref() == Some(d_hex.as_str())
-                })
-            });
-        receipt.note(format!(
-            "A after the restart: row {a_row:?}; A {}; its persisted .evs row for B survived the              restart: {}; the typed waiting_for_fork_resolution was observed: {typed_fork}",
-            a_end.describe(),
-            persisted_t_obs(sim, "A", b.as_bytes())?.is_some()
-        ));
+        // The end-state control only: a sibling sighting is judged in the
+        // cause ladder (a published sibling is a named RED, not an INFRA
+        // premise), including the refused-send shape where D and C stay
+        // clean because the receivers are the backstop.
+        let d_c_hold_ds_commit = end.iter().all(|(_, seen)| {
+            seen.as_ref().is_some_and(|seen| {
+                seen.epoch == Some(e0 + 1)
+                    && !seen.quarantined
+                    && seen.head_committed_by.as_deref() == Some(d_hex.as_str())
+            })
+        });
         receipt.evidence(
-            "no_saved_sibling_reached_d_or_c",
-            contained,
+            "d_and_c_hold_ds_single_commit",
+            d_c_hold_ds_commit,
             format!(
                 "{}; first sibling sighting: {:?}; first past-e0+1 sighting: {:?}; frames A sent \
                  toward B/C before its crash: {}",
@@ -1183,6 +1259,20 @@ async fn scenario(
                 sibling,
                 second_rotation,
                 blackout.dropped()
+            ),
+            at(sim),
+        );
+        let a_keeps_own = a_end.epoch == Some(e0 + 1)
+            && a_end.state_revision == r0 + 1
+            && a_end.head_committed_by.as_deref() == Some(a_hex.as_str())
+            && persisted_t_obs(sim, "A", b.as_bytes())?.is_some();
+        receipt.evidence(
+            "a_keeps_its_own_commit_and_saved_row_across_the_restart",
+            a_keeps_own,
+            format!(
+                "A after the restarts: {}; its persisted .evs row for B is still on disk: {}",
+                a_end.describe(),
+                persisted_t_obs(sim, "A", b.as_bytes())?.is_some()
             ),
             at(sim),
         );
@@ -1206,22 +1296,24 @@ async fn scenario(
             format!("D's row for B: {d_row:?}"),
             at(sim),
         );
+        let marker_present = fork_quarantine_present(sim, "A", &group)
+            .await
+            .unwrap_or(false);
+        let typed_outcome = row_open && typed_fork && a_end.quarantined && marker_present;
         let passed = durable
             && not_early
             && others_clean
             && queued_typed
             && excluded(&end, e0, leaves0)
             && signed_by_d
-            && row_open
-            && typed_fork
-            && a_end.quarantined
-            && a_end.epoch == Some(e0 + 1)
-            && a_end.state_revision == r0 + 1
-            && a_end.head_committed_by.as_deref() == Some(a_hex.as_str())
-            && persisted_t_obs(sim, "A", b.as_bytes())?.is_some()
-            && contained
+            && a_keeps_own
+            && d_c_hold_ds_commit
             && d_row_complete
-            && fork_data_plane;
+            && fork_data_plane
+            && sibling.is_none()
+            && second_rotation.is_none()
+            && typed_outcome
+            && survives;
         if !passed {
             let (cause, observed) = if !durable {
                 (
@@ -1241,7 +1333,7 @@ async fn scenario(
                 )
             } else if !others_clean {
                 (CAUSE_LEAKED_COMMIT, describe_all(&others_at_crash))
-            } else if !excluded(&end, e0, leaves0) || !signed_by_d {
+            } else if !excluded(&end, e0, leaves0) || !signed_by_d || !d_row_complete {
                 (
                     CAUSE_NO_D_COMMIT,
                     format!("D and C at the end: {}", describe_all(&end)),
@@ -1250,15 +1342,21 @@ async fn scenario(
                 (CAUSE_SIBLING_PUBLISHED, sibling.unwrap_or_default())
             } else if second_rotation.is_some() {
                 (CAUSE_SECOND_ROTATION, second_rotation.unwrap_or_default())
-            } else if !row_open || !typed_fork {
-                (
-                    CAUSE_NO_TYPED_FORK,
-                    format!("A's row {a_row:?}; A {}", a_end.describe()),
-                )
-            } else {
+            } else if !fork_data_plane {
                 (
                     CAUSE_DATA_PLANE,
                     format!("{}; {}; {}", c_after.1, b_after.1, a_after.1),
+                )
+            } else {
+                (
+                    CAUSE_NO_TYPED_FORK,
+                    format!(
+                        "A's row {a_row:?}; A {}; the typed waiting_for_fork_resolution was \
+                         observed: {typed_fork}; the public fork-quarantine marker is present: \
+                         {marker_present}; the typed cause and marker survived A's second \
+                         restart: {survives}",
+                        a_end.describe()
+                    ),
                 )
             };
             // Only the row's named failures classify RED; every premise
@@ -1349,7 +1447,13 @@ async fn scenario(
                     format!("{}; {}; {}", a_after.1, c_after.1, b_after.1),
                 )
             };
-            receipt.cause(cause, Some(observed), true, at(sim));
+            // Premise failures stay INFRA like the fork arm's; only the
+            // arm's own outcome causes classify RED.
+            let premise = matches!(
+                cause,
+                CAUSE_NO_DURABLE_COMMIT | CAUSE_EARLY_FALLBACK | CAUSE_LEAKED_COMMIT
+            );
+            receipt.cause(cause, Some(observed), !premise, at(sim));
         }
         receipt.finish(FINAL_RESUME, passed, at(sim));
     }
@@ -1421,10 +1525,10 @@ const LABELS: &[&str] = &["A", "D", "B", "C"];
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-fn w3h_1581e_control_crash_commit_fork_contained() -> Result<()> {
+fn w3h_1581e_red_crash_commit_fork_contained() -> Result<()> {
     super::block_on_paused(async move {
         expect(
-            "w3h_1581e_control_crash_commit_fork_contained",
+            "w3h_1581e_red_crash_commit_fork_contained",
             0x1581_0007,
             LABELS,
             true,
