@@ -3,7 +3,10 @@
 # Usage:
 #   irm https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.ps1 | iex
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.ps1))) -Start
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.45.0 -Start
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.48.0 -Start
+#
+# Versions before v0.46.5 predate the --verify-release-manifest probe in the
+# release binaries and no longer install.
 #
 # What it does:
 #   1. Resolves the latest release (or -Version)
@@ -135,14 +138,16 @@ try {
         Test-ReleaseSignature $gpg $zip "$zip.asc" (Join-Path $Tmp "SAORSA_PUBLIC_KEY.asc") $Tmp
         Write-Host "  GPG signature verified ($TrustedFingerprint)" -ForegroundColor Green
     } else {
-        # Same policy and wording as install.sh: warn loudly, continue on the
-        # checksum and the signed ML-DSA manifest, without the GPG signature.
+        # Same policy and wording as install.sh: warn loudly, and say plainly
+        # that without gpg the manifest check on a first install is
+        # self-attested by the downloaded binary.
         Write-Host ""
         Write-Host "################################################################" -ForegroundColor Yellow
         Write-Host "# WARNING: gpg NOT FOUND - the GPG signature was NOT verified. #" -ForegroundColor Yellow
-        Write-Host "# The checksum and the signed ML-DSA release manifest were     #" -ForegroundColor Yellow
-        Write-Host "# verified, but not the independent GPG signature. Install gpg #" -ForegroundColor Yellow
-        Write-Host "# and re-run for that second signature.                        #" -ForegroundColor Yellow
+        Write-Host "# The checksum and the ML-DSA manifest were checked. On a      #" -ForegroundColor Yellow
+        Write-Host "# first install the manifest is checked by the downloaded      #" -ForegroundColor Yellow
+        Write-Host "# binary itself, not by an independent key. Install gpg and    #" -ForegroundColor Yellow
+        Write-Host "# re-run for a check that does not depend on this download.    #" -ForegroundColor Yellow
         Write-Host "################################################################" -ForegroundColor Yellow
         Write-Host ""
     }
@@ -198,18 +203,39 @@ try {
 
     # Like Test-ReleaseSignature: the probe may write to stderr, and Windows
     # PowerShell 5.1 turns redirected native stderr into a terminating error
-    # under "Stop", so relax around the invocation. $LASTEXITCODE is cleared
-    # first: if x0x.exe fails to launch at all, a stale success from an
+    # under "Stop", so relax around the invocations. $LASTEXITCODE is cleared
+    # before each: if the exe fails to launch at all, a stale success from an
     # earlier native call must not read as "verified".
+    #
+    # Prefer an already-installed x0x.exe as the verifier: its key was
+    # trusted by an earlier install, so the check does not depend on this
+    # download. Installed binaries from v0.46.5 answer the inert
+    # --upgrade-probe flag; older ones reject it and first installs have no
+    # binary yet, so both fall back to the release's own x0x.exe. Limit,
+    # stated plainly: on a first install the manifest is checked by the
+    # downloaded binary itself, so an attacker controlling the whole origin
+    # could self-attest; the pinned GPG signature stays the independent
+    # check there.
     $ErrorActionPreference = "Continue"
+    $verifyBin = Join-Path $extract "x0x.exe"
+    $installedCli = Join-Path $InstallDir "x0x.exe"
+    if (Test-Path -LiteralPath $installedCli -PathType Leaf) {
+        $global:LASTEXITCODE = $null
+        & $installedCli --upgrade-probe --version *> $null
+        if ($LASTEXITCODE -eq 0) { $verifyBin = $installedCli }
+    }
     $global:LASTEXITCODE = $null
-    & (Join-Path $extract "x0x.exe") --verify-release-manifest $manifest $manifestSig 2>$null
+    & $verifyBin --verify-release-manifest $manifest $manifestSig 2>$null
     $probeExit = $LASTEXITCODE
     $ErrorActionPreference = "Stop"
     if ($null -eq $probeExit -or $probeExit -ne 0) {
         throw "ML-DSA manifest signature FAILED for release-manifest.json. The download may have been tampered with."
     }
-    Write-Host "  ML-DSA-65 manifest signature verified" -ForegroundColor Green
+    if ($verifyBin -eq $installedCli) {
+        Write-Host "  ML-DSA-65 manifest signature verified (by the installed x0x.exe)" -ForegroundColor Green
+    } else {
+        Write-Host "  ML-DSA-65 manifest signature verified" -ForegroundColor Green
+    }
 
     # ── Stop any running instance ───────────────────────────────────────────
 

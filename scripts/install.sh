@@ -219,9 +219,10 @@ else
     echo "" >&2
     echo "################################################################" >&2
     echo "# WARNING: gpg NOT FOUND - the GPG signature was NOT verified. #" >&2
-    echo "# The checksum and the signed ML-DSA release manifest were     #" >&2
-    echo "# verified, but not the independent GPG signature. Install gpg #" >&2
-    echo "# and re-run for that second signature.                        #" >&2
+    echo "# The checksum and the ML-DSA manifest were checked. On a      #" >&2
+    echo "# first install the manifest is checked by the downloaded      #" >&2
+    echo "# binary itself, not by an independent key. Install gpg and    #" >&2
+    echo "# re-run for a check that does not depend on this download.    #" >&2
     echo "################################################################" >&2
     echo "" >&2
 fi
@@ -241,6 +242,8 @@ fi
 #
 # A missing manifest or signature, a bad signature, or a hash that differs
 # from the manifest entry stops the install before anything is installed.
+# Releases before v0.46.5 predate the probe in the release binaries and no
+# longer install.
 
 # The manifest's archive_sha256 must name this archive before extraction:
 # this refuses a swapped archive without executing any of its content. The
@@ -280,11 +283,35 @@ if [ ! -f "$PROBE" ] || [ -L "$PROBE" ] || [ ! -x "$PROBE" ]; then
     echo "Error: release archive missing executable x0x" >&2
     exit 1
 fi
-if ! "$PROBE" --verify-release-manifest \
-        "$TMP/release-manifest.json" "$TMP/release-manifest.json.sig"; then
+
+# Prefer an already-installed x0x as the verifier: its key was trusted by an
+# earlier install, so the check does not depend on this download. Installed
+# binaries from v0.46.5 answer the inert --upgrade-probe flag; older ones
+# reject it and first installs have no binary yet, so both fall back to the
+# release's own x0x. Limit, stated plainly: on a first install the manifest
+# is checked by the downloaded binary itself, so an attacker controlling the
+# whole origin could self-attest; the pinned GPG signature stays the
+# independent check there. This is the updater's verify path, so
+# --verify-only also executes the release binary.
+VERIFY_BIN="$PROBE"
+if [ -x "$BIN/x0x" ] && "$BIN/x0x" --upgrade-probe --version >/dev/null 2>&1; then
+    VERIFY_BIN="$BIN/x0x"
+fi
+PROBE_RC=0
+"$VERIFY_BIN" --verify-release-manifest \
+    "$TMP/release-manifest.json" "$TMP/release-manifest.json.sig" || PROBE_RC=$?
+if [ "$PROBE_RC" -eq 126 ]; then
+    echo "Error: cannot execute $VERIFY_BIN to verify the release (noexec mount?); nothing installed." >&2
+    exit 1
+fi
+if [ "$PROBE_RC" -ne 0 ]; then
     verify_failed "release-manifest.json failed ML-DSA signature verification"
 fi
-echo "  ML-DSA-65 manifest signature verified"
+if [ "$VERIFY_BIN" = "$BIN/x0x" ]; then
+    echo "  ML-DSA-65 manifest signature verified (by the installed x0x)"
+else
+    echo "  ML-DSA-65 manifest signature verified"
+fi
 
 if [ "$VERIFY_ONLY" = true ]; then
     echo "Verify-only: $ARCHIVE verified; nothing installed."

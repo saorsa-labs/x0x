@@ -207,8 +207,11 @@ def build_fixture() -> tuple[Path, Path]:
     return binary, secret
 
 
-def manifest_bytes(archive_sha256: str, target: str = TARGET_TRIPLE) -> bytes:
-    """A release manifest in the published pretty-printed layout."""
+def manifest_bytes(
+    archive_sha256: str, target: str = TARGET_TRIPLE, compact: bool = False
+) -> bytes:
+    """A release manifest in the published layout (pretty-printed, or
+    compact-serialized to prove the parser does not depend on whitespace)."""
     return json.dumps(
         {
             "schema_version": 1,
@@ -225,7 +228,8 @@ def manifest_bytes(archive_sha256: str, target: str = TARGET_TRIPLE) -> bytes:
             "skill_url": "",
             "skill_sha256": "0" * 64,
         },
-        indent=2,
+        indent=None if compact else 2,
+        separators=(",", ":") if compact else None,
     ).encode()
 
 
@@ -242,7 +246,7 @@ class InstallManifestVerifyTests(unittest.TestCase):
             # workspace has been built once.
             raise unittest.SkipTest(f"manifest fixture unavailable: {error}") from error
 
-    def sign(self, manifest: bytes, tmp: Path) -> bytes:
+    def sign(self, manifest: bytes, tmp: Path, secret: Path | None = None) -> bytes:
         scratch = tmp / "signing"
         scratch.mkdir(exist_ok=True)
         manifest_path = scratch / "release-manifest.json"
@@ -253,7 +257,7 @@ class InstallManifestVerifyTests(unittest.TestCase):
                 str(self.verifier),
                 "sign",
                 str(manifest_path),
-                str(self.secret),
+                str(secret or self.secret),
                 str(signature_path),
             ],
             check=True,
@@ -261,13 +265,28 @@ class InstallManifestVerifyTests(unittest.TestCase):
         )
         return signature_path.read_bytes()
 
+    def keygen(self, tmp: Path) -> Path:
+        """A second throwaway key pair, for signatures the verifier must
+        reject."""
+        scratch = tmp / "keys"
+        scratch.mkdir(exist_ok=True)
+        secret = scratch / "other-secret.bin"
+        subprocess.run(
+            [str(self.verifier), "keygen", str(scratch / "other.pub"), str(secret)],
+            check=True,
+            timeout=60,
+        )
+        return secret
+
     def run_installer(
         self,
         tmp: Path,
         manifest: bytes | Callable[[str], bytes] | None,
         *,
-        served_manifest: bytes | None = None,
+        served_manifest: bytes | Callable[[str], bytes] | None = None,
         missing: frozenset[str] = frozenset(),
+        secret: Path | None = None,
+        archive_probe_delegates: bool = True,
     ) -> tuple[int, str, Path, Path]:
         """Build a fake release, serve it through a fake curl, run install.sh
         in a scratch HOME, and return (rc, combined output, probe-calls log,
@@ -277,18 +296,22 @@ class InstallManifestVerifyTests(unittest.TestCase):
         archive's real SHA-256 (the good path needs the manifest to name it).
         `served_manifest` overrides the bytes the server returns after
         `manifest` was signed (the tamper case). `missing` names release
-        files the fake downloads fail on. The manifest signature is real:
-        signed by the fixture key the verifier binary embeds."""
+        files the fake downloads fail on. `secret` signs with another
+        throwaway key (the wrong-key case). With
+        `archive_probe_delegates=False` the release's x0x accepts any
+        manifest, isolating the installed-verifier preference. The manifest
+        signature is real: signed by the fixture key the verifier binary
+        embeds."""
         fake_bin = tmp / "fake-bin"
         archive_dir = tmp / "archive" / f"x0x-{PLATFORM}"
         home = tmp / "home"
         files_dir = tmp / "files"
         archive = tmp / f"x0x-{PLATFORM}.tar.gz"
         probe_calls = tmp / "probe-calls.log"
-        fake_bin.mkdir()
-        archive_dir.mkdir(parents=True)
-        home.mkdir()
-        files_dir.mkdir()
+        fake_bin.mkdir(exist_ok=True)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        home.mkdir(exist_ok=True)
+        files_dir.mkdir(exist_ok=True)
 
         write_executable(
             fake_bin / "uname",
@@ -302,13 +325,19 @@ class InstallManifestVerifyTests(unittest.TestCase):
             'mkdir -p "$DIR"\n'
             'printf \'%s\\n\' "127.0.0.1:65535" > "$DIR/api.port"\n',
         )
-        # The release's x0x: the probe delegates to the real verifier binary.
+        # The release's x0x: the probe delegates to the real verifier binary
+        # (or accepts anything, when the test isolates the installed one).
+        probe_branch = (
+            f'    exec "{self.verifier}" verify "$2" "$3"\n'
+            if archive_probe_delegates
+            else "    exit 0\n"
+        )
         write_executable(
             archive_dir / "x0x",
             "#!/usr/bin/env sh\n"
             'if [ "$1" = "--verify-release-manifest" ]; then\n'
             '    printf \'%s\\n\' probe >> "$PROBE_CALLS"\n'
-            f'    exec "{self.verifier}" verify "$2" "$3"\n'
+            f"{probe_branch}"
             "fi\n"
             "exit 0\n",
         )
@@ -331,7 +360,7 @@ class InstallManifestVerifyTests(unittest.TestCase):
                 served["release-manifest.json"] = served_manifest
             else:
                 served["release-manifest.json"] = manifest
-            served["release-manifest.json.sig"] = self.sign(manifest, tmp)
+            served["release-manifest.json.sig"] = self.sign(manifest, tmp, secret)
         for name, data in served.items():
             (files_dir / name).write_bytes(data)
 
@@ -397,6 +426,7 @@ esac
         probe_calls: Path,
         *needles: str,
         probe_ran: bool = True,
+        probe_log: list[str] | None = None,
     ) -> None:
         self.assertNotEqual(rc, 0, output)
         for needle in needles:
@@ -406,24 +436,32 @@ esac
         self.assertFalse((bin_dir / "x0x").exists())
         self.assertFalse((bin_dir / "x0xd").exists())
         calls = probe_calls.read_text(encoding="utf-8").splitlines() if probe_calls.exists() else []
-        self.assertEqual(calls, ["probe"] if probe_ran else [])
+        expected = probe_log if probe_log is not None else (["probe"] if probe_ran else [])
+        self.assertEqual(calls, expected)
 
     def test_good_signed_manifest_installs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            rc, output, probe_calls, bin_dir = self.run_installer(
-                Path(tmpdir), manifest_bytes
-            )
-            self.assertEqual(rc, 0, output)
-            self.assertIn("Archive hash matches the manifest entry", output)
-            self.assertIn("ML-DSA-65 manifest signature verified", output)
-            self.assertIn("Installed:", output)
-            self.assertTrue((bin_dir / "x0x").exists())
-            self.assertEqual(probe_calls.read_text(encoding="utf-8").splitlines(), ["probe"])
+        for layout in ("pretty", "compact"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as tmpdir:
+                rc, output, probe_calls, bin_dir = self.run_installer(
+                    Path(tmpdir),
+                    lambda digest, compact=layout == "compact": manifest_bytes(
+                        digest, compact=compact
+                    ),
+                )
+                self.assertEqual(rc, 0, output)
+                self.assertIn("Archive hash matches the manifest entry", output)
+                self.assertIn("ML-DSA-65 manifest signature verified", output)
+                self.assertIn("Installed:", output)
+                self.assertTrue((bin_dir / "x0x").exists())
+                self.assertEqual(
+                    probe_calls.read_text(encoding="utf-8").splitlines(), ["probe"]
+                )
 
     # name, manifest (None/bytes/factory), served override, missing release
-    # files, expected output needles, and whether the probe gets to run at
-    # all. probe_ran=False pins that the gate refused before any archive byte
-    # executed; True pins that the probe itself rejected the manifest.
+    # files, expected output needles, whether the probe gets to run at all,
+    # and an alternate signing key (None = the fixture key). probe_ran=False
+    # pins that the gate refused before any archive byte executed; True pins
+    # that the probe itself rejected the manifest.
     REFUSAL_CASES = [
         # Signed over the real hash, but different bytes are served: the
         # tampering is caught by the signature, after the binding passes.
@@ -434,6 +472,7 @@ esac
             (),
             ("failed ML-DSA signature verification",),
             True,
+            "wrong_key",
         ),
         # Valid signature naming another archive's hash: refused by the hash
         # binding, before extraction.
@@ -444,6 +483,7 @@ esac
             (),
             ("does not match the manifest entry",),
             False,
+            None,
         ),
         (
             "missing_manifest",
@@ -452,6 +492,7 @@ esac
             ("release-manifest.json",),
             ("download failed", "release-manifest.json"),
             False,
+            None,
         ),
         (
             "missing_signature",
@@ -460,6 +501,7 @@ esac
             ("release-manifest.json.sig",),
             ("download failed", "release-manifest.json.sig"),
             False,
+            None,
         ),
         # Correctly signed manifest with no linux-x64-gnu asset: the hash
         # lookup fails closed, before extraction.
@@ -470,21 +512,66 @@ esac
             (),
             ("no archive_sha256 entry for x86_64-unknown-linux-gnu",),
             False,
+            None,
         ),
     ]
 
     def test_bad_releases_are_refused(self) -> None:
-        for name, manifest, served, missing, needles, probe_ran in self.REFUSAL_CASES:
+        for name, manifest, served, missing, needles, probe_ran, key in self.REFUSAL_CASES:
             with self.subTest(case=name), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                secret = self.keygen(tmp) if key == "wrong_key" else None
                 rc, output, probe_calls, bin_dir = self.run_installer(
-                    Path(tmpdir),
+                    tmp,
                     manifest,
                     served_manifest=served,
                     missing=frozenset(missing),
+                    secret=secret,
                 )
                 self.assert_refused(
                     rc, output, bin_dir, probe_calls, *needles, probe_ran=probe_ran
                 )
+
+    def test_installed_verifier_is_preferred_and_its_refusal_blocks_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "home" / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            # An installed, probe-capable x0x that really verifies; the
+            # release's own x0x is lenient (accepts any manifest). The
+            # installer must use the installed one, so a manifest signed by
+            # the wrong key is refused even though the downloaded binary
+            # would have accepted it.
+            write_executable(
+                bin_dir / "x0x",
+                "#!/usr/bin/env sh\n"
+                'if [ "$1" = "--upgrade-probe" ]; then\n'
+                '    printf \'%s\\n\' \'{"version":"0.48.1"}\'\n'
+                "    exit 0\n"
+                "fi\n"
+                'if [ "$1" = "--verify-release-manifest" ]; then\n'
+                '    printf \'%s\\n\' installed-probe >> "$PROBE_CALLS"\n'
+                f'    exec "{self.verifier}" verify "$2" "$3"\n'
+                "fi\n"
+                "exit 0\n",
+            )
+            installed_x0x = (bin_dir / "x0x").read_bytes()
+            rc, output, probe_calls, bin_dir = self.run_installer(
+                tmp,
+                manifest_bytes,
+                secret=self.keygen(tmp),
+                archive_probe_delegates=False,
+            )
+            self.assertNotEqual(rc, 0, output)
+            self.assertIn("failed ML-DSA signature verification", output)
+            self.assertNotIn("Installed:", output)
+            # Nothing was installed over the existing binary.
+            self.assertEqual((bin_dir / "x0x").read_bytes(), installed_x0x)
+            self.assertFalse((bin_dir / "x0xd").exists())
+            self.assertEqual(
+                probe_calls.read_text(encoding="utf-8").splitlines(),
+                ["installed-probe"],
+            )
 
 
 if __name__ == "__main__":
