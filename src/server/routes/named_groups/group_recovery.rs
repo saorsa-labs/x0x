@@ -1868,6 +1868,13 @@ impl LegacyWrite {
         match outcome {
             Ok(super::AtomicWriteOutcome::Durable) => Self::Durable,
             Ok(super::AtomicWriteOutcome::ReplacedNotDurable) => Self::ReplacedNotDurable,
+            // #1574 slice 3 (Engineer ruling, 30 Oct): the preflight's
+            // re-save renamed the placeholder onto disk before it
+            // refused, so the arming stays contained exactly as before —
+            // `Dropped` would clear the sidecar's arming while the
+            // placeholder survives on disk (a crash leaves an orphan
+            // load reconciliation never repairs).
+            Ok(super::AtomicWriteOutcome::PreflightRefusedAfterRename) => Self::ReplacedNotDurable,
             Ok(super::AtomicWriteOutcome::NotReplaced) | Err(_) => Self::Dropped,
         }
     }
@@ -12363,6 +12370,95 @@ mod tests {
         assert_eq!(
             head_of(&state, &key).await.as_deref(),
             Some(base.state_hash.as_str())
+        );
+        Ok(())
+    }
+
+    /// #1574 slice 3 (Engineer ruling, 30 Oct 19:32 GMT): when the
+    /// durability preflight refuses AFTER its confirming re-save renamed
+    /// the placeholder onto disk, the S3 arming stays contained — disk
+    /// and the sidecar agree. A `NotReplaced` mapping of that refusal
+    /// would clear the sidecar's arming while the placeholder survives
+    /// on disk: a crash before the next good save then leaves the
+    /// orphan that load reconciliation never repairs (#1708's shape).
+    #[tokio::test]
+    async fn a_preflight_refusal_after_rename_keeps_the_s3_arming_contained() -> anyhow::Result<()>
+    {
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let owner = x0x::identity::AgentKeypair::generate()?;
+        let owner_hex = hex::encode(owner.agent_id().as_bytes());
+        let mut base = GroupInfo::new(
+            "adr0109-carry-preflight-refused".to_string(),
+            String::new(),
+            owner.agent_id(),
+            "7209".repeat(16),
+        );
+        base.seal_commit(&owner, 1_000)?;
+        let key = base.mls_group_id.clone();
+        let stable = base.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), base.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let mut ahead = base.clone();
+        ahead.name = "renamed".to_string();
+        ahead.seal_commit(&owner, 2_000)?;
+        let links = links_after(&base, &ahead);
+        let mut joined = ahead.clone();
+        joined.add_member(
+            local.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(owner_hex.clone()),
+            None,
+        );
+        joined.seal_commit(&owner, 3_000)?;
+        let terminal = joined
+            .commit_log
+            .last()
+            .map(|entry| entry.commit.clone())
+            .ok_or_else(|| anyhow::anyhow!("terminal"))?;
+        let event = super::super::NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: stable.clone(),
+            revision: terminal.revision,
+            actor: owner_hex.clone(),
+            name: None,
+            description: None,
+            commit: Some(terminal.clone()),
+        };
+        let ata = sign_ata(&owner, &local, &base, &links)?;
+        // The preflight refuses after its re-save renamed the current
+        // map — the S3 placeholder included — onto disk.
+        state
+            .named_groups_requires_durability_confirmation
+            .store(true, Ordering::SeqCst);
+        state.named_groups_save_fault.store(4, Ordering::SeqCst);
+        let applied = apply_join_carry(&state, &key, &links, &terminal, &event, &ata).await;
+        state.named_groups_save_fault.store(0, Ordering::SeqCst);
+        assert!(!applied, "not published");
+        let legacy = legacy_entry(&state.named_groups_path, &key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("legacy entry"))?;
+        assert!(
+            s3::is_s3_placeholder(&legacy),
+            "the refusal's re-save put the placeholder on disk"
+        );
+        assert!(is_placeheld(&state, &stable), "the arming stays contained");
+        let body = sidecar_snapshot(&state, &stable).await.unwrap_or_default();
+        assert!(
+            body.active_ata.is_some(),
+            "the sidecar keeps the ATA, so disk and sidecar agree"
+        );
+        assert_eq!(
+            head_of(&state, &key).await.as_deref(),
+            Some(base.state_hash.as_str()),
+            "the live map keeps the record from before the carry"
         );
         Ok(())
     }
