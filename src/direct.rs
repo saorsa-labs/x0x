@@ -253,6 +253,15 @@ pub(crate) fn treekem_catchup_refusal_probe(payload: &[u8], requester: &AgentId)
 pub(crate) const TREEKEM_REFUSAL_SEND_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 
+/// #1664: the bound on one machine-addressed DATA reply (a TreeKEM
+/// catch-up page, a control-blob chunk) on the raw-QUIC DM lane. The
+/// same budget class as the refusal frame above: one bounded stream
+/// write, no application-ACK wait — the requester's own retry cadence
+/// re-asks if the frame is lost, and a slow requester cannot hold a
+/// serve slot beyond this.
+pub(crate) const MACHINE_ADDRESSED_REPLY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 /// How long one (machine, group) refusal answer stands before the
 /// same requester may be answered again (per-(machine, group) dedupe,
 /// Engineer ruling, 29 Oct 2026 22:14 GMT). A revocation does not

@@ -12452,12 +12452,12 @@ async fn send_treekem_catchup_refusal(
     state: &Arc<AppState>,
     sender: &AgentId,
     machine_id: &MachineId,
-    request: &TreeKemCatchupRequest,
+    group_id: &str,
     reason: TreeKemCatchupRefusalReason,
 ) {
     #[cfg(test)]
     if let Ok(payload) = serde_json::to_vec(&TreeKemCatchupRefusal::new(
-        request.group_id.clone(),
+        group_id.to_string(),
         hex::encode(sender.as_bytes()),
         reason,
     )) {
@@ -12467,7 +12467,7 @@ async fn send_treekem_catchup_refusal(
     }
     state
         .agent
-        .send_treekem_refusal_reply(sender, *machine_id, &request.group_id, reason)
+        .send_treekem_refusal_reply(sender, *machine_id, group_id, reason)
         .await;
 }
 
@@ -12546,7 +12546,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         return;
     }
     if let Some(reason) = typed_refusal {
-        send_treekem_catchup_refusal(state, sender, machine_id, &request, reason).await;
+        send_treekem_catchup_refusal(state, sender, machine_id, &request.group_id, reason).await;
         return;
     }
     let (authorized, log_keys, held_group) = {
@@ -12678,12 +12678,17 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 return;
             }
         };
+        // #1664: the page answers the machine whose DM this node served
+        // (the QUIC-authenticated requester), never "whichever device
+        // currently resolves for the agent" — a revoked device holding
+        // the portable agent key must not read a page meant for the
+        // clean device that asked.
         if let Err(e) = state
             .agent
-            .send_direct_with_config(sender, payload, direct_message_send_config())
+            .send_machine_addressed_dm(sender, *machine_id, &payload)
             .await
         {
-            tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send member-keyed TreeKEM catch-up response: {e}");
+            tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send member-keyed TreeKEM catch-up response to the requesting machine: {e}");
         }
         return;
     }
@@ -12728,12 +12733,18 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     }
     #[cfg(test)]
     detached_send_test_seam::park(&format!("treekem-catchup-serve:{sender_hex}")).await;
+    // #1664: the page is machine-addressed to the QUIC-authenticated
+    // requester — the same revocation-clean (agent, machine) pair the
+    // #1657 ladder above cleared — so a revoked device that still holds
+    // the portable agent key cannot be handed this answer by an
+    // agent-level resolution (discovery cache, capability binding or
+    // newest connection can each name the revoked device).
     if let Err(e) = state
         .agent
-        .send_direct_with_config(sender, payload, direct_message_send_config())
+        .send_machine_addressed_dm(sender, *machine_id, &payload)
         .await
     {
-        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
+        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response to the requesting machine: {e}");
     }
 }
 
@@ -46704,6 +46715,53 @@ pub(super) async fn send_join_artifact(
     admission: x0x::dm::ArtifactAdmission,
     deadline: Instant,
 ) -> std::result::Result<(), String> {
+    send_join_artifact_exchange(
+        state, recipient, None, payload, group_id, kind, admission, deadline,
+    )
+    .await
+}
+
+/// #1664: the machine-pinned variant for a chunk that ANSWERS a
+/// control-blob fetch. The exchange targets `machine_id` — the
+/// QUIC-authenticated machine the fetch DM came from — instead of the
+/// recipient's binding resolution, which a revoked device still holding
+/// the agent key can hold the newest advert for. The admission seam and
+/// every lifecycle recorder stay exactly the exchange's.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_join_artifact_to_machine(
+    state: &AppState,
+    recipient: &AgentId,
+    machine_id: MachineId,
+    payload: &[u8],
+    group_id: &str,
+    kind: &'static str,
+    admission: x0x::dm::ArtifactAdmission,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
+    send_join_artifact_exchange(
+        state,
+        recipient,
+        Some(machine_id),
+        payload,
+        group_id,
+        kind,
+        admission,
+        deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_join_artifact_exchange(
+    state: &AppState,
+    recipient: &AgentId,
+    pinned_machine: Option<MachineId>,
+    payload: &[u8],
+    group_id: &str,
+    kind: &'static str,
+    admission: x0x::dm::ArtifactAdmission,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
     let exchange_deadline =
         std::cmp::min(Instant::now() + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline);
     #[cfg(test)]
@@ -46721,14 +46779,21 @@ pub(super) async fn send_join_artifact(
                 transports.push((recipient_hex.clone(), kind, "pinned_single_exchange"));
             }
         }
-        let resolve_within = std::cmp::min(
-            x0x::dm::PINNED_RESOLUTION_WAIT,
-            exchange_deadline.saturating_duration_since(Instant::now()) / 2,
-        );
-        state
-            .agent
-            .send_direct_pinned_admitted(recipient, payload, &admission, resolve_within)
-            .await
+        if let Some(machine_id) = pinned_machine {
+            state
+                .agent
+                .send_direct_pinned_admitted_machine(recipient, machine_id, payload, &admission)
+                .await
+        } else {
+            let resolve_within = std::cmp::min(
+                x0x::dm::PINNED_RESOLUTION_WAIT,
+                exchange_deadline.saturating_duration_since(Instant::now()) / 2,
+            );
+            state
+                .agent
+                .send_direct_pinned_admitted(recipient, payload, &admission, resolve_within)
+                .await
+        }
     };
     let outcome = match tokio::time::timeout_at(tokio_deadline(exchange_deadline), exchange).await {
         Ok(Ok(_)) => Ok(()),
@@ -49875,6 +49940,7 @@ pub(in crate::server) mod tests {
     mod issue1622_binding_revoked_catchup;
     mod issue1649_reseat_mandate_receive;
     mod issue1657_typed_refusal_catchup;
+    mod issue1664_machine_addressed_replies;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -57451,6 +57517,7 @@ pub(in crate::server) mod tests {
                         handle_control_blob_message(
                             &dispatch_state,
                             &msg.sender,
+                            &msg.machine_id,
                             msg.verified,
                             message,
                         )
@@ -57475,6 +57542,7 @@ pub(in crate::server) mod tests {
         handle_control_blob_message(
             &state,
             &local,
+            &state.agent.machine_id(),
             true,
             ControlBlobMessage::Reference {
                 reference: reference.clone(),

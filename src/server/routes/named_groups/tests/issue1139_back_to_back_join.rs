@@ -879,6 +879,7 @@ async fn bridge_emitted_pull(
                     super::super::control_blob::handle_control_blob_message(
                         authority,
                         &joiner.agent.agent_id(),
+                        &joiner.agent.machine_id(),
                         true,
                         outbound,
                     )
@@ -942,6 +943,7 @@ async fn bridge_emitted_pull(
             super::super::control_blob::handle_control_blob_message(
                 joiner,
                 &authority.agent.agent_id(),
+                &authority.agent.machine_id(),
                 true,
                 outbound,
             )
@@ -1041,6 +1043,7 @@ async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
     super::super::control_blob::handle_control_blob_message(
         &s.j2,
         &s.authority_id,
+        &s._authority.agent.machine_id(),
         true,
         serde_json::from_slice(&flipped_frame)?,
     )
@@ -1073,6 +1076,7 @@ async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
     super::super::control_blob::handle_control_blob_message(
         &s.j2,
         &s.authority_id,
+        &s._authority.agent.machine_id(),
         true,
         serde_json::from_slice(&reference_frame)?,
     )

@@ -940,6 +940,14 @@ pub struct Agent {
     /// [`Agent::send_treekem_refusal_reply`] — so one pair is answered
     /// once per window across paths. See `direct::TreeKemRefusalReplies`.
     treekem_refusal_replies: std::sync::Arc<direct::TreeKemRefusalReplies>,
+    /// #1664: the test egress recorder for machine-addressed DATA replies
+    /// (a TreeKEM catch-up page, a control-blob chunk) — every
+    /// `(MachineId, payload)` this node addresses to a requesting machine
+    /// on the raw-QUIC DM lane, so a test can assert WHERE an answer went
+    /// (offline agents have no transport, so the addressing decision is
+    /// the observable). Test builds only.
+    #[cfg(test)]
+    machine_reply_egress: std::sync::Mutex<Vec<(identity::MachineId, Vec<u8>)>>,
     /// ADR-0043 review-r5: ceremony gate mirrored on the agent so the
     /// LIBRARY API (`move_authorize`/`move_export`/`move_import`/
     /// `move_activate`/`move_abort`/`move_retire`) is unreachable when
@@ -10339,6 +10347,271 @@ impl Agent {
             reason,
         )
         .await;
+    }
+
+    /// #1664: send one DATA reply machine-addressed on the raw-QUIC DM
+    /// lane — to the machine whose authenticated request this node is
+    /// answering, never "whichever device currently resolves for the
+    /// agent". A revoked device that still holds the portable agent key
+    /// can be exactly that resolution (discovery cache, capability
+    /// binding, newest connection), so an ordinary agent-addressed send
+    /// ([`Self::send_direct_with_config`]) can hand it a page or a chunk
+    /// meant for the clean device that asked.
+    ///
+    /// Delivery shape is the #1657 refusal lane's
+    /// ([`Self::send_treekem_refusal_reply`]) with the data payload this
+    /// lane already carries: the ant-quic PeerId IS the machine id, so the
+    /// frame travels the authenticated raw-QUIC path to `machine_id` and
+    /// nothing else, and the receiving daemon dispatches it exactly as it
+    /// dispatches any DM of the same type. No new wire message.
+    ///
+    /// Gates: the ADR-0043 signing gate (the same egress refusal as every
+    /// DM path) and the raw payload bound. The revocation decision is the
+    /// CALLER's — every caller has already run the #1657 ladder (agent,
+    /// machine, binding, resync) on this exact (requester, machine) pair
+    /// under the revocation-set lock, so a clean pair never loses egress
+    /// here and a revoked pair never reaches this send. A reply addressed
+    /// to this daemon's own (agent, machine) pair is delivered through
+    /// the same loopback path an ordinary self-addressed DM takes.
+    pub(crate) async fn send_machine_addressed_dm(
+        &self,
+        requester: &identity::AgentId,
+        machine_id: identity::MachineId,
+        payload: &[u8],
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*requester);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
+            self.direct_messaging.record_outgoing_failed(*requester);
+            return Err(dm::DmError::PayloadTooLarge {
+                len: payload.len(),
+                max: direct::MAX_DIRECT_PAYLOAD_SIZE,
+            });
+        }
+        #[cfg(test)]
+        if let Ok(mut egress) = self.machine_reply_egress.lock() {
+            egress.push((machine_id, payload.to_vec()));
+        }
+        if *requester == self.identity.agent_id() {
+            if machine_id != self.identity.machine_id() {
+                self.direct_messaging.record_outgoing_failed(*requester);
+                return Err(dm::DmError::NoConnectivity(
+                    "a machine-addressed reply names another machine of this agent".to_string(),
+                ));
+            }
+            self.direct_messaging
+                .record_outgoing_started(*requester, None);
+            let delivered = self
+                .direct_messaging
+                .handle_loopback(
+                    self.identity.machine_id(),
+                    self.identity.agent_id(),
+                    payload.to_vec(),
+                )
+                .await;
+            let receipt = dm_send::loopback_receipt();
+            self.direct_messaging
+                .record_outgoing_succeeded(*requester, receipt.path);
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "machine_reply",
+                outcome = "loopback",
+                delivered_subscribers = delivered,
+                "machine-addressed data reply delivered on the loopback path"
+            );
+            return Ok(receipt);
+        }
+        let Some(network) = self.network.as_ref() else {
+            self.direct_messaging.record_outgoing_failed(*requester);
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "machine_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "machine_reply_no_transport",
+                "machine-addressed data reply decided but this node has no network transport"
+            );
+            return Err(dm::DmError::NoConnectivity(
+                "machine-addressed data reply has no network transport".to_string(),
+            ));
+        };
+        self.direct_messaging
+            .record_outgoing_started(*requester, None);
+        let sender_agent_id = self.identity.agent_id();
+        let peer_id = ant_quic::PeerId(machine_id.0);
+        let send = network.send_direct(&peer_id, sender_agent_id.as_bytes(), payload);
+        match tokio::time::timeout(direct::MACHINE_ADDRESSED_REPLY_TIMEOUT, send).await {
+            Ok(Ok(())) => {
+                let receipt = dm_send::raw_quic_receipt_for_path(dm::DmPath::RawQuic);
+                self.direct_messaging
+                    .record_outgoing_succeeded(*requester, receipt.path);
+                Ok(receipt)
+            }
+            Ok(Err(e)) => {
+                self.direct_messaging.record_outgoing_failed(*requester);
+                let error = Self::map_raw_quic_dm_error(e);
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "machine_reply",
+                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                    error = %error,
+                    outcome = "machine_reply_send_failed",
+                    "failed to send the machine-addressed data reply to the requesting machine"
+                );
+                Err(error)
+            }
+            Err(_) => {
+                self.direct_messaging.record_outgoing_failed(*requester);
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "machine_reply",
+                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                    outcome = "machine_reply_send_timeout",
+                    "timed out sending the machine-addressed data reply to the requesting machine"
+                );
+                Err(dm::DmError::NoConnectivity(
+                    "machine-addressed data reply timed out".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// #1664: [`Self::send_direct_pinned_admitted`] with the target FIXED
+    /// to the QUIC-authenticated machine the answered request came from,
+    /// instead of the recipient's (moveable) binding resolution. Used by
+    /// the join-artifact exchange for a chunk that ANSWERS a control-blob
+    /// fetch: the admission seam still re-checks this agent's revocation
+    /// state and the ADR-0043 B/P pairing for the exact (agent, machine)
+    /// pair at the stream seam, but `check_binding` is false — the
+    /// requester's own binding may legitimately name a different machine
+    /// (a revoked device that still holds the agent key can hold the
+    /// newest advert), and the fetch DM authenticated this machine
+    /// directly. Callers bound the exchange with their own deadline.
+    pub(crate) async fn send_direct_pinned_admitted_machine(
+        &self,
+        to: &identity::AgentId,
+        machine_id: identity::MachineId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        // ADR-0043 signing gate: the same egress refusal the general path
+        // applies before any envelope or transport work.
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        if *to == self.identity.agent_id() {
+            return Err(dm::DmError::NoConnectivity(
+                "a pinned recovery-response send is never self-addressed".to_string(),
+            ));
+        }
+        // G14: a logical DM send like any other. No phi "likely offline"
+        // short-circuit: these sends answer the recipient's own fetch, and a
+        // stale suspicion must not suppress the recovery.
+        self.direct_messaging.record_outgoing_started(*to, None);
+        let result = self
+            .send_direct_pinned_admitted_machine_inner(to, machine_id, payload, admission)
+            .await;
+        match &result {
+            Ok(_) => self
+                .direct_messaging
+                .record_outgoing_succeeded(*to, dm::DmPath::RawQuic),
+            Err(_) => self.direct_messaging.record_outgoing_failed(*to),
+        }
+        result
+    }
+
+    async fn send_direct_pinned_admitted_machine_inner(
+        &self,
+        to: &identity::AgentId,
+        machine_id: identity::MachineId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        #[cfg(test)]
+        if self.network.is_none() {
+            let refused = || {
+                Err(dm::DmError::NoConnectivity(
+                    dm::PINNED_ADMISSION_REFUSED.to_string(),
+                ))
+            };
+            let Some(seam) = admission().await else {
+                return refused();
+            };
+            let admitted = self.pinned_admission_seam(*to, machine_id, false, seam)();
+            if admitted {
+                // The addressing decision the exchange admitted — recorded
+                // only after the admission, exactly where the transport
+                // would write (a withheld send is no egress).
+                if let Ok(mut egress) = self.machine_reply_egress.lock() {
+                    egress.push((machine_id, payload.to_vec()));
+                }
+                return Err(dm::DmError::NoConnectivity(
+                    dm::PINNED_STANDIN_ADMITTED.to_string(),
+                ));
+            }
+            return refused();
+        }
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| dm::DmError::NoConnectivity("network not initialized".to_string()))?;
+        let Some(seam) = admission().await else {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        };
+        // A refusal AT THE SEAM is reported as an admission refusal (a
+        // retryable withhold for the caller), not as a transport failure.
+        let refused_at_seam = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seam = {
+            let refused_at_seam = std::sync::Arc::clone(&refused_at_seam);
+            let checks = self.pinned_admission_seam(*to, machine_id, false, seam);
+            move || {
+                let admitted = checks();
+                if !admitted {
+                    refused_at_seam.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                admitted
+            }
+        };
+        let sent = network
+            .send_direct_pinned(
+                &ant_quic::PeerId(machine_id.0),
+                &self.identity.agent_id().0,
+                payload,
+                seam,
+            )
+            .await;
+        if refused_at_seam.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        }
+        sent.map_err(Self::map_raw_quic_dm_error)?;
+        // The addressing decision the transport wrote — recorded only after
+        // the admitted write (a withheld or failed send is no egress).
+        #[cfg(test)]
+        if let Ok(mut egress) = self.machine_reply_egress.lock() {
+            egress.push((machine_id, payload.to_vec()));
+        }
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "pinned_exchange_written",
+            recipient = %hex::encode(to.as_bytes()),
+            machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&machine_id.0, 4)),
+            resolution = "requester_machine",
+            bytes = payload.len(),
+            "machine-pinned exchange written"
+        );
+        Ok(dm_send::raw_quic_receipt_for_path(dm::DmPath::RawQuic))
     }
 
     /// #461: provenance variant for the direct-send HTTP route — identical
@@ -23598,6 +23871,8 @@ impl AgentBuilder {
             move_state,
             move_state_load_failed,
             treekem_refusal_replies: std::sync::Arc::new(direct::TreeKemRefusalReplies::default()),
+            #[cfg(test)]
+            machine_reply_egress: std::sync::Mutex::default(),
             move_ceremony_enabled: self.move_ceremony_enabled,
             stream_reauth,
             history_service: tokio::sync::Mutex::new(history_service),

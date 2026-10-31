@@ -31,6 +31,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{now_millis_u64, LogHexId};
+use crate::direct::TreeKemCatchupRefusalReason;
 use crate::server::state::AppState;
 
 /// Wire domain for a group-scoped roster-certificate request.
@@ -268,6 +269,18 @@ pub(in crate::server) async fn handle_group_cert_fetch_request(
     let Some(sender) = sender else {
         return false;
     };
+    // #1664: the serve is guarded egress. The gossip lane carries no
+    // machine identity, so the ladder runs on what it CAN authenticate:
+    // the envelope's agent. An agent revocation and a pending revocation
+    // resync keep main's silent drop (no answer, no suppression slot
+    // spent), exactly as the control-blob lane's entry gate.
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(sender) || revoked.revocation_resync_required() {
+            return false;
+        }
+    }
     let Ok(request) = serde_json::from_slice::<GroupCertFetchRequest>(raw) else {
         return false;
     };
@@ -331,6 +344,61 @@ pub(in crate::server) async fn handle_group_cert_fetch_request(
             seat.and_then(|seat| seat.certificate.clone()),
         )
     };
+    // #1664 (ADR 0110 D70; the #1657 ladder): a machine revocation denies
+    // that device only and a binding revocation retires the pairing only,
+    // so the roster check above cannot refuse either. This lane has no
+    // QUIC-authenticated sender machine, so the machine identity is the
+    // one the sender's OWN verified capability binding names — the same
+    // resolution ADR-0043 §9 trusts to gate DM egress. Present evidence
+    // fails closed (a binding that names a machine- or binding-revoked
+    // pairing gets no answer, and the #1657 typed refusal naming the
+    // revocation goes to that machine); absent evidence fails open
+    // (§9.3): a member with no advert this node holds keeps main's
+    // answer. The answer itself still rides the topic broadcast — the
+    // residual that a machine-addressed answer would close needs a wire
+    // change (see the PR body).
+    if let Some(machine_id) = state
+        .agent
+        .capability_store
+        .lookup_binding(sender)
+        .map(|binding| binding.machine_id)
+    {
+        let reason = {
+            let revocation_set = state.agent.revocation_set();
+            let revoked = revocation_set.read().await;
+            if revoked.is_machine_revoked(&machine_id) {
+                Some(TreeKemCatchupRefusalReason::MachineRevoked)
+            } else if revoked.is_binding_revoked(sender, &machine_id) {
+                Some(TreeKemCatchupRefusalReason::BindingRevoked)
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = reason {
+            tracing::warn!(
+                group_id = %LogHexId::group(&stable_group_id),
+                requester = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+                "rejecting group-scoped certificate fetch from a requester whose binding names a machine- or binding-revoked device"
+            );
+            // The refusal send waits up to its transport budget for the
+            // refused device, so it never runs on this topic listener.
+            let refusal_state = std::sync::Arc::clone(state);
+            let refusal_sender = *sender;
+            let refusal_machine = machine_id;
+            let refusal_group = stable_group_id.clone();
+            tokio::spawn(async move {
+                super::send_treekem_catchup_refusal(
+                    &refusal_state,
+                    &refusal_sender,
+                    &refusal_machine,
+                    &refusal_group,
+                    reason,
+                )
+                .await;
+            });
+            return false;
+        }
+    }
     // C5: a recent answer or miss for this (group, digest) suppresses the
     // request BEFORE any hash scan of the cache.
     let key = responder_key(&stable_group_id, &request.cert_digest);

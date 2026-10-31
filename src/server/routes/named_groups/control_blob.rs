@@ -987,21 +987,38 @@ async fn reference_admitted(state: &AppState, reference: &ControlBlobRef) -> boo
 pub(in crate::server) async fn handle_control_blob_message(
     state: &Arc<AppState>,
     sender: &AgentId,
+    machine_id: &MachineId,
     verified: bool,
     message: ControlBlobMessage,
 ) {
     let sender_hex = hex::encode(sender.as_bytes());
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let revoked = {
+    // #1664 (ADR 0110 §3; the #1657 ladder): this lane answers an
+    // authenticated DM, so the QUIC-authenticated sender machine refuses
+    // a revoked device exactly as the TreeKEM catch-up serve does — a
+    // machine revocation denies that device only (the portable agent
+    // keeps its Active seat) and a binding revocation retires the pairing
+    // only, so neither the roster nor the reference header checks can
+    // refuse either. The ask that earns an answer is a Fetch; a machine-
+    // or binding-revoked fetcher gets the #1657 typed refusal naming the
+    // revocation. Every other arm keeps main's silent drop, as the agent
+    // revocation and a pending revocation resync always did.
+    let (machine_refused, binding_refused) = {
         let revocation_set = state.agent.revocation_set();
         let guard = revocation_set.read().await;
-        guard.is_agent_revoked(sender) || guard.revocation_resync_required()
+        if guard.is_agent_revoked(sender) || guard.revocation_resync_required() {
+            return;
+        }
+        (
+            guard.is_machine_revoked(machine_id),
+            guard.is_binding_revoked(sender, machine_id),
+        )
     };
-    if revoked {
-        return;
-    }
     match message {
         ControlBlobMessage::Reference { reference } => {
+            if machine_refused || binding_refused {
+                return;
+            }
             if !incoming_reference_header_valid(&reference, &sender_hex, &local_hex, verified)
                 || !reference_admitted(state, &reference).await
             {
@@ -1052,6 +1069,49 @@ pub(in crate::server) async fn handle_control_blob_message(
             if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
                 return;
             }
+            // #1664: the header check above bound the authenticated sender
+            // to `reference.recipient`, so this refusal answers exactly the
+            // device that asked. It names the revocation so the fetcher can
+            // stop re-fetching and surface the reason, exactly as the
+            // catch-up refusal does.
+            if let Some(reason) = if machine_refused {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&reference.group_id),
+                    requester = %LogHexId::agent(&sender_hex),
+                    "rejecting control-blob fetch from a machine-revoked requester"
+                );
+                Some(TreeKemCatchupRefusalReason::MachineRevoked)
+            } else if binding_refused {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&reference.group_id),
+                    requester = %LogHexId::agent(&sender_hex),
+                    "rejecting control-blob fetch from a requester with a revoked agent-machine binding"
+                );
+                Some(TreeKemCatchupRefusalReason::BindingRevoked)
+            } else {
+                None
+            } {
+                // The refusal send waits up to its transport budget for the
+                // refused device, so it never runs on this listener (a
+                // revoked fetcher storm must not stall other control
+                // traffic — the same detachment the catch-up lane serves
+                // under, #1357/#1616).
+                let refusal_state = Arc::clone(state);
+                let refusal_sender = *sender;
+                let refusal_machine = *machine_id;
+                let refusal_group = reference.group_id.clone();
+                state.spawn_detached(async move {
+                    super::send_treekem_catchup_refusal(
+                        &refusal_state,
+                        &refusal_sender,
+                        &refusal_machine,
+                        &refusal_group,
+                        reason,
+                    )
+                    .await;
+                });
+                return;
+            }
             if reference.kind == ControlBlobKind::JoinResult {
                 // ADR 0107 (review r2): a staged join result is a COPY of a
                 // join artifact, so each chunk is a serve. The chunk is read
@@ -1098,6 +1158,9 @@ pub(in crate::server) async fn handle_control_blob_message(
                 };
                 let task_state = Arc::clone(state);
                 let recipient = *sender;
+                // #1664: the chunk answers THIS machine — the authenticated
+                // sender of the fetch DM — not a binding resolution.
+                let requester_machine = *machine_id;
                 let group_id = reference.group_id.clone();
                 let member_hex = reference.recipient.clone();
                 // r5: the task, like the copy, dies at the original's
@@ -1136,9 +1199,10 @@ pub(in crate::server) async fn handle_control_blob_message(
                                 return;
                             }
                         };
-                        match super::send_join_artifact(
+                        match super::send_join_artifact_to_machine(
                             &task_state,
                             &recipient,
+                            requester_machine,
                             &payload,
                             &group,
                             "join_result_chunk",
@@ -1177,6 +1241,10 @@ pub(in crate::server) async fn handle_control_blob_message(
             let guard = state.control_blobs.staged_serve_guard(&reference);
             let task_state = Arc::clone(state);
             let recipient = *sender;
+            // #1664: the chunk answers THIS machine — the authenticated
+            // sender of the fetch DM — never an agent-level resolution a
+            // revoked device holding the portable agent key can occupy.
+            let requester_machine = *machine_id;
             // #1269: shutdown-owned; the send holds the Agent.
             state.spawn_detached(async move {
                 let _permit = permit;
@@ -1194,14 +1262,24 @@ pub(in crate::server) async fn handle_control_blob_message(
                         return;
                     }
                 }
-                let agent = &task_state.agent;
                 let message = ControlBlobMessage::Chunk {
                     reference,
                     sequence,
                     data_b64: BASE64.encode(chunk),
                 };
-                if let Err(reason) = send_message(agent, &recipient, &message).await {
-                    tracing::warn!(reason, "control blob chunk send failed");
+                let payload = match encode_message(&message) {
+                    Ok(payload) => payload,
+                    Err(reason) => {
+                        tracing::warn!(reason, "control blob chunk encode failed");
+                        return;
+                    }
+                };
+                if let Err(reason) = task_state
+                    .agent
+                    .send_machine_addressed_dm(&recipient, requester_machine, &payload)
+                    .await
+                {
+                    tracing::warn!(reason = %reason, "control blob chunk send failed");
                 }
             });
         }
@@ -1210,6 +1288,9 @@ pub(in crate::server) async fn handle_control_blob_message(
             sequence,
             data_b64,
         } => {
+            if machine_refused || binding_refused {
+                return;
+            }
             if !incoming_reference_header_valid(&reference, &sender_hex, &local_hex, verified)
                 || data_b64.len() > CHUNK_BYTES.div_ceil(3) * 4
             {
@@ -1239,6 +1320,9 @@ pub(in crate::server) async fn handle_control_blob_message(
             // the fetch header check enforces sender == reference.recipient
             // and local == reference.source, and the exact reference
             // (digest + length) keys the removal.
+            if machine_refused || binding_refused {
+                return;
+            }
             if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
                 return;
             }
@@ -1865,7 +1949,14 @@ mod tests {
                     reference: reference.clone(),
                 })?;
                 let message: ControlBlobMessage = serde_json::from_slice(&wire)?;
-                handle_control_blob_message(&state, &recipient, true, message).await;
+                handle_control_blob_message(
+                    &state,
+                    &recipient,
+                    &state.agent.machine_id(),
+                    true,
+                    message,
+                )
+                .await;
             }
         }
         Ok(())
