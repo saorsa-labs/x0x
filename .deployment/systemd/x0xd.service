@@ -5,6 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# ADR 0094 §5: bind ExecStart to /opt/x0x/x0x-launcher only after the
+# signed launcher artifact ships, the authority inventory and restart
+# readback accept a launcher-owned job, and install.sh installs it.
 ExecStart=/opt/x0x/x0xd --config /etc/x0x/config.toml
 Restart=always
 RestartSec=5

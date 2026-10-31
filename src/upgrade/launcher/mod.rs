@@ -1,10 +1,12 @@
-//! Private, dormant S3b engine. No installer or daemon apply path calls it.
-//! The complete inventory issuer and host coordinator remain separate gates.
+//! Dormant S3b engine. Only the `x0x-launcher` and `x0xd` binaries include
+//! it; no installer or daemon apply path calls it. The complete inventory
+//! issuer and host coordinator remain separate gates.
 #![allow(dead_code)]
 
 mod child;
 mod control;
 mod filesystem;
+pub(crate) mod forward;
 #[path = "../journal.rs"]
 mod journal;
 #[path = "../probe.rs"]

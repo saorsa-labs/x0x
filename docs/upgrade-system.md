@@ -248,9 +248,12 @@ The private pair engine is implemented and tested, but no live apply path calls
 it yet. Activation requires the S2c host inventory and the S3a acknowledged
 flush, whose daemon-side owner and arm-and-flush control listener now exist
 (see [Acknowledged shutdown flush](#acknowledged-shutdown-flush-supervised-exit)
-below); launcher-coordinated host transactions remain the missing piece.
-The current apply path still uses its existing single-binary replacement flow.
-Do not infer pair rollback or launcher protection from this dormant module.
+below). The dormant S3b launcher engine now exists (see the
+"Stable launcher (dormant)" note in the fleet section), but
+launcher-coordinated host transactions are still switched off; activation is
+what remains. The current apply path still uses its existing single-binary
+replacement flow. Do not infer pair rollback or launcher protection from this
+dormant module.
 
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes
@@ -486,6 +489,20 @@ dead-job state as the missing-`KeepAlive` case above: fix the unit
 service. Fleet caveat (ADR-0011): the self-updater restarts only
 `x0xd.service` — after any upgrade, restored or successful, restart
 `x0xd-443` too or it keeps serving the old image.
+
+**Stable launcher (dormant).** `x0x-launcher` is the stable recovery
+actor ADR 0094 §5 requires. M2 trial ownership is held, so the binary is
+dormant: if it is installed and run, it becomes `x0xd` by `exec` and
+keeps the direct job's one-process signal and exit semantics. It sits
+outside the daemon/CLI swap set; the daemon updater never replaces it.
+The daemon also refuses to start while `X0X_M2_BOOT_FD` is set and
+activation is held, so a stray drop-in cannot smuggle a candidate boot.
+No tracked unit binds the launcher yet. Binding a fleet unit needs, in
+the ADR 0094 §5 order: the separately signed launcher artifact in the
+release payload, `install.sh` shipping it beside `x0xd`, the
+authority-inventory check accepting a launcher-owned `ExecStart`, and
+the systemd restart readback accepting launcher-owned jobs — until then
+a launcher-bound unit would refuse every self-update.
 
 #### 2. Restore the known-good binary
 
