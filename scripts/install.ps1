@@ -177,7 +177,7 @@ try {
     # The manifest's archive_sha256 must name this zip before extraction:
     # this refuses a swapped archive without executing any of its content.
     $releaseManifest = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
-    $assetEntry = @($releaseManifest.assets | Where-Object { $_.target -eq "x86_64-pc-windows-msvc" })
+    $assetEntry = @($releaseManifest.assets | Where-Object { $_.target -ceq "x86_64-pc-windows-msvc" })
     if ($assetEntry.Count -ne 1 -or -not $assetEntry[0].archive_sha256) {
         throw "The signed manifest has no archive_sha256 entry for x86_64-pc-windows-msvc."
     }
