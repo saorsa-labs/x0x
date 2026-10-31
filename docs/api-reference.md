@@ -27,8 +27,10 @@ that peer are at least 60 s old while another peer still has traffic and a
 bounded liveness probe fails (issue #1419). Those ages are
 application-data ages. A quiet peer, with both directions idle, answers
 the probe and is not degraded. A probe the endpoint could not run, for a
-busy endpoint or a peer without probe support, is not a failure.
-`GET /status` uses the same stored set and the same rule.
+busy endpoint or a peer without probe support, is not a failure. A peer
+is probed only while another peer has traffic, and a confirmed peer
+stays `degraded` until its link carries traffic again or the verdict
+window ends. `GET /status` uses the same stored set and the same rule.
 `GET /peers` sets `link` to `degraded` for each peer in that set. Fleet
 deployments under a supervisor can additionally set `zero_peer_restart_secs = <secs>` in the
 daemon TOML to make the process exit (for `Restart=always` self-heal) after
@@ -438,7 +440,8 @@ direction on that peer is at least 60 s old and the other direction is at
 most 10 s old, or both directions are at least 60 s old while another peer
 has traffic and the liveness probe fails. The reason is appended to
 `warnings`. A quiet peer, with both directions idle, answers the probe and
-is not degraded. `GET /health`, `GET /status`, and
+is not degraded. A confirmed peer stays `degraded` until its link carries
+traffic again or the verdict window ends. `GET /health`, `GET /status`, and
 `GET /peers` read the one-sided set the health refresher stored.
 
 `revocation_resync_required` is false on a healthy node. It is true when a
@@ -1184,7 +1187,7 @@ or an illegal placement; `501` ceremony disabled.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/peers` | `x0x peers` | Connected gossip peers. Each peer has `id` and `link` (`healthy`, or `degraded` when that peer is in the health refresher's stored one-sided set, #1419). One direction on that peer is at least 60 s old and the other is at most 10 s old, or both directions are at least 60 s old while another peer has traffic and the liveness probe fails. A quiet peer answers the probe and stays `healthy`. |
+| GET | `/peers` | `x0x peers` | Connected gossip peers. Each peer has `id` and `link` (`healthy`, or `degraded` when that peer is in the health refresher's stored one-sided set, #1419). One direction on that peer is at least 60 s old and the other is at most 10 s old, or both directions are at least 60 s old while another peer has traffic and the liveness probe fails. A quiet peer answers the probe and stays `healthy`; a confirmed peer stays `degraded` until it recovers. |
 | GET | `/presence` | `x0x presence` | Presence view of online agents |
 | GET | `/presence/online` | `x0x presence online` | Online agents (network-view trust filter) |
 | GET | `/presence/foaf` | `x0x presence foaf` | Friends-of-friends discovery walk (`?ttl=<hops>`, default 3; social-view trust filter) |

@@ -1065,6 +1065,10 @@ mod tests {
             reason.contains("60s"),
             "reason must name the idle bound: {reason}"
         );
+        assert!(
+            reason.contains("both directions idle"),
+            "reason must name the both-directions-idle case: {reason}"
+        );
     }
 
     #[test]

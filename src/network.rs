@@ -349,6 +349,12 @@ const ONE_SIDED_REDIAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// and still fit inside the 5 s health-refresher tick.
 const ONE_SIDED_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Outer bound around one both-stale probe (#1419). ant-quic's own bound
+/// starts at the reply wait, so the send before it needs this second
+/// bound. It is one second longer, so ant-quic's own verdict decides
+/// whenever it can.
+const ONE_SIDED_PROBE_OUTER_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// How many both-stale liveness probes one health tick may start (#1419).
 /// Candidates beyond the cap keep their turn on the next tick.
 const ONE_SIDED_PROBES_PER_TICK: usize = 4;
@@ -2812,11 +2818,18 @@ pub struct NetworkNode {
     /// How many one-sided warnings this node has logged.
     #[cfg(test)]
     one_sided_warnings: Arc<std::sync::atomic::AtomicU32>,
+    /// How many both-stale liveness probes this node has started (#1419).
+    #[cfg(test)]
+    one_sided_probes: Arc<std::sync::atomic::AtomicU32>,
     /// Test-only pause after the repair disconnect and before its dial.
     /// Models a slow re-dial so the proactive scheduler can be observed
     /// inside the window (#1419).
     #[cfg(test)]
     one_sided_redial_pause: Arc<Mutex<Duration>>,
+    /// Test-only pause before a both-stale liveness probe. Models a probe
+    /// that cannot finish inside the outer bound (#1419).
+    #[cfg(test)]
+    one_sided_probe_pause: Arc<Mutex<Duration>>,
     /// Reconnect-suppression tombstones, keyed by peer id. Set when a peer is
     /// disconnected for a non-transport reason (policy rejection, pool
     /// eviction, admin, revocation, shutdown) so neither the proactive
@@ -3310,7 +3323,11 @@ impl NetworkNode {
             #[cfg(test)]
             one_sided_warnings: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(test)]
+            one_sided_probes: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(test)]
             one_sided_redial_pause: Arc::new(Mutex::new(Duration::ZERO)),
+            #[cfg(test)]
+            one_sided_probe_pause: Arc::new(Mutex::new(Duration::ZERO)),
             reconnect_suppressions: Arc::new(Mutex::new(HashMap::new())),
             seed_pin_rejections: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -3717,15 +3734,26 @@ impl NetworkNode {
             // ant-quic's own probe bound starts at the reply wait. The
             // send before it can park on stream credit until the QUIC
             // idle timeout, so an outer tokio bound keeps the refresher
-            // tick inside one probe budget. The elapsed case counts as a
-            // probe timeout.
+            // tick inside the probe budget. The outer bound is one
+            // second longer, so ant-quic's own verdict decides whenever
+            // it can; only a stall before the reply wait elapses here
+            // and counts as a probe timeout.
             let probes = to_probe.iter().map(|peer| async move {
-                match tokio::time::timeout(
-                    ONE_SIDED_PROBE_TIMEOUT,
-                    self.probe_peer(*peer, ONE_SIDED_PROBE_TIMEOUT),
-                )
-                .await
-                {
+                let probe = async {
+                    #[cfg(test)]
+                    {
+                        self.one_sided_probes.fetch_add(1, Ordering::Relaxed);
+                        let pause = *self
+                            .one_sided_probe_pause
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if !pause.is_zero() {
+                            tokio::time::sleep(pause).await;
+                        }
+                    }
+                    self.probe_peer(*peer, ONE_SIDED_PROBE_TIMEOUT).await
+                };
+                match tokio::time::timeout(ONE_SIDED_PROBE_OUTER_TIMEOUT, probe).await {
                     Ok(result) => result,
                     Err(_) => Some(Err(ant_quic::NodeError::Endpoint(
                         ant_quic::EndpointError::ProbeTimeout,
@@ -3741,6 +3769,12 @@ impl NetworkNode {
                 // `None` means the node is gone: inconclusive, not fresh.
                 let Some(result) = result else { continue };
                 let entry = map.entry(*peer).or_default();
+                if entry.last_attempt.is_some_and(|at| at > now) {
+                    // A re-dial claimed this peer after the probe began.
+                    // The outcome belongs to the link that was torn down,
+                    // so it is not written onto the new link.
+                    continue;
+                }
                 apply_one_sided_probe(entry, now, &result);
                 if entry.both_stale_confirmed {
                     degraded.push(*peer);
@@ -3861,6 +3895,16 @@ impl NetworkNode {
     pub(crate) fn pause_one_sided_redial_for_test(&self, pause: Duration) {
         *self
             .one_sided_redial_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = pause;
+    }
+
+    /// Hold a both-stale liveness probe past the outer bound, so a test
+    /// can observe the elapsed case.
+    #[cfg(test)]
+    pub(crate) fn pause_one_sided_probe_for_test(&self, pause: Duration) {
+        *self
+            .one_sided_probe_pause
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = pause;
     }
@@ -11150,7 +11194,13 @@ mod tests {
             one_sided_peer_ids_from(&quiet).is_empty(),
             "B is quiet on both directions while C is fresh, so B stays up"
         );
+        let probes_before = a.one_sided_probes.load(Ordering::Relaxed);
         let resolved = a.resolve_one_sided_peers(&quiet).await;
+        assert_eq!(
+            a.one_sided_probes.load(Ordering::Relaxed),
+            probes_before + 1,
+            "the quiet peer is probed once"
+        );
         assert!(
             resolved.is_empty(),
             "a quiet link answers the liveness probe, so B stays up"
@@ -11484,6 +11534,159 @@ mod tests {
             healed.is_empty(),
             "the healed link leaves the degraded set at once"
         );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+        c.try_shutdown().await.unwrap();
+    }
+
+    /// #1419: one health tick probes at most four both-stale candidates.
+    /// The rest keep their turn on the next tick, and a peer probed inside
+    /// the window is not probed again before the window ends.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_probe_cap_and_window_cooldown() {
+        let plane = "issue1419-probe-cap";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let mut quiet = Vec::new();
+        for host in 2..=6 {
+            let node = NetworkNode::new(config(host), None, None).await.unwrap();
+            let peer = a
+                .connect_addr(SocketAddr::from(([198, 18, 0, host], 5483)))
+                .await
+                .unwrap();
+            assert_eq!(peer, node.peer_id());
+            quiet.push((node, peer));
+        }
+        let c = NetworkNode::new(config(7), None, None).await.unwrap();
+        let peer_c = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 7], 5483)))
+            .await
+            .unwrap();
+        let a_link = Arc::clone(a.sim_link.as_ref().expect("sim link"));
+        let c_link = Arc::clone(c.sim_link.as_ref().expect("sim link"));
+        let peer_a = a.peer_id();
+        for (node, peer) in &quiet {
+            a_link.send(peer, b"\x7fping").unwrap();
+            node.sim_link
+                .as_ref()
+                .expect("sim link")
+                .send(&peer_a, b"\x7fpong")
+                .unwrap();
+        }
+        a_link.send(&peer_c, b"\x7fac").unwrap();
+        c_link.send(&peer_a, b"\x7fca").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        tokio::time::sleep(ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        a_link.send(&peer_c, b"\x7fac2").unwrap();
+        c_link.send(&peer_a, b"\x7fca2").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let samples = a.connected_link_ages().await;
+        let before = a.one_sided_probes.load(Ordering::Relaxed);
+        let degraded = a.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            a.one_sided_probes.load(Ordering::Relaxed) - before,
+            ONE_SIDED_PROBES_PER_TICK as u32,
+            "one tick probes at most four candidates"
+        );
+        assert!(degraded.is_empty(), "every quiet link answers");
+
+        let degraded = a.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            a.one_sided_probes.load(Ordering::Relaxed) - before,
+            ONE_SIDED_PROBES_PER_TICK as u32 + 1,
+            "the fifth candidate keeps its turn on the next tick"
+        );
+        assert!(degraded.is_empty());
+
+        a.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            a.one_sided_probes.load(Ordering::Relaxed) - before,
+            ONE_SIDED_PROBES_PER_TICK as u32 + 1,
+            "a peer probed inside the window is not probed again"
+        );
+
+        a.try_shutdown().await.unwrap();
+        for (node, _) in quiet {
+            node.try_shutdown().await.unwrap();
+        }
+        c.try_shutdown().await.unwrap();
+    }
+
+    /// #1419: a probe that cannot finish inside the outer bound counts as
+    /// a probe timeout, so the refresher tick stays bounded and the link
+    /// is degraded.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_probe_outer_bound_counts_as_timeout() {
+        let plane = "issue1419-probe-outer";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let c = NetworkNode::new(config(3), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        let peer_c = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 3], 5483)))
+            .await
+            .unwrap();
+        let a_link = Arc::clone(a.sim_link.as_ref().expect("sim link"));
+        let b_link = Arc::clone(b.sim_link.as_ref().expect("sim link"));
+        let c_link = Arc::clone(c.sim_link.as_ref().expect("sim link"));
+        let peer_a = a.peer_id();
+        a_link.send(&peer_b, b"\x7fab").unwrap();
+        b_link.send(&peer_a, b"\x7fba").unwrap();
+        a_link.send(&peer_c, b"\x7fac").unwrap();
+        c_link.send(&peer_a, b"\x7fca").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        tokio::time::sleep(ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        a_link.send(&peer_c, b"\x7fac2").unwrap();
+        c_link.send(&peer_a, b"\x7fca2").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        a.pause_one_sided_probe_for_test(ONE_SIDED_PROBE_OUTER_TIMEOUT + Duration::from_secs(1));
+        let samples = a.connected_link_ages().await;
+        let before = a.one_sided_probes.load(Ordering::Relaxed);
+        let degraded = a.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            a.one_sided_probes.load(Ordering::Relaxed) - before,
+            1,
+            "the stalled candidate is probed once"
+        );
+        assert_eq!(
+            degraded,
+            vec![peer_b],
+            "a probe past the outer bound counts as a probe timeout"
+        );
+        {
+            let repairs = a.one_sided_repairs.lock().unwrap();
+            assert!(
+                repairs[&peer_b].both_stale_confirmed,
+                "the elapsed case is recorded as a confirmed timeout"
+            );
+        }
 
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
