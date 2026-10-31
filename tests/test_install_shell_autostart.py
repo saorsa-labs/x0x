@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
 import tarfile
@@ -14,11 +16,103 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = ROOT / "scripts" / "install.sh"
 PLATFORM = "linux-x64-gnu"
+TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
+
+# Deliberately minimal PATH: everything install.sh needs lives in /usr/bin and
+# /bin, and this keeps a host gpg out of the test, so the gpg branch never
+# runs against fixture files it cannot check.
+TEST_PATH_SUFFIX = "/usr/bin:/bin"
 
 
 def write_executable(path: Path, contents: str) -> None:
     path.write_text(contents, encoding="utf-8")
     path.chmod(0o755)
+
+
+def fake_uname(path: Path) -> None:
+    write_executable(
+        path / "uname",
+        """#!/usr/bin/env sh
+case "$1" in
+    -s) echo Linux ;;
+    -m) echo x86_64 ;;
+    *) exit 1 ;;
+esac
+""",
+    )
+
+
+def fake_x0x(path: Path, extra_env: dict[str, str] | None = None) -> None:
+    """The release's x0x. The --verify-release-manifest probe answers as a
+    genuine release binary would (verification itself is covered by
+    tests/test_install_manifest_verify.py); every other call logs its args."""
+    env_lines = "".join(f'{k}="{v}"\n' for k, v in (extra_env or {}).items())
+    write_executable(
+        path,
+        f"""#!/usr/bin/env sh
+{env_lines}if [ "$1" = "--verify-release-manifest" ]; then
+    exit 0
+fi
+printf '%s\\n' "$*" >> "$XOX_CALLS"
+""",
+    )
+
+
+def signed_release_files(archive: Path) -> dict[str, bytes]:
+    """Downloads a fake release serves per URL: the archive, its sidecar
+    checksum, and a manifest whose linux-x64-gnu entry carries the archive's
+    real SHA-256 (the signature is inert here; see fake_x0x)."""
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    manifest = json.dumps(
+        {
+            "schema_version": 1,
+            "version": "0.0.0-test",
+            "timestamp": 0,
+            "assets": [
+                {
+                    "target": TARGET_TRIPLE,
+                    "archive_url": f"http://fixtures/{archive.name}",
+                    "archive_sha256": digest,
+                    "signature_url": f"http://fixtures/{archive.name}.sig",
+                }
+            ],
+            "skill_url": "",
+            "skill_sha256": "0" * 64,
+        },
+        indent=2,
+    ).encode()
+    return {
+        archive.name: archive.read_bytes(),
+        f"{archive.name}.sha256": f"{digest}  {archive.name}\n".encode(),
+        "release-manifest.json": manifest,
+        "release-manifest.json.sig": b"inert signature bytes",
+    }
+
+
+def fake_curl_script(files_dir: Path, archive: Path, health_result: str) -> str:
+    """One fake curl serving every release URL with the right bytes: the
+    archive, its sidecar checksum, and the signed-manifest pair from
+    files_dir. `health_result` is the fallback for API GETs."""
+    return f"""#!/usr/bin/env sh
+OUT=""
+URL=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) shift; OUT="$1" ;;
+        http*) URL="$1" ;;
+    esac
+    shift
+done
+if [ -n "$OUT" ]; then
+    case "$URL" in
+        *release-manifest.json.sig) cat "{files_dir / 'release-manifest.json.sig'}" > "$OUT"; exit 0 ;;
+        *release-manifest.json) cat "{files_dir / 'release-manifest.json'}" > "$OUT"; exit 0 ;;
+        *.sha256) cat "{files_dir / (archive.name + '.sha256')}" > "$OUT"; exit 0 ;;
+        *) cat "{archive}" > "$OUT"; exit 0 ;;
+    esac
+fi
+{health_result}
+"""
 
 
 class InstallShellAutostartTests(unittest.TestCase):
@@ -37,16 +131,7 @@ class InstallShellAutostartTests(unittest.TestCase):
             archive_dir.mkdir(parents=True)
             home.mkdir()
 
-            write_executable(
-                fake_bin / "uname",
-                """#!/usr/bin/env sh
-case "$1" in
-    -s) echo Linux ;;
-    -m) echo x86_64 ;;
-    *) exit 1 ;;
-esac
-""",
-            )
+            fake_uname(fake_bin)
 
             write_executable(
                 archive_dir / "x0xd",
@@ -75,39 +160,29 @@ printf '%s\\n' "127.0.0.1:65535" > "$DIR/api.port"
 """,
             )
 
-            write_executable(
-                archive_dir / "x0x",
-                """#!/usr/bin/env sh
-printf '%s\\n' "$*" >> "$XOX_CALLS"
-""",
-            )
+            fake_x0x(archive_dir / "x0x")
 
             with tarfile.open(archive, "w:gz") as tar:
                 tar.add(archive_dir / "x0xd", arcname=f"x0x-{PLATFORM}/x0xd")
                 tar.add(archive_dir / "x0x", arcname=f"x0x-{PLATFORM}/x0x")
 
+            files_dir = tmp / "files"
+            files_dir.mkdir()
+            for name, data in signed_release_files(archive).items():
+                (files_dir / name).write_bytes(data)
+
             write_executable(
                 fake_bin / "curl",
-                f"""#!/usr/bin/env sh
-OUT=""
-URL=""
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -o) shift; OUT="$1" ;;
-        http*) URL="$1" ;;
-    esac
-    shift
-done
-if [ -n "$OUT" ]; then
-    cp "{archive}" "$OUT"
-    exit 0
-fi
-case "$URL" in
-    */health) printf '%s\\n' '{{"ok":true}}' ;;
-    */agent) printf '%s\\n' '{{}}' ;;
+                fake_curl_script(
+                    files_dir,
+                    archive,
+                    """case "$URL" in
+    */health) printf '%s\\n' '{"ok":true}' ;;
+    */agent) printf '%s\\n' '{}' ;;
     *) exit 1 ;;
 esac
 """,
+                ),
             )
 
             env = os.environ.copy()
@@ -115,7 +190,7 @@ esac
                 {
                     "HOME": str(home),
                     "XDG_DATA_HOME": str(data_home),
-                    "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', '')}",
+                    "PATH": f"{fake_bin}{os.pathsep}{TEST_PATH_SUFFIX}",
                     "TMPDIR": str(tmp),
                     "XOX_CALLS": str(calls),
                     "XOXD_CALLS": str(daemon_calls),
@@ -153,6 +228,7 @@ esac
                 {
                     "HOME": str(home),
                     "XDG_DATA_HOME": str(data_home),
+                    "PATH": TEST_PATH_SUFFIX,
                     "TMPDIR": str(tmp),
                 }
             )
@@ -186,16 +262,7 @@ esac
             archive_dir.mkdir(parents=True)
             install_bin.mkdir(parents=True)
 
-            write_executable(
-                fake_bin / "uname",
-                """#!/usr/bin/env sh
-case "$1" in
-    -s) echo Linux ;;
-    -m) echo x86_64 ;;
-    *) exit 1 ;;
-esac
-""",
-            )
+            fake_uname(fake_bin)
 
             write_executable(
                 fake_bin / "nohup",
@@ -212,12 +279,7 @@ exit 0
 """,
             )
 
-            write_executable(
-                archive_dir / "x0x",
-                """#!/usr/bin/env sh
-printf '%s\\n' new-cli
-""",
-            )
+            fake_x0x(archive_dir / "x0x")
 
             stale_cli = """#!/usr/bin/env sh
 exit 0
@@ -231,30 +293,19 @@ printf '%s\\n' stale-daemon
             with tarfile.open(archive, "w:gz") as tar:
                 tar.add(archive_dir / "x0x", arcname=f"x0x-{PLATFORM}/x0x")
 
-            write_executable(
-                fake_bin / "curl",
-                f"""#!/usr/bin/env sh
-OUT=""
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -o) shift; OUT="$1" ;;
-    esac
-    shift
-done
-if [ -n "$OUT" ]; then
-    cp "{archive}" "$OUT"
-    exit 0
-fi
-exit 1
-""",
-            )
+            files_dir = tmp / "files"
+            files_dir.mkdir()
+            for name, data in signed_release_files(archive).items():
+                (files_dir / name).write_bytes(data)
+
+            write_executable(fake_bin / "curl", fake_curl_script(files_dir, archive, "exit 1"))
 
             env = os.environ.copy()
             env.update(
                 {
                     "HOME": str(home),
                     "XDG_DATA_HOME": str(data_home),
-                    "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', '')}",
+                    "PATH": f"{fake_bin}{os.pathsep}{TEST_PATH_SUFFIX}",
                     "TMPDIR": str(tmp),
                     "NOHUP_CALLS": str(nohup_calls),
                 }
@@ -297,16 +348,7 @@ exit 1
             archive_dir.mkdir(parents=True)
             home.mkdir()
 
-            write_executable(
-                fake_bin / "uname",
-                """#!/usr/bin/env sh
-case "$1" in
-    -s) echo Linux ;;
-    -m) echo x86_64 ;;
-    *) exit 1 ;;
-esac
-""",
-            )
+            fake_uname(fake_bin)
 
             write_executable(
                 fake_bin / "sleep",
@@ -324,41 +366,25 @@ printf '%s\\n' "127.0.0.1:65535" > "$DIR/api.port"
 """,
             )
 
-            write_executable(
-                archive_dir / "x0x",
-                """#!/usr/bin/env sh
-exit 0
-""",
-            )
+            fake_x0x(archive_dir / "x0x")
 
             with tarfile.open(archive, "w:gz") as tar:
                 tar.add(archive_dir / "x0xd", arcname=f"x0x-{PLATFORM}/x0xd")
                 tar.add(archive_dir / "x0x", arcname=f"x0x-{PLATFORM}/x0x")
 
-            write_executable(
-                fake_bin / "curl",
-                f"""#!/usr/bin/env sh
-OUT=""
-while [ $# -gt 0 ]; do
-    case "$1" in
-        -o) shift; OUT="$1" ;;
-    esac
-    shift
-done
-if [ -n "$OUT" ]; then
-    cp "{archive}" "$OUT"
-    exit 0
-fi
-exit 7
-""",
-            )
+            files_dir = tmp / "files"
+            files_dir.mkdir()
+            for name, data in signed_release_files(archive).items():
+                (files_dir / name).write_bytes(data)
+
+            write_executable(fake_bin / "curl", fake_curl_script(files_dir, archive, "exit 7"))
 
             env = os.environ.copy()
             env.update(
                 {
                     "HOME": str(home),
                     "XDG_DATA_HOME": str(data_home),
-                    "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', '')}",
+                    "PATH": f"{fake_bin}{os.pathsep}{TEST_PATH_SUFFIX}",
                     "TMPDIR": str(tmp),
                 }
             )

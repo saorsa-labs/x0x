@@ -28,10 +28,10 @@ curl -sfL https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install
 
 ## Useful install modes
 
-Install and immediately start the daemon:
+Download and verify only; install nothing:
 
 ```bash
-curl -sfL https://x0x.md | sh -s -- --start
+curl -sfL https://x0x.md | sh -s -- --verify-only
 ```
 
 Install, start, and configure autostart:
@@ -43,7 +43,7 @@ curl -sfL https://x0x.md | sh -s -- --autostart
 Install for a named instance:
 
 ```bash
-curl -sfL https://x0x.md | sh -s -- --name alice --start
+curl -sfL https://x0x.md | sh -s -- --name alice
 ```
 
 ## What the installer does
@@ -51,11 +51,17 @@ curl -sfL https://x0x.md | sh -s -- --name alice --start
 The current installer:
 
 1. Detects platform (`linux-x64-gnu`, `linux-arm64-gnu`, `macos-x64`, `macos-arm64`)
-2. Downloads the latest release archive from GitHub
-3. Installs both `x0x` and `x0xd` into `~/.local/bin`
-4. Ensures the shared x0x data directory exists
-5. Optionally starts the daemon (`--start`)
-6. Optionally configures autostart (`--autostart`)
+2. Downloads the latest release archive, its signed release manifest, and the
+   manifest signature from GitHub
+3. Verifies the archive SHA-256 against the sidecar checksum and the signed
+   manifest entry, then verifies the manifest's ML-DSA-65 signature with the
+   `x0x` binary — an already-installed one when available, else the release's
+   own — and, when `gpg` is present, the GPG signature against the pinned
+   Saorsa Labs release key. A failed or missing check stops the install.
+4. Installs both `x0x` and `x0xd` into `~/.local/bin`
+5. Ensures the shared x0x data directory exists
+6. Starts the daemon
+7. Optionally configures autostart (`--autostart`)
 
 ## Installed locations
 
