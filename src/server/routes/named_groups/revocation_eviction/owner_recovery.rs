@@ -4979,6 +4979,33 @@ mod tests {
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        // The route starts its own drive. Finish it before the head syncs.
+        // Its first pass restores the pending-mandate file (#1625). If that
+        // restore lands after the removal below, it puts back the mandate
+        // that this test treats as consumed, and the waiting attempt then
+        // commits it once. Before the sync, the drive only records the
+        // head-sync wait.
+        let tasks = {
+            let mut tasks = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tasks.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&stable)
+                .map(|info| info.state_hash.clone())
+                .as_deref(),
+            Some(info.state_hash.as_str()),
+            "the route's drive waits for head sync"
+        );
         sync_head(&state, &info).await;
 
         let lock = super::super::super::group_membership_lock(&state, &stable).await;
