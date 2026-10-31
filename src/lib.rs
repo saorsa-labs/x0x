@@ -778,8 +778,9 @@ pub struct Agent {
     /// Presence system wrapper for beacons, FOAF discovery, and events.
     presence: Option<std::sync::Arc<presence::PresenceWrapper>>,
     /// Whether the user has consented to disclosing their identity in
-    /// announcements.  Set by `announce_identity(true, true)` and respected
-    /// by the heartbeat so it doesn't erase a consented disclosure.
+    /// announcements.  Set by a successful `announce_identity(true, true)`
+    /// and respected by the heartbeat so it doesn't erase a consented
+    /// disclosure.
     user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Capability store populated by the advert service and consulted by
     /// `send_direct` to choose between gossip and raw-QUIC paths.
@@ -4969,6 +4970,12 @@ fn prioritize_discovery_addresses(addresses: &mut [std::net::SocketAddr]) {
 ///   machine_id or empty key never clobbers a known value.
 /// - **user_id** is never erased: a fresher *anonymous* announcement keeps a
 ///   previously-disclosed user_id.
+/// - **agent certificate** follows the digest the freshest announce
+///   committed to (ADR-0038 freshness; inline below), except that an
+///   equal-`announced_at` anonymous beat never drops it (#1643): a
+///   one-second timestamp proves no order and no blob fetch can repair the
+///   anonymous digest. Narrow exception to ADR 0115 §1's equal-or-newer
+///   replace rule, recorded for approval in PR #1741.
 /// - **last_seen** reflects the most recent receive: it is set from the
 ///   incoming record (matching the pre-merge replace semantics). In production
 ///   `incoming.last_seen` is the current receive time, so it only moves forward;
@@ -4991,6 +4998,11 @@ async fn upsert_discovered_agent(
     match cache.get_mut(&incoming.agent_id) {
         Some(existing) => {
             if incoming.announced_at >= existing.announced_at {
+                // #1643: the beat the cache held BEFORE this merge. The
+                // cert branch below needs the pre-merge value: by then
+                // `existing.announced_at` is already the incoming one, so
+                // comparing there could never see an EQUAL second.
+                let previously_announced_at = existing.announced_at;
                 existing.announced_at = incoming.announced_at;
                 // Replace, don't union: the announcement carries the agent's
                 // full current address set, so the cached list stays bounded.
@@ -5042,7 +5054,18 @@ async fn upsert_discovered_agent(
                 //    NoCertificate until the fetch lands instead of
                 //    trusting stale material;
                 //  - same digest, or a legacy digest-less record → keep
-                //    (monotone; never demote on missing information).
+                //    (monotone; never demote on missing information);
+                //  - an EQUAL-`announced_at` beat committing to the
+                //    ANONYMOUS digest → keep as well (#1643, a narrow
+                //    exception to ADR 0115 §1's equal-or-newer replace
+                //    rule): a one-second timestamp proves no order, so the
+                //    beat may be a pre-consent build racing the
+                //    disclosure, and no blob ever fetches for the
+                //    anonymous digest — a drop has no repair path, it
+                //    only deletes the disclosed evidence. An explicit
+                //    post-consent anonymous announce in the same second
+                //    is unordered the same way; the next strictly fresher
+                //    anonymous beat withdraws the certificate.
                 if let Some(cert) = incoming.agent_certificate.take() {
                     // E2d: only a CHANGE lands — every announce re-carries
                     // the same certificate, and replaying an identical one
@@ -5061,7 +5084,9 @@ async fn upsert_discovered_agent(
                         publish_verified_certificate(cert_events, incoming.agent_id, &cert);
                     }
                 } else if let Some(digest) = incoming.cert_digest {
-                    if existing.cert_digest != Some(digest) {
+                    let equal_second_anonymous = incoming.announced_at == previously_announced_at
+                        && digest == announce_v3::anonymous_cert_digest();
+                    if existing.cert_digest != Some(digest) && !equal_second_anonymous {
                         if existing.agent_certificate.is_some() {
                             tracing::debug!(
                                 agent = %hex::encode(&incoming.agent_id.0[..8]),
@@ -13796,6 +13821,13 @@ impl Agent {
     ///
     /// By default, announcements include agent + machine identity only.
     /// Human identity disclosure is opt-in and requires explicit consent.
+    /// Consent is recorded only after the disclosure publishes
+    /// successfully, so a failed or cancelled call never leaves it on, and
+    /// a successful disclosure keeps it recorded for the announcements
+    /// that follow (the 3 s delayed beat, the 600 s heartbeat, the ADR
+    /// 0110 §4a renewal re-announce), which then carry the identity
+    /// instead of publishing a strictly-fresher anonymous digest that
+    /// would drop it on every peer (#1643).
     ///
     /// # Arguments
     ///
@@ -13810,6 +13842,33 @@ impl Agent {
     /// - Human identity disclosure is requested but no user identity is configured
     /// - Serialization or publish fails
     pub async fn announce_identity(
+        &self,
+        include_user_identity: bool,
+        human_consent: bool,
+    ) -> error::Result<()> {
+        let result = self
+            .publish_identity_announcement(include_user_identity, human_consent)
+            .await;
+        // #1643: record consent only after the disclosure actually
+        // published (as on main). A publish that fails, or whose future is
+        // dropped mid-await (a client disconnect aborts the
+        // `POST /announce` handler), never reaches this line, so consent
+        // cannot turn on without a published disclosure and heartbeats
+        // never escalate to identity beats on their own. There is nothing
+        // to restore on failure, so concurrent disclosures need no lock:
+        // the only write is this monotone `true`, and a failed call never
+        // touches the flag.
+        if result.is_ok() && include_user_identity && human_consent {
+            self.user_identity_consented
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    /// Build and publish the identity announcement on behalf of
+    /// [`Agent::announce_identity`], which records consent after a
+    /// successful publish.
+    async fn publish_identity_announcement(
         &self,
         include_user_identity: bool,
         human_consent: bool,
@@ -14131,13 +14190,6 @@ impl Agent {
             discovered_agent,
         )
         .await;
-
-        // Record consent AFTER successful publish so heartbeats don't start
-        // including user identity if this announcement never actually propagated.
-        if include_user_identity && human_consent {
-            self.user_identity_consented
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
 
         Ok(())
     }
@@ -35481,6 +35533,181 @@ mod tests {
         assert_eq!(entry.user_id, agent.user_id());
     }
 
+    /// #1643: consent is recorded only after the disclosure publishes
+    /// successfully, so a failed publish never turns it on — heartbeats
+    /// would otherwise keep including a user identity that never
+    /// propagated.
+    #[tokio::test]
+    async fn failed_disclosure_does_not_leave_consent_recorded() {
+        // No network config: the gossip runtime is absent, so the publish
+        // path errors before anything leaves this process. Key files stay
+        // in a temp dir, not ~/.x0x.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .build()
+            .await
+            .unwrap();
+
+        let err = agent.announce_identity(true, true).await.unwrap_err();
+        assert!(
+            err.to_string().contains("gossip runtime not initialized"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !agent
+                .user_identity_consented
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a failed disclosure must restore the prior consent value"
+        );
+    }
+
+    /// #1643 review r3: cancelling the disclosure task (the disconnect
+    /// case) must leave consent off, whatever point it reached.
+    #[tokio::test]
+    async fn cancelled_disclosure_does_not_leave_consent_recorded() {
+        // No network config: the gossip runtime is absent, so the publish
+        // errors or is cancelled before anything leaves this process.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = std::sync::Arc::new(
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let clone = std::sync::Arc::clone(&agent);
+        let task = tokio::spawn(async move { clone.announce_identity(true, true).await });
+        // Let the task run, then cancel it before awaiting the result.
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert!(
+            !agent
+                .user_identity_consented
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a cancelled disclosure must not leave consent on"
+        );
+    }
+
+    /// Waits for the unix second to tick over and returns the new second,
+    /// so an announcement published afterwards is strictly fresher than
+    /// everything published before the call.
+    async fn next_second_boundary() -> u64 {
+        let start = Agent::unix_timestamp_secs();
+        while Agent::unix_timestamp_secs() == start {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Agent::unix_timestamp_secs()
+    }
+
+    /// Reads the next X0A3 identity announce frame a local publish put on
+    /// the identity announce topic. The v3 `payload_version` is
+    /// `announced_at` for an identity announce and `0` for an anonymous
+    /// one, so it distinguishes the two without a peer.
+    async fn next_v3_announcement(
+        wire: &mut gossip::pubsub::Subscription,
+    ) -> announce_v3::IdentityAnnouncementV3 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, wire.recv())
+                .await
+                .expect("an identity announcement was published")
+                .expect("the wire subscription stays open");
+            if !announce_v3::is_v3_payload(&msg.payload) {
+                continue;
+            }
+            return announce_v3::deserialize_v3(&msg.payload)
+                .expect("the identity announce wire frame decodes");
+        }
+    }
+
+    /// #1643 review r3: a successful consented disclosure records consent,
+    /// so every beat that follows it — the 3 s delayed beat and the 600 s
+    /// heartbeat, both `HeartbeatContext::announce` — is an identity beat
+    /// (v3 `payload_version` = `announced_at`, not the anonymous `0`) and
+    /// not a strictly-fresher anonymous digest that would drop the
+    /// certificate on every peer, and the ADR 0110 §4a renewal re-announce
+    /// (`reannounce_identity_if_consented`) fires. Red at 4c97e71b, where
+    /// the `ConsentGrant` keep bug left consent off after every
+    /// successful disclosure.
+    #[tokio::test]
+    async fn consented_disclosure_is_followed_by_identity_beats_and_renewal_reannounce() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_user_key(identity::UserKeypair::generate().unwrap())
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_dir(dir.path().join("peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("networked agent with a user identity");
+        // The real announce path, observed on the wire: the disclosure and
+        // the beats each publish an X0A3 frame on the identity announce
+        // topic, and a local subscriber receives every publish.
+        let runtime = agent
+            .gossip_runtime
+            .as_ref()
+            .expect("a networked agent has a gossip runtime");
+        let mut wire = runtime
+            .pubsub()
+            .subscribe(IDENTITY_ANNOUNCE_TOPIC.to_string())
+            .await;
+
+        // The consented disclosure.
+        agent
+            .announce_identity(true, true)
+            .await
+            .expect("the disclosure publishes");
+        assert!(
+            agent
+                .user_identity_consented
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a successful disclosure records consent"
+        );
+        let disclosure = next_v3_announcement(&mut wire).await;
+        assert_ne!(
+            disclosure.payload_version, 0,
+            "the disclosure carries the identity, not the anonymous digest"
+        );
+
+        // The beat after the disclosure, in a strictly later second so an
+        // anonymous beat cannot hide behind the equal-second keep rule.
+        // `reannounce_identity` runs the same `HeartbeatContext::announce`
+        // the 3 s delayed beat and the 600 s heartbeat run.
+        let beat_second = next_second_boundary().await;
+        agent
+            .reannounce_identity()
+            .await
+            .expect("the beat publishes");
+        let beat = next_v3_announcement(&mut wire).await;
+        assert_ne!(
+            beat.payload_version, 0,
+            "the beat after consent is an identity beat, not an anonymous one"
+        );
+        assert!(
+            beat.payload_version >= beat_second,
+            "the identity beat is the strictly fresher announcement peers see"
+        );
+
+        // The ADR 0110 §4a renewal re-announce fires on the recorded
+        // consent instead of returning as a no-op.
+        let renewal_second = next_second_boundary().await;
+        agent
+            .reannounce_identity_if_consented()
+            .await
+            .expect("the renewal re-announce publishes");
+        let renewal = next_v3_announcement(&mut wire).await;
+        assert!(
+            renewal.payload_version >= renewal_second,
+            "the renewal re-announce published a fresh identity announcement"
+        );
+    }
+
     /// #650 regression: a loopback-bound daemon's gossip advert must agree
     /// with its agent card (#638/#649). ant-quic 0.27.50 honours the
     /// explicit P2P bind, so every other interface address (LAN,
@@ -41416,6 +41643,295 @@ async fn upsert_discovered_agent_preserves_known_user_id() {
         Some(user),
         "a fresher anonymous announcement must not erase a disclosed user_id"
     );
+}
+
+/// #1643: `announced_at` has one-second precision, so a disclosure and an
+/// anonymous beat built in the same second are unordered on the wire —
+/// the beat may be a pre-consent build racing the disclosure (an explicit
+/// post-consent anonymous announce in the same second is unordered the
+/// same way). When gossip delivers the anonymous beat after the
+/// disclosure, the merge must not read its anonymous digest as a re-key:
+/// no blob ever fetches for the anonymous digest, so dropping the
+/// certificate has no repair path. Until the next cert-carrying beat,
+/// owner trust on the peer would read false and the owner-trust gates
+/// (remote GUI show, owner-only routes) would refuse.
+#[tokio::test]
+async fn same_second_anonymous_announce_keeps_a_disclosed_certificate() {
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let cert_events = test_cert_events();
+    let user = identity::UserKeypair::generate().unwrap();
+    let member = identity::AgentKeypair::generate().unwrap();
+    let cert = identity::AgentCertificate::issue(&user, &member).unwrap();
+    let user_id = user.user_id();
+    let id = member.agent_id();
+    let digest = announce_v3::cert_digest(&Some(user_id), &Some(cert.clone()));
+
+    // The disclosure lands first: certificate, digest and user_id present.
+    let mut disclosed = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], Some(user_id));
+    disclosed.agent_id = id;
+    disclosed.agent_certificate = Some(cert.clone());
+    disclosed.cert_not_after = cert.not_after();
+    disclosed.cert_digest = Some(digest);
+    upsert_discovered_agent(&cache, &cert_events, disclosed).await;
+
+    // The pre-consent anonymous beat, built in the SAME second, delivered
+    // after the disclosure (reverse order).
+    let mut anonymous = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    anonymous.agent_id = id;
+    anonymous.cert_digest = Some(announce_v3::anonymous_cert_digest());
+    upsert_discovered_agent(&cache, &cert_events, anonymous).await;
+
+    {
+        let guard = cache.read().await;
+        let entry = guard.get(&id).expect("entry present");
+        assert!(
+            entry.agent_certificate.as_ref().is_some_and(|c| c == &cert),
+            "a same-second anonymous beat must not drop the disclosed certificate"
+        );
+        assert_eq!(
+            entry.cert_digest,
+            Some(digest),
+            "the certificate stays coupled to the digest it arrived under"
+        );
+        assert_eq!(entry.user_id, Some(user_id));
+    }
+
+    // A same-second beat committing to a DIFFERENT non-anonymous digest (a
+    // re-key inside one second) still drops: the blob fetch can repair it.
+    let mut same_second_rekey = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    same_second_rekey.agent_id = id;
+    same_second_rekey.cert_digest = Some([0xAA; 32]);
+    upsert_discovered_agent(&cache, &cert_events, same_second_rekey).await;
+    {
+        let guard = cache.read().await;
+        let entry = guard.get(&id).expect("entry present");
+        assert!(
+            entry.agent_certificate.is_none(),
+            "a same-second non-anonymous re-key digest still drops the certificate"
+        );
+        assert_eq!(entry.cert_digest, Some([0xAA; 32]));
+    }
+
+    // Restore the disclosed state, then ADR-0038 freshness is intact: a
+    // strictly fresher anonymous beat still drops the cached certificate.
+    // There the beat provably postdates the disclosure, so the digest
+    // change reads as a withdrawal.
+    let mut again = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    again.agent_id = id;
+    again.agent_certificate = Some(cert.clone());
+    again.cert_not_after = cert.not_after();
+    again.cert_digest = Some(digest);
+    upsert_discovered_agent(&cache, &cert_events, again).await;
+    let mut fresher_anonymous = discovered_agent_fixture(9, 1_005, &["1.2.3.4:5483"], None);
+    fresher_anonymous.agent_id = id;
+    fresher_anonymous.cert_digest = Some(announce_v3::anonymous_cert_digest());
+    upsert_discovered_agent(&cache, &cert_events, fresher_anonymous).await;
+    let guard = cache.read().await;
+    let entry = guard.get(&id).expect("entry present");
+    assert!(
+        entry.agent_certificate.is_none(),
+        "a strictly fresher anonymous beat still drops the cached certificate"
+    );
+    assert_eq!(
+        entry.cert_digest,
+        Some(announce_v3::anonymous_cert_digest())
+    );
+}
+
+/// #1643, announced-binding store: the binding carries the certificate
+/// evidence the owner-trust and revocation gates read, and its expiry
+/// feeds [`identity::is_expired`] — a CLEARED expiry fails open (`None` is
+/// never expired). The store therefore takes the same equal-second rule as
+/// the discovery cache: an anonymous beat built in the SAME second as the
+/// disclosure, delivered after it, must not replace the binding's
+/// `cert_digest` or clear its `cert_not_after`. A one-second timestamp
+/// cannot order the two beats, and no blob ever fetches for the anonymous
+/// digest, so the drop has no repair path — it only deletes the disclosed
+/// evidence and opens the expiry until the next cert-carrying beat.
+/// Everything else still replaces, pinned by the controls below.
+#[tokio::test]
+async fn same_second_anonymous_announce_keeps_a_disclosed_binding_certificate() {
+    let machine_cache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let bindings = std::sync::Arc::new(tokio::sync::RwLock::new(
+        dm_inbox::AuthenticatedMachineBindingCache::default(),
+    ));
+    let discovery = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let cert_events = test_cert_events();
+    let user = identity::UserKeypair::generate().unwrap();
+    let member = identity::AgentKeypair::generate().unwrap();
+    // A PRESENT expiry: the fail-open this test guards is the None clear.
+    let not_after = 2_000_000_000u64;
+    let cert =
+        identity::AgentCertificate::issue_with_expiry(&user, &member, Some(not_after)).unwrap();
+    let user_id = user.user_id();
+    let id = member.agent_id();
+    let digest = announce_v3::cert_digest(&Some(user_id), &Some(cert.clone()));
+
+    // The disclosure lands first, through the identity listener's real
+    // cache step: the binding commits to the certificate's digest and
+    // carries its expiry.
+    let mut disclosed = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], Some(user_id));
+    disclosed.agent_id = id;
+    disclosed.agent_certificate = Some(cert.clone());
+    disclosed.cert_not_after = cert.not_after();
+    disclosed.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        disclosed,
+    )
+    .await;
+
+    // The pre-consent anonymous beat, built in the SAME second and from a
+    // different machine, delivered after the disclosure (reverse order).
+    let mut anonymous = discovered_agent_fixture(8, 1_000, &["1.2.3.4:5483"], None);
+    anonymous.agent_id = id;
+    anonymous.cert_digest = Some(announce_v3::anonymous_cert_digest());
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        anonymous,
+    )
+    .await;
+
+    {
+        let store = bindings.read().await;
+        let binding = store.peek(&id).expect("binding present");
+        assert_eq!(
+            binding.cert_digest,
+            Some(digest),
+            "a same-second anonymous beat must not replace the binding's cert_digest"
+        );
+        assert_eq!(
+            binding.cert_not_after,
+            Some(not_after),
+            "a same-second anonymous beat must not clear the binding's expiry — a cleared \
+             expiry fails open in identity::is_expired"
+        );
+        assert_eq!(
+            binding.machine_id,
+            identity::MachineId([8u8; 32]),
+            "the keep protects only the certificate fields; the machine still replaces"
+        );
+    }
+
+    // A same-second beat committing to a DIFFERENT non-anonymous digest (a
+    // re-key inside one second) still re-keys: the blob fetch repairs the
+    // expiry when its certificate lands.
+    let mut same_second_rekey = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    same_second_rekey.agent_id = id;
+    same_second_rekey.cert_digest = Some([0xAA; 32]);
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        same_second_rekey,
+    )
+    .await;
+    {
+        let store = bindings.read().await;
+        let binding = store.peek(&id).expect("binding present");
+        assert_eq!(
+            binding.cert_digest,
+            Some([0xAA; 32]),
+            "a same-second non-anonymous re-key digest still replaces the binding's digest"
+        );
+        assert_eq!(
+            binding.cert_not_after, None,
+            "a re-key's expiry lands when its blob fetch completes"
+        );
+    }
+
+    // Restore the disclosed state, then a STRICTLY fresher anonymous beat
+    // still withdraws: there the beat provably postdates the disclosure,
+    // so the digest change reads as a withdrawal.
+    let mut again = discovered_agent_fixture(9, 1_002, &["1.2.3.4:5483"], Some(user_id));
+    again.agent_id = id;
+    again.agent_certificate = Some(cert);
+    again.cert_not_after = Some(not_after);
+    again.cert_digest = Some(digest);
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        again,
+    )
+    .await;
+    let mut fresher_anonymous = discovered_agent_fixture(9, 1_005, &["1.2.3.4:5483"], None);
+    fresher_anonymous.agent_id = id;
+    fresher_anonymous.cert_digest = Some(announce_v3::anonymous_cert_digest());
+    cache_verified_announcement(
+        &machine_cache,
+        &bindings,
+        None,
+        &discovery,
+        &cert_events,
+        fresher_anonymous,
+    )
+    .await;
+    {
+        let store = bindings.read().await;
+        let binding = store.peek(&id).expect("binding present");
+        assert_eq!(
+            binding.cert_digest,
+            Some(announce_v3::anonymous_cert_digest()),
+            "a strictly fresher anonymous beat still replaces the binding's digest"
+        );
+        assert_eq!(
+            binding.cert_not_after, None,
+            "a strictly fresher anonymous beat still clears the binding's expiry"
+        );
+    }
+}
+
+/// #1643, fetch-pending variant: the peer's entry holds only the DIGEST of
+/// a disclosure whose blob fetch is still in flight. A same-second
+/// pre-consent anonymous beat must not move the entry to the anonymous
+/// digest — `patch_discovery_entry_when_blob_lands` only attaches a
+/// certificate while the entry still commits to the fetched digest, so the
+/// old behavior stranded the in-flight repair and left the peer without
+/// evidence until the agent's next cert-carrying beat.
+#[tokio::test]
+async fn same_second_anonymous_announce_keeps_a_pending_fetch_digest() {
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let cert_events = test_cert_events();
+    let user = identity::UserKeypair::generate().unwrap();
+    let member = identity::AgentKeypair::generate().unwrap();
+    let cert = identity::AgentCertificate::issue(&user, &member).unwrap();
+    let id = member.agent_id();
+    let digest = announce_v3::cert_digest(&Some(user.user_id()), &Some(cert));
+
+    // The disclosure's V3 beat landed: digest known, certificate still
+    // behind the async blob fetch.
+    let mut pending = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    pending.agent_id = id;
+    pending.cert_digest = Some(digest);
+    upsert_discovered_agent(&cache, &cert_events, pending).await;
+
+    let mut anonymous = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
+    anonymous.agent_id = id;
+    anonymous.cert_digest = Some(announce_v3::anonymous_cert_digest());
+    upsert_discovered_agent(&cache, &cert_events, anonymous).await;
+
+    let guard = cache.read().await;
+    let entry = guard.get(&id).expect("entry present");
+    assert_eq!(
+        entry.cert_digest,
+        Some(digest),
+        "the entry keeps the digest the in-flight fetch will resolve"
+    );
+    assert!(entry.agent_certificate.is_none());
 }
 
 #[test]
