@@ -248,12 +248,31 @@ The private pair engine is implemented and tested, but no live apply path calls
 it yet. Activation requires the S2c host inventory and the S3a acknowledged
 flush, whose daemon-side owner and arm-and-flush control listener now exist
 (see [Acknowledged shutdown flush](#acknowledged-shutdown-flush-supervised-exit)
-below). The dormant S3b launcher engine now exists (see the
-"Stable launcher (dormant)" note in the fleet section), but
-launcher-coordinated host transactions are still switched off; activation is
-what remains. The current apply path still uses its existing single-binary
+below). The launcher-side flush receipt, reap check and pair restore code
+now exists too, but it is switched off (`ENABLED = false`) and no apply path
+calls it; activation of launcher-coordinated host transactions is what
+remains. The current apply path still uses its existing single-binary
 replacement flow. Do not infer pair rollback or launcher protection from this
 dormant module.
+
+The dormant launcher trial (`src/upgrade/launcher/run.rs`) bounds a candidate
+start. It reserves each attempt durably before exec, so a failed exec still
+counts. The limits are at most 3 attempts, 120 s to readiness per attempt,
+60 s of stable health and a 660 s total trial, with 10 s between attempts.
+These values are provisional until David rules on them. When the attempts
+or the total budget run out, the cause is Failed. A changed boot, a launcher
+restart during exec or rollback, or a service stop during the trial is
+Interrupted. In each case the launcher restores the previous pair and starts
+the restored daemon. A restarted launcher resumes an interrupted rollback,
+keeps the first rollback cause, and starts only a missing restored child, at
+most 3 times. A failed reap or a failed restored start stops automatic
+recovery (`RecoveryFailed`) until an operator repairs the host.
+
+While launcher activation is held, `x0xd` refuses to start if the
+`X0X_M2_BOOT_FD` environment variable is set, even to an empty value. The
+check runs before argument parsing, so `--help` and `--check` refuse too. The
+error names the variable. This is a fail-closed guard against a half-armed
+launcher. Remove the variable from the unit or shell to start `x0xd`.
 
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes
@@ -492,17 +511,22 @@ service. Fleet caveat (ADR-0011): the self-updater restarts only
 
 **Stable launcher (dormant).** `x0x-launcher` is the stable recovery
 actor ADR 0094 §5 requires. M2 trial ownership is held, so the binary is
-dormant: if it is installed and run, it becomes `x0xd` by `exec` and
-keeps the direct job's one-process signal and exit semantics. It sits
-outside the daemon/CLI swap set; the daemon updater never replaces it.
-The daemon also refuses to start while `X0X_M2_BOOT_FD` is set and
-activation is held, so a stray drop-in cannot smuggle a candidate boot.
-No tracked unit binds the launcher yet. Binding a fleet unit needs, in
-the ADR 0094 §5 order: the separately signed launcher artifact in the
-release payload, `install.sh` shipping it beside `x0xd`, the
-authority-inventory check accepting a launcher-owned `ExecStart`, and
-the systemd restart readback accepting launcher-owned jobs — until then
-a launcher-bound unit would refuse every self-update.
+dormant: run as `x0x-launcher /absolute/path/x0xd [args]`, it becomes
+`x0xd` by `exec` and keeps the direct job's one-process signal and exit
+semantics. The daemon path must be absolute; the launcher never searches
+`PATH`. A missing daemon path exits 64 (`EX_USAGE`). A failed `exec` exits
+75 (`EX_TEMPFAIL`), which `Restart=always` retries as for a direct unit.
+The launcher sits outside the daemon/CLI swap set; the daemon updater never
+replaces it. `x0xd` also refuses to start while `X0X_M2_BOOT_FD` is set
+(see [Dormant pair transaction](#dormant-pair-transaction-m2-s2e)).
+
+No tracked unit binds the launcher yet. ADR 0094 §5 lists four
+preconditions for binding a fleet unit: the separately signed launcher
+artifact in the release payload, `install.sh` shipping it beside `x0xd`,
+the authority-inventory check accepting a launcher-owned `ExecStart`, and
+the systemd restart readback accepting launcher-owned jobs. Until all four
+hold, a launcher-bound unit would refuse every self-update. The unit switch
+also needs David's approval because it changes production hosts.
 
 #### 2. Restore the known-good binary
 

@@ -304,21 +304,7 @@ run_launcher_case() {
     systemctl_bounded "launcher-stop-$case_name" "$case_dir/stop.out" "$case_dir/stop.err" stop "$unit"
   fi
   wait_file "$case_dir/done.json" 30
-  python3 - "$case_dir" "$case_name" <<'PY_CHECK'
-import json, pathlib, sys
-root, case = pathlib.Path(sys.argv[1]), sys.argv[2]
-done = json.loads((root / 'done.json').read_text())
-assert done['case'] == case, done
-assert done['attempts'] == (1 if case in ('restart', 'restart-child', 'stop') else 3), done
-if case.startswith('restart'):
-    assert done['deadline_ms'] == int((root / 'original-deadline').read_text()), done
-    first = json.loads((root / 'first-invocation.json').read_text())
-    assert first['pid'] != done['pid'] and first['invocation'] != done['invocation'], (first, done)
-if case == 'stop':
-    assert not (root / 'restored-started.json').exists()
-else:
-    assert (root / 'restored-started.json').is_file()
-PY_CHECK
+  python3 -B "$script_dir/linux690_launcher_done.py" "$case_dir" "$case_name"
   journal_bounded "launcher-journal-$case_name" "$unit" "$case_dir/journal.txt" "$case_dir/journal.err" || true
   systemctl_bounded "launcher-final-stop-$case_name" "$case_dir/final-stop.out" "$case_dir/final-stop.err" stop "$unit" || true
   systemctl_bounded "launcher-reset-$case_name" "$case_dir/reset.out" "$case_dir/reset.err" reset-failed "$unit" || true

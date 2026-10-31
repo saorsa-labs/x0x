@@ -181,11 +181,12 @@ fn prepare(root: &Path, case: &str) -> (recovery::Host, Trial) {
     )
     .unwrap();
     let path = root.join("trial.json");
-    // Missing receipt cannot start NEW while OLD is still alive.
+    // Without an OLD reap receipt, authorize refuses the start.
     assert!(control::authorize(&host, &mut trial, &path, &[]).is_err());
     assert_eq!(trial.attempts, 0);
     let reaped =
-        control::flush_and_reap(&host, &trial, &path, &mut old, "inert launcher fixture").unwrap();
+        control::flush_and_reap(&host, &mut trial, &path, &mut old, "inert launcher fixture")
+            .unwrap();
     control::authorize(&host, &mut trial, &path, &[reaped]).unwrap();
     (host, trial)
 }
@@ -323,6 +324,7 @@ fn systemd() {
         root.join("done.json"),
         serde_json::to_vec(&serde_json::json!({"case": case,
         "attempts": trial.attempts, "deadline_ms": trial.deadline_ms, "cause": trial.cause,
+        "verdict": trial.verdict,
         "pid": std::process::id(), "invocation": std::env::var("INVOCATION_ID").unwrap()}))
         .unwrap(),
     )

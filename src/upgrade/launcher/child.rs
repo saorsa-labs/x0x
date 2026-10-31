@@ -74,7 +74,7 @@ impl Owned {
             }
         };
         drop(channel);
-        let setup = (|| {
+        let setup = (|| -> io::Result<Identity> {
             let child_identity = identity(child.id())?;
             trial.child = Some(child_identity.clone());
             trial.save(path)?;
@@ -114,9 +114,17 @@ impl Owned {
                 channel: Some(parent),
                 booted: false,
             })),
+            // A candidate that dies before it takes its permit (EPIPE) or
+            // that this OS cannot hold in custody is a failed attempt: the
+            // caller charges it and retries. Only a failed reap is final.
             Err(error) => {
-                stop_and_reap(&mut child)?;
-                Err(error)
+                if let Err(reap) = stop_and_reap(&mut child) {
+                    let error = invalid(format!("{error}; reap also failed: {reap}"));
+                    return Err(trial.recovery_failed(path, error));
+                }
+                trial.child = None;
+                trial.cause = Some(format!("boot setup failed: {error}"));
+                Ok(None)
             }
         }
     }
@@ -208,7 +216,10 @@ pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
         return Ok(());
     }
     if !super::ENABLED {
-        return Err(invalid("M2 launcher activation is held"));
+        return Err(invalid(format!(
+            "{BOOT_FD} is set, but M2 launcher activation is held; \
+             unset {BOOT_FD} to start x0xd"
+        )));
     }
     candidate_boot_owned(version)
 }
@@ -292,5 +303,24 @@ pub(super) fn absent(expected: &Identity) -> io::Result<bool> {
         Ok(actual) => Ok(actual != *expected),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// While activation is held, x0xd refuses a launcher boot descriptor
+    /// and the refusal names the variable the operator must remove.
+    #[test]
+    fn a_held_boot_descriptor_refuses_and_names_the_variable() {
+        candidate_boot("0.0.0").unwrap();
+        // Each nextest test runs in its own process, so the environment
+        // change cannot reach another test.
+        std::env::set_var(BOOT_FD, "3");
+        let error = candidate_boot("0.0.0").unwrap_err().to_string();
+        std::env::remove_var(BOOT_FD);
+        assert!(error.contains("X0X_M2_BOOT_FD"), "{error}");
+        assert!(error.contains("held"), "{error}");
     }
 }

@@ -3,12 +3,14 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import stat
 import subprocess
 import tempfile
 import textwrap
 import unittest
+import linux690_launcher_done
 from systemd_isolation import fixture_identity, validate
 
 RUNNER = Path(__file__).with_name("linux690-systemd-acceptance.sh")
@@ -318,6 +320,91 @@ class M2IsolationControls(unittest.TestCase):
             with self.subTest(field=field):
                 result = self.run_with_admission(receipt)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class LauncherDoneCheck(unittest.TestCase):
+    REASONS = {
+        "exec": ("failed", "launch attempts exhausted: exec failed: No such file"),
+        "crash": ("failed", "launch attempts exhausted: candidate exited before commit"),
+        "hang": ("failed", "launch attempts exhausted: readiness deadline reached"),
+        "restart": ("interrupted", "launcher died during exec"),
+        "restart-child": ("interrupted", "launcher lost child custody"),
+    }
+
+    def fixture(self, case: str, **changes: object) -> Path:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        done: dict[str, object] = {
+            "case": case,
+            "attempts": 1 if case in ("restart", "restart-child", "stop") else 3,
+            "deadline_ms": 5000,
+            "cause": None,
+            "verdict": None,
+            "pid": 200,
+            "invocation": "inv-2",
+        }
+        if case in self.REASONS:
+            klass, reason = self.REASONS[case]
+            done["verdict"] = {"class": klass, "reason": reason}
+            (root / "restored-started.json").write_text("{}\n", encoding="utf-8")
+        if case.startswith("restart"):
+            (root / "original-deadline").write_text("5000\n", encoding="utf-8")
+            first = {"pid": 100, "invocation": "inv-1"}
+            (root / "first-invocation.json").write_text(json.dumps(first), encoding="utf-8")
+        done.update(changes)
+        (root / "done.json").write_text(json.dumps(done), encoding="utf-8")
+        return root
+
+    def rejects(self, root: Path, case: str) -> None:
+        with self.assertRaises((AssertionError, ValueError)):
+            linux690_launcher_done.check(root, case)
+        self.assertNotEqual(linux690_launcher_done.main(["x", str(root), case]), 0)
+
+    def test_each_case_passes(self) -> None:
+        for case in ("exec", "crash", "hang", "restart", "restart-child", "stop"):
+            with self.subTest(case=case):
+                root = self.fixture(case)
+                linux690_launcher_done.check(root, case)
+                self.assertEqual(linux690_launcher_done.main(["x", str(root), case]), 0)
+
+    def test_unknown_case_fails(self) -> None:
+        self.rejects(self.fixture("stop"), "other")
+
+    def test_wrong_verdict_class_fails(self) -> None:
+        verdict = {"class": "interrupted", "reason": self.REASONS["hang"][1]}
+        self.rejects(self.fixture("hang", verdict=verdict), "hang")
+
+    def test_reason_without_case_text_fails(self) -> None:
+        reason = "launch attempts exhausted: candidate did not acknowledge its boot barrier"
+        self.rejects(self.fixture("crash", verdict={"class": "failed", "reason": reason}), "crash")
+
+    def test_missing_verdict_fails(self) -> None:
+        self.rejects(self.fixture("exec", verdict=None), "exec")
+
+    def test_stop_with_verdict_fails(self) -> None:
+        verdict = {"class": "interrupted", "reason": "launcher died during exec"}
+        self.rejects(self.fixture("stop", verdict=verdict), "stop")
+
+    def test_wrong_attempts_fails(self) -> None:
+        self.rejects(self.fixture("crash", attempts=2), "crash")
+        self.rejects(self.fixture("restart", attempts=3), "restart")
+
+    def test_stop_with_restored_child_fails(self) -> None:
+        root = self.fixture("stop")
+        (root / "restored-started.json").write_text("{}\n", encoding="utf-8")
+        self.rejects(root, "stop")
+
+    def test_missing_restored_child_fails(self) -> None:
+        root = self.fixture("hang")
+        (root / "restored-started.json").unlink()
+        self.rejects(root, "hang")
+
+    def test_restart_with_changed_deadline_fails(self) -> None:
+        self.rejects(self.fixture("restart", deadline_ms=6000), "restart")
+        self.rejects(self.fixture("restart-child", deadline_ms=6000), "restart-child")
+
+    def test_restart_reusing_first_pid_fails(self) -> None:
+        self.rejects(self.fixture("restart", pid=100), "restart")
 
 
 if __name__ == "__main__":
