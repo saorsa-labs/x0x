@@ -178,6 +178,22 @@ struct S4Inner {
     head_rounds: HashMap<String, HeadRound>,
     /// §2: the last ask of each peer in the current round.
     head_round_asks: HeadRoundAsks,
+    /// #1660 (Engineer ruling, 29 Oct 17:12 GMT): how many head asks
+    /// this node has sent to each seat of each group. A delivery row's
+    /// share record keeps the count at its seal; a report closes a GSS
+    /// seat only after the count moved past that, so only answers that
+    /// could answer an ask sent after the seal close the seat.
+    head_ask_seq: HashMap<(String, [u8; 32]), u64>,
+    /// #1660 (Engineer ruling, 30 Oct 05:10 GMT): the seat's share-seal
+    /// generation. It advances only when a seal creates the seat's share
+    /// record or changes its key (`crypto_exclusion::note_share_went_to`
+    /// moves it). An ask task reads it before its request leaves and
+    /// again at completion, so a completion whose send was in flight
+    /// across such a seal never credits the count. The generation is
+    /// monotonic for the daemon's life — the worker pass never drops it,
+    /// so a group that leaves the open set and returns never reuses a
+    /// value an in-flight ask still holds.
+    share_seal_seq: HashMap<(String, [u8; 32]), u64>,
     /// §2: accepted `202 queued` manual bans, persisted in the `.evs` v2
     /// extension until the ban is applied.
     queued_bans: BTreeMap<EvictionKey, u64>,
@@ -923,22 +939,36 @@ pub(in crate::server) async fn seal_probe_for_test(
 }
 
 /// §2: the catch-up response handler calls this for each verified,
-/// applied, non-truncated catch-up page, with or without the
-/// responder's saved head (`responder_state_hash`). The sender is an
-/// active, unrevoked member; the handler checked that. §3: the same
-/// answer is the sender's survivor convergence evidence for the S4
-/// deliveries of the group ([`crypto_exclusion::note_survivor_head`]).
-/// An absent field is the
-/// #1578 keyless disclaimer (David's ruling, 28 Oct 02:09 GMT) only
-/// from a keyless survivor
+/// applied, non-truncated catch-up page, with or without the responder's
+/// saved head (`responder_state_hash`). The handler checked the sender
+/// when the answer arrived — an active, unrevoked member. #1660 (ADR
+/// 0110 §3: no mid-send exception) makes the delivery completion step
+/// re-check the live roster before it closes a seat as delivered. The
+/// handler's checks ran before the page applied, and a removal or
+/// revocation can land inside that window.
+///
+/// A sender that is no longer an Active member, or that the revocation
+/// verdict refuses, closes no seat. A GSS row's report closes a seat
+/// only when a sealed share went to the key the sender's seat carries
+/// now, and a head ask went to the seat after that seal (Engineer
+/// ruling, 29 Oct 17:12 GMT).
+/// The report itself is still a verified, applied page, so it keeps
+/// counting for the §2 head round (chain agreement). Only the
+/// seat-closing is gated.
+///
+/// §3: the same answer is the sender's survivor convergence evidence
+/// for the S4 deliveries of the group
+/// ([`crypto_exclusion::note_survivor_head`]).
+///
+/// An absent field is the #1578 keyless disclaimer (David's ruling,
+/// 28 Oct 02:09 GMT) only from a keyless survivor
 /// ([`hashless_answer_is_a_keyless_disclaimer`], Engineer ruling (2),
-/// 28 Oct 23:34 GMT): no head is convergence evidence, and that
-/// sender's answer counts for the ask cadence only
-/// ([`note_head_disclaimed`]); its unresolved head evidence persists,
-/// because a keyless reply does not prove the head the sender reported
-/// reached the local chain (ADR 0110 §2). Every other sender's
-/// hash-less answer is exactly main's reply: ignored, so the ask
-/// cadence still counts the sender.
+/// 28 Oct 23:34 GMT). No head is convergence evidence. That sender's
+/// answer counts for the ask cadence only ([`note_head_disclaimed`]).
+/// Its unresolved head evidence persists: a keyless reply does not
+/// prove the head the sender reported reached the local chain
+/// (ADR 0110 §2). Every other sender's hash-less answer is exactly
+/// main's reply — ignored, so the ask cadence still counts the sender.
 pub(in crate::server) async fn note_catchup_head(
     state: &AppState,
     group_ids: &[String],
@@ -953,6 +983,15 @@ pub(in crate::server) async fn note_catchup_head(
         let groups = state.named_groups.read().await;
         group_ids.iter().find_map(|id| {
             crate::server::resolve_group_entry_locked(&groups, id).map(|(_, info)| {
+                // #1660: the sender's seat on the live roster, the one
+                // this answer is judged against. `None` when the sender
+                // is no Active member any more.
+                let seat = info
+                    .active_members()
+                    .find(|member| member.agent_id == sender_hex)
+                    .map(|member| crypto_exclusion::SenderSeat {
+                        key: member.kem_public_key_b64.clone(),
+                    });
                 (
                     info.stable_group_id().to_string(),
                     info.state_hash.clone(),
@@ -962,13 +1001,30 @@ pub(in crate::server) async fn note_catchup_head(
                             installed_heads(info, reported),
                         )
                     }),
+                    seat,
                     reported.is_none() && hashless_answer_is_a_keyless_disclaimer(info, sender),
                 )
             })
         })
     };
-    let Some((stable, head, classified, keyless_disclaimer)) = current else {
+    let Some((stable, head, classified, seat, keyless_disclaimer)) = current else {
         return;
+    };
+    // #1660: D60 entitlement is not fixed at commit — the completion step
+    // re-runs the revocation verdict on the sender before any seat closes.
+    // A disclaimed answer closes no seat, so it needs no verdict.
+    let mut sender_seat = if classified.is_some() {
+        match seat {
+            Some(seat)
+                if crypto_exclusion::write_allowed(state, &x0x::identity::AgentId(sender))
+                    .await =>
+            {
+                Some(seat)
+            }
+            _ => None,
+        }
+    } else {
+        None
     };
     let Some((report, installed)) = classified else {
         if !keyless_disclaimer {
@@ -992,9 +1048,47 @@ pub(in crate::server) async fn note_catchup_head(
         return;
     };
     let mut inner = state.revocation_evictions.inner.lock().await;
+    // #1660 (Claude review; Codex P2): the seat facts and the verdict
+    // above were read before this lock. A removal, revocation or re-key
+    // that lands in that gap must still refuse. The seat is re-read here
+    // in full — Active membership and the KEM key it carries now — and
+    // the record matches only that fresh key, so a share sealed to a key
+    // the seat no longer carries closes nothing. The re-checks take the
+    // seam form: `try_*` locks that refuse on contention — a retryable
+    // withhold, like every egress seam.
+    if sender_seat.is_some() {
+        // #1660 (Claude round 6): match the entry the first read judged
+        // this answer against — the one whose stable id is `stable`, not
+        // the first of `group_ids` that resolves.
+        let fresh_seat = match state.named_groups.try_read() {
+            Ok(groups) => group_ids.iter().find_map(|id| {
+                crate::server::resolve_group_entry_locked(&groups, id)
+                    .filter(|(_, info)| info.stable_group_id() == stable)
+                    .and_then(|(_, info)| {
+                        info.active_members()
+                            .find(|member| member.agent_id == sender_hex)
+                            .map(|member| crypto_exclusion::SenderSeat {
+                                key: member.kem_public_key_b64.clone(),
+                            })
+                    })
+            }),
+            Err(_) => None,
+        };
+        sender_seat = match fresh_seat {
+            Some(seat)
+                if crypto_exclusion::write_allowed_at_seam(
+                    state,
+                    &x0x::identity::AgentId(sender),
+                ) =>
+            {
+                Some(seat)
+            }
+            _ => None,
+        };
+    }
     // §3: the answer is also the sender's convergence evidence for the
     // S4 deliveries of this group whose result it holds.
-    crypto_exclusion::note_survivor_head(&mut inner, &stable, &sender, &installed);
+    crypto_exclusion::note_survivor_head(&mut inner, &stable, &sender, &installed, sender_seat);
     // Only groups with S4 work keep a round (the worker pass creates it).
     if !inner.head_rounds.contains_key(&stable) {
         return;
@@ -1249,12 +1343,26 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         .map(|key| key.stable_group_id.clone())
         .chain(extra_rounds.keys().cloned())
         .collect();
+    // #1660 (Claude round 6): a live owner-recovery delivery keeps its
+    // group's head-ask counts too — its rounds ask and seal again, and
+    // the ask gate compares counts that must survive this pass. Only
+    // the counts: the §2 head rounds stay with the open work above, so
+    // a live delivery group gains no periodic round of catch-up asks to
+    // every holder.
+    let ask_count_groups: BTreeSet<String> = open_groups
+        .iter()
+        .cloned()
+        .chain(inner.orc.delivery_groups().map(str::to_string))
+        .collect();
     inner
         .head_rounds
         .retain(|stable, _| open_groups.contains(stable));
     inner
         .head_round_asks
         .retain(|stable, _| open_groups.contains(stable));
+    inner
+        .head_ask_seq
+        .retain(|(stable, _), _| ask_count_groups.contains(stable));
     for stable in &open_groups {
         let Some((group_key, info)) = by_stable.get(stable.as_str()) else {
             continue;
@@ -7435,6 +7543,85 @@ pub(super) mod tests {
         Ok(())
     }
 
+    /// #1660 (Claude review): a report the completion step refuses still
+    /// counts for the §2 head round. The sender was removed mid-send, so
+    /// its report closes no delivery seat. But the report itself is a
+    /// verified, applied page, so the round counts it: it confirms the
+    /// local head and clears the sender's conflicting evidence. Only the
+    /// seat-closing is gated.
+    #[tokio::test]
+    async fn a_refused_senders_report_still_counts_for_the_head_round() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let group_id = "c9".repeat(16);
+        let survivor = [9; 32];
+        let survivor_hex = hex::encode(survivor);
+        let mut info = GroupInfo::new(
+            "refused-head-round".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.secret_epoch = 4;
+        info.shared_secret = Some(vec![7; 32]);
+        info.security_binding = Some("gss:epoch=4".to_string());
+        info.add_member(survivor_hex.clone(), GroupRole::Member, None, None);
+        // Removed mid-send: the completion step refuses the sender.
+        info.members_v2
+            .get_mut(&survivor_hex)
+            .expect("the sender's seat")
+            .state = GroupMemberState::Removed;
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .head_rounds
+            .insert(
+                stable.clone(),
+                HeadRound {
+                    head: info.state_hash.clone(),
+                    started: Instant::now(),
+                    asked: BTreeSet::new(),
+                    confirmed: false,
+                    conflicting: BTreeSet::from([survivor]),
+                },
+            );
+        note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            Some(&info.state_hash),
+        )
+        .await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        let round = inner.head_rounds.get(&stable).expect("the round");
+        assert!(
+            round.confirmed,
+            "the refused sender's report still confirms the local head (§2)"
+        );
+        assert!(
+            !round.conflicting.contains(&survivor),
+            "the refused sender's on-chain report clears its conflicting entry (§2)"
+        );
+        assert!(
+            inner
+                .head_round_asks
+                .values()
+                .any(|asks| asks.answered.contains(&survivor)),
+            "the refused sender answered: the round does not re-ask it every 2 s"
+        );
+        Ok(())
+    }
+
     /// #1578 rc10 (Engineer ruling (2), 28 Oct 23:34 GMT; Claude
     /// blocking at 2e3d2f5): a hash-less catch-up answer counts as the
     /// sender's answer only from a keyless survivor. Three members of
@@ -8072,5 +8259,40 @@ pub(super) mod tests {
         );
         assert!(inner.store.get(&key).is_some_and(|row| row.phase.is_open()));
         Ok(())
+    }
+
+    /// #1660 (Claude round 8 review): the share-seal generation is
+    /// monotonic for the daemon's life. The worker pass keeps a group's
+    /// entry even when the group owns no open work: a group that drops out
+    /// of the open set and returns must never restart the counter at a
+    /// value an ask that is still in flight read before the drop, or that
+    /// ask's late completion credits a count against the new record's bar.
+    #[tokio::test]
+    async fn a_groups_share_seal_generation_survives_the_worker_pass() {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state()
+            .await
+            .unwrap();
+        // The group "gone" owns no open work — no row, no mandate, no
+        // delivery — so it sits outside `ask_count_groups`.
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner
+                .share_seal_seq
+                .insert(("gone".to_string(), [0x5e; 32]), 7);
+        }
+        super::revocation_eviction_pass(&state).await;
+        let kept = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            inner
+                .share_seal_seq
+                .get(&("gone".to_string(), [0x5e; 32]))
+                .copied()
+        };
+        assert_eq!(
+            kept,
+            Some(7),
+            "a group outside the open set keeps its share-seal generation"
+        );
+        state.agent.shutdown().await;
     }
 }

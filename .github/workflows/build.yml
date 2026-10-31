@@ -103,13 +103,13 @@ jobs:
 
           # macOS x86_64 (cross-compiled on Apple Silicon)
           - platform: macos-x64
-            os: macos-14
+            os: macos-15
             target: x86_64-apple-darwin
             cross: false
 
           # macOS ARM64 (Apple Silicon)
           - platform: macos-arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             cross: false
 
