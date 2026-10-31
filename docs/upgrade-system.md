@@ -120,6 +120,58 @@ Complete host inventory and transaction-bound guide installation remain
 separate M2 work. These staging controls do not establish a protected host
 transaction or authorize guide promotion at host commit.
 
+### CLI check and a split install (#1104)
+
+`x0x upgrade --check` prints this CLI version. It calls `GET /health` on
+the local daemon selected by `--api`, or by `--name`, or on the default
+instance when neither is set. The address comes from the same discovery as
+the other CLI commands. That includes `127.0.0.1:12700` when no port file
+exists. `localhost` and `127.0.0.1` are the same endpoint. The request stays
+on loopback and does not use a proxy. `--check` still completes when no
+daemon answers. `--check --force` fetches the current release and compares
+versions. It prints "Update available" only when that release is strictly
+newer than this CLI. An equal, older or unparseable release is not an update.
+
+The check compares this CLI with the executable of that running daemon.
+It resolves both paths to their real directories, so a symlink to the CLI
+is not a split install. A CLI in `~/.cargo/bin` is reported when the running
+`x0xd` is in another directory, even if `~/.cargo/bin` also contains `x0xd`.
+The executable is read from that instance's process. The daemon does not
+report its path. A lock file whose process id now belongs to a different
+`x0xd` instance is ignored. When the executable cannot be read, the check
+says that it cannot tell. It does not warn in that case. When an update is
+available and the result is unknown, the check still says to run
+`x0x upgrade --apply`.
+
+The daemon apply replaces `x0x` only when that file is in the same directory
+as the running `x0xd`. It resolves a symlinked daemon path before it looks
+for that sibling. After `x0x upgrade --apply`, this CLI prints
+"CLI not upgraded" and a reinstall hint when its own file is not beside that
+daemon and its version is older than the version the daemon applied. On
+Linux, a replaced CLI path can end in ` (deleted)`. The check removes that
+suffix before it compares directories. The CLI prints that notice on stderr,
+after the unchanged apply response. When the CLI cannot read the path, it
+prints "Cannot tell" only if this CLI is older than the applied version.
+The hint is:
+
+```text
+cargo install x0x --bin x0x --force
+```
+
+That command installs only the `x0x` CLI. It does not replace `x0xd`.
+`scripts/install.sh` has no CLI-only mode, so the hint does not call it.
+The same check prints that hint only for an older CLI that is apart from the
+running daemon. It does not also print `x0x upgrade --apply`. A CLI beside
+that daemon at a different version does not get the hint. Apply still
+replaces that sibling. `x0x --name <instance>` and `x0x --api <address>`
+select that daemon for `--check` and `--apply`.
+
+A daemon apply that finds no sibling `x0x` records that the file is missing
+at debug level. It does not warn. `POST /upgrade/apply` and `x0x doctor` do
+not carry a companion status field. A14 plans a `cli_status` value of
+`CannotApply` on `GET /diagnostics/upgrade` and `GET /owner/machines`.
+This issue does not add that field. The CLI does not replace itself.
+
 ### Candidate execution probes (M2 S2d)
 
 Both packaged binaries accept `--upgrade-probe` as their first argument.
