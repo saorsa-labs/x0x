@@ -28,7 +28,6 @@
 set -e
 
 REPO="saorsa-labs/x0x"
-URL="https://github.com/$REPO/releases/latest/download"
 BIN="$HOME/.local/bin"
 NAME=""
 NAME_SET=false
@@ -160,16 +159,13 @@ verify_failed() {
     exit 1
 }
 
-echo "Downloading..."
-fetch "$URL/$ARCHIVE" "$TMP/$ARCHIVE"
-fetch "$URL/$ARCHIVE.sha256" "$TMP/$ARCHIVE.sha256"
-fetch "$URL/release-manifest.json" "$TMP/release-manifest.json"
-fetch "$URL/release-manifest.json.sig" "$TMP/release-manifest.json.sig"
-
-# Resolve the tag behind releases/latest through the same API the updater
-# uses. The manifest's version and channel must match it below (the updater's
+# Resolve the latest release tag first, through the same API the updater
+# uses, and download every file from that tag. This keeps the tag and the
+# assets from disagreeing when a release is published mid-install, and the
+# manifest's version and channel must match the tag below (the updater's
 # rule, src/upgrade/monitor.rs), so an older, genuinely-signed release
 # replayed for a newer tag is refused.
+echo "Resolving the latest release..."
 fetch "https://api.github.com/repos/$REPO/releases/latest" "$TMP/latest.json"
 TAG=$(tr -d '\n\r' < "$TMP/latest.json" | awk '{
     if (match($0, /"tag_name": *"[^"]*"/)) {
@@ -184,6 +180,13 @@ case "$TAG" in
     v?*) ;;
     *) verify_failed "could not resolve the latest release tag" ;;
 esac
+URL="https://github.com/$REPO/releases/download/$TAG"
+
+echo "Downloading $TAG..."
+fetch "$URL/$ARCHIVE" "$TMP/$ARCHIVE"
+fetch "$URL/$ARCHIVE.sha256" "$TMP/$ARCHIVE.sha256"
+fetch "$URL/release-manifest.json" "$TMP/release-manifest.json"
+fetch "$URL/release-manifest.json.sig" "$TMP/release-manifest.json.sig"
 
 # SHA-256: always required.
 if command -v sha256sum >/dev/null 2>&1; then
@@ -370,6 +373,16 @@ if [ -z "$VERIFY_BIN" ]; then
 fi
 if [ "$PROBE_RC" -eq 126 ] || [ "$PROBE_RC" -eq 127 ]; then
     echo "Error: cannot execute $VERIFY_BIN to verify the release (noexec mount or bad interpreter?); nothing installed." >&2
+    if [ "$VERIFY_BIN" = "$BIN/x0x" ]; then
+        echo "The installed x0x is unusable. Remove $BIN/x0x and re-run to repair the install." >&2
+    fi
+    exit 1
+fi
+if [ "$PROBE_RC" -ge 128 ]; then
+    echo "Error: the verifier $VERIFY_BIN was killed by signal $((PROBE_RC - 128)); nothing installed." >&2
+    if [ "$VERIFY_BIN" = "$BIN/x0x" ]; then
+        echo "The installed x0x did not survive its own verification run (wrong architecture, bad code signature). Remove $BIN/x0x and re-run to repair the install." >&2
+    fi
     exit 1
 fi
 if [ "$PROBE_RC" -ne 0 ]; then

@@ -66,6 +66,11 @@ def find_pwsh() -> str | None:
     found = shutil.which("pwsh")
     if found:
         return found
+    override = os.environ.get("X0X_TEST_PWSH")
+    if override and Path(override).exists():
+        return override
+    # Developer machines without pwsh on PATH: the self-contained copy this
+    # run downloaded under its evidence dir. CI runners have pwsh on PATH.
     return str(EVIDENCE_PWSH) if EVIDENCE_PWSH.exists() else None
 
 
@@ -84,6 +89,13 @@ def scratch_directory() -> Iterator[Path]:
 class _QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         pass
+
+    def guess_type(self, path: str) -> str:
+        # The GitHub API reply has no extension; Invoke-RestMethod needs the
+        # JSON content type to deserialize it.
+        if path.endswith("/releases/latest"):
+            return "application/json"
+        return super().guess_type(path)
 
 
 @contextlib.contextmanager
@@ -124,9 +136,14 @@ class InstallPs1VerifyTests(unittest.TestCase):
             raise unittest.SkipTest("cargo is required to build the manifest fixture")
         cls.pwsh = find_pwsh()
         if cls.pwsh is None:
+            if os.environ.get("CI"):
+                # A silent skip here leaves CI green while the ps1 gate rots.
+                raise AssertionError(
+                    "pwsh is required on CI runners (ubuntu-latest ships it)"
+                )
             raise unittest.SkipTest(
                 "pwsh is required to exercise scripts/install.ps1 "
-                "(not on PATH and no evidence-dir copy)"
+                "(not on PATH, no X0X_TEST_PWSH, no evidence-dir copy)"
             )
         # Like the sh suite: a failed fixture build fails the suite, it does
         # not skip it.
@@ -199,9 +216,12 @@ class InstallPs1VerifyTests(unittest.TestCase):
         secret: Path | None = None,
         archive_probe_delegates: bool = True,
         pre_install: Callable[[Path], None] | None = None,
+        use_version_param: bool = True,
+        served_manifest_override: bytes | Callable[[str], bytes] | None = None,
+        missing: frozenset[str] = frozenset(),
     ) -> tuple[int, str, Path, Path]:
         """Build the fake Windows release, serve it over local HTTP, patch
-        only the script's download base URL, run it under pwsh, and return
+        only the script's download base URLs, run it under pwsh, and return
         (exit code, combined output, install dir, probe-calls log).
 
         `manifest` is fixed bytes or a factory that receives the zip's real
@@ -210,7 +230,12 @@ class InstallPs1VerifyTests(unittest.TestCase):
         `secret` signs with another throwaway key (the wrong-key case).
         With `archive_probe_delegates=False` the release's x0x.exe accepts
         any manifest, isolating the installed-verifier behavior.
-        `pre_install` populates the install dir before the run."""
+        `pre_install` populates the install dir before the run. With
+        `use_version_param=False` no -Version is passed and the GitHub
+        releases/latest API is served (and patched) instead, exercising the
+        script's own tag resolution. `served_manifest_override` replaces the
+        manifest bytes after they were signed (the tamper case); `missing`
+        names release files the fake origin does not carry."""
         bindir = tmp / "bindir"
         release_dir = tmp / "web" / RELEASE_PATH
         release_dir.mkdir(parents=True, exist_ok=True)
@@ -234,18 +259,34 @@ class InstallPs1VerifyTests(unittest.TestCase):
         if callable(manifest):
             manifest = manifest(digest)
         signature = self.sign(manifest, tmp, secret)
+        served_manifest = manifest
+        if served_manifest_override is not None:
+            if callable(served_manifest_override):
+                served_manifest_override = served_manifest_override(digest)
+            served_manifest = served_manifest_override
         (release_dir / ASSET).write_bytes(archive.read_bytes())
         (release_dir / f"{ASSET}.sha256").write_text(f"{digest}  {ASSET}\n", encoding="utf-8")
-        (release_dir / "release-manifest.json").write_bytes(manifest)
+        if "release-manifest.json" not in missing:
+            (release_dir / "release-manifest.json").write_bytes(served_manifest)
         (release_dir / "release-manifest.json.sig").write_bytes(signature)
+        if not use_version_param:
+            api_file = tmp / "web" / "api" / "repos" / "saorsa-labs" / "x0x" / "releases" / "latest"
+            api_file.parent.mkdir(parents=True, exist_ok=True)
+            api_file.write_text(f'{{"tag_name": "{TAG}"}}\n', encoding="utf-8")
 
         with serve_release_directory(tmp / "web") as port:
             script = install_script().read_text(encoding="utf-8")
             patched = script.replace("https://github.com/", f"http://127.0.0.1:{port}/gh/")
+            if not use_version_param:
+                patched = patched.replace(
+                    "https://api.github.com/", f"http://127.0.0.1:{port}/api/"
+                )
             # $Repo stays a PowerShell variable in the patched text; only
-            # check that the real download base was swapped.
+            # check that the real download bases were swapped.
             if "https://github.com/" in patched or f"http://127.0.0.1:{port}/gh/" not in patched:
                 raise AssertionError("failed to patch the install.ps1 download base URL")
+            if not use_version_param and "https://api.github.com/" in patched:
+                raise AssertionError("failed to patch the install.ps1 API base URL")
             script_path = tmp / "install.ps1"
             script_path.write_text(patched, encoding="utf-8")
 
@@ -269,19 +310,19 @@ class InstallPs1VerifyTests(unittest.TestCase):
             for name in [n for n in env if n.lower() in ("http_proxy", "https_proxy", "all_proxy")]:
                 del env[name]
 
+            argv = [
+                self.pwsh,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+            ]
+            if use_version_param:
+                argv += ["-Version", TAG]
+            argv += ["-InstallDir", str(bindir)]
             result = subprocess.run(
-                [
-                    self.pwsh,
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(script_path),
-                    "-Version",
-                    TAG,
-                    "-InstallDir",
-                    str(bindir),
-                ],
+                argv,
                 cwd=str(tmp),
                 env=env,
                 capture_output=True,
@@ -362,6 +403,74 @@ class InstallPs1VerifyTests(unittest.TestCase):
             self.assert_refused(
                 rc, output, bindir, probe_calls, "stable, non-prerelease releases only"
             )
+
+    def test_manifest_channel_must_match_case_sensitively(self) -> None:
+        # The updater and install.sh compare the channel byte-for-byte;
+        # PowerShell's -eq is case-insensitive by default, so "Stable" must
+        # still be refused.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp,
+                lambda digest: manifest_bytes(
+                    digest, target=WINDOWS_TARGET, version="0.48.0", channel="Stable"
+                ),
+            )
+            self.assert_refused(
+                rc, output, bindir, probe_calls, "stable, non-prerelease releases only"
+            )
+
+    def test_latest_resolution_installs(self) -> None:
+        # No -Version: the script resolves the tag itself through the GitHub
+        # releases/latest API (patched to the fake origin), and the good
+        # manifest for that tag installs.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp, good_manifest, use_version_param=False
+            )
+            self.assertEqual(rc, 0, output)
+            self.assertIn("Release: v0.48.0", output)
+            self.assertIn("Manifest version 0.48.0 (stable) matches v0.48.0", self.flat(output))
+            self.assertIn("Installed:", output)
+            self.assertTrue((bindir / "x0x.exe").exists())
+            self.assertTrue((bindir / "x0xd.exe").exists())
+            calls = probe_calls.read_text(encoding="utf-8").splitlines() if probe_calls.exists() else []
+            self.assertEqual(calls, ["probe"])
+
+    def test_tampered_manifest_refused(self) -> None:
+        # The manifest is signed, then different bytes are served: only the
+        # ML-DSA signature can catch the swap.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp,
+                good_manifest,
+                served_manifest_override=lambda digest: good_manifest(digest).replace(
+                    b'"timestamp": 0', b'"timestamp": 1'
+                ),
+            )
+            self.assertNotEqual(rc, 0, output)
+            self.assertIn("ML-DSA manifest signature FAILED", self.flat(output))
+            self.assertNotIn("Installed:", output)
+            self.assertFalse((bindir / "x0x.exe").exists())
+
+    def test_manifest_hash_mismatch_refused(self) -> None:
+        # A correctly signed manifest that names another archive's hash is
+        # refused by the binding, before extraction.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp, lambda digest: manifest_bytes("4" * 64, target=WINDOWS_TARGET)
+            )
+            self.assert_refused(rc, output, bindir, probe_calls, "SHA-256 mismatch")
+
+    def test_missing_manifest_refused(self) -> None:
+        # pwsh's error display for the failed download shows the status
+        # code, not the URL, so the 404 is the visible cause.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp,
+                good_manifest,
+                missing=frozenset({"release-manifest.json"}),
+            )
+            self.assert_refused(rc, output, bindir, probe_calls, "404")
 
     def test_installed_verifier_launch_failure_stops_install(self) -> None:
         with scratch_directory() as tmp:

@@ -51,25 +51,28 @@ curl -sfL https://x0x.md | sh -s -- --name alice
 The current installer:
 
 1. Detects platform (`linux-x64-gnu`, `linux-arm64-gnu`, `macos-x64`, `macos-arm64`)
-2. Downloads the latest release archive, its signed release manifest, and the
-   manifest signature from GitHub
-3. Verifies the archive SHA-256 against the sidecar checksum and the signed
-   manifest entry, then verifies the manifest's ML-DSA-65 signature with the
-   `x0x` binary — an already-installed one when available, else the release's
-   own — and, when `gpg` is present, the GPG signature against the pinned
-   Saorsa Labs release key. A failed or missing check stops the install.
-   On a first install without `gpg`, the manifest check is made by the
-   downloaded binary itself, so it does not bind the release to a key you
+2. Resolves the latest release tag through the GitHub API. Every file is
+   then downloaded from that one tag. If the API is unreachable or
+   rate-limited, the install stops.
+3. Checks the archive SHA-256 against the sidecar checksum.
+4. When `gpg` is present, checks the GPG signature against the pinned
+   Saorsa Labs release key.
+5. Reads the signed release manifest. The manifest `version` and `channel`
+   must match the tag: stable channel, non-prerelease version, same
+   version. This is the rule the updater applies to manifests. The
+   manifest's archive hash must also match the downloaded archive. An
+   older, genuinely-signed release cannot be served for a newer tag.
+6. Verifies the manifest's ML-DSA-65 signature with an `x0x` binary: an
+   already-installed one when available, else the release's own. A missing,
+   invalid or unmatched check stops the install. An installed binary that
+   cannot run also stops the install; remove it and re-run to repair.
+   On a first install without `gpg`, the downloaded binary verifies its
+   own manifest, so the check does not bind the release to a key you
    already trust.
-4. Resolves the release tag (through the GitHub API, as the updater does)
-   and refuses a signed manifest whose `version` or `channel` does not match
-   it — stable channel, non-prerelease version, same version — so an older,
-   genuinely-signed release cannot be served for a newer tag. An unreachable
-   or rate-limited API stops the install rather than skipping this check.
-5. Installs both `x0x` and `x0xd` into `~/.local/bin`
-6. Ensures the shared x0x data directory exists
-7. Starts the daemon
-8. Optionally configures autostart (`--autostart`)
+7. Installs both `x0x` and `x0xd` into `~/.local/bin`
+8. Ensures the shared x0x data directory exists
+9. Starts the daemon
+10. Optionally configures autostart (`--autostart`)
 
 ## Release-key rotation
 

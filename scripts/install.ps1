@@ -191,10 +191,10 @@ try {
     if (-not $manifestVersion -or -not $manifestChannel) {
         throw "The signed manifest is missing its version or channel."
     }
-    if ($manifestVersion -like "*-*" -or $manifestChannel -ne "stable") {
+    if ($manifestVersion -like "*-*" -or $manifestChannel -cne "stable") {
         throw "The signed manifest names $manifestVersion ($manifestChannel); the updater rule accepts stable, non-prerelease releases only."
     }
-    if ($manifestVersion -ne $Tag.TrimStart("v")) {
+    if ($manifestVersion -cne $Tag.TrimStart("v")) {
         throw "The signed manifest names version $manifestVersion ($manifestChannel), but release $Tag was requested. Nothing was installed."
     }
     Write-Host "  Manifest version $manifestVersion ($manifestChannel) matches $Tag"

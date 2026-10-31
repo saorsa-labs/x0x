@@ -624,6 +624,20 @@ esac
                     rc, output, bin_dir, probe_calls, *needles, probe_ran=probe_ran
                 )
 
+    def test_unresolvable_latest_tag_stops_the_install(self) -> None:
+        # The tag gate fails closed when the GitHub API cannot be reached
+        # (offline, rate-limited) or answers without a tag_name: nothing is
+        # installed and no release byte executes.
+        for tag, needle in (
+            (None, "download failed"),
+            ("", "could not resolve the latest release tag"),
+        ):
+            with self.subTest(tag=tag or "empty"), tempfile.TemporaryDirectory() as tmpdir:
+                rc, output, probe_calls, bin_dir = self.run_installer(
+                    Path(tmpdir), manifest_bytes, tag=tag
+                )
+                self.assert_refused(rc, output, bin_dir, probe_calls, needle, probe_ran=False)
+
     def test_installed_verifier_is_preferred_and_its_refusal_blocks_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
