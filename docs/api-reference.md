@@ -1567,8 +1567,8 @@ token. A session token is refused before the body is read.
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
 | POST | `/groups/discover/subscribe` | `x0x group discover-subscribe` | **Phase C.2**: subscribe to a tag/name/id shard |
 | DELETE | `/groups/discover/subscribe/:kind/:shard` | `x0x group discover-unsubscribe` | **Phase C.2**: unsubscribe from a shard |
-| GET | `/groups/discover` | `x0x group discover` | **Phase C.2**: list locally known discoverable groups |
-| GET | `/groups/cards/:id` | `x0x group card <group_id>` | Fetch a single group card |
+| GET | `/groups/discover` | `x0x group discover` | **Phase C.2**: list locally known discoverable groups. A group whose durable store write is held back (#1570) is listed by its cached card only. If no card is cached, or the cached card has expired, the group is not listed until the write lands. A card expires when its `expires_at` has passed. This node signs cards with a 24 h TTL. An imported card keeps the TTL its signer set |
+| GET | `/groups/cards/:id` | `x0x group card <group_id>` | Fetch a single group card. For a group whose durable store write is held back (#1570), the cached card is served. If no card is cached, or the cached card has expired, the route answers 404 `card not found` until the write lands. A card expires when its `expires_at` has passed. This node signs cards with a 24 h TTL. An imported card keeps the TTL its signer set |
 | POST | `/groups/cards/import` | `x0x group card-import` | Import a group card into local cache |
 | POST | `/groups/:id/secure/encrypt` | `x0x group secure-encrypt <group_id>` | Encrypt content with the group's shared secret (member-only) |
 | POST | `/groups/:id/secure/decrypt` | `x0x group secure-decrypt <group_id>` | Decrypt content with the group's shared secret (member-only, epoch must match) |
