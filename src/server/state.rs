@@ -1647,12 +1647,20 @@ pub(super) struct NamedGroupTestRecorders {
     /// peer stopped with `truncated_page_no_progress` was asked for its
     /// next page again at the moved cursor. Tests read the reason here.
     pub(super) catchup_page_rearms: StdMutex<Vec<(String, String, &'static str)>>,
-    /// #1685 round 4: every stopped peer the re-arm pre-check retired as
-    /// departed — no Active seat on the live roster any more, or the
-    /// agent is revoked — as `(group, peer, reason)`: no re-arm ask, its
-    /// stopped-loop row dropped, its page fence closed. Tests read the
-    /// reason here.
+    /// #1685 round 4, in its round 8 shape (Engineer ruling, 31 Oct
+    /// 2026): every stopped peer the re-arm pre-check retired as
+    /// departed — the agent is revoked, or it holds no Active seat on
+    /// the live roster any more — as `(group, peer, reason)`: no
+    /// re-arm ask, its stopped-loop row dropped, its page fence
+    /// closed. Tests read the reason here.
     pub(super) catchup_page_departed: StdMutex<Vec<(String, String, &'static str)>>,
+    /// #1685 round 8 (Engineer ruling, 31 Oct 2026): every stopped peer
+    /// the re-arm pre-check DEFERRED — the agent keeps its Active seat
+    /// but a machine or binding revocation, or a pending revocation
+    /// resync, holds pages from the machine its stopped page came from
+    /// — as `(group, peer, reason)`: no ask, the stopped-loop row stays
+    /// armed, the page fence stays open. Tests read the reason here.
+    pub(super) catchup_page_deferred: StdMutex<Vec<(String, String, &'static str)>>,
 }
 
 #[cfg(test)]

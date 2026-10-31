@@ -21,6 +21,15 @@
 //! were all already at or below the cursor (a duplicate from a second
 //! peer, or a stale page) pages on: the next ask carries a newer
 //! cursor and can still make progress.
+//!
+//! Round 8 (Engineer ruling, 31 Oct 2026): the re-arm pre-check
+//! decides on the two halves of the shared revocation gate separately.
+//! Only a revoked AGENT or a lost Active seat retires a stopped peer
+//! (row dropped, fence closed without its terminal page); a machine or
+//! binding revocation on a member that keeps its Active seat, or a
+//! pending revocation resync, DEFERS it — row armed, nothing sent,
+//! fence open — so a live member's self-leave fence can never close
+//! over a known gap.
 
 use super::*;
 use x0x::identity::AgentKeypair;
@@ -173,8 +182,8 @@ async fn eventually<F: Fn() -> bool>(condition: F) -> bool {
 
 /// Insert a verified self-revocation of `device` (the device's own key,
 /// as the #1616 tests do). D70: this denies the machine only — the
-/// agent's portable seat stays, which is exactly the case the round 5
-/// shared gate must still retire.
+/// agent's portable seat stays, which is exactly the case round 8 must
+/// DEFER, not retire (Engineer ruling, 31 Oct 2026).
 async fn revoke_machine(state: &AppState, device: &x0x::identity::MachineKeypair) {
     let record = x0x::revocation::RevocationRecord::sign(
         x0x::revocation::RevokedSubject::Machine(device.machine_id()),
@@ -190,6 +199,65 @@ async fn revoke_machine(state: &AppState, device: &x0x::identity::MachineKeypair
         .verify_and_insert(record, None)
         .expect("machine self-revocation verifies"));
     assert!(set.is_machine_revoked(&device.machine_id()));
+    assert!(!set.revocation_resync_required());
+}
+
+/// Insert a verified self-revocation of the AGENT (its own key, as the
+/// ADR 0107 tests do). Round 8 (Engineer ruling, 31 Oct 2026): this is
+/// the DEPARTED half of the shared gate — the portable agent itself is
+/// revoked, so no machine of it can ever serve the terminal page, and
+/// the pre-check retires the peer.
+async fn revoke_agent(state: &AppState, agent: &AgentKeypair) {
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(agent.agent_id()),
+        agent.public_key(),
+        agent.secret_key(),
+        now_millis_u64() / 1_000,
+        Some("test".to_string()),
+    )
+    .expect("sign agent revocation");
+    let revocation_set = state.agent.revocation_set();
+    let mut set = revocation_set.write().await;
+    assert!(set
+        .verify_and_insert(record, None)
+        .expect("agent self-revocation verifies"));
+    assert!(set.is_agent_revoked(&agent.agent_id()));
+    assert!(!set.revocation_resync_required());
+}
+
+/// Retire the `(agent, machine)` pairing with an owner-signed ADR-0043
+/// tombstone, the only legal authority for a binding subject (the #1622
+/// staging). D70: this kills the pairing only — the agent's portable
+/// seat stays Active, so round 8 must DEFER the peer, never retire it.
+async fn retire_binding(
+    state: &AppState,
+    owner: &x0x::identity::UserKeypair,
+    agent: &AgentKeypair,
+    machine: &x0x::identity::MachineId,
+) {
+    let cert =
+        x0x::identity::AgentCertificate::issue(owner, agent).expect("owner certificate for agent");
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::AgentMachineBinding(
+            x0x::revocation::AgentMachineBinding {
+                agent: agent.agent_id(),
+                machine: *machine,
+                move_epoch: 1,
+            },
+        ),
+        owner.public_key(),
+        owner.secret_key(),
+        now_millis_u64() / 1_000,
+        Some("test".to_string()),
+    )
+    .expect("sign binding revocation");
+    let revocation_set = state.agent.revocation_set();
+    let mut set = revocation_set.write().await;
+    assert!(set
+        .verify_and_insert(record, Some(&cert))
+        .expect("binding revocation verifies"));
+    assert!(set.is_binding_revoked(&agent.agent_id(), machine));
+    assert!(!set.is_agent_revoked(&agent.agent_id()));
     assert!(!set.revocation_resync_required());
 }
 
@@ -1135,8 +1203,9 @@ async fn a_departed_stopped_peer_is_retired_not_rearmed() -> Result<()> {
     //    R in one pass — the re-arm pass really runs, and the roster it
     //    consults no longer has the responder. The departed responder
     //    must NOT be re-armed; its row and fence are retired with the
-    //    typed reason instead. The helper is still a member, so it IS
-    //    re-armed — the pre-check separates the two.
+    //    typed reason instead. The helper is not re-armed either: it is
+    //    the page sender, so the coordinator skips it (round 5, finding
+    //    4) — nobody is asked.
     handle_treekem_catchup_response(
         &state,
         &helper_id,
@@ -1615,18 +1684,18 @@ async fn a_next_page_ask_that_cannot_leave_keeps_the_stopped_row_armed() -> Resu
     Ok(())
 }
 
-/// Review round 5, finding 3: the re-arm pre-check uses the SAME gate
-/// as the page handler, through the shared helper. The responder stops
-/// on the gapped E2; its MACHINE is then revoked (ADR 0110 D70 — the
-/// device is denied while the agent keeps its Active seat, exactly the
-/// split the old agent-only pre-check missed); the helper's terminal
-/// page delivers E1 and the replay applies E2. The detached re-arm must
-/// retire the machine-revoked responder — row dropped, fence closed,
-/// typed `peer_departed` — not re-arm it: a page from that device is
-/// dropped at the page gate, so its terminal page can never close its
-/// fence.
+/// #1685 round 8 (Engineer ruling, 31 Oct 2026; Claude review at
+/// e756545d, blocker 2, reversing round 5 finding 3): a machine
+/// revocation (ADR 0110 D70) denies the DEVICE only — the agent's
+/// portable seat stays Active, and the agent can serve the terminal
+/// page from another machine. The re-arm pre-check must DEFER the
+/// stopped peer — row armed, nothing sent, fence OPEN — never retire
+/// it. At e756545d the pre-check keyed the retire on the whole shared
+/// gate, so this shape closed a still-Active member's fence without
+/// its terminal page.
 #[tokio::test]
-async fn a_machine_revoked_stopped_peer_is_retired_by_the_shared_gate() -> Result<()> {
+async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_not_retired() -> Result<()>
+{
     let group_id = "12".repeat(32);
     let device = x0x::identity::MachineKeypair::generate()?;
     let pair = issue1685_chain_pair(&group_id, Some(device)).await?;
@@ -1647,7 +1716,124 @@ async fn a_machine_revoked_stopped_peer_is_retired_by_the_shared_gate() -> Resul
         .catchup_page_force_ok
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // 1. The responder stops on E2, paged from its own device.
+    // 1. The responder stops on E2, paged from its own device; its row
+    //    arms and its page fence opens.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the responder's stopped row is armed"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "CONTROL: the responder's page fence is open"
+    );
+
+    // 2. D70: revoke the device only. The agent's seat stays Active —
+    //    the roster alone cannot retire this peer.
+    revoke_machine(&state, responder_device.as_ref().expect("device")).await;
+
+    // 3. The helper's terminal page delivers E1; the replay applies E2
+    //    and the cursor moves. The detached re-arm runs the pre-check
+    //    against the recorded machine and DEFERS the responder.
+    handle_treekem_catchup_response(
+        &state,
+        &helper,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    assert!(
+        eventually(|| {
+            !state
+                .named_group_test_recorders
+                .catchup_page_deferred
+                .lock()
+                .expect("deferred recorder")
+                .is_empty()
+        })
+        .await,
+        "the detached re-arm deferred the machine-revoked responder"
+    );
+    assert_eq!(
+        page_requests(&state),
+        0,
+        "#1685 round 8: nothing is sent while the peer is held — the ask would be \
+         answered from the revoked machine and dropped at the page gate"
+    );
+    assert!(
+        rearm_requests(&state).is_empty(),
+        "no typed re-arm was recorded"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_departed
+            .lock()
+            .expect("departed recorder")
+            .is_empty(),
+        "the still-Active responder is NOT retired"
+    );
+    assert_eq!(
+        state
+            .named_group_test_recorders
+            .catchup_page_deferred
+            .lock()
+            .expect("deferred recorder")
+            .clone(),
+        vec![(group_id.clone(), responder_hex.clone(), "revocation_hold")],
+        "the defer is typed and names the held peer"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "#1685 round 8: the held member's page fence stays OPEN — a still-Active \
+         member's fence never closes without its terminal page"
+    );
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "the stopped row stays armed, so the next cursor-moving replay retries"
+    );
+    Ok(())
+}
+
+/// #1685 round 8 (Engineer ruling, 31 Oct 2026): a binding revocation
+/// (#1622, ADR 0110 D70) retires the `(agent, machine)` PAIRING only —
+/// the agent's portable seat stays Active and the device stays clean,
+/// so the agent can serve the terminal page from another machine. The
+/// pre-check must DEFER the stopped peer, exactly as for a machine
+/// revocation; at e756545d the shared-gate key retired it instead.
+#[tokio::test]
+async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_not_retired() -> Result<()>
+{
+    let group_id = "17".repeat(32);
+    let device = x0x::identity::MachineKeypair::generate()?;
+    let pair = issue1685_chain_pair(&group_id, Some(device)).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        helper,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder stops on E2, paged from the pairing's device.
     handle_treekem_catchup_response(
         &state,
         &responder.agent_id(),
@@ -1662,13 +1848,221 @@ async fn a_machine_revoked_stopped_peer_is_retired_by_the_shared_gate() -> Resul
         "CONTROL: the responder's stopped row is armed"
     );
 
-    // 2. D70: revoke the device only. The agent's seat stays Active —
-    //    the roster alone cannot retire this peer.
-    revoke_machine(&state, responder_device.as_ref().expect("device")).await;
+    // 2. #1622: retire the pairing only, owner-signed. The agent's
+    //    seat stays Active and the device stays clean.
+    let owner = x0x::identity::UserKeypair::generate()?;
+    retire_binding(&state, &owner, &responder, &responder_machine).await;
 
     // 3. The helper's terminal page delivers E1; the replay applies E2
-    //    and the cursor moves. The detached re-arm runs the shared gate
-    //    against the recorded machine and retires the responder.
+    //    and the cursor moves. The pre-check DEFERS the responder.
+    handle_treekem_catchup_response(
+        &state,
+        &helper,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    assert!(
+        eventually(|| {
+            !state
+                .named_group_test_recorders
+                .catchup_page_deferred
+                .lock()
+                .expect("deferred recorder")
+                .is_empty()
+        })
+        .await,
+        "the detached re-arm deferred the binding-revoked responder"
+    );
+    assert_eq!(
+        page_requests(&state),
+        0,
+        "nothing is sent while the pairing is held"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_departed
+            .lock()
+            .expect("departed recorder")
+            .is_empty(),
+        "the still-Active responder is NOT retired"
+    );
+    assert!(
+        rearm_requests(&state).is_empty(),
+        "no typed re-arm was recorded"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "the held member's page fence stays OPEN — it closes on the agent's own \
+         terminal page from a clean machine, never on the pairing's retirement"
+    );
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "the stopped row stays armed"
+    );
+    Ok(())
+}
+
+/// #1685 round 8 (Engineer ruling, 31 Oct 2026; Claude review at
+/// e756545d, blocker 1): a pending revocation resync (#1116) is a
+/// global, temporary hold, not a departure. If the re-arm pass runs
+/// while the resync pends, every stopped peer of the group must be
+/// DEFERRED — row armed, nothing sent, fence OPEN. At e756545d the
+/// pre-check retired every stopped peer on the resync bit and closed
+/// their fences for good, so `rekey_treekem_self_leaves` could seal a
+/// self-leave rekey over a known gap. The cursor-moving replay that
+/// spawns the pass cannot itself be staged under a resync — the apply
+/// gate withholds every group metadata event while it pends
+/// (`apply_metadata_event_withhold`, named_groups.rs), exactly why the
+/// reviewer called the trigger plausible rather than proven — so the
+/// test enters through the pass's own production entry
+/// (`spawn_stopped_treekem_catchup_rearms`, what a cursor-moving replay
+/// calls): the ruling is defense in depth for any cursor movement that
+/// slips past the hold (a local mutation, then a replay).
+#[tokio::test]
+async fn a_resync_pending_stopped_peer_with_an_active_seat_is_deferred_not_retired() -> Result<()> {
+    let group_id = "18".repeat(32);
+    let pair = issue1685_chain_pair(&group_id, None).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder stops on E2; its row arms and its fence opens.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the responder's stopped row is armed"
+    );
+
+    // 2. #1116: a quarantined carrier closes admission — the global,
+    //    temporary hold (the #1577 staging).
+    *state.agent.revocation_set().write().await =
+        x0x::revocation::RevocationSet::quarantined_carrier(x0x::revocation::REVOCATION_CARRIER_V3);
+    assert!(
+        state
+            .agent
+            .revocation_set()
+            .read()
+            .await
+            .revocation_resync_required(),
+        "CONTROL: the resync hold is pending"
+    );
+
+    // 3. The re-arm pass runs against the resync-holding set. The
+    //    responder keeps its Active seat, so it is DEFERRED.
+    spawn_stopped_treekem_catchup_rearms(&state, &group_id, None);
+    assert!(
+        eventually(|| {
+            !state
+                .named_group_test_recorders
+                .catchup_page_deferred
+                .lock()
+                .expect("deferred recorder")
+                .is_empty()
+        })
+        .await,
+        "the re-arm pass deferred the resync-held responder"
+    );
+    assert_eq!(
+        page_requests(&state),
+        0,
+        "nothing is sent while the resync pends"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_departed
+            .lock()
+            .expect("departed recorder")
+            .is_empty(),
+        "the resync-holding responder is NOT retired (at e756545d the resync bit \
+         retired every stopped peer of the group)"
+    );
+    assert!(
+        rearm_requests(&state).is_empty(),
+        "no typed re-arm was recorded"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "#1685 round 8: the held member's page fence stays OPEN — a resync is a \
+         temporary hold, never a fence exit"
+    );
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "the stopped row stays armed for the replay after the resync clears"
+    );
+    Ok(())
+}
+
+/// #1685 round 8, the retire half of the ruling: an AGENT revocation
+/// retires the portable agent itself — no machine of it can ever serve
+/// the terminal page. The pre-check retires the stopped peer (row
+/// dropped, fence closed, typed `peer_departed`), exactly as round 4
+/// ruled for a seatless peer (the round 4 test pins the roster side;
+/// this pins the revoked-agent side). This side is green before round
+/// 8 too: the narrowing must not lose the retirement.
+#[tokio::test]
+async fn an_agent_revoked_stopped_peer_is_retired_and_its_fence_closes() -> Result<()> {
+    let group_id = "19".repeat(32);
+    let pair = issue1685_chain_pair(&group_id, None).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        helper,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder stops on E2; its row arms and its fence opens.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "CONTROL: the responder's page fence is open"
+    );
+
+    // 2. Revoke the AGENT — the departed half of the shared gate. The
+    //    roster is untouched; the gate alone retires the peer.
+    revoke_agent(&state, &responder).await;
+
+    // 3. The helper's terminal page delivers E1; the replay applies E2
+    //    and the cursor moves. The pre-check RETIRES the responder.
     handle_treekem_catchup_response(
         &state,
         &helper,
@@ -1687,17 +2081,7 @@ async fn a_machine_revoked_stopped_peer_is_retired_by_the_shared_gate() -> Resul
                 .is_empty()
         })
         .await,
-        "the detached re-arm retired the machine-revoked responder"
-    );
-    assert_eq!(
-        page_requests(&state),
-        0,
-        "#1685 round 5, finding 3: the machine-revoked responder is retired, not asked \
-         (at 5319f206 the pre-check saw only agent revocation and re-armed it)"
-    );
-    assert!(
-        rearm_requests(&state).is_empty(),
-        "no typed re-arm was recorded"
+        "the detached re-arm retired the agent-revoked responder"
     );
     assert_eq!(
         state
@@ -1707,11 +2091,29 @@ async fn a_machine_revoked_stopped_peer_is_retired_by_the_shared_gate() -> Resul
             .expect("departed recorder")
             .clone(),
         vec![(group_id.clone(), responder_hex.clone(), "peer_departed")],
-        "the retirement is typed and names the machine-revoked peer"
+        "the retirement is typed and names the revoked peer"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_deferred
+            .lock()
+            .expect("deferred recorder")
+            .is_empty(),
+        "an agent revocation is a departure, not a hold"
+    );
+    assert_eq!(
+        page_requests(&state),
+        0,
+        "the revoked responder is retired, not asked"
+    );
+    assert!(
+        rearm_requests(&state).is_empty(),
+        "no typed re-arm was recorded"
     );
     assert!(
         !self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
-        "the machine-revoked peer's page fence is closed, never left open"
+        "the revoked peer's page fence is closed, never left open"
     );
     assert!(
         treekem_page_stopped_peers(&fence_ids).is_empty(),
@@ -1744,7 +2146,6 @@ async fn a_departed_retire_rechecks_the_self_leave_rekey_its_fence_close_release
         responder,
         responder_hex,
         responder_machine,
-        responder_device,
         helper,
         event1,
         event2,
@@ -1755,6 +2156,11 @@ async fn a_departed_retire_rechecks_the_self_leave_rekey_its_fence_close_release
         .named_group_test_recorders
         .catchup_page_force_ok
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    // The fresh-attempt counter is process-wide; drain it so the
+    // CONTROL below cannot see another test's pass (Claude review at
+    // e756545d, finding 6 — fine under nextest's process-per-test, flaky
+    // under plain `cargo test`).
+    let _ = take_fresh_self_leave_rekey_attempts();
     let epoch_before = cursor(&state, &group_id).await.1;
 
     // 1. The responder stops on E2, paged from its own device; its page
@@ -1772,9 +2178,11 @@ async fn a_departed_retire_rechecks_the_self_leave_rekey_its_fence_close_release
         "CONTROL: the stopped responder's page fence is open"
     );
 
-    // 2. D70: revoke the device only, so the shared gate (not the
-    //    roster) is what retires the responder.
-    revoke_machine(&state, responder_device.as_ref().expect("device")).await;
+    // 2. Revoke the responder's AGENT (round 8: the departed half of
+    //    the shared gate — the roster is untouched, so the gate, not
+    //    the roster, is what retires the responder). A machine
+    //    revocation would now defer, not retire (round 8).
+    revoke_agent(&state, &responder).await;
 
     // 3. The helper's terminal page delivers E1; the replay applies E2.
     //    Both leavers are Removed with tree leaves outstanding, so a
@@ -1819,7 +2227,7 @@ async fn a_departed_retire_rechecks_the_self_leave_rekey_its_fence_close_release
                 .is_empty()
         })
         .await,
-        "the detached re-arm retired the machine-revoked responder"
+        "the detached re-arm retired the agent-revoked responder"
     );
     assert!(
         take_fresh_self_leave_rekey_attempts() > 0,

@@ -12882,16 +12882,50 @@ pub(in crate::server) fn catchup_846_gate_armed(info: &x0x::groups::GroupInfo) -
 /// revocation resync (#1116: admission is closed until a trusted
 /// authority publishes a verified snapshot). The response handler drops
 /// a page that fails this before any fence work, and the refusal handler
-/// mirrors it, so the re-arm pre-check reuses the SAME gate (with the
-/// machine the stopped peer's last page came from) to decide a peer can
-/// never deliver the terminal page that closes its fence.
+/// mirrors it.
+///
+/// #1685 round 8 (Engineer ruling, 31 Oct 2026) splits the same checks
+/// into the two halves the re-arm pre-check now decides on, so the page
+/// gate and the pre-check can never drift: the departed half below, and
+/// [`treekem_catchup_sender_page_hold`] — a machine or binding
+/// revocation, or a pending resync, holds PAGES from that machine, but
+/// the agent itself is not gone.
 fn treekem_catchup_sender_revoked(
     revoked: &x0x::revocation::RevocationSet,
     sender: &AgentId,
     machine_id: &MachineId,
 ) -> bool {
+    treekem_catchup_sender_departed(revoked, sender)
+        || treekem_catchup_sender_page_hold(revoked, sender, machine_id)
+}
+
+/// #1685 round 8 (Engineer ruling, 31 Oct 2026): the DEPARTED half of
+/// [`treekem_catchup_sender_revoked`] — an agent revocation retires the
+/// portable agent itself, so it can never deliver the terminal page
+/// that closes its fence from ANY machine. This, or a lost Active seat,
+/// is the only condition that may retire a stopped peer's fence without
+/// its terminal page.
+fn treekem_catchup_sender_departed(
+    revoked: &x0x::revocation::RevocationSet,
+    sender: &AgentId,
+) -> bool {
     revoked.is_agent_revoked(sender)
-        || revoked.is_machine_revoked(machine_id)
+}
+
+/// #1685 round 8 (Engineer ruling, 31 Oct 2026): the HOLD half of
+/// [`treekem_catchup_sender_revoked`] — machine revocation (#1616,
+/// ADR 0110 D70), binding revocation (#1622) or a pending revocation
+/// resync (#1116). Each holds pages from this `machine`: a page the
+/// agent serves from a clean machine passes the page gate as ever, and
+/// a resync is a global temporary hold, not a departure. A stopped peer
+/// that keeps its Active seat is DEFERRED on this half — row armed,
+/// fence open — never retired.
+fn treekem_catchup_sender_page_hold(
+    revoked: &x0x::revocation::RevocationSet,
+    sender: &AgentId,
+    machine_id: &MachineId,
+) -> bool {
+    revoked.is_machine_revoked(machine_id)
         || revoked.is_binding_revoked(sender, machine_id)
         || revoked.revocation_resync_required()
 }
@@ -12916,8 +12950,10 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         // #1622 (ADR 0110 D70): a revoked agent-machine binding retires
         // the pairing only — agent and device each stay clean — so the
         // pairing itself is dropped here, before the roster check.
-        // #1685 round 5: the gate itself is shared with the re-arm
-        // pre-check through [`treekem_catchup_sender_revoked`].
+        // #1685 round 5 + round 8: the gate itself is shared with the
+        // re-arm pre-check through [`treekem_catchup_sender_revoked`];
+        // round 8 decides its halves separately there — a hold defers a
+        // stopped peer, only a departure retires it.
         if treekem_catchup_sender_revoked(&revoked, sender, machine_id) {
             return;
         }
@@ -13350,15 +13386,29 @@ static TREEKEM_PAGE_STOP_REWARN: std::sync::LazyLock<
 /// premise (the identical next page) no longer holds.
 const TREEKEM_PAGE_STOP_REARM_REASON: &str = "replay_applied";
 
-/// #1685 round 4 (Engineer ruling, 30 Oct 2026): the typed retirement
-/// reason recorded when the re-arm pre-check finds a stopped peer no
-/// longer passes the member gate — removed, banned, agent- or
-/// machine-revoked, its pairing retired, a pending revocation resync, or
-/// its group withdrew or left the local map. Such a peer can never
-/// deliver the terminal page that closes its fence (the page handler
-/// drops its pages before any fence work), so its stopped-loop row and
-/// page fence are retired instead of re-armed, never left open.
+/// #1685 round 4 (Engineer ruling, 30 Oct 2026), narrowed by round 8
+/// (Engineer ruling, 31 Oct 2026): the typed retirement reason recorded
+/// when the re-arm pre-check finds a stopped peer is revoked (the agent
+/// itself) or holds no Active seat on the live roster any more —
+/// removed, banned, its group withdrawn or gone from the local map.
+/// Such a peer can never deliver the terminal page that closes its
+/// fence (the page handler drops its pages before any fence work), so
+/// its stopped-loop row and page fence are retired instead of
+/// re-armed, never left open. A machine or binding revocation, or a
+/// pending revocation resync, is NOT a departure (round 8): the agent
+/// keeps its seat, so the peer is deferred with
+/// [`TREEKEM_PAGE_STOP_DEFERRED_PEER_REASON`] instead.
 const TREEKEM_PAGE_STOP_DEPARTED_PEER_REASON: &str = "peer_departed";
+
+/// #1685 round 8 (Engineer ruling, 31 Oct 2026): the typed defer reason
+/// recorded when the re-arm pre-check finds a stopped peer that keeps
+/// its Active seat but whose pages are on hold — the machine its
+/// stopped page came from is revoked, its (agent, machine) pairing is
+/// retired, or a revocation resync has admission closed. The row stays
+/// armed and the page fence stays OPEN (a page the agent serves from a
+/// clean machine closes it as ever); nothing is sent, and the next
+/// replay that moves the cursor retries the ask.
+const TREEKEM_PAGE_STOP_DEFERRED_PEER_REASON: &str = "revocation_hold";
 
 /// #1685 round 3: how long one armed row of
 /// [`TREEKEM_PAGE_STOPPED_PEERS`] survives. Rows are pruned by age only
@@ -13389,7 +13439,12 @@ type TreekemPageStoppedPeersByGroup = std::collections::HashMap<
 /// from (round 5), so the re-arm pre-check can run the same
 /// machine-aware revocation gate a page from this peer must pass. This
 /// map is liveness bookkeeping, not safety state: the peer fence itself
-/// stays open until that peer's terminal page whatever this map holds.
+/// stays open until that peer's terminal page whatever this map holds —
+/// except the round 4 retirement, narrowed by round 8 (Engineer
+/// rulings, 30–31 Oct 2026): a peer whose AGENT is revoked or that has
+/// no Active seat is retired (row dropped, fence closed without a
+/// terminal page), while a peer a machine/binding revocation or a
+/// pending resync holds on is DEFERRED — row armed, fence open.
 /// A stop arms its row; a row is cleared only once a re-arm or
 /// next-page request WENT OUT (round 5, review finding 2: a send that
 /// never left keeps the row armed, so a later replay that moves the
@@ -13406,11 +13461,13 @@ type TreekemPageStoppedPeersByGroup = std::collections::HashMap<
 /// timer and no timeout ever ends it as terminal;
 /// [`TREEKEM_PAGE_STOPPED_PEERS_TTL`] bounds this map's bookkeeping
 /// only and never closes a fence. The waiting state stays typed (this
-/// map plus [`TREEKEM_PAGE_STOP_REARM_REASON`] and
-/// [`TREEKEM_PAGE_STOP_DEPARTED_PEER_REASON`]) and visible (the stop
-/// warn and the re-arm info log), and it has an exit (the re-arm ask,
-/// the terminal page that closes the peer fence, or the round 4
-/// retirement of a peer that left the roster).
+/// map plus [`TREEKEM_PAGE_STOP_REARM_REASON`],
+/// [`TREEKEM_PAGE_STOP_DEPARTED_PEER_REASON`] and
+/// [`TREEKEM_PAGE_STOP_DEFERRED_PEER_REASON`]) and visible (the stop
+/// warn, the re-arm info log, the retirement and defer logs), and it
+/// has an exit (the re-arm ask, the terminal page that closes the peer
+/// fence, or the round 4/8 retirement of a peer that is revoked or has
+/// no Active seat).
 static TREEKEM_PAGE_STOPPED_PEERS: std::sync::LazyLock<
     std::sync::Mutex<TreekemPageStoppedPeersByGroup>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -13469,16 +13526,50 @@ fn treekem_page_stopped_peers_clear(group_ids: &[String], peer: &str) {
     guard.retain(|_, peers| !peers.is_empty());
 }
 
-/// #1685 round 4 (Engineer ruling, 30 Oct 2026): retire a stopped peer
-/// that no longer passes the member gate. Its terminal page can never
-/// close the peer fence — the page handler drops a non-member's pages
-/// before any fence work — so a fence held open for it is a wait with
-/// no exit (ADR 0088 L2). Drop its stopped-loop row, close its page
-/// fence with the same call the terminal page makes, and retire its
-/// re-warn row: the peer left the authenticated roster, so it cannot
-/// be asked or satisfied — the same retirement main gives a departed
-/// peer's catch-up rows (retain against the authenticated roster,
-/// [`self_leave_startup_drop_inactive`]).
+/// #1685 round 8 (Claude review at e756545d, finding 3): clear one
+/// peer's armed row only if it is still the exact row the caller saw.
+/// The reply to a re-arm ask can be handled before the ask's send
+/// future returns, and its no-progress stop arms a FRESH row; an
+/// unconditional clear would wipe it and leave the peer's fence open
+/// with no row — nothing would re-ask or retire it. The row a racing
+/// reply re-armed carries a different stop instant, so it survives.
+fn treekem_page_stopped_peers_clear_if(
+    group_ids: &[String],
+    peer: &str,
+    machine: &MachineId,
+    stopped_at: &std::time::Instant,
+) {
+    let mut guard = TREEKEM_PAGE_STOPPED_PEERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for group_id in group_ids {
+        if let Some(peers) = guard.get_mut(group_id) {
+            if peers.get(peer).is_some_and(|(row_machine, row_stopped)| {
+                row_machine == machine && row_stopped == stopped_at
+            }) {
+                peers.remove(peer);
+            }
+        }
+    }
+    guard.retain(|_, peers| !peers.is_empty());
+}
+
+/// #1685 round 4 (Engineer ruling, 30 Oct 2026), narrowed by round 8
+/// (Engineer ruling, 31 Oct 2026): retire a stopped peer whose agent is
+/// revoked or that no longer holds an Active seat. Its terminal page
+/// can never close the peer fence — the page handler drops a
+/// non-member's or revoked agent's pages before any fence work — so a
+/// fence held open for it is a wait with no exit (ADR 0088 L2). Drop
+/// its stopped-loop row, close its page fence with the same call the
+/// terminal page makes, and retire its re-warn row: the peer left the
+/// authenticated roster, so it cannot be asked or satisfied — the same
+/// retirement main gives a departed peer's catch-up rows (retain
+/// against the authenticated roster, `self_leave_startup_drop_inactive`).
+/// A peer a machine/binding revocation or a pending resync holds on is
+/// NOT retired (round 8): its agent keeps its Active seat, so the
+/// re-arm pre-check defers it instead — the row stays armed and the
+/// fence stays open until the agent serves a terminal page from a
+/// clean machine.
 ///
 /// #1685 round 7 (Claude review at 40455742, finding 1; Engineer
 /// ruling, 30 Oct 2026): the fence close above may release the group's
@@ -13544,25 +13635,30 @@ fn treekem_page_stopped_peers_drop_group(group_ids: &[String]) {
 fn treekem_page_stopped_peers(group_ids: &[String]) -> Vec<String> {
     treekem_page_stopped_peer_rows(group_ids)
         .into_iter()
-        .map(|(peer, _)| peer)
+        .map(|(peer, _, _)| peer)
         .collect()
 }
 
-/// #1685 round 5: the armed rows as `(peer, machine)` pairs, with the
-/// machine each stopped peer's last page came from — the machine the
-/// re-arm pre-check runs the shared revocation gate against. Sorted by
-/// peer, one row per peer across the aliases.
-fn treekem_page_stopped_peer_rows(group_ids: &[String]) -> Vec<(String, MachineId)> {
+/// #1685 round 5: the armed rows as `(peer, machine, stop instant)`,
+/// with the machine each stopped peer's last page came from — the
+/// machine the re-arm pre-check runs the shared revocation gate against
+/// — and the instant it stopped (round 8: the re-arm task's
+/// clear-on-send compares against it, so a row a racing reply re-armed
+/// survives the clear). Sorted by peer, one row per peer across the
+/// aliases.
+fn treekem_page_stopped_peer_rows(
+    group_ids: &[String],
+) -> Vec<(String, MachineId, std::time::Instant)> {
     let guard = TREEKEM_PAGE_STOPPED_PEERS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut rows: Vec<(String, MachineId)> = guard
+    let mut rows: Vec<(String, MachineId, std::time::Instant)> = guard
         .iter()
         .filter(|(group_id, _)| group_ids.contains(group_id))
         .flat_map(|(_, peers)| {
             peers
                 .iter()
-                .map(|(peer, (machine, _))| (peer.clone(), *machine))
+                .map(|(peer, (machine, stopped))| (peer.clone(), *machine, *stopped))
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_bytes().cmp(b.1.as_bytes())));
@@ -13620,14 +13716,22 @@ impl Drop for TreeKemPageRearmSlot {
 /// group and hold the replay fence for the whole send budget. One
 /// detached coordinator resolves the roster once and spawns one task
 /// per (group, peer), single-flighted through
-/// [`TREEKEM_PAGE_REARM_INFLIGHT`]; an unreachable peer delays only
-/// its own re-arm. `skip_peer` — the peer whose page triggered the
+/// [`TREEKEM_PAGE_REARM_INFLIGHT`] — keyed by the group's REGISTER KEY
+/// once the group is live (round 8, Claude review at e756545d, finding
+/// 4: the caller may pass either the register key or the stable id, and
+/// two spellings must not run two parallel page streams for one peer;
+/// the passed id keys the claim only once the group left the map and
+/// has no register key to resolve); an unreachable peer delays only its
+/// own re-arm. `skip_peer` — the peer whose page triggered the
 /// replay — is not asked while the group is live: the page handler's
 /// own moved-cursor branch asks it, and one peer must never hold two
 /// parallel page streams (review finding 4). A group that left the
 /// local map has no current members, so every armed row is retired
-/// instead. The peer fence stays open in every case: only that peer's
-/// terminal page closes it, never this ask.
+/// instead. The peer fence stays open unless the pre-check retires the
+/// peer as departed — revoked agent or no Active seat (round 8); a
+/// held peer (machine/binding revocation, pending resync) is deferred
+/// with its row armed — and only that peer's terminal page or that
+/// retirement closes it, never the ask itself.
 fn spawn_stopped_treekem_catchup_rearms(
     state: &Arc<AppState>,
     group_id: &str,
@@ -13644,13 +13748,16 @@ fn spawn_stopped_treekem_catchup_rearms(
     let spawned = spawn_via.spawn_detached(async move {
         let state = coordinator_state;
         let group_id = group_id_for_task;
-        let (aliases, live) = {
+        let (aliases, live, claim_key) = {
             let groups = state.named_groups.read().await;
             let mut aliases = vec![group_id.clone()];
             // The roster the pre-check asks against, read once under
             // the lock that resolves the aliases. `None` means the
             // group left the local map: no peer of it is a current
-            // member.
+            // member. The claim key is the resolved register key while
+            // the group is live (round 8, finding 4: both id spellings
+            // of one group must contend for one claim), and the passed
+            // id once it is not.
             let resolved = groups
                 .get_key_value(&group_id)
                 .map(|(key, info)| (key.clone(), info.clone()))
@@ -13660,32 +13767,32 @@ fn spawn_stopped_treekem_catchup_rearms(
                         .find(|(_, info)| info.stable_group_id() == group_id)
                         .map(|(key, info)| (key.clone(), info.clone()))
                 });
-            let live = match resolved {
+            let (live, claim_key) = match resolved {
                 Some((register_key, info)) => {
-                    aliases.push(register_key);
+                    aliases.push(register_key.clone());
                     aliases.push(info.mls_group_id.clone());
                     aliases.push(info.stable_group_id().to_string());
-                    Some(info)
+                    (Some(info), register_key)
                 }
-                None => None,
+                None => (None, group_id.clone()),
             };
             aliases.sort();
             aliases.dedup();
-            (aliases, live)
+            (aliases, live, claim_key)
         };
         let peers = treekem_page_stopped_peer_rows(&aliases);
         if peers.is_empty() {
             return;
         }
-        for (peer_hex, machine) in peers {
+        for (peer_hex, machine, stopped_at) in peers {
             if live.is_some() && Some(&peer_hex) == skip_peer.as_ref() {
                 continue;
             }
-            if !treekem_page_rearm_claim(&group_id, &peer_hex) {
+            if !treekem_page_rearm_claim(&claim_key, &peer_hex) {
                 continue;
             }
             let slot = TreeKemPageRearmSlot {
-                group_key: group_id.clone(),
+                group_key: claim_key.clone(),
                 peer_hex: peer_hex.clone(),
             };
             let roster = live.clone();
@@ -13702,6 +13809,7 @@ fn spawn_stopped_treekem_catchup_rearms(
                     roster.as_ref(),
                     peer_hex,
                     machine,
+                    stopped_at,
                 )
                 .await;
             });
@@ -13716,24 +13824,39 @@ fn spawn_stopped_treekem_catchup_rearms(
 }
 
 /// #1685 round 3 (review 5712505625) + round 4 (Engineer ruling,
-/// 30 Oct 2026) + round 5: re-arm one stopped peer inside its detached
-/// task. The membership pre-check: before an armed peer is asked again
-/// it must still pass the gates a page from it must pass — the SAME
-/// shared revocation gate the page handler runs
+/// 30 Oct 2026) + round 5 + round 8 (Engineer ruling, 31 Oct 2026):
+/// re-arm one stopped peer inside its detached task. The membership
+/// pre-check decides on the two halves of the shared revocation gate a
+/// page from this peer must pass
 /// ([`treekem_catchup_sender_revoked`], against the machine its
-/// stopped page came from: agent revocation, machine revocation,
-/// binding revocation, a pending revocation resync) and an Active seat
-/// on the live (not withdrawn) roster the triggering replay consulted.
-/// A peer that fails can never deliver the terminal page that closes
-/// its fence (the page handler drops its pages before any fence work),
-/// so it is retired by
-/// [`treekem_page_stopped_peers_drop_departed`] instead of re-armed:
-/// row dropped, fence closed, never left open — and the retire
-/// re-checks the responsive rekey, because the fence it closes may be
-/// the group's last open one (round 7). The ask stays inside
-/// [`SELF_LEAVE_CATCHUP_PAGE_SENDS`] sends, and the row is cleared only
-/// once a send SUCCEEDED (review finding 2): a failed re-arm keeps the
-/// row armed, so the next replay that moves the cursor retries it.
+/// stopped page came from):
+///
+/// - DEPARTED — the agent itself is revoked
+///   ([`treekem_catchup_sender_departed`]), or it holds no Active seat
+///   on the live (not withdrawn) roster the triggering replay
+///   consulted. It can never deliver the terminal page that closes its
+///   fence, so it is retired by
+///   [`treekem_page_stopped_peers_drop_departed`]: row dropped, fence
+///   closed, never left open — and the retire re-checks the responsive
+///   rekey, because the fence it closes may be the group's last open
+///   one (round 7).
+/// - HELD — the machine its stopped page came from is revoked, its
+///   (agent, machine) pairing is retired, or a revocation resync has
+///   admission closed ([`treekem_catchup_sender_page_hold`]). These
+///   hold PAGES, not the agent: the agent keeps its Active seat and
+///   can serve a terminal page from another machine, and a resync is a
+///   global temporary hold. The peer is DEFERRED (round 8): the row
+///   stays armed, nothing is sent, the fence stays open, and the next
+///   replay that moves the cursor retries. Retiring here (the rounds 4
+///   and 7 shape, which keyed on the whole shared gate) closed a
+///   still-Active member's fence without its terminal page — over a
+///   known gap during a resync, which the record forbids.
+///
+/// The ask stays inside [`SELF_LEAVE_CATCHUP_PAGE_SENDS`] sends, and
+/// the row is cleared only once a send SUCCEEDED (review finding 2) —
+/// and then only if the reply has not already re-armed a fresher row
+/// (round 8, finding 3): a failed re-arm keeps the row armed, so the
+/// next replay that moves the cursor retries it.
 async fn rearm_one_stopped_treekem_catchup_page(
     state: &Arc<AppState>,
     group_id: &str,
@@ -13741,34 +13864,40 @@ async fn rearm_one_stopped_treekem_catchup_page(
     roster: Option<&x0x::groups::GroupInfo>,
     peer_hex: String,
     machine: MachineId,
+    stopped_at: std::time::Instant,
 ) {
     let Ok(peer) = parse_agent_id_hex(&peer_hex) else {
         treekem_page_stopped_peers_clear(aliases, &peer_hex);
         return;
     };
-    // #1685 round 4 + round 5 finding 3: the full gate a page from this
-    // peer must pass, on the machine its stopped page came from. A
-    // stopped peer that fails it can never deliver the terminal page
-    // that closes its fence, so it is retired here — row dropped,
-    // fence closed — not re-armed.
-    let sender_revoked = {
+    // #1685 round 8 (Engineer ruling, 31 Oct 2026): only an agent
+    // revocation or a lost Active seat is a departure. A machine or
+    // binding revocation retires that device or pairing only — the
+    // agent keeps its Active seat and can serve pages from another
+    // machine — and a pending revocation resync is a global temporary
+    // hold, not a departure; neither may close a still-Active member's
+    // fence (the round 4 + round 7 pre-check keyed the retire on the
+    // whole shared gate and closed live members' fences).
+    let (agent_revoked, page_hold) = {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
-        treekem_catchup_sender_revoked(&revoked, &peer, &machine)
+        (
+            treekem_catchup_sender_departed(&revoked, &peer),
+            treekem_catchup_sender_page_hold(&revoked, &peer, &machine),
+        )
     };
     let current_member =
         roster.is_some_and(|info| !info.withdrawn && info.has_active_member(&peer_hex));
-    if sender_revoked || !current_member {
+    if agent_revoked || !current_member {
         treekem_page_stopped_peers_drop_departed(state, group_id, aliases, &peer_hex).await;
         tracing::warn!(
             group_id = %LogHexId::group(group_id),
             sender = %LogHexId::agent(&peer_hex),
             reason = TREEKEM_PAGE_STOP_DEPARTED_PEER_REASON,
-            revoked = sender_revoked,
-            "TreeKEM catch-up page loop not re-armed: the stopped peer left the \
-             authenticated roster (removed, banned or revoked) or admission is \
-             closed for a revocation resync, so its terminal page can no longer \
-             close its page fence; its stopped-loop row and fence are retired \
+            revoked = agent_revoked,
+            "TreeKEM catch-up page loop not re-armed: the stopped peer's agent is revoked \
+             or it holds no Active seat on the live roster, so its terminal page can no \
+             longer close its page fence; its stopped-loop row and fence are retired \
              instead of left open"
         );
         #[cfg(test)]
@@ -13781,6 +13910,30 @@ async fn rearm_one_stopped_treekem_catchup_page(
                 group_id.to_string(),
                 peer_hex,
                 TREEKEM_PAGE_STOP_DEPARTED_PEER_REASON,
+            ));
+        return;
+    }
+    if page_hold {
+        tracing::info!(
+            group_id = %LogHexId::group(group_id),
+            sender = %LogHexId::agent(&peer_hex),
+            reason = TREEKEM_PAGE_STOP_DEFERRED_PEER_REASON,
+            "TreeKEM catch-up page re-arm deferred: the stopped peer keeps its Active \
+             seat but a machine or binding revocation, or a pending revocation resync, \
+             holds pages from the machine its stopped page came from; the stopped row \
+             stays armed, nothing is sent, and the page fence stays open until the \
+             agent serves a terminal page from a clean machine"
+        );
+        #[cfg(test)]
+        state
+            .named_group_test_recorders
+            .catchup_page_deferred
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((
+                group_id.to_string(),
+                peer_hex,
+                TREEKEM_PAGE_STOP_DEFERRED_PEER_REASON,
             ));
         return;
     }
@@ -13802,7 +13955,7 @@ async fn rearm_one_stopped_treekem_catchup_page(
         );
         return;
     }
-    treekem_page_stopped_peers_clear(aliases, &peer_hex);
+    treekem_page_stopped_peers_clear_if(aliases, &peer_hex, &machine, &stopped_at);
     tracing::info!(
         group_id = %LogHexId::group(group_id),
         sender = %LogHexId::agent(&peer_hex),
