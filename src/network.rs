@@ -438,6 +438,28 @@ pub(crate) fn both_stale_candidate_indexes(samples: &[LinkAgeSample]) -> Vec<usi
         .collect()
 }
 
+/// Whether a failed liveness probe is evidence that the link itself is
+/// broken (#1419).
+///
+/// Only outcomes that name the link count: the probe timed out with no
+/// answer, the connection was closed, or the send was refused. A busy
+/// endpoint (`ProbeOverBudget`), a shutdown, a peer that left the table,
+/// and a peer without probe support are inconclusive. An inconclusive
+/// peer is neither degraded nor re-dialled on that evidence; the probe
+/// runs again after the window.
+fn one_sided_probe_confirms_broken(error: &ant_quic::NodeError) -> bool {
+    match error {
+        ant_quic::NodeError::Endpoint(
+            ant_quic::EndpointError::ProbeTimeout
+            | ant_quic::EndpointError::ConnectionClosed { .. }
+            | ant_quic::EndpointError::Connection(_),
+        ) => true,
+        // The sim refuses the moved winner's sends with this error.
+        ant_quic::NodeError::Connection(_) => true,
+        _ => false,
+    }
+}
+
 /// One re-dial episode for a peer that is one-sided (#1419).
 #[derive(Debug, Default)]
 struct OneSidedRepair {
@@ -3605,9 +3627,12 @@ impl NetworkNode {
     /// have traffic is decided by a bounded liveness probe: a quiet link
     /// answers and stays up, a broken link fails the probe, joins the
     /// degraded set and is then re-dialled once by
-    /// [`Self::repair_one_sided_links`]. Each peer is probed at most once
-    /// per [`ONE_SIDED_REDIAL_BACKOFF`], so this waits no longer than
-    /// [`ONE_SIDED_PROBE_TIMEOUT`] and only while a candidate exists.
+    /// [`Self::repair_one_sided_links`]. Only a probe failure that names
+    /// the link degrades the peer ([`one_sided_probe_confirms_broken`]);
+    /// a busy endpoint or a probe-incapable peer is inconclusive. Each
+    /// peer is probed at most once per [`ONE_SIDED_REDIAL_BACKOFF`], so
+    /// this waits no longer than [`ONE_SIDED_PROBE_TIMEOUT`] and only
+    /// while a candidate exists.
     pub(crate) async fn resolve_one_sided_peers(
         &self,
         samples: &[LinkAgeSample],
@@ -3647,10 +3672,14 @@ impl NetworkNode {
             for (peer, result) in to_probe.iter().zip(results) {
                 // `None` means the node is gone: inconclusive, not fresh.
                 let Some(result) = result else { continue };
+                let confirmed = match result {
+                    Ok(_) => false,
+                    Err(error) => one_sided_probe_confirms_broken(&error),
+                };
                 let entry = map.entry(*peer).or_default();
                 entry.both_stale_probe_at = Some(now);
-                entry.both_stale_confirmed = result.is_err();
-                if result.is_err() {
+                entry.both_stale_confirmed = confirmed;
+                if confirmed {
                     degraded.push(*peer);
                 }
             }
@@ -10798,6 +10827,50 @@ mod tests {
             both_stale_candidate_indexes(&[sample(1, missing), fresh_peer]).is_empty(),
             "a missing timestamp is neither stale nor fresh"
         );
+    }
+
+    /// #1419: only a probe failure that names the link confirms a
+    /// both-directions-stale peer. A busy endpoint, a probe-incapable
+    /// peer and a peer that left the table are inconclusive, so a healthy
+    /// quiet link is never degraded by them.
+    #[test]
+    fn both_stale_probe_failure_is_classified_by_cause() {
+        use ant_quic::EndpointError;
+        let confirms = |error: ant_quic::NodeError| one_sided_probe_confirms_broken(&error);
+        assert!(confirms(ant_quic::NodeError::Endpoint(
+            EndpointError::ProbeTimeout
+        )));
+        assert!(confirms(ant_quic::NodeError::Endpoint(
+            EndpointError::ConnectionClosed {
+                reason: ant_quic::ConnectionCloseReason::LifecycleCleanup
+            }
+        )));
+        assert!(confirms(ant_quic::NodeError::Endpoint(
+            EndpointError::Connection("send refused".to_string())
+        )));
+        assert!(
+            confirms(ant_quic::NodeError::Connection(
+                "sim: generation superseded".to_string()
+            )),
+            "the sim's moved-winner refusal names the link"
+        );
+        assert!(
+            !confirms(ant_quic::NodeError::Endpoint(
+                EndpointError::ProbeOverBudget
+            )),
+            "a busy endpoint is inconclusive"
+        );
+        assert!(
+            !confirms(ant_quic::NodeError::Endpoint(EndpointError::NotSupported)),
+            "a probe-incapable peer is inconclusive"
+        );
+        assert!(
+            !confirms(ant_quic::NodeError::Endpoint(EndpointError::PeerNotFound(
+                test_ant_peer(9)
+            ))),
+            "a peer that left the table is inconclusive"
+        );
+        assert!(!confirms(ant_quic::NodeError::ShuttingDown));
     }
 
     /// #1419: a quiet peer stays connected. One direction stale and the other
