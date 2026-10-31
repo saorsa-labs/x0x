@@ -1,5 +1,5 @@
 //! OwnerCertified harness support (#1666) and the ADR 0109 §10 rows
-//! H-S3-c and H-S3-c2 (#871, D78, D79, D121, D156, #1572). O is the only
+//! H-S3-c, H-S3-c2, H-S3-c3 and H-S3-d8 (#871, D78, D79, D121, D156, #1572). O is the only
 //! install with the owner's USER key; A, X and J hold owner-issued agent
 //! certificates only (test builds load `agent.cert` without a user key).
 //!
@@ -344,6 +344,9 @@ struct Prefix {
     joined_at: usize,
     /// While set, every write that O originates is held from J (H-S3-c).
     o_to_j_held: Arc<std::sync::atomic::AtomicBool>,
+    /// While set, every write that J originates is held from A and O
+    /// (H-S3-d8). Unset after the prefix.
+    j_out_held: Arc<std::sync::atomic::AtomicBool>,
     /// O's held r+1 gossip writes to J after r+1′.
     held_to_j: Arc<std::sync::atomic::AtomicUsize>,
     /// H-S3-c2: re-published canonical r+1 frames delivered to J.
@@ -422,6 +425,7 @@ async fn fork_prefix(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result
     let minted = view(sim, "O", &group).await?;
     let link = invite(sim, "O", &group).await?;
     let (o, x, j) = (sim.peer("O")?.0, sim.peer("X")?.0, sim.peer("J")?.0);
+    let a = sim.peer("A")?.0;
 
     // X is cut from O and A; O's r+1 publish (and its relays) is captured
     // and held from J.
@@ -611,9 +615,11 @@ async fn fork_prefix(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result
         .is_ok();
     let fork_frames = pubsub_delivered(sim, "X", "J", forked_at, b"w3h c X fork")?;
     let o_to_j_held = Arc::new(std::sync::atomic::AtomicBool::new(!both));
+    let j_out_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let (held, held_to_j) = (Arc::clone(&held), Arc::clone(&held_to_j));
         let (seal_ids, o_held) = (Arc::clone(&seal_ids), Arc::clone(&o_to_j_held));
+        let j_held = Arc::clone(&j_out_held);
         let what = match both {
             true => "X cut; O's r+1 gossip passes to J",
             false => {
@@ -636,7 +642,10 @@ async fn fork_prefix(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result
             let from_o =
                 origin == o && dst == j && o_held.load(std::sync::atomic::Ordering::SeqCst);
             let seal_to_j = dst == j && is_held(&seal_ids, msg);
-            origin == x || dst == x || (!both && (to_j || from_o || seal_to_j))
+            let from_j = origin == j
+                && (dst == a || dst == o)
+                && j_held.load(std::sync::atomic::Ordering::SeqCst);
+            origin == x || dst == x || from_j || (!both && (to_j || from_o || seal_to_j))
         });
     }
     // H-S3-c2: O publishes its recorded r+1 bytes again (a new message ID,
@@ -722,6 +731,7 @@ async fn fork_prefix(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result
         fork,
         joined_at,
         o_to_j_held,
+        j_out_held,
         held_to_j,
         canonical,
     }))
@@ -738,16 +748,21 @@ struct Advanced {
     unchanged: bool,
     kind: Option<String>,
     baseline: bool,
+    /// Every answer J recorded from a peer it asked, over the advance.
+    answers: std::collections::BTreeSet<String>,
+    /// The `reseat_required` cause the row expects.
+    cause: &'static str,
 }
 
-/// H-S3-c's "Advance 30 min" on `p`: J must show `reseat_required
-/// {not_on_chain, ..}`, unchanged to the end. `None` when H-S3-c2's
-/// prerequisite is missing: the receipt is then finished.
+/// H-S3-c's "Advance 30 min" on `p` (or H-S3-d8's shorter `window`): J
+/// must show `reseat_required {cause, ..}`, unchanged to the end. `None`
+/// when H-S3-c2's prerequisite is missing: the receipt is then finished.
 async fn advance(
     sim: &mut Sim,
     receipt: &mut Receipt,
     p: &Prefix,
     both: bool,
+    (window, cause): (Duration, &'static str),
 ) -> Result<Option<Advanced>> {
     let Prefix {
         fork, held_to_j, ..
@@ -757,9 +772,10 @@ async fn advance(
     // The advance: J's recovery states, sampled each poll. A failed read
     // stops the window and the row is INFRA.
     let mut states: Vec<String> = Vec::new();
+    let mut answers = std::collections::BTreeSet::new();
     let mut seen = Observations::default();
     let waited = sim
-        .until("the gate window", GATE_WINDOW, async |s: &Sim| {
+        .until("the gate window", window, async |s: &Sim| {
             let Some(j_status) = seen.observe(status_now(s, "J", &group)).await else {
                 return true;
             };
@@ -768,6 +784,8 @@ async fn advance(
                 if states.last() != Some(&text) {
                     states.push(text);
                 }
+                let asked = st.recovery["asked"].as_array().into_iter().flatten();
+                answers.extend(asked.filter_map(|a| a["answer"].as_str().map(str::to_string)));
             }
             false
         })
@@ -799,8 +817,7 @@ async fn advance(
         }
     }
     let typed = j_status.as_ref().is_some_and(|st| {
-        st.recovery_state() == Some("reseat_required")
-            && st.recovery_cause() == Some("not_on_chain")
+        st.recovery_state() == Some("reseat_required") && st.recovery_cause() == Some(cause)
     });
     let kind = j_status
         .as_ref()
@@ -837,7 +854,8 @@ async fn advance(
         .map_or_else(|| "404".to_string(), Status::describe);
     receipt.note(format!(
         "after the advance: J {j_text}; J {}; states {states:?}; O's r+1 gossip frames to J \
-         after r+1′ (held in c): {}; re-published to J (c2): {canonical}",
+         after r+1′ (held in c): {}; re-published to J (c2): {canonical}; answers J \
+         recorded {answers:?}",
         j1.describe(),
         held_to_j.load(std::sync::atomic::Ordering::SeqCst)
     ));
@@ -850,6 +868,8 @@ async fn advance(
         unchanged,
         kind,
         baseline,
+        answers,
+        cause,
     }))
 }
 
@@ -977,7 +997,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     let Some(p) = fork_prefix(sim, receipt, both).await? else {
         return Ok(());
     };
-    let Some(adv) = advance(sim, receipt, &p, both).await? else {
+    let Some(adv) = advance(sim, receipt, &p, both, (GATE_WINDOW, "not_on_chain")).await? else {
         return Ok(());
     };
     let (group, j_hex, o_to_j_held) = (p.group.clone(), p.j_hex.clone(), &p.o_to_j_held);
@@ -1060,7 +1080,13 @@ fn advance_checks(p: &Prefix, adv: &Advanced, both: bool) -> Vec<(&'static str, 
             "j_gate_still_armed_after_the_advance",
             adv.j1.gap_refusal.is_some(),
         ),
-        ("j_typed_reseat_required_not_on_chain", adv.typed),
+        (
+            match adv.cause {
+                "not_a_member" => "j_typed_reseat_required_not_a_member",
+                _ => "j_typed_reseat_required_not_on_chain",
+            },
+            adv.typed,
+        ),
         (refs, adv.refs_ok),
         (
             "typed_state_unchanged_to_the_end_of_the_advance",
@@ -1142,7 +1168,7 @@ async fn owner_path_reseat(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let Some(p) = fork_prefix(sim, receipt, false).await? else {
         return Ok(());
     };
-    let Some(adv) = advance(sim, receipt, &p, false).await? else {
+    let Some(adv) = advance(sim, receipt, &p, false, (GATE_WINDOW, "not_on_chain")).await? else {
         return Ok(());
     };
     let (group, j_hex) = (&p.group, &p.j_hex);
@@ -1191,6 +1217,81 @@ async fn owner_path_reseat(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         sim,
         receipt,
         (FINAL_C3, CAUSE_C3),
+        &adv,
+        &swap,
+        &checks,
+        red,
+    );
+    Ok(())
+}
+
+// ─── H-S3-d8 ──────────────────────────────────────────────────────────────
+
+const FINAL_D8: &str = "j_reseat_required_not_a_member_then_a_removal_basis_reseats_it";
+const CAUSE_D8: &str = "the row's main observation: after the advance J stays on X's fork r+1′ \
+                        with its gap gate armed and no typed re-seat state (as H-S3-c); or O's \
+                        route returns 404; or J leaves containment before the keyed swap \
+                        (ADR 0109 §3); `observed` lists each failing step";
+/// One request interval (§11: the first retry after 60 s, plus margin).
+const REQUEST_INTERVAL: Duration = Duration::from_secs(70);
+
+/// H-S3-d8 (`Removal` basis): H-S3-c up to r+1′ on J. With J's writes to
+/// A and O held, A removes J (r+3); after `GATE_STALL` and one request
+/// interval J shows `reseat_required {not_a_member, Gap(..)}`, and O's
+/// re-seat with basis `Removal(r+3)` swaps J in at r+4.
+async fn removal_basis_reseat(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let Some(p) = fork_prefix(sim, receipt, false).await? else {
+        return Ok(());
+    };
+    let (group, j_hex) = (&p.group, &p.j_hex);
+    p.j_out_held.store(true, Ordering::SeqCst);
+    sim.fabric()
+        .mark("fault: every write from J to A and O held");
+    let path = format!("/groups/{group}/members/{j_hex}");
+    let (code, body) = sim.api("A", Method::DELETE, &path, None).await?;
+    ensure!(code.is_success(), "A removes J: {code} {body}");
+    let j_removal = view(sim, "A", group).await?;
+    all_reach(sim, &["O"], group, &j_removal.state_hash).await?;
+    p.j_out_held.store(false, Ordering::SeqCst);
+    sim.fabric().mark("fault: J's writes to A and O released");
+    // O's direct writes stay held from J for the advance, as in H-S3-c, so
+    // J's answers come from A; they pass from the re-seat on (H-S3-c3).
+    let window = (
+        crate::groups::recovery::GATE_STALL + REQUEST_INTERVAL,
+        "not_a_member",
+    );
+    let Some(adv) = advance(sim, receipt, &p, false, window).await? else {
+        return Ok(());
+    };
+    p.o_to_j_held.store(false, Ordering::SeqCst);
+    sim.fabric().mark("fault: O's direct writes pass to J");
+    let swap = reseat_and_swap(sim, receipt, &p, &adv, "O", &j_removal).await?;
+    // O's answers stay held from J over the advance, so O shows `pending`.
+    let answered: Vec<&String> = adv.answers.iter().filter(|a| *a != "pending").collect();
+    let only_not_a_member = !answered.is_empty() && answered.iter().all(|a| *a == "not_a_member");
+    let mut checks = advance_checks(&p, &adv, false);
+    checks.extend([
+        (
+            "a_removal_at_r_plus_3",
+            j_removal.state_revision == p.minted.state_revision + 3 && !j_removal.lists(j_hex),
+        ),
+        ("j_requests_answered_only_not_a_member", only_not_a_member),
+        (
+            "reseat_route_accepts_the_removal_basis",
+            swap.code.is_success(),
+        ),
+        (
+            "member_added_carries_owner_mandate",
+            swap.adds > 0 && swap.owner_mandate,
+        ),
+    ]);
+    checks.extend(swap_checks(&p, &swap));
+    let red = adv.baseline || swap.code == StatusCode::NOT_FOUND || swap.early_active.is_some();
+    settle(
+        sim,
+        receipt,
+        (FINAL_D8, CAUSE_D8),
         &adv,
         &swap,
         &checks,
@@ -1346,6 +1447,7 @@ enum Row {
     C,
     C2,
     C3,
+    D8,
 }
 
 async fn run(case: &str, seed: u64, row: Row) -> Receipt {
@@ -1354,12 +1456,14 @@ async fn run(case: &str, seed: u64, row: Row) -> Receipt {
         Row::Control => (LABELS, FINAL),
         Row::C | Row::C2 => (C_LABELS, FINAL_C),
         Row::C3 => (C_LABELS, FINAL_C3),
+        Row::D8 => (C_LABELS, FINAL_D8),
     };
     receipt.note(match row {
         Row::Control => "OwnerCertified harness support (#1666): A has no USER key".to_string(),
         Row::C => "ADR 0109 S3 (#1356, #1572) H-S3-c; O alone holds the USER key".to_string(),
         Row::C2 => "ADR 0109 S3 (#1356, #1572) H-S3-c2; O alone holds the USER key".to_string(),
         Row::C3 => "ADR 0109 S3 (#1356, #1572) H-S3-c3; O online throughout".to_string(),
+        Row::D8 => "ADR 0109 S3 (#1356, #1572) H-S3-d8; A removes J, O re-seats".to_string(),
     });
     match Sim::empty(case, seed, labels) {
         Ok(mut sim) => {
@@ -1368,6 +1472,7 @@ async fn run(case: &str, seed: u64, row: Row) -> Receipt {
                 Row::C => owner_reseat(&mut sim, &mut receipt, false).await,
                 Row::C2 => owner_reseat(&mut sim, &mut receipt, true).await,
                 Row::C3 => owner_path_reseat(&mut sim, &mut receipt).await,
+                Row::D8 => removal_basis_reseat(&mut sim, &mut receipt).await,
             };
             if let Err(error) = ran {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
@@ -1439,6 +1544,18 @@ fn w3h_1356_red_s3_c2_reseat_retires_marker_and_gap() -> Result<()> {
 fn w3h_1356_control_s3_c3_owner_reseats_owner_axis_node() -> Result<()> {
     let case = "w3h_1356_control_s3_c3_owner_reseats_owner_axis_node";
     super::super::block_on_paused(expect(case, 0x1356_0109, Row::C3))
+}
+
+/// H-S3-d8 (`Removal` basis): a control; on `main` before S3, J stayed at
+/// r+1′ with no typed state, as in H-S3-c.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node() -> Result<()> {
+    let case = "w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node";
+    super::super::block_on_paused(expect(case, 0x1356_0110, Row::D8))
 }
 
 /// A record for the staging tests: J's fork is r+1′ (11), A removes J at
