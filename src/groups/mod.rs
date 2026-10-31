@@ -1873,15 +1873,47 @@ impl GroupInfo {
     /// installed via [`Self::set_member_certificate`] (which re-checks the
     /// digest and stamps both fields). A provided certificate that matches
     /// no committed digest (or belongs to a byte-bearing member) is ignored
-    /// and logged — hydration never rewrites committed state. Returns the
-    /// number of members hydrated; the server broadcast bridge is the
-    /// intended caller.
+    /// and logged — hydration never rewrites committed state. #1023: seats
+    /// no provided certificate covers fall back to the group's OWN
+    /// retained-commit snapshots (`commit_log`), newest first, under the
+    /// same digest-anchored rule — the retained chain is a certificate
+    /// carrier, so a node holding it can hydrate with every other holder
+    /// offline. Returns the number of members hydrated; the server
+    /// broadcast bridge is the intended caller.
     pub fn hydrate_member_certificates(
         &mut self,
         certificates: &[(String, crate::identity::AgentCertificate)],
     ) -> usize {
+        // #1023: collect the commit-log fallback before any mutation (the
+        // scan borrows `self` immutably). A seat the caller covers is left
+        // to the caller's entry — the shared loop below skips byte-bearing
+        // seats, so an overlap cannot double-install.
+        let mut from_commit_log: Vec<(String, crate::identity::AgentCertificate)> = Vec::new();
+        for (agent_hex, member) in &self.members_v2 {
+            if member.certificate.is_some() {
+                continue;
+            }
+            let Some(committed) = member.certificate_digest.as_deref() else {
+                continue;
+            };
+            for retained in self.commit_log.iter().rev() {
+                let Some(snapshot) = retained.roster.get(agent_hex) else {
+                    continue;
+                };
+                let Some(cert) = snapshot.certificate.as_ref() else {
+                    continue;
+                };
+                if owner_cert::certificate_digest_hex(cert) == committed {
+                    from_commit_log.push((agent_hex.clone(), cert.clone()));
+                }
+                // One snapshot per member: the newest retained entry that
+                // carries bytes for this seat decides (a match installs, a
+                // mismatch is evidence for a different admission).
+                break;
+            }
+        }
         let mut hydrated = 0usize;
-        for (agent_hex, cert) in certificates {
+        for (agent_hex, cert) in certificates.iter().chain(from_commit_log.iter()) {
             let Some(member) = self.members_v2.get(agent_hex) else {
                 continue;
             };
@@ -2178,7 +2210,10 @@ impl GroupInfo {
     /// `certificate_digest` — a mismatching local cert drops its bytes but
     /// keeps the committed digest, so projection members without local
     /// bytes seat digest-only (`MemberCertStatus::DigestPending`) instead
-    /// of losing their committed evidence.
+    /// of losing their committed evidence. #1023: an entry whose snapshot
+    /// carries certificate bytes that hash to its committed digest seats
+    /// the BYTES at adoption, so a chain served while the certificate
+    /// holders were online keeps the group sealable after they go offline.
     pub fn apply_reconstructed_roster(
         &mut self,
         projection: &BTreeMap<String, state_commit::RosterMemberSnapshot>,
@@ -2194,6 +2229,24 @@ impl GroupInfo {
             self.members_v2.remove(&id);
         }
         for (id, snap) in projection {
+            // #1023: snapshot-carried certificate bytes install on
+            // adoption ONLY when they hash to the entry's committed
+            // `certificate_digest` — the same digest-anchored rule as
+            // [`Self::hydrate_member_certificates`]. Bytes without a
+            // committed digest, or hashing to a different one, are not
+            // evidence for this admission: the seat stays digest-only
+            // (`MemberCertStatus::DigestPending`). A byte-bearing seat
+            // hashes identically to its digest-only form, so the adopted
+            // root never moves.
+            let snapshot_certificate = snap
+                .certificate
+                .as_ref()
+                .filter(|cert| {
+                    snap.certificate_digest.as_deref().is_some_and(|committed| {
+                        owner_cert::certificate_digest_hex(cert) == committed
+                    })
+                })
+                .cloned();
             match self.members_v2.get_mut(id) {
                 Some(member) => {
                     member.role = snap.role;
@@ -2217,6 +2270,9 @@ impl GroupInfo {
                     // remains digest-committed
                     // (`MemberCertStatus::DigestPending`).
                     member.certificate_digest = snap.certificate_digest.clone();
+                    if member.certificate.is_none() {
+                        member.certificate = snapshot_certificate;
+                    }
                 }
                 None => {
                     let mut member =
@@ -2224,6 +2280,7 @@ impl GroupInfo {
                     member.role = snap.role;
                     member.state = snap.state;
                     member.certificate_digest = snap.certificate_digest.clone();
+                    member.certificate = snapshot_certificate;
                     self.members_v2.insert(id.clone(), member);
                 }
             }
@@ -3748,14 +3805,29 @@ mod tests {
             signed_root,
             "materialized roster must re-derive the projection's signed root"
         );
-        for hex in [&creator_hex, &agent_hex] {
-            let m = adopted.members_v2.get(hex).unwrap();
-            assert!(
-                m.certificate.is_none(),
-                "projection materialization carries no bytes, only the digest"
-            );
-            assert_eq!(m.certificate_digest.as_deref(), Some(committed.as_str()));
-        }
+        // #1023: a BYTE-BEARING source seat now materializes with its
+        // bytes (the snapshot carries them), while a digest-only source
+        // seat still materializes digest-only. Both hold the committed
+        // digest, so both re-derive the same signed root either way.
+        let creator = adopted.members_v2.get(&creator_hex).unwrap();
+        assert_eq!(
+            creator.certificate.as_ref(),
+            Some(&cert),
+            "a byte-bearing source seat materializes with its bytes (#1023)"
+        );
+        assert_eq!(
+            creator.certificate_digest.as_deref(),
+            Some(committed.as_str())
+        );
+        let digest_only = adopted.members_v2.get(&agent_hex).unwrap();
+        assert!(
+            digest_only.certificate.is_none(),
+            "a digest-only source seat materializes with no bytes, only the digest"
+        );
+        assert_eq!(
+            digest_only.certificate_digest.as_deref(),
+            Some(committed.as_str())
+        );
     }
 
     #[test]
@@ -3804,6 +3876,164 @@ mod tests {
             state_commit::compute_roster_root(&adopted.members_v2),
             signed_root
         );
+    }
+
+    /// #1023: a chain whose snapshots carry certificate bytes seats the
+    /// bytes at adoption (the new-member arm is pinned by the updated
+    /// `apply_reconstructed_roster_copies_certificate_digest_across_gap`)
+    /// — but ONLY after the bytes hash to the entry's committed digest,
+    /// for a digest-only local seat as for a materialized one. Mismatched
+    /// snapshot bytes are not evidence for this admission: the seat stays
+    /// digest-only.
+    #[test]
+    fn apply_reconstructed_roster_seats_snapshot_bytes_after_digest_check() {
+        let (_user, _agent_kp, cert) = certified_fixture();
+        let committed = owner_cert::certificate_digest_hex(&cert);
+
+        // A sealing authority's roster: the creator seat byte-bearing at
+        // capture, so its retained snapshots carry the bytes.
+        let mut source = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        let creator_hex = hex::encode([1u8; 32]);
+        source
+            .set_member_certificate(&creator_hex, cert.clone())
+            .expect("creator cert installs");
+        let projection = state_commit::roster_projection(&source.members_v2);
+        assert!(
+            projection
+                .get(&creator_hex)
+                .is_some_and(|snap| snap.certificate.is_some()),
+            "post-#1023 capture carries the seat bytes"
+        );
+        let signed_root = state_commit::roster_root_of_projection(&projection);
+
+        // Digest-only local seat (existing-member arm): the bytes install.
+        let mut digest_only = GroupInfo::new("S".into(), String::new(), agent(8), "aabb".repeat(8));
+        digest_only.add_member(creator_hex.clone(), GroupRole::Member, None, None);
+        digest_only
+            .members_v2
+            .get_mut(&creator_hex)
+            .unwrap()
+            .certificate_digest = Some(committed.clone());
+        digest_only.apply_reconstructed_roster(&projection);
+        assert_eq!(
+            digest_only.members_v2[&creator_hex].certificate.as_ref(),
+            Some(&cert),
+            "matched snapshot bytes install on a digest-only seat"
+        );
+        assert_eq!(
+            state_commit::compute_roster_root(&digest_only.members_v2),
+            signed_root
+        );
+
+        // Snapshot bytes hashing to a DIFFERENT digest never install: the
+        // seat stays digest-only and the root still re-derives.
+        let (_user2, _agent2_kp, other_cert) = certified_fixture();
+        let mut mismatched = projection.clone();
+        mismatched.get_mut(&creator_hex).unwrap().certificate = Some(other_cert);
+        let mut strict = GroupInfo::new("S".into(), String::new(), agent(7), "aabb".repeat(8));
+        strict.add_member(creator_hex.clone(), GroupRole::Member, None, None);
+        strict
+            .members_v2
+            .get_mut(&creator_hex)
+            .unwrap()
+            .certificate_digest = Some(committed.clone());
+        strict.apply_reconstructed_roster(&mismatched);
+        assert!(
+            strict.members_v2[&creator_hex].certificate.is_none(),
+            "snapshot bytes for another admission must not install"
+        );
+        assert_eq!(
+            strict.members_v2[&creator_hex]
+                .certificate_digest
+                .as_deref(),
+            Some(committed.as_str())
+        );
+        assert_eq!(
+            state_commit::compute_roster_root(&strict.members_v2),
+            state_commit::roster_root_of_projection(&mismatched)
+        );
+    }
+
+    /// #1023: `hydrate_member_certificates` falls back to the group's OWN
+    /// retained-commit snapshots for still-digest-only seats — the retained
+    /// chain is a certificate carrier, so a node holding it hydrates with
+    /// every other holder offline. The fallback keeps the digest-anchored
+    /// rule: snapshot bytes for a different admission never install.
+    #[test]
+    fn hydrate_member_certificates_falls_back_to_commit_log_snapshots() {
+        let (_user, agent_kp, cert) = certified_fixture();
+        let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
+        let committed = owner_cert::certificate_digest_hex(&cert);
+
+        // The authority's captured link: the member byte-bearing at seal.
+        let mut authority = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        authority.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        authority
+            .set_member_certificate(&agent_hex, cert.clone())
+            .expect("cert installs");
+        let commit = state_commit::GroupStateCommit::sign(
+            "aabb".repeat(8),
+            1,
+            None,
+            state_commit::compute_roster_root(&authority.members_v2),
+            "ph".to_string(),
+            "mh".to_string(),
+            None,
+            false,
+            0,
+            &agent_kp,
+        )
+        .expect("fixture commit signs");
+        let retained = state_commit::RetainedCommit {
+            commit,
+            roster: state_commit::roster_projection(&authority.members_v2),
+            meta: Some(state_commit::GroupPublicMeta::default()),
+        };
+
+        // A holder whose seat is digest-only but which holds the retained
+        // link: the fallback hydrates with NO caller-supplied pairs.
+        let mut holder = GroupInfo::new("S".into(), String::new(), agent(2), "aabb".repeat(8));
+        holder.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        holder
+            .members_v2
+            .get_mut(&agent_hex)
+            .unwrap()
+            .certificate_digest = Some(committed.clone());
+        holder.commit_log.push(retained.clone());
+        assert_eq!(
+            holder.hydrate_member_certificates(&[]),
+            1,
+            "the retained snapshot must hydrate the digest-only seat"
+        );
+        assert_eq!(
+            holder.members_v2[&agent_hex].certificate.as_ref(),
+            Some(&cert)
+        );
+        assert_eq!(
+            holder.members_v2[&agent_hex].certificate_digest.as_deref(),
+            Some(committed.as_str())
+        );
+
+        // The owner re-keyed while this holder kept the old chain: the
+        // snapshot bytes hash to the OLD digest, so they are evidence for
+        // a different admission and nothing installs.
+        let (_user3, _agent3_kp, cert3) = certified_fixture();
+        let re_keyed = owner_cert::certificate_digest_hex(&cert3);
+        let mut stale_holder =
+            GroupInfo::new("S".into(), String::new(), agent(3), "aabb".repeat(8));
+        stale_holder.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        stale_holder
+            .members_v2
+            .get_mut(&agent_hex)
+            .unwrap()
+            .certificate_digest = Some(re_keyed);
+        stale_holder.commit_log.push(retained);
+        assert_eq!(
+            stale_holder.hydrate_member_certificates(&[]),
+            0,
+            "snapshot bytes for a different admission must not hydrate"
+        );
+        assert!(stale_holder.members_v2[&agent_hex].certificate.is_none());
     }
 
     #[test]

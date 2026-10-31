@@ -3097,6 +3097,7 @@ async fn issue458r3_chain_with_roster_churn_refused() -> Result<()> {
             state: x0x::groups::GroupMemberState::Active,
             treekem_key_package_hash: None,
             certificate_digest: None,
+            certificate: None,
         },
     );
     let churned = x0x::groups::state_commit::RetainedCommit {
@@ -4586,6 +4587,7 @@ async fn issue458r5_certified_member_in_gap_adopts_digest_only() -> Result<()> {
             state: x0x::groups::GroupMemberState::Active,
             treekem_key_package_hash: None,
             certificate_digest: Some(filler_digest.clone()),
+            certificate: None,
         },
     );
     let churned_commit = x0x::groups::GroupStateCommit::sign(
@@ -4884,6 +4886,7 @@ async fn issue458r4_adoption_hydrates_reconstructed_digest_only_seats() -> Resul
             state: x0x::groups::GroupMemberState::Active,
             treekem_key_package_hash: None,
             certificate_digest: Some(filler_digest.clone()),
+            certificate: None,
         },
     );
     let churned_commit = x0x::groups::GroupStateCommit::sign(

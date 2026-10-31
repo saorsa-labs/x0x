@@ -1662,7 +1662,7 @@ struct CreatorOfflineScenario {
 ///    never arrived.
 /// 5. The admin is promoted, per `promotion`.
 async fn creator_offline_scenario(promotion: Promotion) -> Result<CreatorOfflineScenario> {
-    creator_offline_scenario_on_plane(promotion, false, 0, false, false).await
+    creator_offline_scenario_on_plane(promotion, false, 0, false, false, false).await
 }
 
 async fn creator_offline_scenario_on_plane(
@@ -1670,6 +1670,7 @@ async fn creator_offline_scenario_on_plane(
     home_treekem: bool,
     extra_seats: usize,
     legacy_sidecar: bool,
+    legacy_chain: bool,
     recover: bool,
 ) -> Result<CreatorOfflineScenario> {
     let seed: [u8; 32] = rand::random();
@@ -1736,9 +1737,17 @@ async fn creator_offline_scenario_on_plane(
     };
 
     // (2) The admin-to-be's stub: the creator's seat is digest-only.
+    // #1023: with `legacy_chain`, the stub's retained history is rewritten
+    // to the pre-#1023 wire form (no snapshot bytes), the mixed-fleet
+    // case — otherwise the stub's own cloned base link carries every
+    // seat's bytes and the commit-log fallback resolves them without any
+    // fetch.
     let mut stub = base.clone();
     for seat in stub.members_v2.values_mut() {
         seat.certificate = None;
+    }
+    if legacy_chain {
+        stub.commit_log = stub.commit_log.into_iter().map(legacy_wire_link).collect();
     }
     admin
         .named_groups
@@ -2227,7 +2236,8 @@ async fn member_added_certificate_sidecar_is_wire_compatible() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn treekem_home_promoted_admin_seals_while_creator_offline() -> Result<()> {
     let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, true, 0, false, false).await?;
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, true, 0, false, false, false)
+            .await?;
     assert!(
         s.admin
             .treekem_groups
@@ -2266,10 +2276,14 @@ fn legacy_member_added_retains_certificate_recovery_context() {
 
 /// Red before the fix: seating does not request the trimmed certificates.
 /// With recovery during admission, all other holders can leave before seal.
+/// #1023: the stub's chain is pre-#1023 wire form (no snapshot bytes), so
+/// the recovery loop is the only carrier left — a post-#1023 chain would
+/// hydrate every seat from the stub's own retained link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trimmed_member_added_recovers_before_creator_offline_seal() -> Result<()> {
     let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 15, false, true).await?;
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 15, false, true, true)
+            .await?;
     assert!(!promoted_admin_seals_new_joiner(&s, &[])
         .await?
         .roster_root
@@ -2282,7 +2296,8 @@ async fn trimmed_member_added_recovers_before_creator_offline_seal() -> Result<(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_member_added_recovers_before_creator_offline_seal() -> Result<()> {
     let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 12, true, true).await?;
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 12, true, false, true)
+            .await?;
     assert!(!promoted_admin_seals_new_joiner(&s, &[])
         .await?
         .roster_root
@@ -2293,10 +2308,15 @@ async fn legacy_member_added_recovers_before_creator_offline_seal() -> Result<()
 
 /// No receiver can recover bytes after their last holder disappears.
 /// Keep the fail-closed seal and bounded retry deadline in this case.
+/// #1023: the stub's chain is pre-#1023 wire form (no snapshot bytes), so
+/// no carrier exists at all — a post-#1023 chain carries every seat's
+/// bytes and the seal succeeds with all holders offline (see
+/// `chain_carried_certificates_let_promoted_admin_seal_while_creator_offline`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trimmed_member_added_all_holders_offline_stays_pending() -> Result<()> {
     let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 15, false, false).await?;
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 15, false, true, false)
+            .await?;
     let err = promoted_admin_seals_new_joiner(&s, &[])
         .await
         .expect_err("no holder answered");
@@ -2324,6 +2344,280 @@ async fn trimmed_member_added_all_holders_offline_stays_pending() -> Result<()> 
         "next",
         "attempt"
     ));
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// #1023: rewrite a retained link to the pre-#1023 wire form — the
+/// snapshots without certificate bytes, exactly what an old peer serves.
+/// On a pre-#1023 origin this is a no-op (the key never serializes).
+fn legacy_wire_link(
+    link: x0x::groups::state_commit::RetainedCommit,
+) -> x0x::groups::state_commit::RetainedCommit {
+    let mut payload = serde_json::to_value(&link).expect("the link encodes");
+    for snapshot in payload["roster"]
+        .as_object_mut()
+        .expect("roster")
+        .values_mut()
+    {
+        snapshot
+            .as_object_mut()
+            .expect("snapshot")
+            .remove("certificate");
+    }
+    serde_json::from_value(payload).expect("the pre-#1023 link decodes")
+}
+
+/// #1023 (Root decision 2026-09-27, option (i)): the chain-carrier
+/// scenario. The admin adopts its group state from the creator's SERVED
+/// CHAIN LINK — the `RetainedCommit` form `intervening_chain_from` serves
+/// to a member crossing a revision gap — through the production recovery
+/// fold. No seat-event sidecar, no JoinResult and no announce cache ever
+/// reach it. With `legacy_chain`, EVERY link the admin holds is rewritten
+/// to the pre-#1023 wire form, the mixed-fleet case of an old peer's
+/// chain.
+async fn creator_offline_chain_carrier_scenario(
+    legacy_chain: bool,
+) -> Result<CreatorOfflineScenario> {
+    let seed: [u8; 32] = rand::random();
+    let owner = x0x::identity::UserKeypair::from_seed(&seed)?;
+    let (creator, _creator_dir, creator_cert) = owner_device_state(&seed).await?;
+    let (admin, admin_dir, admin_cert) = owner_device_state(&seed).await?;
+    let creator_hex = hex::encode(creator.agent.agent_id().as_bytes());
+    let admin_hex = hex::encode(admin.agent.agent_id().as_bytes());
+    let group_id = hex::encode(rand::random::<[u8; 32]>());
+
+    // (1) The creator's owner-certified group, creator seat byte-bearing,
+    // base revision sealed.
+    let mut base = x0x::groups::GroupInfo::with_policy(
+        "r1023-chain".to_string(),
+        String::new(),
+        creator.agent.agent_id(),
+        group_id.clone(),
+        x0x::groups::GroupPolicy {
+            discoverability: x0x::groups::GroupDiscoverability::Hidden,
+            admission: x0x::groups::GroupAdmission::OwnerCertified(owner.user_id()),
+            confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
+            read_access: x0x::groups::GroupReadAccess::MembersOnly,
+            write_access: x0x::groups::GroupWriteAccess::MembersOnly,
+        },
+    );
+    base.set_member_certificate(&creator_hex, creator_cert.clone())
+        .expect("the creator's certificate binds its own seat");
+    seal_commit_owner_certified(
+        &creator,
+        &mut base,
+        creator.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    creator
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), base.clone());
+
+    // (2) The admin's stub: the base revision with every seat digest-only
+    // (a joiner's key-stripped view). It never cached the creator's
+    // announce; no sidecar and no JoinResult ever arrive. In the legacy
+    // variant the stub's retained history is also pre-#1023 wire form, so
+    // no link the admin holds ever carried bytes.
+    let mut stub = base.clone();
+    for seat in stub.members_v2.values_mut() {
+        seat.certificate = None;
+    }
+    if legacy_chain {
+        stub.commit_log = stub.commit_log.into_iter().map(legacy_wire_link).collect();
+    }
+    admin
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), stub);
+    assert!(
+        admin
+            .agent
+            .announce_blob_cache
+            .find_by_cert_digest(&digest_arr(&seat_digest(&creator_cert)))
+            .await
+            .is_none(),
+        "the admin never cached the creator's announce"
+    );
+
+    // (3) The creator admits the admin through the production route (which
+    // seats the admin's verified certificate on the CREATOR's roster) and
+    // promotes it; both published events are captured.
+    install_discovery_cert(&creator, &admin.agent, &admin_cert).await;
+    creator
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .clear();
+    let response = add_named_group_member(
+        State(Arc::clone(&creator)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(AddNamedGroupMemberRequest {
+            agent_id: admin_hex.clone(),
+            display_name: None,
+            treekem_key_package_b64: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the creator admits");
+    let seat_event = creator
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .iter()
+        .filter_map(|(_topic, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .find(|event| {
+            matches!(event, NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                if *agent_id == admin_hex)
+        })
+        .expect("the creator published the admin's seat event");
+    // The served-chain wire form: the creator's retained link for the
+    // admission revision.
+    let mut served_link = {
+        let groups = creator.named_groups.read().await;
+        groups
+            .get(&group_id)
+            .expect("creator group")
+            .commit_log
+            .last()
+            .expect("the admission was retained")
+            .clone()
+    };
+    assert!(
+        served_link.roster.contains_key(&admin_hex)
+            && served_link.roster.contains_key(&creator_hex),
+        "the retained link holds the full post-admission roster"
+    );
+    if legacy_chain {
+        served_link = legacy_wire_link(served_link);
+    }
+    let response = update_member_role(
+        State(Arc::clone(&creator)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((group_id.clone(), admin_hex.clone())),
+        Json(UpdateMemberRoleRequest {
+            role: "admin".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the creator promotes");
+    let role_event = creator
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .iter()
+        .filter_map(|(_topic, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .find(|event| {
+            matches!(event, NamedGroupMetadataEvent::MemberRoleUpdated {
+                agent_id,
+                role: x0x::groups::GroupRole::Admin,
+                commit: Some(_),
+                ..
+            } if *agent_id == admin_hex)
+        })
+        .expect("the creator published a signed role-update commit");
+
+    // (4) The creator goes offline before the admin adopts anything.
+    let creator_id = creator.agent.agent_id();
+    creator.agent.shutdown().await;
+    drop(creator);
+
+    // (5) The admin adopts the served link through the production
+    // recovery fold (per-link `validate_apply`, roster-root re-derivation,
+    // full state-hash re-derivation), then the signed promotion applies
+    // gaplessly on the adopted head.
+    {
+        let mut groups = admin.named_groups.write().await;
+        let info = groups.get_mut(&group_id).expect("stub");
+        *info = x0x::groups::recovery::apply_link_state_only(info, &served_link)
+            .expect("the served link adopts");
+    }
+    let applied =
+        apply_named_group_metadata_event(&admin, role_event, creator_id, true, None).await;
+    assert!(
+        applied.accepted,
+        "the admin applies the creator's signed role-update commit"
+    );
+    Ok(CreatorOfflineScenario {
+        creator_hex,
+        creator_cert,
+        admin,
+        _admin_dir: admin_dir,
+        group_id,
+        owner,
+        seat_event,
+        served_join_result: Vec::new(),
+    })
+}
+
+/// #1023 (Root decision 2026-09-27, option (i)): the retained-commit
+/// snapshots are a certificate carrier. The admin adopts its state from
+/// the served chain link — no seat-event sidecar, no JoinResult, no
+/// announce cache — and the creator is offline. The promoted admin MUST
+/// seal the next joiner: the creator's certificate arrived with the
+/// committed chain, not with any live holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chain_carried_certificates_let_promoted_admin_seal_while_creator_offline() -> Result<()> {
+    let s = creator_offline_chain_carrier_scenario(false).await?;
+    let commit = promoted_admin_seals_new_joiner(&s, &[])
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "the promoted admin must seal from chain-carried certificates while the creator is offline: {err}"
+            )
+        });
+    assert!(!commit.roster_root.is_empty());
+    assert!(
+        seat_has_bytes(&s.admin, &s.group_id, &s.creator_hex).await,
+        "the creator's seat holds bytes after the adoption"
+    );
+    assert!(
+        s.admin
+            .agent
+            .announce_blob_cache
+            .find_by_cert_digest(&digest_arr(&seat_digest(&s.creator_cert)))
+            .await
+            .is_none(),
+        "the bytes arrived with the chain, not the announce path"
+    );
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// #1023: the gate itself is unchanged. A pre-#1023 peer's chain (the
+/// wire form without snapshot certificate bytes) still adopts — the field
+/// is additive — but the creator's seat stays digest-only, so with the
+/// sidecar absent, every holder offline and no announce, the seal keeps
+/// refusing with `OwnerCertMemberPending`. Only bytes that were actually
+/// carried somewhere can unblock a seal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_format_chain_without_snapshot_bytes_stays_pending() -> Result<()> {
+    let s = creator_offline_chain_carrier_scenario(true).await?;
+    assert!(
+        !seat_has_bytes(&s.admin, &s.group_id, &s.creator_hex).await,
+        "a link without snapshot bytes leaves the creator's seat digest-only"
+    );
+    let err = promoted_admin_seals_new_joiner(&s, &[])
+        .await
+        .expect_err("a never-carried certificate must keep blocking the seal");
+    // The admin's OWN seat self-hydrates at seat time from its local
+    // identity; the creator's never-carried certificate is the wedge.
+    match &err {
+        x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. } => {
+            assert_eq!(members, &vec![s.creator_hex.clone()], "{err}");
+        }
+        other => panic!("expected OwnerCertMemberPending, got {other}"),
+    }
     s.admin.agent.shutdown().await;
     Ok(())
 }

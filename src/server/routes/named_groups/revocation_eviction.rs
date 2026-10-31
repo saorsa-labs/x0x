@@ -5623,6 +5623,7 @@ pub(super) mod tests {
                     state: x0x::groups::GroupMemberState::Active,
                     treekem_key_package_hash: None,
                     certificate_digest: None,
+                    certificate: None,
                 },
             );
             (roster, epoch)

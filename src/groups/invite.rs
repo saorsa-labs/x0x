@@ -1364,6 +1364,7 @@ mod tests {
                         state: GroupMemberState::Active,
                         treekem_key_package_hash: Some("0f".repeat(32)),
                         certificate_digest: Some("5a".repeat(32)),
+                        certificate: None,
                     },
                 )
             })
@@ -2036,6 +2037,7 @@ mod tests {
                             state: GroupMemberState::Active,
                             treekem_key_package_hash: Some("0f".repeat(32)),
                             certificate_digest: Some("5a".repeat(32)),
+                            certificate: None,
                         },
                     )
                 })
@@ -2119,6 +2121,7 @@ mod tests {
                         state: GroupMemberState::Active,
                         treekem_key_package_hash: None,
                         certificate_digest: None,
+                        certificate: None,
                     },
                 );
                 t.base_roster = Some(roster);
@@ -2227,6 +2230,7 @@ mod tests {
                                 state: GroupMemberState::Pending,
                                 treekem_key_package_hash: Some(hex64()),
                                 certificate_digest: Some(hex64()),
+                                certificate: None,
                             },
                         )
                     })

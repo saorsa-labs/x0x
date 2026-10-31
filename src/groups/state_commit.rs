@@ -144,6 +144,15 @@ pub struct RosterMemberSnapshot {
     /// when the entry carries one (legacy snapshots deserialize without it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate_digest: Option<String>,
+    /// #1023: the seat's `AgentCertificate` bytes, when the projection was
+    /// captured from a byte-bearing seat, so certificates travel with the
+    /// retained-commit snapshots a chain serves. Root derivation ignores
+    /// the bytes (a byte-bearing seat and its digest-only form hash
+    /// identically), so the signed `roster_root` never moves; legacy
+    /// payloads decode without the field and peers that do not know the
+    /// field ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<crate::identity::AgentCertificate>,
 }
 
 /// Project the roster-root-relevant view of a roster: `Active` + `Banned`
@@ -173,6 +182,10 @@ pub fn roster_projection(
                         .as_ref()
                         .map(crate::groups::owner_cert::certificate_digest_hex)
                         .or(m.certificate_digest.clone()),
+                    // #1023: byte-bearing seats contribute their bytes so
+                    // chain adopters can seat them with the authority
+                    // offline; digest-only seats contribute none.
+                    certificate: m.certificate.clone(),
                 },
             )
         })
@@ -194,6 +207,25 @@ pub fn roster_root_of_projection(projection: &BTreeMap<String, RosterMemberSnaps
         })
         .collect();
     roster_root_from_entries(&mut entries)
+}
+
+/// #1023: the projection with certificate BYTES stripped. The certificate
+/// carrier is the retained-commit chain (state commits, the roster snapshot
+/// served at join, JoinResult) — an invite LINK is not, and its DM budget
+/// is size-bound by design (#469 A1: "no certificate BYTES"), so the v4
+/// invite base roster embeds this form. The committed digests — and so the
+/// root the invite recomputes — are identical either way.
+#[must_use]
+pub fn roster_projection_digest_only(
+    members_v2: &BTreeMap<String, GroupMember>,
+) -> BTreeMap<String, RosterMemberSnapshot> {
+    roster_projection(members_v2)
+        .into_iter()
+        .map(|(id, mut snap)| {
+            snap.certificate = None;
+            (id, snap)
+        })
+        .collect()
 }
 
 /// A retained, applied state commit paired with the roster projection it
@@ -2326,6 +2358,69 @@ mod tests {
         );
     }
 
+    /// #1023: the snapshot `certificate` field is a wire ADDITION. A
+    /// payload from a pre-#1023 peer — no `certificate` key at all — must
+    /// decode, and the bytes must never move the signed root: a projection
+    /// with bytes, the same projection with the bytes stripped, and the
+    /// decoded legacy payload all re-derive ONE root.
+    #[test]
+    fn snapshot_certificate_field_is_wire_additive_with_unchanged_root() {
+        let user = crate::identity::UserKeypair::generate().unwrap();
+        let agent = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&user, &agent).unwrap();
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+
+        let mut members = BTreeMap::new();
+        let mut m = make_member(&agent_hex, GroupRole::Member);
+        m.certificate = Some(cert.clone());
+        m.certificate_digest = Some(crate::groups::owner_cert::certificate_digest_hex(&cert));
+        members.insert(agent_hex.clone(), m);
+
+        let with_bytes = roster_projection(&members);
+        assert!(
+            with_bytes
+                .get(&agent_hex)
+                .is_some_and(|snap| snap.certificate.is_some()),
+            "a byte-bearing seat projects its bytes into the snapshot"
+        );
+        let root_with_bytes = roster_root_of_projection(&with_bytes);
+        assert_eq!(compute_roster_root(&members), root_with_bytes);
+
+        // The pre-#1023 wire form: the same snapshot without the bytes
+        // serializes WITHOUT the key (`skip_serializing_if`), so this is
+        // exactly what an old peer serves. It must decode back.
+        let mut stripped = with_bytes.clone();
+        stripped.get_mut(&agent_hex).unwrap().certificate = None;
+        let legacy_payload =
+            serde_json::to_value(&stripped[&agent_hex]).expect("legacy payload encodes");
+        assert!(
+            legacy_payload.get("certificate").is_none(),
+            "a stripped snapshot carries no certificate key on the wire"
+        );
+        let decoded: BTreeMap<String, RosterMemberSnapshot> = {
+            let mut map = serde_json::Map::new();
+            map.insert(agent_hex.clone(), legacy_payload);
+            serde_json::from_value(serde_json::Value::Object(map))
+                .expect("a legacy payload without the field decodes")
+        };
+        assert_eq!(
+            decoded, stripped,
+            "the decoded legacy form is the stripped snapshot"
+        );
+        assert_eq!(
+            roster_root_of_projection(&decoded),
+            root_with_bytes,
+            "the legacy form re-derives the same signed root"
+        );
+
+        // A byte-bearing snapshot round-trips through the new field.
+        let round_trip: BTreeMap<String, RosterMemberSnapshot> =
+            serde_json::from_value(serde_json::to_value(&with_bytes).expect("encodes"))
+                .expect("the byte-bearing payload decodes");
+        assert_eq!(round_trip, with_bytes);
+        assert_eq!(roster_root_of_projection(&round_trip), root_with_bytes);
+    }
+
     // ── ADR-0064 Decision §2 (slice 4): alternate-chain ancestor walk ──
 
     use crate::identity::AgentKeypair;
@@ -2336,6 +2431,7 @@ mod tests {
             state,
             treekem_key_package_hash: None,
             certificate_digest: None,
+            certificate: None,
         }
     }
 

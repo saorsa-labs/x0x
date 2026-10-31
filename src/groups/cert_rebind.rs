@@ -1278,6 +1278,7 @@ mod tests {
             state: GroupMemberState::Active,
             treekem_key_package_hash: Some("kp".to_string()),
             certificate_digest: digest.map(str::to_string),
+            certificate: None,
         }
     }
 
