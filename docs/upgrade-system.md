@@ -255,6 +255,19 @@ remains. The current apply path still uses its existing single-binary
 replacement flow. Do not infer pair rollback or launcher protection from this
 dormant module.
 
+The dormant launcher trial (`src/upgrade/launcher/run.rs`) bounds a candidate
+start. It reserves each attempt durably before exec, so a failed exec still
+counts. The limits are at most 3 attempts, 120 s to readiness per attempt,
+60 s of stable health and a 660 s total trial, with 10 s between attempts.
+These values are provisional until David rules on them. When the attempts
+or the total budget run out, the cause is Failed. A changed boot, a launcher
+restart during exec or rollback, or a service stop during the trial is
+Interrupted. In each case the launcher restores the previous pair and starts
+the restored daemon. A restarted launcher resumes an interrupted rollback,
+keeps the first rollback cause, and starts only a missing restored child, at
+most 3 times. A failed reap or a failed restored start stops automatic
+recovery (`RecoveryFailed`) until an operator repairs the host.
+
 The `x0x-launcher` binary builds only with the non-default `m2-launcher`
 cargo feature. Default builds and `cargo install` of the published crate do
 not build it until the activation slice. The launcher gives a candidate its boot

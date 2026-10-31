@@ -57,7 +57,7 @@ pub(super) fn fixture_receipt(bytes: &[u8]) -> io::Result<serde_json::Value> {
 /// an unrelated PID. It persists the original budget before requesting stop.
 pub(super) fn flush_and_reap(
     host: &recovery::Host,
-    trial: &Trial,
+    trial: &mut Trial,
     trial_path: &Path,
     child: &mut Child,
     token: &str,
@@ -107,7 +107,11 @@ pub(super) fn flush_and_reap(
             old,
         })
     })();
-    result.map_err(|error| keep_cause(error, child::stop_and_reap(child)))
+    result.map_err(|error| match child::stop_and_reap(child) {
+        Ok(()) => error,
+        // An unreaped OLD child is unowned: mark the trial RecoveryFailed.
+        reap => trial.recovery_failed(trial_path, keep_cause(error, reap)),
+    })
 }
 
 /// The flush failure is the cause; a reap failure must not mask it.
@@ -314,12 +318,12 @@ mod tests {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
         let path = root.join("trial.json");
         let clock = Clock::now().unwrap();
-        let trial = Trial::new(host.binding().unwrap(), "alice".into(), &clock).unwrap();
+        let mut trial = Trial::new(host.binding().unwrap(), "alice".into(), &clock).unwrap();
         let mut old = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
-        let result = flush_and_reap(&host, &trial, &path, &mut old, "inert launcher fixture");
+        let result = flush_and_reap(&host, &mut trial, &path, &mut old, "inert launcher fixture");
         old.kill().unwrap();
         old.wait().unwrap();
         assert_eq!(refused(result).kind(), io::ErrorKind::Unsupported);
@@ -393,11 +397,11 @@ mod tests {
 
         #[test]
         fn flush_and_reap_refuses_an_old_child_the_plan_does_not_name() {
-            let (_dir, root, host, trial, mut old) = owned(|p| {
+            let (_dir, root, host, mut trial, mut old) = owned(|p| {
                 p.old_pid = p.old_pid.map(|pid| pid + 1);
             });
             let path = root.join("trial.json");
-            let error = refused(flush_and_reap(&host, &trial, &path, &mut old, TOKEN));
+            let error = refused(flush_and_reap(&host, &mut trial, &path, &mut old, TOKEN));
             assert!(
                 error.to_string().contains("differs from frozen ownership"),
                 "{error}"
@@ -413,7 +417,7 @@ mod tests {
             let (_dir, root, host, mut trial, mut old) = owned(|_| {});
             trial.phase = Phase::Authorized;
             let path = root.join("trial.json");
-            let error = refused(flush_and_reap(&host, &trial, &path, &mut old, TOKEN));
+            let error = refused(flush_and_reap(&host, &mut trial, &path, &mut old, TOKEN));
             assert!(
                 error.to_string().contains("differs from frozen ownership"),
                 "{error}"
@@ -425,9 +429,9 @@ mod tests {
 
         #[test]
         fn a_flush_without_a_daemon_socket_persists_the_budget_and_reaps() {
-            let (_dir, root, host, trial, mut old) = owned(|_| {});
+            let (_dir, root, host, mut trial, mut old) = owned(|_| {});
             let path = root.join("trial.json");
-            let error = refused(flush_and_reap(&host, &trial, &path, &mut old, TOKEN));
+            let error = refused(flush_and_reap(&host, &mut trial, &path, &mut old, TOKEN));
             assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
             assert!(old.try_wait().unwrap().is_some());
             let saved = Trial::load(&path, &trial.binding, "alice").unwrap();
@@ -441,10 +445,10 @@ mod tests {
                 |r| r["binding"]["transaction_id"] = "another".into(),
             ];
             for edit in edits {
-                let (_dir, root, host, trial, mut old) = owned(|_| {});
+                let (_dir, root, host, mut trial, mut old) = owned(|_| {});
                 let path = root.join("trial.json");
                 let server = serve(&root, edit, None);
-                let error = refused(flush_and_reap(&host, &trial, &path, &mut old, TOKEN));
+                let error = refused(flush_and_reap(&host, &mut trial, &path, &mut old, TOKEN));
                 server.join().unwrap();
                 assert!(
                     error
@@ -463,7 +467,7 @@ mod tests {
             let (_dir, root, host, mut trial, mut old) = owned(|_| {});
             let path = root.join("trial.json");
             let server = serve(&root, |_| {}, Some(old.id()));
-            let reaped = match flush_and_reap(&host, &trial, &path, &mut old, TOKEN) {
+            let reaped = match flush_and_reap(&host, &mut trial, &path, &mut old, TOKEN) {
                 Ok(reaped) => reaped,
                 Err(error) => panic!("{error}"),
             };
