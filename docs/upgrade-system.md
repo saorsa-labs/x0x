@@ -515,6 +515,26 @@ service. Fleet caveat (ADR-0011): the self-updater restarts only
 `x0xd.service` — after any upgrade, restored or successful, restart
 `x0xd-443` too or it keeps serving the old image.
 
+**Stable launcher (dormant).** `x0x-launcher` is the stable recovery
+actor ADR 0094 §5 requires. M2 trial ownership is held, so the binary is
+dormant: run as `x0x-launcher /absolute/path/x0xd [args]`, it becomes
+`x0xd` by `exec` and keeps the direct job's one-process signal and exit
+semantics. The daemon path must be absolute; the launcher never searches
+`PATH`. A missing daemon path exits 64 (`EX_USAGE`). A failed `exec` exits
+75 (`EX_TEMPFAIL`), which `Restart=always` retries as for a direct unit.
+The launcher sits outside the daemon/CLI swap set; the daemon updater never
+replaces it. `x0xd` also refuses to start while `X0X_M2_BOOT_FD` is set
+(see [Dormant pair transaction](#dormant-pair-transaction-m2-s2e)).
+
+No tracked unit binds the launcher yet, and default builds do not build it
+(it needs the `m2-launcher` feature). ADR 0094 §5 lists four
+preconditions for binding a fleet unit: the separately signed launcher
+artifact in the release payload, `install.sh` shipping it beside `x0xd`,
+the authority-inventory check accepting a launcher-owned `ExecStart`, and
+the systemd restart readback accepting launcher-owned jobs. Until all four
+hold, a launcher-bound unit would refuse every self-update. The unit switch
+also needs David's approval because it changes production hosts.
+
 #### 2. Restore the known-good binary
 
 Only needed when the replacement will not start. On Unix a rename over the
