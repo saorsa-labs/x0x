@@ -610,11 +610,16 @@ jobs:
     needs: w3h-plan
     runs-on: ubuntu-latest
     # S3 runs the H-S3-c/c2 owner-cert rows at 15 min each (#1689) and the
-    # H-S3-d7 flood row (#1717), so its group gets 165 min (Engineer ruling,
-    # 30 Oct; no shard split). Every other group keeps 120 min. The isolated test
+    # H-S3-d7 flood row (#1717), so its group gets 185 min (Engineer ruling,
+    # 30 Oct, 165 min; no shard split; raised by option (b) of the 31 Oct
+    # ruling, #1727). Every other group keeps 120 min. The isolated test
     # phase has its own deadline (`X0X_RUNTIME_TIMEOUT_SECONDS` below), which
-    # must also fit inside this limit with room for setup and upload.
-    timeout-minutes: ${{ matrix.group == 's3' && 165 || 120 }}
+    # must also fit inside this limit with room for setup and upload. The
+    # one-job lib build below takes about 20 min (19m 32s in job
+    # 124482285010, against 10m 20s with parallel jobs in job 124477009427),
+    # so 165 min no longer held setup, build, the 155-min test deadline and
+    # upload.
+    timeout-minutes: ${{ matrix.group == 's3' && 185 || 120 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.w3h-plan.outputs.matrix) }}
@@ -666,7 +671,7 @@ jobs:
           X0X_ISOLATION_ROLE: w3h-harness
           # The deadline of the isolated test phase only (the build runs
           # before it). S3 needs about 135 min for 20 reruns, so it gets
-          # 9300 s (155 min) inside its 165-min job; every other group keeps
+          # 9300 s (155 min) inside its 185-min job; every other group keeps
           # 6600 s. `isolated-runtime.py` caps the value at 21600 s.
           X0X_RUNTIME_TIMEOUT_SECONDS: ${{ matrix.group == 's3' && 9300 || 6600 }}
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
@@ -693,7 +698,8 @@ jobs:
         # filter is not the cause. Property tests already pass
         # `--build-jobs 1` after the same 143 on this image during
         # `cargo nextest list` (run 40530790509). One build job does not
-        # change the test binary. The 120 min and 165 min job budgets stay.
+        # change the test binary. The 120 min job budget stays; the s3 budget
+        # rises to 185 min for the longer build (see `timeout-minutes`).
         run: |
           if [ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]; then
             export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}"$'\x1f'"--cfg"$'\x1f'"tokio_unstable"
