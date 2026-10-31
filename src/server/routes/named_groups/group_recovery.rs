@@ -38,6 +38,8 @@ use x0x::groups::GroupInfo;
 use x0x::identity::AgentId;
 use x0x::logging::LogHexId;
 
+#[cfg(test)]
+mod h_s3_home_fixture;
 mod sidecar_resume;
 
 /// The worker tick.
