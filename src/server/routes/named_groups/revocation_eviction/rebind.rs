@@ -60,6 +60,7 @@ use x0x::logging::LogHexId;
 use super::crypto_exclusion::{
     all_converged, apply_round, ask_heads, finish_attempt, guarded_admission_for, head_rule_admits,
     next_attempt, note_converged, write_allowed, HeadRule, RecipientDelivery, RoundUpdate,
+    SenderSeat,
 };
 use super::frame_stash::{FrameStash, StashedFrame};
 
@@ -1563,13 +1564,21 @@ fn install_round(
 
 /// §3 survivor convergence ([`super::crypto_exclusion::note_survivor_head`]):
 /// `sender` holds each head in `installed`, so it converged in each rebind
-/// delivery of `stable_group_id` whose result is one of them.
+/// delivery of `stable_group_id` whose result is one of them. `sender_seat`
+/// is the sender's live-roster facts at this moment (#1660): a rebind
+/// frame carries no key material, so only the live-survivor half of the
+/// gate applies — a member removed or revoked mid-send closes no seat.
 pub(super) fn note_survivor_head(
     rebind: &mut RebindState,
     stable_group_id: &str,
     sender: &[u8; 32],
     installed: &BTreeSet<String>,
+    sender_seat: Option<SenderSeat>,
+    _ask_seq: Option<u64>,
 ) {
+    if sender_seat.is_none() {
+        return;
+    }
     for ((stable, result_head), delivery) in &mut rebind.deliveries {
         if stable == stable_group_id {
             note_converged(&mut delivery.recipients, result_head, sender, installed);
@@ -1720,7 +1729,7 @@ async fn drive_deliveries(state: &Arc<AppState>) {
             &key,
             updates,
         );
-        ask_heads(state, &key.0, head_asks);
+        ask_heads(state, &key.0, head_asks).await;
         for (recipient, attempt) in started {
             spawn_send(
                 state,
@@ -1768,6 +1777,12 @@ fn spawn_send(
             Ok(Ok(_)) => RecipientDelivery::Sent,
             Ok(Err(x0x::dm::DmError::RecipientUpgradeRequired { .. })) => {
                 RecipientDelivery::Lacking
+            }
+            // The in-process stand-in reports an admitted exchange with its
+            // marker error (test builds only), as for the other S4 rows.
+            #[cfg(test)]
+            Ok(Err(error)) if error.to_string().contains(x0x::dm::PINNED_STANDIN_ADMITTED) => {
+                RecipientDelivery::Sent
             }
             Ok(Err(error)) => {
                 // An admission refusal is a withhold: the next round
@@ -2553,11 +2568,60 @@ mod tests {
             RecipientDelivery::Sent
         ));
         // A head report of a later head on the chain through "r" is the
-        // recipient's convergence evidence: the delivery ends.
+        // recipient's convergence evidence: the delivery ends. The seat is
+        // live and D60-clean (#1660 gate; a rebind row ignores `keyed`).
         let installed = BTreeSet::from(["r".to_string(), "r2".to_string()]);
-        note_survivor_head(&mut rebind, "g", &survivor, &installed);
+        note_survivor_head(
+            &mut rebind,
+            "g",
+            &survivor,
+            &installed,
+            Some(SenderSeat { key: None }),
+            Some(1),
+        );
         assert!(round(&mut rebind).is_empty());
         assert!(!rebind.deliveries.contains_key(&key));
+    }
+
+    /// #1660: a rebind row closes a seat only through a live, D60-clean
+    /// sender. A report from a refused sender — the gate holds no seat —
+    /// converges nothing: the delivery stays and the next round sends the
+    /// frame again.
+    #[test]
+    fn a_report_from_a_refused_sender_closes_no_rebind_seat() {
+        let survivor = [5; 32];
+        let key = ("g".to_string(), "r".to_string());
+        let mut rebind = RebindState::default();
+        rebind.deliveries.insert(
+            key.clone(),
+            delivery_to(&[(survivor, RecipientDelivery::Due)]),
+        );
+        let active = BTreeSet::from([survivor]);
+        let round = |rebind: &mut RebindState| {
+            let snapshot = rebind.deliveries[&key].recipients.clone();
+            let (updates, _) = plan_round(&snapshot, &active, |_| Some(Some(true)));
+            install_round(rebind, &key, updates)
+        };
+        let &[(_, attempt)] = round(&mut rebind).as_slice() else {
+            panic!("one send starts");
+        };
+        assert!(complete_send(
+            &mut rebind,
+            &key,
+            &survivor,
+            attempt,
+            RecipientDelivery::Sent
+        ));
+        // A head report of a later head on the chain through "r" from a
+        // sender the D60 gate refuses: no convergence evidence.
+        let installed = BTreeSet::from(["r".to_string(), "r2".to_string()]);
+        note_survivor_head(&mut rebind, "g", &survivor, &installed, None, None);
+        assert_eq!(
+            round(&mut rebind).len(),
+            1,
+            "a refused sender's report ends no delivery"
+        );
+        assert!(rebind.deliveries.contains_key(&key));
     }
 
     /// A round drops recipients that left the roster, withholds a D60
@@ -2688,6 +2752,195 @@ mod daemon_tests {
             x0x::dm::CapabilityRegistry::CERTIFICATE_REBIND_V1,
         )()
         .await
+    }
+
+    /// #1633: a committed rebind of a GSS group aimed at a survivor whose
+    /// roster seat carries no KEM public key (#1578). The Engineer call of
+    /// 25 Oct, to close such a row from the author's own record, lived
+    /// under a day (27 Oct 23:42 UTC to 28 Oct 00:18 UTC). ADR 0110 §3
+    /// L228 governs: survivor
+    /// convergence, not a transport ACK, proves delivery. While the seat
+    /// is keyless, the survivor claims no head in its catch-up answers
+    /// (#1627, David's ruling, 28 Oct 02:09 GMT), so a keyless disclaimer
+    /// converges nothing and the carrier's acceptance of the frame holds
+    /// the row at `Sent`. The row ends only when the survivor reports
+    /// the result head; the keyed re-join is the named recovery,
+    /// modelled here (the rebind frame carries no key material, and this
+    /// row's convergence never reads a seat's KEM key) — the real
+    /// install path is proven by the owner-recovery and crypto-exclusion
+    /// two-node tests.
+    #[tokio::test]
+    async fn a_keyless_seat_stays_pending_until_a_head_report_converges_it() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let survivor = AgentId([0x88; 32]);
+        let survivor_id = *survivor.as_bytes();
+        let survivor_hex = hex::encode(survivor.as_bytes());
+        let group_id = "cc".repeat(16);
+        let mut info = GroupInfo::new("cb".into(), String::new(), admin, group_id.clone());
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        // `add_member` seats the survivor with no KEM key.
+        info.add_member(
+            survivor_hex.clone(),
+            GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        // The survivor's current verified advert sets `certificate_rebind_v1`.
+        advertise(
+            &state,
+            survivor,
+            x0x::dm::CapabilityRegistry::current().bits,
+            x0x::dm_capability::now_unix_ms(),
+        );
+        let key = (info.stable_group_id().to_string(), info.state_hash.clone());
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .rebind
+            .deliveries
+            .insert(
+                key.clone(),
+                Delivery {
+                    bytes: Arc::new(b"X0XCR1\0rebind".to_vec()),
+                    result_head: info.state_hash.clone(),
+                    recipients: BTreeMap::from([(survivor_id, RecipientDelivery::Due)]),
+                    next_at: Instant::now(),
+                    started: Instant::now(),
+                    resumed: false,
+                },
+            );
+        let row_present = || {
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            async move {
+                state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .rebind
+                    .deliveries
+                    .contains_key(&key)
+            }
+        };
+        let seat_status = || {
+            let state = Arc::clone(&state);
+            let key = key.clone();
+            async move {
+                state
+                    .revocation_evictions
+                    .inner
+                    .lock()
+                    .await
+                    .rebind
+                    .deliveries
+                    .get(&key)
+                    .and_then(|delivery| delivery.recipients.get(&survivor_id).copied())
+            }
+        };
+        drive_deliveries(&state).await;
+        let mut accepted = false;
+        for _ in 0..250 {
+            if seat_status().await == Some(RecipientDelivery::Sent) {
+                accepted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            accepted,
+            "the carrier's acceptance is Sent, not delivery: an ACK closes no seat (ADR 0110 §3)"
+        );
+        assert!(
+            row_present().await,
+            "the row stays open after the carrier's acceptance"
+        );
+        assert_eq!(
+            seat_status().await,
+            Some(RecipientDelivery::Sent),
+            "the seat stays Sent after the carrier's acceptance"
+        );
+        // The keyless survivor's answer while keyless (#1627, David's
+        // ruling, 28 Oct 02:09 GMT): no `responder_state_hash` at all,
+        // fed here at the catch-up entry point. The served shape itself
+        // is pinned by the crypto-exclusion tests on the real serve path.
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            None,
+        )
+        .await;
+        assert!(
+            row_present().await,
+            "a keyless disclaimer converges nothing — the survivor claims no head while keyless"
+        );
+        assert_eq!(
+            seat_status().await,
+            Some(RecipientDelivery::Sent),
+            "a keyless disclaimer converges nothing — the survivor claims no head while keyless"
+        );
+        // The rebind frame carries no key material: a survivor can hold
+        // and report the result head only once it can take the group's
+        // secret. This row's convergence never reads a seat's KEM key, so
+        // the recovery is modelled, not observed: seating the key on the
+        // author's roster copy stands for the re-join of the named
+        // recovery, and the report below is the share-proof such a keyed
+        // survivor then serves. The real install path is proven by the
+        // owner-recovery and crypto-exclusion two-node tests.
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        {
+            let mut groups = state.named_groups.write().await;
+            let stored = groups.get_mut(&group_id).expect("the author's roster copy");
+            stored
+                .members_v2
+                .get_mut(&survivor_hex)
+                .expect("the survivor's seat")
+                .kem_public_key_b64 = Some(BASE64.encode(&kem.public_bytes));
+        }
+        // The share-proof report of the keyed recovery, fed at the
+        // catch-up entry point (the served shape is pinned by the
+        // crypto-exclusion tests).
+        super::super::note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            Some(&info.state_hash),
+        )
+        .await;
+        let mut converged = false;
+        for _ in 0..250 {
+            if seat_status().await == Some(RecipientDelivery::Converged) {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            converged,
+            "only the survivor's report that holds the result head converges the seat"
+        );
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            if let Some(delivery) = inner.rebind.deliveries.get_mut(&key) {
+                delivery.next_at = Instant::now();
+            }
+        }
+        drive_deliveries(&state).await;
+        assert!(
+            !row_present().await,
+            "only the reported result head ends the delivery"
+        );
+        Ok(())
     }
 
     /// #1357 review P1 (#1508): rebind delivery and catch-up go through the

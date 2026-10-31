@@ -45,7 +45,7 @@ pub(in crate::server) use requester_offer::{
     RequesterOfferObligation,
 };
 
-use super::super::state::AppState;
+use super::super::state::{AppState, TreeKemCatchupRefusalNote};
 use super::super::{
     api_error, api_error_with_reason, bad_request, forbidden, not_found, parse_agent_id_hex,
     parse_optional_json,
@@ -61,6 +61,7 @@ use super::public_group_bootstrap_outbox::{
     spawn_public_group_bootstrap_delivery,
 };
 use crate as x0x;
+use crate::direct::{TreeKemCatchupRefusal, TreeKemCatchupRefusalReason};
 use crate::groups::aad::secure_share_aad;
 use crate::server::group_access::{self, AccessLevel, MemberState};
 use anyhow::{Context, Result};
@@ -3044,7 +3045,16 @@ async fn publish_group_card_with_reseal(
 ) -> Option<x0x::groups::GroupStateCommit> {
     let membership_lock = group_membership_lock(state, group_id).await;
     let _membership_guard = membership_lock.lock().await;
-    publish_group_card_to_discovery_inner(state, group_id, true).await
+    let commit = publish_group_card_to_discovery_inner(state, group_id, true).await;
+    // #1570, #1708 review: a reseal that published ends the hold itself,
+    // so its publish settles the owed card. Left set, the next worker
+    // pass published the same card again.
+    if commit.is_some() {
+        if let Some(info) = state.named_groups.read().await.get(group_id) {
+            group_recovery::settle_card_debt(state, info.stable_group_id());
+        }
+    }
+    commit
 }
 
 async fn publish_group_card_to_discovery_inner(
@@ -3069,6 +3079,20 @@ async fn publish_group_card_to_discovery_inner(
         // member-scoped withdrawal signal needs it, and that is not a leak
         // because members already know the group.
         if !group_card_is_listable(info) {
+            return None;
+        }
+        // #1570: a held-back group's live record is ahead of its durable
+        // form, so no card is signed or published from it — not by the
+        // republish worker, a create fan-out or a state-change hook. The
+        // worker pass publishes the owed card once the hold ends,
+        // whichever save ended the hold. "Held back" here includes a
+        // group whose un-placeholdering write has not landed
+        // (Engineer ruling, 29 Oct 2026). The reseal path
+        // (`seal_group_state`) keeps main's behaviour: its persist must
+        // land Durable before this point publishes, and that persist
+        // retries the sidecar write, so a seal may itself end the hold
+        // and succeed (Engineer ruling, 29 Oct 2026, 19:56).
+        if !reseal && group_recovery::is_card_held_back(state, info.stable_group_id()) {
             return None;
         }
         let mut candidate = info.clone();
@@ -3525,7 +3549,8 @@ async fn emit_shard_digest(state: &AppState, kind: x0x::groups::ShardKind, shard
 /// routing key or the D.3 stable id. #1570 (ZCode on 8ac7036f): a held-back
 /// group's live record is ahead of its durable form, so no card is signed
 /// from it; the Pull falls back to a cached card, as for a group this node
-/// does not own.
+/// does not own. #1570 (29 Oct 2026): "held back" includes a group whose
+/// un-placeholdering write has not landed.
 pub(super) fn pull_card_record<'a>(
     state: &AppState,
     groups: &'a HashMap<String, x0x::groups::GroupInfo>,
@@ -3534,7 +3559,7 @@ pub(super) fn pull_card_record<'a>(
     groups
         .get(gid)
         .or_else(|| groups.values().find(|info| info.stable_group_id() == gid))
-        .filter(|info| !group_recovery::is_held_back(state, info.stable_group_id()))
+        .filter(|info| !group_recovery::is_card_held_back(state, info.stable_group_id()))
 }
 
 async fn respond_to_pull(
@@ -6681,6 +6706,14 @@ pub(in crate::server) async fn refresh_group_card_cache_from_info(
     if !group_card_is_listable(info) {
         cache.remove(key);
         cache.remove(&stable_key);
+        return;
+    }
+    // #1570: a held-back group's live record is ahead of its durable form,
+    // so no fresh card is signed from it into the cache `GET /groups/discover`
+    // and card-by-id serve. The cache keeps the card of the last durable
+    // form until the hold clears; a group whose un-placeholdering write
+    // has not landed is held back too (29 Oct 2026 ruling).
+    if group_recovery::is_card_held_back(state, info.stable_group_id()) {
         return;
     }
     match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
@@ -12215,6 +12248,22 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
         return true;
     }
     let Ok(response) = serde_json::from_slice::<TreeKemCatchupResponse>(payload) else {
+        // #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the
+        // asker's mirror of the response arm — the typed refusal a peer
+        // sent instead of a page when it refused this device's request.
+        let Ok(refusal) = serde_json::from_slice::<TreeKemCatchupRefusal>(payload) else {
+            return true;
+        };
+        // #1604 G5: refuse held unknown variants (a refusal reason this
+        // node does not know) before any asker state changes.
+        let Ok(refusal) = crate::wire_compat::reject_unknown("TreeKemCatchupRefusal", refusal)
+        else {
+            return true;
+        };
+        if refusal.message_type != TreeKemCatchupRefusal::MESSAGE_TYPE {
+            return true;
+        }
+        handle_treekem_catchup_refusal(state, sender, machine_id, verified, refusal).await;
         return true;
     };
     // #1604 G5: refuse held unknown variants before any apply.
@@ -12252,6 +12301,176 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
         .is_some()
 }
 
+/// #1657: how long one surfaced refusal note suppresses the warn for
+/// an identical repeat (same peer, same reason, same group). The note
+/// itself is always refreshed; only the operator log line is deduped,
+/// so no verified peer can flood it.
+const TREEKEM_REFUSAL_REWARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the asker's
+/// side of the typed refusal. A peer refused this device's catch-up
+/// request, naming its machine or binding revocation. The refusal stops
+/// the 2 s head-round re-ask of that peer when it answered a peer this
+/// node asked this round (it answered — exactly like the keyless
+/// disclaimer, it confirms or clears no head evidence) and the reason
+/// is surfaced for EVERY ask kind — head-round, gap, page and
+/// key-package catch-up asks alike (review round 3, finding 3): an
+/// operator log line plus the latest note per group on `AppState`,
+/// readable by tests and a later diagnostics surface. The gates mirror
+/// the response handler — an unverified sender, a sender this node
+/// itself holds revoked, and a pending revocation resync all change
+/// nothing, so a revoked peer cannot forge a silence — and a refusal
+/// addressed to another requester is not ours. The warn states what the
+/// PEER reports, not verified local state, and a repeated identical
+/// note does not re-warn. A peer that never sends the refusal (an
+/// older peer, or the gossip-inbox path whose payload is ciphertext at
+/// its gate) leaves main's behavior: the ask cadence keeps counting
+/// the peer.
+pub(in crate::server) async fn handle_treekem_catchup_refusal(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    machine_id: &MachineId,
+    verified: bool,
+    refusal: TreeKemCatchupRefusal,
+) {
+    if !verified {
+        return;
+    }
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(sender)
+            || revoked.is_machine_revoked(machine_id)
+            || revoked.is_binding_revoked(sender, machine_id)
+            || revoked.revocation_resync_required()
+        {
+            return;
+        }
+    }
+    let self_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if refusal.requester_agent_id() != self_hex {
+        return;
+    }
+    // #1657 review (Claude, REQUEST-CHANGES 2): a refusal for a group
+    // this node does not hold is not an answer to an ask this node made;
+    // recording it would let any verified peer grow the note map without
+    // limit. The note map is bounded by the groups this node holds — as
+    // the head-round marking below already is (it resolves the group and
+    // ignores unknown ids).
+    {
+        let groups = state.named_groups.read().await;
+        if crate::server::resolve_group_entry_locked(&groups, refusal.group_id()).is_none() {
+            tracing::debug!(
+                group_id = %LogHexId::group(refusal.group_id()),
+                peer = %LogHexId::agent(&hex::encode(sender.as_bytes())),
+                "ignoring a TreeKEM catch-up refusal for a group this node does not hold"
+            );
+            return;
+        }
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    // Review round 3, finding 3: the asked-peer check now guards the
+    // RE-ASK STOP only. Only a refusal from a peer this node asked this
+    // head round may close that peer's unanswered slot — an unsolicited
+    // refusal still cannot stop a re-ask — but a refusal from any peer
+    // that passed the gates above is surfaced below, because the usual
+    // catch-up asks (gap, page, key package) never write a head round
+    // at all.
+    if !revocation_eviction::note_catchup_refused_peer(
+        state,
+        &[refusal.group_id().to_string()],
+        *sender.as_bytes(),
+    )
+    .await
+    {
+        tracing::debug!(
+            group_id = %LogHexId::group(refusal.group_id()),
+            peer = %LogHexId::agent(&sender_hex),
+            "a TreeKEM catch-up refusal from a peer this node did not ask this round: the reason is surfaced, the head-round re-ask cadence keeps counting the peer"
+        );
+    }
+    // The surface: warn once per distinct (peer, reason) per group — a
+    // repeated identical refusal refreshes the note but does not re-warn,
+    // so no verified peer can flood the operator log.
+    let repeated = state
+        .treekem_catchup_refusals
+        .lock()
+        .ok()
+        .and_then(|notes| {
+            notes.get(refusal.group_id()).and_then(|note| {
+                (note.peer == *sender.as_bytes()
+                    && note.reason == refusal.reason
+                    && note.at.elapsed() < TREEKEM_REFUSAL_REWARN_AFTER)
+                    .then_some(())
+            })
+        })
+        .is_some();
+    if !repeated {
+        tracing::warn!(
+            group_id = %LogHexId::group(refusal.group_id()),
+            peer = %LogHexId::agent(&sender_hex),
+            reason = ?refusal.reason,
+            "TreeKEM catch-up refused: the peer reports this device's revocation (peer-reported, not locally verified); the head-round re-ask stops for that peer when it was asked this round"
+        );
+    }
+    if let Ok(mut notes) = state.treekem_catchup_refusals.lock() {
+        notes.insert(
+            refusal.group_id().to_string(),
+            TreeKemCatchupRefusalNote {
+                reason: refusal.reason,
+                peer: *sender.as_bytes(),
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+}
+
+/// #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): send the
+/// typed refusal for a machine- or binding-revoked catch-up requester.
+/// The refusal names the revocation so the requester can stop re-asking
+/// and surface the reason; it carries no group data beyond what the
+/// request itself named. It travels machine-addressed on the catch-up
+/// DM lane, so its sender is authenticated exactly like a page (the
+/// QUIC ML-DSA-65 handshake on the raw path, the signed envelope on
+/// the gossip path).
+/// Review round 1, finding 2: the refusal echoes the authenticated
+/// sender id, never an id the request chose (the requester-id check
+/// above already refused a mismatch), and it is MACHINE-addressed, so
+/// it reaches the revoked device that asked — never a clean device of
+/// the same agent.
+/// Review round 3 (Claude finding 2 / Codex P2 2): ordinary DM egress
+/// (`send_direct_bound_to_machine` → `send_direct_all_stages`) cannot
+/// carry it — its ADR-0043 B/P pairing preflight and `pin_show_machine`
+/// deny exactly the revoked pairing this refusal answers, so the frame
+/// never left. The send now runs on the refusal-only reply path
+/// (`Agent::send_treekem_refusal_reply`), which reaches the requesting
+/// machine without opening any other route and keeps ordinary/key
+/// egress denial untouched. The test recorder observes the DECISION
+/// here (exactly as the page serve does); the egress itself is
+/// recorded at the send seam on the agent, after every gate.
+async fn send_treekem_catchup_refusal(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    machine_id: &MachineId,
+    request: &TreeKemCatchupRequest,
+    reason: TreeKemCatchupRefusalReason,
+) {
+    #[cfg(test)]
+    if let Ok(payload) = serde_json::to_vec(&TreeKemCatchupRefusal::new(
+        request.group_id.clone(),
+        hex::encode(sender.as_bytes()),
+        reason,
+    )) {
+        if let Ok(mut recorded) = state.named_group_test_recorders.catchup_refusals.lock() {
+            recorded.push(payload);
+        }
+    }
+    state
+        .agent
+        .send_treekem_refusal_reply(sender, *machine_id, &request.group_id, reason)
+        .await;
+}
+
 pub(in crate::server) async fn handle_treekem_catchup_request(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -12266,8 +12485,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // #1577 (ADR 0110 §3): a catch-up page carries membership events and
     // TreeKEM epochs, so the serve is guarded egress. A revoked target
     // keeps its Active seat until the S4 eviction commits, so the roster
-    // check below alone cannot refuse it. Drop the request on the same
-    // path the response handler uses for a revoked sender; no typed reply.
+    // check below alone cannot refuse it.
     // #1616 (ADR 0110 D70): a machine revocation denies that device only;
     // the portable agent keeps its Active seat, so the same roster check
     // cannot refuse the device either — the DM's QUIC-authenticated
@@ -12276,9 +12494,15 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // only — the agent keeps its seat and the device stays clean — so
     // neither gate above can refuse it; the pairing itself does, under
     // its own operator sentence.
+    // #1657 (ADR 0110 §3; David's approval, 28 Oct 02:08 GMT): the
+    // machine and binding refusals answer with the typed refusal that
+    // names the revocation, instead of the interim silent drop — the
+    // requester can stop re-asking and surface the reason. The agent
+    // revocation and a pending revocation resync keep the silent drop:
+    // the approval names machine- and binding-revoked devices only.
     // A pending revocation resync also refuses (fail-closed, as the
     // response handler does), under its own operator sentence.
-    {
+    let typed_refusal = {
         let revocation_set = state.agent.revocation_set();
         let revoked = revocation_set.read().await;
         if revoked.is_agent_revoked(sender) {
@@ -12295,26 +12519,34 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request from a machine-revoked requester"
             );
-            return;
-        }
-        if revoked.is_binding_revoked(sender, machine_id) {
+            Some(TreeKemCatchupRefusalReason::MachineRevoked)
+        } else if revoked.is_binding_revoked(sender, machine_id) {
             tracing::warn!(
                 group_id = %LogHexId::group(&request.group_id),
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request from a requester with a revoked agent-machine binding"
             );
-            return;
-        }
-        if revoked.revocation_resync_required() {
+            Some(TreeKemCatchupRefusalReason::BindingRevoked)
+        } else if revoked.revocation_resync_required() {
             tracing::warn!(
                 group_id = %LogHexId::group(&request.group_id),
                 requester = %LogHexId::agent(&sender_hex),
                 "rejecting TreeKEM catch-up request while the revocation set needs a resync"
             );
             return;
+        } else {
+            None
         }
-    }
+    };
+    // Review round 1, finding 2: a request whose claimed requester is not
+    // the authenticated sender gets no reply at all, so the refusal below
+    // only ever answers a request that named this sender — and echoes the
+    // authenticated `sender_hex`, never the id the request chose.
     if sender_hex != request.requester_agent_id {
+        return;
+    }
+    if let Some(reason) = typed_refusal {
+        send_treekem_catchup_refusal(state, sender, machine_id, &request, reason).await;
         return;
     }
     let (authorized, log_keys, held_group) = {
@@ -12948,6 +13180,10 @@ async fn request_treekem_catchup_page(
             if let Ok(mut recorded) = state.named_group_test_recorders.catchup_responses.lock() {
                 recorded.push(group_id.as_bytes().to_vec());
             }
+            // The request is out; the return the ask task waits on is the
+            // ACK. A test that parks here holds that send in flight across
+            // a later seal (#1660 round 7/8, Codex P2 30 Oct).
+            detached_send_test_seam::park(&format!("treekem-catchup-page-ack:{group_id}")).await;
             return true;
         }
     }
@@ -14794,7 +15030,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-                let Some(commit_b64) = treekem_commit_b64 else {
+                // #1680 round 3: borrow, not move — the §3a gate below
+                // re-reads `treekem_commit_b64` to bind the commit's added
+                // leaf to the mandate's bound hash.
+                let Some(commit_b64) = treekem_commit_b64.as_ref() else {
                     return ApplyMetadataResult::REJECTED;
                 };
                 if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
@@ -14803,7 +15042,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 let Some(epoch) = treekem_epoch else {
                     return ApplyMetadataResult::REJECTED;
                 };
-                Some((commit_b64, treekem_welcome_b64, welcome_ref, epoch))
+                Some((commit_b64.clone(), treekem_welcome_b64, welcome_ref, epoch))
             } else {
                 None
             };
@@ -15071,6 +15310,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // `ReseatMandateV1` in place of the owner mandate. It is
             // accepted only under the §3a rule; a failure refuses with the
             // committed state unchanged, as `owner_mandate_missing` does.
+            // Check 8 reads the subject-signed `MemberJoined` the event
+            // carries in `member_joined_recovery` (Engineer ruling
+            // 30 Oct 2026) and binds the TreeKEM commit's added leaf to
+            // the mandate's bound hash.
             let reseat_accepted = match (
                 info.policy.admission.owner_certified_user_id(),
                 owner_mandate.as_ref(),
@@ -15087,6 +15330,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         treekem_key_package_hash.as_deref(),
                         treekem_epoch,
                         owner_certified_certificate.as_ref(),
+                        member_joined_recovery.as_deref(),
+                        treekem_commit_b64.as_deref(),
                     )
                     .await
                     {
@@ -17895,6 +18140,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         && verify_authority_attested_member_joined_recovery(&next, recovery)
                 })
                 .await;
+            // Engineer ruling 30 Oct 2026 (PR #1728, comment 6528069544):
+            // a re-seat that binds a KeyPackage carries the subject's own
+            // signed, non-authority-only `MemberJoined` for it inside the
+            // event, so every receiver can enforce ADR 0109 §3a check 8
+            // fail-closed instead of trusting the mandate's hash binding
+            // alone. Only the re-seat add carries it (an ordinary add keeps
+            // the record on its own delivery lane below), and only when a
+            // package is bound — a packageless re-seat has no check-8
+            // evidence to carry. Old receivers ignore the field; old
+            // senders omit it and are refused (accepted, #1659 precedent).
+            let reseat_recovery = reseat_mandate
+                .as_ref()
+                .filter(|mandate| !mandate.fields.key_package_hash.is_empty())
+                .and(member_joined_recovery.clone());
             let mut event = NamedGroupMetadataEvent::MemberAdded {
                 roster_certificates_b64: Vec::new(),
                 group_id: event_group_id.clone(),
@@ -17910,7 +18169,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     .members_v2
                     .get(&member_agent_id)
                     .and_then(|member| member.treekem_key_package_hash.clone()),
-                member_joined_recovery: None,
+                member_joined_recovery: reseat_recovery,
                 member_recovery_history: Vec::new(),
                 certificate_b64: owner_certified_admission.as_ref().map(|cert| {
                     use base64::Engine as _;
@@ -33804,6 +34063,14 @@ pub(in crate::server) async fn discover_groups(
         if !group_card_is_listable(info) {
             continue;
         }
+        // #1570: a held-back group's live record is ahead of its durable
+        // form, so no card is signed from it. Its cached card (merged
+        // above) is served, as for a group this node does not own; a
+        // group whose un-placeholdering write has not landed is held
+        // back too (29 Oct 2026 ruling).
+        if group_recovery::is_card_held_back(&state, info.stable_group_id()) {
+            continue;
+        }
         if let Ok(Some(card)) = info.to_signed_group_card(signing_kp) {
             merge_card(&card);
         }
@@ -33985,7 +34252,15 @@ pub(in crate::server) async fn get_group_card(
         }
     }
     let groups = state.named_groups.read().await;
-    if let Some(info) = groups.get(&id) {
+    // #1570: a held-back group's live record is ahead of its durable form,
+    // so no card is signed from it. The cached card (checked above) is
+    // served, as for a group this node does not own; a group whose
+    // un-placeholdering write has not landed is held back too (29 Oct
+    // 2026 ruling).
+    if let Some(info) = groups
+        .get(&id)
+        .filter(|info| !group_recovery::is_card_held_back(&state, info.stable_group_id()))
+    {
         match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
             Ok(Some(card)) => {
                 return Json(serde_json::to_value(&card).unwrap_or(serde_json::Value::Null))
@@ -49615,12 +49890,14 @@ pub(in crate::server) mod tests {
     mod issue1288_bootstrap_outbox_shutdown;
     mod issue1347_join_request_token_class;
     mod issue1569_owner_certified_placeholder;
+    mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
     mod issue1570_held_back_tombstone;
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
     mod issue1649_reseat_mandate_receive;
+    mod issue1657_typed_refusal_catchup;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -50446,6 +50723,7 @@ pub(in crate::server) mod tests {
                 TREEKEM_CATCHUP_SERVE_SLOTS,
             )),
             treekem_epoch_ahead_targets: Mutex::new(HashMap::new()),
+            treekem_catchup_refusals: StdMutex::new(HashMap::new()),
             group_membership_locks: RwLock::new(HashMap::new()),
             reseat_stagings: Default::default(),
             treekem_groups: crate::server::reseat_scope::ScopedGroupMap::default(),
