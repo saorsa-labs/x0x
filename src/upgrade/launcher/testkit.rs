@@ -15,6 +15,20 @@ pub(super) fn fixture(
     recovery::Host,
     journal::JournalRecord,
 ) {
+    fixture_with(phase, |_| {})
+}
+
+/// As `fixture`, but `edit` changes the record before the journal is
+/// written and the Host is bound (for example, to freeze a live OLD child).
+pub(super) fn fixture_with(
+    phase: journal::Phase,
+    edit: impl FnOnce(&mut journal::JournalRecord),
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    recovery::Host,
+    journal::JournalRecord,
+) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let artifact = |name: &str| {
@@ -60,7 +74,7 @@ pub(super) fn fixture(
         boot_id: "fixture-boot".into(),
         was_running: true,
     };
-    let record = journal::JournalRecord {
+    let mut record = journal::JournalRecord {
         schema_version: 1,
         record_kind: "journal".into(),
         transaction_id: "refusal-fixture".into(),
@@ -87,6 +101,7 @@ pub(super) fn fixture(
             observed_sha256: None,
         },
     };
+    edit(&mut record);
     journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
     let host = recovery::Host::new(root.clone(), record.clone()).unwrap();
     (dir, root, host, record)

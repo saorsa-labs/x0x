@@ -268,6 +268,12 @@ keeps the first rollback cause, and starts only a missing restored child, at
 most 3 times. A failed reap or a failed restored start stops automatic
 recovery (`RecoveryFailed`) until an operator repairs the host.
 
+The `x0x-launcher` binary builds only with the non-default `m2-launcher`
+cargo feature. Default builds and `cargo install` of the published crate do
+not build it until the activation slice. The launcher gives a candidate its boot
+permit as one JSON line on descriptor 3 (`X0X_M2_BOOT_FD=3`). This contract is
+provisional and dormant; it is frozen before `ENABLED = true`.
+
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes
 again before mutation. It copies each old binary beside its target, using that
