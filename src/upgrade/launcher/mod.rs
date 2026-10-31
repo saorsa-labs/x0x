@@ -27,6 +27,8 @@ pub(crate) fn candidate_boot_for_fixture(version: &str) -> io::Result<()> {
 }
 mod control;
 mod recovery;
+#[cfg(all(test, unix))]
+mod testkit;
 pub(crate) fn fixture_receipt(request: &[u8]) -> io::Result<serde_json::Value> {
     control::fixture_receipt(request)
 }

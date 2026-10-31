@@ -215,6 +215,9 @@ pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
 
 pub(crate) fn candidate_boot_owned(version: &str) -> io::Result<()> {
     let value = std::env::var_os(BOOT_FD).ok_or_else(|| invalid("boot descriptor missing"))?;
+    // Drop the descriptor variable at once: a re-exec or any later child
+    // must not treat an inherited descriptor 3 as its own boot channel.
+    std::env::remove_var(BOOT_FD);
     if value != "3" {
         return Err(invalid("invalid private boot descriptor"));
     }
@@ -238,7 +241,12 @@ pub(crate) fn candidate_boot_owned(version: &str) -> io::Result<()> {
         || parent != permit.parent
         || std::env::current_exe()?.canonicalize()? != permit.executable
         || std::env::current_dir()? != permit.cwd
-        || std::env::args().collect::<Vec<_>>() != permit.argv
+        || std::env::args_os().collect::<Vec<std::ffi::OsString>>()
+            != permit
+                .argv
+                .iter()
+                .map(|arg| std::ffi::OsString::from(arg.as_str()))
+                .collect::<Vec<_>>()
         || version != permit.version
         || filesystem::hash(&permit.executable)? != permit.sha256
         || Clock::now()?.ms.saturating_mul(1_000_000) >= permit.record.deadline_ns
