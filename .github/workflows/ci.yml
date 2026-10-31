@@ -476,6 +476,68 @@ jobs:
             ${{ runner.temp }}/x0x-isolation-*/
           if-no-files-found: error
 
+  # ADR 0109 H-S3-home released-binary gate (#1571). It runs the published
+  # v0.45.0 and v0.46.1 daemons against the real Home placeholder rule.
+  # The run has about 30 minutes of real-time waits, so it is its own job
+  # and the Test Suite shards do not carry it. It is not a required check.
+  # nextest-isolated.sh fetches the pinned binaries before the loopback-only
+  # namespace (scripts/ci/prepare-released-h-s3-home.sh).
+  h-s3-home-released:
+    name: H-S3-home released binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry and sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.95.0-h-s3-home-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Resolve test dependency graph
+        run: cargo metadata --locked --format-version 1 >/dev/null
+
+      - name: Cache released-binary target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.95.0-h-s3-home-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'scripts/ci/prepare-released-h-s3-home.sh') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144
+
+      - name: Run H-S3-home against v0.45.0 and v0.46.1
+        env:
+          X0X_ISOLATION_ROLE: h-s3-home-released
+          X0X_RUNTIME_TIMEOUT_SECONDS: 3000
+        run: >-
+          bash scripts/ci/nextest-isolated.sh --locked --test h_s3_home_released --
+          --run-ignored ignored-only --no-tests=fail
+
+      - name: Upload H-S3-home custody
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: h-s3-home-released
+          # The reports and the released daemon logs only; the run data
+          # directories hold identity keys and the API token.
+          path: |
+            ${{ runner.temp }}/x0x-metadata-*/
+            ${{ runner.temp }}/x0x-isolation-*/
+            target/h-s3-home/*-report.json
+            target/h-s3-home/*/*/std*-*.log
+          if-no-files-found: warn
+
   linux-systemd-policy:
     name: Linux systemd policy acceptance
     runs-on: ubuntu-latest
