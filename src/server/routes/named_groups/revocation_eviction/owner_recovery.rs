@@ -1292,6 +1292,10 @@ async fn try_commit(state: &Arc<AppState>, stable: &str) {
             commit_treekem(state, &group_key, &info, next, body, &revocations).await;
         }
         orc::RecoveryCryptoKind::Gss => {
+            // #1597 item 1: a sealed share can raise the local epoch
+            // before its commit, so the rotation starts at the committed
+            // epoch, as the GSS crypto exclusion does.
+            next.secret_epoch = x0x::groups::crypto_exclusion::committed_secret_epoch(&info);
             let (secret, next_secret_epoch) = next.rotate_shared_secret();
             let Ok(secret) = <[u8; 32]>::try_from(secret.as_slice()) else {
                 return;
@@ -2061,12 +2065,19 @@ pub(in crate::server) async fn park_early_share(
         return;
     };
     let sender_hex = hex::encode(sender.as_bytes());
+    // #1597 review: the staleness baseline is the epoch the head
+    // commits, not the local one. A share below it is stale, and an
+    // installed secret at or above it is an uncommitted early share, so
+    // a share of that epoch is not its duplicate.
+    let committed = x0x::groups::crypto_exclusion::committed_secret_epoch(info);
     if !verified
         || info.withdrawn
         || orc::crypto_kind(info) != orc::RecoveryCryptoKind::Gss
         || *actor != sender_hex
-        || *secret_epoch < info.secret_epoch
-        || (*secret_epoch == info.secret_epoch && info.shared_secret.is_some())
+        || *secret_epoch < committed
+        || (*secret_epoch == info.secret_epoch
+            && info.secret_epoch == committed
+            && info.shared_secret.is_some())
     {
         return;
     }
@@ -3238,10 +3249,14 @@ async fn receive_commit(
     // share arrives the frame waits, durable and in the stash; the share
     // wakes the worker ([`park_early_share`]), and the author seals it
     // again after each frame write.
+    //
+    // #1597 review: a local secret at or above the recovery's epoch is
+    // never this recovery's key. The recovery's sender is no admin on
+    // the parent, so its share cannot install before the head; that
+    // secret is an early share an admin sealed, and a revoked admin may
+    // hold it. It does not satisfy the rule.
     let gss_secret = match &body.crypto {
-        orc::OwnerRecoveryCryptoV1::Gss { next_secret_epoch }
-            if info.secret_epoch < *next_secret_epoch || info.shared_secret.is_none() =>
-        {
+        orc::OwnerRecoveryCryptoV1::Gss { next_secret_epoch } => {
             // #1508 rc12 (Codex P1): the group may have moved on past this
             // recovery while this node was away, so no node seals this
             // epoch's secret any more (catch-up seals the current secret
@@ -3346,12 +3361,12 @@ async fn receive_commit(
                 }
                 orc::OwnerRecoveryCryptoV1::Gss { next_secret_epoch } => {
                     // The secret and its epoch install with the head. An
-                    // intermediate head holds no secret of its epoch.
-                    if let Some(secret) = &gss_secret {
-                        next.shared_secret = Some(secret.to_vec());
-                    } else if next.secret_epoch < *next_secret_epoch {
-                        next.shared_secret = None;
-                    }
+                    // intermediate head holds no secret of its epoch, and
+                    // a local secret at or above that epoch is an early
+                    // share that an admin sealed. A revoked admin may hold
+                    // it, so it does not survive the install (#1597
+                    // review).
+                    next.shared_secret = gss_secret.as_ref().map(|secret| secret.to_vec());
                     next.secret_epoch = *next_secret_epoch;
                     next.security_binding = Some(orc::gss_binding(*next_secret_epoch));
                 }
@@ -6274,6 +6289,156 @@ mod restart_tests {
             held.shared_secret.as_deref(),
             Some(new_secret.as_slice()),
             "the survivor holds the new epoch's secret"
+        );
+        author.agent.shutdown().await;
+        survivor.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1597 review: a survivor can hold an early share of the recovery's
+    /// own epoch — an admin's rotation that never committed — when the
+    /// recovery frame arrives. That secret is not the recovery's key, and
+    /// a revoked admin may hold it, so the install replaces it: the head
+    /// takes the recovery's sealed share, never the early one.
+    #[tokio::test]
+    async fn an_installed_early_share_does_not_survive_a_gss_recovery() -> Result<()> {
+        use super::super::super as ng;
+        let (author_dir, survivor_dir) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let author = offline_author(author_dir.path(), [0x73; 32]).await?;
+        let survivor = offline_daemon(survivor_dir.path(), None).await?;
+        let owner = author
+            .agent
+            .identity()
+            .user_keypair()
+            .context("owner key")?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let survivor_id = survivor.agent.agent_id();
+        let survivor_hex = hex::encode(survivor_id.as_bytes());
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut info = recovery_parent(
+            owner,
+            &admin,
+            [
+                author.agent.identity().agent_keypair(),
+                survivor.agent.identity().agent_keypair(),
+            ],
+        )?;
+        info.policy.confidentiality = x0x::groups::policy::GroupConfidentiality::MlsEncrypted;
+        {
+            use base64::Engine as _;
+            let member = info
+                .members_v2
+                .get_mut(&survivor_hex)
+                .context("survivor seat")?;
+            member.kem_public_key_b64 = Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(&survivor.agent_kem_keypair.public_bytes),
+            );
+        }
+        // A head the commit log retains at epoch 0: the committed
+        // baseline is real on both sides.
+        info.security_binding = Some(orc::gss_binding(info.secret_epoch));
+        info.seal_commit_evicting(&admin, 500)?;
+        let stable = info.stable_group_id().to_string();
+        for state in [&author, &survivor] {
+            hold_persisted(state, &info).await?;
+        }
+        revoke(&author, &admin).await?;
+        super::tests::advertise(
+            &author,
+            survivor_id,
+            x0x::dm::CapabilityRegistry::current().bits,
+            x0x::dm_capability::now_unix_ms(),
+        );
+        // The admin's rotation share of epoch 1 lands before its
+        // revocation, and installs: the head still commits epoch 0, so it
+        // is an early share, and its sender is an admin of that head.
+        let early_secret = [0xA5u8; 32];
+        let survivor_kem = info
+            .members_v2
+            .get(&survivor_hex)
+            .and_then(|member| member.kem_public_key_b64.clone())
+            .context("survivor KEM key")?;
+        let early_share = ng::build_secure_share_event(
+            &stable,
+            &survivor_hex,
+            &survivor_kem,
+            &admin_hex,
+            &early_secret,
+            info.secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the early share"))?;
+        let installed = ng::apply_named_group_metadata_event(
+            &survivor,
+            early_share,
+            admin.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            installed.accepted,
+            "the admin's share installs: {installed:?}"
+        );
+        let held = survivor.named_groups.read().await[&stable].clone();
+        assert_eq!(
+            held.secret_epoch, 1,
+            "the early share raised the local epoch"
+        );
+        assert_eq!(held.shared_secret.as_deref(), Some(early_secret.as_slice()));
+        // Then the revocation lands, and the admin holds that secret.
+        revoke(&survivor, &admin).await?;
+
+        let (committed, frame) = commit_own_recovery(&author, &stable, &info).await?;
+        let new_secret = committed.shared_secret.clone().context("new secret")?;
+        assert_eq!(
+            committed.secret_epoch, 1,
+            "the recovery binds the committed epoch + 1"
+        );
+        assert_ne!(
+            new_secret.as_slice(),
+            early_secret.as_slice(),
+            "the recovery rotated a new secret"
+        );
+
+        // The recovery's share parks (its sender is no admin on the
+        // parent), then the frame installs and replaces the early secret.
+        let mut share = None;
+        for _ in 0..100 {
+            worker_tick(&author).await;
+            share = scheduled_shares(&author)
+                .into_iter()
+                .find(|(recipient, _)| *recipient == survivor_hex)
+                .map(|(_, share)| share);
+            if share.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let share = share.context("the author seals the new secret to the survivor")?;
+        let early = ng::apply_named_group_metadata_event(
+            &survivor,
+            share,
+            author.agent.agent_id(),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            !early.accepted,
+            "the recovery share parks while the early secret holds the epoch"
+        );
+        assert_eq!(
+            receive_bytes(&survivor, &frame).await?,
+            ReceiveOutcome::Applied
+        );
+        let held = survivor.named_groups.read().await[&stable].clone();
+        assert_eq!(held.state_hash, committed.state_hash, "the recovery head");
+        assert_eq!(held.secret_epoch, 1);
+        assert_eq!(
+            held.shared_secret.as_deref(),
+            Some(new_secret.as_slice()),
+            "the recovery key replaced the early share's secret"
         );
         author.agent.shutdown().await;
         survivor.agent.shutdown().await;
