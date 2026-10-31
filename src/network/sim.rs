@@ -2216,9 +2216,10 @@ impl SimLink {
 
     pub(crate) fn probe_peer(&self, peer_id: &PeerId) -> Result<Duration, NodeError> {
         // The probe envelope is a send from this end, so the end whose
-        // winner moved (#1419, ant-quic#332) cannot probe: its probe fails
+        // winner moved (#1419, ant-quic#332) cannot probe. Its probe fails
         // the same way a data send is refused, while the other end still
-        // answers.
+        // answers. The refusal uses the endpoint's link-naming error so
+        // the x0x probe classifier sees the same cause as on QUIC.
         let winner_moved = self
             .fabric
             .lock()
@@ -2226,7 +2227,9 @@ impl SimLink {
             .get(&pair(self.me.0, peer_id.0))
             .is_some_and(|link| link.one_sided.is_some_and(|(who, _)| who == self.me.0));
         if winner_moved {
-            return Err(NodeError::Connection("sim: generation superseded".into()));
+            return Err(NodeError::Endpoint(EndpointError::Connection(
+                "sim: generation superseded".into(),
+            )));
         }
         if self.is_connected(peer_id) {
             Ok(self.fabric.base_latency * 2)

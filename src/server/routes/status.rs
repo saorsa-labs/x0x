@@ -1152,11 +1152,12 @@ mod tests {
     }
 
     /// #1419, the deferred acceptance case: a link whose two directions
-    /// are both stale while other peers flow — the eph `r0481pre-e2e`
-    /// shape — is degraded by the publish path, then re-dialled once.
+    /// are both stale while other peers flow (the eph `r0481pre-e2e`
+    /// shape) is degraded by the publish path, then re-dialled once.
     /// `publish_one_sided_health` resolves the liveness probe before the
-    /// store, so the stored count is visible while the re-dial is paused,
-    /// and the re-dial clears the moved winner.
+    /// store, so the stored count is visible while the re-dial is paused.
+    /// The re-dial clears the moved winner, and a later publish leaves the
+    /// snapshot healthy again.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn issue1419_both_directions_stale_link_is_published_degraded_then_repaired() {
         use std::sync::Arc;
@@ -1211,7 +1212,9 @@ mod tests {
         a_link.send(&peer_c, b"\x7fac2").unwrap();
         c_link.send(&peer_a, b"\x7fca2").unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
-        a.pause_one_sided_redial_for_test(Duration::from_secs(3));
+        // The pause holds the re-dial inside its 3 s bound, short of the
+        // bound itself so the dial still completes.
+        a.pause_one_sided_redial_for_test(Duration::from_secs(1));
 
         let snapshot = Arc::new(HealthSnapshot::default());
         let published = Arc::clone(&snapshot);
@@ -1241,6 +1244,17 @@ mod tests {
             a.try_connection_generation(&peer_b).unwrap(),
             b.try_connection_generation(&peer_a).unwrap(),
             "both ends agree on that winner"
+        );
+        // Fresh traffic on the healed link, then one more publish: the
+        // stored view returns to healthy.
+        a_link.send(&peer_b, b"\x7fhealed-ab").unwrap();
+        b_link.send(&peer_a, b"\x7fhealed-ba").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        super::publish_one_sided_health(&a, &snapshot, 2).await;
+        assert_eq!(
+            snapshot.load().2,
+            0,
+            "the healed link leaves the stored degraded set"
         );
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();

@@ -345,8 +345,9 @@ const ONE_SIDED_REDIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bound on the liveness probe that decides a both-directions-stale peer
 /// (#1419). The probe succeeds quickly on a quiet link; only a broken
-/// link spends this budget.
-const ONE_SIDED_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// link spends this budget. Three seconds leave room for a relayed path
+/// and still fit inside the 5 s health-refresher tick.
+const ONE_SIDED_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Send and receive ages for one connected peer (#1419).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -448,16 +449,14 @@ pub(crate) fn both_stale_candidate_indexes(samples: &[LinkAgeSample]) -> Vec<usi
 /// peer is neither degraded nor re-dialled on that evidence; the probe
 /// runs again after the window.
 fn one_sided_probe_confirms_broken(error: &ant_quic::NodeError) -> bool {
-    match error {
+    matches!(
+        error,
         ant_quic::NodeError::Endpoint(
             ant_quic::EndpointError::ProbeTimeout
-            | ant_quic::EndpointError::ConnectionClosed { .. }
-            | ant_quic::EndpointError::Connection(_),
-        ) => true,
-        // The sim refuses the moved winner's sends with this error.
-        ant_quic::NodeError::Connection(_) => true,
-        _ => false,
-    }
+                | ant_quic::EndpointError::ConnectionClosed { .. }
+                | ant_quic::EndpointError::Connection(_),
+        )
+    )
 }
 
 /// One re-dial episode for a peer that is one-sided (#1419).
@@ -479,12 +478,13 @@ struct OneSidedRepair {
 /// Keep backoff and the warning unless the peer's own link has recovered.
 ///
 /// A sample that omits the peer is not recovery. The timestamp stays through
-/// [`ONE_SIDED_REDIAL_BACKOFF`]. Recovery means the peer is still connected
-/// and is not one-sided, including a quiet peer whose two directions are
-/// both stale. Recovery clears the warning. The timestamp still blocks a
-/// dial inside the backoff. A probe-confirmed peer keeps its confirmation
-/// while its sample stays both-directions stale; traffic on either
-/// direction clears it.
+/// [`ONE_SIDED_REDIAL_BACKOFF`]. Recovery means the peer still carries
+/// traffic: a sample with a fresh direction. Such a sample clears the
+/// warning and the probe confirmation. A quiet sample clears the warning
+/// only when no live probe confirmation says the link is broken, so a
+/// confirmed peer warns once per episode. The backoff timestamp still
+/// blocks a dial inside the window. An entry with a probe verdict inside
+/// the window is kept for its cooldown, even when it confirms nothing.
 fn plan_one_sided_repairs(
     map: &mut HashMap<AntPeerId, OneSidedRepair>,
     samples: &[LinkAgeSample],
@@ -495,7 +495,9 @@ fn plan_one_sided_repairs(
             continue;
         }
         if let Some(entry) = map.get_mut(&sample.peer) {
-            entry.warned = false;
+            if sample.age.fresh_direction() || !entry.both_stale_confirmed {
+                entry.warned = false;
+            }
             if sample.age.fresh_direction() {
                 entry.both_stale_confirmed = false;
             }
@@ -512,7 +514,10 @@ fn plan_one_sided_repairs(
             && samples
                 .iter()
                 .any(|sample| sample.peer == *peer && sample.age.both_directions_stale());
-        in_backoff || still_one_sided || still_confirmed
+        let probe_cooldown = entry
+            .both_stale_probe_at
+            .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF);
+        in_backoff || still_one_sided || still_confirmed || probe_cooldown
     });
     let mut peers = one_sided_peer_ids_from(samples);
     peers.extend(samples.iter().filter_map(|sample| {
@@ -3628,36 +3633,55 @@ impl NetworkNode {
     /// answers and stays up, a broken link fails the probe, joins the
     /// degraded set and is then re-dialled once by
     /// [`Self::repair_one_sided_links`]. Only a probe failure that names
-    /// the link degrades the peer ([`one_sided_probe_confirms_broken`]);
-    /// a busy endpoint or a probe-incapable peer is inconclusive. Each
-    /// peer is probed at most once per [`ONE_SIDED_REDIAL_BACKOFF`], so
-    /// this waits no longer than [`ONE_SIDED_PROBE_TIMEOUT`] and only
-    /// while a candidate exists.
+    /// the link degrades the peer ([`one_sided_probe_confirms_broken`]).
+    /// A busy endpoint or a probe-incapable peer is inconclusive. A peer
+    /// stays in the degraded set while its probe verdict is inside the
+    /// window and its sample stays both-directions stale, even when other
+    /// peers go quiet; it is probed again when the window ends. Each peer
+    /// is probed at most once per [`ONE_SIDED_REDIAL_BACKOFF`], so this
+    /// waits no longer than [`ONE_SIDED_PROBE_TIMEOUT`] and only while a
+    /// probe is due.
     pub(crate) async fn resolve_one_sided_peers(
         &self,
         samples: &[LinkAgeSample],
     ) -> Vec<AntPeerId> {
         let now = Instant::now();
         let mut degraded = one_sided_peer_ids_from(samples);
+        let candidates: std::collections::HashSet<usize> =
+            both_stale_candidate_indexes(samples).into_iter().collect();
         let mut to_probe = Vec::new();
         {
-            let mut map = match self.one_sided_repairs.lock() {
+            let map = match self.one_sided_repairs.lock() {
                 Ok(map) => map,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            for index in both_stale_candidate_indexes(samples) {
-                let peer = samples[index].peer;
-                let entry = map.entry(peer).or_default();
-                let probed_inside_window = entry
-                    .both_stale_probe_at
-                    .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF);
+            for (index, sample) in samples.iter().enumerate() {
+                if !sample.age.both_directions_stale() {
+                    continue;
+                }
+                let peer = sample.peer;
+                let (probed_inside_window, confirmed_before) = match map.get(&peer) {
+                    Some(entry) => (
+                        entry.both_stale_probe_at.is_some_and(|at| {
+                            now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF
+                        }),
+                        entry.both_stale_confirmed,
+                    ),
+                    None => (false, false),
+                };
                 if probed_inside_window {
-                    if entry.both_stale_confirmed {
+                    if confirmed_before {
                         degraded.push(peer);
                     }
                     continue;
                 }
-                to_probe.push(peer);
+                // Other peers' traffic gates the first probe of a quiet
+                // peer. A peer the last probe named broken stays watched
+                // when that traffic stops, so a known failure cannot leave
+                // the health view.
+                if candidates.contains(&index) || confirmed_before {
+                    to_probe.push(peer);
+                }
             }
         }
         if !to_probe.is_empty() {
@@ -3838,6 +3862,22 @@ impl NetworkNode {
         true
     }
 
+    /// Clear the both-stale probe verdict for `peer` (#1419).
+    ///
+    /// A successful re-dial spends the verdict: the next resolver pass
+    /// probes the new link instead of reusing the old failure, so a healed
+    /// peer leaves the degraded set at once. The warning flag stays.
+    fn spend_one_sided_probe_verdict(&self, peer: &AntPeerId) {
+        let mut map = match self.one_sided_repairs.lock() {
+            Ok(map) => map,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(entry) = map.get_mut(peer) {
+            entry.both_stale_confirmed = false;
+            entry.both_stale_probe_at = None;
+        }
+    }
+
     /// Claim the repair window without dialling, so a test can interleave
     /// the claim with the scheduler's cache wait.
     #[cfg(test)]
@@ -3885,6 +3925,12 @@ impl NetworkNode {
         };
         match tokio::time::timeout(ONE_SIDED_REDIAL_TIMEOUT, dial).await {
             Ok(Ok(_)) => {
+                // The dial spent the probe verdict: a new connection is up,
+                // so the old both-stale confirmation must not keep the
+                // peer degraded for the rest of the window. The warning
+                // stays, so a link that breaks again does not warn twice
+                // for one episode.
+                self.spend_one_sided_probe_verdict(peer);
                 info!(
                     target: "x0x::connect",
                     peer_id_prefix = %prefix,
@@ -10849,10 +10895,10 @@ mod tests {
             EndpointError::Connection("send refused".to_string())
         )));
         assert!(
-            confirms(ant_quic::NodeError::Connection(
-                "sim: generation superseded".to_string()
+            !confirms(ant_quic::NodeError::Connection(
+                "a generic connection error".to_string()
             )),
-            "the sim's moved-winner refusal names the link"
+            "a generic connection error does not name the link"
         );
         assert!(
             !confirms(ant_quic::NodeError::Endpoint(
@@ -10871,6 +10917,85 @@ mod tests {
             "a peer that left the table is inconclusive"
         );
         assert!(!confirms(ant_quic::NodeError::ShuttingDown));
+    }
+
+    /// #1419: a confirmed both-stale episode warns once across passes, an
+    /// inconclusive verdict keeps its cooldown entry without dialling, and
+    /// traffic on either direction is recovery.
+    #[test]
+    fn both_stale_episode_keeps_one_warning_and_the_probe_cooldown() {
+        let stale = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(90)),
+            received_ago: Some(Duration::from_secs(90)),
+        };
+        let fresh = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(1)),
+            received_ago: Some(Duration::from_secs(1)),
+        };
+        let sample = |peer, age| LinkAgeSample { peer, age };
+        let peer = test_ant_peer(1);
+        let other = test_ant_peer(2);
+        let now = Instant::now();
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            peer,
+            OneSidedRepair {
+                last_attempt: None,
+                warned: true,
+                both_stale_probe_at: Some(now),
+                both_stale_confirmed: true,
+                scheduler_cancel: None,
+            },
+        );
+        let samples = [sample(peer, stale), sample(other, fresh)];
+        assert_eq!(
+            plan_one_sided_repairs(&mut map, &samples, now),
+            vec![peer],
+            "the confirmed both-stale peer is re-dialled"
+        );
+        assert!(
+            map[&peer].warned,
+            "a confirmed both-stale sample does not re-arm the warning"
+        );
+        assert_eq!(
+            plan_one_sided_repairs(&mut map, &samples, now),
+            vec![peer],
+            "a second pass plans the same repair"
+        );
+        assert!(
+            map[&peer].warned,
+            "the second pass still does not re-arm the warning"
+        );
+
+        let recovered = [sample(peer, fresh)];
+        plan_one_sided_repairs(&mut map, &recovered, now);
+        assert!(!map[&peer].warned, "traffic on either direction recovers");
+        assert!(
+            !map[&peer].both_stale_confirmed,
+            "recovery clears the confirmation"
+        );
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            peer,
+            OneSidedRepair {
+                last_attempt: None,
+                warned: false,
+                both_stale_probe_at: Some(now),
+                both_stale_confirmed: false,
+                scheduler_cancel: None,
+            },
+        );
+        let quiet_node = [sample(peer, stale)];
+        assert!(
+            plan_one_sided_repairs(&mut map, &quiet_node, now).is_empty(),
+            "an inconclusive verdict does not dial"
+        );
+        assert!(
+            map.contains_key(&peer),
+            "the cooldown keeps the entry for the next probe"
+        );
     }
 
     /// #1419: a quiet peer stays connected. One direction stale and the other
@@ -11102,11 +11227,13 @@ mod tests {
         b.try_shutdown().await.unwrap();
     }
 
-    /// #1419: the original eph `r0481pre-e2e` shape — both directions of
-    /// one peer stale (610 s / 725 s against sub-2 s peers) after a
+    /// #1419: the original eph `r0481pre-e2e` shape. Both directions of
+    /// one peer are stale (610 s / 725 s against sub-2 s peers) after a
     /// relay superseded the winner on this side only. The pure rule alone
-    /// cannot see it; the liveness probe fails on the moved winner, the
+    /// cannot see it. The liveness probe fails on the moved winner, the
     /// peer is degraded, and one bounded re-dial restores both directions.
+    /// The confirmed failure stays in the view when the other peers go
+    /// quiet, and the healed link leaves the view.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn issue1419_both_directions_stale_link_is_probed_degraded_and_repaired_once() {
         let plane = "issue1419-both-stale";
@@ -11171,7 +11298,19 @@ mod tests {
             "the failed liveness probe degrades the both-directions-stale link"
         );
 
-        a.repair_one_sided_links(&samples).await;
+        // Every peer now goes quiet together. B stays a known failure and
+        // is probed again once the window ends; C, never confirmed, is not
+        // probed at all on a quiet node.
+        tokio::time::sleep(ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        let quiet_samples = a.connected_link_ages().await;
+        let still_degraded = a.resolve_one_sided_peers(&quiet_samples).await;
+        assert_eq!(
+            still_degraded,
+            vec![peer_b],
+            "the confirmed failure stays degraded when other peers go quiet"
+        );
+
+        a.repair_one_sided_links(&quiet_samples).await;
         assert_eq!(
             a.one_sided_warnings.load(Ordering::Relaxed),
             1,
@@ -11182,11 +11321,16 @@ mod tests {
             1,
             "the repair dials once"
         );
-        a.repair_one_sided_links(&samples).await;
+        a.repair_one_sided_links(&quiet_samples).await;
         assert_eq!(
             a.one_sided_redials.load(Ordering::Relaxed),
             1,
             "a second pass inside the backoff does not dial"
+        );
+        assert_eq!(
+            a.one_sided_warnings.load(Ordering::Relaxed),
+            1,
+            "a second pass inside the episode does not warn again"
         );
         assert_eq!(
             fabric.one_sided_winner_for_test(&peer_a, &peer_b),
@@ -11218,6 +11362,13 @@ mod tests {
             b_to_a.iter().any(|(dst, _, _)| *dst == peer_a.0),
             "B's bytes reach A after the re-dial (deliveries: {})",
             b_to_a.len()
+        );
+
+        let healed_samples = a.connected_link_ages().await;
+        let healed = a.resolve_one_sided_peers(&healed_samples).await;
+        assert!(
+            healed.is_empty(),
+            "the healed link leaves the degraded set at once"
         );
 
         a.try_shutdown().await.unwrap();
