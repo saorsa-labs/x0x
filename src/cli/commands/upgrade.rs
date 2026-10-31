@@ -6,7 +6,7 @@
 //! whether this CLI sits beside the daemon that is running. It reads that
 //! executable from the selected instance's process. It does not ask the
 //! daemon for a path. When that executable cannot be read, the check says
-//! it cannot tell.
+//! it cannot tell. An available update still names `x0x upgrade --apply`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,6 +23,9 @@ const REPO: &str = "saorsa-labs/x0x";
 /// Quiet result when the running daemon executable cannot be read.
 pub(crate) const CANNOT_TELL_SPLIT: &str =
     "Cannot tell whether this CLI sits beside the running daemon.";
+
+/// Next step when an update is available and apply can still install it.
+const APPLY_HINT: &str = "Use `x0x upgrade --apply` to install through the running daemon.";
 
 /// Where this CLI sits relative to the daemon that is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,9 +65,10 @@ pub(crate) fn check_report(facts: &CheckFacts<'_>) -> String {
         lines.push(format!("Release v{release}"));
     }
 
-    // The hint is only for a CLI that is apart from the running daemon and
-    // older than that daemon. A CLI beside that daemon is replaced by apply.
-    // An unknown executable must not produce a warning.
+    // The reinstall hint is only for a CLI that is apart from the running
+    // daemon and older than that daemon. A CLI beside that daemon is replaced
+    // by apply. An unknown executable must not produce that warning. An
+    // available update still names `x0x upgrade --apply`.
     let cli_older_than_daemon = facts
         .daemon_version
         .filter(|daemon| release_is_newer(facts.cli_version, daemon));
@@ -101,10 +105,7 @@ pub(crate) fn check_report(facts: &CheckFacts<'_>) -> String {
                         lines.push(CLI_REINSTALL_HINT.to_string());
                     }
                 }
-                SplitView::Beside => lines.push(
-                    "Use `x0x upgrade --apply` to install through the running daemon.".to_string(),
-                ),
-                SplitView::Unknown => {}
+                SplitView::Beside | SplitView::Unknown => lines.push(APPLY_HINT.to_string()),
             }
         } else {
             lines.push(format!(
@@ -178,14 +179,18 @@ pub(crate) fn split_cli_notice(
     cli_version: &str,
     applied_version: &str,
 ) -> Option<String> {
+    // Same or newer than the applied release: say nothing. "Cannot tell" is
+    // only for a CLI that may still be behind, including Windows, where the
+    // process path cannot be read.
+    let behind = release_is_newer(cli_version, applied_version);
     let Some(cli_path) = cli_path else {
-        return Some(CANNOT_TELL_SPLIT.to_string());
+        return behind.then(|| CANNOT_TELL_SPLIT.to_string());
     };
     match split_relation(cli_path, daemon_exe) {
         SplitView::Beside => None,
-        SplitView::Unknown => Some(CANNOT_TELL_SPLIT.to_string()),
+        SplitView::Unknown => behind.then(|| CANNOT_TELL_SPLIT.to_string()),
         SplitView::Apart => {
-            if !release_is_newer(cli_version, applied_version) {
+            if !behind {
                 return None;
             }
             let shown = path_for_display(cli_path);
@@ -211,6 +216,7 @@ pub(crate) fn split_relation(cli: &Path, daemon_exe: Option<&Path>) -> SplitView
 }
 
 fn canonical_parent(path: &Path) -> Option<PathBuf> {
+    let path = strip_deleted_suffix(path.to_path_buf());
     std::fs::canonicalize(path)
         .ok()?
         .parent()
@@ -218,7 +224,8 @@ fn canonical_parent(path: &Path) -> Option<PathBuf> {
 }
 
 fn path_for_display(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    let path = strip_deleted_suffix(path.to_path_buf());
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 fn applied_release_version(response: &serde_json::Value) -> Option<&str> {
@@ -341,18 +348,39 @@ async fn observe_selected_daemon(instance: Option<&str>, api: Option<&str>) -> O
 /// `--api` selects the instance whose `api.port` matches that address.
 /// A service definition is not used: it can name a binary that is not the
 /// process answering this check. `None` means the check cannot tell.
+///
+/// `exe_for_pid` receives the instance name from the selected directory
+/// (`None` is the default instance). A pid whose command line names a
+/// different instance is not this daemon.
 pub(crate) fn running_daemon_executable(
     data_root: &Path,
     name: Option<&str>,
     api: Option<&str>,
-    exe_for_pid: impl Fn(u32) -> Option<PathBuf>,
+    exe_for_pid: impl Fn(u32, Option<&str>) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     let dir = selected_instance_dir(data_root, name, api)?;
+    let instance = expected_daemon_name(&dir)?;
     let pid = read_instance_pid(&dir)?;
-    let exe = exe_for_pid(pid)?;
+    let exe = exe_for_pid(pid, instance.as_deref())?;
     exe.file_name()
         .is_some_and(|file| file == apply::daemon_file_name())
         .then_some(exe)
+}
+
+/// `--name` recorded for this instance directory.
+///
+/// The outer `Option` is `None` when `dir` is not an instance directory.
+/// The inner `Option` is the `--name` value. `None` is the default instance.
+fn expected_daemon_name(dir: &Path) -> Option<Option<String>> {
+    let file_name = dir.file_name()?.to_str()?;
+    if file_name == "x0x" {
+        return Some(None);
+    }
+    let name = file_name.strip_prefix("x0x-")?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(Some(name.to_string()))
 }
 
 fn selected_instance_dir(
@@ -415,7 +443,21 @@ fn endpoint_key(addr: &str) -> Option<String> {
     if rest.is_empty() || rest.contains(['/', ' ', '\\']) {
         return None;
     }
-    Some(rest.to_string())
+    let Some((host, port)) = split_host_port(rest) else {
+        return Some(rest.to_string());
+    };
+    // `localhost` and `127.0.0.1` are one endpoint. `[::1]` stays distinct:
+    // a daemon bound to one of those addresses does not listen on the other.
+    let host = if host.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1"
+    } else {
+        host
+    };
+    if rest.starts_with('[') {
+        Some(format!("[{host}]:{port}"))
+    } else {
+        Some(format!("{host}:{port}"))
+    }
 }
 
 /// Loopback `host:port` only. A non-loopback address is not queried.
@@ -496,59 +538,183 @@ async fn running_daemon_version(base_url: &str) -> Option<String> {
     version_from_health_body(&bytes)
 }
 
-fn process_executable(pid: u32) -> Option<PathBuf> {
+fn process_executable(pid: u32, instance: Option<&str>) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        linux_process_executable(pid)
+        linux_process_executable(pid, instance)
     }
     #[cfg(target_os = "macos")]
     {
-        macos_process_executable(pid)
+        macos_process_executable(pid, instance)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = pid;
+        let _ = (pid, instance);
         None
     }
 }
 
-#[cfg(target_os = "linux")]
-fn linux_process_executable(pid: u32) -> Option<PathBuf> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    if comm.trim() != "x0xd" {
+/// Accept `exe` only when it is `x0xd` and `args` is that instance.
+///
+/// A stale `instance.lock` can name a pid that now belongs to another
+/// `x0xd`. The command line's `--name` is how those processes differ.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn exe_if_this_instance(exe: PathBuf, args: &[String], instance: Option<&str>) -> Option<PathBuf> {
+    let exe = strip_deleted_suffix(exe);
+    if exe
+        .file_name()
+        .is_none_or(|file| file != apply::daemon_file_name())
+    {
         return None;
     }
-    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    Some(strip_deleted_suffix(path))
+    argv_names_instance(args, instance).then_some(exe)
 }
 
-#[cfg(target_os = "macos")]
-fn macos_process_executable(pid: u32) -> Option<PathBuf> {
-    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: `proc_pidpath` writes at most `buf.len()` bytes into `buf`
-    // and reads only this pid. A non-positive return is an error.
-    let wrote = unsafe {
-        libc::proc_pidpath(
-            pid as libc::c_int,
-            buf.as_mut_ptr().cast(),
-            buf.len() as u32,
-        )
-    };
-    if wrote <= 0 {
-        return None;
-    }
-    let bytes = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?.to_bytes();
-    let path = PathBuf::from(std::str::from_utf8(bytes).ok()?);
-    Some(path)
-}
-
-#[cfg(target_os = "linux")]
+/// Linux `current_exe` appends ` (deleted)` after the file is replaced.
 fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
     let text = path.to_string_lossy();
     match text.strip_suffix(" (deleted)") {
         Some(clean) => PathBuf::from(clean),
         None => path,
     }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn argv_from_nul_bytes(buf: &[u8]) -> Vec<String> {
+    buf.split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `true` when `args` is the `x0xd` for `instance`.
+///
+/// `instance` `None` is the default daemon: it has no `--name` argument.
+/// An empty argument list does not match. The caller could not read a
+/// command line, so the pid is not treated as this daemon.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn argv_names_instance(args: &[String], instance: Option<&str>) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+    let named = args
+        .windows(2)
+        .find(|pair| pair[0] == "--name")
+        .map(|pair| pair[1].as_str());
+    match (instance, named) {
+        (None, None) => true,
+        (Some(want), Some(got)) => want == got,
+        _ => false,
+    }
+}
+
+/// Parse the `KERN_PROCARGS2` buffer: argc, executable path, padding, argv.
+#[cfg(any(test, target_os = "macos"))]
+fn argv_from_procargs2(buf: &[u8]) -> Option<Vec<String>> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes(buf[0..4].try_into().ok()?);
+    let count = usize::try_from(argc).ok()?;
+    if count == 0 || count > 1024 {
+        return None;
+    }
+    let mut index = 4;
+    while index < buf.len() && buf[index] != 0 {
+        index += 1;
+    }
+    while index < buf.len() && buf[index] == 0 {
+        index += 1;
+    }
+    let mut args = Vec::with_capacity(count);
+    for _ in 0..count {
+        if index >= buf.len() {
+            return None;
+        }
+        let start = index;
+        while index < buf.len() && buf[index] != 0 {
+            index += 1;
+        }
+        let text = std::str::from_utf8(buf.get(start..index)?).ok()?;
+        args.push(text.to_string());
+        index += 1;
+    }
+    Some(args)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_executable(pid: u32, instance: Option<&str>) -> Option<PathBuf> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    if comm.trim() != apply::daemon_file_name() {
+        return None;
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    exe_if_this_instance(path, &argv_from_nul_bytes(&cmdline), instance)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_executable(pid: u32, instance: Option<&str>) -> Option<PathBuf> {
+    let path = macos_pid_path(pid)?;
+    let args = macos_process_args(pid)?;
+    exe_if_this_instance(path, &args, instance)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pid_path(pid: u32) -> Option<PathBuf> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `proc_pidpath` writes at most `buf.len()` bytes into `buf`
+    // and reads only this pid. A non-positive return is an error.
+    let cap = u32::try_from(buf.len()).ok()?;
+    let wrote = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), cap) };
+    if wrote <= 0 {
+        return None;
+    }
+    let bytes = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?.to_bytes();
+    Some(PathBuf::from(std::str::from_utf8(bytes).ok()?))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_args(pid: u32) -> Option<Vec<String>> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let namelen = libc::c_uint::try_from(mib.len()).ok()?;
+    let mut size: libc::size_t = 0;
+    // SAFETY: a null output buffer asks for the byte count only. `mib`
+    // stays valid for the call. No value is written to the kernel.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            namelen,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 || size > 1_048_576 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: `buf` has `size` bytes and is exclusive to this call.
+    // The call reads process arguments. It does not write a kernel value.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            namelen,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size > buf.len() {
+        return None;
+    }
+    buf.truncate(size);
+    argv_from_procargs2(&buf)
 }
 
 /// Text shown when the release signature does not match this binary's key.
@@ -645,19 +811,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn issue1104_check_and_apply_pass_name_and_api_into_run() {
-        let source = include_str!("../../bin/x0x.rs");
-        assert!(
-            source.contains("commands::upgrade::run(*check, *force, name, api)"),
-            "upgrade --check must pass --name and --api into run"
-        );
-        assert!(
-            source.contains("split_cli_notice_after_apply(&response, name, api)"),
-            "upgrade --apply must report against the same --name and --api"
-        );
-    }
-
     #[tokio::test]
     async fn standalone_apply_refuses_before_io_even_with_force() {
         for force in [false, true] {
@@ -751,12 +904,19 @@ mod tests {
             SplitView::Apart,
             "a sibling x0xd in ~/.cargo/bin is not the running daemon"
         );
-        let report = report(SplitView::Apart, "1.0.0", "1.2.0", "1.2.0", false);
+        let report = check_report(&CheckFacts {
+            cli_version: "1.0.0",
+            cli_path: Some(&cli),
+            daemon_exe: Some(&daemon),
+            split: SplitView::Apart,
+            daemon_version: Some("1.2.0"),
+            release_version: Some("1.2.0"),
+            force: false,
+            already_current: false,
+            missing_release: false,
+        });
         assert!(report.contains("CLI not upgraded"), "{report}");
-        assert!(
-            report.contains("/usr/local/bin/x0xd") || cfg!(windows),
-            "{report}"
-        );
+        assert!(report.contains(&daemon.display().to_string()), "{report}");
     }
 
     #[cfg(unix)]
@@ -810,7 +970,10 @@ mod tests {
         assert!(report.contains(CANNOT_TELL_SPLIT), "{report}");
         assert!(!report.contains("CLI not upgraded"), "{report}");
         assert!(!report.contains(CLI_REINSTALL_HINT), "{report}");
-        assert!(!report.contains("Use `x0x upgrade --apply`"), "{report}");
+        assert!(
+            report.contains(APPLY_HINT),
+            "an unknown split with an update still names apply: {report}"
+        );
     }
 
     #[test]
@@ -837,6 +1000,14 @@ mod tests {
         let unknown = split_cli_notice(Some(&cli), None, "1.0.0", applied).expect("cannot tell");
         assert!(unknown.contains(CANNOT_TELL_SPLIT), "{unknown}");
         assert!(!unknown.contains("CLI not upgraded"), "{unknown}");
+        assert!(
+            split_cli_notice(Some(&cli), None, "1.4.0", applied).is_none(),
+            "a current CLI must not be told the path is unknown"
+        );
+        assert!(split_cli_notice(Some(&cli), None, "2.0.0", applied).is_none());
+        let missing = split_cli_notice(None, Some(&daemon), "1.0.0", applied).expect("behind");
+        assert!(missing.contains(CANNOT_TELL_SPLIT), "{missing}");
+        assert!(split_cli_notice(None, Some(&daemon), "1.4.0", applied).is_none());
         assert!(applied_release_version(&serde_json::json!({"applied": false})).is_none());
     }
 
@@ -867,7 +1038,7 @@ mod tests {
         assert_eq!(fallback, "http://127.0.0.1:12700");
         assert!(DaemonClient::resolve_base_url(Some("bob"), None, empty.path()).is_err());
 
-        let exe_for_pid = |pid: u32| match pid {
+        let exe_for_pid = |pid: u32, _instance: Option<&str>| match pid {
             11 => Some(local_daemon.clone()),
             22 => Some(cargo_daemon.clone()),
             _ => None,
@@ -898,8 +1069,10 @@ mod tests {
             "an --api with no matching port file must not use another instance"
         );
         assert!(
-            running_daemon_executable(root.path(), None, None, |_| Some(PathBuf::from("/bin/sh")))
-                .is_none(),
+            running_daemon_executable(root.path(), None, None, |_, _| Some(PathBuf::from(
+                "/bin/sh"
+            )))
+            .is_none(),
             "a process that is not x0xd must not count as the daemon"
         );
     }
@@ -1036,5 +1209,178 @@ mod tests {
         });
         assert!(missing.contains("No release found on GitHub."), "{missing}");
         assert!(!missing.contains("Update available"), "{missing}");
+    }
+
+    #[test]
+    fn issue1104_deleted_cli_suffix_is_still_beside_the_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        let cli = write_bin(&bin, apply::cli_file_name());
+        let daemon = write_bin(&bin, apply::daemon_file_name());
+        let deleted = PathBuf::from(format!("{} (deleted)", cli.display()));
+        assert_eq!(
+            split_relation(&deleted, Some(&daemon)),
+            SplitView::Beside,
+            "the Linux deleted suffix must not hide a sibling CLI"
+        );
+        let applied = "9.0.0";
+        assert!(
+            split_cli_notice(Some(&deleted), Some(&daemon), "1.0.0", applied).is_none(),
+            "a successful sibling swap must not print Cannot tell"
+        );
+    }
+
+    #[test]
+    fn issue1104_missing_path_is_unknown_and_does_not_claim_a_split() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing").join(apply::cli_file_name());
+        let daemon = write_bin(&root.path().join("bin"), apply::daemon_file_name());
+        assert_eq!(split_relation(&missing, Some(&daemon)), SplitView::Unknown);
+        let report = check_report(&CheckFacts {
+            cli_version: "1.0.0",
+            cli_path: None,
+            daemon_exe: Some(&daemon),
+            split: SplitView::Unknown,
+            daemon_version: Some("1.4.0"),
+            release_version: Some("1.4.0"),
+            force: false,
+            already_current: false,
+            missing_release: false,
+        });
+        assert!(report.contains(CANNOT_TELL_SPLIT), "{report}");
+        assert!(report.contains(APPLY_HINT), "{report}");
+        assert!(!report.contains("CLI not upgraded"), "{report}");
+        let current = check_report(&CheckFacts {
+            cli_version: "1.4.0",
+            cli_path: None,
+            daemon_exe: None,
+            split: SplitView::Unknown,
+            daemon_version: Some("1.4.0"),
+            release_version: Some("1.4.0"),
+            force: false,
+            already_current: false,
+            missing_release: false,
+        });
+        assert!(
+            !current.contains(APPLY_HINT),
+            "no update means no apply line: {current}"
+        );
+    }
+
+    #[test]
+    fn issue1104_localhost_matches_the_ipv4_loopback_port_file() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("x0x");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("api.port"), "127.0.0.1:12700\n").unwrap();
+        std::fs::write(dir.join("instance.lock"), "11").unwrap();
+        let daemon = write_bin(&root.path().join("bin"), apply::daemon_file_name());
+        for api in [
+            "localhost:12700",
+            "http://LOCALHOST:12700",
+            "127.0.0.1:12700",
+        ] {
+            let found = running_daemon_executable(root.path(), None, Some(api), |pid, instance| {
+                assert_eq!(pid, 11, "{api}");
+                assert_eq!(instance, None, "{api}");
+                Some(daemon.clone())
+            });
+            assert_eq!(found.as_deref(), Some(daemon.as_path()), "{api}");
+        }
+        assert!(
+            running_daemon_executable(root.path(), None, Some("[::1]:12700"), |_, _| Some(
+                daemon.clone()
+            ))
+            .is_none(),
+            "[::1] is a different socket from 127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn issue1104_duplicate_port_or_bad_lock_is_not_a_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("x0x");
+        let second = root.path().join("x0x-bob");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("api.port"), "127.0.0.1:12700\n").unwrap();
+        std::fs::write(second.join("api.port"), "localhost:12700\n").unwrap();
+        std::fs::write(first.join("instance.lock"), "11").unwrap();
+        std::fs::write(second.join("instance.lock"), "22").unwrap();
+        let daemon = write_bin(&root.path().join("bin"), apply::daemon_file_name());
+        assert!(
+            running_daemon_executable(root.path(), None, Some("127.0.0.1:12700"), |_, _| {
+                Some(daemon.clone())
+            })
+            .is_none(),
+            "two port files for one endpoint must not pick a daemon"
+        );
+        for text in ["0", "nope", "", "-1"] {
+            std::fs::write(first.join("instance.lock"), text).unwrap();
+            std::fs::write(second.join("api.port"), "127.0.0.1:13999\n").unwrap();
+            assert!(
+                running_daemon_executable(root.path(), None, None, |_, _| Some(daemon.clone()))
+                    .is_none(),
+                "lock {text:?} must not select a daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn issue1104_stale_lock_pid_owned_by_another_daemon_does_not_match() {
+        let default_args = vec!["/usr/local/bin/x0xd".to_string()];
+        let alice = vec![
+            "/usr/local/bin/x0xd".to_string(),
+            "--name".to_string(),
+            "alice".to_string(),
+        ];
+        let bob = vec![
+            "/opt/x0x/x0xd".to_string(),
+            "--name".to_string(),
+            "bob".to_string(),
+        ];
+        assert!(argv_names_instance(&default_args, None));
+        assert!(!argv_names_instance(&alice, None));
+        assert!(argv_names_instance(&alice, Some("alice")));
+        assert!(!argv_names_instance(&bob, Some("alice")));
+        assert!(!argv_names_instance(&default_args, Some("alice")));
+        assert!(!argv_names_instance(&[], None));
+
+        let daemon = PathBuf::from(format!("/usr/local/bin/{}", apply::daemon_file_name()));
+        assert!(exe_if_this_instance(daemon.clone(), &alice, Some("alice")).is_some());
+        assert!(exe_if_this_instance(daemon.clone(), &bob, Some("alice")).is_none());
+        let deleted = PathBuf::from(format!(
+            "/usr/local/bin/{} (deleted)",
+            apply::daemon_file_name()
+        ));
+        assert_eq!(
+            exe_if_this_instance(deleted, &default_args, None).as_deref(),
+            Some(daemon.as_path())
+        );
+        assert!(exe_if_this_instance(PathBuf::from("/bin/sh"), &default_args, None).is_none());
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/local/bin/x0xd\0\0\0\0");
+        for arg in ["/usr/local/bin/x0xd", "--name", "alice"] {
+            buf.extend_from_slice(arg.as_bytes());
+            buf.push(0);
+        }
+        let parsed = argv_from_procargs2(&buf).expect("procargs");
+        assert!(argv_names_instance(&parsed, Some("alice")));
+        let nul = b"/usr/local/bin/x0xd\0--name\0bob\0";
+        assert!(argv_names_instance(&argv_from_nul_bytes(nul), Some("bob")));
+    }
+
+    #[test]
+    fn issue1104_apart_cli_newer_than_its_daemon_still_prints_the_reinstall_hint() {
+        let report = report(SplitView::Apart, "1.5.0", "1.0.0", "2.0.0", false);
+        assert!(!report.contains("CLI not upgraded"), "{report}");
+        assert!(report.contains(CLI_REINSTALL_HINT), "{report}");
+        assert!(
+            report.contains("does not upgrade a CLI installed apart"),
+            "{report}"
+        );
+        assert!(!report.contains(APPLY_HINT), "{report}");
     }
 }

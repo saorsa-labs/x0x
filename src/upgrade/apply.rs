@@ -49,6 +49,20 @@ pub(crate) fn daemon_file_name() -> &'static str {
     }
 }
 
+/// Sibling `x0x` beside the installed daemon.
+///
+/// The path is canonical when the daemon path can be resolved. Apply and the
+/// CLI check then agree on a symlinked install. A path that cannot be
+/// resolved keeps its own parent.
+pub(crate) fn sibling_cli_path(daemon_install: &Path) -> Result<PathBuf, UpgradeError> {
+    let resolved =
+        std::fs::canonicalize(daemon_install).unwrap_or_else(|_| daemon_install.to_path_buf());
+    let parent = resolved
+        .parent()
+        .ok_or_else(|| UpgradeError::Other("target has no parent directory".to_string()))?;
+    Ok(parent.join(cli_file_name()))
+}
+
 /// `Some` when no sibling CLI file exists. Callers log it at debug, not warn.
 ///
 /// A CLI in another directory is not visible on this path. The CLI process
@@ -1478,11 +1492,7 @@ impl AutoApplyUpgrader {
         // Prepare an optional companion replace; both locks run off-worker below.
         let mut companion = None;
         if self.binary_name == "x0xd" {
-            let parent_dir = target_path
-                .parent()
-                .ok_or_else(|| UpgradeError::Other("target has no parent directory".to_string()))?;
-            let x0x_name = cli_file_name();
-            let x0x_path = parent_dir.join(x0x_name);
+            let x0x_path = sibling_cli_path(&target_path)?;
             // #1104: replace only a sibling x0x. A missing file is not a split
             // install. Do not search the rest of the host. The CLI process
             // reports a binary that lives in another directory.
@@ -1503,7 +1513,7 @@ impl AutoApplyUpgrader {
                 {
                     let extracted_x0x = temp_dir.join("extracted-x0x");
                     if let Err(e) =
-                        extract_binary_from_archive(&archive_path, &extracted_x0x, x0x_name)
+                        extract_binary_from_archive(&archive_path, &extracted_x0x, cli_file_name())
                     {
                         warn!("Failed to extract companion x0x binary: {e}");
                     } else {
@@ -4783,5 +4793,30 @@ mod tests {
         );
         std::fs::write(&missing, b"cli").unwrap();
         assert!(missing_sibling_cli_message(&missing).is_none());
+    }
+
+    #[test]
+    fn sibling_cli_path_uses_the_real_directory_of_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("opt");
+        std::fs::create_dir_all(&real).unwrap();
+        let daemon = real.join(daemon_file_name());
+        std::fs::write(&daemon, b"d").unwrap();
+        #[cfg(unix)]
+        let target = {
+            use std::os::unix::fs::symlink;
+            let link_dir = root.path().join("link");
+            std::fs::create_dir_all(&link_dir).unwrap();
+            let link = link_dir.join(daemon_file_name());
+            symlink(&daemon, &link).unwrap();
+            link
+        };
+        #[cfg(not(unix))]
+        let target = daemon;
+        let sibling = sibling_cli_path(&target).expect("sibling");
+        let expected = std::fs::canonicalize(&real)
+            .expect("real dir")
+            .join(cli_file_name());
+        assert_eq!(sibling, expected);
     }
 }

@@ -303,7 +303,7 @@ enum Commands {
         /// Skip the staging delay. Eligibility, holds and transaction checks still apply.
         #[arg(long, requires = "apply", conflicts_with = "check")]
         now: bool,
-        /// With --check, fetch the current manifest regardless of version.
+        /// With --check, fetch the release and report an update only when it is newer.
         /// Does not bypass the daemon's apply checks.
         #[arg(long)]
         force: bool,

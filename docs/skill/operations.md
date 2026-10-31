@@ -30,7 +30,8 @@ daemon is the only binary writer. Apply fails if no daemon is available.
 Bare `x0x upgrade` and `--force` alone do not install. `--check` reads GitHub
 and calls local `/health` on the daemon selected by `--api` or `--name`.
 It takes precedence over `--apply`. It does not install.
-`--check --force` fetches the current manifest regardless of version;
+`--check --force` fetches the current release and reports an update only when
+that release is newer than this CLI.
 `--force` cannot bypass daemon apply checks. `x0xd --check-updates` only
 reports; it installs neither binaries nor SKILL.md.
 
