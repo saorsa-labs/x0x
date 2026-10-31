@@ -134,7 +134,7 @@ fn roster_root_from_entries(
 /// (`Active` + `Banned` members). Sufficient to answer "what did the signed
 /// roster say at revision N" and to re-derive the commit's `roster_root`
 /// independently — without having witnessed every prior commit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct RosterMemberSnapshot {
     pub role: GroupRole,
     pub state: GroupMemberState,
@@ -150,9 +150,87 @@ pub struct RosterMemberSnapshot {
     /// the bytes (a byte-bearing seat and its digest-only form hash
     /// identically), so the signed `roster_root` never moves; legacy
     /// payloads decode without the field and peers that do not know the
-    /// field ignore it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// field ignore it. Encoded as base64(bincode) — the same bytes
+    /// [`crate::groups::owner_cert::certificate_digest_hex`] hashes — so
+    /// one seat adds about 10 KB to a link instead of the about 26 KB the
+    /// default JSON array-of-numbers form costs. Only the newest
+    /// [`RETAINED_CERT_CARRY_LINKS`] retained commits keep the bytes.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "certificate_b64"
+    )]
     pub certificate: Option<crate::identity::AgentCertificate>,
+}
+
+/// #1023: equality is COMMITTED-STATE equality — exactly the fields the
+/// signed roster root covers. The `certificate` carriage bytes are
+/// deliberately excluded: a byte-bearing snapshot and its digest-only
+/// form describe the same committed seat (they hash identically), so
+/// whole-snapshot comparisons — the self-rebind link check
+/// (`cert_rebind::is_self_rebind_link`), the bootstrap serving guard —
+/// stay stable across nodes and versions that hold different byte sets.
+/// The bytes themselves stay digest-anchored at every install site.
+impl PartialEq for RosterMemberSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.role == other.role
+            && self.state == other.state
+            && self.treekem_key_package_hash == other.treekem_key_package_hash
+            && self.certificate_digest == other.certificate_digest
+    }
+}
+
+/// #1023: how many NEWEST retained commits keep their snapshot
+/// certificate bytes; older links age to digest-only when a new commit
+/// is retained. A node that adopted or
+/// hydrated while a link still carried bytes keeps what it SEATED, so
+/// nothing seated is lost — the bound only stops the persisted and served
+/// log from copying every seat's certificate into every commit forever.
+pub const RETAINED_CERT_CARRY_LINKS: usize = 8;
+
+/// #1023: serde codec for the snapshot `certificate` field — one base64
+/// string of the bincode form (the exact bytes the committed digest
+/// hashes), never a JSON array of numbers.
+mod certificate_b64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(
+        certificate: &Option<crate::identity::AgentCertificate>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use base64::Engine as _;
+        match certificate {
+            None => serializer.serialize_none(),
+            Some(cert) => serializer.serialize_str(
+                &base64::engine::general_purpose::STANDARD
+                    .encode(bincode::serialize(cert).map_err(serde::ser::Error::custom)?),
+            ),
+        }
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<crate::identity::AgentCertificate>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use base64::Engine as _;
+        let Some(encoded) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        // Annotate the target: without it, inference binds the call to the
+        // function's Option<AgentCertificate> return and bincode reads the
+        // certificate's first byte as an Option tag.
+        let certificate: crate::identity::AgentCertificate =
+            bincode::deserialize(&bytes).map_err(serde::de::Error::custom)?;
+        Ok(Some(certificate))
+    }
 }
 
 /// Project the roster-root-relevant view of a roster: `Active` + `Banned`
@@ -2419,6 +2497,51 @@ mod tests {
                 .expect("the byte-bearing payload decodes");
         assert_eq!(round_trip, with_bytes);
         assert_eq!(roster_root_of_projection(&round_trip), root_with_bytes);
+    }
+
+    /// #1023: snapshot equality is COMMITTED-STATE equality — the fields
+    /// the signed root covers. Carriage bytes never participate: a mixed
+    /// roster (one byte-bearing seat, one digest-only) equals its
+    /// byte-stripped form, because the self-rebind link check and the
+    /// bootstrap serving guard compare whole snapshots across nodes and
+    /// versions that hold different byte sets. A different committed
+    /// digest stays a different state.
+    #[test]
+    fn snapshot_equality_ignores_carriage_bytes() {
+        let user = crate::identity::UserKeypair::generate().unwrap();
+        let agent = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&user, &agent).unwrap();
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let other_hex = hex_id(0x99);
+
+        let mut members = BTreeMap::new();
+        let mut m = make_member(&agent_hex, GroupRole::Member);
+        m.certificate = Some(cert.clone());
+        m.certificate_digest = Some(crate::groups::owner_cert::certificate_digest_hex(&cert));
+        members.insert(agent_hex.clone(), m);
+        members.insert(
+            other_hex.clone(),
+            make_member(&other_hex, GroupRole::Member),
+        );
+
+        let with_bytes = roster_projection(&members);
+        assert!(with_bytes[&agent_hex].certificate.is_some());
+        assert!(with_bytes[&other_hex].certificate.is_none());
+        let mut stripped = with_bytes.clone();
+        for snapshot in stripped.values_mut() {
+            snapshot.certificate = None;
+        }
+        assert_eq!(
+            with_bytes, stripped,
+            "a mixed roster equals its byte-stripped committed form"
+        );
+
+        let mut re_keyed = stripped;
+        re_keyed.get_mut(&agent_hex).unwrap().certificate_digest = Some("ff".repeat(32));
+        assert_ne!(
+            with_bytes, re_keyed,
+            "a different committed digest is a different state"
+        );
     }
 
     // ── ADR-0064 Decision §2 (slice 4): alternate-chain ancestor walk ──

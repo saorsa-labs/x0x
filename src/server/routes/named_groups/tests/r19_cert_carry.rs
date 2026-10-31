@@ -2581,6 +2581,17 @@ async fn chain_carried_certificates_let_promoted_admin_seal_while_creator_offlin
         seat_has_bytes(&s.admin, &s.group_id, &s.creator_hex).await,
         "the creator's seat holds bytes after the adoption"
     );
+    let seated = {
+        let groups = s.admin.named_groups.read().await;
+        groups
+            .get(&s.group_id)
+            .and_then(|info| info.committed_certificate(&s.creator_hex).cloned())
+    };
+    assert_eq!(
+        seated.as_ref(),
+        Some(&s.creator_cert),
+        "the adopted bytes are exactly the creator's certificate"
+    );
     assert!(
         s.admin
             .agent

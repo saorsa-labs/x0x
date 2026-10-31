@@ -1905,11 +1905,11 @@ impl GroupInfo {
                 };
                 if owner_cert::certificate_digest_hex(cert) == committed {
                     from_commit_log.push((agent_hex.clone(), cert.clone()));
+                    break;
                 }
-                // One snapshot per member: the newest retained entry that
-                // carries bytes for this seat decides (a match installs, a
-                // mismatch is evidence for a different admission).
-                break;
+                // A byte-bearing snapshot for a DIFFERENT admission is not
+                // a verdict on this seat: keep looking — an older link may
+                // still carry the bytes this seat committed to.
             }
         }
         let mut hydrated = 0usize;
@@ -2022,6 +2022,21 @@ impl GroupInfo {
                 cap = COMMIT_LOG_CAP,
                 "commit_log exceeded cap; dropped oldest retained commits",
             );
+        }
+        // #1023: only the newest RETAINED_CERT_CARRY_LINKS keep their
+        // snapshot certificate bytes; older links age to digest-only. A
+        // node that adopted or hydrated while a link carried bytes keeps
+        // what it seated, so the bound loses nothing seated — it stops the
+        // persisted and served log from copying every seat's certificate
+        // into every commit forever.
+        let carry_from = self
+            .commit_log
+            .len()
+            .saturating_sub(state_commit::RETAINED_CERT_CARRY_LINKS);
+        for retained in &mut self.commit_log[..carry_from] {
+            for snapshot in retained.roster.values_mut() {
+                snapshot.certificate = None;
+            }
         }
     }
 
@@ -3951,6 +3966,38 @@ mod tests {
         assert_eq!(
             state_commit::compute_roster_root(&strict.members_v2),
             state_commit::roster_root_of_projection(&mismatched)
+        );
+    }
+
+    /// #1023 (review repro): a byte-bearing retained commit must round-trip
+    /// through the persisted JSON store form.
+    #[test]
+    fn groupinfo_json_round_trips_byte_bearing_retained_commit() {
+        let (_user, agent_kp, cert) = certified_fixture();
+        let creator_hex = hex::encode([1u8; 32]);
+        let mut info = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        info.set_member_certificate(&creator_hex, cert.clone())
+            .expect("creator cert installs");
+        let commit = state_commit::GroupStateCommit::sign(
+            "aabb".repeat(8),
+            1,
+            None,
+            state_commit::compute_roster_root(&info.members_v2),
+            "ph".to_string(),
+            "mh".to_string(),
+            None,
+            false,
+            0,
+            &agent_kp,
+        )
+        .expect("fixture commit signs");
+        info.retain_commit(&commit);
+        let json = serde_json::to_string(&info).expect("GroupInfo encodes");
+        let back: GroupInfo = serde_json::from_str(&json).expect("GroupInfo decodes");
+        assert_eq!(
+            back.commit_log[0].roster[&creator_hex].certificate.as_ref(),
+            Some(&cert),
+            "the retained snapshot certificate survives the store round-trip"
         );
     }
 
