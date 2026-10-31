@@ -8,13 +8,6 @@ use tokio::sync::Semaphore;
 
 const CHUNK_BYTES: usize = x0x::files::DEFAULT_CHUNK_SIZE;
 
-/// #1664 review round 2: the bound on concurrently detached refusal
-/// sends for this lane. A revoked device can fetch for many group ids and
-/// each refusal send costs its transport budget; a full set keeps main's
-/// silent drop (the device is revoked either way).
-static CONTROL_BLOB_REFUSAL_SEND_SLOTS: std::sync::LazyLock<
-    std::sync::Arc<tokio::sync::Semaphore>,
-> = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)));
 // The existing TreeKEM recovery-control cache has an 8 MiB encoded-JSON
 // budget. Use that explicit control-plane precedent for one exact blob and
 // one peer's outstanding bytes. Larger (even otherwise legal) historical
@@ -1007,10 +1000,13 @@ pub(in crate::server) async fn handle_control_blob_message(
     // machine revocation denies that device only (the portable agent
     // keeps its Active seat) and a binding revocation retires the pairing
     // only, so neither the roster nor the reference header checks can
-    // refuse either. The ask that earns an answer is a Fetch; a machine-
-    // or binding-revoked fetcher gets the #1657 typed refusal naming the
-    // revocation. Every other arm keeps main's silent drop, as the agent
-    // revocation and a pending revocation resync always did.
+    // refuse either. A machine- or binding-revoked device gets NO answer:
+    // the blob is withheld and NO frame is sent (Engineer ruling,
+    // 31 Oct 2026 03:40 GMT — `treekem_catchup_refusal_v1`, bit 13, stays
+    // TreeKEM catch-up only, as shipped in v0.48.1; a typed control-blob
+    // refusal would be a separate wire question). The agent revocation
+    // and a pending revocation resync keep main's silent drop, as they
+    // always did.
     let (machine_refused, binding_refused) = {
         let revocation_set = state.agent.revocation_set();
         let guard = revocation_set.read().await;
@@ -1077,59 +1073,20 @@ pub(in crate::server) async fn handle_control_blob_message(
             if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
                 return;
             }
-            // #1664: the header check above bound the authenticated sender
-            // to `reference.recipient`, so this refusal answers exactly the
-            // device that asked. It is the catch-up lane's typed refusal
-            // reused as the ANSWER (bit 13 gates its send, the per-
-            // (machine, group) dedupe bounds it): a receiver records it
-            // through the existing catch-up-refusal handling — nothing
-            // control-blob-specific is implied on the receive side; whether
-            // that widening of the frame's meaning stands is FOR ENGINEER
-            // in the PR body.
-            if let Some(reason) = if machine_refused {
-                tracing::warn!(
+            // #1664: bit 13 (`treekem_catchup_refusal_v1`) is NOT widened
+            // to this lane (Engineer ruling, 31 Oct 2026 03:40 GMT) — it
+            // stays TreeKEM catch-up only, as shipped in v0.48.1. A
+            // machine- or binding-revoked fetcher gets the silent drop:
+            // the blob is withheld and no frame is sent. The header check
+            // above bound the authenticated sender to
+            // `reference.recipient`, so the withheld blob is exactly the
+            // one the revoked device asked for.
+            if machine_refused || binding_refused {
+                tracing::debug!(
                     group_id = %LogHexId::group(&reference.group_id),
                     requester = %LogHexId::agent(&sender_hex),
-                    "rejecting control-blob fetch from a machine-revoked requester"
+                    "control-blob fetch from a revoked requester dropped: no answer"
                 );
-                Some(TreeKemCatchupRefusalReason::MachineRevoked)
-            } else if binding_refused {
-                tracing::warn!(
-                    group_id = %LogHexId::group(&reference.group_id),
-                    requester = %LogHexId::agent(&sender_hex),
-                    "rejecting control-blob fetch from a requester with a revoked agent-machine binding"
-                );
-                Some(TreeKemCatchupRefusalReason::BindingRevoked)
-            } else {
-                None
-            } {
-                // The refusal send waits up to its transport budget for the
-                // refused device, so it never runs on this listener (a
-                // revoked fetcher storm must not stall other control
-                // traffic — the same detachment the catch-up lane serves
-                // under, #1357/#1616), and the detached refusal sends are
-                // themselves bounded: a full slot set keeps main's silent
-                // drop (the device is revoked either way).
-                let Ok(refusal_permit) =
-                    CONTROL_BLOB_REFUSAL_SEND_SLOTS.clone().try_acquire_owned()
-                else {
-                    return;
-                };
-                let refusal_state = Arc::clone(state);
-                let refusal_sender = *sender;
-                let refusal_machine = *machine_id;
-                let refusal_group = reference.group_id.clone();
-                state.spawn_detached(async move {
-                    let _refusal_permit = refusal_permit;
-                    super::send_treekem_catchup_refusal(
-                        &refusal_state,
-                        &refusal_sender,
-                        &refusal_machine,
-                        &refusal_group,
-                        reason,
-                    )
-                    .await;
-                });
                 return;
             }
             if reference.kind == ControlBlobKind::JoinResult {

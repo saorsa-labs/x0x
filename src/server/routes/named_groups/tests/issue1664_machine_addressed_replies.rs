@@ -4,11 +4,13 @@
 //! device that still holds the portable agent key can occupy (discovery
 //! cache, capability binding, newest connection). The catch-up page and
 //! the control-blob chunk now ride the machine-addressed raw-QUIC reply
-//! lane (the #1657 refusal lane's delivery shape for data), the
-//! JoinResult chunk exchange pins the same machine, and the control-blob
-//! serve refuses a machine- or binding-revoked fetcher with the #1657
-//! typed refusal. The seat-cert lane rides the gossip topic, which
-//! carries no authenticated requester machine: its ladder is the
+//! lane (the #1657 refusal lane's delivery shape for data), the JoinResult
+//! chunk exchange pins the same machine, and a machine- or
+//! binding-revoked control-blob fetcher gets NO answer — the blob is
+//! withheld and no frame is sent: bit 13 (`treekem_catchup_refusal_v1`)
+//! stays TreeKEM catch-up only, as shipped in v0.48.1 (Engineer ruling,
+//! 31 Oct 2026 03:40 GMT). The seat-cert lane rides the gossip topic,
+//! which carries no authenticated requester machine: its ladder is the
 //! envelope's agent only — a binding-based refusal there would be a
 //! revoked device's denial-of-service lever over the clean device of the
 //! same agent (review round 1). Every addressing decision is recorded at
@@ -29,8 +31,9 @@ fn machine_reply_egress(state: &AppState) -> Vec<(MachineId, Vec<u8>)> {
         .clone()
 }
 
-/// Every typed refusal the serve decided on, decoded (the #1657 decision
-/// recorder, reused by the control-blob and seat-cert refusals).
+/// Every typed refusal the serve decided on, decoded (the #1657 catch-up
+/// decision recorder; the control-blob test observes it EMPTY — bit 13
+/// never answers a control-blob fetch).
 fn recorded_refusals(state: &AppState) -> Vec<TreeKemCatchupRefusal> {
     state
         .named_group_test_recorders
@@ -397,29 +400,22 @@ async fn eventually<T>(budget: Duration, mut f: impl FnMut() -> Option<T>) -> Op
     }
 }
 
-/// Poll until at least `count` refusal decisions are recorded (the
-/// control-blob and seat-cert refusal sends run detached, so the decision
-/// lands shortly after the handler returns).
-async fn await_refusal_count(state: &AppState, count: usize) -> Vec<TreeKemCatchupRefusal> {
-    eventually(Duration::from_secs(5), || {
-        (recorded_refusals(state).len() >= count).then(|| recorded_refusals(state))
-    })
-    .await
-    .expect("the refusal decision is recorded")
-}
-
 /// The control-blob handler: a fetch from a machine- or binding-revoked
-/// device is answered with the #1657 typed refusal and no chunk, while a
-/// clean device's chunk is addressed to ITS machine at the send seam.
+/// device gets NO answer — the blob is withheld and no frame is sent (the
+/// bit-13 widening was ruled out 31 Oct 2026 03:40 GMT; the revoked
+/// fetchers below DO advertise bit 13, so the test stays red if the frame
+/// ever widens back to this lane) — while a clean device's chunk is
+/// addressed to ITS machine at the send seam.
 #[tokio::test]
-async fn control_blob_answers_go_to_the_requesting_machine_and_revoked_fetchers_are_refused(
+async fn control_blob_answers_go_to_the_requesting_machine_and_revoked_fetchers_get_no_frame(
 ) -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
     let group_id = "66".repeat(32);
     let fetcher = AgentKeypair::generate()?;
 
-    // A machine-revoked fetcher: the typed refusal names the machine, and
-    // no chunk egress exists for it.
+    // A machine-revoked fetcher: no answer at all — no chunk, and no
+    // refusal frame on any lane (the fetcher advertises bit 13, so a
+    // re-widening of the catch-up refusal to this lane would show here).
     let fetch = staged_fetch(
         &state,
         &group_id,
@@ -436,21 +432,17 @@ async fn control_blob_answers_go_to_the_requesting_machine_and_revoked_fetchers_
         fetch,
     )
     .await;
-    let refusals = await_refusal_count(&state, 1).await;
-    assert_eq!(refusals.len(), 1, "the machine-revoked fetcher is refused");
-    assert_eq!(
-        refusals[0].reason,
-        TreeKemCatchupRefusalReason::MachineRevoked
-    );
-    assert_eq!(refusals[0].group_id(), group_id);
     assert!(
         machine_reply_egress(&state).is_empty(),
         "no chunk is addressed to the machine-revoked fetcher"
     );
+    assert!(
+        recorded_refusals(&state).is_empty(),
+        "no refusal decision exists for the machine-revoked fetcher: the blob is withheld and no frame is sent"
+    );
 
     // A binding-revoked fetcher (a different fetcher agent, so the first
-    // refusal's dedupe does not answer for it): the refusal names the
-    // binding.
+    // fetch's reference cannot answer for it): the same silent drop.
     let other = AgentKeypair::generate()?;
     let fetch = staged_fetch(&state, &group_id, &hex::encode(other.agent_id().as_bytes()))?;
     let owner = x0x::identity::UserKeypair::generate()?;
@@ -465,19 +457,16 @@ async fn control_blob_answers_go_to_the_requesting_machine_and_revoked_fetchers_
         fetch,
     )
     .await;
-    let refusals = await_refusal_count(&state, 2).await;
-    assert_eq!(refusals.len(), 2, "the binding-revoked fetcher is refused");
-    assert_eq!(
-        refusals[1].reason,
-        TreeKemCatchupRefusalReason::BindingRevoked
-    );
     assert!(
         machine_reply_egress(&state).is_empty(),
         "no chunk is addressed to the binding-revoked pairing"
     );
+    assert!(
+        recorded_refusals(&state).is_empty(),
+        "no refusal decision exists for the binding-revoked pairing either"
+    );
 
-    // The agent-revoked gate keeps main's silent drop: no refusal, no
-    // chunk.
+    // The agent-revoked gate keeps main's silent drop: no chunk.
     let third = AgentKeypair::generate()?;
     let fetch = staged_fetch(&state, &group_id, &hex::encode(third.agent_id().as_bytes()))?;
     revoke_agent(&state, &third).await;
@@ -489,12 +478,11 @@ async fn control_blob_answers_go_to_the_requesting_machine_and_revoked_fetchers_
         fetch,
     )
     .await;
-    assert_eq!(
-        recorded_refusals(&state).len(),
-        2,
-        "the agent-revocation refusal stays a silent drop"
+    assert!(
+        machine_reply_egress(&state).is_empty(),
+        "the agent-revocation gate keeps the silent drop"
     );
-    assert!(machine_reply_egress(&state).is_empty());
+    assert!(recorded_refusals(&state).is_empty());
 
     // CONTROL: a clean fetcher's chunk is served and addressed to ITS
     // machine. The serve runs on a detached task, so poll the seam.
@@ -529,6 +517,21 @@ async fn control_blob_answers_go_to_the_requesting_machine_and_revoked_fetchers_
         chunk,
         control_blob::ControlBlobMessage::Chunk { .. }
     ));
+    // After the clean serve's polling window, the revoked fetchers still
+    // hold no frame: re-check the refusal surfaces so a detached refusal
+    // send (the shape the widening used) cannot land after the asserts
+    // above and slip through.
+    assert!(
+        recorded_refusals(&state).is_empty(),
+        "no refusal frame was ever decided for a control-blob fetch (bit 13 stays TreeKEM catch-up only)"
+    );
+    assert!(state
+        .agent
+        .treekem_refusal_replies
+        .egress
+        .lock()
+        .expect("refusal egress recorder")
+        .is_empty());
     Ok(())
 }
 
