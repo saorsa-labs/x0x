@@ -9,15 +9,29 @@ pub(super) fn hash(path: &Path) -> io::Result<[u8; 32]> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() || file.metadata()?.len() > 200 * 1024 * 1024 {
+    if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_BINARY_BYTES {
         return Err(invalid("not a bounded regular binary"));
     }
+    hash_bounded(&mut file, MAX_BINARY_BYTES)
+}
+
+const MAX_BINARY_BYTES: u64 = 200 * 1024 * 1024;
+
+/// Hashes at most `limit` bytes. A source that grows past `limit` while it
+/// is read is refused, not hashed in part.
+fn hash_bounded(source: impl Read, limit: u64) -> io::Result<[u8; 32]> {
+    let mut source = source.take(limit.saturating_add(1));
     let mut hash = Sha256::new();
     let mut buf = [0; 65536];
+    let mut total: u64 = 0;
     loop {
-        let n = file.read(&mut buf)?;
+        let n = source.read(&mut buf)?;
         if n == 0 {
             break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > limit {
+            return Err(invalid("binary grew past the read limit"));
         }
         hash.update(&buf[..n]);
     }
@@ -106,5 +120,15 @@ mod tests {
         assert!(restore_one(&plan).is_err());
         assert_eq!(std::fs::read(target).unwrap(), b"candidate");
         assert_eq!(std::fs::read(backup).unwrap(), b"damaged");
+    }
+
+    #[test]
+    fn hash_refuses_a_source_longer_than_the_limit() {
+        let bytes = [7u8; 100];
+        assert_eq!(
+            hash_bounded(&bytes[..], 100).unwrap(),
+            <[u8; 32]>::from(Sha256::digest(bytes))
+        );
+        assert!(hash_bounded(&bytes[..], 99).is_err());
     }
 }
