@@ -61,10 +61,26 @@ The current installer:
    On a first install without `gpg`, the manifest check is made by the
    downloaded binary itself, so it does not bind the release to a key you
    already trust.
-4. Installs both `x0x` and `x0xd` into `~/.local/bin`
-5. Ensures the shared x0x data directory exists
-6. Starts the daemon
-7. Optionally configures autostart (`--autostart`)
+4. Resolves the release tag (through the GitHub API, as the updater does)
+   and refuses a signed manifest whose `version` or `channel` does not match
+   it — stable channel, non-prerelease version, same version — so an older,
+   genuinely-signed release cannot be served for a newer tag. An unreachable
+   or rate-limited API stops the install rather than skipping this check.
+5. Installs both `x0x` and `x0xd` into `~/.local/bin`
+6. Ensures the shared x0x data directory exists
+7. Starts the daemon
+8. Optionally configures autostart (`--autostart`)
+
+## Release-key rotation
+
+The ML-DSA key the verifier checks is compiled into the `x0x` binary. If the
+Saorsa Labs release key is ever rotated, an already-installed `x0x` keeps the
+old key, refuses every manifest signed with the new one, and the installer
+stops — the updater has the same limit, by design. To install across a
+rotation, remove the installed CLI first (`~/.local/bin/x0x` on Linux/macOS,
+`%LOCALAPPDATA%\x0x\bin\x0x.exe` on Windows) so the downloaded binary does
+the check, and have `gpg` present so the pinned GPG signature stays the
+independent anchor.
 
 ## Installed locations
 

@@ -11,7 +11,8 @@
 #   1. Detects platform (Linux/macOS, x64/arm64)
 #   2. Downloads latest release from GitHub
 #   3. Verifies its SHA-256, the sidecar checksum and the signed ML-DSA-65
-#      release manifest (through the release's own x0x binary, the updater's
+#      release manifest, whose version and channel must match the resolved
+#      release tag (through the release's own x0x binary, the updater's
 #      verify path), and, when gpg is present, its GPG signature against the
 #      pinned Saorsa Labs release key (fails closed on any mismatch)
 #   4. Stops any running x0xd instance
@@ -165,6 +166,25 @@ fetch "$URL/$ARCHIVE.sha256" "$TMP/$ARCHIVE.sha256"
 fetch "$URL/release-manifest.json" "$TMP/release-manifest.json"
 fetch "$URL/release-manifest.json.sig" "$TMP/release-manifest.json.sig"
 
+# Resolve the tag behind releases/latest through the same API the updater
+# uses. The manifest's version and channel must match it below (the updater's
+# rule, src/upgrade/monitor.rs), so an older, genuinely-signed release
+# replayed for a newer tag is refused.
+fetch "https://api.github.com/repos/$REPO/releases/latest" "$TMP/latest.json"
+TAG=$(tr -d '\n\r' < "$TMP/latest.json" | awk '{
+    if (match($0, /"tag_name": *"[^"]*"/)) {
+        tag = substr($0, RSTART, RLENGTH)
+        sub(/"tag_name": *"/, "", tag)
+        sub(/"$/, "", tag)
+        print tag
+        exit
+    }
+}')
+case "$TAG" in
+    v?*) ;;
+    *) verify_failed "could not resolve the latest release tag" ;;
+esac
+
 # SHA-256: always required.
 if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL_SHA=$(sha256sum "$TMP/$ARCHIVE" | awk '{print $1}')
@@ -232,18 +252,57 @@ fi
 # The updater refuses a release whose manifest signature fails against the
 # release key compiled into the binary (src/upgrade/signature.rs). This
 # installer reuses that verify path instead of adding a second
-# implementation. Two checks, in this order:
+# implementation. Three checks, in this order:
 #
-#   1. Bind: the manifest's archive_sha256 entry for this platform must name
-#      the downloaded archive, before any of the archive's bytes run.
-#   2. Sign: the release's own x0x runs the inert --verify-release-manifest
+#   1. Bind: the manifest's version and channel must match the resolved
+#      release tag (stable, non-prerelease, same version — the rule
+#      src/upgrade/monitor.rs applies), before any of the archive's bytes
+#      run. A genuinely-signed manifest for a different release is refused.
+#   2. Bind: the manifest's archive_sha256 entry for this platform must name
+#      the downloaded archive, still before extraction.
+#   3. Sign: the release's own x0x runs the inert --verify-release-manifest
 #      probe (src/upgrade/verification_probe.rs), which reads only the two
 #      files before any initialization.
 #
-# A missing manifest or signature, a bad signature, or a hash that differs
-# from the manifest entry stops the install before anything is installed.
+# A missing manifest or signature, a bad signature, a version or channel
+# that differs from the release tag, or a hash that differs from the
+# manifest entry stops the install before anything is installed.
 # Releases before v0.46.5 predate the probe in the release binaries and no
 # longer install.
+
+# The version and channel come off the raw bytes with the same whitespace-
+# tolerant match the hash binding below uses; the probe has not run yet.
+MANIFEST_VERSION=$(tr -d '\n\r' < "$TMP/release-manifest.json" | awk '{
+    if (match($0, /"version": *"[^"]*"/)) {
+        field = substr($0, RSTART, RLENGTH)
+        sub(/"version": *"/, "", field)
+        sub(/"$/, "", field)
+        print field
+        exit
+    }
+}')
+MANIFEST_CHANNEL=$(tr -d '\n\r' < "$TMP/release-manifest.json" | awk '{
+    if (match($0, /"channel": *"[^"]*"/)) {
+        field = substr($0, RSTART, RLENGTH)
+        sub(/"channel": *"/, "", field)
+        sub(/"$/, "", field)
+        print field
+        exit
+    }
+}')
+if [ -z "$MANIFEST_VERSION" ] || [ -z "$MANIFEST_CHANNEL" ]; then
+    verify_failed "manifest is missing its version or channel field"
+fi
+case "$MANIFEST_VERSION" in
+    *-*) verify_failed "manifest version $MANIFEST_VERSION is a prerelease; the updater refuses non-stable manifests" ;;
+esac
+if [ "$MANIFEST_CHANNEL" != "stable" ]; then
+    verify_failed "manifest channel '$MANIFEST_CHANNEL' is not stable; the updater refuses non-stable manifests"
+fi
+if [ "$MANIFEST_VERSION" != "${TAG#v}" ]; then
+    verify_failed "manifest version $MANIFEST_VERSION ($MANIFEST_CHANNEL) does not match the resolved release tag $TAG"
+fi
+echo "  Manifest version $MANIFEST_VERSION ($MANIFEST_CHANNEL) matches $TAG"
 
 # The manifest's archive_sha256 must name this archive before extraction:
 # this refuses a swapped archive without executing any of its content. The
@@ -309,8 +368,8 @@ if [ -z "$VERIFY_BIN" ]; then
     PROBE_RC=0
     "$VERIFY_BIN" --verify-release-manifest "$MANIFEST" "$MANIFEST_SIG" || PROBE_RC=$?
 fi
-if [ "$PROBE_RC" -eq 126 ]; then
-    echo "Error: cannot execute $VERIFY_BIN to verify the release (noexec mount?); nothing installed." >&2
+if [ "$PROBE_RC" -eq 126 ] || [ "$PROBE_RC" -eq 127 ]; then
+    echo "Error: cannot execute $VERIFY_BIN to verify the release (noexec mount or bad interpreter?); nothing installed." >&2
     exit 1
 fi
 if [ "$PROBE_RC" -ne 0 ]; then

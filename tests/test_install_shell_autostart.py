@@ -60,13 +60,16 @@ printf '%s\\n' "$*" >> "$XOX_CALLS"
 
 def signed_release_files(archive: Path) -> dict[str, bytes]:
     """Downloads a fake release serves per URL: the archive, its sidecar
-    checksum, and a manifest whose linux-x64-gnu entry carries the archive's
-    real SHA-256 (the signature is inert here; see fake_x0x)."""
+    checksum, a manifest whose linux-x64-gnu entry carries the archive's
+    real SHA-256 (the signature is inert here; see fake_x0x), and the
+    GitHub API reply naming the tag the manifest's version and channel
+    match (the installer refuses a manifest that names another release)."""
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     manifest = json.dumps(
         {
             "schema_version": 1,
-            "version": "0.0.0-test",
+            "version": "0.48.0",
+            "channel": "stable",
             "timestamp": 0,
             "assets": [
                 {
@@ -86,13 +89,15 @@ def signed_release_files(archive: Path) -> dict[str, bytes]:
         f"{archive.name}.sha256": f"{digest}  {archive.name}\n".encode(),
         "release-manifest.json": manifest,
         "release-manifest.json.sig": b"inert signature bytes",
+        "latest.json": b'{"tag_name": "v0.48.0"}\n',
     }
 
 
 def fake_curl_script(files_dir: Path, archive: Path, health_result: str) -> str:
     """One fake curl serving every release URL with the right bytes: the
-    archive, its sidecar checksum, and the signed-manifest pair from
-    files_dir. `health_result` is the fallback for API GETs."""
+    archive, its sidecar checksum, the signed-manifest pair and the
+    latest-release API reply from files_dir. `health_result` is the
+    fallback for API GETs."""
     return f"""#!/usr/bin/env sh
 OUT=""
 URL=""
@@ -105,6 +110,7 @@ while [ $# -gt 0 ]; do
 done
 if [ -n "$OUT" ]; then
     case "$URL" in
+        *api.github.com/repos/*releases/latest) cat "{files_dir / 'latest.json'}" > "$OUT"; exit 0 ;;
         *release-manifest.json.sig) cat "{files_dir / 'release-manifest.json.sig'}" > "$OUT"; exit 0 ;;
         *release-manifest.json) cat "{files_dir / 'release-manifest.json'}" > "$OUT"; exit 0 ;;
         *.sha256) cat "{files_dir / (archive.name + '.sha256')}" > "$OUT"; exit 0 ;;

@@ -9,8 +9,15 @@ src/upgrade/signature.rs itself (the pattern of tests/upgrade_test_signing.rs),
 with a compile-time test key replacing the production key through the
 debug-only upgrade-test-signing seam.
 
+The gate also pins the release identity the updater enforces
+(src/upgrade/monitor.rs validate_manifest_at): the manifest must be a stable,
+non-prerelease version equal to the tag GitHub resolves for "latest" with its
+leading "v" stripped. An older, genuinely-signed release served for a newer
+tag is refused before any archive byte executes.
+
 The fixture build is cached under the repo target directory, keyed by a hash
 of its sources; the cached throwaway signing key never leaves that directory.
+A fixture build failure fails the suite; only a missing cargo skips it.
 """
 
 from __future__ import annotations
@@ -38,7 +45,11 @@ TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
 TEST_PATH_SUFFIX = "/usr/bin:/bin"
 
 FIXTURE_MAIN_RS = """#[allow(dead_code)]
-#[path = "{signature_rs}"]
+// Copied next to this file by the test harness: the real
+// src/upgrade/signature.rs, so the fixture verifies with the production
+// code. A relative path keeps the cache digest independent of the worktree
+// the test runs from.
+#[path = "signature.rs"]
 mod signature;
 
 use saorsa_pqc::api::sig::ml_dsa_65;
@@ -136,11 +147,18 @@ def write_executable(path: Path, contents: str) -> None:
 def build_fixture() -> tuple[Path, Path]:
     """Compile the manifest signing/verification fixture and return
     (binary, secret-key) paths. Cached per source hash. The key pair is a
-    throwaway fixture key, never a release key."""
+    throwaway fixture key, never a release key. The cache key contains no
+    absolute paths, so every checkout of this repo shares one cache root —
+    and therefore one binary/key pairing, which lives in the shared cargo
+    target directory."""
     sources = {
         "Cargo.toml": FIXTURE_CARGO_TOML,
         "build.rs": FIXTURE_BUILD_RS,
-        "main.rs": FIXTURE_MAIN_RS.replace("{signature_rs}", str(SIGNATURE_RS)),
+        "main.rs": FIXTURE_MAIN_RS,
+        # Copied into the fixture, not #[path]-referenced: the bytes hash the
+        # same either way, but a path reference would make the digest (and so
+        # the cache root) differ per checkout.
+        "signature.rs": SIGNATURE_RS.read_text(encoding="utf-8"),
     }
     digest = hashlib.sha256(
         b"\0".join(
@@ -160,7 +178,7 @@ def build_fixture() -> tuple[Path, Path]:
 
     root.mkdir(parents=True, exist_ok=True)
     for name, contents in sources.items():
-        target = root / "src" / name if name == "main.rs" else root / name
+        target = root / "src" / name if name in ("main.rs", "signature.rs") else root / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(contents, encoding="utf-8")
     # Reuse the reviewed dependency graph; resolution changes stay local.
@@ -208,26 +226,35 @@ def build_fixture() -> tuple[Path, Path]:
 
 
 def manifest_bytes(
-    archive_sha256: str, target: str = TARGET_TRIPLE, compact: bool = False
+    archive_sha256: str,
+    target: str = TARGET_TRIPLE,
+    compact: bool = False,
+    version: str = "0.48.0",
+    channel: str | None = "stable",
 ) -> bytes:
     """A release manifest in the published layout (pretty-printed, or
-    compact-serialized to prove the parser does not depend on whitespace)."""
-    return json.dumps(
+    compact-serialized to prove the parser does not depend on whitespace).
+    `version`/`channel` drive the release-tag gate; `channel=None` omits the
+    field entirely (the missing-channel refusal)."""
+    fields: dict[str, object] = {
+        "schema_version": 1,
+        "version": version,
+    }
+    if channel is not None:
+        fields["channel"] = channel
+    fields["timestamp"] = 0
+    fields["assets"] = [
         {
-            "schema_version": 1,
-            "version": "0.0.0-test",
-            "timestamp": 0,
-            "assets": [
-                {
-                    "target": target,
-                    "archive_url": "http://fixtures/archive",
-                    "archive_sha256": archive_sha256,
-                    "signature_url": "http://fixtures/archive.sig",
-                }
-            ],
-            "skill_url": "",
-            "skill_sha256": "0" * 64,
-        },
+            "target": target,
+            "archive_url": "http://fixtures/archive",
+            "archive_sha256": archive_sha256,
+            "signature_url": "http://fixtures/archive.sig",
+        }
+    ]
+    fields["skill_url"] = ""
+    fields["skill_sha256"] = "0" * 64
+    return json.dumps(
+        fields,
         indent=None if compact else 2,
         separators=(",", ":") if compact else None,
     ).encode()
@@ -238,13 +265,9 @@ class InstallManifestVerifyTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         if shutil.which("cargo") is None:
             raise unittest.SkipTest("cargo is required to build the manifest fixture")
-        try:
-            cls.verifier, cls.secret = build_fixture()
-        except AssertionError as error:
-            # A cold cargo cache (no saorsa-pqc in the registry cache) cannot
-            # build the fixture offline; the gate still runs wherever the
-            # workspace has been built once.
-            raise unittest.SkipTest(f"manifest fixture unavailable: {error}") from error
+        # A failed fixture build must fail the suite, not skip it: the gate
+        # these tests pin is only as good as its evidence.
+        cls.verifier, cls.secret = build_fixture()
 
     def sign(self, manifest: bytes, tmp: Path, secret: Path | None = None) -> bytes:
         scratch = tmp / "signing"
@@ -287,6 +310,7 @@ class InstallManifestVerifyTests(unittest.TestCase):
         missing: frozenset[str] = frozenset(),
         secret: Path | None = None,
         archive_probe_delegates: bool = True,
+        tag: str | None = "v0.48.0",
     ) -> tuple[int, str, Path, Path]:
         """Build a fake release, serve it through a fake curl, run install.sh
         in a scratch HOME, and return (rc, combined output, probe-calls log,
@@ -299,9 +323,10 @@ class InstallManifestVerifyTests(unittest.TestCase):
         files the fake downloads fail on. `secret` signs with another
         throwaway key (the wrong-key case). With
         `archive_probe_delegates=False` the release's x0x accepts any
-        manifest, isolating the installed-verifier preference. The manifest
-        signature is real: signed by the fixture key the verifier binary
-        embeds."""
+        manifest, isolating the installed-verifier preference. `tag` is the
+        tag_name the fake GitHub API serves for the "latest" release (None:
+        the API answers nothing). The manifest signature is real: signed by
+        the fixture key the verifier binary embeds."""
         fake_bin = tmp / "fake-bin"
         archive_dir = tmp / "archive" / f"x0x-{PLATFORM}"
         home = tmp / "home"
@@ -372,6 +397,15 @@ class InstallManifestVerifyTests(unittest.TestCase):
             f"        *{name}) cat \"{files_dir / name}\" > \"$OUT\"; exit 0 ;;\n"
             for name in sorted(served)
         )
+        # The GitHub "latest release" API call the tag gate resolves. Unlike
+        # the served release files it is neither signed nor in `served`: the
+        # gate must treat it only as a hint to check the manifest against.
+        tag_serve = (
+            "        *api.github.com/repos/*/releases/latest*) "
+            f"printf '%s\\n' '{{\"tag_name\": \"{tag}\"}}' > \"$OUT\"; exit 0 ;;\n"
+            if tag is not None
+            else ""
+        )
         write_executable(
             fake_bin / "curl",
             f"""#!/usr/bin/env sh
@@ -386,7 +420,7 @@ while [ $# -gt 0 ]; do
 done
 if [ -n "$OUT" ]; then
     case "$URL" in
-{missing_patterns}{serve}        *) exit 1 ;;
+{tag_serve}{missing_patterns}{serve}        *) exit 1 ;;
     esac
 fi
 case "$URL" in
@@ -451,6 +485,9 @@ esac
                 self.assertEqual(rc, 0, output)
                 self.assertIn("Archive hash matches the manifest entry", output)
                 self.assertIn("ML-DSA-65 manifest signature verified", output)
+                self.assertIn(
+                    "Manifest version 0.48.0 (stable) matches v0.48.0", output
+                )
                 self.assertIn("Installed:", output)
                 self.assertTrue((bin_dir / "x0x").exists())
                 self.assertEqual(
@@ -464,14 +501,58 @@ esac
     # that the probe itself rejected the manifest.
     REFUSAL_CASES = [
         # Signed over the real hash, but different bytes are served: the
-        # tampering is caught by the signature, after the binding passes.
+        # tamper targets a field no installer check pre-reads (timestamp), so
+        # only the signature can catch it, after the binding passes.
         (
             "tampered_manifest",
             manifest_bytes,
-            lambda digest: manifest_bytes(digest).replace(b"0.0.0-test", b"9.9.9-evil"),
+            lambda digest: manifest_bytes(digest).replace(
+                b'"timestamp": 0', b'"timestamp": 1'
+            ),
             (),
             ("failed ML-DSA signature verification",),
             True,
+            None,
+        ),
+        # Genuinely signed by the fixture key, but not the release the API
+        # resolved: the version/channel gate (the updater's
+        # validate_manifest_at rule) refuses before any archive byte runs.
+        # An older, validly-signed release replayed for a newer tag must not
+        # install, so none of these use a wrong key.
+        (
+            "manifest_version_differs_from_tag",
+            lambda digest: manifest_bytes(digest, version="0.47.0"),
+            None,
+            (),
+            ("does not match the resolved release tag",),
+            False,
+            None,
+        ),
+        (
+            "manifest_is_prerelease",
+            lambda digest: manifest_bytes(digest, version="0.48.0-rc1"),
+            None,
+            (),
+            ("is a prerelease",),
+            False,
+            None,
+        ),
+        (
+            "manifest_channel_not_stable",
+            lambda digest: manifest_bytes(digest, channel="prerelease"),
+            None,
+            (),
+            ("is not stable",),
+            False,
+            None,
+        ),
+        (
+            "manifest_missing_channel",
+            lambda digest: manifest_bytes(digest, channel=None),
+            None,
+            (),
+            ("missing its version or channel",),
+            False,
             None,
         ),
         # Manifest bytes unchanged, but signed by an unrelated key: the
@@ -580,6 +661,35 @@ esac
                 probe_calls.read_text(encoding="utf-8").splitlines(),
                 ["installed-probe"],
             )
+
+    def test_installed_verifier_launch_failure_stops_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "home" / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            # An installed x0x whose shebang names a nonexistent interpreter:
+            # invoking it fails to launch (126 under /bin/sh on macOS, 127
+            # under bash/dash), the same class of failure as the noexec
+            # case. The installer must refuse instead of falling back to the
+            # release's own binary — and the release's x0x must not run.
+            write_executable(
+                bin_dir / "x0x",
+                "#!/nonexistent-x0x-interp\nexit 0\n",
+            )
+            installed_x0x = (bin_dir / "x0x").read_bytes()
+            rc, output, probe_calls, bin_dir = self.run_installer(tmp, manifest_bytes)
+            self.assertNotEqual(rc, 0, output)
+            self.assertIn("cannot execute", output)
+            self.assertNotIn("Installed:", output)
+            # Nothing was installed over the broken-but-present binary.
+            self.assertEqual((bin_dir / "x0x").read_bytes(), installed_x0x)
+            self.assertFalse((bin_dir / "x0xd").exists())
+            calls = (
+                probe_calls.read_text(encoding="utf-8").splitlines()
+                if probe_calls.exists()
+                else []
+            )
+            self.assertEqual(calls, [])
 
     def test_pre_probe_installed_binary_falls_back_to_the_release_binary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
