@@ -5,7 +5,8 @@
 //! expects GREEN (the ADR 0109 behaviour) and keeps its `_red_` name, as
 //! #1256 and #1357 did. A red arm that fails with the observation its
 //! `CAUSE_*` names (the base's behaviour) is RED; any other failure is
-//! INFRA. Controls are GREEN before and after S3.
+//! INFRA. Controls are GREEN before and after S3, except the H-S3-d4 and
+//! H-S3-d7 controls: they call S3 routes, so they are GREEN with S3 only.
 //!
 //! The ADR 0109 H-S3-a row (#818, skewed clocks) is `case_818`'s red
 //! baseline, `w3h_818_red_baseline_ownerless_skewed_joiner_is_quarantined`.

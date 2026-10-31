@@ -1,5 +1,8 @@
 //! ADR 0109 §10 row H-S3-d4 (route refusals, D156, D170; #1572). Control,
-//! expected GREEN with S3 (on `main` before S3, the route returns 404).
+//! expected GREEN with S3. A build that does not refuse is RED with
+//! `CAUSE`: each wrong answer is a 404 (no re-seat route) or a 2xx (the
+//! route went ahead). On `main` before S3 the recovery read is missing
+//! too, so `issued` fails and the receipt is INFRA, not RED.
 //!
 //! Nodes are H-S3-d3's: O holds the owner's USER key; A, M1 and J hold
 //! owner-issued agent certificates only (see `owner_axis`). O promotes A
@@ -29,7 +32,8 @@ use super::*;
 
 const LABELS: &[&str] = &["O", "A", "M1", "B", "J", "E"];
 const FINAL: &str = "a_refuses_each_reseat_call_with_its_typed_reason_and_signs_nothing";
-const CAUSE: &str = "the re-seat route is missing (404 on every call), as on main before S3";
+const CAUSE: &str = "a refusal is missing: each wrong answer is a 404 (no re-seat route) or a \
+                     2xx (the route went ahead)";
 
 /// A's issued-invite records for `group` (secrets, sorted).
 async fn invites(sim: &Sim, group: &str) -> Result<Vec<String>> {
@@ -154,7 +158,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     ];
     let mut observed = Vec::new();
     let mut all_typed = true;
-    let mut all_404 = true;
+    let mut unrefused = true;
     let mut quiet = true;
     let mut answered = 0_usize;
     for step in 0..5 {
@@ -187,7 +191,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         let unchanged =
             before_hash == after_hash && before_invites == after_invites && reseats.is_empty();
         all_typed &= typed;
-        all_404 &= got_code == 404;
+        unrefused &= typed || got_code == 404 || (200..300).contains(&got_code);
         quiet &= unchanged;
         observed.push(format!(
             "{what}: {got_code} {got:?} (want {want_code} {want:?}); hash moved {}, invites \
@@ -209,7 +213,12 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     receipt.note(observed.join("; "));
     let passed = all_typed && quiet;
     if !passed {
-        receipt.cause(CAUSE, Some(observed.join("; ")), all_404, at(sim));
+        receipt.cause(
+            CAUSE,
+            Some(observed.join("; ")),
+            unrefused && !all_typed,
+            at(sim),
+        );
     }
     receipt.finish(FINAL, passed, at(sim));
     Ok(())
