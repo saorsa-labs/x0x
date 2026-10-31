@@ -4970,7 +4970,8 @@ fn prioritize_discovery_addresses(addresses: &mut [std::net::SocketAddr]) {
 ///   committed to (ADR-0038 freshness; inline below), except that an
 ///   equal-`announced_at` anonymous beat never drops it (#1643): a
 ///   one-second timestamp proves no order and no blob fetch can repair the
-///   anonymous digest.
+///   anonymous digest. Narrow exception to ADR 0115 §1's equal-or-newer
+///   replace rule, recorded for approval in PR #1741.
 /// - **last_seen** reflects the most recent receive: it is set from the
 ///   incoming record (matching the pre-merge replace semantics). In production
 ///   `incoming.last_seen` is the current receive time, so it only moves forward;
@@ -5051,12 +5052,16 @@ async fn upsert_discovered_agent(
                 //  - same digest, or a legacy digest-less record → keep
                 //    (monotone; never demote on missing information);
                 //  - an EQUAL-`announced_at` beat committing to the
-                //    ANONYMOUS digest → keep as well (#1643): a
-                //    one-second timestamp proves no order, consent is
-                //    recorded before the disclosure is built so the beat
-                //    can only predate the disclosure, and no blob ever
-                //    fetches for the anonymous digest — a drop has no
-                //    repair path, it only deletes the disclosed evidence.
+                //    ANONYMOUS digest → keep as well (#1643, a narrow
+                //    exception to ADR 0115 §1's equal-or-newer replace
+                //    rule): a one-second timestamp proves no order, so the
+                //    beat may be a pre-consent build racing the
+                //    disclosure, and no blob ever fetches for the
+                //    anonymous digest — a drop has no repair path, it
+                //    only deletes the disclosed evidence. An explicit
+                //    post-consent anonymous announce in the same second
+                //    is unordered the same way; the next strictly fresher
+                //    anonymous beat withdraws the certificate.
                 if let Some(cert) = incoming.agent_certificate.take() {
                     // E2d: only a CHANGE lands — every announce re-carries
                     // the same certificate, and replaying an identical one
@@ -7651,6 +7656,32 @@ async fn run_strict_capability_refresh(
             () = tokio::time::sleep_until(deadline) => return,
             () = shutdown_token.cancelled() => return,
         }
+    }
+}
+
+/// Restores `user_identity_consented` to its pre-grant value when a
+/// disclosure fails or is dropped, unless [`ConsentGrant::keep`] disarmed
+/// it (#1643): the `POST /announce` handler's future can be dropped
+/// mid-publish (a client disconnect aborts it), and consent must not stay
+/// on when nothing was published.
+struct ConsentGrant {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    prior: bool,
+}
+
+impl ConsentGrant {
+    fn new(flag: std::sync::Arc<std::sync::atomic::AtomicBool>, prior: bool) -> Self {
+        Self { flag, prior }
+    }
+
+    /// The publish finished: consent stands.
+    fn keep(self) {}
+}
+
+impl Drop for ConsentGrant {
+    fn drop(&mut self) {
+        self.flag
+            .store(self.prior, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -13422,8 +13453,8 @@ impl Agent {
     /// By default, announcements include agent + machine identity only.
     /// Human identity disclosure is opt-in and requires explicit consent.
     /// Consent is recorded before the announcement is built and restored
-    /// when the publish fails, so every announcement raced by this call
-    /// carries the disclosure (#1643).
+    /// when the publish fails or is cancelled, so every announcement raced
+    /// by this call carries the disclosure (#1643).
     ///
     /// # Arguments
     ///
@@ -13455,26 +13486,32 @@ impl Agent {
         // it can delete the just-disclosed certificate (see
         // `upsert_discovered_agent`). Storing first means every
         // announcement built after this line carries the certificate. The
-        // restore below keeps the old guarantee for the steady state: once
-        // a failed disclosure returns, consent is back to its prior value,
-        // so heartbeats do not keep including the identity. (One beat
-        // published during the in-flight attempt may still carry it — the
-        // human did consent, and the next anonymous beat in a later second
-        // withdraws it again.)
+        // grant restores the prior value when the publish fails AND when
+        // the caller drops the disclosure mid-publish (a client disconnect
+        // aborts the `POST /announce` handler), so heartbeats do not keep
+        // including the identity. (One beat published during the in-flight
+        // attempt may still carry it — the human did consent, and the next
+        // anonymous beat in a later second withdraws it again.)
         let consented_before = self
             .user_identity_consented
             .load(std::sync::atomic::Ordering::Acquire);
-        let granted_consent = include_user_identity && human_consent;
-        if granted_consent {
+        let grant = if include_user_identity && human_consent {
             self.user_identity_consented
                 .store(true, std::sync::atomic::Ordering::Release);
-        }
+            Some(ConsentGrant::new(
+                std::sync::Arc::clone(&self.user_identity_consented),
+                consented_before,
+            ))
+        } else {
+            None
+        };
         let result = self
             .publish_identity_announcement(include_user_identity, human_consent)
             .await;
-        if granted_consent && result.is_err() {
-            self.user_identity_consented
-                .store(consented_before, std::sync::atomic::Ordering::Release);
+        if result.is_ok() {
+            if let Some(grant) = grant {
+                grant.keep();
+            }
         }
         result
     }
@@ -35217,6 +35254,64 @@ mod tests {
         );
     }
 
+    /// #1643 review r2: the consent grant restores the prior value when a
+    /// disclosure is dropped without finishing — a client disconnect aborts
+    /// the `POST /announce` handler mid-publish — and stands when kept.
+    #[test]
+    fn consent_grant_restores_on_drop_and_keeps_on_success() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            // What announce_identity does: store, then arm the grant.
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            let _grant = ConsentGrant::new(std::sync::Arc::clone(&flag), false);
+            assert!(
+                flag.load(std::sync::atomic::Ordering::Acquire),
+                "consent is on while the grant is armed"
+            );
+        }
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::Acquire),
+            "a dropped grant restores the prior value"
+        );
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        {
+            ConsentGrant::new(std::sync::Arc::clone(&flag), true).keep();
+        }
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "a kept grant leaves consent on"
+        );
+    }
+
+    /// #1643 review r2: cancelling the disclosure task (the disconnect
+    /// case) must leave consent off, whatever point it reached.
+    #[tokio::test]
+    async fn cancelled_disclosure_does_not_leave_consent_recorded() {
+        // No network config: the gossip runtime is absent, so the publish
+        // errors or is cancelled before anything leaves this process.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = std::sync::Arc::new(
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key_path(dir.path().join("agent.key"))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let clone = std::sync::Arc::clone(&agent);
+        let task = tokio::spawn(async move { clone.announce_identity(true, true).await });
+        // Let the task run, then cancel it before awaiting the result.
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert!(
+            !agent
+                .user_identity_consented
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a cancelled disclosure must not leave consent on"
+        );
+    }
+
     /// #650 regression: a loopback-bound daemon's gossip advert must agree
     /// with its agent card (#638/#649). ant-quic 0.27.50 honours the
     /// explicit P2P bind, so every other interface address (LAN,
@@ -41154,15 +41249,16 @@ async fn upsert_discovered_agent_preserves_known_user_id() {
     );
 }
 
-/// #1643: `announced_at` has one-second precision, so a disclosure and a
-/// pre-consent anonymous beat built in the same second are unordered on the
-/// wire. When gossip delivers the anonymous beat after the disclosure, the
-/// merge must not read its anonymous digest as a re-key: consent is recorded
-/// before the disclosure is built, so an anonymous beat can only predate the
-/// disclosure, and no blob ever fetches for the anonymous digest, so dropping
-/// the certificate has no repair path. Until the next cert-carrying beat,
-/// owner trust on the peer would read false and the owner-trust gates (remote
-/// GUI show, owner-only routes) would refuse.
+/// #1643: `announced_at` has one-second precision, so a disclosure and an
+/// anonymous beat built in the same second are unordered on the wire —
+/// the beat may be a pre-consent build racing the disclosure (an explicit
+/// post-consent anonymous announce in the same second is unordered the
+/// same way). When gossip delivers the anonymous beat after the
+/// disclosure, the merge must not read its anonymous digest as a re-key:
+/// no blob ever fetches for the anonymous digest, so dropping the
+/// certificate has no repair path. Until the next cert-carrying beat,
+/// owner trust on the peer would read false and the owner-trust gates
+/// (remote GUI show, owner-only routes) would refuse.
 #[tokio::test]
 async fn same_second_anonymous_announce_keeps_a_disclosed_certificate() {
     let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
@@ -41206,11 +41302,6 @@ async fn same_second_anonymous_announce_keeps_a_disclosed_certificate() {
 
     // A same-second beat committing to a DIFFERENT non-anonymous digest (a
     // re-key inside one second) still drops: the blob fetch can repair it.
-    let mut rekeyed = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
-    rekeyed.agent_id = id;
-    rekeyed.agent_certificate = Some(cert.clone());
-    rekeyed.cert_digest = Some(digest);
-    upsert_discovered_agent(&cache, &cert_events, rekeyed).await;
     let mut same_second_rekey = discovered_agent_fixture(9, 1_000, &["1.2.3.4:5483"], None);
     same_second_rekey.agent_id = id;
     same_second_rekey.cert_digest = Some([0xAA; 32]);
