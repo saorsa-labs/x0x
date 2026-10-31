@@ -1654,12 +1654,16 @@ pub(super) struct NamedGroupTestRecorders {
     /// re-arm ask, its stopped-loop row dropped, its page fence
     /// closed. Tests read the reason here.
     pub(super) catchup_page_departed: StdMutex<Vec<(String, String, &'static str)>>,
-    /// #1685 round 8 (Engineer ruling, 31 Oct 2026): every stopped peer
-    /// the re-arm pre-check DEFERRED — the agent keeps its Active seat
-    /// but a machine or binding revocation, or a pending revocation
-    /// resync, holds pages from the machine its stopped page came from
-    /// — as `(group, peer, reason)`: no ask, the stopped-loop row stays
-    /// armed, the page fence stays open. Tests read the reason here.
+    /// #1685 rounds 8 and 9 (Engineer rulings, 31 Oct 2026): every
+    /// stopped peer the re-arm pre-check DEFERRED — the agent keeps its
+    /// Active seat but a machine or binding revocation, or a pending
+    /// revocation resync, holds pages from the machine its stopped page
+    /// came from — as `(group, peer, reason)`. `revocation_hold_ask_sent`
+    /// (round 9): the deferred ask went to the agent anyway and the
+    /// stopped-loop row stays armed until a valid page closes it;
+    /// `revocation_hold`: nothing was sent (a pending resync holds the
+    /// apply gate, or every send failed) and the row stays armed. The
+    /// page fence stays open in both shapes. Tests read the reason here.
     pub(super) catchup_page_deferred: StdMutex<Vec<(String, String, &'static str)>>,
 }
 

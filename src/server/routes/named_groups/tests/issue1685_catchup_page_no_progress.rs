@@ -30,6 +30,19 @@
 //! pending revocation resync, DEFERS it — row armed, nothing sent,
 //! fence open — so a live member's self-leave fence can never close
 //! over a known gap.
+//!
+//! Round 9 (Engineer ruling, 31 Oct 2026): a machine or binding hold
+//! still SENDS the deferred ask. The ask goes to the agent on the
+//! existing page request (bounded sends) and the stopped row STAYS
+//! ARMED — an answer from the held machine dies at the page gate, so a
+//! row cleared on that send would strand the peer for ever — and only
+//! a valid page from a clean machine closes the row and the fence
+//! (`revocation_hold_ask_sent`; the reason stays `revocation_hold`
+//! when every send failed). Only the resync defer stays silent. A
+//! non-truncated reply also no longer skips its own sender in the
+//! detached re-arm pass: the handler asks nothing for it (a terminal
+//! page clears the row, a key-package reply keeps it), so the replay
+//! it triggers may re-arm that sender when it moves the cursor.
 
 use super::*;
 use x0x::identity::AgentKeypair;
@@ -1685,17 +1698,21 @@ async fn a_next_page_ask_that_cannot_leave_keeps_the_stopped_row_armed() -> Resu
 }
 
 /// #1685 round 8 (Engineer ruling, 31 Oct 2026; Claude review at
-/// e756545d, blocker 2, reversing round 5 finding 3): a machine
-/// revocation (ADR 0110 D70) denies the DEVICE only — the agent's
-/// portable seat stays Active, and the agent can serve the terminal
-/// page from another machine. The re-arm pre-check must DEFER the
-/// stopped peer — row armed, nothing sent, fence OPEN — never retire
-/// it. At e756545d the pre-check keyed the retire on the whole shared
-/// gate, so this shape closed a still-Active member's fence without
-/// its terminal page.
+/// e756545d, blocker 2, reversing round 5 finding 3), in its round 9
+/// shape (Engineer ruling, 31 Oct 2026): a machine revocation
+/// (ADR 0110 D70) denies the DEVICE only — the agent's portable seat
+/// stays Active, and the agent can serve the terminal page from
+/// another machine. The re-arm pre-check DEFERS the stopped peer —
+/// never retires it — and round 9 sends the deferred ask to the agent
+/// anyway (the existing page request, bounded sends) while the row
+/// STAYS ARMED: an answer from the held machine dies at the page gate,
+/// so a row cleared on that send would strand the peer; the fence
+/// closes only on the agent's own valid answer from a clean machine.
+/// An indefinite silent defer (the round 8 shape) kept a live member's
+/// fence open and blocked the group's rekeys until a restart.
 #[tokio::test]
-async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_not_retired() -> Result<()>
-{
+async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_with_the_ask_sent_not_retired(
+) -> Result<()> {
     let group_id = "12".repeat(32);
     let device = x0x::identity::MachineKeypair::generate()?;
     let pair = issue1685_chain_pair(&group_id, Some(device)).await?;
@@ -1742,7 +1759,8 @@ async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_not_reti
 
     // 3. The helper's terminal page delivers E1; the replay applies E2
     //    and the cursor moves. The detached re-arm runs the pre-check
-    //    against the recorded machine and DEFERS the responder.
+    //    against the recorded machine, DEFERS the responder — and round
+    //    9 sends the deferred ask anyway.
     handle_treekem_catchup_response(
         &state,
         &helper,
@@ -1765,13 +1783,13 @@ async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_not_reti
     );
     assert_eq!(
         page_requests(&state),
-        0,
-        "#1685 round 8: nothing is sent while the peer is held — the ask would be \
-         answered from the revoked machine and dropped at the page gate"
+        1,
+        "#1685 round 9: the deferred ask went to the agent — the agent keeps its \
+         Active seat, so it may answer from a clean machine (round 8 sent nothing)"
     );
     assert!(
         rearm_requests(&state).is_empty(),
-        "no typed re-arm was recorded"
+        "no typed re-arm was recorded: a hold defers, it is not a replay re-arm"
     );
     assert!(
         state
@@ -1789,13 +1807,17 @@ async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_not_reti
             .lock()
             .expect("deferred recorder")
             .clone(),
-        vec![(group_id.clone(), responder_hex.clone(), "revocation_hold")],
-        "the defer is typed and names the held peer"
+        vec![(
+            group_id.clone(),
+            responder_hex.clone(),
+            "revocation_hold_ask_sent"
+        )],
+        "the defer is typed and names the held peer, with the ask-sent reason"
     );
     assert!(
         self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
-        "#1685 round 8: the held member's page fence stays OPEN — a still-Active \
-         member's fence never closes without its terminal page"
+        "#1685 round 9: the held member's page fence stays OPEN — the ask is not an \
+         answer; only the agent's valid page from a clean machine closes it"
     );
     assert_eq!(
         treekem_page_stopped_peers(&fence_ids),
@@ -1805,15 +1827,18 @@ async fn a_machine_revoked_stopped_peer_with_an_active_seat_is_deferred_not_reti
     Ok(())
 }
 
-/// #1685 round 8 (Engineer ruling, 31 Oct 2026): a binding revocation
-/// (#1622, ADR 0110 D70) retires the `(agent, machine)` PAIRING only —
-/// the agent's portable seat stays Active and the device stays clean,
-/// so the agent can serve the terminal page from another machine. The
-/// pre-check must DEFER the stopped peer, exactly as for a machine
-/// revocation; at e756545d the shared-gate key retired it instead.
+/// #1685 round 8 (Engineer ruling, 31 Oct 2026), in its round 9 shape
+/// (Engineer ruling, 31 Oct 2026): a binding revocation (#1622,
+/// ADR 0110 D70) retires the `(agent, machine)` PAIRING only — the
+/// agent's portable seat stays Active and the device stays clean, so
+/// the agent can serve the terminal page from another machine. The
+/// pre-check DEFERS the stopped peer, exactly as for a machine
+/// revocation, and round 9 sends the deferred ask anyway with the row
+/// left armed; the fence closes only on the agent's valid answer from
+/// a machine the pairing still covers.
 #[tokio::test]
-async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_not_retired() -> Result<()>
-{
+async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_with_its_ask_sent_not_retired(
+) -> Result<()> {
     let group_id = "17".repeat(32);
     let device = x0x::identity::MachineKeypair::generate()?;
     let pair = issue1685_chain_pair(&group_id, Some(device)).await?;
@@ -1854,7 +1879,8 @@ async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_not_reti
     retire_binding(&state, &owner, &responder, &responder_machine).await;
 
     // 3. The helper's terminal page delivers E1; the replay applies E2
-    //    and the cursor moves. The pre-check DEFERS the responder.
+    //    and the cursor moves. The pre-check DEFERS the responder — and
+    //    round 9 sends the deferred ask anyway.
     handle_treekem_catchup_response(
         &state,
         &helper,
@@ -1877,8 +1903,10 @@ async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_not_reti
     );
     assert_eq!(
         page_requests(&state),
-        0,
-        "nothing is sent while the pairing is held"
+        1,
+        "#1685 round 9: the deferred ask went to the agent — the pairing holds the \
+         one device only, and the agent may answer from another (round 8 sent \
+         nothing)"
     );
     assert!(
         state
@@ -1891,7 +1919,21 @@ async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_not_reti
     );
     assert!(
         rearm_requests(&state).is_empty(),
-        "no typed re-arm was recorded"
+        "no typed re-arm was recorded: a hold defers, it is not a replay re-arm"
+    );
+    assert_eq!(
+        state
+            .named_group_test_recorders
+            .catchup_page_deferred
+            .lock()
+            .expect("deferred recorder")
+            .clone(),
+        vec![(
+            group_id.clone(),
+            responder_hex.clone(),
+            "revocation_hold_ask_sent"
+        )],
+        "the defer is typed and names the held peer, with the ask-sent reason"
     );
     assert!(
         self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
@@ -1910,7 +1952,10 @@ async fn a_binding_revoked_stopped_peer_with_an_active_seat_is_deferred_not_reti
 /// e756545d, blocker 1): a pending revocation resync (#1116) is a
 /// global, temporary hold, not a departure. If the re-arm pass runs
 /// while the resync pends, every stopped peer of the group must be
-/// DEFERRED — row armed, nothing sent, fence OPEN. At e756545d the
+/// DEFERRED — row armed, nothing sent, fence OPEN. Round 9 keeps this
+/// the one SILENT defer: the resync holds the apply gate itself, so an
+/// answer could not apply anyway, while a machine or binding hold now
+/// sends its ask. At e756545d the
 /// pre-check retired every stopped peer on the resync bit and closed
 /// their fences for good, so `rekey_treekem_self_leaves` could seal a
 /// self-leave rekey over a known gap. The cursor-moving replay that
@@ -1988,6 +2033,18 @@ async fn a_resync_pending_stopped_peer_with_an_active_seat_is_deferred_not_retir
         page_requests(&state),
         0,
         "nothing is sent while the resync pends"
+    );
+    assert_eq!(
+        state
+            .named_group_test_recorders
+            .catchup_page_deferred
+            .lock()
+            .expect("deferred recorder")
+            .clone(),
+        vec![(group_id.clone(), responder_hex.clone(), "revocation_hold")],
+        "round 9: the resync defer stays SILENT — the reason keeps it distinguishable \
+         from the machine/binding hold, which now records \
+         \"revocation_hold_ask_sent\" for its sent ask"
     );
     assert!(
         state
@@ -2419,5 +2476,824 @@ async fn an_accepted_replay_that_moves_no_cursor_does_not_rearm() -> Result<()> 
     );
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     assert_eq!(page_requests(&state), 0, "no delayed re-arm arrived either");
+    Ok(())
+}
+
+/// #1685 round 9 (Engineer ruling, 31 Oct 2026), the whole arc of the
+/// ruling: a stopped peer a machine revocation holds is ASKED anyway,
+/// and the agent's answer from a CLEAN machine — never the held
+/// device — closes its row and its page fence. The responder stops on
+/// the gapped E2 paged from its own device; the device is then revoked
+/// (D70: the agent's Active seat stays). The cursor-moving replay's
+/// detached re-arm sends the deferred ask and KEEPS the row armed, so
+/// the ask cannot strand the peer; the agent then serves its terminal
+/// page from a clean machine and the normal terminal path ends the
+/// stream. Before round 9 the defer sent nothing, so a quiet group's
+/// fence stayed open until a restart.
+#[tokio::test]
+async fn a_machine_held_stopped_peer_is_asked_anyway_and_its_clean_answer_closes_row_and_fence(
+) -> Result<()> {
+    let group_id = "1a".repeat(32);
+    let device = x0x::identity::MachineKeypair::generate()?;
+    let pair = issue1685_chain_pair(&group_id, Some(device)).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        responder_device,
+        helper,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder stops on E2, paged from its own device: its row
+    //    arms and its page fence opens.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the responder's stopped row is armed"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "CONTROL: the responder's page fence is open"
+    );
+
+    // 2. D70: revoke the device only. The agent's seat stays Active, so
+    //    the peer is held, not departed.
+    revoke_machine(&state, responder_device.as_ref().expect("device")).await;
+
+    // 3. The helper's terminal page delivers E1; the replay applies E2
+    //    and the cursor moves. The detached re-arm holds the responder
+    //    on the machine half — so round 9 SENDS the deferred ask to the
+    //    agent and keeps the row armed.
+    handle_treekem_catchup_response(
+        &state,
+        &helper,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    assert!(
+        eventually(|| {
+            !state
+                .named_group_test_recorders
+                .catchup_page_deferred
+                .lock()
+                .expect("deferred recorder")
+                .is_empty()
+        })
+        .await,
+        "the detached re-arm deferred the machine-held responder with its ask sent"
+    );
+    assert_eq!(
+        state
+            .named_group_test_recorders
+            .catchup_page_deferred
+            .lock()
+            .expect("deferred recorder")
+            .clone(),
+        vec![(
+            group_id.clone(),
+            responder_hex.clone(),
+            "revocation_hold_ask_sent"
+        )],
+        "the defer is typed with the ask-sent reason: a send left for the agent"
+    );
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "#1685 round 9: the deferred ask went out — the agent keeps its Active \
+         seat and may answer from a clean machine (round 8 sent nothing)"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_departed
+            .lock()
+            .expect("departed recorder")
+            .is_empty(),
+        "the held responder is NOT retired"
+    );
+    assert!(
+        rearm_requests(&state).is_empty(),
+        "no typed re-arm: a hold defers, it is not a replay re-arm"
+    );
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "#1685 round 9: the row STAYS ARMED after the ask — an answer from the \
+         held machine dies at the page gate, so a row cleared on this send would \
+         strand the peer for ever"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "#1685 round 9: the ask is not an answer — the fence stays open until a \
+         valid page closes it"
+    );
+
+    // 4. The agent answers from a CLEAN machine. The page gate passes
+    //    (the clean machine is not the revoked device), so the terminal
+    //    page closes the row and the fence through the normal path.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![]),
+    )
+    .await;
+    assert!(
+        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        "the clean machine's terminal page cleared the armed row"
+    );
+    assert!(
+        !self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "the clean machine's terminal page closed the peer fence"
+    );
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "the terminal page asks for nothing: the stream ended on it"
+    );
+    Ok(())
+}
+
+/// #1685 round 9 pin (green before and after): the held machine cannot
+/// answer its own deferred ask. A page from a machine the revocation
+/// set holds dies at the page gate — before any fence, stopped-row or
+/// recorder work — so the refused answer changes nothing: the row
+/// stays armed for the next cursor-moving replay, the fence stays
+/// open, no new ask fires and nothing new is recorded. The ask went to
+/// the AGENT; only its clean machine may answer (the arc test above).
+#[tokio::test]
+async fn a_page_from_the_held_machine_itself_dies_at_the_page_gate() -> Result<()> {
+    let group_id = "1b".repeat(32);
+    let device = x0x::identity::MachineKeypair::generate()?;
+    let pair = issue1685_chain_pair(&group_id, Some(device)).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        responder_device,
+        helper,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder stops on E2, paged from its own device.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the responder's stopped row is armed"
+    );
+
+    // 2. D70: revoke the device only; the agent's seat stays Active.
+    revoke_machine(&state, responder_device.as_ref().expect("device")).await;
+
+    // 3. The helper's terminal page delivers E1; the replay applies E2,
+    //    the cursor moves and the detached re-arm sends the deferred
+    //    ask (row armed, fence open — the arc test's first half).
+    handle_treekem_catchup_response(
+        &state,
+        &helper,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    assert!(
+        eventually(|| {
+            !state
+                .named_group_test_recorders
+                .catchup_page_deferred
+                .lock()
+                .expect("deferred recorder")
+                .is_empty()
+        })
+        .await,
+        "the detached re-arm deferred the machine-held responder with its ask sent"
+    );
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "CONTROL: the deferred ask went out"
+    );
+
+    // 4. The HELD machine answers anyway. The page gate refuses it
+    //    before any fence or row work, so nothing reacts.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        terminal_page(&group_id, vec![]),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "the gate-refused page left the armed row exactly as it was"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "the gate-refused page left the fence exactly as it was"
+    );
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "#1685 round 9 pin: a page from the held machine dies at the page gate — \
+         no new ask, no fence work, no reaction at all"
+    );
+    assert!(
+        rearm_requests(&state).is_empty(),
+        "no typed re-arm was recorded"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_departed
+            .lock()
+            .expect("departed recorder")
+            .is_empty(),
+        "no retirement: the refused page is not a departure"
+    );
+    assert_eq!(
+        state
+            .named_group_test_recorders
+            .catchup_page_deferred
+            .lock()
+            .expect("deferred recorder")
+            .clone(),
+        vec![(
+            group_id.clone(),
+            responder_hex.clone(),
+            "revocation_hold_ask_sent"
+        )],
+        "exactly one defer record: the gate recorded nothing for the refused page"
+    );
+    Ok(())
+}
+
+/// #1685 round 9, the key-package reply fix: the page handler passes
+/// the re-arm skip only for a TRUNCATED page's sender. The responder
+/// stops on the gapped E2; E1 — the link E2 waits for — is queued
+/// behind it; the responder then answers with a NON-truncated
+/// key-package-shaped reply (every event of the page a
+/// `MemberJoined`). The handler asks its sender nothing (the
+/// key-package branch keeps every fence and row), but the reply's
+/// replay applies E1 then E2 and MOVES the cursor, so the re-arm pass
+/// must be allowed to re-arm the SENDER itself. Before round 9 the
+/// unconditional skip left the armed sender unasked — its row stayed
+/// armed with nobody left to clear or retire it. The `MemberJoined`
+/// itself need not apply; only its shape and its replay matter.
+#[tokio::test]
+async fn a_key_package_reply_no_longer_skips_the_armed_sender_in_the_rearm_pass() -> Result<()> {
+    let group_id = "1c".repeat(32);
+    let pair = issue1685_chain_pair(&group_id, None).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder stops on E2: the event queues behind its missing
+    //    predecessor and the row arms.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the responder's stopped row is armed"
+    );
+
+    // 2. E1 — the link E2 waits for — queues behind it, authenticated
+    //    as its own leaver: the sender the replay applies it as (the
+    //    page path's relay rule resolved the same author for E2).
+    let leaver1 = match &event1 {
+        NamedGroupMetadataEvent::MemberRemoved { agent_id, .. } => {
+            parse_agent_id_hex(agent_id).expect("the chain pair's E1 leaver agent id")
+        }
+        _ => unreachable!("the chain pair's E1 is a MemberRemoved"),
+    };
+    state
+        .treekem_pending_events
+        .write()
+        .await
+        .get_mut(&group_id)
+        .expect("the stopped page queued E2")
+        .push_back(PendingTreeKemMetadataEvent {
+            event: event1,
+            sender: leaver1,
+            queued_at: std::time::Instant::now(),
+        });
+
+    // 3. The responder answers with a NON-truncated key-package-shaped
+    //    reply: one MemberJoined for an unrelated stranger (an invite
+    //    no roster ever issued), so every event of the page is a
+    //    MemberJoined and the handler takes the key-package branch.
+    let stranger = AgentKeypair::generate()?;
+    let key_package_reply = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: group_id.clone(),
+        events: vec![NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.clone(),
+            stable_group_id: None,
+            member_agent_id: hex::encode(stranger.agent_id().as_bytes()),
+            member_public_key_b64: base64::engine::general_purpose::STANDARD
+                .encode(stranger.public_key().as_bytes()),
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: hex::encode(state.agent.agent_id().as_bytes()),
+            invite_secret: format!("issue1685-round9-kp-{group_id}"),
+            ts_ms: now_millis_u64(),
+            treekem_key_package_b64: None,
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
+            certificate_b64: None,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: String::new(),
+        }],
+        truncated: false,
+        responder_state_hash: Some("kp-reply-head".to_string()),
+    };
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        key_package_reply,
+    )
+    .await;
+
+    // 4. The reply's replay applied E1 then E2, so the cursor moved and
+    //    the re-arm pass re-armed the sender itself (no skip for a
+    //    non-truncated reply's sender).
+    assert!(
+        eventually(|| !rearm_requests(&state).is_empty()).await,
+        "#1685 round 9: the key-package reply's replay re-armed its own sender \
+         (before round 9 the skip left the armed sender unasked)"
+    );
+    assert_eq!(
+        rearm_requests(&state),
+        vec![(group_id.clone(), responder_hex.clone(), "replay_applied")],
+        "the re-arm is typed and names the reply's own sender"
+    );
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "exactly one ask went out: the sender's own re-arm"
+    );
+    assert!(
+        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        "the ask that went out cleared the sender's row"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "the re-arm asks; only the responder's own terminal page closes its fence"
+    );
+    Ok(())
+}
+
+/// #1685 round 9 safety pin (round 8's race guard, finding 3 — green
+/// before and after): while a detached re-arm task is parked at the
+/// send seam, a racing no-progress page from the same peer arms a
+/// FRESH row (a new stop instant). When the parked send then
+/// completes, its clear-on-send compares the recorded stop instant and
+/// must NOT wipe the fresh row — an unconditional clear would leave
+/// the peer's fence open with no row: nothing would re-ask or retire
+/// it.
+#[tokio::test]
+async fn a_fresh_stop_survives_the_parked_rearms_clear_on_send() -> Result<()> {
+    let group_id = "1d".repeat(32);
+    let pair = issue1685_chain_pair(&group_id, None).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        helper,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder stops on E2: the row arms at the FIRST stop
+    //    instant.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the responder's stopped row is armed"
+    );
+
+    // 2. The re-arm ask parks at the send seam: the helper's terminal
+    //    page delivers E1, the replay applies E2, the cursor moves, and
+    //    the detached re-arm's send cannot leave.
+    let parked = detached_send_test_seam::arm(&format!("treekem-catchup-page:{group_id}"));
+    handle_treekem_catchup_response(
+        &state,
+        &helper,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    assert!(
+        eventually(|| parked.reached()).await,
+        "the detached re-arm's ask is the parked send"
+    );
+    assert!(
+        treekem_page_rearm_inflight(&group_id, &responder_hex),
+        "CONTROL: the (group, peer) re-arm claim is held while the send is parked"
+    );
+
+    // 3. While the send is parked, the responder stops AGAIN: a gapped
+    //    truncated event at the moved head arms a FRESH row (a new stop
+    //    instant) under the same machine.
+    let head = cursor(&state, &group_id).await;
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(
+            &group_id,
+            fork_removal_page_event(&group_id, &responder, head.0 + 1),
+        ),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "the racing page armed a FRESH row for the same peer"
+    );
+
+    // 4. Release the parked send: it succeeds, records its re-arm and
+    //    clears only the row it saw — the fresh row survives the
+    //    clear-on-send.
+    drop(parked);
+    assert!(
+        eventually(|| !treekem_page_rearm_inflight(&group_id, &responder_hex)).await,
+        "the released re-arm task finished and released its claim"
+    );
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "#1685 round 8, finding 3: the clear-on-send matched the old stop instant \
+         and did not wipe the fresh row the racing page armed"
+    );
+    assert_eq!(
+        rearm_requests(&state),
+        vec![(group_id.clone(), responder_hex.clone(), "replay_applied")],
+        "the released send recorded exactly one typed re-arm"
+    );
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "exactly one ask went out: the parked re-arm's own"
+    );
+    Ok(())
+}
+
+/// #1685 round 9 safety pin (round 8's finding 4 — green before and
+/// after): the re-arm claim is keyed by the group's REGISTER key, so
+/// the caller's two id spellings (register key or stable id) contend
+/// for ONE claim. While the responder's re-arm task is parked at the
+/// send seam, a second re-arm pass spawned under the STABLE id must
+/// not start a second send task for the same peer: exactly one ask and
+/// one typed re-arm — one page stream per peer.
+#[tokio::test]
+async fn one_rearm_task_per_peer_across_both_group_id_spellings() -> Result<()> {
+    let group_id = "1e".repeat(32);
+    let pair = issue1685_chain_pair(&group_id, None).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        helper,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder stops on E2 (row armed).
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the responder's stopped row is armed"
+    );
+
+    // 2. The re-arm ask parks at the send seam, so its task holds the
+    //    register-keyed claim.
+    let parked = detached_send_test_seam::arm(&format!("treekem-catchup-page:{group_id}"));
+    handle_treekem_catchup_response(
+        &state,
+        &helper,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    assert!(
+        eventually(|| parked.reached()).await,
+        "the detached re-arm's ask is the parked send"
+    );
+    assert!(
+        treekem_page_rearm_inflight(&group_id, &responder_hex),
+        "CONTROL: the register-keyed claim is held while the send is parked"
+    );
+
+    // 3. A second re-arm pass under the OTHER spelling (the stable id)
+    //    resolves the same register key, so the held claim must skip
+    //    the peer. Give the second coordinator a moment to run while
+    //    the first task still holds the claim.
+    spawn_stopped_treekem_catchup_rearms(&state, &fence_ids[2], None);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        treekem_page_rearm_inflight(&group_id, &responder_hex),
+        "CONTROL: the first task still holds its claim (its send is still parked)"
+    );
+
+    // 4. Release: exactly one ask and one typed re-arm in total — the
+    //    stable-id pass never started a second send.
+    drop(parked);
+    assert!(
+        eventually(|| !treekem_page_rearm_inflight(&group_id, &responder_hex)).await,
+        "the released re-arm task finished and released its claim"
+    );
+    assert_eq!(
+        page_requests(&state),
+        1,
+        "#1685 round 8, finding 4: one ask total — both id spellings contend for \
+         one (group, peer) claim, so the second pass started no second send"
+    );
+    assert_eq!(
+        rearm_requests(&state),
+        vec![(group_id.clone(), responder_hex.clone(), "replay_applied")],
+        "exactly one typed re-arm"
+    );
+    assert!(
+        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        "the one ask that went out cleared the row"
+    );
+    Ok(())
+}
+
+/// #1685 round 9 safety pin (round 5's clear-on-success — green before
+/// and after), the DETACHED half: when every send of a re-arm really
+/// fails (the force-ok seam stays off, so the real send runs against
+/// the unit-test state and fails), the bounded tries are all spent,
+/// the stopped row STAYS armed and nothing is recorded — no typed
+/// re-arm, no defer, no departure. The next replay that moves the
+/// cursor retries the peer.
+#[tokio::test]
+async fn a_detached_rearm_that_cannot_send_keeps_the_row_armed_and_records_nothing() -> Result<()> {
+    let group_id = "1f".repeat(32);
+    let pair = issue1685_chain_pair(&group_id, None).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        helper,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    // No force_ok and no armed seam: every real send fails in the
+    // unit-test state.
+
+    // 1. The responder stops on E2 (row armed; the stop itself sends
+    //    nothing).
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the responder's stopped row is armed"
+    );
+    assert_eq!(
+        page_requests(&state),
+        0,
+        "CONTROL: the stopped loop asks nobody"
+    );
+
+    // 2. The helper's terminal page delivers E1; the replay applies E2
+    //    and the cursor moves, so the detached re-arm runs — and every
+    //    one of its bounded sends fails.
+    let before = cursor(&state, &group_id).await;
+    handle_treekem_catchup_response(
+        &state,
+        &helper,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![event1]),
+    )
+    .await;
+    assert_ne!(
+        cursor(&state, &group_id).await,
+        before,
+        "CONTROL: the replay really applied the retained E2"
+    );
+    assert!(
+        eventually(|| !treekem_page_rearm_inflight(&group_id, &responder_hex)).await,
+        "the failed re-arm task finished and released its claim"
+    );
+    // Settle: nothing may land after the task's exit either.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "#1685 round 5, finding 2: a re-arm whose every send failed keeps the row \
+         armed, so the next cursor-moving replay retries the peer"
+    );
+    assert_eq!(page_requests(&state), 0, "no ask left");
+    assert!(
+        rearm_requests(&state).is_empty(),
+        "no typed re-arm was recorded"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_deferred
+            .lock()
+            .expect("deferred recorder")
+            .is_empty(),
+        "no defer record: this peer is not held, its sends failed"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_departed
+            .lock()
+            .expect("departed recorder")
+            .is_empty(),
+        "the responder keeps its Active seat: no departure"
+    );
+    Ok(())
+}
+
+/// #1685 round 9 safety pin (round 5, finding 2 — green before and
+/// after), the INLINE half: a truncated page that MOVES the cursor
+/// makes the handler itself ask for the next page. With the force-ok
+/// seam off (every real send fails in the unit-test state), the inline
+/// ask leaves nothing: no page request is recorded, the stream records
+/// no stop (the page made progress), the two applied links drain the
+/// queue, and the peer's page fence stays open — this peer still owes
+/// its terminal page.
+#[tokio::test]
+async fn an_inline_next_page_ask_that_cannot_send_leaves_no_trace() -> Result<()> {
+    let group_id = "21".repeat(32);
+    let pair = issue1685_chain_pair(&group_id, None).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    // No force_ok and no armed seam: the real send path runs and fails
+    // in the unit-test state.
+    let before = cursor(&state, &group_id).await;
+
+    // 1. The responder's ONE truncated page carries both links of the
+    //    chain: E1 applies at the base head, then E2 applies at E1's
+    //    head — the cursor moves inside the page, and the handler asks
+    //    for the next page itself.
+    let mut both = truncated_page(&group_id, event1);
+    both.events.push(event2);
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        both,
+    )
+    .await;
+
+    assert_ne!(
+        cursor(&state, &group_id).await,
+        before,
+        "CONTROL: the page applied both links and moved the cursor"
+    );
+    assert_eq!(
+        pending_len(&state, &group_id).await,
+        0,
+        "CONTROL: the queue drained through the applied links"
+    );
+    assert_eq!(
+        page_requests(&state),
+        0,
+        "#1685 round 5, finding 2: the inline next-page ask that cannot leave \
+         sends nothing (no forced ask ran; the row would stay armed for the next \
+         replay)"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_stops
+            .lock()
+            .expect("page-stop recorder")
+            .is_empty(),
+        "a progressing page records no stop"
+    );
+    assert!(
+        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        "no row armed: nothing stopped, and the failed inline ask clears nothing"
+    );
+    assert!(
+        rearm_requests(&state).is_empty(),
+        "no typed re-arm was recorded"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "the truncated page opened this peer's fence and the failed ask closes \
+         nothing — this peer still owes its terminal page"
+    );
     Ok(())
 }
