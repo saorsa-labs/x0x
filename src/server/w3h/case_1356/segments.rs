@@ -15,7 +15,10 @@
 //! - **66 links** (65 renames). The join-carry ATA ends at r+64, and the
 //!   link after it is a rename, not the terminal. The exhausted segment
 //!   admits nothing: J shows `awaiting_attestation {segment_exhausted}` at
-//!   r+64 only. J then converges.
+//!   r+64 only, and asks A again from r+64. J then converges. J asks at
+//!   once from its new head (#1726), so the answer can arrive before the
+//!   case reads the exhausted state; A's answer from r+64 then shows that
+//!   the segment ended there.
 //!
 //! In each run, any ATA that A sends J in answer starts at r+64, and J
 //! never holds a marker. The case does not count the join-carry entries
@@ -99,6 +102,18 @@ impl Run {
 
     fn exhausted(&self) -> bool {
         self.states.iter().any(|state| state == EXHAUSTED)
+    }
+
+    /// The join-carry segment ended at r+64: J showed `segment_exhausted`,
+    /// or A answered J's request from r+64. J asks again from a new head
+    /// at once (#1726), so A's answer can arrive inside one poll and the
+    /// case never reads the exhausted state. In iteration 10/20 of s3 job
+    /// 124525597881 the 66-link run had states null, catching_up, null and
+    /// one answer (71, 2) from r+64. The answer is the stronger evidence:
+    /// J asks from r+64 only because the segment admits nothing past it.
+    fn segment_ended(&self) -> bool {
+        let end = self.base + ATA_MAX_LINKS as u64;
+        self.exhausted() || self.answered.iter().any(|(from, _)| *from == end)
     }
 
     /// J started at r and converged with no marker.
@@ -267,7 +282,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     );
     let ok64 = one_segment(&run64);
     let ok65 = segment_boundary(&run65);
-    let ok66 = segment_boundary(&run66) && run66.exhausted();
+    let ok66 = segment_boundary(&run66) && run66.segment_ended();
     for (name, ok, run) in [
         ("gap_64_one_join_carry_ata_and_no_request", ok64, &run64),
         ("gap_65_join_carry_ata_of_64_then_one_link", ok65, &run65),
@@ -332,6 +347,12 @@ fn w3h_1356_s64_segment_shapes() {
     };
     assert!(one_segment(&run));
     assert!(segment_boundary(&run), "64 + the terminal");
+    assert!(!run.segment_ended(), "no exhausted state and no answer");
+    run.answered = vec![(69, 2)];
+    assert!(run.segment_ended(), "an answer from r+64 ends the segment");
+    run.answered = vec![(70, 1)];
+    assert!(!run.segment_ended(), "an answer not from r+64");
+    run.answered.clear();
     run.head_at_seal = 6;
     assert!(!one_segment(&run), "J did not start at r");
     assert!(!segment_boundary(&run), "J did not start at r");
