@@ -248,9 +248,12 @@ The private pair engine is implemented and tested, but no live apply path calls
 it yet. Activation requires the S2c host inventory and the S3a acknowledged
 flush, whose daemon-side owner and arm-and-flush control listener now exist
 (see [Acknowledged shutdown flush](#acknowledged-shutdown-flush-supervised-exit)
-below); launcher-coordinated host transactions remain the missing piece.
-The current apply path still uses its existing single-binary replacement flow.
-Do not infer pair rollback or launcher protection from this dormant module.
+below). The launcher-side flush receipt, reap check and pair restore code
+now exists too, but it is switched off (`ENABLED = false`) and no apply path
+calls it; activation of launcher-coordinated host transactions is what
+remains. The current apply path still uses its existing single-binary
+replacement flow. Do not infer pair rollback or launcher protection from this
+dormant module.
 
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes

@@ -93,15 +93,7 @@ pub(super) fn flush_and_reap(
         std::io::BufReader::new(socket)
             .take(1024 * 1024)
             .read_until(b'\n', &mut bytes)?;
-        let reply: Reply = serde_json::from_slice(&bytes)?;
-        let binding = reply.receipt.binding;
-        if binding.transaction_id != trial.binding.transaction
-            || binding.generation != trial.binding.generation
-            || binding.plan_sha256 != digest(&(p.instance_id.clone(), plan))?
-            || reply.receipt.receipt_id.is_empty()
-        {
-            return Err(invalid("flush reply does not bind this participant"));
-        }
+        check_reply(&bytes, &trial.binding, &p.instance_id, plan)?;
         let end = Instant::now() + Duration::from_millis(REAP_MS);
         while child.try_wait()?.is_none() {
             if Instant::now() >= end {
@@ -115,10 +107,36 @@ pub(super) fn flush_and_reap(
             old,
         })
     })();
-    if result.is_err() {
-        child::stop_and_reap(child)?;
+    if let Err(error) = result {
+        // The flush failure is the cause; a reap failure must not mask it.
+        if let Err(reap) = child::stop_and_reap(child) {
+            return Err(io::Error::other(format!(
+                "{error}; reap also failed: {reap}"
+            )));
+        }
+        return Err(error);
     }
     result
+}
+
+/// The reply must name this transaction, generation and participant plan,
+/// and carry a receipt id. Any other reply refuses the start.
+fn check_reply(
+    bytes: &[u8],
+    expected: &Binding,
+    instance: &str,
+    plan: &journal::FrozenPlan,
+) -> io::Result<()> {
+    let reply: Reply = serde_json::from_slice(bytes)?;
+    let binding = reply.receipt.binding;
+    if binding.transaction_id != expected.transaction
+        || binding.generation != expected.generation
+        || binding.plan_sha256 != digest(&(instance, plan))?
+        || reply.receipt.receipt_id.is_empty()
+    {
+        return Err(invalid("flush reply does not bind this participant"));
+    }
+    Ok(())
 }
 
 pub(super) fn authorize(
@@ -161,4 +179,114 @@ pub(super) fn authorize(
         trial.phase = Phase::Authorized;
         trial.save(path)
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::super::testkit::fixture;
+    use super::*;
+
+    fn reply(host: &recovery::Host, edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+        let binding = host.binding().unwrap();
+        let request = serde_json::json!({
+            "token": "inert launcher fixture", "transaction_id": binding.transaction,
+            "generation": binding.generation, "instance_id": "alice", "plan": host.plan()
+        });
+        let mut receipt = fixture_receipt(&serde_json::to_vec(&request).unwrap()).unwrap();
+        edit(&mut receipt);
+        serde_json::to_vec(&serde_json::json!({ "receipt": receipt })).unwrap()
+    }
+
+    #[test]
+    fn a_flush_reply_binds_transaction_generation_plan_and_receipt_id() {
+        let (_dir, _root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let binding = host.binding().unwrap();
+        let check = |bytes: Vec<u8>| check_reply(&bytes, &binding, "alice", host.plan());
+        check(reply(&host, |_| {})).unwrap();
+        let refusals: [fn(&mut serde_json::Value); 4] = [
+            |r| r["binding"]["transaction_id"] = "another".into(),
+            |r| r["binding"]["generation"] = 2.into(),
+            |r| r["binding"]["plan_sha256"] = serde_json::json!(vec![0u8; 32]),
+            |r| r["receipt_id"] = "".into(),
+        ];
+        for edit in refusals {
+            let error = check(reply(&host, edit)).unwrap_err().to_string();
+            assert!(error.contains("does not bind"), "{error}");
+        }
+        // A reply for another participant of the same plan is refused too.
+        let error = check_reply(&reply(&host, |_| {}), &binding, "bob", host.plan())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not bind"), "{error}");
+    }
+
+    #[test]
+    fn authorize_refuses_a_receipt_for_another_old_process() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let clock = Clock::now().unwrap();
+        let mut trial = Trial::new(host.binding().unwrap(), "alice".into(), &clock).unwrap();
+        trial.save(&path).unwrap();
+        let p = &host.plan().participants[0];
+        let receipt = |pid: u32, binding: Binding| Reaped {
+            instance: "alice".into(),
+            binding,
+            old: Identity {
+                pid,
+                start: p.process_start.unwrap(),
+                boot: p.boot_id.clone(),
+            },
+        };
+        let mut stale = trial.binding.clone();
+        stale.generation += 1;
+        for reaped in [
+            receipt(p.old_pid.unwrap() + 1, trial.binding.clone()),
+            receipt(p.old_pid.unwrap(), stale),
+        ] {
+            let error = authorize(&host, &mut trial, &path, &[reaped])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("does not bind"), "{error}");
+            assert_eq!(trial.phase, Phase::Armed);
+        }
+    }
+
+    /// The OLD identity in the plan is a live process here, so a receipt
+    /// that names it cannot prove the reap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authorize_refuses_while_the_old_child_is_alive() {
+        let mut old = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let live = child::identity(old.id()).unwrap();
+        let (_dir, root, _host, mut record) = fixture(journal::Phase::SwappedCli);
+        let p = &mut record.plan.participants[0];
+        p.old_pid = Some(live.pid);
+        p.process_start = Some(live.start);
+        p.boot_id = live.boot.clone();
+        journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+        let host = recovery::Host::new(root.clone(), record).unwrap();
+        let path = root.join("trial.json");
+        let mut trial = Trial::new(
+            host.binding().unwrap(),
+            "alice".into(),
+            &Clock::now().unwrap(),
+        )
+        .unwrap();
+        trial.save(&path).unwrap();
+        let reaped = Reaped {
+            instance: "alice".into(),
+            binding: trial.binding.clone(),
+            old: live,
+        };
+        let error = authorize(&host, &mut trial, &path, &[reaped])
+            .unwrap_err()
+            .to_string();
+        old.kill().unwrap();
+        old.wait().unwrap();
+        assert!(error.contains("does not bind"), "{error}");
+        assert_eq!(trial.phase, Phase::Armed);
+    }
 }

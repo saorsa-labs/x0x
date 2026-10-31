@@ -9,7 +9,8 @@ pub(super) fn hash(path: &Path) -> io::Result<[u8; 32]> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() || file.metadata()?.len() > 200 * 1024 * 1024 {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 200 * 1024 * 1024 {
         return Err(invalid("not a bounded regular binary"));
     }
     let mut hash = Sha256::new();
