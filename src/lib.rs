@@ -10366,12 +10366,11 @@ impl Agent {
     /// dispatches any DM of the same type. No new wire message.
     ///
     /// Gates: the ADR-0043 signing gate (the same egress refusal as every
-    /// DM path), the raw payload bound, and — review round 1 — the same
-    /// B/P pairing evaluation ordinary egress runs, re-read HERE at the
-    /// send. The caller ran the #1657 ladder (agent, machine, binding,
-    /// resync) when it decided to answer, but a chunk serve can park and
-    /// read the blob after releasing the revocation-set lock, so a
-    /// revocation landing in that window still finds this send closed. A
+    /// DM path), the raw payload bound, and — review rounds 1 and 2 — the
+    /// full revocation ladder (agent, machine, binding/placement, resync)
+    /// re-read HERE at the send: a chunk serve can park and read the blob
+    /// after the handler's ladder decision, so a revocation landing in
+    /// that window still finds this send closed under its own sentence. A
     /// reply addressed to this daemon's own (agent, machine) pair is
     /// delivered through the same loopback path an ordinary self-addressed
     /// DM takes.
@@ -10429,9 +10428,31 @@ impl Agent {
             return Ok(receipt);
         }
         let network = self.network.as_ref();
-        // Review round 1: re-evaluate the pairing for the exact
-        // (requester, machine) pair at the send — the caller's ladder
-        // decision can predate the chunk read that followed it.
+        // Review round 2, finding 1: re-read EVERY revocation sentence for
+        // the exact (requester, machine) pair at the send — the caller's
+        // ladder decision can predate the chunk read that followed it.
+        // `recipient_pairing_denied` below covers the binding and placement
+        // only; the agent, machine and resync sentences are read here.
+        {
+            let revocation_set = self.revocation_set.read().await;
+            if revocation_set.is_agent_revoked(requester)
+                || revocation_set.is_machine_revoked(&machine_id)
+                || revocation_set.revocation_resync_required()
+            {
+                drop(revocation_set);
+                self.direct_messaging.record_outgoing_failed(*requester);
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "machine_reply",
+                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                    outcome = "machine_reply_revoked_at_send",
+                    "machine-addressed data reply withheld: a revocation for this (agent, machine) pair landed before the write"
+                );
+                return Err(dm::DmError::EnvelopeConstruction(
+                    "recipient revoked at the send (agent, machine or resync)".to_string(),
+                ));
+            }
+        }
         if let Some(denial) = self.recipient_pairing_denied(requester, &machine_id).await {
             self.direct_messaging.record_outgoing_failed(*requester);
             tracing::debug!(
@@ -10590,6 +10611,40 @@ impl Agent {
             .network
             .as_ref()
             .ok_or_else(|| dm::DmError::NoConnectivity("network not initialized".to_string()))?;
+        // Review round 2, finding 2: a fetch can arrive with no live
+        // connection to the asking machine (fetch frames go gossip-first),
+        // and the connection can be replaced between the fetch and this
+        // detached serve. `send_direct_pinned` needs a live generation, so
+        // run the resolver's connect ladder first — repair, then the
+        // pinned redial — bounded by the repair budget the resolver uses;
+        // the CALLER's exchange deadline bounds this whole inner future.
+        let ant_peer_id = ant_quic::PeerId(machine_id.0);
+        {
+            let transport = RawQuicTransport::Network(network);
+            let mut connected = transport.is_connected(&ant_peer_id).await;
+            if !connected {
+                const MACHINE_REPLY_REPAIR_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(3);
+                let _ = tokio::time::timeout(
+                    MACHINE_REPLY_REPAIR_TIMEOUT,
+                    transport.ensure_peer_send_ready(&ant_peer_id),
+                )
+                .await;
+                connected = transport.is_connected(&ant_peer_id).await;
+                if !connected && transport.pinned_redial(self, to, machine_id).await {
+                    connected = true;
+                }
+            }
+            if !connected {
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "machine_reply",
+                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                    outcome = "machine_reply_pinned_no_connection",
+                    "machine-pinned exchange found no live connection after repair; the fetcher's retry re-asks"
+                );
+            }
+        }
         let Some(seam) = admission().await else {
             return Err(dm::DmError::NoConnectivity(
                 dm::PINNED_ADMISSION_REFUSED.to_string(),

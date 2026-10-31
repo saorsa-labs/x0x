@@ -288,6 +288,77 @@ async fn a_catchup_page_goes_to_the_requesting_machine_and_a_revoked_asker_gets_
         TreeKemCatchupRefusalReason::MachineRevoked
     );
     assert_eq!(refusals[0].group_id(), group_id);
+    // The refusal's DESTINATION: the machine-addressed refusal lane carries
+    // it to the revoked device that asked (the send-seam recorder, after
+    // every gate).
+    let refusal_egress = state
+        .agent
+        .treekem_refusal_replies
+        .egress
+        .lock()
+        .expect("refusal egress recorder")
+        .clone();
+    assert!(
+        refusal_egress
+            .iter()
+            .any(|(machine, _)| *machine == device.machine_id()),
+        "the refusal is addressed to the revoked device's machine"
+    );
+    Ok(())
+}
+
+/// Review round 2, finding 1: a revocation that lands BETWEEN the
+/// handler's ladder decision and the send still closes the send. The
+/// serve's test seam parks the page send after the decision; the machine
+/// is revoked while parked; the released send egresses nothing.
+#[tokio::test]
+async fn a_revocation_landing_during_a_parked_page_serve_still_closes_the_send() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "69".repeat(32);
+    let member = AgentKeypair::generate()?;
+    let device = x0x::identity::MachineKeypair::generate()?;
+    seat_members(&state, &group_id, &[&member]).await;
+
+    let sender_hex = hex::encode(member.agent_id().as_bytes());
+    let pause = detached_send_test_seam::arm(&format!("treekem-catchup-serve:{sender_hex}"));
+    let parked_state = Arc::clone(&state);
+    let parked_member = member.agent_id();
+    let parked_device = device.machine_id();
+    let serve = tokio::spawn(async move {
+        handle_treekem_catchup_request(
+            &parked_state,
+            &parked_member,
+            &parked_device,
+            true,
+            catchup_request(&group_id, &parked_member),
+        )
+        .await;
+    });
+    // The serve reached its send (the ladder passed: the machine was clean
+    // when the handler read it) and parked there.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !pause.reached() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the parked serve never reached its send"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The revocation lands mid-serve, then the send is released.
+    revoke_machine(&state, &device).await;
+    drop(pause);
+    serve.await.expect("the parked serve completes");
+    assert_eq!(
+        recorded_pages(&state),
+        1,
+        "the page DECISION was recorded before the park (the asker was clean when the ladder read it)"
+    );
+    assert!(
+        !machine_reply_egress(&state)
+            .iter()
+            .any(|(machine, _)| *machine == device.machine_id()),
+        "the released send is closed by the revocation that landed while it was parked: no egress to the now-revoked machine"
+    );
     Ok(())
 }
 
@@ -498,7 +569,7 @@ async fn seat_cert_drops_an_agent_revoked_member_and_cannot_be_weaponised_by_adv
     info.policy.admission = x0x::groups::GroupAdmission::OwnerCertified(owner.user_id());
     info.metadata_topic = format!("x0x/group/issue1664-{remote_hex}");
     info.members_v2.clear();
-    info.add_member(local_hex, x0x::groups::GroupRole::Admin, None, None);
+    info.add_member(local_hex.clone(), x0x::groups::GroupRole::Admin, None, None);
     info.add_member(
         remote_hex.clone(),
         x0x::groups::GroupRole::Admin,
@@ -555,32 +626,66 @@ async fn seat_cert_drops_an_agent_revoked_member_and_cannot_be_weaponised_by_adv
         "a clean requester is still answered while a revoked device holds its agent's newest advert"
     );
 
-    // An agent-revoked requester that IS an active roster member (so the
-    // roster check alone would admit it — and the C5 answer slot above is
-    // already taken, so only the revocation gate can explain this drop):
-    // the silent drop — no answer and no refusal, exactly as the
-    // control-blob lane's agent gate.
+    // Review round 2, finding 3: the agent-revoked drop must be provable
+    // on its own — a SECOND group with the same digest-only remote seat
+    // (a fresh C5 answer slot) and the revoked member on ITS roster, so
+    // with the gate neutered this exact ask would be ANSWERED (roster
+    // hit, cache hit, fresh slot). With the gate it gets the silent
+    // drop — no answer and no refusal, exactly as the control-blob
+    // lane's agent gate.
     let revoked_member = AgentKeypair::generate()?;
+    let revoked_member_hex = hex::encode(revoked_member.agent_id().as_bytes());
+    let second_key = format!("local2-{revoked_member_hex}");
     {
-        let mut groups = state.named_groups.write().await;
-        groups.get_mut(&group_key).expect("fixture").add_member(
-            hex::encode(revoked_member.agent_id().as_bytes()),
+        let mut second = x0x::groups::GroupInfo::with_policy(
+            "issue1664".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            format!("issue1664-two-{revoked_member_hex}"),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        second.policy.admission = x0x::groups::GroupAdmission::OwnerCertified(owner.user_id());
+        second.metadata_topic = format!("x0x/group/issue1664-two-{revoked_member_hex}");
+        second.members_v2.clear();
+        second.add_member(local_hex.clone(), x0x::groups::GroupRole::Admin, None, None);
+        second.add_member(
+            remote_hex.clone(),
+            x0x::groups::GroupRole::Admin,
+            None,
+            None,
+        );
+        second.add_member(
+            revoked_member_hex.clone(),
             x0x::groups::GroupRole::Member,
             None,
             None,
         );
+        if let Some(seat) = second.members_v2.get_mut(&remote_hex) {
+            seat.certificate = None;
+            seat.certificate_digest = Some(remote_digest.clone());
+        }
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(second_key.clone(), second);
     }
+    let second_request = serde_json::to_vec(&seat_cert_fetch::GroupCertFetchRequest {
+        group_id: second_key.clone(),
+        cert_digest: remote_digest.clone(),
+        requester: revoked_member_hex.clone(),
+    })?;
     revoke_agent(&state, &revoked_member).await;
     assert!(
         !seat_cert_fetch::handle_group_cert_fetch_request(
             &state,
-            &request,
+            &second_request,
             Some(&revoked_member.agent_id()),
             true,
-            &group_key
+            &second_key
         )
         .await,
-        "an agent-revoked roster member gets no answer"
+        "an agent-revoked roster member gets no answer on a fresh slot it would otherwise be answered on"
     );
     assert!(
         recorded_refusals(&state).is_empty(),

@@ -7,6 +7,14 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::Semaphore;
 
 const CHUNK_BYTES: usize = x0x::files::DEFAULT_CHUNK_SIZE;
+
+/// #1664 review round 2: the bound on concurrently detached refusal
+/// sends for this lane. A revoked device can fetch for many group ids and
+/// each refusal send costs its transport budget; a full set keeps main's
+/// silent drop (the device is revoked either way).
+static CONTROL_BLOB_REFUSAL_SEND_SLOTS: std::sync::LazyLock<
+    std::sync::Arc<tokio::sync::Semaphore>,
+> = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)));
 // The existing TreeKEM recovery-control cache has an 8 MiB encoded-JSON
 // budget. Use that explicit control-plane precedent for one exact blob and
 // one peer's outstanding bytes. Larger (even otherwise legal) historical
@@ -1071,9 +1079,13 @@ pub(in crate::server) async fn handle_control_blob_message(
             }
             // #1664: the header check above bound the authenticated sender
             // to `reference.recipient`, so this refusal answers exactly the
-            // device that asked. It names the revocation so the fetcher can
-            // stop re-fetching and surface the reason, exactly as the
-            // catch-up refusal does.
+            // device that asked. It is the catch-up lane's typed refusal
+            // reused as the ANSWER (bit 13 gates its send, the per-
+            // (machine, group) dedupe bounds it): a receiver records it
+            // through the existing catch-up-refusal handling — nothing
+            // control-blob-specific is implied on the receive side; whether
+            // that widening of the frame's meaning stands is FOR ENGINEER
+            // in the PR body.
             if let Some(reason) = if machine_refused {
                 tracing::warn!(
                     group_id = %LogHexId::group(&reference.group_id),
@@ -1095,12 +1107,20 @@ pub(in crate::server) async fn handle_control_blob_message(
                 // refused device, so it never runs on this listener (a
                 // revoked fetcher storm must not stall other control
                 // traffic — the same detachment the catch-up lane serves
-                // under, #1357/#1616).
+                // under, #1357/#1616), and the detached refusal sends are
+                // themselves bounded: a full slot set keeps main's silent
+                // drop (the device is revoked either way).
+                let Ok(refusal_permit) =
+                    CONTROL_BLOB_REFUSAL_SEND_SLOTS.clone().try_acquire_owned()
+                else {
+                    return;
+                };
                 let refusal_state = Arc::clone(state);
                 let refusal_sender = *sender;
                 let refusal_machine = *machine_id;
                 let refusal_group = reference.group_id.clone();
                 state.spawn_detached(async move {
+                    let _refusal_permit = refusal_permit;
                     super::send_treekem_catchup_refusal(
                         &refusal_state,
                         &refusal_sender,
