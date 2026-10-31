@@ -561,6 +561,12 @@ struct SubjectState {
     /// Rounds that ended with no usable answer (the backoff exponent).
     attempts: u32,
     next_retry_at: Instant,
+    /// The head the last request named, and when it was sent; cleared when
+    /// the round restarts from a later head.
+    asked_from: Option<(String, Instant)>,
+    /// The target that refused `rate_limited` in this round and was given
+    /// one cooldown retry (#1726).
+    cooled: Option<[u8; 32]>,
     /// The index of the next target in the current round.
     next_target: usize,
     /// The target asked last, when, and the head the request named.
@@ -586,6 +592,8 @@ impl SubjectState {
             },
             attempts: 0,
             next_retry_at: now,
+            asked_from: None,
+            cooled: None,
             next_target: 0,
             pending: None,
             asked: BTreeMap::new(),
@@ -601,6 +609,7 @@ impl SubjectState {
         self.next_retry_at = now + s3::request_backoff(self.attempts.saturating_sub(1));
         self.next_target = 0;
         self.pending = None;
+        self.cooled = None;
     }
 }
 
@@ -4215,6 +4224,21 @@ async fn next_target(
         subject.progress_revision = info.state_revision;
         subject.progress_at = now;
     }
+    // The node left the head its last request named. §2 drops an answer
+    // for an old head, so a request still open is void, and the last
+    // round's silence was for that head: its backoff does not hold here.
+    // The round starts again from the first target once a responder's
+    // per-requester interval (§11) has passed since that request, so the
+    // new head's request is not refused `rate_limited` (#1726).
+    if let Some((_, asked_at)) = subject
+        .asked_from
+        .take_if(|(head, _)| *head != info.state_hash)
+    {
+        subject.pending = None;
+        subject.next_target = 0;
+        subject.cooled = None;
+        subject.next_retry_at = now.max(asked_at + s3::RESPONDER_PER_REQUESTER_INTERVAL);
+    }
     // A gap record alone asks only after GATE_STALL without progress; an
     // armed admin ATA asks for its renewal after ATA_ARMED_LIFETIME.
     let gap_only = !marker && refs.iter().all(|r| matches!(r, RecoveryRef::Gap { .. }));
@@ -4279,6 +4303,7 @@ async fn next_target(
     }
     let target = targets.get(subject.next_target).copied()?;
     subject.pending = Some((*target.as_bytes(), now, info.state_hash.clone()));
+    subject.asked_from = Some((info.state_hash.clone(), now));
     subject
         .asked
         .entry(hex::encode(target.as_bytes()))
@@ -4527,7 +4552,15 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
                             reason: other.as_str().to_string(),
                         };
                     }
-                    advance_round(subject, now, from_pending);
+                    let target = *sender.as_bytes();
+                    if other == AttestRefusalReason::RateLimited
+                        && from_pending
+                        && subject.cooled != Some(target)
+                    {
+                        cool_down(subject, target, now);
+                    } else {
+                        advance_round(subject, now, from_pending);
+                    }
                 }
             }
         }
@@ -4736,6 +4769,19 @@ fn advance_round(subject: &mut SubjectState, now: Instant, from_pending: bool) {
     // `next_target` past the list ends the round on the next tick.
     subject.next_target = subject.next_target.saturating_add(1);
     subject.next_retry_at = now;
+}
+
+/// A `rate_limited` refusal from the asked target: ask that target again
+/// once its per-requester interval (§11) has passed, in this round. The
+/// responder starts that interval when it admits a request, which can be
+/// later than this node sent it, so the restart in [`next_target`] can
+/// still reach it too early (#1726). The interval started before the
+/// refusal was sent, so it has passed one interval after the refusal
+/// arrives. One cooldown per target per round: a second refusal moves the
+/// round on, so the round still ends and backs off.
+fn cool_down(subject: &mut SubjectState, target: [u8; 32], now: Instant) {
+    subject.cooled = Some(target);
+    subject.next_retry_at = now + s3::RESPONDER_PER_REQUESTER_INTERVAL;
 }
 
 /// An ATA from the request path (§2): verify it for this node, then arm
@@ -11895,6 +11941,231 @@ mod tests {
             awaiting("no_capable_peer"),
             "asked"
         );
+        Ok(())
+    }
+
+    /// #1726 (W3-H H-S3-x): a backoff holds only at the head it was earned
+    /// at. The node's last round asked from `base` and ended with no
+    /// answer, so its backoff runs (120 s, the second step); it then moves
+    /// to `mid` (here the segment's end, where the next segment is due
+    /// now). Its next round starts from `mid` once a responder's
+    /// per-requester interval (60 s, §11) has passed since that request,
+    /// not after the backoff, and a request still open from `base` is
+    /// dropped. Before the fix the node waited out the backoff (240 s at
+    /// the third step, up to 1 h). Control: at the head it asked from, the
+    /// backoff holds. Inert: an offline agent; an ask shows as
+    /// `no_capable_peer`.
+    #[tokio::test]
+    async fn a_segment_end_after_a_failed_round_asks_without_the_backoff() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (admin, base, mid, ahead, links) = segment_fixture(&state)?;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let ata = sign_ata(&admin, &local, &base, &links[..1])?;
+        let terminal = super::super::NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: ahead.stable_group_id().to_string(),
+            revision: links[1].commit.revision,
+            actor: admin_hex,
+            agent_id: "44".repeat(32),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(links[1].commit.clone()),
+        };
+        let terminal_json = serde_json::to_vec(&terminal)?;
+        let stable = base.stable_group_id().to_string();
+        assert!(
+            update_sidecar(&state, &stable, move |body| {
+                body.active_ata = Some(ata);
+                body.queued_terminal = Some(terminal_json);
+            })
+            .await
+        );
+        assert!(exhausted_segment(&state, &mid).await.is_some());
+        let key = base.mls_group_id.clone();
+        let refs = live_refs(&state, &mid).await;
+        let start = Instant::now();
+        let early = start + Duration::from_secs(1);
+        let due = start + s3::RESPONDER_PER_REQUESTER_INTERVAL;
+        // Two rounds asked from `info`'s head ended with no answer, the last
+        // at `start`; with `open`, a request from that head is still pending.
+        let failed_rounds = |info: &GroupInfo, open: bool| {
+            let mut subject = SubjectState::new(start, info.state_revision);
+            subject.end_round(start);
+            subject.end_round(start);
+            subject.asked_from = Some((info.state_hash.clone(), start));
+            subject.pending = open.then(|| ([7u8; 32], start, info.state_hash.clone()));
+            subject
+        };
+        assert!(failed_rounds(&base, false).next_retry_at > due);
+        let set = |subject: SubjectState| {
+            let state = &state;
+            let stable = stable.clone();
+            async move {
+                state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .subjects
+                    .insert(stable, subject);
+            }
+        };
+
+        // Control: no progress since the failed rounds; the backoff holds
+        // past the responder interval.
+        set(failed_rounds(&mid, false)).await;
+        assert_eq!(
+            next_target(&state, &key, &mid, &local, &refs, due).await,
+            None
+        );
+        assert_eq!(
+            view_of(&state, &stable).await,
+            awaiting("segment_exhausted"),
+            "held by the backoff"
+        );
+
+        // The rounds failed at `base`, then the node moved to `mid`, with
+        // and without a request still open from `base`.
+        for open in [false, true] {
+            set(failed_rounds(&base, open)).await;
+            assert_eq!(
+                next_target(&state, &key, &mid, &local, &refs, early).await,
+                None
+            );
+            assert_eq!(
+                view_of(&state, &stable).await,
+                awaiting("segment_exhausted"),
+                "held by the responder interval (open: {open})"
+            );
+            assert_eq!(
+                next_target(&state, &key, &mid, &local, &refs, due).await,
+                None
+            );
+            assert_eq!(
+                view_of(&state, &stable).await,
+                awaiting("no_capable_peer"),
+                "asked after the interval, not the backoff (open: {open})"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1726 (Greptile P1 on 02f1e9c7): the responder starts its
+    /// per-requester interval (§11) when it admits a request, not when the
+    /// requester sent it. The old head's request was sent at 0 s and
+    /// admitted at 20 s, so the responder holds the requester until 80 s.
+    /// The new head's round restarts at 60 s (the requester's own clock)
+    /// and its request is admitted at 65 s: `refused {rate_limited}`. The
+    /// requester asks the same target again one interval after that
+    /// refusal (past 80 s, so it is admitted), in the same round, and does
+    /// not take the old backoff. Before the fix the refusal moved the
+    /// round on; with one target the round ended and backed off (240 s at
+    /// the third step). A second `rate_limited` from that target in the
+    /// round moves the round on as before, so the round still ends.
+    #[tokio::test]
+    async fn a_new_head_rate_limited_refusal_gets_a_cooldown_retry() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, _ata, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let requester = *state.agent.agent_id().as_bytes();
+        let target = *admin.agent_id().as_bytes();
+        let interval = s3::RESPONDER_PER_REQUESTER_INTERVAL;
+
+        // The responder side of the race, on its own clock.
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut budget = ResponderBudget::default();
+        assert_eq!(budget.admit(requester, at(20)), Admission::Build);
+        budget.finish(0);
+        assert_eq!(at(0) + interval, at(60), "the requester's restart");
+        assert_eq!(budget.admit(requester, at(65)), Admission::Refuse);
+        budget.finish(0);
+        // A retry one interval after the refusal (sent at 65 s) is
+        // admitted: the interval began at admission (20 s), before it.
+        assert_eq!(budget.admit(requester, at(65) + interval), Admission::Build);
+        budget.finish(0);
+
+        // The requester side: two rounds failed at the old head, then the
+        // new head's round asked `target`, which refuses `rate_limited`.
+        let rate_limited = || GroupAttestResponseV1 {
+            group: stable.clone(),
+            subject: requester,
+            for_head_state_hash: info.state_hash.clone(),
+            answer: AttestAnswer::Refused(AttestRefusalReason::RateLimited),
+        };
+        let ask = |at: Instant| {
+            let state = &state;
+            let stable = stable.clone();
+            let head = info.state_hash.clone();
+            let revision = info.state_revision;
+            async move {
+                let mut inner = state.group_recovery.inner.lock().await;
+                let subject = inner
+                    .subjects
+                    .entry(stable)
+                    .or_insert_with(|| SubjectState::new(at, revision));
+                subject.pending = Some((target, at, head.clone()));
+                subject.asked_from = Some((head, at));
+            }
+        };
+        let snapshot = || {
+            let state = &state;
+            let stable = stable.clone();
+            async move {
+                state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .subjects
+                    .get(&stable)
+                    .map(|s| (s.attempts, s.next_target, s.next_retry_at, s.view.clone()))
+            }
+        };
+        {
+            let mut subject = SubjectState::new(t0, info.state_revision);
+            subject.end_round(t0);
+            subject.end_round(t0);
+            state
+                .group_recovery
+                .inner
+                .lock()
+                .await
+                .subjects
+                .insert(stable.clone(), subject);
+        }
+        ask(Instant::now()).await;
+        let before = Instant::now();
+        handle_response(&state, admin.agent_id(), rate_limited()).await;
+        let after = Instant::now();
+        let (attempts, next, retry_at, view) =
+            snapshot().await.ok_or_else(|| anyhow::anyhow!("subject"))?;
+        assert_eq!(attempts, 2, "the round did not end");
+        assert_eq!(next, 0, "the same target is asked again");
+        assert!(
+            retry_at >= before + interval && retry_at <= after + interval,
+            "the retry waits one interval after the refusal"
+        );
+        assert!(after + interval < before + s3::request_backoff(2));
+        assert_eq!(Some(view), awaiting("rate_limited"));
+
+        // The cooldown retry is refused too: the round moves on.
+        ask(Instant::now()).await;
+        handle_response(&state, admin.agent_id(), rate_limited()).await;
+        let (attempts, next, _, _) = snapshot().await.ok_or_else(|| anyhow::anyhow!("subject"))?;
+        assert_eq!(
+            (attempts, next),
+            (2, 1),
+            "one cooldown per target per round"
+        );
+        // A new round gives each target its cooldown again.
+        let mut inner = state.group_recovery.inner.lock().await;
+        let subject = inner
+            .subjects
+            .get_mut(&stable)
+            .ok_or_else(|| anyhow::anyhow!("subject"))?;
+        assert_eq!(subject.cooled, Some(target));
+        subject.end_round(Instant::now());
+        assert_eq!(subject.cooled, None);
         Ok(())
     }
 
