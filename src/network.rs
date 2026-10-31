@@ -434,7 +434,10 @@ pub(crate) fn one_sided_peer_ids_from(samples: &[LinkAgeSample]) -> Vec<AntPeerI
 /// These peers are candidates for the liveness probe in
 /// [`NetworkNode::resolve_one_sided_peers`], not one-sided by their ages
 /// alone: a quiet link and a broken link share this shape. A node whose
-/// every peer is quiet selects nobody, so its quiet peers stay up.
+/// every peer is quiet selects nobody, so its quiet peers stay up. The
+/// resolver adds two gates on top: a peer this node probed successfully
+/// inside [`ONE_SIDED_FLOWING`] does not count as the flowing peer.
+#[cfg(test)]
 pub(crate) fn both_stale_candidate_indexes(samples: &[LinkAgeSample]) -> Vec<usize> {
     samples
         .iter()
@@ -472,10 +475,11 @@ fn one_sided_probe_confirms_broken(error: &ant_quic::NodeError) -> bool {
 
 /// Record one both-stale probe outcome (#1419).
 ///
-/// The probe timestamp always moves, so the window restarts. A failure
-/// that names the link confirms; a success clears. An inconclusive
-/// outcome keeps the earlier verdict: a confirmed failure stays degraded
-/// and an unconfirmed peer stays quiet.
+/// The probe timestamp always moves, so the probe cooldown restarts. A
+/// failure that names the link confirms and stamps the confirmation. A
+/// success clears both. An inconclusive outcome moves only the probe
+/// timestamp: it extends no confirmation, so a peer is never degraded or
+/// re-dialled on inconclusive evidence alone.
 fn apply_one_sided_probe(
     entry: &mut OneSidedRepair,
     now: Instant,
@@ -483,8 +487,14 @@ fn apply_one_sided_probe(
 ) {
     entry.both_stale_probe_at = Some(now);
     match result {
-        Ok(_) => entry.both_stale_confirmed = false,
-        Err(error) if one_sided_probe_confirms_broken(error) => entry.both_stale_confirmed = true,
+        Ok(_) => {
+            entry.both_stale_confirmed = false;
+            entry.both_stale_confirmed_at = None;
+        }
+        Err(error) if one_sided_probe_confirms_broken(error) => {
+            entry.both_stale_confirmed = true;
+            entry.both_stale_confirmed_at = Some(now);
+        }
         Err(_) => {}
     }
 }
@@ -494,12 +504,14 @@ fn apply_one_sided_probe(
 struct OneSidedRepair {
     last_attempt: Option<Instant>,
     warned: bool,
-    /// When the last both-directions-stale liveness probe ran, and whether
-    /// it failed. A failed probe keeps the peer in the degraded set inside
-    /// the window without probing again; a sample with traffic on either
-    /// direction clears the flag.
+    /// When the last both-directions-stale liveness probe ran. A probe
+    /// inside the window is not repeated.
     both_stale_probe_at: Option<Instant>,
+    /// Whether the last probe that produced a verdict named the link
+    /// broken, and when. Listing and repair need the confirmation inside
+    /// the window; an inconclusive probe extends nothing.
     both_stale_confirmed: bool,
+    both_stale_confirmed_at: Option<Instant>,
     /// Scheduler attempt armed across the discovery-cache wait and both
     /// dials. A repair claim cancels it so that attempt cannot also dial.
     scheduler_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -513,8 +525,9 @@ struct OneSidedRepair {
 /// warning and the probe confirmation. A quiet sample clears the warning
 /// only when no live probe confirmation says the link is broken, so a
 /// confirmed peer warns once per episode. The backoff timestamp still
-/// blocks a dial inside the window. An entry with a probe verdict inside
-/// the window is kept for its cooldown, even when it confirms nothing.
+/// blocks a dial inside the window. An entry with a probe inside the
+/// window is kept for its cooldown, even when it confirms nothing. A peer
+/// is re-dialled only while a confirming probe sits inside the window.
 fn plan_one_sided_repairs(
     map: &mut HashMap<AntPeerId, OneSidedRepair>,
     samples: &[LinkAgeSample],
@@ -530,9 +543,16 @@ fn plan_one_sided_repairs(
             }
             if sample.age.fresh_direction() {
                 entry.both_stale_confirmed = false;
+                entry.both_stale_confirmed_at = None;
             }
         }
     }
+    let confirmed_inside_window = |entry: &OneSidedRepair| {
+        entry.both_stale_confirmed
+            && entry
+                .both_stale_confirmed_at
+                .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF)
+    };
     map.retain(|peer, entry| {
         let in_backoff = entry
             .last_attempt
@@ -540,7 +560,7 @@ fn plan_one_sided_repairs(
         let still_one_sided = samples
             .iter()
             .any(|sample| sample.peer == *peer && sample.age.one_sided());
-        let still_confirmed = entry.both_stale_confirmed
+        let still_confirmed = confirmed_inside_window(entry)
             && samples
                 .iter()
                 .any(|sample| sample.peer == *peer && sample.age.both_directions_stale());
@@ -555,11 +575,7 @@ fn plan_one_sided_repairs(
             return None;
         }
         let entry = map.get(&sample.peer)?;
-        let confirmed = entry.both_stale_confirmed
-            && entry
-                .both_stale_probe_at
-                .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF);
-        confirmed.then_some(sample.peer)
+        confirmed_inside_window(entry).then_some(sample.peer)
     }));
     peers.sort_unstable();
     peers.dedup();
@@ -3676,59 +3692,95 @@ impl NetworkNode {
     /// [`Self::repair_one_sided_links`]. Only a probe failure that names
     /// the link degrades the peer ([`one_sided_probe_confirms_broken`]).
     /// A busy endpoint or a probe-incapable peer is inconclusive, and an
-    /// inconclusive probe keeps the earlier verdict. A peer stays in the
-    /// degraded set while its probe verdict is inside the window and its
-    /// sample stays both-directions stale, even when other peers go
-    /// quiet; it is probed again when the window ends. Each peer is
-    /// probed at most once per [`ONE_SIDED_REDIAL_BACKOFF`], at most
-    /// [`ONE_SIDED_PROBES_PER_TICK`] probes run per tick, and each probe
-    /// is under an outer [`ONE_SIDED_PROBE_TIMEOUT`] bound because
-    /// ant-quic's own bound starts at the reply wait.
+    /// inconclusive probe extends no confirmation, so a peer is never
+    /// degraded or re-dialled on inconclusive evidence alone. A peer stays
+    /// in the degraded set while a confirming probe sits inside the window
+    /// and its sample stays both-directions stale, even when other peers
+    /// go quiet. A peer this node probed successfully inside the last
+    /// [`ONE_SIDED_FLOWING`] does not count as the flowing peer for
+    /// another candidate, so probing cannot bootstrap probing on a quiet
+    /// node. Each peer is probed at most once per
+    /// [`ONE_SIDED_REDIAL_BACKOFF`], never-probed candidates go first,
+    /// at most [`ONE_SIDED_PROBES_PER_TICK`] probes run per tick, and
+    /// each probe is under an outer [`ONE_SIDED_PROBE_TIMEOUT`] bound
+    /// because ant-quic's own bound starts at the reply wait.
     pub(crate) async fn resolve_one_sided_peers(
         &self,
         samples: &[LinkAgeSample],
     ) -> Vec<AntPeerId> {
         let now = Instant::now();
         let mut degraded = one_sided_peer_ids_from(samples);
-        let candidates: std::collections::HashSet<usize> =
-            both_stale_candidate_indexes(samples).into_iter().collect();
         let mut to_probe = Vec::new();
+        let mut previously_probed = std::collections::HashSet::new();
         {
             let map = match self.one_sided_repairs.lock() {
                 Ok(map) => map,
                 Err(poisoned) => poisoned.into_inner(),
+            };
+            // A peer this node probed successfully just now is fresh only
+            // because of that probe. It must not qualify another quiet
+            // peer for probing.
+            let probe_fresh: std::collections::HashSet<AntPeerId> = map
+                .iter()
+                .filter(|(_, entry)| {
+                    !entry.both_stale_confirmed
+                        && entry.both_stale_probe_at.is_some_and(|at| {
+                            now.saturating_duration_since(at) <= ONE_SIDED_FLOWING
+                        })
+                })
+                .map(|(peer, _)| *peer)
+                .collect();
+            let candidate_flows = |index: usize| {
+                samples.iter().enumerate().any(|(other, other_sample)| {
+                    other != index
+                        && other_sample.age.fresh_direction()
+                        && !probe_fresh.contains(&other_sample.peer)
+                })
             };
             for (index, sample) in samples.iter().enumerate() {
                 if !sample.age.both_directions_stale() {
                     continue;
                 }
                 let peer = sample.peer;
-                let (probed_inside_window, confirmed_before) = match map.get(&peer) {
-                    Some(entry) => (
-                        entry.both_stale_probe_at.is_some_and(|at| {
-                            now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF
-                        }),
-                        entry.both_stale_confirmed,
-                    ),
-                    None => (false, false),
-                };
+                let (probed_inside_window, confirmed_before, confirmed_inside_window) =
+                    match map.get(&peer) {
+                        Some(entry) => (
+                            entry.both_stale_probe_at.is_some_and(|at| {
+                                now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF
+                            }),
+                            entry.both_stale_confirmed,
+                            entry.both_stale_confirmed
+                                && entry.both_stale_confirmed_at.is_some_and(|at| {
+                                    now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF
+                                }),
+                        ),
+                        None => (false, false, false),
+                    };
+                if confirmed_inside_window {
+                    degraded.push(peer);
+                }
                 if probed_inside_window {
-                    if confirmed_before {
-                        degraded.push(peer);
-                    }
                     continue;
                 }
                 // Other peers' traffic gates the first probe of a quiet
-                // peer. A peer the last probe named broken stays watched
-                // when that traffic stops, so a known failure cannot leave
-                // the health view.
-                if candidates.contains(&index) || confirmed_before {
+                // peer. A peer a probe once named broken stays watched
+                // when that traffic stops, so a known failure cannot hide
+                // from the view, but only a confirming probe degrades it.
+                if candidate_flows(index) || confirmed_before {
                     to_probe.push(peer);
+                    if map
+                        .get(&peer)
+                        .is_some_and(|entry| entry.both_stale_probe_at.is_some())
+                    {
+                        previously_probed.insert(peer);
+                    }
                 }
             }
         }
-        // One tick probes at most this many peers, so a large quiet set
-        // cannot spend the whole tick on probes.
+        // One tick probes at most this many peers, never-probed candidates
+        // first, so a large quiet set cannot starve its tail and cannot
+        // spend the whole tick on probes.
+        to_probe.sort_by_key(|peer| previously_probed.contains(peer));
         to_probe.truncate(ONE_SIDED_PROBES_PER_TICK);
         if !to_probe.is_empty() {
             // ant-quic's own probe bound starts at the reply wait. The
@@ -11017,53 +11069,64 @@ mod tests {
         assert!(!confirms(ant_quic::NodeError::ShuttingDown));
     }
 
-    /// #1419: an inconclusive probe outcome keeps the earlier verdict, so
-    /// a confirmed failure cannot leave the degraded set on a busy
-    /// endpoint, and a quiet peer stays unconfirmed.
+    /// #1419: an inconclusive probe extends no confirmation. The sticky
+    /// flag survives, but the confirmation keeps its own timestamp, so
+    /// once it leaves the window the peer is neither degraded nor
+    /// re-dialled on the inconclusive evidence alone.
     #[test]
-    fn both_stale_probe_outcome_keeps_the_earlier_verdict_when_inconclusive() {
+    fn both_stale_inconclusive_probe_extends_no_confirmation() {
         use ant_quic::EndpointError;
-        let now = Instant::now();
-        let confirmed = || OneSidedRepair {
-            warned: true,
-            both_stale_probe_at: Some(now),
-            both_stale_confirmed: true,
-            ..OneSidedRepair::default()
+        let t0 = Instant::now();
+        let stale = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(90)),
+            received_ago: Some(Duration::from_secs(90)),
         };
-        let mut entry = confirmed();
+        let peer = test_ant_peer(1);
+        let samples = [LinkAgeSample { peer, age: stale }];
+        let mut map = std::collections::HashMap::new();
+
         apply_one_sided_probe(
-            &mut entry,
-            now,
+            map.entry(peer).or_default(),
+            t0,
+            &Err(ant_quic::NodeError::Endpoint(EndpointError::ProbeTimeout)),
+        );
+        assert_eq!(
+            plan_one_sided_repairs(&mut map, &samples, t0),
+            vec![peer],
+            "a confirming probe inside the window re-dials"
+        );
+
+        let t1 = t0 + Duration::from_secs(50);
+        apply_one_sided_probe(
+            map.get_mut(&peer).expect("entry"),
+            t1,
             &Err(ant_quic::NodeError::Endpoint(
                 EndpointError::ProbeOverBudget,
             )),
         );
         assert!(
-            entry.both_stale_confirmed,
-            "a busy endpoint keeps the confirmed failure degraded"
+            map[&peer].both_stale_confirmed,
+            "the sticky flag survives a busy endpoint"
         );
-        assert_eq!(entry.both_stale_probe_at, Some(now), "the window restarts");
-
-        let mut entry = confirmed();
-        apply_one_sided_probe(
-            &mut entry,
-            now,
-            &Err(ant_quic::NodeError::Endpoint(EndpointError::ProbeTimeout)),
+        assert_eq!(
+            map[&peer].both_stale_confirmed_at,
+            Some(t0),
+            "an inconclusive probe extends no confirmation"
         );
-        assert!(entry.both_stale_confirmed, "a timeout re-confirms");
-        apply_one_sided_probe(&mut entry, now, &Ok(Duration::ZERO));
-        assert!(!entry.both_stale_confirmed, "a success clears");
 
-        let mut entry = OneSidedRepair::default();
-        apply_one_sided_probe(
-            &mut entry,
-            now,
-            &Err(ant_quic::NodeError::Endpoint(EndpointError::NotSupported)),
+        let t2 = t0 + Duration::from_secs(70);
+        assert!(
+            plan_one_sided_repairs(&mut map, &samples, t2).is_empty(),
+            "inconclusive evidence alone does not re-dial"
         );
         assert!(
-            !entry.both_stale_confirmed,
-            "an unsupported peer stays unconfirmed"
+            map.contains_key(&peer),
+            "the probe cooldown keeps the entry"
         );
+
+        apply_one_sided_probe(map.get_mut(&peer).expect("entry"), t2, &Ok(Duration::ZERO));
+        assert!(!map[&peer].both_stale_confirmed, "a success clears");
+        assert_eq!(map[&peer].both_stale_confirmed_at, None);
     }
 
     /// #1419: a confirmed both-stale episode warns once across passes, an
@@ -11092,6 +11155,7 @@ mod tests {
                 warned: true,
                 both_stale_probe_at: Some(now),
                 both_stale_confirmed: true,
+                both_stale_confirmed_at: Some(now),
                 scheduler_cancel: None,
             },
         );
@@ -11131,6 +11195,7 @@ mod tests {
                 warned: false,
                 both_stale_probe_at: Some(now),
                 both_stale_confirmed: false,
+                both_stale_confirmed_at: None,
                 scheduler_cancel: None,
             },
         );
@@ -11451,12 +11516,18 @@ mod tests {
             "the failed liveness probe degrades the both-directions-stale link"
         );
 
-        // Every peer now goes quiet together. B stays a known failure and
-        // is probed again once the window ends; C, never confirmed, is not
-        // probed at all on a quiet node.
+        // Every peer now goes quiet together. The confirmation inside its
+        // window keeps B degraded without a new probe; C, never confirmed,
+        // is not probed at all on a quiet node.
         tokio::time::sleep(ONE_SIDED_STALE + Duration::from_secs(10)).await;
         let quiet_samples = a.connected_link_ages().await;
+        let probes_before = a.one_sided_probes.load(Ordering::Relaxed);
         let still_degraded = a.resolve_one_sided_peers(&quiet_samples).await;
+        assert_eq!(
+            a.one_sided_probes.load(Ordering::Relaxed),
+            probes_before,
+            "the confirmation inside its window lists B without a new probe"
+        );
         assert_eq!(
             still_degraded,
             vec![peer_b],
