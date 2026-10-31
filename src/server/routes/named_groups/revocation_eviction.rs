@@ -937,6 +937,38 @@ pub(in crate::server) async fn seal_probe_for_test(
     )
 }
 
+/// W3-H (#1581, test builds only): the S4 commit gate's own inputs for
+/// `target_hex` in `group_id`, read atomically under one `inner` lock
+/// with one `now`: the row's phase and the live monotonic budget elapsed
+/// since T_obs — the same elapsed the commit permission compares with the
+/// rank's fallback offset. `None` when this node holds no row for the
+/// target. Read-only; changes nothing.
+#[cfg(test)]
+pub(in crate::server) async fn s4_gate_probe_for_test(
+    state: &AppState,
+    group_key: &str,
+    target_hex: &str,
+) -> Option<(String, Option<u64>)> {
+    let stable = {
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, group_key)
+            .map(|(_, info)| info.stable_group_id().to_string())
+    }?;
+    let target = super::parse_agent_id_hex(target_hex).ok()?;
+    let key = EvictionKey::new(stable, *target.as_bytes());
+    let now = Instant::now();
+    let inner = state.revocation_evictions.inner.lock().await;
+    let phase = inner
+        .store
+        .get(&key)
+        .map(|row| row.phase.as_str().to_string())?;
+    let elapsed_ms = inner
+        .budgets
+        .get(&key)
+        .map(|budget| s4::duration_ms(budget.elapsed(now)));
+    Some((phase, elapsed_ms))
+}
+
 /// §2: the catch-up response handler calls this for each verified,
 /// applied, non-truncated catch-up page, with or without the responder's
 /// saved head (`responder_state_hash`). The handler checked the sender

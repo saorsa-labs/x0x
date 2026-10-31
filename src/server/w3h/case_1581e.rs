@@ -106,7 +106,7 @@ use super::control::{create_group, invite, join, members, mesh};
 use super::home::membership_state;
 use super::receipt::{Receipt, Verdict};
 use super::*;
-use crate::groups::eviction::S4Timing;
+use crate::groups::eviction::{duration_ms, S4Timing};
 use anyhow::{ensure, Context as _};
 use base64::Engine as _;
 use serde_json::json;
@@ -133,6 +133,9 @@ const CAUSE_EARLY_FALLBACK: &str = "A's fallback committed the exclusion before 
                                     waiting out the designated window";
 const CAUSE_LEAKED_COMMIT: &str = "A's exclusion reached B or C before the crash: the blackout \
                                    did not cover the publication, so no fork exists to contain";
+const CAUSE_REMOVE_REPLY: &str = "A's manual remove was not answered by the typed 202 queue: no \
+                                  waiting_for_designated_admin naming the designated D with \
+                                  local_rank 1";
 const CAUSE_NO_D_COMMIT: &str = "D never committed the competing exclusion while A was down: D \
                                  and C did not reach H signed by D after D's restart";
 const CAUSE_NO_TYPED_FORK: &str = "no typed waiting_for_fork_resolution: after D's competing \
@@ -471,6 +474,24 @@ async fn seal_probe(sim: &Sim, label: &str, group: &str, target_hex: &str) -> Re
     let state = sim.state(label)?;
     Ok(
         crate::server::routes::named_groups::s4_seal_probe_for_test(&state, group, target_hex)
+            .await,
+    )
+}
+
+/// The production S4 commit gate for `target` on `label`, read atomically
+/// under one lock: the row phase and the live monotonic budget elapsed
+/// since T_obs — the same elapsed the commit permission compares with W
+/// (read-only; no public API exposes the budget). `None` when `label`
+/// holds no row for the target.
+async fn gate_probe(
+    sim: &Sim,
+    label: &str,
+    group: &str,
+    target_hex: &str,
+) -> Result<Option<(String, Option<u64>)>> {
+    let state = sim.state(label)?;
+    Ok(
+        crate::server::routes::named_groups::s4_gate_probe_for_test(&state, group, target_hex)
             .await,
     )
 }
@@ -858,48 +879,86 @@ async fn scenario(
 
     // A's manual remove of the S4 target, as the rank-1 admin inside the
     // window: queued with the typed wait naming the down designated D.
+    // The whole reply is a premise of both arms — the automatic eviction
+    // could finish the scenario without a working manual-remove route —
+    // so the status, the cause, the designated D and A's rank 1 are all
+    // asserted: a broken route fails the row instead of hiding behind the
+    // fork arm's RED cause.
     let deadline = t0.saturating_add(w.saturating_add(timing.completion_bound));
     let (rm_status, rm_body, rm_retries) =
         remove_retrying(sim, "A", &group, &b_hex, deadline).await?;
-    let queued_typed = rm_body["waiting"]["cause"].as_str() == Some("waiting_for_designated_admin")
+    let queued_typed = rm_status == StatusCode::ACCEPTED
+        && rm_body["waiting"]["cause"].as_str() == Some("waiting_for_designated_admin")
         && rm_body["waiting"]["designated_admin"]
             .as_str()
-            .is_some_and(|named| named.eq_ignore_ascii_case(&d_hex));
-    // A premise of the arm, recorded as evidence so its failure is INFRA,
+            .is_some_and(|named| named.eq_ignore_ascii_case(&d_hex))
+        && rm_body["waiting"]["local_rank"].as_u64() == Some(1);
+    // A premise of the arms, recorded as evidence so its failure is INFRA,
     // not a RED the gate's expected-verdict pin would satisfy.
     receipt.evidence(
         "a_manual_remove_queues_typed_naming_the_down_designated",
         queued_typed,
-        format!("A DELETE members/{b_hex}: {rm_status} {rm_body} ({rm_retries} typed 424 retries)"),
+        format!(
+            "A DELETE members/{b_hex}: {rm_status} {rm_body} ({rm_retries} typed 424 retries); \
+             want 202 waiting_for_designated_admin, designated D, local_rank 1"
+        ),
         at(sim),
     );
     let remove_reply = format!(
         "A DELETE members/{b_hex}: {rm_status} {rm_body} ({rm_retries} typed 424 retries); the \
-         typed queue names the down designated D: {queued_typed}"
+         typed 202 queue names the down designated D with local_rank 1: {queued_typed}"
     );
 
     // A's rank-1 fallback commits the exclusion at T_obs + W: durable on
     // A (its public row `committed_delivery_pending`, its epoch e0 + 1,
     // its head committed by A) while its publication dies in the
-    // blackout. The commit must not precede the window.
+    // blackout. The commit must not precede the window, and the window is
+    // A's own: every poll reads the gate's ruler — the live monotonic
+    // budget since T_obs, the same elapsed the commit permission compares
+    // with W, read with the row phase under one lock — so a sighting of
+    // the committed row while the budget is still short of W is early by
+    // the server's own arithmetic, whatever the delivery delay from B's
+    // request was. The poll tightens from 100 ms to 2 ms through the
+    // window's edge (±250 ms), so the coarse cadence cannot hide a small
+    // early commit; what remains is the paused clock's own 1 ms step.
     let mut a_commit_at: Option<Duration> = None;
+    let mut early: Option<String> = None;
+    let w_ms = duration_ms(w);
+    let mut fine = false;
+    let watched = &*sim;
     let waited = sim
-        .until(
-            "A's fallback commits into the blackout",
-            FALLBACK,
-            async |s: &Sim| {
-                let committed = matches!(
-                    s4_row(s, "A", &group, &b_hex).await,
-                    Ok(Some(row)) if row["phase"].as_str() == Some("committed_delivery_pending")
-                ) && try_view_now(s, "A", &group, &b).await.is_ok_and(|seen| {
-                    seen.is_some_and(|seen| seen.epoch == Some(e0 + 1) && !seen.lists_b)
-                });
-                if committed && a_commit_at.is_none() {
-                    a_commit_at = Some(s.fabric().now().saturating_sub(t0));
+        .within("A's fallback commits into the blackout", FALLBACK, async {
+            loop {
+                if let Ok(Some((phase, elapsed_ms))) =
+                    gate_probe(watched, "A", &group, &b_hex).await
+                {
+                    if phase == "committed_delivery_pending"
+                        && elapsed_ms.is_some_and(|elapsed| elapsed < w_ms)
+                        && early.is_none()
+                    {
+                        early = Some(format!(
+                            "the row was committed_delivery_pending at {elapsed_ms:?} ms of \
+                                 budget since T_obs, short of W ({w_ms} ms)"
+                        ));
+                    }
+                    fine = matches!(elapsed_ms, Some(elapsed)
+                            if elapsed + 250 >= w_ms && elapsed <= w_ms.saturating_add(250));
                 }
-                committed
-            },
-        )
+                let committed = matches!(
+                    s4_row(watched, "A", &group, &b_hex).await,
+                    Ok(Some(row)) if row["phase"].as_str() == Some("committed_delivery_pending")
+                ) && try_view_now(watched, "A", &group, &b).await.is_ok_and(
+                    |seen| seen.is_some_and(|seen| seen.epoch == Some(e0 + 1) && !seen.lists_b),
+                );
+                if committed {
+                    if a_commit_at.is_none() {
+                        a_commit_at = Some(watched.fabric().now().saturating_sub(t0));
+                    }
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(if fine { 2 } else { 100 })).await;
+            }
+        })
         .await;
     if let Err(error) = waited {
         if !expired(&error) {
@@ -920,16 +979,22 @@ async fn scenario(
         && a_row_committed
             .as_ref()
             .is_some_and(|row| row["phase"].as_str() == Some("committed_delivery_pending"));
-    let not_early = a_commit_at.is_some_and(|at| at >= w);
+    let not_early = early.is_none();
     receipt.evidence(
         "a_commits_durably_into_the_blackout",
         durable && not_early && blackout.dropped() > 0,
         format!(
             "A at the crash window: {}; A's public row for B: {a_row_committed:?}; first durable \
-             commit {:?} after t=0 (W is {w:?}, so the window was waited out: {not_early}); \
-             blackout dropped {} frames from A toward B/C",
+             commit {:?} after t=0 (W is {w:?}); every committed sighting held at least {} ms of \
+             budget since T_obs, so the window was waited out: {not_early}{}; blackout dropped {} \
+             frames from A toward B/C",
             a_committed.describe(),
             a_commit_at,
+            w_ms,
+            early
+                .as_ref()
+                .map(|why| format!(" — early sighting: {why}"))
+                .unwrap_or_default(),
             blackout.dropped()
         ),
         at(sim),
@@ -1324,12 +1389,20 @@ async fn scenario(
                 (
                     CAUSE_EARLY_FALLBACK,
                     format!(
-                        "A's first durable commit {a_commit_at:?} after t=0; W is {w:?}; the \
-                         typed queue reply was {remove_reply}"
+                        "early sighting: {}; first durable commit {a_commit_at:?} after t=0; W is \
+                         {w:?}; the typed queue reply was {remove_reply}",
+                        early
+                            .as_deref()
+                            .unwrap_or("a committed sighting held less budget than W since T_obs")
                     ),
                 )
             } else if !others_clean {
                 (CAUSE_LEAKED_COMMIT, describe_all(&others_at_crash))
+            } else if !queued_typed {
+                (
+                    CAUSE_REMOVE_REPLY,
+                    format!("A DELETE members/{b_hex}: {rm_status} {rm_body}"),
+                )
             } else if !excluded(&end, e0, leaves0) || !signed_by_d || !d_row_complete {
                 (
                     CAUSE_NO_D_COMMIT,
@@ -1401,6 +1474,7 @@ async fn scenario(
         let passed = durable
             && not_early
             && others_clean
+            && queued_typed
             && converged
             && a_done
             && once
@@ -1421,12 +1495,20 @@ async fn scenario(
                 (
                     CAUSE_EARLY_FALLBACK,
                     format!(
-                        "A's first durable commit {a_commit_at:?} after t=0; W is {w:?}; the \
-                         typed queue reply was {remove_reply}"
+                        "early sighting: {}; first durable commit {a_commit_at:?} after t=0; W is \
+                         {w:?}; the typed queue reply was {remove_reply}",
+                        early
+                            .as_deref()
+                            .unwrap_or("a committed sighting held less budget than W since T_obs")
                     ),
                 )
             } else if !others_clean {
                 (CAUSE_LEAKED_COMMIT, describe_all(&others_at_crash))
+            } else if !queued_typed {
+                (
+                    CAUSE_REMOVE_REPLY,
+                    format!("A DELETE members/{b_hex}: {rm_status} {rm_body}"),
+                )
             } else if sibling.is_some() {
                 (CAUSE_SIBLING_PUBLISHED, sibling.unwrap_or_default())
             } else if second_rotation.is_some() {
@@ -1448,7 +1530,10 @@ async fn scenario(
             // arm's own outcome causes classify RED.
             let premise = matches!(
                 cause,
-                CAUSE_NO_DURABLE_COMMIT | CAUSE_EARLY_FALLBACK | CAUSE_LEAKED_COMMIT
+                CAUSE_NO_DURABLE_COMMIT
+                    | CAUSE_EARLY_FALLBACK
+                    | CAUSE_LEAKED_COMMIT
+                    | CAUSE_REMOVE_REPLY
             );
             receipt.cause(cause, Some(observed), !premise, at(sim));
         }
