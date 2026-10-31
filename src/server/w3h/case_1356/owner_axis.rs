@@ -331,9 +331,29 @@ fn member_added_mandates(
     Ok(found)
 }
 
-/// H-S3-c, or with `both` H-S3-c2 (ADR 0109 §10). Each candidate step is a
-/// named sub-check; a red run lists the ones that fail.
-async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result<()> {
+/// What the shared H-S3-c prefix leaves for a row: J on X's fork r+1′ with
+/// its gap gate armed, and the fabric hold still in place.
+struct Prefix {
+    group: String,
+    j_hex: String,
+    /// O's head when invite I was minted (r).
+    minted: View,
+    /// X's r+1′ head, which J holds.
+    fork: View,
+    /// The fabric write index when J redeemed invite I.
+    joined_at: usize,
+    /// While set, every write that O originates is held from J (H-S3-c).
+    o_to_j_held: Arc<std::sync::atomic::AtomicBool>,
+    /// O's held r+1 gossip writes to J after r+1′.
+    held_to_j: Arc<std::sync::atomic::AtomicUsize>,
+    /// H-S3-c2: re-published canonical r+1 frames delivered to J.
+    canonical: usize,
+}
+
+/// The H-S3-c setup up to J on X's fork r+1′ (ADR 0109 §10), shared by the
+/// owner-axis rows; with `both`, H-S3-c2's canonical r+1 also reaches J.
+/// `None` when a prerequisite is missing: the receipt is then finished.
+async fn fork_prefix(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result<Option<Prefix>> {
     let owner = crate::identity::UserKeypair::from_seed(&[0x13; 32])?;
     start_certified(sim, "O", &owner, true).await?;
     for label in ["A", "X", "J"] {
@@ -693,8 +713,46 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         receipt.note(format!("WARN logs since J's join: {}", logs.join(" | ")));
         receipt.note("J's gate did not arm before the window: the row's prerequisite is missing");
         receipt.finish(FINAL_C, false, at(sim));
-        return Ok(());
+        return Ok(None);
     }
+    Ok(Some(Prefix {
+        group,
+        j_hex,
+        minted,
+        fork,
+        joined_at,
+        o_to_j_held,
+        held_to_j,
+        canonical,
+    }))
+}
+
+/// J's recovery over H-S3-c's gate window, and the row's main observation.
+struct Advanced {
+    j_status: Option<Status>,
+    /// J's record after the window.
+    j1: View,
+    states: Vec<String>,
+    typed: bool,
+    refs_ok: bool,
+    unchanged: bool,
+    kind: Option<String>,
+    baseline: bool,
+}
+
+/// H-S3-c's "Advance 30 min" on `p`: J must show `reseat_required
+/// {not_on_chain, ..}`, unchanged to the end. `None` when H-S3-c2's
+/// prerequisite is missing: the receipt is then finished.
+async fn advance(
+    sim: &mut Sim,
+    receipt: &mut Receipt,
+    p: &Prefix,
+    both: bool,
+) -> Result<Option<Advanced>> {
+    let Prefix {
+        fork, held_to_j, ..
+    } = p;
+    let (group, joined_at, canonical) = (p.group.clone(), p.joined_at, p.canonical);
 
     // The advance: J's recovery states, sampled each poll. A failed read
     // stops the window and the row is INFRA.
@@ -737,7 +795,7 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         if !held {
             receipt.note("J lacks the marker or the gap record: the row's prerequisite is missing");
             receipt.finish(FINAL_C, false, at(sim));
-            return Ok(());
+            return Ok(None);
         }
     }
     let typed = j_status.as_ref().is_some_and(|st| {
@@ -783,7 +841,146 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
         j1.describe(),
         held_to_j.load(std::sync::atomic::Ordering::SeqCst)
     ));
+    Ok(Some(Advanced {
+        j_status,
+        j1,
+        states,
+        typed,
+        refs_ok,
+        unchanged,
+        kind,
+        baseline,
+    }))
+}
 
+/// A's or O's re-seat of J and what followed it.
+struct Swap {
+    code: StatusCode,
+    /// The first sample in which J left containment before the swap.
+    early_active: Option<String>,
+    /// The issuer's head after the re-seat.
+    head: View,
+    j2: Option<View>,
+    membership: Option<String>,
+    /// `MemberAdded(J)` writes from the issuer, and whether any carried a
+    /// `reseat_mandate` or an `owner_mandate`.
+    adds: usize,
+    reseat_mandate: bool,
+    owner_mandate: bool,
+    /// The re-seat invite the issuer stored, read right after the call
+    /// (the issuer prunes it once J is seated).
+    invite: Option<crate::groups::invite::SignedInvite>,
+}
+
+/// `issuer` calls the re-seat route for J with basis `Removal(j_removal)`;
+/// J's live record is sampled until the keyed swap (ADR 0109 §3), each
+/// sample checked against J's record after the advance.
+async fn reseat_and_swap(
+    sim: &Sim,
+    receipt: &mut Receipt,
+    p: &Prefix,
+    adv: &Advanced,
+    issuer: &str,
+    j_removal: &View,
+) -> Result<Swap> {
+    let (group, j_hex) = (p.group.clone(), p.j_hex.clone());
+    let (j1, j_status) = (&adv.j1, &adv.j_status);
+    let cut = sim.fabric().writes().len();
+    let path = format!("/groups/{group}/members/{j_hex}/reseat");
+    let (reseat_code, answer) = sim
+        .api(issuer, Method::POST, &path, Some(reseat_body(j_removal)))
+        .await?;
+    let invite = issued_invite(sim, issuer, &j_hex)?;
+    // Contained until the keyed swap (ADR 0109 §3): every sample is checked.
+    let base_membership = j_status.as_ref().and_then(|st| st.membership.clone());
+    let mut early_active = None;
+    let mut seen = Observations::default();
+    let waited = sim
+        .until("J is re-seated", RESEAT_BOUND, async |s: &Sim| {
+            let Some(jv) = seen.observe(try_view_now(s, "J", &group)).await else {
+                return true;
+            };
+            // No call on J's API until the swap (the row's "with no call on
+            // J's API"): see [`membership_now`].
+            let Some(membership) = seen.observe(membership_now(s, "J", &group)).await else {
+                return true;
+            };
+            let Some(again) = seen.observe(try_view_now(s, "J", &group)).await else {
+                return true;
+            };
+            // The issuer is read after J, so a swapped J never meets an older head.
+            let Some(a) = seen.observe(view_now(s, issuer, &group)).await else {
+                return true;
+            };
+            if !same_record(jv.as_ref(), again.as_ref()) {
+                return false; // J moved between its reads: no consistent sample.
+            }
+            let membership = membership.as_deref();
+            let sample = (jv.as_ref(), membership);
+            let base = (j1, base_membership.as_deref());
+            match staging(sample, &a, base, j_removal.state_revision) {
+                Staging::Swapped => true,
+                Staging::Contained => false,
+                Staging::Breach => {
+                    early_active.get_or_insert_with(|| {
+                        let j = jv
+                            .as_ref()
+                            .map_or_else(|| "no record".into(), View::describe);
+                        format!("J {j} membership {membership:?}; A {}", a.describe())
+                    });
+                    false
+                }
+            }
+        })
+        .await;
+    if let Err(error) = waited {
+        ensure!(expired(&error), error);
+    }
+    seen.verify("J is re-seated")?;
+    let head = view(sim, issuer, &group).await?;
+    let j2 = sim
+        .at_instant("read J's group", try_view_now(sim, "J", &group))
+        .await??;
+    // The probe, not `GET /groups/:id`: with no swap J is still in staging,
+    // and the GET does not return in one virtual instant there.
+    let membership = sim
+        .at_instant("read J's membership", membership_now(sim, "J", &group))
+        .await??;
+    let (adds, reseat_mandate, owner_mandate) = member_added_mandates(sim, cut, issuer, "J")?;
+    let j2_text = j2
+        .as_ref()
+        .map_or_else(|| "no record".to_string(), View::describe);
+    receipt.note(format!(
+        "reseat by {issuer} {reseat_code} {answer}; J removed at {}; {issuer} {}; J {j2_text}; J \
+         membership {membership:?}; {issuer}'s MemberAdded(J) writes {adds} reseat_mandate \
+         {reseat_mandate} owner_mandate {owner_mandate}; J membership after the advance \
+         {base_membership:?}; early_active={early_active:?}",
+        j_removal.state_revision,
+        head.describe()
+    ));
+    Ok(Swap {
+        code: reseat_code,
+        early_active,
+        head,
+        j2,
+        membership,
+        adds,
+        reseat_mandate,
+        owner_mandate,
+        invite,
+    })
+}
+
+/// H-S3-c, or with `both` H-S3-c2 (ADR 0109 §10). Each candidate step is a
+/// named sub-check; a red run lists the ones that fail.
+async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result<()> {
+    let Some(p) = fork_prefix(sim, receipt, both).await? else {
+        return Ok(());
+    };
+    let Some(adv) = advance(sim, receipt, &p, both).await? else {
+        return Ok(());
+    };
+    let (group, j_hex, o_to_j_held) = (p.group.clone(), p.j_hex.clone(), &p.o_to_j_held);
     // The capability floor: A holds O's current mandate advert, then O stops.
     let o_agent = sim.ids("O")?.0;
     let bit = crate::dm::CapabilityRegistry::GROUP_RESEAT_MANDATE_V1;
@@ -819,123 +1016,24 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
     })
     .await?;
     let j_removal = view(sim, "A", &group).await?;
-    let cut = sim.fabric().writes().len();
-    let path = format!("/groups/{group}/members/{j_hex}/reseat");
-    let (reseat_code, answer) = sim
-        .api("A", Method::POST, &path, Some(reseat_body(&j_removal)))
-        .await?;
-    // Contained until the keyed swap (ADR 0109 §3): every sample is checked.
-    let base_membership = j_status.as_ref().and_then(|st| st.membership.clone());
-    let mut early_active = None;
-    let mut seen = Observations::default();
-    let waited = sim
-        .until("J is re-seated", RESEAT_BOUND, async |s: &Sim| {
-            let Some(jv) = seen.observe(try_view_now(s, "J", &group)).await else {
-                return true;
-            };
-            // No call on J's API until the swap (the row's "with no call on
-            // J's API"): see [`membership_now`].
-            let Some(membership) = seen.observe(membership_now(s, "J", &group)).await else {
-                return true;
-            };
-            let Some(again) = seen.observe(try_view_now(s, "J", &group)).await else {
-                return true;
-            };
-            // A is read after J, so a swapped J never meets an older A head.
-            let Some(a) = seen.observe(view_now(s, "A", &group)).await else {
-                return true;
-            };
-            if !same_record(jv.as_ref(), again.as_ref()) {
-                return false; // J moved between its reads: no consistent sample.
-            }
-            let membership = membership.as_deref();
-            let sample = (jv.as_ref(), membership);
-            let base = (&j1, base_membership.as_deref());
-            match staging(sample, &a, base, j_removal.state_revision) {
-                Staging::Swapped => true,
-                Staging::Contained => false,
-                Staging::Breach => {
-                    early_active.get_or_insert_with(|| {
-                        let j = jv
-                            .as_ref()
-                            .map_or_else(|| "no record".into(), View::describe);
-                        format!("J {j} membership {membership:?}; A {}", a.describe())
-                    });
-                    false
-                }
-            }
-        })
-        .await;
-    if let Err(error) = waited {
-        ensure!(expired(&error), error);
-    }
-    seen.verify("J is re-seated")?;
-    let head = view(sim, "A", &group).await?;
-    let j2 = sim
-        .at_instant("read J's group", try_view_now(sim, "J", &group))
-        .await??;
-    // The probe, not `GET /groups/:id`: with no swap J is still in staging,
-    // and the GET does not return in one virtual instant there.
-    let membership = sim
-        .at_instant("read J's membership", membership_now(sim, "J", &group))
-        .await??;
-    let (adds, reseat_mandate, owner_mandate) = member_added_mandates(sim, cut, "A", "J")?;
-    let j2_text = j2
-        .as_ref()
-        .map_or_else(|| "no record".to_string(), View::describe);
-    receipt.note(format!(
-        "reseat {reseat_code} {answer}; A removed J at {}; A {}; J {j2_text}; J membership \
-         {membership:?}; A's MemberAdded(J) writes {adds} reseat_mandate {reseat_mandate} \
-         owner_mandate {owner_mandate}",
-        j_removal.state_revision,
-        head.describe()
-    ));
-    let mut checks: Vec<(&str, bool)> = vec![
-        (
-            "j_gate_still_armed_after_the_advance",
-            j1.gap_refusal.is_some(),
-        ),
-        ("j_typed_reseat_required_not_on_chain", typed),
-        (
-            if both {
-                "j_holds_marker_and_gap_ref_named"
-            } else {
-                "ref_kind_gap"
-            },
-            refs_ok,
-        ),
-        ("typed_state_unchanged_to_the_end_of_the_advance", unchanged),
-        (
-            "j_contained_on_x_fork_after_the_advance",
-            j1.state_hash == fork.state_hash,
-        ),
+    let swap = reseat_and_swap(sim, receipt, &p, &adv, "A", &j_removal).await?;
+    let mut checks = advance_checks(&p, &adv, both);
+    checks.extend([
         ("a_holds_o_mandate_advert_before_o_stops", floor),
         (
             "reseat_route_accepts_with_owner_offline",
-            reseat_code.is_success(),
+            swap.code.is_success(),
         ),
-        (
-            "a_reseat_head_at_r_plus_4",
-            head.state_revision == minted.state_revision + 4,
-        ),
-        ("member_added_carries_reseat_mandate", reseat_mandate),
+        ("member_added_carries_reseat_mandate", swap.reseat_mandate),
         (
             "member_added_carries_no_owner_mandate",
-            adds > 0 && !owner_mandate,
+            swap.adds > 0 && !swap.owner_mandate,
         ),
-        ("j_contained_until_the_keyed_swap", early_active.is_none()),
-        (
-            "j_active_with_keys_at_a_head_and_epoch",
-            caught_up(j2.as_ref(), &head, membership.as_deref()),
-        ),
-        (
-            "j_marker_and_gap_record_retired",
-            j2.as_ref()
-                .is_some_and(|v| v.marker.is_none() && v.gap_refusal.is_none()),
-        ),
-    ];
+    ]);
+    checks.extend(swap_checks(&p, &swap));
     // Restart O after the swap; O applies it and O's next rename applies.
     sim.start_again("O").await?;
+    let head = &swap.head;
     let o_applies = reaches(sim, "O", &group, &head.state_hash, SETUP).await;
     checks.push(("restarted_o_applies_the_reseat", o_applies));
     let mut rename_applies = false;
@@ -946,24 +1044,200 @@ async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Resul
             && reaches(sim, "J", &group, &o_head.state_hash, SETUP).await;
     }
     checks.push(("a_and_j_apply_o_next_rename", rename_applies));
+    let red = adv.baseline || swap.early_active.is_some();
+    settle(sim, receipt, (FINAL_C, CAUSE_C), &adv, &swap, &checks, red);
+    Ok(())
+}
+
+/// The advance's sub-checks, shared by the owner-axis rows.
+fn advance_checks(p: &Prefix, adv: &Advanced, both: bool) -> Vec<(&'static str, bool)> {
+    let refs = match both {
+        true => "j_holds_marker_and_gap_ref_named",
+        false => "ref_kind_gap",
+    };
+    vec![
+        (
+            "j_gate_still_armed_after_the_advance",
+            adv.j1.gap_refusal.is_some(),
+        ),
+        ("j_typed_reseat_required_not_on_chain", adv.typed),
+        (refs, adv.refs_ok),
+        (
+            "typed_state_unchanged_to_the_end_of_the_advance",
+            adv.unchanged,
+        ),
+        (
+            "j_contained_on_x_fork_after_the_advance",
+            adv.j1.state_hash == p.fork.state_hash,
+        ),
+    ]
+}
+
+/// The keyed swap's sub-checks: J stays contained until the swap, then is
+/// Active with keys at the issuer's r+4 head, with its records retired.
+fn swap_checks(p: &Prefix, swap: &Swap) -> Vec<(&'static str, bool)> {
+    vec![
+        (
+            "reseat_head_at_r_plus_4",
+            swap.head.state_revision == p.minted.state_revision + 4,
+        ),
+        (
+            "j_contained_until_the_keyed_swap",
+            swap.early_active.is_none(),
+        ),
+        (
+            "j_active_with_keys_at_the_issuer_head_and_epoch",
+            caught_up(swap.j2.as_ref(), &swap.head, swap.membership.as_deref()),
+        ),
+        (
+            "j_marker_and_gap_record_retired",
+            swap.j2
+                .as_ref()
+                .is_some_and(|v| v.marker.is_none() && v.gap_refusal.is_none()),
+        ),
+    ]
+}
+
+/// Notes the row's sub-checks and concludes it under `(last, cause)`.
+fn settle(
+    sim: &Sim,
+    receipt: &mut Receipt,
+    (last, cause): (&str, &str),
+    adv: &Advanced,
+    swap: &Swap,
+    checks: &[(&str, bool)],
+    red: bool,
+) {
     let failing: Vec<&str> = checks
         .iter()
         .filter(|(_, ok)| !ok)
         .map(|(n, _)| *n)
         .collect();
-    receipt.note(format!(
-        "sub-checks {checks:?}; ref_kind={kind:?}; J membership after the advance \
-         {base_membership:?}; early_active={early_active:?}"
-    ));
+    receipt.note(format!("sub-checks {checks:?}; ref_kind={:?}", adv.kind));
+    let j2_text = swap
+        .j2
+        .as_ref()
+        .map_or_else(|| "no record".to_string(), View::describe);
     let observed = format!(
-        "failing {failing:?}; J after the advance {}; states {states:?}; reseat {reseat_code}; \
-         A {}; J {j2_text}",
-        j1.describe(),
-        head.describe()
+        "failing {failing:?}; J after the advance {}; states {:?}; reseat {}; issuer {}; J \
+         {j2_text}",
+        adv.j1.describe(),
+        adv.states,
+        swap.code,
+        swap.head.describe()
     );
-    let red = baseline || early_active.is_some();
-    conclude(receipt, &failing, observed, red, at(sim));
+    conclude_row(receipt, (last, cause), &failing, observed, red, at(sim));
+}
+
+// ─── H-S3-c3 ──────────────────────────────────────────────────────────────
+
+const FINAL_C3: &str = "owner_reseats_j_with_a_countersigned_invite_and_its_owner_mandate";
+const CAUSE_C3: &str = "the row's main observation: O's re-seat route returns 404 (no S3 \
+                        re-seat); or J leaves containment before the keyed swap (ADR 0109 \
+                        §3); `observed` lists each failing step";
+
+/// H-S3-c3 (owner path): H-S3-c with O online throughout. O removes J
+/// (r+3) and calls reseat with basis `Removal(r+3)`.
+async fn owner_path_reseat(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+    let Some(p) = fork_prefix(sim, receipt, false).await? else {
+        return Ok(());
+    };
+    let Some(adv) = advance(sim, receipt, &p, false).await? else {
+        return Ok(());
+    };
+    let (group, j_hex) = (&p.group, &p.j_hex);
+    // O stays online, so its direct writes to J pass from here (the re-seat
+    // needs them). O's held r+1 and r+2 gossip IDs stay held from J.
+    p.o_to_j_held
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    sim.fabric().mark("fault: O's direct writes pass to J");
+    let path = format!("/groups/{group}/members/{j_hex}");
+    let (code, body) = sim.api("O", Method::DELETE, &path, None).await?;
+    ensure!(code.is_success(), "O removes J: {code} {body}");
+    sim.until("O no longer lists J", SETUP, async |s: &Sim| {
+        view_now(s, "O", group).await.is_ok_and(|v| !v.lists(j_hex))
+    })
+    .await?;
+    let j_removal = view(sim, "O", group).await?;
+    let swap = reseat_and_swap(sim, receipt, &p, &adv, "O", &j_removal).await?;
+    let invite = &swap.invite;
+    let countersigned = invite.as_ref().is_some_and(|i| {
+        i.version == crate::groups::invite::INVITE_VERSION_V4
+            && i.owner_countersignature_b64.is_some()
+    });
+    receipt.note(format!(
+        "O's issued re-seat invite: version {:?}, owner countersignature {countersigned}",
+        invite.as_ref().map(|i| i.version)
+    ));
+    let mut checks = advance_checks(&p, &adv, false);
+    checks.extend([
+        (
+            "reseat_route_accepts_on_the_owner_path",
+            swap.code.is_success(),
+        ),
+        ("o_mints_an_owner_countersigned_invite_v4", countersigned),
+        (
+            "member_added_carries_owner_mandate",
+            swap.adds > 0 && swap.owner_mandate,
+        ),
+        (
+            "member_added_carries_no_reseat_mandate",
+            !swap.reseat_mandate,
+        ),
+    ]);
+    checks.extend(swap_checks(&p, &swap));
+    let red = swap.code == StatusCode::NOT_FOUND || swap.early_active.is_some();
+    settle(
+        sim,
+        receipt,
+        (FINAL_C3, CAUSE_C3),
+        &adv,
+        &swap,
+        &checks,
+        red,
+    );
     Ok(())
+}
+
+/// The newest re-seat invite `issuer` issued for `subject`, read from the
+/// S3 sidecar files under its data directory. The read is passive, so it
+/// runs while `issuer` is up (`Sim::data_dir` is for stopped nodes).
+fn issued_invite(
+    sim: &Sim,
+    issuer: &str,
+    subject: &str,
+) -> Result<Option<crate::groups::invite::SignedInvite>> {
+    use crate::groups::recovery::{decode_sidecar, GROUP_RECOVERY_EXTENSION};
+    let mut dirs = vec![sim.root.path().join(issuer).join("data")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if path
+                .extension()
+                .is_none_or(|e| e != GROUP_RECOVERY_EXTENSION)
+            {
+                continue;
+            }
+            let Ok(body) = decode_sidecar(&std::fs::read(&path)?) else {
+                continue;
+            };
+            let issued = body
+                .issued_reseats
+                .iter()
+                .rev()
+                .find(|i| i.authorisation.fields.subject == subject);
+            if let Some(issued) = issued {
+                return crate::groups::invite::SignedInvite::from_link(&issued.invite)
+                    .map(Some)
+                    .map_err(|e| anyhow!("{issuer}'s re-seat invite: {e}"));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// `label`'s `membership_state` for `group` (the label `GET /groups/:id`
@@ -996,7 +1270,7 @@ async fn membership_now(sim: &Sim, label: &str, group: &str) -> Result<Option<St
     Ok(Some(membership.to_string()))
 }
 
-/// One staging sample of J's live record, from A's re-seat call on.
+/// One staging sample of J's live record, from the issuer's re-seat call on.
 #[derive(Debug, PartialEq)]
 enum Staging {
     Contained,
@@ -1006,10 +1280,10 @@ enum Staging {
 
 /// ADR 0109 §3: until the keyed swap, J's live record stays as it was
 /// after the advance (`base`: same hash, gate armed, same marker presence,
-/// same membership label). The swap is J Active with keys at A's head past
-/// A's removal of J (`removal`), with the gate retired. Any other sample is
-/// a breach: for example J Active while A is still at the removal
-/// revision, or Active at A's new hash before J has keys.
+/// same membership label). The swap is J Active with keys at the issuer's
+/// head (`a`) past its removal of J (`removal`), with the gate retired. Any
+/// other sample is a breach: for example J Active while the issuer is still
+/// at the removal revision, or Active at its new hash before J has keys.
 fn staging(
     (j, membership): (Option<&View>, Option<&str>),
     a: &View,
@@ -1048,10 +1322,22 @@ fn same_record(one: Option<&View>, two: Option<&View>) -> bool {
 /// RED only with the row's main observation or a staging breach (`red`);
 /// any other failure is INFRA.
 fn conclude(receipt: &mut Receipt, failing: &[&str], observed: String, red: bool, at_us: u128) {
+    conclude_row(receipt, (FINAL_C, CAUSE_C), failing, observed, red, at_us);
+}
+
+/// [`conclude`] for a row with its own final step and RED cause.
+fn conclude_row(
+    receipt: &mut Receipt,
+    (last, cause): (&str, &str),
+    failing: &[&str],
+    observed: String,
+    red: bool,
+    at_us: u128,
+) {
     if !failing.is_empty() {
-        receipt.cause(CAUSE_C, Some(observed), red, at_us);
+        receipt.cause(cause, Some(observed), red, at_us);
     }
-    receipt.finish(FINAL_C, failing.is_empty(), at_us);
+    receipt.finish(last, failing.is_empty(), at_us);
 }
 
 #[derive(Clone, Copy)]
@@ -1059,6 +1345,7 @@ enum Row {
     Control,
     C,
     C2,
+    C3,
 }
 
 async fn run(case: &str, seed: u64, row: Row) -> Receipt {
@@ -1066,11 +1353,13 @@ async fn run(case: &str, seed: u64, row: Row) -> Receipt {
     let (labels, last) = match row {
         Row::Control => (LABELS, FINAL),
         Row::C | Row::C2 => (C_LABELS, FINAL_C),
+        Row::C3 => (C_LABELS, FINAL_C3),
     };
     receipt.note(match row {
         Row::Control => "OwnerCertified harness support (#1666): A has no USER key".to_string(),
         Row::C => "ADR 0109 S3 (#1356, #1572) H-S3-c; O alone holds the USER key".to_string(),
         Row::C2 => "ADR 0109 S3 (#1356, #1572) H-S3-c2; O alone holds the USER key".to_string(),
+        Row::C3 => "ADR 0109 S3 (#1356, #1572) H-S3-c3; O online throughout".to_string(),
     });
     match Sim::empty(case, seed, labels) {
         Ok(mut sim) => {
@@ -1078,6 +1367,7 @@ async fn run(case: &str, seed: u64, row: Row) -> Receipt {
                 Row::Control => scenario(&mut sim, &mut receipt).await,
                 Row::C => owner_reseat(&mut sim, &mut receipt, false).await,
                 Row::C2 => owner_reseat(&mut sim, &mut receipt, true).await,
+                Row::C3 => owner_path_reseat(&mut sim, &mut receipt).await,
             };
             if let Err(error) = ran {
                 receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
@@ -1137,6 +1427,18 @@ fn w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node() -> Result<()> {
 fn w3h_1356_red_s3_c2_reseat_retires_marker_and_gap() -> Result<()> {
     let case = "w3h_1356_red_s3_c2_reseat_retires_marker_and_gap";
     super::super::block_on_paused(expect(case, 0x1356_0107, Row::C2))
+}
+
+/// H-S3-c3 (owner path): a control; on `main` before S3 the route returned
+/// 404.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1356_control_s3_c3_owner_reseats_owner_axis_node() -> Result<()> {
+    let case = "w3h_1356_control_s3_c3_owner_reseats_owner_axis_node";
+    super::super::block_on_paused(expect(case, 0x1356_0109, Row::C3))
 }
 
 /// A record for the staging tests: J's fork is r+1′ (11), A removes J at
