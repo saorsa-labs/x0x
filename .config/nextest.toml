@@ -49,6 +49,12 @@ filter = 'test(/(^|::)w3h_1356_(red_s3_c2?_(promoted_admin_reseats_owner_axis_no
 slow-timeout = { period = "60s", terminate-after = 15 }
 priority = 60
 
+# The H-S3-s64 row: see the `w3h-gate` override below.
+[[profile.w3h.overrides]]
+filter = 'test(/(^|::)w3h_1356_control_s3_s64_segment_boundary$/)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+priority = 55
+
 # The CI `W3-H harness` gate job only: the same as `w3h`, plus raw payload
 # dumps (`<case>-<pid>.payloads`, test identities only; the first run of
 # each case and the first run whose digest differs from it) next to the
@@ -75,6 +81,15 @@ success-output = "final"
 filter = 'test(/(^|::)w3h_1356_(red_s3_c2?_(promoted_admin_reseats_owner_axis_node|reseat_retires_marker_and_gap)|control_s3_c3_owner_reseats_owner_axis_node)$/)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 priority = 60
+
+# ADR 0109 H-S3-s64 (#1572): three S0 groups, each with 63 to 65
+# renames and a join result of about 800 KB, about 135 s of wall time per
+# run locally. The 300 s kill above leaves no margin on the 4-vCPU runner,
+# so this row gets 10 minutes and starts early in each rerun.
+[[profile.w3h-gate.overrides]]
+filter = 'test(/(^|::)w3h_1356_control_s3_s64_segment_boundary$/)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+priority = 55
 
 # Start the longest sims first in each rerun. In list order the 83 s
 # #1427 catch-up case waited for the 1023 sims (about 145 s each on the
