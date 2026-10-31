@@ -163,8 +163,11 @@ pub struct RosterMemberSnapshot {
     pub certificate: Option<crate::identity::AgentCertificate>,
 }
 
-/// #1023: equality is COMMITTED-STATE equality — exactly the fields the
-/// signed roster root covers. The `certificate` carriage bytes are
+/// #1023: equality is COMMITTED-STATE equality — the fields that identify
+/// the committed seat: role, state, TreeKEM key-package hash and the
+/// certificate digest the signed roster root hashes (the TreeKEM hash is
+/// kept from the old derived equality and is authenticated by the add
+/// commit's signed `security_binding`). The `certificate` carriage bytes are
 /// deliberately excluded: a byte-bearing snapshot and its digest-only
 /// form describe the same committed seat (they hash identically), so
 /// whole-snapshot comparisons — the self-rebind link check
@@ -226,9 +229,14 @@ mod certificate_b64 {
             .map_err(serde::de::Error::custom)?;
         // Annotate the target: without it, inference binds the call to the
         // function's Option<AgentCertificate> return and bincode reads the
-        // certificate's first byte as an Option tag.
-        let certificate: crate::identity::AgentCertificate =
-            bincode::deserialize(&bytes).map_err(serde::de::Error::custom)?;
+        // certificate's first byte as an Option tag. The limit bounds the
+        // decode of peer-supplied bytes (a certificate is ~7 KiB).
+        use bincode::Options as _;
+        let certificate: crate::identity::AgentCertificate = bincode::options()
+            .with_fixint_encoding()
+            .with_limit(64 * 1024)
+            .deserialize(&bytes)
+            .map_err(serde::de::Error::custom)?;
         Ok(Some(certificate))
     }
 }

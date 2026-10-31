@@ -4001,6 +4001,52 @@ mod tests {
         );
     }
 
+    /// #1023: only the newest RETAINED_CERT_CARRY_LINKS retained commits
+    /// keep their snapshot bytes; older links age to digest-only at
+    /// retention, so the persisted and served log carries a bounded amount.
+    #[test]
+    fn retain_commit_ages_certificate_carry_to_newest_links() {
+        let (_user, agent_kp, cert) = certified_fixture();
+        let creator_hex = hex::encode([1u8; 32]);
+        let mut info = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        info.set_member_certificate(&creator_hex, cert.clone())
+            .expect("creator cert installs");
+        let total = state_commit::RETAINED_CERT_CARRY_LINKS + 2;
+        for revision in 1..=total as u64 {
+            let commit = state_commit::GroupStateCommit::sign(
+                "aabb".repeat(8),
+                revision,
+                None,
+                state_commit::compute_roster_root(&info.members_v2),
+                "ph".to_string(),
+                "mh".to_string(),
+                None,
+                false,
+                0,
+                &agent_kp,
+            )
+            .expect("fixture commit signs");
+            info.retain_commit(&commit);
+        }
+        assert_eq!(info.commit_log.len(), total);
+        let carry = state_commit::RETAINED_CERT_CARRY_LINKS;
+        let aged_out = total - carry;
+        for (index, retained) in info.commit_log.iter().enumerate() {
+            let snapshot = retained.roster[&creator_hex].certificate.as_ref();
+            if index < aged_out {
+                assert!(
+                    snapshot.is_none(),
+                    "link {index} older than the carry window must age to digest-only"
+                );
+            } else {
+                assert!(
+                    snapshot.is_some_and(|seated| seated == &cert),
+                    "link {index} inside the carry window keeps the bytes"
+                );
+            }
+        }
+    }
+
     /// #1023: `hydrate_member_certificates` falls back to the group's OWN
     /// retained-commit snapshots for still-digest-only seats — the retained
     /// chain is a certificate carrier, so a node holding it hydrates with
