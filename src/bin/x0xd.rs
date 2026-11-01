@@ -46,6 +46,31 @@ pub static MALLOC_CONF: &[u8] =
 
 use x0x::server::{DaemonConfig, InstanceName, ServeOptions};
 
+/// First `--name value` or `--name=value` on `args`.
+///
+/// An empty value is the same error as a missing value. `x0xd` and the CLI
+/// split check both accept these two spellings.
+fn cli_name_argument(args: &[String]) -> Result<Option<String>> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--name" {
+            let value = args
+                .get(index + 1)
+                .context("--name requires an instance name")?;
+            if value.is_empty() {
+                anyhow::bail!("--name requires an instance name");
+            }
+            return Ok(Some(value.clone()));
+        }
+        if let Some(value) = arg.strip_prefix("--name=") {
+            if value.is_empty() {
+                anyhow::bail!("--name requires an instance name");
+            }
+            return Ok(Some(value.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// Resolve CLI/config precedence before deriving any instance-scoped ACL path.
 ///
 /// A CLI name is already validated because it may be needed to locate the
@@ -224,14 +249,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     };
 
     // Parse and validate --name before using it to locate a named config file.
-    let cli_instance_name = if let Some(idx) = args.iter().position(|a| a == "--name") {
-        let name = args
-            .get(idx + 1)
-            .context("--name requires an instance name")?
-            .clone();
-        Some(InstanceName::try_from(name)?)
-    } else {
-        None
+    // `--name alice` and `--name=alice` are the same flag.
+    let cli_instance_name = match cli_name_argument(&args)? {
+        Some(name) => Some(InstanceName::try_from(name)?),
+        None => None,
     };
 
     // Handle --list: discover running instances and exit
@@ -1020,6 +1041,21 @@ mod tests {
     fn valid_name(raw: &str) -> InstanceName {
         InstanceName::try_from(raw.to_owned())
             .unwrap_or_else(|e| panic!("{raw:?}: expected valid instance name, got {e}"))
+    }
+
+    #[test]
+    fn name_flag_accepts_the_equals_spelling() {
+        let separate = cli_name_argument(&["x0xd".into(), "--name".into(), "alice".into()])
+            .expect("two-argument form");
+        assert_eq!(separate.as_deref(), Some("alice"));
+        let equals =
+            cli_name_argument(&["x0xd".into(), "--name=alice".into()]).expect("equals form");
+        assert_eq!(equals.as_deref(), Some("alice"));
+        assert!(cli_name_argument(&["x0xd".into()]).unwrap().is_none());
+        let missing = cli_name_argument(&["x0xd".into(), "--name".into()]).unwrap_err();
+        assert!(missing.to_string().contains("requires an instance name"));
+        let empty = cli_name_argument(&["x0xd".into(), "--name=".into()]).unwrap_err();
+        assert!(empty.to_string().contains("requires an instance name"));
     }
 
     #[test]
