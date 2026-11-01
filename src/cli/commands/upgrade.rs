@@ -6,7 +6,9 @@
 //! whether this CLI sits beside the daemon that is running. It reads that
 //! executable from the selected instance's process. It does not ask the
 //! daemon for a path. When that executable cannot be read, the check says
-//! it cannot tell. An available update still names `x0x upgrade --apply`.
+//! it cannot tell. If `/health` also shows this CLI is older than that
+//! daemon, it prints the version gap and the reinstall hint. An available
+//! update still names `x0x upgrade --apply`.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -34,7 +36,10 @@ pub(crate) enum SplitView {
     Beside,
     /// The canonical CLI directory is not the running daemon's directory.
     Apart,
-    /// The running daemon executable could not be read. Do not warn.
+    /// The running daemon executable could not be read.
+    ///
+    /// The check still prints the version gap and the reinstall hint when
+    /// `/health` shows this CLI is older than that daemon.
     Unknown,
 }
 
@@ -66,10 +71,12 @@ pub(crate) fn check_report(facts: &CheckFacts<'_>) -> String {
         lines.push(format!("Release v{release}"));
     }
 
-    // The reinstall hint is only for a CLI that is apart from the running
-    // daemon and older than that daemon. A CLI beside that daemon is replaced
-    // by apply. An unknown executable must not produce that warning. An
-    // available update still names `x0x upgrade --apply`.
+    // An apart CLI that is older than the running daemon gets the full
+    // "not upgraded" report. An unreadable daemon path cannot say "apart",
+    // but `/health` is enough for the version gap and the reinstall hint
+    // (issue #1104, other-user service daemon and Windows). A CLI that is
+    // not older only says that the path cannot be read. An available update
+    // still names `x0x upgrade --apply` when the result is unknown.
     let cli_older_than_daemon = facts
         .daemon_version
         .filter(|daemon| release_is_newer(facts.cli_version, daemon));
@@ -81,6 +88,14 @@ pub(crate) fn check_report(facts: &CheckFacts<'_>) -> String {
                 facts.cli_version,
                 daemon,
             ));
+        }
+        (SplitView::Unknown, _, Some(daemon)) => {
+            lines.push(CANNOT_TELL_SPLIT.to_string());
+            lines.push(format!(
+                "CLI v{} is older than daemon v{daemon}.",
+                facts.cli_version
+            ));
+            lines.push(CLI_REINSTALL_HINT.to_string());
         }
         (SplitView::Unknown, _, _) if facts.daemon_version.is_some() => {
             lines.push(CANNOT_TELL_SPLIT.to_string());
@@ -139,13 +154,13 @@ fn cli_not_upgraded_lines(
     cli_version: &str,
     daemon_version: &str,
 ) -> Vec<String> {
+    let cli_text = visible_path(cli_path);
     let place = match daemon_exe {
         Some(daemon) => format!(
-            "{} is not beside the running daemon {}.",
-            cli_path.display(),
-            daemon.display()
+            "{cli_text} is not beside the running daemon {}.",
+            visible_path(daemon)
         ),
-        None => format!("{} is not beside the running daemon.", cli_path.display()),
+        None => format!("{cli_text} is not beside the running daemon."),
     };
     vec![
         "CLI not upgraded".to_string(),
@@ -157,6 +172,11 @@ fn cli_not_upgraded_lines(
 
 /// Notice after apply when this CLI is apart from the running daemon and
 /// older than the applied `version`. The response body is unchanged (#1104).
+///
+/// The daemon restarts after the 750 ms deferred-restart delay. A service
+/// manager can replace the process inside that window, so a single read then
+/// says the path cannot be read. This waits through that window before it
+/// reports "Cannot tell".
 pub fn split_cli_notice_after_apply(
     response: &serde_json::Value,
     name: Option<&str>,
@@ -164,12 +184,49 @@ pub fn split_cli_notice_after_apply(
 ) -> Option<String> {
     let applied_version = applied_release_version(response)?;
     let cli_path = std::env::current_exe().ok();
-    let daemon_exe = dirs::data_dir()
-        .and_then(|root| running_daemon_executable(&root, name, api, process_executable));
-    split_cli_notice(
+    // 20 pauses of 50 ms (1 s) cover the 750 ms deferred restart plus a
+    // short wait for the service manager to publish the new process.
+    let pause = Duration::from_millis(50);
+    let attempts: u32 = 21;
+    notice_for_applied_version(
         cli_path.as_deref(),
-        daemon_exe.as_deref(),
         crate::VERSION,
+        applied_version,
+        || {
+            dirs::data_dir()
+                .and_then(|root| running_daemon_executable(&root, name, api, process_executable))
+        },
+        attempts,
+        pause,
+    )
+}
+
+fn notice_for_applied_version(
+    cli_path: Option<&Path>,
+    cli_version: &str,
+    applied_version: &str,
+    mut lookup: impl FnMut() -> Option<PathBuf>,
+    attempts: u32,
+    pause: Duration,
+) -> Option<String> {
+    let attempts = attempts.max(1);
+    let mut daemon_exe = None;
+    for attempt in 0..attempts {
+        daemon_exe = lookup();
+        if daemon_exe.is_some() || !release_is_newer(cli_version, applied_version) {
+            break;
+        }
+        if attempt + 1 == attempts {
+            break;
+        }
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+    }
+    split_cli_notice(
+        cli_path,
+        daemon_exe.as_deref(),
+        cli_version,
         applied_version,
     )
 }
@@ -227,6 +284,21 @@ fn canonical_parent(path: &Path) -> Option<PathBuf> {
 fn path_for_display(path: &Path) -> PathBuf {
     let path = strip_deleted_suffix(path.to_path_buf());
     std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+/// One line of a path, with control characters replaced.
+///
+/// A daemon path is operator-controlled data printed on stderr. A newline or
+/// escape in that path must not change the following lines. The version
+/// string is rejected when it contains a control character; a path cannot
+/// be rejected, so those characters become U+FFFD.
+fn visible_path(path: &Path) -> String {
+    path_for_display(path)
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 fn applied_release_version(response: &serde_json::Value) -> Option<&str> {
@@ -364,6 +436,11 @@ pub(crate) fn running_daemon_executable(
     let dir = selected_instance_dir(data_root, name, api)?;
     let instance = expected_daemon_name(&dir)?;
     let pid = read_instance_pid(&dir)?;
+    // A recycled pid belongs to a process that started after this lock was
+    // written. `--name` cannot tell two default-instance daemons apart.
+    if !lock_pid_is_current(process_start_time(pid), lock_modified(&dir)) {
+        return None;
+    }
     let exe = exe_for_pid(pid, instance.as_deref())?;
     exe.file_name()
         .is_some_and(|file| file == apply::daemon_file_name())
@@ -432,6 +509,86 @@ fn read_instance_pid(dir: &Path) -> Option<u32> {
     let text = std::fs::read_to_string(dir.join("instance.lock")).ok()?;
     let pid = text.trim().parse::<u32>().ok()?;
     (pid > 0).then_some(pid)
+}
+
+fn lock_modified(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir.join("instance.lock"))
+        .ok()?
+        .modified()
+        .ok()
+}
+
+/// `true` when `pid` can still be the process that wrote the lock.
+///
+/// A start time more than 2 seconds after the lock's mtime is a recycled
+/// pid. Missing times do not reject: the platform could not answer, and the
+/// command line is still checked.
+fn lock_pid_is_current(
+    process_start: Option<std::time::SystemTime>,
+    lock_modified: Option<std::time::SystemTime>,
+) -> bool {
+    match (process_start, lock_modified) {
+        (Some(started), Some(modified)) => match started.duration_since(modified) {
+            Ok(later) => later <= Duration::from_secs(2),
+            Err(_) => true,
+        },
+        _ => true,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit_once(')')?.1.trim_start();
+    let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
+    // SAFETY: `sysconf(_SC_CLK_TCK)` reads a process-wide constant. It takes
+    // no pointer and writes no caller memory.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    let hz = u64::try_from(hz).ok()?;
+    let btime = linux_boot_time()?;
+    let started = btime.checked_add(ticks / hz)?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(started))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_time() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/stat").ok()?;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("btime ") {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = libc::c_int::try_from(std::mem::size_of_val(&info)).ok()?;
+    // SAFETY: `info` is zeroed and exclusive to this call. `proc_pidinfo`
+    // writes at most `size` bytes and reads only this pid.
+    let wrote = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if wrote != size {
+        return None;
+    }
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(info.pbi_start_tvsec))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start_time(_pid: u32) -> Option<std::time::SystemTime> {
+    None
 }
 
 fn endpoint_key(addr: &str) -> Option<String> {
@@ -512,8 +669,9 @@ pub(crate) fn version_from_health_body(bytes: &[u8]) -> Option<String> {
 
 /// Read one daemon's version from loopback `/health`.
 ///
-/// The client does not use a proxy. A missing daemon or a non-loopback
-/// address is `None`. The request carries no token and times out after 2 seconds.
+/// The client does not use a proxy and does not follow a redirect. A missing
+/// daemon or a non-loopback address is `None`. The request carries no token
+/// and times out after 2 seconds.
 async fn running_daemon_version(base_url: &str) -> Option<String> {
     let root = base_url.trim_end_matches('/');
     let addr = root
@@ -525,6 +683,7 @@ async fn running_daemon_version(base_url: &str) -> Option<String> {
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .build()
         .ok()?;
@@ -562,7 +721,12 @@ fn process_executable(pid: u32, instance: Option<&str>) -> Option<PathBuf> {
 /// A stale `instance.lock` can name a pid that now belongs to another
 /// `x0xd`. The command line's `--name` is how those processes differ.
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
-fn exe_if_this_instance(exe: PathBuf, args: &[String], instance: Option<&str>) -> Option<PathBuf> {
+fn exe_if_this_instance(
+    exe: PathBuf,
+    args: &[String],
+    instance: Option<&str>,
+    config_name: Option<&str>,
+) -> Option<PathBuf> {
     let exe = strip_deleted_suffix(exe);
     if exe
         .file_name()
@@ -570,7 +734,7 @@ fn exe_if_this_instance(exe: PathBuf, args: &[String], instance: Option<&str>) -
     {
         return None;
     }
-    argv_names_instance(args, instance).then_some(exe)
+    argv_names_instance(args, instance, config_name).then_some(exe)
 }
 
 /// Linux `current_exe` appends ` (deleted)` after the file is replaced.
@@ -591,25 +755,112 @@ fn argv_from_nul_bytes(buf: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// How one flag was written on the daemon command line.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+enum FlagRead {
+    Absent,
+    Value(String),
+    Invalid,
+}
+
+/// First `--flag value` or `--flag=value`.
+///
+/// `x0xd` accepts both spellings for `--name`. An empty value does not match.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn argv_flag_value(args: &[String], flag: &str) -> FlagRead {
+    let equals = format!("{flag}=");
+    for (index, arg) in args.iter().enumerate() {
+        if arg == flag {
+            return match args.get(index + 1) {
+                Some(value) if !value.is_empty() => FlagRead::Value(value.clone()),
+                _ => FlagRead::Invalid,
+            };
+        }
+        if let Some(value) = arg.strip_prefix(&equals) {
+            return if value.is_empty() {
+                FlagRead::Invalid
+            } else {
+                FlagRead::Value(value.to_string())
+            };
+        }
+    }
+    FlagRead::Absent
+}
+
+/// `--config PATH` only. `x0xd` ignores `--config=PATH` and loads the default
+/// file, so this reader ignores that spelling too.
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn argv_config_path(args: &[String]) -> FlagRead {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--config" {
+            return match args.get(index + 1) {
+                Some(value) if !value.is_empty() => FlagRead::Value(value.clone()),
+                _ => FlagRead::Invalid,
+            };
+        }
+    }
+    FlagRead::Absent
+}
+
 /// `true` when `args` is the `x0xd` for `instance`.
 ///
-/// `instance` `None` is the default daemon: it has no `--name` argument.
+/// `instance` `None` is the default daemon. A `--name` flag, in either
+/// spelling, wins over `config_name`. With no `--name`, `config_name` is
+/// the config file's `instance_name` (`None` is the default instance).
 /// An empty argument list does not match. The caller could not read a
 /// command line, so the pid is not treated as this daemon.
 #[cfg(any(test, target_os = "linux", target_os = "macos"))]
-fn argv_names_instance(args: &[String], instance: Option<&str>) -> bool {
+fn argv_names_instance(args: &[String], instance: Option<&str>, config_name: Option<&str>) -> bool {
     if args.is_empty() {
         return false;
     }
-    let named = args
-        .windows(2)
-        .find(|pair| pair[0] == "--name")
-        .map(|pair| pair[1].as_str());
-    match (instance, named) {
-        (None, None) => true,
-        (Some(want), Some(got)) => want == got,
-        _ => false,
+    let effective = match argv_flag_value(args, "--name") {
+        FlagRead::Invalid => return false,
+        FlagRead::Value(name) => Some(name),
+        FlagRead::Absent => config_name.map(str::to_string),
+    };
+    effective.as_deref() == instance
+}
+
+/// Top-level `instance_name` in a daemon config file. Missing or unreadable
+/// files are the default instance (`None`).
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
+fn instance_name_in_config(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 1024 * 1024 {
+        return None;
     }
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    let name = value.get("instance_name")?.as_str()?;
+    if name.is_empty() || name.len() > 64 {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Config name for a process whose command line has no `--name`.
+///
+/// `None` as the outer value means the command line is not usable (a broken
+/// `--config`). The inner value is the file's `instance_name`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolved_config_name(args: &[String]) -> Option<Option<String>> {
+    match argv_flag_value(args, "--name") {
+        FlagRead::Invalid => return None,
+        FlagRead::Value(_) => return Some(None),
+        FlagRead::Absent => {}
+    }
+    match argv_config_path(args) {
+        FlagRead::Invalid => None,
+        FlagRead::Value(path) => Some(instance_name_in_config(Path::new(&path))),
+        FlagRead::Absent => Some(default_config_instance_name()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn default_config_instance_name() -> Option<String> {
+    let path = dirs::config_dir()?.join("x0x").join("config.toml");
+    instance_name_in_config(&path)
 }
 
 /// Parse the `KERN_PROCARGS2` buffer: argc, executable path, padding, argv.
@@ -654,14 +905,17 @@ fn linux_process_executable(pid: u32, instance: Option<&str>) -> Option<PathBuf>
     }
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    exe_if_this_instance(path, &argv_from_nul_bytes(&cmdline), instance)
+    let args = argv_from_nul_bytes(&cmdline);
+    let config_name = resolved_config_name(&args)?;
+    exe_if_this_instance(path, &args, instance, config_name.as_deref())
 }
 
 #[cfg(target_os = "macos")]
 fn macos_process_executable(pid: u32, instance: Option<&str>) -> Option<PathBuf> {
     let path = macos_pid_path(pid)?;
     let args = macos_process_args(pid)?;
-    exe_if_this_instance(path, &args, instance)
+    let config_name = resolved_config_name(&args)?;
+    exe_if_this_instance(path, &args, instance, config_name.as_deref())
 }
 
 #[cfg(target_os = "macos")]
@@ -953,14 +1207,14 @@ mod tests {
     }
 
     #[test]
-    fn issue1104_unknown_daemon_executable_does_not_warn() {
+    fn issue1104_unknown_daemon_executable_does_not_warn_a_current_cli() {
         let root = tempfile::tempdir().unwrap();
         let cargo = root.path().join(".cargo/bin");
         let cli = write_bin(&cargo, apply::cli_file_name());
         write_bin(&cargo, apply::daemon_file_name());
         assert_eq!(split_relation(&cli, None), SplitView::Unknown);
         let report = check_report(&CheckFacts {
-            cli_version: "1.0.0",
+            cli_version: "2.0.0",
             cli_path: Some(&cli),
             daemon_exe: None,
             split: SplitView::Unknown,
@@ -974,8 +1228,69 @@ mod tests {
         assert!(!report.contains("CLI not upgraded"), "{report}");
         assert!(!report.contains(CLI_REINSTALL_HINT), "{report}");
         assert!(
+            !report.contains("is older than daemon"),
+            "a newer CLI must not get the version gap: {report}"
+        );
+        assert!(
+            !report.contains(APPLY_HINT),
+            "no newer release means no apply line: {report}"
+        );
+    }
+
+    #[test]
+    fn issue1104_unreadable_daemon_path_reports_an_older_cli() {
+        // Other-user service daemon, or any daemon on Windows: `/health`
+        // has a version and the executable path cannot be read.
+        let report = check_report(&CheckFacts {
+            cli_version: "1.0.0",
+            cli_path: Some(Path::new("/home/user/.cargo/bin/x0x")),
+            daemon_exe: None,
+            split: SplitView::Unknown,
+            daemon_version: Some("1.4.0"),
+            release_version: Some("1.0.0"),
+            force: true,
+            already_current: false,
+            missing_release: false,
+        });
+        assert!(report.contains(CANNOT_TELL_SPLIT), "{report}");
+        assert!(
+            report.contains("CLI v1.0.0 is older than daemon v1.4.0."),
+            "{report}"
+        );
+        assert!(report.contains(CLI_REINSTALL_HINT), "{report}");
+        assert!(!report.contains("CLI not upgraded"), "{report}");
+        assert!(
+            !report.contains("is not beside"),
+            "an unreadable path must not claim the directories differ: {report}"
+        );
+        assert!(!report.contains("install.sh"), "{report}");
+        assert!(
+            !report.contains(APPLY_HINT),
+            "the release is not newer, so apply is not the next step: {report}"
+        );
+    }
+
+    #[test]
+    fn issue1104_unreadable_path_with_an_update_still_names_apply() {
+        let report = check_report(&CheckFacts {
+            cli_version: "1.0.0",
+            cli_path: Some(Path::new("/home/user/.cargo/bin/x0x")),
+            daemon_exe: None,
+            split: SplitView::Unknown,
+            daemon_version: Some("1.2.0"),
+            release_version: Some("1.3.0"),
+            force: false,
+            already_current: false,
+            missing_release: false,
+        });
+        assert!(
+            report.contains("CLI v1.0.0 is older than daemon v1.2.0."),
+            "{report}"
+        );
+        assert!(report.contains(CLI_REINSTALL_HINT), "{report}");
+        assert!(
             report.contains(APPLY_HINT),
-            "an unknown split with an update still names apply: {report}"
+            "an unknown path can still be beside the daemon: {report}"
         );
     }
 
@@ -1296,6 +1611,11 @@ mod tests {
             missing_release: false,
         });
         assert!(report.contains(CANNOT_TELL_SPLIT), "{report}");
+        assert!(
+            report.contains("CLI v1.0.0 is older than daemon v1.4.0."),
+            "{report}"
+        );
+        assert!(report.contains(CLI_REINSTALL_HINT), "{report}");
         assert!(report.contains(APPLY_HINT), "{report}");
         assert!(!report.contains("CLI not upgraded"), "{report}");
         let current = check_report(&CheckFacts {
@@ -1387,25 +1707,27 @@ mod tests {
             "--name".to_string(),
             "bob".to_string(),
         ];
-        assert!(argv_names_instance(&default_args, None));
-        assert!(!argv_names_instance(&alice, None));
-        assert!(argv_names_instance(&alice, Some("alice")));
-        assert!(!argv_names_instance(&bob, Some("alice")));
-        assert!(!argv_names_instance(&default_args, Some("alice")));
-        assert!(!argv_names_instance(&[], None));
+        assert!(argv_names_instance(&default_args, None, None));
+        assert!(!argv_names_instance(&alice, None, None));
+        assert!(argv_names_instance(&alice, Some("alice"), None));
+        assert!(!argv_names_instance(&bob, Some("alice"), None));
+        assert!(!argv_names_instance(&default_args, Some("alice"), None));
+        assert!(!argv_names_instance(&[], None, None));
 
         let daemon = PathBuf::from(format!("/usr/local/bin/{}", apply::daemon_file_name()));
-        assert!(exe_if_this_instance(daemon.clone(), &alice, Some("alice")).is_some());
-        assert!(exe_if_this_instance(daemon.clone(), &bob, Some("alice")).is_none());
+        assert!(exe_if_this_instance(daemon.clone(), &alice, Some("alice"), None).is_some());
+        assert!(exe_if_this_instance(daemon.clone(), &bob, Some("alice"), None).is_none());
         let deleted = PathBuf::from(format!(
             "/usr/local/bin/{} (deleted)",
             apply::daemon_file_name()
         ));
         assert_eq!(
-            exe_if_this_instance(deleted, &default_args, None).as_deref(),
+            exe_if_this_instance(deleted, &default_args, None, None).as_deref(),
             Some(daemon.as_path())
         );
-        assert!(exe_if_this_instance(PathBuf::from("/bin/sh"), &default_args, None).is_none());
+        assert!(
+            exe_if_this_instance(PathBuf::from("/bin/sh"), &default_args, None, None).is_none()
+        );
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&3i32.to_ne_bytes());
@@ -1415,9 +1737,13 @@ mod tests {
             buf.push(0);
         }
         let parsed = argv_from_procargs2(&buf).expect("procargs");
-        assert!(argv_names_instance(&parsed, Some("alice")));
+        assert!(argv_names_instance(&parsed, Some("alice"), None));
         let nul = b"/usr/local/bin/x0xd\0--name\0bob\0";
-        assert!(argv_names_instance(&argv_from_nul_bytes(nul), Some("bob")));
+        assert!(argv_names_instance(
+            &argv_from_nul_bytes(nul),
+            Some("bob"),
+            None
+        ));
     }
 
     #[test]
@@ -1433,24 +1759,31 @@ mod tests {
     }
 
     #[test]
-    fn issue1104_check_edges_the_coverage_run_left_red() {
+    fn issue1104_missing_daemon_path_does_not_invent_one() {
         let lines = cli_not_upgraded_lines(Path::new("/tmp/x0x"), None, "1.0.0", "1.2.0");
         assert!(
             lines[1].contains("is not beside the running daemon.")
                 && !lines[1].contains("running daemon /"),
             "{lines:?}"
         );
+    }
 
+    #[test]
+    fn issue1104_blank_instance_suffix_is_not_a_named_instance() {
         let root = tempfile::tempdir().unwrap();
         let empty_name = root.path().join("x0x-");
         std::fs::create_dir(&empty_name).unwrap();
         assert!(expected_daemon_name(&empty_name).is_none());
+    }
 
+    #[test]
+    fn issue1104_endpoint_scan_returns_only_the_matching_port_file() {
+        let root = tempfile::tempdir().unwrap();
         let named = root.path().join("x0x-alice");
         std::fs::create_dir(&named).unwrap();
         let skipped = root.path().join("x0x-bob");
         std::fs::create_dir(&skipped).unwrap();
-        // APFS rejects a non-UTF-8 name. Linux coverage still walks that entry.
+        // APFS rejects a non-UTF-8 name. Linux still walks that entry.
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::ffi::OsStringExt;
@@ -1460,25 +1793,244 @@ mod tests {
             std::fs::create_dir(&bad).unwrap();
         }
         std::fs::write(named.join("api.port"), "example.com\n").unwrap();
-        assert_eq!(endpoint_key("example.com").as_deref(), Some("example.com"));
-        assert!(!health_addr_allowed("example.com"));
-        assert!(!health_addr_allowed(&format!(
-            "http://{}.example",
-            "a".repeat(130)
-        )));
-        assert!(split_host_port("1:2:3").is_none());
         assert_eq!(
             instance_dir_for_endpoint(root.path(), "example.com").as_deref(),
             Some(named.as_path())
         );
+    }
 
+    #[test]
+    fn issue1104_a_host_without_a_port_is_not_a_health_address() {
+        assert_eq!(endpoint_key("example.com").as_deref(), Some("example.com"));
+        assert!(!health_addr_allowed("example.com"));
+    }
+
+    #[test]
+    fn issue1104_an_overlong_http_host_is_not_a_health_address() {
+        assert!(!health_addr_allowed(&format!(
+            "http://{}.example",
+            "a".repeat(130)
+        )));
+    }
+
+    #[test]
+    fn issue1104_three_colon_pieces_are_not_a_host_and_port() {
+        assert!(split_host_port("1:2:3").is_none());
+    }
+
+    #[test]
+    fn issue1104_procargs2_needs_a_complete_argument_vector() {
         assert!(argv_from_procargs2(&[]).is_none());
         assert!(argv_from_procargs2(&0i32.to_ne_bytes()).is_none());
         let mut short = 1i32.to_ne_bytes().to_vec();
         short.extend_from_slice(b"/x0xd");
         assert!(argv_from_procargs2(&short).is_none());
+    }
 
-        #[cfg(target_os = "linux")]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn issue1104_this_process_is_not_the_daemon_executable() {
         assert!(process_executable(std::process::id(), None).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn issue1104_this_process_path_and_arguments_can_be_read() {
+        let path = macos_pid_path(std::process::id()).expect("proc_pidpath");
+        assert!(path.is_absolute(), "{path:?}");
+        let args = macos_process_args(std::process::id()).expect("KERN_PROCARGS2");
+        assert!(!args.is_empty());
+        assert!(process_executable(std::process::id(), None).is_none());
+    }
+
+    #[test]
+    fn issue1104_daemon_path_control_characters_stay_on_one_line() {
+        let daemon = PathBuf::from("/usr/local/bin/x0xd\nINJECT");
+        let lines = cli_not_upgraded_lines(Path::new("/tmp/x0x"), Some(&daemon), "1.0.0", "1.2.0");
+        assert!(
+            !lines[1].chars().any(|c| c.is_control()),
+            "the daemon path must stay on one line: {lines:?}"
+        );
+        assert!(lines[1].contains('\u{FFFD}'), "{lines:?}");
+        assert_eq!(lines[0], "CLI not upgraded");
+        assert!(lines[2].contains("CLI v1.0.0 is older than daemon v1.2.0."));
+    }
+
+    #[test]
+    fn issue1104_name_equals_form_and_config_instance_name_select_the_daemon() {
+        let equals = vec![
+            "/usr/local/bin/x0xd".to_string(),
+            "--name=alice".to_string(),
+        ];
+        assert!(argv_names_instance(&equals, Some("alice"), None));
+        assert!(!argv_names_instance(&equals, None, None));
+        assert!(argv_names_instance(&equals, Some("alice"), Some("bob")));
+        assert!(!argv_names_instance(&equals, Some("bob"), Some("bob")));
+        let broken = vec!["/usr/local/bin/x0xd".to_string(), "--name".to_string()];
+        assert!(!argv_names_instance(&broken, None, Some("alice")));
+
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "instance_name = \"alice\"\nnetwork_id = \"test\"\n",
+        )
+        .unwrap();
+        assert_eq!(instance_name_in_config(&config).as_deref(), Some("alice"));
+        let from_config = vec![
+            "/usr/local/bin/x0xd".to_string(),
+            "--config".to_string(),
+            config.display().to_string(),
+        ];
+        assert!(matches!(argv_config_path(&from_config), FlagRead::Value(_)));
+        let name = instance_name_in_config(&config);
+        assert!(argv_names_instance(
+            &from_config,
+            Some("alice"),
+            name.as_deref()
+        ));
+        assert!(!argv_names_instance(&from_config, None, name.as_deref()));
+        std::fs::write(&config, "[history]\ninstance_name = \"alice\"\n").unwrap();
+        assert!(
+            instance_name_in_config(&config).is_none(),
+            "a nested key is not the daemon's instance name"
+        );
+    }
+
+    #[test]
+    fn issue1104_a_pid_that_started_after_the_lock_is_not_the_holder() {
+        let earlier = std::time::UNIX_EPOCH + Duration::from_secs(10);
+        let later = std::time::UNIX_EPOCH + Duration::from_secs(30);
+        assert!(!lock_pid_is_current(Some(later), Some(earlier)));
+        assert!(lock_pid_is_current(Some(earlier), Some(later)));
+        assert!(lock_pid_is_current(None, Some(later)));
+        assert!(lock_pid_is_current(Some(later), None));
+        assert!(lock_pid_is_current(
+            Some(earlier + Duration::from_secs(2)),
+            Some(earlier)
+        ));
+        assert!(!lock_pid_is_current(
+            Some(earlier + Duration::from_secs(3)),
+            Some(earlier)
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn issue1104_current_process_matches_a_lock_written_after_it_started() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("x0x");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("instance.lock"), std::process::id().to_string()).unwrap();
+        let daemon = write_bin(&root.path().join("bin"), apply::daemon_file_name());
+        let found = running_daemon_executable(root.path(), None, None, |pid, instance| {
+            assert_eq!(pid, std::process::id());
+            assert_eq!(instance, None);
+            Some(daemon.clone())
+        });
+        assert_eq!(found.as_deref(), Some(daemon.as_path()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn issue1104_reused_pid_does_not_match_a_lock_written_before_that_process() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("x0x");
+        std::fs::create_dir(&dir).unwrap();
+        let lock = dir.join("instance.lock");
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        let file = std::fs::File::options().write(true).open(&lock).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        drop(file);
+        let daemon = write_bin(&root.path().join("bin"), apply::daemon_file_name());
+        assert!(
+            running_daemon_executable(root.path(), None, None, |_, _| Some(daemon.clone()))
+                .is_none(),
+            "a process that started after the lock mtime is not this daemon"
+        );
+    }
+
+    #[test]
+    fn issue1104_apply_notice_retries_across_the_restart_window() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        let cli = write_bin(&bin, apply::cli_file_name());
+        let daemon = write_bin(&bin, apply::daemon_file_name());
+        let calls = std::cell::Cell::new(0u32);
+        let notice = notice_for_applied_version(
+            Some(&cli),
+            "1.0.0",
+            "1.4.0",
+            || {
+                let seen = calls.get();
+                calls.set(seen + 1);
+                (seen >= 2).then(|| daemon.clone())
+            },
+            4,
+            Duration::ZERO,
+        );
+        assert!(
+            notice.is_none(),
+            "a sibling found after the restart must not say Cannot tell: {notice:?}"
+        );
+        assert_eq!(calls.get(), 3);
+
+        let calls = std::cell::Cell::new(0u32);
+        let unknown = notice_for_applied_version(
+            Some(&cli),
+            "1.0.0",
+            "1.4.0",
+            || {
+                calls.set(calls.get() + 1);
+                None
+            },
+            3,
+            Duration::ZERO,
+        )
+        .expect("still unknown");
+        assert!(unknown.contains(CANNOT_TELL_SPLIT), "{unknown}");
+        assert_eq!(calls.get(), 3);
+
+        let calls = std::cell::Cell::new(0u32);
+        let current = notice_for_applied_version(
+            Some(&cli),
+            "1.4.0",
+            "1.4.0",
+            || {
+                calls.set(calls.get() + 1);
+                None
+            },
+            4,
+            Duration::ZERO,
+        );
+        assert!(current.is_none(), "{current:?}");
+        assert_eq!(calls.get(), 1, "a current CLI must not wait on the path");
+    }
+
+    #[tokio::test]
+    async fn issue1104_health_check_does_not_follow_a_redirect() {
+        use std::io::{Read, Write};
+        let redirected = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        redirected.set_nonblocking(true).unwrap();
+        let redirected_port = redirected.local_addr().unwrap().port();
+        let front = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let front_port = front.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = front.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{redirected_port}/health\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        });
+        let version = running_daemon_version(&format!("http://127.0.0.1:{front_port}")).await;
+        assert!(version.is_none(), "{version:?}");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            redirected.accept().is_err(),
+            "the health client must not open the redirect target"
+        );
     }
 }

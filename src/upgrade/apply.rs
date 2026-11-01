@@ -49,15 +49,14 @@ pub(crate) fn daemon_file_name() -> &'static str {
     }
 }
 
-/// Sibling `x0x` beside the installed daemon.
+/// Sibling `x0x` beside the daemon path apply is replacing.
 ///
-/// The path is canonical when the daemon path can be resolved. Apply and the
-/// CLI check then agree on a symlinked install. A path that cannot be
-/// resolved keeps its own parent.
+/// This uses that path's own directory. It does not resolve a symlink first.
+/// `install_path` is the daemon swap target; the CLI swap target is the
+/// `x0x` next to it. A symlinked `x0xd` therefore replaces the `x0x` beside
+/// the link, which is the directory the operator invoked.
 pub(crate) fn sibling_cli_path(daemon_install: &Path) -> Result<PathBuf, UpgradeError> {
-    let resolved =
-        std::fs::canonicalize(daemon_install).unwrap_or_else(|_| daemon_install.to_path_buf());
-    let parent = resolved
+    let parent = daemon_install
         .parent()
         .ok_or_else(|| UpgradeError::Other("target has no parent directory".to_string()))?;
     Ok(parent.join(cli_file_name()))
@@ -4795,28 +4794,66 @@ mod tests {
         assert!(missing_sibling_cli_message(&missing).is_none());
     }
 
-    #[test]
-    fn sibling_cli_path_uses_the_real_directory_of_a_symlink() {
+    /// A symlinked `x0xd` with a real `x0x` beside the link replaces that
+    /// `x0x`. The CLI in the symlink target's directory is a different file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_daemon_swaps_the_cli_beside_the_link() {
+        use std::os::unix::fs::symlink;
+
         let root = tempfile::tempdir().unwrap();
         let real = root.path().join("opt");
         std::fs::create_dir_all(&real).unwrap();
-        let daemon = real.join(daemon_file_name());
-        std::fs::write(&daemon, b"d").unwrap();
-        #[cfg(unix)]
-        let target = {
-            use std::os::unix::fs::symlink;
-            let link_dir = root.path().join("link");
-            std::fs::create_dir_all(&link_dir).unwrap();
-            let link = link_dir.join(daemon_file_name());
-            symlink(&daemon, &link).unwrap();
-            link
-        };
-        #[cfg(not(unix))]
-        let target = daemon;
-        let sibling = sibling_cli_path(&target).expect("sibling");
-        let expected = std::fs::canonicalize(&real)
-            .expect("real dir")
-            .join(cli_file_name());
-        assert_eq!(sibling, expected);
+        let real_daemon = real.join(daemon_file_name());
+        std::fs::write(&real_daemon, b"real-daemon").unwrap();
+        let decoy = real.join(cli_file_name());
+        std::fs::write(&decoy, b"decoy-cli").unwrap();
+
+        let link_dir = root.path().join("link");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join(daemon_file_name());
+        symlink(&real_daemon, &link).unwrap();
+        let cli = link_dir.join(cli_file_name());
+        std::fs::write(&cli, b"old-cli").unwrap();
+
+        let swap = sibling_cli_path(&link).expect("sibling");
+        assert_eq!(swap, cli);
+
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("archive.bin"), b"payload").unwrap();
+        let incoming_daemon = scratch.join("daemon");
+        std::fs::write(&incoming_daemon, b"new-daemon").unwrap();
+        let incoming_cli = scratch.join("cli");
+        std::fs::write(&incoming_cli, b"new-cli").unwrap();
+
+        let result = apply_replacements_offloaded(
+            Upgrader::new(link.clone(), semver::Version::new(1, 0, 0)),
+            incoming_daemon,
+            semver::Version::new(2, 0, 0),
+            Some((
+                Upgrader::new(swap, semver::Version::new(1, 0, 0)),
+                incoming_cli,
+            )),
+            TempDirGuard { path: scratch },
+            None,
+            None,
+        )
+        .await
+        .expect("replace");
+        assert!(matches!(result, UpgradeResult::Success { .. }));
+        assert_eq!(std::fs::read(&cli).unwrap(), b"new-cli");
+        assert_eq!(std::fs::read(&link).unwrap(), b"new-daemon");
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy-cli");
+        assert_eq!(std::fs::read(&real_daemon).unwrap(), b"real-daemon");
+        let lock_name = format!("{}.upgrade.lock", cli_file_name());
+        assert!(
+            link_dir.join(&lock_name).is_file(),
+            "the CLI lock stays beside the link"
+        );
+        assert!(
+            !real.join(&lock_name).exists(),
+            "the real directory is not the CLI swap target"
+        );
     }
 }
