@@ -1,7 +1,8 @@
 //! Private, dormant S3b engine. No installer or daemon apply path calls it.
-//! The only live call is `candidate_boot` at x0xd start, which refuses while
-//! `X0X_M2_BOOT_FD` is set and activation is held. The complete inventory
-//! issuer and host coordinator remain separate gates.
+//! The only live call is `candidate_boot` at x0xd start, which ignores a
+//! stray `X0X_M2_BOOT_FD` with one warning while activation is held and
+//! refuses only a present permit that fails its checks (ADR 0094 §6). The
+//! complete inventory issuer and host coordinator remain separate gates.
 #![allow(dead_code)]
 
 mod child;
