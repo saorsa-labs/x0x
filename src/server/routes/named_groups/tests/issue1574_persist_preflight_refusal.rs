@@ -253,11 +253,7 @@ async fn a_quarantine_clear_refuses_a_durability_preflight_refusal() -> Result<(
         },
         no_anchor: false,
     });
-    state
-        .named_groups
-        .write()
-        .await
-        .insert(key.clone(), info.clone());
+    state.named_groups.write().await.insert(key.clone(), info);
     assert!(matches!(
         save_named_groups_checked(&state).await,
         Ok(AtomicWriteOutcome::Durable)
