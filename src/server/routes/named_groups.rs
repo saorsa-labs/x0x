@@ -10726,6 +10726,18 @@ pub(in crate::server) async fn s4_seal_probe_for_test(
     revocation_eviction::seal_probe_for_test(state, group_id, target_hex).await
 }
 
+/// W3-H (#1581, test builds only): the S4 commit gate's own inputs for
+/// `target_hex` in `group_id` — the row phase and the live budget
+/// elapsed since T_obs, read atomically under one lock. Read-only.
+#[cfg(test)]
+pub(in crate::server) async fn s4_gate_probe_for_test(
+    state: &AppState,
+    group_id: &str,
+    target_hex: &str,
+) -> Option<(String, Option<u64>)> {
+    revocation_eviction::s4_gate_probe_for_test(state, group_id, target_hex).await
+}
+
 /// W3-H (#1567, test builds only): remove this node's cached copies of
 /// `member_agent_id`'s `MemberJoined` for `group_id`, as when its one
 /// gossip delivery came before this node could apply it. Returns `false`
