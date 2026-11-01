@@ -356,8 +356,10 @@ const ONE_SIDED_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const ONE_SIDED_PROBE_OUTER_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How many both-stale liveness probes one health tick may start (#1419).
-/// Candidates beyond the cap keep their turn on the next tick.
-const ONE_SIDED_PROBES_PER_TICK: usize = 4;
+/// Two, inside ant-quic's endpoint-wide budget of four probe slots, so
+/// other probe callers keep headroom. Candidates beyond the cap keep
+/// their turn on the next tick.
+const ONE_SIDED_PROBES_PER_TICK: usize = 2;
 
 /// Send and receive ages for one connected peer (#1419).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3804,30 +3806,42 @@ impl NetworkNode {
             // ant-quic's own probe bound starts at the reply wait. The
             // send before it can park on stream credit until the QUIC
             // idle timeout, so an outer tokio bound keeps the refresher
-            // tick inside the probe budget. The node handle is taken
-            // before that bound, so a lock wait spends no probe budget.
-            // The outer bound is one second longer, so ant-quic's own
-            // verdict decides whenever it can; only a stall before the
-            // reply wait elapses here and counts as a probe timeout.
+            // tick inside the probe budget. The probe runs as its own
+            // task: dropping it mid-flight would leave ant-quic's
+            // in-flight mark stuck and fail every later probe on that
+            // connection, so the bound is applied to the task handle and
+            // the probe always finishes inside ant-quic. The node handle
+            // is taken before that bound, so a lock wait spends no probe
+            // budget. The outer bound is one second longer, so ant-quic's
+            // own verdict decides whenever it can; only a stall before
+            // the reply wait elapses here and counts as a probe timeout.
             let probes = to_probe.iter().map(|peer| async move {
                 // `None` means the node is gone: inconclusive, not fresh.
                 let node = self.node.read().await.as_ref().cloned()?;
-                let probe = async {
+                let peer = *peer;
+                #[cfg(test)]
+                let (probes_run, probe_pause) = (
+                    Arc::clone(&self.one_sided_probes),
+                    Arc::clone(&self.one_sided_probe_pause),
+                );
+                let flight = tokio::spawn(async move {
                     #[cfg(test)]
                     {
-                        self.one_sided_probes.fetch_add(1, Ordering::Relaxed);
-                        let pause = *self
-                            .one_sided_probe_pause
+                        probes_run.fetch_add(1, Ordering::Relaxed);
+                        let pause = *probe_pause
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         if !pause.is_zero() {
                             tokio::time::sleep(pause).await;
                         }
                     }
-                    node.probe_peer(peer, ONE_SIDED_PROBE_TIMEOUT).await
-                };
-                match tokio::time::timeout(ONE_SIDED_PROBE_OUTER_TIMEOUT, probe).await {
-                    Ok(result) => Some(result),
+                    node.probe_peer(&peer, ONE_SIDED_PROBE_TIMEOUT).await
+                });
+                match tokio::time::timeout(ONE_SIDED_PROBE_OUTER_TIMEOUT, flight).await {
+                    Ok(Ok(result)) => Some(result),
+                    // The probe task failed without a verdict: not fresh
+                    // and not evidence of a broken link.
+                    Ok(Err(_)) => None,
                     Err(_) => Some(Err(ant_quic::NodeError::Endpoint(
                         ant_quic::EndpointError::ProbeTimeout,
                     ))),
@@ -11680,9 +11694,13 @@ mod tests {
         c.try_shutdown().await.unwrap();
     }
 
-    /// #1419: one health tick probes at most four both-stale candidates.
-    /// The rest keep their turn on the next tick, and a peer probed inside
-    /// the window is not probed again before the window ends.
+    /// #1419: one health tick probes at most two both-stale candidates,
+    /// inside ant-quic's four-slot endpoint probe budget. The rest keep
+    /// their turn on the next tick, and a peer probed inside the window
+    /// is not probed again before the window ends. The confirmation
+    /// window runs on the real clock, which paused tokio time does not
+    /// move, so the expired-window behaviour is covered by
+    /// [`both_stale_inconclusive_probe_extends_no_confirmation`].
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn issue1419_probe_cap_and_window_cooldown() {
         let plane = "issue1419-probe-cap";
@@ -11738,22 +11756,30 @@ mod tests {
         assert_eq!(
             a.one_sided_probes.load(Ordering::Relaxed) - before,
             ONE_SIDED_PROBES_PER_TICK as u32,
-            "one tick probes at most four candidates"
+            "one tick probes at most two candidates"
         );
         assert!(degraded.is_empty(), "every quiet link answers");
 
         let degraded = a.resolve_one_sided_peers(&samples).await;
         assert_eq!(
             a.one_sided_probes.load(Ordering::Relaxed) - before,
-            ONE_SIDED_PROBES_PER_TICK as u32 + 1,
-            "the fifth candidate keeps its turn on the next tick"
+            ONE_SIDED_PROBES_PER_TICK as u32 * 2,
+            "the next two candidates keep their turn on the next tick"
+        );
+        assert!(degraded.is_empty());
+
+        let degraded = a.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            a.one_sided_probes.load(Ordering::Relaxed) - before,
+            ONE_SIDED_PROBES_PER_TICK as u32 * 2 + 1,
+            "the fifth candidate keeps its turn on the third tick"
         );
         assert!(degraded.is_empty());
 
         a.resolve_one_sided_peers(&samples).await;
         assert_eq!(
             a.one_sided_probes.load(Ordering::Relaxed) - before,
-            ONE_SIDED_PROBES_PER_TICK as u32 + 1,
+            ONE_SIDED_PROBES_PER_TICK as u32 * 2 + 1,
             "a peer probed inside the window is not probed again"
         );
 
