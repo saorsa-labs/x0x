@@ -303,7 +303,7 @@ enum Commands {
         /// Skip the staging delay. Eligibility, holds and transaction checks still apply.
         #[arg(long, requires = "apply", conflicts_with = "check")]
         now: bool,
-        /// With --check, fetch the current manifest regardless of version.
+        /// With --check, fetch the release and report an update only when it is newer.
         /// Does not bypass the daemon's apply checks.
         #[arg(long)]
         force: bool,
@@ -2264,7 +2264,7 @@ async fn run(
             force,
             ..
         } if *check || !*apply => {
-            return commands::upgrade::run(*check, *force).await;
+            return commands::upgrade::run(*check, *force, name, api).await;
         }
         Commands::Instances => return commands::daemon::instances().await,
         Commands::Doctor => {
@@ -3342,6 +3342,13 @@ async fn run(
             };
             let response = client.post_empty(path).await?;
             x0x::cli::print_value(client.format(), &response);
+            // #1104: the apply response stays unchanged. This process reports
+            // when it sits apart from the daemon it just upgraded.
+            if let Some(notice) =
+                commands::upgrade::split_cli_notice_after_apply(&response, name, api)
+            {
+                eprintln!("{notice}");
+            }
             Ok(())
         }
         Commands::Ws { sub } => match sub {
