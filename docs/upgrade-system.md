@@ -268,17 +268,21 @@ keeps the first rollback cause, and starts only a missing restored child, at
 most 3 times. A failed reap or a failed restored start stops automatic
 recovery (`RecoveryFailed`) until an operator repairs the host.
 
-While launcher activation is held, `x0xd` refuses to start if the
-`X0X_M2_BOOT_FD` environment variable is set, even to an empty value. The
-check runs before argument parsing, so `--help` and `--check` refuse too. The
-error names the variable. This is a fail-closed guard against a half-armed
-launcher. Remove the variable from the unit or shell to start `x0xd`.
-
 The `x0x-launcher` binary builds only with the non-default `m2-launcher`
 cargo feature. Default builds and `cargo install` of the published crate do
 not build it until the activation slice. The launcher gives a candidate its boot
 permit as one JSON line on descriptor 3 (`X0X_M2_BOOT_FD=3`). This contract is
 provisional and dormant; it is frozen before `ENABLED = true`.
+
+While activation is held, the dormant launcher child cannot brick a daemon
+start. `x0xd` reads `X0X_M2_BOOT_FD` before runtime creation; a marker with
+no launcher permit behind it (an unrelated or missing descriptor 3) is
+dropped with one warning line and the daemon starts normally. ADR 0094 §6
+requires this: fail closed means "start the configured binary normally and
+report degraded", never brick startup. The refusal stays only where a real
+launcher permit arrives on descriptor 3 and fails its checks. When
+activation turns the engine on, the full boot barrier applies as specified:
+permit checks, boot record write, then the barrier ack.
 
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes
