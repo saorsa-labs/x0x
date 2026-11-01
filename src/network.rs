@@ -4067,6 +4067,12 @@ impl NetworkNode {
             Ok(flights) => flights,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // A flight that arrives after teardown emptied the list is
+        // aborted at once, so none holds a Node clone past shutdown.
+        if self.shutdown_state.started.load(Ordering::Acquire) {
+            flight.abort();
+            return;
+        }
         flights.retain(|flight| !flight.is_finished());
         flights.push(flight);
     }
