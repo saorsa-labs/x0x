@@ -123,7 +123,7 @@ impl UpgradeMonitor {
     ///
     /// Returns `Some(VerifiedRelease)` if a newer version is available with a valid
     /// signed manifest, `None` otherwise. A current or older release still has a
-    /// published version; [`Self::fetch_release_for_check`] keeps it.
+    /// published version; `fetch_release_for_check` keeps it.
     pub async fn check_for_updates(&self) -> Result<Option<VerifiedRelease>, UpgradeError> {
         Ok(self.fetch_release_for_check().await?.update)
     }
