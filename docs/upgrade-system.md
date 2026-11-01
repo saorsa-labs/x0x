@@ -278,11 +278,16 @@ While activation is held, the dormant launcher child cannot brick a daemon
 start. `x0xd` reads `X0X_M2_BOOT_FD` before runtime creation; a marker with
 no launcher permit behind it (an unrelated or missing descriptor 3) is
 dropped with one warning line and the daemon starts normally. ADR 0094 §6
-requires this: fail closed means "start the configured binary normally and
-report degraded", never brick startup. The refusal stays only where a real
-launcher permit arrives on descriptor 3 and fails its checks. When
-activation turns the engine on, the full boot barrier applies as specified:
-permit checks, boot record write, then the barrier ack.
+itself governs unknown or corrupt recovery records. The held-boot path
+applies that rule to the boot marker by analogy: fail closed means "start
+the configured binary normally and report degraded", never brick startup.
+The degraded report in the code is one warning line on stderr. The refusal
+covers only a permit present on descriptor 3: one that fails its checks,
+or one the process cannot verify. On a non-Linux host, every well-formed
+permit refuses the boot today, because the process-custody identity check
+needs Linux `/proc`. When activation turns the engine on, the full boot
+barrier applies as specified: permit checks, boot record write, then the
+barrier ack.
 
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes
