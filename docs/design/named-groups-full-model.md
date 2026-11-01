@@ -1236,21 +1236,20 @@ We should commit to this product direction explicitly:
 
 That is the right long-term model, and it gives us a sane path from the current named-group + MLS split to a real product.
 
-
 ## Certificate carriage with group state (#1023)
 
 A roster seat commits to its owner-issued certificate by BLAKE3 digest
-inside the signed roster root. The BYTES travel with the retained-commit
-snapshots: `RosterMemberSnapshot.certificate` (optional, base64(bincode))
-carries a byte-bearing seat's certificate, so the chain a group serves —
-state commits, the roster snapshot served at join, the JoinResult — is
-itself a certificate carrier and any adopter can seat the bytes with the
-creator and every other holder offline. Install is digest-anchored
-everywhere (`apply_reconstructed_roster`, `hydrate_member_certificates`):
-bytes that hash to a different digest never seat. Snapshot equality is
-committed-state equality (the bytes never participate), the signed root
-never moves, and only the HEAD retained commit keeps the bytes
-(`RETAINED_CERT_CARRY_LINKS` = 1, Engineer ruling 31 Oct 2026); older
-links age to digest-only. Invite links stay
-digest-only (DM budget). The seal gate is unchanged: a certificate carried
-nowhere still blocks with `OwnerCertMemberPending`.
+inside the signed roster root. The BYTES also travel with group state
+(#1023). The `RosterMemberSnapshot.certificate` field is optional. It
+holds base64(bincode) certificate bytes. Only the HEAD retained commit
+keeps the field (`RETAINED_CERT_CARRY_LINKS` = 1, Engineer ruling of
+31 Oct 2026). Older links age to digest-only.
+
+A member that reads the head link can seat the bytes when the creator and
+all other holders are offline. Install is digest-anchored at both sites
+(`apply_reconstructed_roster`, `hydrate_member_certificates`). Bytes that
+hash to a different digest never seat. Snapshot equality covers the
+committed fields only, so the bytes never change a comparison. The signed
+root does not move. Invite links stay digest-only, because of the direct
+message budget. The seal gate is unchanged: a certificate that no link
+carried still blocks the seal with `OwnerCertMemberPending`.

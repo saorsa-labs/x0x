@@ -1908,8 +1908,8 @@ impl GroupInfo {
                     break;
                 }
                 // A byte-bearing snapshot for a DIFFERENT admission is not
-                // a verdict on this seat: keep looking — an older link may
-                // still carry the bytes this seat committed to.
+                // a verdict on this seat: keep looking — a record
+                // installed whole can hold byte-bearing older links.
             }
         }
         let mut hydrated = 0usize;
@@ -1987,6 +1987,10 @@ impl GroupInfo {
                 repaired += 1;
             }
         }
+        // #1023: age the certificate carry at load too — a record
+        // installed whole (a backup restore, a peer-built file) keeps old
+        // byte-bearing links until its next commit otherwise.
+        self.age_certificate_carry();
         repaired
     }
 

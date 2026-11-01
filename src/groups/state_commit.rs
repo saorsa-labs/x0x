@@ -225,6 +225,14 @@ mod certificate_b64 {
         let Some(encoded) = Option::<String>::deserialize(deserializer)? else {
             return Ok(None);
         };
+        // Cap the STRING before any decode work: a certificate is under
+        // 8 KiB of bincode, so anything near the base64 of 64 KiB is not
+        // one.
+        if encoded.len() > 90_000 {
+            return Err(serde::de::Error::custom(
+                "snapshot certificate string exceeds the carry limit",
+            ));
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded.as_bytes())
             .map_err(serde::de::Error::custom)?;
@@ -2539,11 +2547,18 @@ mod tests {
         );
 
         // A malformed certificate string is a whole-link decode failure —
-        // an adopter never sees a partially-decoded roster.
+        // an adopter never sees a partially-decoded roster. An oversized
+        // string is refused before any decode work.
         let mut payload = serde_json::to_value(&with_bytes[&agent_hex]).expect("encodes");
         payload["certificate"] = serde_json::json!("not base64!");
         let decoded: Result<RosterMemberSnapshot, _> = serde_json::from_value(payload);
         assert!(decoded.is_err(), "a malformed certificate fails closed");
+        let mut oversized = serde_json::to_value(&with_bytes[&agent_hex]).expect("encodes");
+        oversized["certificate"] = serde_json::json!("A".repeat(100_000));
+        assert!(
+            serde_json::from_value::<RosterMemberSnapshot>(oversized).is_err(),
+            "an oversized certificate string fails closed before decoding"
+        );
     }
 
     /// #1023: snapshot equality is COMMITTED-STATE equality — the fields

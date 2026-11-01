@@ -2317,9 +2317,8 @@ async fn trimmed_member_added_recovers_before_creator_offline_seal() -> Result<(
 /// A 0.45 / pre-#1025 authority omits the sidecar altogether.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn legacy_member_added_recovers_before_creator_offline_seal() -> Result<()> {
-    let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 12, true, false, true)
-            .await?;
+    let s = creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 12, true, true, true)
+        .await?;
     assert!(!promoted_admin_seals_new_joiner(&s, &[])
         .await?
         .roster_root
@@ -2391,13 +2390,13 @@ fn legacy_wire_link(
 }
 
 /// #1023 (Root decision 2026-09-27, option (i)): the chain-carrier
-/// scenario. The admin adopts its group state from the creator's SERVED
-/// CHAIN LINK — the `RetainedCommit` form `intervening_chain_from` serves
-/// to a member crossing a revision gap — through the production recovery
-/// fold. No seat-event sidecar, no JoinResult and no announce cache ever
-/// reach it. With `legacy_chain`, EVERY link the admin holds is rewritten
-/// to the pre-#1023 wire form, the mixed-fleet case of an old peer's
-/// chain.
+/// scenario. The admin adopts its group state from the creator's HEAD
+/// retained link — the byte-bearing `RetainedCommit` a catch-up or a
+/// `GET /groups/:id/state/commits` read serves, folded through the
+/// production recovery path (`apply_link_state_only`). No seat-event
+/// sidecar, no JoinResult and no announce cache ever reach it. With
+/// `legacy_chain`, EVERY link the admin holds is rewritten to the
+/// pre-#1023 wire form, the mixed-fleet case of an old peer's chain.
 async fn creator_offline_chain_carrier_scenario(
     legacy_chain: bool,
 ) -> Result<CreatorOfflineScenario> {
@@ -2697,6 +2696,119 @@ async fn join_result_with_chain_bytes_stays_under_the_dm_budget() -> Result<()> 
     Ok(())
 }
 
+/// #1023: the strip really bounds a byte-bearing chain. A served link
+/// that carries every seat's certificate (the mixed-fleet form) pushes
+/// the gap result over the direct-message budget; the production builder
+/// strips the chain's certificate bytes and the result fits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_result_strips_a_byte_bearing_chain() -> Result<()> {
+    let seed: [u8; 32] = rand::random();
+    let owner = x0x::identity::UserKeypair::from_seed(&seed)?;
+    let (creator, _creator_dir, creator_cert) = owner_device_state(&seed).await?;
+    let creator_hex = hex::encode(creator.agent.agent_id().as_bytes());
+    let group_id = hex::encode(rand::random::<[u8; 32]>());
+    let mut base = x0x::groups::GroupInfo::with_policy(
+        "r1023-strip".to_string(),
+        String::new(),
+        creator.agent.agent_id(),
+        group_id.clone(),
+        x0x::groups::GroupPolicy {
+            discoverability: x0x::groups::GroupDiscoverability::Hidden,
+            admission: x0x::groups::GroupAdmission::OwnerCertified(owner.user_id()),
+            confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
+            read_access: x0x::groups::GroupReadAccess::MembersOnly,
+            write_access: x0x::groups::GroupWriteAccess::MembersOnly,
+        },
+    );
+    base.set_member_certificate(&creator_hex, creator_cert.clone())
+        .expect("the creator's certificate binds its own seat");
+    // Five more byte-bearing seats, then one seal: the HEAD link carries
+    // every certificate.
+    let mut member_certs = Vec::new();
+    for _ in 0..5 {
+        let key = x0x::identity::AgentKeypair::generate()?;
+        let hex = hex::encode(key.agent_id().as_bytes());
+        base.add_member(hex.clone(), x0x::groups::GroupRole::Member, None, None);
+        let cert = x0x::identity::AgentCertificate::issue(&owner, &key)?;
+        base.set_member_certificate(&hex, cert.clone())
+            .expect("certificate binds its seat");
+        member_certs.push((hex, cert));
+    }
+    seal_commit_owner_certified(
+        &creator,
+        &mut base,
+        creator.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    creator
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), base);
+    let link = {
+        let groups = creator.named_groups.read().await;
+        groups
+            .get(&group_id)
+            .expect("creator group")
+            .commit_log
+            .last()
+            .expect("the seal was retained")
+            .clone()
+    };
+    assert!(
+        link.roster
+            .values()
+            .filter(|snap| snap.certificate.is_some())
+            .count()
+            >= 6,
+        "the head link carries every certificate"
+    );
+
+    let event = staged_member_added(
+        &group_id,
+        &creator_hex,
+        &member_certs[0].0,
+        &member_certs[0].1,
+    );
+    let response = JoinResultMessage::Result {
+        event: Box::new(event),
+        chain: vec![link],
+        head_attestation: None,
+        roster_certificates_b64: Vec::new(),
+        intervening_events: Vec::new(),
+        admin_attestation: None,
+    };
+    if let JoinResultMessage::Result { chain, .. } = &response {
+        let chain_bytes = serde_json::to_vec(chain)?.len();
+        assert!(
+            chain_bytes > x0x::dm::MAX_PAYLOAD_BYTES,
+            "the byte-bearing link ({chain_bytes} B) starts over budget"
+        );
+    }
+    let payload = join_result_payload_with_roster_certificates(
+        &creator,
+        &group_id,
+        &member_certs[1].0,
+        response,
+    )
+    .await?;
+    assert!(
+        payload.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
+        "the stripped result is {} B, over the {} B budget",
+        payload.len(),
+        x0x::dm::MAX_PAYLOAD_BYTES
+    );
+    let JoinResultMessage::Result { chain, .. } = serde_json::from_slice(&payload)? else {
+        panic!("served payload is a Result");
+    };
+    assert!(chain
+        .iter()
+        .all(|link| link.roster.values().all(|snap| snap.certificate.is_none())));
+    creator.agent.shutdown().await;
+    Ok(())
+}
+
 /// #1023 (Engineer ruling 31 Oct 23:52 GMT: the HEAD link is the carry):
 /// when the live roster lost its certificate bytes (the key-stripped /
 /// restart-before-hydration shape) and no cache or sidecar holds them,
@@ -2708,8 +2820,19 @@ async fn seal_time_hydrate_falls_back_to_the_head_link() -> Result<()> {
     {
         let mut groups = s.admin.named_groups.write().await;
         let info = groups.get_mut(&s.group_id).expect("admin's group");
+        // The head link still carries the creator's bytes (the promotion
+        // sealed over the byte-bearing roster); the live roster loses
+        // them — the committed digests stay.
+        let head_carries = info
+            .commit_log
+            .last()
+            .and_then(|link| link.roster.get(&s.creator_hex))
+            .is_some_and(|snap| snap.certificate.is_some());
+        assert!(
+            head_carries,
+            "the fixture's head link carries the creator's bytes"
+        );
         for seat in info.members_v2.values_mut() {
-            // The committed digests stay; only the bytes are lost.
             seat.certificate = None;
         }
     }
