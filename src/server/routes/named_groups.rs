@@ -5780,7 +5780,7 @@ async fn install_fork_evidence(
             );
             false
         }
-        Ok(AtomicWriteOutcome::NotReplaced) => {
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename) => {
             tracing::debug!(
                 group_id = %LogHexId::group(group_key),
                 "#468: fork evidence install was a no-op (lineage gone or already carries evidence)"
@@ -7088,7 +7088,11 @@ where
     // this call wrote (`Rebound`), never journals another transaction left.
     let journals_ours = rebind_group_id.filter(|_| matches!(prejournaled, RebindOutcome::Rebound));
     let outcome = save_named_groups_store_checked(state, &legacy_json, &home_suite_json).await;
-    if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
+    if matches!(
+        &outcome,
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+            | Err(_)
+    ) {
         if let Some(group_id) = journals_ours {
             discard_rebind_journal(state, group_id).await;
         }
@@ -7255,7 +7259,11 @@ where
         }
         Err(error) => Err(error),
     };
-    if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
+    if matches!(
+        &outcome,
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+            | Err(_)
+    ) {
         compare_and_restore_named_groups(state, &before, &after).await;
     }
     match &outcome {
@@ -7265,7 +7273,8 @@ where
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
             .named_groups_requires_durability_confirmation
             .store(true, Ordering::Release),
-        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+        | Err(_) => {}
     }
     outcome
 }
@@ -7771,7 +7780,8 @@ async fn confirm_named_groups_durability_unlocked(state: &AppState) -> bool {
             true
         }
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => false,
-        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => false,
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+        | Err(_) => false,
     }
 }
 
@@ -7845,6 +7855,22 @@ async fn persist_named_group_info_inner(
             Ok(AtomicWriteOutcome::Durable) => state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release),
+            // #1574: this refusal staged nothing of THIS caller's
+            // candidate, so it must not read as "the replacement is
+            // visible, only its directory fsync is unconfirmed" — the
+            // arm every caller uses to keep the candidate and proceed.
+            // The refusal gets its own outcome: the re-save's rename put
+            // the CURRENT map on disk (an S3 placeholder included), so
+            // the S3 arming maps it to its contained path while every
+            // install site refuses it like `NotReplaced`. The flag stays
+            // set (the earlier replacement is still unconfirmed), so the
+            // seam keeps refusing publication and the next save retries
+            // this preflight. `Ok(ReplacedNotDurable)` from this
+            // function now always means the caller's candidate is
+            // installed in the live map.
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                return Ok(AtomicWriteOutcome::PreflightRefusedAfterRename)
+            }
             outcome => return outcome,
         }
     }
@@ -7962,7 +7988,11 @@ async fn persist_named_group_info_inner(
         }
     }
     let outcome = save_named_groups_checked_unlocked(state).await;
-    if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
+    if matches!(
+        &outcome,
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+            | Err(_)
+    ) {
         rollback_pre_durable(
             state,
             group_id,
@@ -7981,7 +8011,8 @@ async fn persist_named_group_info_inner(
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
             .named_groups_requires_durability_confirmation
             .store(true, Ordering::Release),
-        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+        | Err(_) => {}
     }
     // ADR 0109 §4 (#1570, ZCode on d1be57f1): the journal above was
     // prepared from its own encode, and the save encoded again. If the
@@ -10345,7 +10376,10 @@ impl TreeKemMemberKeyPackageCache {
                         )
                         .await;
                 }
-                Ok(AtomicWriteOutcome::NotReplaced) => {
+                Ok(
+                    AtomicWriteOutcome::NotReplaced
+                    | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                ) => {
                     return self
                         .record_persistence_failure(
                             revision,
@@ -12040,7 +12074,11 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                         _ => (false, true),
                     }
                 }
-                Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => (false, false),
+                Ok(
+                    AtomicWriteOutcome::NotReplaced
+                    | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                )
+                | Err(_) => (false, false),
             };
             // ADR 0109 §4 (#1570, ZCode on d1be57f1): the roster file can be
             // Durable while this group is held back. Its legacy entry then
@@ -16741,7 +16779,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     );
                     return ApplyMetadataResult::REJECTED;
                 }
-                Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                Ok(
+                    AtomicWriteOutcome::NotReplaced
+                    | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                )
+                | Err(_) => {
                     tracing::error!(
                         group_id = %resolved_group_key,
                         "JoinRequestCreated: durable save failed, restoring in-memory state"
@@ -16992,7 +17034,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         );
                         return ApplyMetadataResult::REJECTED;
                     }
-                    Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                    Ok(
+                        AtomicWriteOutcome::NotReplaced
+                        | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                    )
+                    | Err(_) => {
                         tracing::error!(
                             group_id = %resolved_group_key,
                             "JoinRequestApproved: durable save failed, restoring in-memory state"
@@ -18107,7 +18153,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         "MemberJoined: seat applied but parent-dir fsync unconfirmed — the durability flag re-persists on the next save"
                     );
                 }
-                Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                Ok(
+                    AtomicWriteOutcome::NotReplaced
+                    | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                )
+                | Err(_) => {
                     return ApplyMetadataResult::REJECTED;
                 }
             }
@@ -21186,6 +21236,25 @@ pub(in crate::server) mod detached_send_test_seam {
     /// the seat apply waits in its Welcome fetch.
     pub(in crate::server) fn welcome_fetch_key(welcome_id: &str) -> String {
         format!("welcome-fetch:{welcome_id}")
+    }
+
+    /// #1574 item 5: the delivery round reaches the roster read of
+    /// `group_id` (the drop-deciding read, before the persistence lock is
+    /// taken). The rollback test waits on this gate, not on a fixed sleep,
+    /// so a task that never ran cannot fake a pass. The key is per group,
+    /// not per test, so its one-shot arm stays safe only under the
+    /// process-per-test runner.
+    pub(in crate::server) fn ce_roster_read_gate_key(group_id: &str) -> String {
+        format!("ce-roster-read-gate:{group_id}")
+    }
+
+    /// #1574 item 5: inside the persistence lock, immediately before the
+    /// delivery round reads the roster of `group_id`. The rollback test
+    /// holds the lock, so this may not fire until the lock is released —
+    /// a removed lock fails that test. As with the gate key, the arm is
+    /// one-shot and safe under the process-per-test runner.
+    pub(in crate::server) fn ce_roster_read_held_key(group_id: &str) -> String {
+        format!("ce-roster-read-held:{group_id}")
     }
 }
 
@@ -25530,7 +25599,7 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
                 .store(true, Ordering::Release);
             anyhow::bail!("withdrawn named groups repair was not directory-durable");
         }
-        AtomicWriteOutcome::NotReplaced => {
+        AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename => {
             anyhow::bail!("withdrawn named groups repair did not replace the roster");
         }
     }
@@ -36707,7 +36776,7 @@ async fn persist_treekem_and_named_groups_atomic_locked(
             return Err(anyhow::Error::new(EpochInstalledPersistError)
                 .context("named groups replacement was not directory-durable"));
         }
-        AtomicWriteOutcome::NotReplaced => {
+        AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename => {
             // #1187: the named half did not land, so the journal must not
             // replay this transaction at restart (the caller rolls back).
             discard_unless_kept(state, group_id_hex, keep_journals).await;
@@ -36771,7 +36840,9 @@ async fn persist_named_half_without_snapshot_locked(
     let durable = match outcome {
         AtomicWriteOutcome::Durable => true,
         AtomicWriteOutcome::ReplacedNotDurable => false,
-        AtomicWriteOutcome::NotReplaced => anyhow::bail!("named groups replacement did not occur"),
+        AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename => {
+            anyhow::bail!("named groups replacement did not occur")
+        }
     };
     state
         .named_groups_requires_durability_confirmation
@@ -40961,7 +41032,8 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) -> R
                 "causal queue replacement is visible but not directory-durable".to_string(),
             );
         }
-        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+        | Err(_) => {
             return Err("causal queue replacement was not persisted".to_string());
         }
     }
@@ -42092,7 +42164,10 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                     "relay recovery roster is visible but not directory-durable".to_string()
                 );
             }
-            Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+            Ok(
+                AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename,
+            )
+            | Err(_) => {
                 *state.named_groups.write().await = original_groups_view;
                 return Err("relay recovery roster was not persisted".to_string());
             }
@@ -42119,7 +42194,8 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                 "relay recovery replacement is visible but not directory-durable".to_string(),
             );
         }
-        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+        | Err(_) => {
             return Err("relay recovery state was not persisted".to_string());
         }
     }
@@ -42138,7 +42214,8 @@ pub(in crate::server) async fn save_named_groups(state: &AppState) -> bool {
             );
             false
         }
-        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+        | Err(_) => {
             tracing::error!("named-groups replacement did not occur");
             false
         }
@@ -42556,7 +42633,8 @@ async fn save_named_groups_store_checked(
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
             .named_groups_requires_durability_confirmation
             .store(true, Ordering::Release),
-        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename)
+        | Err(_) => {}
     }
     // ADR 0109 §4 (#1570 rc4): a placeheld group's committed legacy form
     // advances only when this write landed.
@@ -42608,6 +42686,15 @@ pub(in crate::server) enum AtomicWriteOutcome {
     ReplacedNotDurable,
     /// Rename + parent fsync both succeeded.
     Durable,
+    /// #1574 slice 3: the durability preflight refused AFTER its
+    /// confirming re-save renamed the visible file (the directory fsync
+    /// still fails). The caller's own candidate was staged nowhere, so
+    /// for the caller's install this is a refusal exactly like
+    /// `NotReplaced`. It is a distinct outcome because the rename that
+    /// happened wrote the CURRENT map — an S3 placeholder included — so
+    /// the S3 arming must stay contained (its placeholder is on disk)
+    /// instead of rolling the sidecar arming back.
+    PreflightRefusedAfterRename,
 }
 
 /// #1269 r2: test-only seam that parks one atomic named-groups write for a

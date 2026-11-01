@@ -981,6 +981,14 @@ pub(in crate::server) async fn commit_locked(
             .await
     {
         if ng::self_leave_persist_left_epoch_installed(&error) {
+            // #1574 item 1: the TreeKEM transaction
+            // (`persist_treekem_and_named_groups_atomic_with_info`) has
+            // no durability preflight, so an error on this path after
+            // the epoch install is genuinely committed state — the
+            // journal it leaves behind is the commit point a restart
+            // replays. The arm converges memory to the candidate, so
+            // the `committed_crypto_exclusion` call below drops state
+            // only on installed roster state.
             tracing::error!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: crypto-only exclusion persist reported an error after the epoch was installed: {error}");
             let mut groups = state.named_groups.write().await;
             if groups
@@ -1160,6 +1168,15 @@ pub(super) async fn commit_gss(state: &Arc<AppState>, key: &EvictionKey, group_k
     // The rotated group record. A rename without the directory fsync has
     // installed the epoch, as in the TreeKEM path; the guarded egress holds
     // the frame until the re-save is durable (§5).
+    //
+    // #1574 item 1: `ReplacedNotDurable` here always means installed
+    // state. Since the durability preflight reports its refusal as
+    // `NotReplaced` (it stages nothing), this outcome only arises from a
+    // write that staged `next` into the live map, so recording the
+    // delivery, retiring the journal and sealing shares below stand on
+    // the installed roster. A power loss before a confirming save is the
+    // one revert: the frame's row is durable in the `.evs` and a restart
+    // replays the journal, whose commit point precedes it.
     if !matches!(
         ng::persist_named_group_info(state, group_key, next.clone()).await,
         Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
@@ -1509,7 +1526,31 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
     let local = *state.agent.agent_id().as_bytes();
     let capabilities = state.agent.capability_store();
     for (key, delivery) in due {
+        // #1574 item 5: the drop-deciding roster read (group gone or
+        // withdrawn, fork quarantine, head moved) holds
+        // `named_groups_persistence_lock`, because
+        // `persist_named_group_info` shows its candidate in the map before
+        // the write and restores the map when the write fails.
+        // An unlocked read could drop a delivery on a candidate that a
+        // failing write rolls back (persistence → `named_groups`; no
+        // S4 `inner` lock is held here). The two one-shot test seams
+        // (inert unless armed) let the rollback test prove the ordering:
+        // the gate fires when the round reaches the read leg, `held`
+        // fires only inside the lock.
+        #[cfg(test)]
+        super::super::detached_send_test_seam::park(
+            &super::super::detached_send_test_seam::ce_roster_read_gate_key(&key.stable_group_id),
+        )
+        .await;
         let info = {
+            let _committed = state.named_groups_persistence_lock.lock().await;
+            #[cfg(test)]
+            super::super::detached_send_test_seam::park(
+                &super::super::detached_send_test_seam::ce_roster_read_held_key(
+                    &key.stable_group_id,
+                ),
+            )
+            .await;
             let groups = state.named_groups.read().await;
             groups
                 .values()
@@ -2561,6 +2602,11 @@ async fn install_gss(
         Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
     ) {
         // A local storage fault, not a sender defect: keep the frame.
+        // #1574 item 1: a durability-preflight refusal reports
+        // `NotReplaced` (nothing was staged), so it lands here — the
+        // frame stays durable for the retry and the roster keeps the
+        // parent. `ReplacedNotDurable` means the install is staged in
+        // the live map, so the steps below report installed state only.
         return ReceiveOutcome::LocalFailure;
     }
     remove_legacy_mls_member(state, group_key, AgentId(body.target)).await;
@@ -3511,6 +3557,394 @@ mod daemon_tests {
             .await
             .context("the pre-phase re-save is durable")?;
         assert!(seam(), "the frame leaves once the roster is durable");
+        Ok(())
+    }
+
+    /// #1574 slice 3, the root: the durability preflight inside
+    /// `persist_named_group_info_inner` never reports its refusal as
+    /// `ReplacedNotDurable`. The refusal stages nothing of the caller's
+    /// candidate (the confirming re-save of the earlier replacement
+    /// failed again), so it must not read as "the candidate is visible,
+    /// only its fsync is unconfirmed" — the arm every commit site uses
+    /// to keep the candidate and proceed. A refusal whose re-save
+    /// renamed the current map gets its own outcome (S3 maps it to its
+    /// contained path); a refusal before any rename stays `NotReplaced`.
+    /// Before the fix both read as `ReplacedNotDurable` with nothing
+    /// staged, and the commit sites dropped held state on an install
+    /// that never happened.
+    #[tokio::test]
+    async fn a_durability_preflight_refusal_never_reads_as_a_staged_replacement() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.agent_id();
+        let group_id = "cf".repeat(16);
+        let mut info = GroupInfo::new("cf".into(), String::new(), admin, group_id.clone());
+        info.add_member(
+            hex::encode([0x7a; 32]),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(admin.as_bytes())),
+            None,
+        );
+        info.seal_commit(state.agent.identity().agent_keypair(), ng::now_millis_u64())?;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        assert_eq!(
+            ng::persist_named_group_info(&state, &group_id, info.clone()).await?,
+            ng::AtomicWriteOutcome::Durable
+        );
+        let mut candidate = info.clone();
+        candidate.seal_commit(state.agent.identity().agent_keypair(), ng::now_millis_u64())?;
+        async fn head_is(state: &AppState, group_id: &str, info: &GroupInfo) -> bool {
+            state
+                .named_groups
+                .read()
+                .await
+                .get(group_id)
+                .is_some_and(|stored| stored.state_hash == info.state_hash)
+        }
+        // A refusal whose re-save renamed the current map (the re-save's
+        // fsync failed again): its own outcome, never a staged one, and
+        // nothing of the candidate is staged.
+        state
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let after_rename = ng::set_save_fault(&state, ng::SaveFault::ReplacedNotDurableAfterWrite);
+        assert_eq!(
+            ng::persist_named_group_info(&state, &group_id, candidate.clone()).await?,
+            ng::AtomicWriteOutcome::PreflightRefusedAfterRename,
+            "the refusal staged nothing, so it must not read as a visible replacement"
+        );
+        assert!(
+            head_is(&state, &group_id, &info).await,
+            "nothing was staged for the refused candidate"
+        );
+        // A refusal before any rename: plain `NotReplaced`.
+        let no_rename = ng::set_save_fault(&state, ng::SaveFault::NotReplaced);
+        assert_eq!(
+            ng::persist_named_group_info(&state, &group_id, candidate.clone()).await?,
+            ng::AtomicWriteOutcome::NotReplaced
+        );
+        assert!(
+            head_is(&state, &group_id, &info).await,
+            "nothing was staged for the refused candidate"
+        );
+        // Once the re-save is durable the same write lands.
+        drop(after_rename);
+        drop(no_rename);
+        assert_eq!(
+            ng::persist_named_group_info(&state, &group_id, candidate.clone()).await?,
+            ng::AtomicWriteOutcome::Durable
+        );
+        assert!(
+            head_is(&state, &group_id, &candidate).await,
+            "the retry installs the candidate once the preflight is durable"
+        );
+        Ok(())
+    }
+
+    /// #1574 item 1, `commit_gss`: a GSS crypto-only exclusion whose
+    /// roster persist hits the preflight's refusal (nothing staged) must
+    /// not commit. Before the root fix the refusal read as
+    /// `ReplacedNotDurable` — the arm that means "installed, only the
+    /// directory fsync is unconfirmed" — so `commit_gss` marked the row
+    /// `committed_delivery_pending`, started its delivery and sealed
+    /// shares of a rotation no roster installed.
+    #[tokio::test]
+    async fn a_gss_crypto_exclusion_refuses_a_durability_preflight_refusal() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "the leave must apply: {applied:?}");
+        let parent = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        fx.state
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let fault = ng::set_save_fault(&fx.state, ng::SaveFault::ReplacedNotDurableAfterWrite);
+        run_worker(&fx.state).await;
+        {
+            let inner = fx.state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get(&key).expect("S4 self-leave row");
+            assert_eq!(
+                row.phase,
+                Phase::Pending,
+                "nothing was installed, so the exclusion must not commit"
+            );
+            assert!(
+                inner.ce.deliveries.is_empty(),
+                "no delivery may start for an install that never happened"
+            );
+        }
+        let stored = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        assert_eq!(
+            stored.state_hash, parent.state_hash,
+            "the roster keeps the parent head"
+        );
+        assert_eq!(stored.secret_epoch, 0, "the secret did not rotate");
+        assert_eq!(
+            stored.shared_secret.as_deref(),
+            Some(fx.old_secret.as_slice()),
+            "the old secret stands"
+        );
+        // The retry commits once the confirming re-save is durable again.
+        drop(fault);
+        fx.state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .next_attempt
+            .remove(&key);
+        run_worker(&fx.state).await;
+        assert!(
+            latest_frame_for_test(&fx.state, &fx.stable).await.is_some(),
+            "the retry committed the exclusion"
+        );
+        let phase = fx
+            .state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .store
+            .get(&key)
+            .map(|row| row.phase);
+        assert_eq!(phase, Some(Phase::CommittedDeliveryPending));
+        Ok(())
+    }
+
+    /// #1574 item 1, the GSS receive path: a survivor whose install
+    /// persist hits the preflight's refusal reports a local failure, not
+    /// `Applied`: the frame stays for the retry and the roster keeps the
+    /// parent. Before the root fix the refusal read as
+    /// `ReplacedNotDurable` (staged), the install reported `Applied` and
+    /// released holds for an install that never happened.
+    #[tokio::test]
+    async fn a_received_gss_exclusion_refuses_a_durability_preflight_refusal() -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "the leave must apply: {applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .expect("the committed exclusion frame");
+        // The survivor takes the leave, holds the frame for its share,
+        // then the share arrives.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let admin = fx.state.agent.agent_id();
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare
+        );
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let shares: Vec<(String, String, Vec<u8>)> = fx
+            .state
+            .named_group_test_recorders
+            .secure_share_scheduled
+            .lock()
+            .map(|scheduled| scheduled.clone())
+            .unwrap_or_default();
+        let share: ng::NamedGroupMetadataEvent = shares
+            .iter()
+            .find(|(_, recipient, _)| *recipient == survivor_hex)
+            .and_then(|(_, _, payload)| serde_json::from_slice(payload).ok())
+            .expect("a share for the survivor");
+        let _ = ng::apply_named_group_metadata_event(&fx.replica, share, admin, true, None).await;
+        let parent = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        fx.replica
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let fault = ng::set_save_fault(&fx.replica, ng::SaveFault::ReplacedNotDurableAfterWrite);
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::LocalFailure,
+            "nothing was installed"
+        );
+        assert_eq!(
+            fx.replica
+                .named_groups
+                .read()
+                .await
+                .get(&fx.group_id)
+                .map(|stored| stored.state_hash.clone()),
+            Some(parent.state_hash.clone()),
+            "the roster keeps the parent head"
+        );
+        // Once the re-save is durable the same frame installs.
+        drop(fault);
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the retry installs the frame"
+        );
+        Ok(())
+    }
+
+    /// #1574 item 5: `drive_deliveries` drops a delivery on its "group
+    /// gone or withdrawn" read, so the read must hold
+    /// `named_groups_persistence_lock`:
+    /// `persist_named_group_info` shows its candidate in the map before
+    /// the write and restores the map when the write fails. Before the
+    /// fix the drive read a mid-write withdraw candidate and dropped the
+    /// delivery the committed roster still admits. The mid-write leg
+    /// waits for the roster-read gate seam (proof the round reached the
+    /// read) and then proves the read waits behind the persistence lock:
+    /// the `held` seam, inside the lock, stays cold while the test holds
+    /// it — not a fixed sleep, so a removed lock fails this test.
+    #[tokio::test]
+    async fn a_crypto_exclusion_delivery_drop_waits_out_a_roster_candidate_that_rolls_back(
+    ) -> Result<()> {
+        let fx = gss_leave_fixture().await?;
+        let survivor = fx.replica.agent.agent_id();
+        let info = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .expect("group");
+        let key = EvictionKey::new(fx.stable.clone(), *fx.leaver.as_bytes());
+        {
+            let mut inner = fx.state.revocation_evictions.inner.lock().await;
+            new_delivery(
+                &mut inner.ce,
+                &key,
+                &info.state_hash,
+                info.state_revision.saturating_add(1),
+                Arc::new(Vec::new()),
+                vec![*survivor.as_bytes()],
+                false,
+            );
+        }
+        // The mid-write window: a withdraw candidate is in the map while
+        // the persistence lock is held — exactly what a failing
+        // `persist_named_group_info` restores.
+        let gate = ng::detached_send_test_seam::arm(
+            &ng::detached_send_test_seam::ce_roster_read_gate_key(&fx.group_id),
+        );
+        let held = ng::detached_send_test_seam::arm(
+            &ng::detached_send_test_seam::ce_roster_read_held_key(&fx.group_id),
+        );
+        let guard = fx.state.named_groups_persistence_lock.lock().await;
+        let mut candidate = info.clone();
+        candidate.withdrawn = true;
+        fx.state
+            .named_groups
+            .write()
+            .await
+            .insert(fx.group_id.clone(), candidate);
+        let driven = {
+            let state = Arc::clone(&fx.state);
+            tokio::spawn(async move { drive_deliveries(&state).await })
+        };
+        for _ in 0..250 {
+            if gate.reached() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        assert!(
+            gate.reached(),
+            "the round reached the roster read (the gate seam), not a sleep"
+        );
+        // Release the gate: the round now goes for the persistence lock,
+        // which this test holds. The seam inside the lock may fire only
+        // after the lock is released below; with the lock removed it
+        // fires here and this test fails.
+        drop(gate);
+        for _ in 0..75 {
+            if held.reached() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        assert!(
+            !held.reached(),
+            "the roster read ran without the persistence lock in hand"
+        );
+        assert!(
+            fx.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .contains_key(&key),
+            "the drop must block on the persistence lock, not read the mid-write candidate"
+        );
+        // The write failed: the map is restored under the same lock hold.
+        fx.state
+            .named_groups
+            .write()
+            .await
+            .insert(fx.group_id.clone(), info.clone());
+        // `held` is disarmed before the release, so the round reads
+        // straight through the restored roster.
+        drop(held);
+        drop(guard);
+        driven.await?;
+        assert!(
+            fx.state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .ce
+                .deliveries
+                .contains_key(&key),
+            "the committed roster's delivery survives its round"
+        );
+        assert_ne!(
+            delivery_status(&fx.state, &key, &survivor).await,
+            Some(RecipientDelivery::Due),
+            "the committed roster's round ran"
+        );
         Ok(())
     }
 

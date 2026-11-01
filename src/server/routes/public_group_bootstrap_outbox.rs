@@ -580,7 +580,9 @@ pub(in crate::server) async fn persist_named_group_info_with_bootstrap_obligatio
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
             return Ok(AtomicWriteOutcome::ReplacedNotDurable);
         }
-        Ok(AtomicWriteOutcome::NotReplaced) => return Ok(AtomicWriteOutcome::NotReplaced),
+        Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename) => {
+            return Ok(AtomicWriteOutcome::NotReplaced)
+        }
         Err(error) => return Err(error),
     }
 
@@ -597,7 +599,11 @@ pub(in crate::server) async fn persist_named_group_info_with_bootstrap_obligatio
     }
 
     match replace_public_group_bootstrap_outbox_unlocked(state, previous_outbox).await {
-        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced) => {}
+        Ok(
+            AtomicWriteOutcome::Durable
+            | AtomicWriteOutcome::NotReplaced
+            | AtomicWriteOutcome::PreflightRefusedAfterRename,
+        ) => {}
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
             tracing::error!("bootstrap outbox rollback replacement was not directory-durable");
         }
@@ -645,7 +651,11 @@ pub(in crate::server) async fn cancel_public_group_bootstrap_obligations_for_rem
     }
     let group_id = group.stable_group_id();
     match cancel_public_group_bootstrap_obligations(state, recipient_hex, group_id).await {
-        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced) => {}
+        Ok(
+            AtomicWriteOutcome::Durable
+            | AtomicWriteOutcome::NotReplaced
+            | AtomicWriteOutcome::PreflightRefusedAfterRename,
+        ) => {}
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => tracing::warn!(
             group_id = %LogHexId::group(group_id),
             recipient = %LogHexId::agent(recipient_hex),
@@ -924,7 +934,9 @@ pub(in crate::server) async fn load_public_group_bootstrap_outbox(
     }
     *state.public_group_bootstrap_outbox.write().await = loaded;
     match reconcile_public_group_bootstrap_outbox(state).await? {
-        AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced => Ok(()),
+        AtomicWriteOutcome::Durable
+        | AtomicWriteOutcome::NotReplaced
+        | AtomicWriteOutcome::PreflightRefusedAfterRename => Ok(()),
         AtomicWriteOutcome::ReplacedNotDurable => Err(std::io::Error::other(
             "public-group bootstrap outbox reconciliation was not directory-durable",
         )),
@@ -978,7 +990,9 @@ async fn finish_public_group_bootstrap_obligation_after_ack(
         AtomicWriteOutcome::ReplacedNotDurable => {
             return Ok(AtomicWriteOutcome::ReplacedNotDurable);
         }
-        AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced => {}
+        AtomicWriteOutcome::Durable
+        | AtomicWriteOutcome::NotReplaced
+        | AtomicWriteOutcome::PreflightRefusedAfterRename => {}
     }
     let exact_obligation_remains = state
         .public_group_bootstrap_outbox
@@ -1111,7 +1125,11 @@ pub(in crate::server) async fn public_group_bootstrap_outbox_step(state: &Arc<Ap
         return;
     }
     match reconcile_public_group_bootstrap_outbox(state).await {
-        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced) => {}
+        Ok(
+            AtomicWriteOutcome::Durable
+            | AtomicWriteOutcome::NotReplaced
+            | AtomicWriteOutcome::PreflightRefusedAfterRename,
+        ) => {}
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
             tracing::warn!(
                 "public-group bootstrap reconciliation was not directory-durable; delivery deferred"
@@ -1175,7 +1193,11 @@ async fn settle_public_group_bootstrap_attempt(
                 "public-group bootstrap received durable application ACK"
             );
             match finish_public_group_bootstrap_obligation_after_ack(state, obligation).await {
-                Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced) => {}
+                Ok(
+                    AtomicWriteOutcome::Durable
+                    | AtomicWriteOutcome::NotReplaced
+                    | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                ) => {}
                 Ok(AtomicWriteOutcome::ReplacedNotDurable) => tracing::warn!(
                     "public-group bootstrap ACK completion was not directory-durable"
                 ),
