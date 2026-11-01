@@ -12,6 +12,9 @@ const EXIT_USAGE: u8 = 64;
 /// 75 is `EX_TEMPFAIL`: the manager restarts the job, as it does for a
 /// direct unit whose daemon cannot exec.
 const EXIT_TEMPFAIL: u8 = 75;
+/// 69 is `EX_UNAVAILABLE`: this host cannot run process custody.
+#[cfg(not(unix))]
+const EXIT_UNAVAILABLE: u8 = 69;
 
 fn main() -> std::process::ExitCode {
     #[cfg(unix)]
@@ -34,6 +37,6 @@ fn main() -> std::process::ExitCode {
     #[cfg(not(unix))]
     {
         eprintln!("x0x-launcher: process custody requires Unix");
-        std::process::ExitCode::from(69)
+        std::process::ExitCode::from(EXIT_UNAVAILABLE)
     }
 }

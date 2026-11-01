@@ -1,10 +1,11 @@
 //! Dormant-mode passthrough for the installed stable launcher.
 //!
-//! ADR 0094 §5 binds `x0x-launcher` into the unit `ExecStart` before M2
-//! activation. With no launcher-owned trial in flight the launcher has no
-//! authority and no child to own, so it becomes the daemon by `exec`:
-//! the manager keeps one process with the same signals, exit codes and
-//! restart semantics as the previous direct job.
+//! ADR 0094 §5 requires the unit `ExecStart` to bind `x0x-launcher` before
+//! M2 activation, once the §5 preconditions hold. With no launcher-owned
+//! trial in flight the launcher has no authority and no child to own, so
+//! it becomes the daemon by `exec`: the manager keeps one process with the
+//! same signals, exit codes and restart semantics as the previous direct
+//! job.
 use super::*;
 use std::ffi::OsString;
 
@@ -35,12 +36,25 @@ pub(crate) fn daemon_argv(argv: &[OsString]) -> io::Result<DaemonCommand> {
     }
 }
 
+/// The M2 launcher marks its private fd-3 boot handoff with this variable
+/// (#1375). A passthrough daemon has no launcher permit behind fd 3, so it
+/// must not inherit a stale marker. The restart.rs handoff path strips the
+/// variable for its children; the dormant launcher does the same.
+const LAUNCHER_BOOT_FD_ENV: &str = "X0X_M2_BOOT_FD";
+
 /// Replace this process with the daemon. The return value is the `exec`
 /// error; on success this function does not return.
+///
+/// Dormant passthrough only. It is correct while the engine is held
+/// (`ENABLED = false`) and no launcher-owned trial can exist. When
+/// `ENABLED` turns `true`, the launcher-owned trial path must run instead;
+/// `dormant_passthrough_requires_the_held_engine` fails on that flip until
+/// the passthrough is re-tied to it.
 pub(crate) fn exec_daemon(command: &DaemonCommand) -> io::Error {
     use std::os::unix::process::CommandExt;
     let mut daemon = std::process::Command::new(&command.executable);
     daemon.args(&command.args);
+    daemon.env_remove(LAUNCHER_BOOT_FD_ENV);
     daemon.exec()
 }
 
@@ -70,6 +84,19 @@ mod tests {
     #[test]
     fn relative_daemon_argv_is_refused() {
         assert!(daemon_argv(&["x0xd".into(), "--config".into()]).is_err());
+    }
+
+    /// The passthrough is only correct while the engine is held. Flipping
+    /// `ENABLED` to `true` must wire the launcher-owned trial path ahead of
+    /// the passthrough; this test forces that work instead of a silent skip.
+    /// The assert is on a const by design, so the lint is allowed here.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn dormant_passthrough_requires_the_held_engine() {
+        assert!(
+            !ENABLED,
+            "ENABLED = true: wire the launcher-owned trial path before the dormant passthrough"
+        );
     }
 
     /// The installed launcher must become the daemon, not parent it. This

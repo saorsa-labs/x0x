@@ -526,23 +526,31 @@ service. Fleet caveat (ADR-0011): the self-updater restarts only
 
 **Stable launcher (dormant).** `x0x-launcher` is the stable recovery
 actor ADR 0094 §5 requires. M2 trial ownership is held, so the binary is
-dormant: run as `x0x-launcher /absolute/path/x0xd [args]`, it becomes
+dormant. Run as `x0x-launcher /absolute/path/x0xd [args]`, it becomes
 `x0xd` by `exec` and keeps the direct job's one-process signal and exit
-semantics. The daemon path must be absolute; the launcher never searches
-`PATH`. A missing daemon path exits 64 (`EX_USAGE`). A failed `exec` exits
-75 (`EX_TEMPFAIL`), which `Restart=always` retries as for a direct unit.
-The launcher sits outside the daemon/CLI swap set; the daemon updater never
-replaces it. `x0xd` also refuses to start while `X0X_M2_BOOT_FD` is set
-(see [Dormant pair transaction](#dormant-pair-transaction-m2-s2e)).
+semantics. The daemon path must be absolute. The launcher never searches
+`PATH`. A missing or relative daemon path exits 64 (`EX_USAGE`). A failed
+`exec` exits 75 (`EX_TEMPFAIL`); `Restart=always` retries it as for a
+direct unit. The argv contract and the exit codes are provisional and
+dormant. They are frozen before `ENABLED = true`, like the fd 3 boot
+contract. The launcher strips a stray `X0X_M2_BOOT_FD` from the daemon's
+environment before the `exec`. While activation is held, `x0xd` ignores a
+stray `X0X_M2_BOOT_FD` with one warning. It refuses to start only for a
+permit present on descriptor 3 that fails its checks (see
+[Dormant pair transaction](#dormant-pair-transaction-m2-s2e)). The
+launcher sits outside the daemon/CLI swap set. The daemon updater never
+replaces it.
 
 No tracked unit binds the launcher yet, and default builds do not build it
-(it needs the `m2-launcher` feature). ADR 0094 §5 lists four
-preconditions for binding a fleet unit: the separately signed launcher
-artifact in the release payload, `install.sh` shipping it beside `x0xd`,
-the authority-inventory check accepting a launcher-owned `ExecStart`, and
-the systemd restart readback accepting launcher-owned jobs. Until all four
-hold, a launcher-bound unit would refuse every self-update. The unit switch
-also needs David's approval because it changes production hosts.
+(it needs the `m2-launcher` feature). ADR 0094 §5 preconditions for
+binding a fleet unit include: the separately signed launcher artifact in
+the release payload, verified for hash, version and account rights;
+`install.sh` or `x0x autostart --repair` shipping it beside `x0xd`; an
+M2-capable daemon installed first under the existing direct job; the
+authority-inventory check accepting a launcher-owned `ExecStart`; and the
+`KillMode` and restart readbacks accepting launcher-owned jobs. Until
+these hold, a launcher-bound unit would refuse every self-update. The unit
+switch also needs David's approval because it changes production hosts.
 
 #### 2. Restore the known-good binary
 

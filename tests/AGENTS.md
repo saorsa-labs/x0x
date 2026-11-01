@@ -109,6 +109,7 @@ tokens, ciphertexts, invites or log text. Pure-python tests:
 | `gossip_cache_adapter_integration.rs` | Gossip cache adapter wrapping bootstrap cache |
 | `rendezvous_integration.rs` | Rendezvous shard discovery |
 | `upgrade_integration.rs` | Self-update manifest signing, verification, rollout |
+| `upgrade_launcher_passthrough.rs` | Dormant x0x-launcher exec passthrough (unix, m2-launcher feature) |
 | `vps_e2e_integration.rs` | VPS bootstrap node end-to-end |
 
 Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
