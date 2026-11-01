@@ -19,6 +19,7 @@ pub mod discovery;
 pub mod eviction;
 pub mod invite;
 pub mod kem_envelope;
+pub mod key_republish;
 pub mod kv_context;
 pub mod member;
 pub mod owner_cert;
@@ -2631,6 +2632,16 @@ impl GroupInfo {
         self.members_v2
             .entry(agent_id_hex.clone())
             .and_modify(|m| {
+                // #1663 review round 4 (Claude, 30 Oct): a row returning
+                // to Active from Removed or Banned starts a fresh
+                // republication epoch — the re-joined member's own row is
+                // new, so a retained counter would refuse its every
+                // republication as stale. The reset rides the signed
+                // re-admission every peer applies alike; an already-Active
+                // row keeps its counter.
+                if m.state != GroupMemberState::Active {
+                    m.kem_key_sequence = None;
+                }
                 m.role = role;
                 m.state = GroupMemberState::Active;
                 m.updated_at = now;
@@ -2655,6 +2666,7 @@ impl GroupInfo {
                 added_by,
                 removed_by: None,
                 kem_public_key_b64,
+                kem_key_sequence: None,
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
                 certificate: None,
@@ -2671,6 +2683,32 @@ impl GroupInfo {
             m.kem_public_key_b64 = Some(kem_public_key_b64);
             m.updated_at = now_millis();
         }
+    }
+
+    /// #1663: seat a verified republished KEM key on `agent_id_hex`'s
+    /// Active row. `key_sequence` is the seat's monotonic republication
+    /// counter: the install refuses a replay or a stale key (a sequence
+    /// the row already reached), exactly
+    /// [`crate::groups::key_republish::validate_against_seat`]. The key and
+    /// the counter are local data — the roster root and the state hash do
+    /// not hash them, so this install changes neither. Returns whether the
+    /// row changed.
+    pub fn install_republished_kem_key(
+        &mut self,
+        agent_id_hex: &str,
+        kem_public_key_b64: &str,
+        key_sequence: u64,
+    ) -> bool {
+        let Some(m) = self.members_v2.get_mut(agent_id_hex) else {
+            return false;
+        };
+        if m.state != GroupMemberState::Active || key_sequence <= m.kem_key_sequence.unwrap_or(0) {
+            return false;
+        }
+        m.kem_public_key_b64 = Some(kem_public_key_b64.to_string());
+        m.kem_key_sequence = Some(key_sequence);
+        m.updated_at = now_millis();
+        true
     }
 
     /// Record the TreeKEM KeyPackage that binds a roster member to a ratchet
@@ -2737,6 +2775,7 @@ impl GroupInfo {
                 added_by: None,
                 removed_by: banned_by,
                 kem_public_key_b64: None,
+                kem_key_sequence: None,
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
                 certificate: None,

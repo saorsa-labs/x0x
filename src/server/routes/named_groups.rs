@@ -12,6 +12,9 @@ mod fair_admission;
 mod group_recovery;
 mod gss_share_hold;
 pub(in crate::server) use gss_share_hold::GssShareHolds;
+mod key_republish;
+pub(in crate::server) use key_republish::republish_outstanding_keyless_seats;
+pub(in crate::server) use key_republish::PendingKeyRepublish;
 mod revocation_eviction;
 pub(in crate::server) use revocation_eviction::rebind::rebind_member_certificate;
 mod seat_cert_fetch;
@@ -2818,6 +2821,21 @@ fn secure_share_admission(
 /// ban or terminal mutation quiesces it with the recipient's other egress.
 /// Returns whether a delivery was scheduled.
 fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadataEvent) -> bool {
+    spawn_secure_share_delivery_notifying(state, event, None)
+}
+
+/// [`spawn_secure_share_delivery`], with a hook the FIRST carrier-accepted
+/// write of the share fires (#1663 review P1, Codex controller, 30 Oct):
+/// the S4 crypto-exclusion round's share debt ends on that acceptance —
+/// the one share-possession signal that is independent of the restored
+/// head a keyed-but-shareless seat keeps serving. A withheld, purged or
+/// failed delivery never fires it, so the debt (and the delivery's
+/// obligation) survives the worker's bounded retries.
+fn spawn_secure_share_delivery_notifying(
+    state: &Arc<AppState>,
+    event: &NamedGroupMetadataEvent,
+    accepted: Option<Box<dyn FnOnce() + Send>>,
+) -> bool {
     let NamedGroupMetadataEvent::SecureShareDelivered {
         group_id,
         recipient,
@@ -2855,6 +2873,7 @@ fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadata
     let recipient_hex = recipient.clone();
     let epoch = *secret_epoch;
     let deadline = Instant::now() + SECURE_SHARE_DELIVERY_HORIZON;
+    let mut accepted = accepted;
     spawn_join_artifact_egress(
         state,
         group_id,
@@ -2900,6 +2919,13 @@ fn spawn_secure_share_delivery(state: &Arc<AppState>, event: &NamedGroupMetadata
                 };
                 if written {
                     sent += 1;
+                    // #1663 review P1 (Codex controller, 30 Oct): the
+                    // first carrier-accepted write is the share-debt
+                    // completion signal; later resends of the same share
+                    // fire nothing.
+                    if let Some(fired) = accepted.take() {
+                        fired();
+                    }
                     backoff = GROUP_BACKGROUND_PUBLISH_DELAY;
                     if sent < SECURE_SHARE_SENDS {
                         tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
@@ -4835,7 +4861,10 @@ fn restore_local_member_key_material(
         // state hash, so a signed next commit can carry a different
         // non-empty value and still verify. Drop the remote value first.
         // Retained members then take the local value back, including None.
+        // #1663 review round 4 (Claude, 30 Oct): the republication counter
+        // `kem_key_sequence` is local data too.
         member.kem_public_key_b64 = None;
+        member.kem_key_sequence = None;
         member.treekem_key_package_b64 = None;
         member.treekem_key_package_hash = None;
         member.certificate_missing_since_ms = None;
@@ -4845,6 +4874,7 @@ fn restore_local_member_key_material(
         member
             .kem_public_key_b64
             .clone_from(&previous.kem_public_key_b64);
+        member.kem_key_sequence = previous.kem_key_sequence;
         member
             .treekem_key_package_b64
             .clone_from(&previous.treekem_key_package_b64);
@@ -14152,6 +14182,7 @@ pub(in crate::server) fn set_join_request_created(
                 added_by: None,
                 removed_by: None,
                 kem_public_key_b64: Some(kem_b64),
+                kem_key_sequence: None,
                 treekem_key_package_b64: treekem_key_package_b64.clone(),
                 treekem_key_package_hash: None,
                 certificate: None,
@@ -22234,6 +22265,7 @@ fn invite_join_group_info(
                         added_by: None,
                         removed_by: None,
                         kem_public_key_b64: None,
+                        kem_key_sequence: None,
                         treekem_key_package_b64: None,
                         treekem_key_package_hash: snap.treekem_key_package_hash,
                         certificate: None,
@@ -23749,6 +23781,7 @@ pub(super) async fn join_group_via_invite_inner(
                         added_by: None,
                         removed_by: None,
                         kem_public_key_b64: Some(kem_b64.clone()),
+                        kem_key_sequence: None,
                         treekem_key_package_b64: None,
                         treekem_key_package_hash: None,
                         certificate: None,
@@ -41220,6 +41253,7 @@ fn build_listener_request_candidate_for_restart(
                         added_by: None,
                         removed_by: None,
                         kem_public_key_b64: Some(kem_b64),
+                        kem_key_sequence: None,
                         treekem_key_package_b64: treekem_key_package_b64.clone(),
                         certificate_digest: None,
                         treekem_key_package_hash: None,
@@ -49841,6 +49875,64 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// #1663 review round 4 (Claude, 30 Oct): the republication counter is
+    /// local data; a catch-up snapshot's value must not land.
+    #[test]
+    fn a_catchup_apply_keeps_the_local_kem_key_sequence() {
+        let admin = AgentId([0x16; 32]);
+        let admin_hex = hex::encode(admin.as_bytes());
+        let member_hex = "63".repeat(32);
+        let newcomer_hex = "77".repeat(32);
+        let mut local = x0x::groups::GroupInfo::new(
+            "Catch-up".to_string(),
+            String::new(),
+            admin,
+            "ab".repeat(32),
+        );
+        local.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        let local_member = local.members_v2.get_mut(&member_hex).expect("local member");
+        local_member.kem_public_key_b64 = Some("local-kem".to_string());
+        local_member.kem_key_sequence = Some(2);
+        // The responder's snapshot rows carry a hostile key AND counter.
+        let mut snapshot = local.clone();
+        snapshot.add_member(
+            newcomer_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        for id in [&member_hex, &newcomer_hex] {
+            let hostile = snapshot.members_v2.get_mut(id).expect("snapshot member");
+            hostile.kem_public_key_b64 = Some("remote-kem".to_string());
+            hostile.kem_key_sequence = Some(9);
+        }
+        // The apply's member adoption, then the local-data restore.
+        let mut next = local.clone();
+        next.members_v2.clone_from(&snapshot.members_v2);
+        restore_local_member_key_material(&mut next, &local);
+        let kept = next.members_v2.get(&member_hex).expect("retained member");
+        assert_eq!(
+            kept.kem_key_sequence,
+            Some(2),
+            "the responder's counter must not land"
+        );
+        assert_eq!(kept.kem_public_key_b64.as_deref(), Some("local-kem"));
+        let added = next
+            .members_v2
+            .get(&newcomer_hex)
+            .expect("snapshot-only member");
+        assert_eq!(
+            added.kem_key_sequence, None,
+            "a member with no local row takes no counter"
+        );
+        assert_eq!(added.kem_public_key_b64.as_deref(), None);
+    }
+
     /// ADR 0108 §8 (#1575): the notice currently staged for one
     /// `(group, member, attempt)`, as `(cause, signer_agent_id, detail)`.
     pub(in crate::server) fn staged_join_pending_notice(
@@ -50842,6 +50934,8 @@ pub(in crate::server) mod tests {
             parked_role_updates: StdMutex::new(HashMap::new()),
             parked_gss_removals: StdMutex::new(HashMap::new()),
             gss_share_holds: GssShareHolds::default(),
+            key_republish_pending: StdMutex::new(std::collections::BTreeMap::new()),
+            key_republish_sweep_armed: std::sync::atomic::AtomicBool::new(false),
             join_result_staging_guards: StdMutex::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
@@ -56494,6 +56588,7 @@ pub(in crate::server) mod tests {
                 added_by: None,
                 removed_by: None,
                 kem_public_key_b64: Some("joiner-kem".to_string()),
+                kem_key_sequence: None,
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
                 certificate: None,

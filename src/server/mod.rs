@@ -1331,6 +1331,8 @@ pub async fn serve_with_options(
         parked_role_updates: StdMutex::new(HashMap::new()),
         parked_gss_removals: StdMutex::new(HashMap::new()),
         gss_share_holds: crate::server::routes::named_groups::GssShareHolds::default(),
+        key_republish_pending: StdMutex::new(std::collections::BTreeMap::new()),
+        key_republish_sweep_armed: std::sync::atomic::AtomicBool::new(false),
         join_result_staging_guards: StdMutex::new(HashMap::new()),
         owner_cert_pending_joins: RwLock::new(HashMap::new()),
         pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
@@ -2611,6 +2613,18 @@ pub async fn serve_with_options(
                     routes::named_groups::startup_self_leave_rekey(&shielded).await;
                 })
                 .await;
+        }));
+    }
+
+    // #1663: a member of an encrypted GSS group whose own seat carries no
+    // KEM key republishes the key at boot. The keyless-install hook covers
+    // the live discovery; this pass covers a node that restarted into the
+    // keyless state (the hold and the head disclaimer persist across a
+    // restart until the seat is keyed again).
+    {
+        let republish_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            routes::named_groups::republish_outstanding_keyless_seats(&republish_state).await;
         }));
     }
 

@@ -1916,6 +1916,7 @@ fn the_join_seat_key_marker_row_is_transparent_to_the_join_state_checks() {
             added_by: None,
             removed_by: None,
             kem_public_key_b64: Some("joiner-kem".to_string()),
+            kem_key_sequence: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,
