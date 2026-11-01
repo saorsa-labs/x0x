@@ -21209,6 +21209,25 @@ pub(in crate::server) mod detached_send_test_seam {
     pub(in crate::server) fn welcome_fetch_key(welcome_id: &str) -> String {
         format!("welcome-fetch:{welcome_id}")
     }
+
+    /// #1574 item 5: the delivery round reaches the roster read of
+    /// `group_id` (the drop-deciding read, before the persistence lock is
+    /// taken). The rollback test waits on this gate, not on a fixed sleep,
+    /// so a task that never ran cannot fake a pass. The key is per group,
+    /// not per test, so its one-shot arm stays safe only under the
+    /// process-per-test runner.
+    pub(in crate::server) fn ce_roster_read_gate_key(group_id: &str) -> String {
+        format!("ce-roster-read-gate:{group_id}")
+    }
+
+    /// #1574 item 5: inside the persistence lock, immediately before the
+    /// delivery round reads the roster of `group_id`. The rollback test
+    /// holds the lock, so this may not fire until the lock is released —
+    /// a removed lock fails that test. As with the gate key, the arm is
+    /// one-shot and safe under the process-per-test runner.
+    pub(in crate::server) fn ce_roster_read_held_key(group_id: &str) -> String {
+        format!("ce-roster-read-held:{group_id}")
+    }
 }
 
 /// Fan-out a persisted public group message as a race: gossip topic publish

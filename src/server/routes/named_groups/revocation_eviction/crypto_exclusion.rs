@@ -1529,13 +1529,28 @@ pub(super) async fn drive_deliveries(state: &Arc<AppState>) {
         // #1574 item 5: the drop-deciding roster read (group gone or
         // withdrawn, fork quarantine, head moved) holds
         // `named_groups_persistence_lock`, because
-        // `persist_named_group_info` shows its candidate in the map
-        // before the write and restores the map when the write fails.
+        // `persist_named_group_info` shows its candidate in the map before
+        // the write and restores the map when the write fails.
         // An unlocked read could drop a delivery on a candidate that a
         // failing write rolls back (persistence → `named_groups`; no
-        // S4 `inner` lock is held here).
+        // S4 `inner` lock is held here). The two one-shot test seams
+        // (inert unless armed) let the rollback test prove the ordering:
+        // the gate fires when the round reaches the read leg, `held`
+        // fires only inside the lock.
+        #[cfg(test)]
+        super::super::detached_send_test_seam::park(
+            &super::super::detached_send_test_seam::ce_roster_read_gate_key(&key.stable_group_id),
+        )
+        .await;
         let info = {
             let _committed = state.named_groups_persistence_lock.lock().await;
+            #[cfg(test)]
+            super::super::detached_send_test_seam::park(
+                &super::super::detached_send_test_seam::ce_roster_read_held_key(
+                    &key.stable_group_id,
+                ),
+            )
+            .await;
             let groups = state.named_groups.read().await;
             groups
                 .values()
@@ -3815,7 +3830,11 @@ mod daemon_tests {
     /// `persist_named_group_info` shows its candidate in the map before
     /// the write and restores the map when the write fails. Before the
     /// fix the drive read a mid-write withdraw candidate and dropped the
-    /// delivery the committed roster still admits.
+    /// delivery the committed roster still admits. The mid-write leg
+    /// waits for the roster-read gate seam (proof the round reached the
+    /// read) and then proves the read waits behind the persistence lock:
+    /// the `held` seam, inside the lock, stays cold while the test holds
+    /// it — not a fixed sleep, so a removed lock fails this test.
     #[tokio::test]
     async fn a_crypto_exclusion_delivery_drop_waits_out_a_roster_candidate_that_rolls_back(
     ) -> Result<()> {
@@ -3845,6 +3864,12 @@ mod daemon_tests {
         // The mid-write window: a withdraw candidate is in the map while
         // the persistence lock is held — exactly what a failing
         // `persist_named_group_info` restores.
+        let gate = ng::detached_send_test_seam::arm(
+            &ng::detached_send_test_seam::ce_roster_read_gate_key(&fx.group_id),
+        );
+        let held = ng::detached_send_test_seam::arm(
+            &ng::detached_send_test_seam::ce_roster_read_held_key(&fx.group_id),
+        );
         let guard = fx.state.named_groups_persistence_lock.lock().await;
         let mut candidate = info.clone();
         candidate.withdrawn = true;
@@ -3857,12 +3882,31 @@ mod daemon_tests {
             let state = Arc::clone(&fx.state);
             tokio::spawn(async move { drive_deliveries(&state).await })
         };
-        for _ in 0..30 {
-            if driven.is_finished() {
+        for _ in 0..250 {
+            if gate.reached() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(4)).await;
         }
+        assert!(
+            gate.reached(),
+            "the round reached the roster read (the gate seam), not a sleep"
+        );
+        // Release the gate: the round now goes for the persistence lock,
+        // which this test holds. The seam inside the lock may fire only
+        // after the lock is released below; with the lock removed it
+        // fires here and this test fails.
+        drop(gate);
+        for _ in 0..75 {
+            if held.reached() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        }
+        assert!(
+            !held.reached(),
+            "the roster read ran without the persistence lock in hand"
+        );
         assert!(
             fx.state
                 .revocation_evictions
@@ -3880,6 +3924,9 @@ mod daemon_tests {
             .write()
             .await
             .insert(fx.group_id.clone(), info.clone());
+        // `held` is disarmed before the release, so the round reads
+        // straight through the restored roster.
+        drop(held);
         drop(guard);
         driven.await?;
         assert!(
