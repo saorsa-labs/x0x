@@ -12,9 +12,11 @@
 #   2. Downloads latest release from GitHub
 #   3. Verifies its SHA-256, the sidecar checksum and the signed ML-DSA-65
 #      release manifest, whose version and channel must match the resolved
-#      release tag (through the release's own x0x binary, the updater's
-#      verify path), and, when gpg is present, its GPG signature against the
-#      pinned Saorsa Labs release key (fails closed on any mismatch)
+#      release tag (through an installed x0x when available, else the
+#      release's own binary — the updater's verify path — before the
+#      archive is unpacked), and, when gpg is present, its GPG signature
+#      against the pinned Saorsa Labs release key (fails closed on any
+#      mismatch)
 #   4. Stops any running x0xd instance
 #   5. Installs x0xd (daemon) + x0x (CLI) to ~/.local/bin
 #   6. Starts the daemon
@@ -162,9 +164,11 @@ verify_failed() {
 # Resolve the latest release tag first, through the same API the updater
 # uses, and download every file from that tag. This keeps the tag and the
 # assets from disagreeing when a release is published mid-install, and the
-# manifest's version and channel must match the tag below (the updater's
-# rule, src/upgrade/monitor.rs), so an older, genuinely-signed release
-# replayed for a newer tag is refused.
+# manifest's version and channel must match the tag below, so a manifest
+# from one release cannot be served for another. The tag comes from an
+# unauthenticated API, so this is not downgrade protection: the updater's
+# newer-version and manifest-age checks (src/upgrade/monitor.rs) are what
+# refuse an older release, and this installer does not replicate them.
 echo "Resolving the latest release..."
 fetch "https://api.github.com/repos/$REPO/releases/latest" "$TMP/latest.json"
 TAG=$(tr -d '\n\r' < "$TMP/latest.json" | awk '{
@@ -242,10 +246,11 @@ else
     echo "" >&2
     echo "################################################################" >&2
     echo "# WARNING: gpg NOT FOUND - the GPG signature was NOT verified. #" >&2
-    echo "# The checksum and the ML-DSA manifest were checked. On a      #" >&2
-    echo "# first install the manifest is checked by the downloaded      #" >&2
-    echo "# binary itself, not by an independent key. Install gpg and    #" >&2
-    echo "# re-run for a check that does not depend on this download.    #" >&2
+    echo "# The checksum and the ML-DSA manifest were checked. With      #" >&2
+    echo "# no installed post-v0.46.5 x0x, the manifest is checked by    #" >&2
+    echo "# the downloaded binary itself, not by an independent key.     #" >&2
+    echo "# Install gpg and re-run for a check that does not depend      #" >&2
+    echo "# on this download.                                            #" >&2
     echo "################################################################" >&2
     echo "" >&2
 fi
@@ -255,17 +260,29 @@ fi
 # The updater refuses a release whose manifest signature fails against the
 # release key compiled into the binary (src/upgrade/signature.rs). This
 # installer reuses that verify path instead of adding a second
-# implementation. Three checks, in this order:
+# implementation. Four steps, in this order:
 #
 #   1. Bind: the manifest's version and channel must match the resolved
-#      release tag (stable, non-prerelease, same version — the rule
-#      src/upgrade/monitor.rs applies), before any of the archive's bytes
-#      run. A genuinely-signed manifest for a different release is refused.
-#   2. Bind: the manifest's archive_sha256 entry for this platform must name
-#      the downloaded archive, still before extraction.
-#   3. Sign: the release's own x0x runs the inert --verify-release-manifest
-#      probe (src/upgrade/verification_probe.rs), which reads only the two
-#      files before any initialization.
+#      release tag (stable, non-prerelease, same version), before any of
+#      the archive's bytes run. A genuinely-signed manifest for a
+#      different release is refused. The stable, non-prerelease shape is
+#      the updater's rule (src/upgrade/monitor.rs); matching the tag is
+#      this installer's addition.
+#   2. Bind: the manifest's archive_sha256 entry for this platform must
+#      name the downloaded archive, still before extraction.
+#   3. Sign: an already-installed x0x — its key was trusted by an earlier
+#      install — runs the inert --verify-release-manifest probe
+#      (src/upgrade/verification_probe.rs), which reads only the two
+#      downloaded files, and this runs before the archive is unpacked at
+#      all. The bound hash and the verified signature therefore always
+#      apply to the same bytes.
+#   4. Only then is the archive unpacked, into a fresh subfolder, so its
+#      entries can never replace the manifest and signature that were
+#      bound and checked. On a first install, or when the installed x0x
+#      predates v0.46.5 (exit 2 on the probe argument), the release's own
+#      x0x from that subfolder does the check instead — a stated
+#      self-attest limit; the pinned GPG signature stays the independent
+#      anchor there.
 #
 # A missing manifest or signature, a bad signature, a version or channel
 # that differs from the release tag, or a hash that differs from the
@@ -335,27 +352,34 @@ if [ "$MANIFEST_SHA" != "$ACTUAL_SHA" ]; then
 fi
 echo "  Archive hash matches the manifest entry ($TARGET_TRIPLE)"
 
-# Extract now: verification runs the release's own x0x before anything is
-# installed. The binding above already proved this archive is the one the
-# manifest names; the signature now proves the manifest itself.
-tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
-
-PROBE="$TMP/x0x-${PLATFORM}/x0x"
-if [ ! -f "$PROBE" ] || [ -L "$PROBE" ] || [ ! -x "$PROBE" ]; then
-    echo "Error: release archive missing executable x0x" >&2
-    exit 1
-fi
+# Unpack into a fresh subfolder, never $TMP itself: a crafted archive
+# carrying its own release-manifest.json and .sig must not be able to
+# overwrite the files the binding and the signature check read. mkdir
+# without -p is the freshness guard; a symlinked top-level folder in the
+# archive is refused before anything under it is used.
+EXTRACT="$TMP/extract"
+unpack_release() {
+    mkdir "$EXTRACT" || verify_failed "could not create the unpack folder"
+    tar -xzf "$TMP/$ARCHIVE" -C "$EXTRACT" || verify_failed "could not unpack $ARCHIVE"
+    if [ -L "$EXTRACT/x0x-${PLATFORM}" ] || [ ! -d "$EXTRACT/x0x-${PLATFORM}" ]; then
+        echo "Error: release archive missing directory x0x-${PLATFORM}" >&2
+        exit 1
+    fi
+}
 
 # Prefer an already-installed x0x as the verifier: its key was trusted by an
-# earlier install, so the check does not depend on this download. Installed
-# binaries from v0.46.5 know --verify-release-manifest and exit 0 (valid) or
-# 1 (invalid); a pre-probe installed binary rejects the unknown argument
-# with exit code 2, and first installs have no binary yet, so both fall back
-# to the release's own x0x. Limit, stated plainly: on a first install the
-# manifest is checked by the downloaded binary itself, so an attacker
-# controlling the whole origin could self-attest; the pinned GPG signature
-# stays the independent check there. This is the updater's verify path, so
-# --verify-only also executes the release binary.
+# earlier install, so the check does not depend on this download. The probe
+# runs before the archive is unpacked, and the manifest and signature it
+# reads are the downloaded files, which no archive byte has touched.
+# Installed binaries from v0.46.5 know --verify-release-manifest and exit 0
+# (valid) or 1 (invalid); a pre-probe installed binary rejects the unknown
+# argument with exit code 2, and first installs have no binary yet, so both
+# fall back to the release's own x0x, unpacked into the fresh subfolder.
+# Limit, stated plainly: on those fallback paths the manifest is checked by
+# the downloaded binary itself, so an attacker controlling the whole origin
+# could self-attest; the pinned GPG signature stays the independent check
+# there. This is the updater's verify path, so --verify-only also executes
+# the release binary on a fallback.
 MANIFEST="$TMP/release-manifest.json"
 MANIFEST_SIG="$TMP/release-manifest.json.sig"
 VERIFY_BIN=""
@@ -367,6 +391,18 @@ if [ -x "$BIN/x0x" ]; then
     fi
 fi
 if [ -z "$VERIFY_BIN" ]; then
+    if [ -x "$BIN/x0x" ]; then
+        echo "" >&2
+        echo "Warning: the installed x0x predates v0.46.5 and cannot check the" >&2
+        echo "manifest, so the downloaded binary verifies its own release. The" >&2
+        echo "pinned GPG signature stays the independent check for this install." >&2
+    fi
+    unpack_release
+    PROBE="$EXTRACT/x0x-${PLATFORM}/x0x"
+    if [ ! -f "$PROBE" ] || [ -L "$PROBE" ] || [ ! -x "$PROBE" ]; then
+        echo "Error: release archive missing executable x0x" >&2
+        exit 1
+    fi
     VERIFY_BIN="$PROBE"
     PROBE_RC=0
     "$VERIFY_BIN" --verify-release-manifest "$MANIFEST" "$MANIFEST_SIG" || PROBE_RC=$?
@@ -433,8 +469,13 @@ http_get_auth() {
 
 mkdir -p "$BIN"
 
+# The installed-verifier path skips the earlier unpack; extract now.
+if [ ! -d "$EXTRACT" ]; then
+    unpack_release
+fi
+
 for bin in x0xd x0x; do
-    SRC="$TMP/x0x-${PLATFORM}/$bin"
+    SRC="$EXTRACT/x0x-${PLATFORM}/$bin"
     if [ ! -f "$SRC" ] || [ -L "$SRC" ] || [ ! -x "$SRC" ]; then
         echo "Error: release archive missing executable $bin" >&2
         exit 1
@@ -443,8 +484,8 @@ done
 
 NEW_XOXD="$BIN/x0xd.new.$$"
 NEW_XOX="$BIN/x0x.new.$$"
-cp "$TMP/x0x-${PLATFORM}/x0xd" "$NEW_XOXD"
-cp "$TMP/x0x-${PLATFORM}/x0x" "$NEW_XOX"
+cp "$EXTRACT/x0x-${PLATFORM}/x0xd" "$NEW_XOXD"
+cp "$EXTRACT/x0x-${PLATFORM}/x0x" "$NEW_XOX"
 chmod +x "$NEW_XOXD" "$NEW_XOX"
 mv "$NEW_XOXD" "$BIN/x0xd"
 mv "$NEW_XOX" "$BIN/x0x"

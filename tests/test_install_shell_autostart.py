@@ -28,7 +28,7 @@ def installer_tools(tmp: Path) -> Path:
     scripts/install.sh resolves from PATH (see
     test_install_manifest_verify.build_installer_tools) plus python3, which
     the fake sleep delegates to. Never /usr/bin or /bin wholesale: on a host
-    with gpg there, the GPG branch (install.sh:212) would demand .asc files
+    with gpg there, the GPG branch of install.sh would demand .asc files
     the fake release does not serve and the install would die before the
     checks these tests pin (Greptile P1 on #1753)."""
     return build_installer_tools(tmp / "installer-tools", extra=("python3",))

@@ -9,11 +9,15 @@ src/upgrade/signature.rs itself (the pattern of tests/upgrade_test_signing.rs),
 with a compile-time test key replacing the production key through the
 debug-only upgrade-test-signing seam.
 
-The gate also pins the release identity the updater enforces
-(src/upgrade/monitor.rs validate_manifest_at): the manifest must be a stable,
-non-prerelease version equal to the tag GitHub resolves for "latest" with its
-leading "v" stripped. An older, genuinely-signed release served for a newer
-tag is refused before any archive byte executes.
+The gate also pins the release identity: the manifest must be a stable,
+non-prerelease version equal to the tag GitHub resolves for "latest" with
+its leading "v" stripped. The stable, non-prerelease shape is the updater's
+rule (src/upgrade/monitor.rs validate_manifest_at); matching the tag is the
+installer's own addition, which refuses a genuinely-signed manifest from
+another release served for this tag before any archive byte executes. The
+gate also proves the archive cannot replace the bound manifest files (it
+unpacks into a separate subfolder only after the signature check) and
+covers the gpg-present branch.
 
 The fixture build is cached under the repo target directory, keyed by a hash
 of its sources; each cache entry keeps its own copy of the binary next to its
@@ -24,7 +28,9 @@ suite; only a missing cargo skips it.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -33,6 +39,7 @@ import tarfile
 import tempfile
 import unittest
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -45,9 +52,9 @@ TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
 # The external commands scripts/install.sh resolves from PATH. The
 # installer's PATH in these tests is a directory holding exactly these, as
 # absolute symlinks — never /usr/bin or /bin wholesale — so a host gpg
-# cannot be found wherever the host keeps it: found, the GPG branch
-# (install.sh:212) demands .asc files the fake release does not serve and
-# the install dies before the manifest gate (Greptile P1 on #1753). `sh` is
+# cannot be found wherever the host keeps it: found, the GPG branch of
+# install.sh demands .asc files the fake release does not serve and the
+# install dies before the manifest gate (Greptile P1 on #1753). `sh` is
 # here too: the fake release's shebangs run `#!/usr/bin/env sh`, and env
 # resolves sh through the child PATH.
 INSTALLER_TOOLS = (
@@ -70,6 +77,11 @@ INSTALLER_TOOLS = (
 # resolve. A perl-script shasum still runs: its #! interpreter is absolute
 # and needs no PATH entry.
 CHECKSUM_TOOLS = ("sha256sum", "shasum")
+
+# TRUSTED_FPR in scripts/install.sh: when gpg is on the installer's PATH,
+# the gpg branch pins the Saorsa Labs release key by primary fingerprint
+# and must refuse any other key or signer.
+TRUSTED_FPR = "CEB3506E7DCB8A2DD2D679E8EDDA4827D89C0F29"
 
 
 def build_installer_tools(
@@ -203,6 +215,34 @@ def write_executable(path: Path, contents: str) -> None:
     path.chmod(0o755)
 
 
+_fixture_lock_depth = 0
+
+
+@contextmanager
+def fixture_cache_lock():
+    """Serialize fixture-cache builds and test mutations across
+    worktrees (flock) and re-enters within one process (unittest is
+    serial, but the cache test wraps a build_fixture call)."""
+    global _fixture_lock_depth
+    if _fixture_lock_depth:
+        _fixture_lock_depth += 1
+        try:
+            yield
+        finally:
+            _fixture_lock_depth -= 1
+        return
+    root = target_root() / "install-test-fixture"
+    root.mkdir(parents=True, exist_ok=True)
+    with open(root / ".lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _fixture_lock_depth = 1
+        try:
+            yield
+        finally:
+            _fixture_lock_depth = 0
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def build_fixture() -> tuple[Path, Path]:
     """Compile the manifest signing/verification fixture and return
     (binary, secret-key) paths. Cached per source hash. The key pair is a
@@ -228,68 +268,73 @@ def build_fixture() -> tuple[Path, Path]:
         )
     ).hexdigest()[:16]
     root = target_root() / "install-test-fixture" / digest
-    build_output = cargo_output_dir(root) / "install-manifest-fixture"
-    binary = root / "install-manifest-fixture"
-    public = root / "public-key.bin"
-    secret = root / "test-signing-secret.bin"
-    # The stamp is written only after the entry's binary copy exists; without
-    # it, a half-finished cache could serve the stage-1 binary, which embeds
-    # the production key and would refuse every fixture signature.
-    stamp = root / ".feature-build-done"
-    if stamp.exists() and binary.exists() and public.exists() and secret.exists():
-        return binary, secret
+    with fixture_cache_lock():
+        build_output = cargo_output_dir(root) / "install-manifest-fixture"
+        binary = root / "install-manifest-fixture"
+        public = root / "public-key.bin"
+        secret = root / "test-signing-secret.bin"
+        # The stamp is written only after the entry's binary copy exists; without
+        # it, a half-finished cache could serve the stage-1 binary, which embeds
+        # the production key and would refuse every fixture signature.
+        stamp = root / ".feature-build-done"
+        if stamp.exists() and binary.exists() and public.exists() and secret.exists():
+            return binary, secret
 
-    root.mkdir(parents=True, exist_ok=True)
-    for name, contents in sources.items():
-        target = root / "src" / name if name in ("main.rs", "signature.rs") else root / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(contents, encoding="utf-8")
-    # Reuse the reviewed dependency graph; resolution changes stay local.
-    shutil.copy(ROOT / "Cargo.lock", root / "Cargo.lock")
+        root.mkdir(parents=True, exist_ok=True)
+        for name, contents in sources.items():
+            target = (
+                root / "src" / name
+                if name in ("main.rs", "signature.rs")
+                else root / name
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(contents, encoding="utf-8")
+        # Reuse the reviewed dependency graph; resolution changes stay local.
+        shutil.copy(ROOT / "Cargo.lock", root / "Cargo.lock")
 
-    # cargo-llvm-cov and other wrappers must not leak into the nested build.
-    scrub = [
-        "RUSTFLAGS",
-        "RUSTC_WRAPPER",
-        "RUSTC_WORKSPACE_WRAPPER",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "LLVM_PROFILE_FILE",
-        "CARGO_LLVM_COV",
-        "CARGO_LLVM_COV_SHOW_ENV",
-        "CARGO_LLVM_COV_TARGET_DIR",
-        "CARGO_BUILD_TARGET",
-    ]
-    env = {k: v for k, v in os.environ.items() if k not in scrub}
+        # cargo-llvm-cov and other wrappers must not leak into the nested build.
+        scrub = [
+            "RUSTFLAGS",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "LLVM_PROFILE_FILE",
+            "CARGO_LLVM_COV",
+            "CARGO_LLVM_COV_SHOW_ENV",
+            "CARGO_LLVM_COV_TARGET_DIR",
+            "CARGO_BUILD_TARGET",
+        ]
+        env = {k: v for k, v in os.environ.items() if k not in scrub}
 
-    def cargo(*args: str) -> None:
-        build = subprocess.run(
-            ["cargo", "build", "--manifest-path", str(root / "Cargo.toml"), *args],
+        def cargo(*args: str) -> None:
+            build = subprocess.run(
+                ["cargo", "build", "--manifest-path", str(root / "Cargo.toml"), *args],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            if build.returncode != 0:
+                raise AssertionError(f"fixture build failed ({args}):\n{build.stderr}")
+
+        # Stage 1: keygen needs no embedded key. Stage 2 embeds the generated
+        # public key through the debug-only upgrade-test-signing seam, so verify
+        # trusts exactly the fixture key pair.
+        cargo("--offline")
+        subprocess.run(
+            [build_output, "keygen", str(public), str(secret)],
+            check=True,
             cwd=root,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=600,
+            timeout=60,
         )
-        if build.returncode != 0:
-            raise AssertionError(f"fixture build failed ({args}):\n{build.stderr}")
-
-    # Stage 1: keygen needs no embedded key. Stage 2 embeds the generated
-    # public key through the debug-only upgrade-test-signing seam, so verify
-    # trusts exactly the fixture key pair.
-    cargo("--offline")
-    subprocess.run(
-        [build_output, "keygen", str(public), str(secret)],
-        check=True,
-        cwd=root,
-        timeout=60,
-    )
-    cargo("--offline", "--features", "upgrade-test-signing")
-    # Pin this entry's binary/key pairing before the stamp: the cargo output
-    # path may be shared across source hashes and worktrees, so the entry
-    # must serve its own copy, not that path.
-    shutil.copy2(build_output, binary)
-    stamp.write_text("ok", encoding="utf-8")
-    return binary, secret
+        cargo("--offline", "--features", "upgrade-test-signing")
+        # Pin this entry's binary/key pairing before the stamp: the cargo output
+        # path may be shared across source hashes and worktrees, so the entry
+        # must serve its own copy, not that path.
+        shutil.copy2(build_output, binary)
+        stamp.write_text("ok", encoding="utf-8")
+        return binary, secret
 
 
 def manifest_bytes(
@@ -379,6 +424,8 @@ class InstallManifestVerifyTests(unittest.TestCase):
         served_manifest: bytes | Callable[[str], bytes] | None = None,
         missing: frozenset[str] = frozenset(),
         secret: Path | None = None,
+        archive_extras: dict[str, bytes] | None = None,
+        served_extras: dict[str, bytes] | None = None,
         archive_probe_delegates: bool = True,
         tag: str | None = "v0.48.0",
         tools_dir: Path | None = None,
@@ -392,7 +439,11 @@ class InstallManifestVerifyTests(unittest.TestCase):
         `served_manifest` overrides the bytes the server returns after
         `manifest` was signed (the tamper case). `missing` names release
         files the fake downloads fail on. `secret` signs with another
-        throwaway key (the wrong-key case). With
+        throwaway key (the wrong-key case). `archive_extras` adds top-level
+        members to the fake archive (e.g. a manifest pair a crafted archive
+        tries to plant); `served_extras` adds further files the fake server
+        holds, keyed by bare file name (the .asc files the gpg branch
+        downloads). With
         `archive_probe_delegates=False` the release's x0x accepts any
         manifest, isolating the installed-verifier preference. `tag` is the
         tag_name the fake GitHub API serves for the "latest" release (None:
@@ -443,6 +494,10 @@ class InstallManifestVerifyTests(unittest.TestCase):
         with tarfile.open(archive, "w:gz") as tar:
             tar.add(archive_dir / "x0xd", arcname=f"x0x-{PLATFORM}/x0xd")
             tar.add(archive_dir / "x0x", arcname=f"x0x-{PLATFORM}/x0x")
+            for name, data in (archive_extras or {}).items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
 
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         served = {
@@ -459,6 +514,7 @@ class InstallManifestVerifyTests(unittest.TestCase):
             else:
                 served["release-manifest.json"] = manifest
             served["release-manifest.json.sig"] = self.sign(manifest, tmp, secret)
+        served.update(served_extras or {})
         for name, data in served.items():
             (files_dir / name).write_bytes(data)
 
@@ -570,7 +626,7 @@ esac
     def test_installer_path_excludes_host_gpg(self) -> None:
         # Greptile P1 on #1753: Linux commonly keeps gpg in /usr/bin, so a
         # PATH holding that directory verbatim finds the host gpg; the GPG
-        # branch (install.sh:212) then demands .asc files this fake release
+        # branch of install.sh then demands .asc files this fake release
         # does not serve and the install dies before the manifest gate.
         # Simulate exactly that host — every tool plus a gpg in one
         # directory — and prove the built tool set keeps gpg off the
@@ -600,6 +656,64 @@ esac
             self.assertEqual(rc, 0, output)
             self.assertIn("ML-DSA-65 manifest signature verified", output)
 
+    def test_gpg_present_branch_checks_the_pinned_key(self) -> None:
+        # Every other test keeps gpg off the installer's PATH, so the GPG
+        # branch of install.sh never ran. Give it a fake gpg that prints
+        # exactly the lines the installer parses — the show-keys line puts
+        # the key fingerprint in colon-field 10, the VALIDSIG line makes
+        # the signer the third whitespace field — and pin the three
+        # outcomes: the pinned key with the pinned signer installs; either
+        # one swapped for another fingerprint is refused before the probe.
+        with tempfile.TemporaryDirectory() as tools_tmp:
+            fake_gpg_dir = Path(tools_tmp) / "fake-gpg"
+            fake_gpg_dir.mkdir()
+            # A placeholder so build_installer_tools can resolve gpg at all;
+            # each sub-test overwrites it with the fingerprints under test.
+            write_executable(fake_gpg_dir / "gpg", "#!/usr/bin/env sh\nexit 0\n")
+            tools_dir = build_installer_tools(
+                Path(tools_tmp) / "tools",
+                source_path=(
+                    f"{fake_gpg_dir}{os.pathsep}{os.environ.get('PATH', os.defpath)}"
+                ),
+                extra=("gpg",),
+            )
+            other_fpr = "0123456789ABCDEF0123456789ABCDEF01234567"
+            for key_fpr, sig_fpr, refusal in (
+                (TRUSTED_FPR, TRUSTED_FPR, None),
+                (other_fpr, TRUSTED_FPR, "SAORSA_PUBLIC_KEY.asc is not the pinned release key"),
+                (TRUSTED_FPR, other_fpr, "GPG signature was not made by the pinned release key"),
+            ):
+                with tempfile.TemporaryDirectory() as tmpdir, self.subTest(
+                    key=key_fpr[:8], sig=sig_fpr[:8]
+                ):
+                    write_executable(
+                        fake_gpg_dir / "gpg",
+                        "#!/usr/bin/env sh\n"
+                        'case "$*" in\n'
+                        f"    *--show-keys*) printf 'fpr:::::::::{key_fpr}:\\n' ;;\n"
+                        f"    *--verify*) printf '[GNUPG:] VALIDSIG {sig_fpr}\\n' ;;\n"
+                        "esac\n"
+                        "exit 0\n",
+                    )
+                    rc, output, probe_calls, bin_dir = self.run_installer(
+                        Path(tmpdir),
+                        manifest_bytes,
+                        tools_dir=tools_dir,
+                        served_extras={
+                            f"x0x-{PLATFORM}.tar.gz.asc": b"fake detached signature\n",
+                            "SAORSA_PUBLIC_KEY.asc": b"fake public key\n",
+                        },
+                    )
+                    if refusal is None:
+                        self.assertEqual(rc, 0, output)
+                        self.assertIn(f"GPG signature verified ({TRUSTED_FPR})", output)
+                        self.assertIn("ML-DSA-65 manifest signature verified", output)
+                        self.assertIn("Installed:", output)
+                    else:
+                        self.assert_refused(
+                            rc, output, bin_dir, probe_calls, refusal, probe_ran=False
+                        )
+
     def test_cached_verifier_is_entry_local_not_the_shared_cargo_output(self) -> None:
         # Greptile P2 on #1753: with CARGO_TARGET_DIR (or a global
         # build.target-dir) every source hash compiles to the same
@@ -607,38 +721,40 @@ esac
         # can leave a differently keyed binary at that path while this
         # entry's stamp and secret survive. The cache must serve the entry's
         # own copy, so replacing whatever sits at the shared output path
-        # changes nothing.
+        # changes nothing. The swap and the build run under the cache lock,
+        # which serializes them against a concurrent worktree's build.
         shared = cargo_output_dir(self.verifier.parent) / "install-manifest-fixture"
         original = shared.read_bytes()
-        try:
+        with fixture_cache_lock():
             write_executable(shared, "#!/usr/bin/env sh\nexit 1\n")
-            binary, secret = build_fixture()
-            self.assertNotEqual(binary, shared)
-            self.assertTrue(
-                binary.is_relative_to(target_root() / "install-test-fixture"),
-                binary,
-            )
-            # And the pair still works: a manifest signed by the returned
-            # secret verifies under the returned binary.
-            with tempfile.TemporaryDirectory() as tmpdir:
-                scratch = Path(tmpdir) / "signing"
-                scratch.mkdir()
-                manifest = scratch / "release-manifest.json"
-                signature = scratch / "release-manifest.json.sig"
-                manifest.write_bytes(manifest_bytes("0" * 64))
-                subprocess.run(
-                    [str(binary), "sign", str(manifest), str(secret), str(signature)],
-                    check=True,
-                    timeout=60,
+            try:
+                binary, secret = build_fixture()
+                self.assertNotEqual(binary, shared)
+                self.assertTrue(
+                    binary.is_relative_to(target_root() / "install-test-fixture"),
+                    binary,
                 )
-                subprocess.run(
-                    [str(binary), "verify", str(manifest), str(signature)],
-                    check=True,
-                    timeout=60,
-                )
-        finally:
-            shared.write_bytes(original)
-            shared.chmod(0o755)
+                # And the pair still works: a manifest signed by the returned
+                # secret verifies under the returned binary.
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    scratch = Path(tmpdir) / "signing"
+                    scratch.mkdir()
+                    manifest = scratch / "release-manifest.json"
+                    signature = scratch / "release-manifest.json.sig"
+                    manifest.write_bytes(manifest_bytes("0" * 64))
+                    subprocess.run(
+                        [str(binary), "sign", str(manifest), str(secret), str(signature)],
+                        check=True,
+                        timeout=60,
+                    )
+                    subprocess.run(
+                        [str(binary), "verify", str(manifest), str(signature)],
+                        check=True,
+                        timeout=60,
+                    )
+            finally:
+                shared.write_bytes(original)
+                shared.chmod(0o755)
 
     # name, manifest (None/bytes/factory), served override, missing release
     # files, expected output needles, whether the probe gets to run at all,
@@ -661,10 +777,11 @@ esac
             None,
         ),
         # Genuinely signed by the fixture key, but not the release the API
-        # resolved: the version/channel gate (the updater's
-        # validate_manifest_at rule) refuses before any archive byte runs.
-        # An older, validly-signed release replayed for a newer tag must not
-        # install, so none of these use a wrong key.
+        # resolved: a manifest from an older release served for this tag is
+        # refused before any archive byte runs. The stable, non-prerelease
+        # shape comes from the updater's validate_manifest_at; the
+        # version-must-equal-the-tag binding is installer-only. None of
+        # these use a wrong key — the signature is genuinely valid.
         (
             "manifest_version_differs_from_tag",
             lambda digest: manifest_bytes(digest, version="0.47.0"),
@@ -822,6 +939,62 @@ esac
                 ["installed-probe"],
             )
 
+    def test_archive_cannot_replace_the_bound_manifest(self) -> None:
+        # Claude review blocker on #1753: pre-fix, the archive was unpacked
+        # into $TMP itself — the folder holding the downloaded
+        # release-manifest.json — after the hash binding but before the
+        # signature check. A crafted archive carrying a genuinely-signed
+        # manifest pair at its top level let tar overwrite the served
+        # (tampered) manifest with that pair; the verifier then verified
+        # the genuine manifest and the malicious binaries installed. The
+        # check now runs on the downloaded manifest before any unpacking
+        # (the archive unpacks into a separate subfolder), so the tampered
+        # bytes are refused; pre-fix this test is red.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "home" / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            # As in the installed-verifier-preference test: the installed
+            # x0x really verifies, and its refusal must block the install.
+            write_executable(
+                bin_dir / "x0x",
+                "#!/usr/bin/env sh\n"
+                'if [ "$1" = "--verify-release-manifest" ] && [ $# -eq 3 ]; then\n'
+                '    printf \'%s\\n\' installed-probe >> "$PROBE_CALLS"\n'
+                f'    exec "{self.verifier}" verify "$2" "$3"\n'
+                "fi\n"
+                'echo "error: unexpected argument" >&2\n'
+                "exit 2\n",
+            )
+            installed_x0x = (bin_dir / "x0x").read_bytes()
+            # Signed before run_installer: its own signing reuses the same
+            # scratch directory. The pair's content can be any release —
+            # the probe checks only the signature.
+            genuine = manifest_bytes("9" * 64, version="0.47.0")
+            genuine_sig = self.sign(genuine, tmp)
+            rc, output, probe_calls, bin_dir = self.run_installer(
+                tmp,
+                manifest_bytes,
+                served_manifest=lambda digest: manifest_bytes(digest).replace(
+                    b'"timestamp": 0', b'"timestamp": 1'
+                ),
+                archive_extras={
+                    "release-manifest.json": genuine,
+                    "release-manifest.json.sig": genuine_sig,
+                },
+            )
+            self.assertNotEqual(rc, 0, output)
+            self.assertIn("failed ML-DSA signature verification", output)
+            self.assertNotIn("Installed:", output)
+            # The planted pair bought nothing: nothing was installed over
+            # the existing binary.
+            self.assertEqual((bin_dir / "x0x").read_bytes(), installed_x0x)
+            self.assertFalse((bin_dir / "x0xd").exists())
+            self.assertEqual(
+                probe_calls.read_text(encoding="utf-8").splitlines(),
+                ["installed-probe"],
+            )
+
     def test_installed_verifier_launch_failure_stops_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -869,6 +1042,9 @@ esac
             rc, output, probe_calls, bin_dir = self.run_installer(tmp, manifest_bytes)
             self.assertEqual(rc, 0, output)
             self.assertIn("ML-DSA-65 manifest signature verified", output)
+            # The fallback names why: the installed binary predates the
+            # probe release, so the downloaded binary self-attests.
+            self.assertIn("predates v0.46.5", output)
             self.assertNotIn("by the installed x0x", output)
             self.assertIn("Installed:", output)
             # The good release replaces the pre-probe binary, as an upgrade

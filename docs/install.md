@@ -58,17 +58,26 @@ The current installer:
 4. When `gpg` is present, checks the GPG signature against the pinned
    Saorsa Labs release key.
 5. Reads the signed release manifest. The manifest `version` and `channel`
-   must match the tag: stable channel, non-prerelease version, same
-   version. This is the rule the updater applies to manifests. The
-   manifest's archive hash must also match the downloaded archive. An
-   older, genuinely-signed release cannot be served for a newer tag.
-6. Verifies the manifest's ML-DSA-65 signature with an `x0x` binary: an
-   already-installed one when available, else the release's own. A missing,
-   invalid or unmatched check stops the install. An installed binary that
-   cannot run also stops the install; remove it and re-run to repair.
-   On a first install without `gpg`, the downloaded binary verifies its
-   own manifest, so the check does not bind the release to a key you
-   already trust.
+   must name a stable, non-prerelease release, and the version must equal
+   the resolved tag with its leading `v` removed. The manifest's archive
+   hash must also match the downloaded archive. This refuses a manifest
+   from one release served for another. It is not downgrade protection:
+   the `latest` tag comes from the unauthenticated GitHub API, so an
+   older, genuinely-signed release replayed in full can still install.
+   The updater refuses that (a newer-version check and a manifest age
+   limit); `x0x upgrade --apply --now` keeps that protection, the
+   installer does not replicate it.
+6. Verifies the manifest's ML-DSA-65 signature with an `x0x` binary,
+   before the archive is unpacked, and unpacks into a separate folder so
+   archive entries cannot replace the files that were checked. The
+   verifier is an already-installed `x0x` when available; on a first
+   install, or with a pre-v0.46.5 `x0x` installed (the installer warns),
+   it is the release's own binary, so `--verify-only` executes that
+   release binary on those paths. A missing, invalid or unmatched check
+   stops the install. An installed binary that cannot run also stops the
+   install; remove it and re-run to repair. Without `gpg` on those
+   fallback paths, the downloaded binary verifies its own manifest, so
+   the check does not bind the release to a key you already trust.
 7. Installs both `x0x` and `x0xd` into `~/.local/bin`
 8. Ensures the shared x0x data directory exists
 9. Starts the daemon

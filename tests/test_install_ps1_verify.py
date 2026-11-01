@@ -5,9 +5,12 @@ The Windows counterpart of tests/test_install_manifest_verify.py, run under
 real PowerShell (pwsh) on the local machine. Two rules of the installer are
 pinned:
 
-  * the updater rule (src/upgrade/monitor.rs): the signed manifest's version
-    and channel must name the resolved release tag — stable, non-prerelease,
-    same version — or nothing is installed;
+  * the release-identity binding: the signed manifest's version and
+    channel must name the resolved release tag — stable, non-prerelease,
+    same version — or nothing is installed. The stable, non-prerelease
+    shape is the updater's rule (src/upgrade/monitor.rs); matching the
+    tag is the installer's own addition — the updater never compares the
+    manifest version with the tag;
   * an installed x0x.exe that exists but cannot launch stops the install
     instead of falling back to the downloaded binary, which would let an
     unverified download decide its own install.
@@ -268,7 +271,8 @@ class InstallPs1VerifyTests(unittest.TestCase):
         (release_dir / f"{ASSET}.sha256").write_text(f"{digest}  {ASSET}\n", encoding="utf-8")
         if "release-manifest.json" not in missing:
             (release_dir / "release-manifest.json").write_bytes(served_manifest)
-        (release_dir / "release-manifest.json.sig").write_bytes(signature)
+        if "release-manifest.json.sig" not in missing:
+            (release_dir / "release-manifest.json.sig").write_bytes(signature)
         if not use_version_param:
             api_file = tmp / "web" / "api" / "repos" / "saorsa-labs" / "x0x" / "releases" / "latest"
             api_file.parent.mkdir(parents=True, exist_ok=True)
@@ -346,8 +350,10 @@ class InstallPs1VerifyTests(unittest.TestCase):
         bindir: Path,
         probe_calls: Path,
         *needles: str,
+        probe_log: list[str] | None = None,
     ) -> None:
-        """A refusal before extraction: nothing installed, no probe call."""
+        """A refusal: nothing installed, and the probe-calls log equals
+        `probe_log` (default: no probe call at all, as the shell suite)."""
         self.assertNotEqual(rc, 0, output)
         for needle in needles:
             self.assertIn(needle, self.flat(output))
@@ -355,7 +361,7 @@ class InstallPs1VerifyTests(unittest.TestCase):
         self.assertFalse((bindir / "x0x.exe").exists())
         self.assertFalse((bindir / "x0xd.exe").exists())
         calls = probe_calls.read_text(encoding="utf-8").splitlines() if probe_calls.exists() else []
-        self.assertEqual(calls, [])
+        self.assertEqual(calls, probe_log if probe_log is not None else [])
 
     def test_good_signed_manifest_installs(self) -> None:
         with scratch_directory() as tmp:
@@ -438,7 +444,8 @@ class InstallPs1VerifyTests(unittest.TestCase):
 
     def test_tampered_manifest_refused(self) -> None:
         # The manifest is signed, then different bytes are served: only the
-        # ML-DSA signature can catch the swap.
+        # ML-DSA signature can catch the swap. The release's own x0x.exe
+        # extracts and runs, then rejects the tampered bytes.
         with scratch_directory() as tmp:
             rc, output, bindir, probe_calls = self.run_installer(
                 tmp,
@@ -447,10 +454,32 @@ class InstallPs1VerifyTests(unittest.TestCase):
                     b'"timestamp": 0', b'"timestamp": 1'
                 ),
             )
-            self.assertNotEqual(rc, 0, output)
-            self.assertIn("ML-DSA manifest signature FAILED", self.flat(output))
-            self.assertNotIn("Installed:", output)
-            self.assertFalse((bindir / "x0x.exe").exists())
+            self.assert_refused(
+                rc,
+                output,
+                bindir,
+                probe_calls,
+                "ML-DSA manifest signature FAILED",
+                probe_log=["probe"],
+            )
+
+    def test_signature_by_wrong_key_refused(self) -> None:
+        # The manifest bytes are unchanged but signed by an unrelated key:
+        # the release's own x0x.exe runs the check and rejects the key.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp,
+                good_manifest,
+                secret=self.keygen(tmp),
+            )
+            self.assert_refused(
+                rc,
+                output,
+                bindir,
+                probe_calls,
+                "ML-DSA manifest signature FAILED",
+                probe_log=["probe"],
+            )
 
     def test_manifest_hash_mismatch_refused(self) -> None:
         # A correctly signed manifest that names another archive's hash is
@@ -461,6 +490,42 @@ class InstallPs1VerifyTests(unittest.TestCase):
             )
             self.assert_refused(rc, output, bindir, probe_calls, "SHA-256 mismatch")
 
+    def test_manifest_without_windows_target_refused(self) -> None:
+        # A correctly signed manifest with no windows asset: the hash lookup
+        # fails closed, before extraction.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp,
+                lambda digest: manifest_bytes(
+                    digest, target="x86_64-unknown-linux-gnu", version="0.48.0", channel="stable"
+                ),
+            )
+            self.assert_refused(
+                rc,
+                output,
+                bindir,
+                probe_calls,
+                "no archive_sha256 entry for x86_64-pc-windows-msvc",
+            )
+
+    def test_manifest_target_case_must_match(self) -> None:
+        # Pins the -ceq case-sensitive target comparison from commit e9fce0c9:
+        # a regression to -eq, which folds case, must stay red.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp,
+                lambda digest: manifest_bytes(
+                    digest, target="X86_64-PC-WINDOWS-MSVC", version="0.48.0", channel="stable"
+                ),
+            )
+            self.assert_refused(
+                rc,
+                output,
+                bindir,
+                probe_calls,
+                "no archive_sha256 entry for x86_64-pc-windows-msvc",
+            )
+
     def test_missing_manifest_refused(self) -> None:
         # pwsh's error display for the failed download shows the status
         # code, not the URL, so the 404 is the visible cause.
@@ -469,6 +534,17 @@ class InstallPs1VerifyTests(unittest.TestCase):
                 tmp,
                 good_manifest,
                 missing=frozenset({"release-manifest.json"}),
+            )
+            self.assert_refused(rc, output, bindir, probe_calls, "404")
+
+    def test_missing_signature_refused(self) -> None:
+        # The signature download fails like the manifest one: the 404 is the
+        # visible cause, and no release byte runs.
+        with scratch_directory() as tmp:
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp,
+                good_manifest,
+                missing=frozenset({"release-manifest.json.sig"}),
             )
             self.assert_refused(rc, output, bindir, probe_calls, "404")
 
@@ -526,6 +602,40 @@ class InstallPs1VerifyTests(unittest.TestCase):
             self.assertFalse((bindir / "x0xd.exe").exists())
             calls = probe_calls.read_text(encoding="utf-8").splitlines() if probe_calls.exists() else []
             self.assertEqual(calls, ["installed-probe"])
+
+    def test_pre_probe_installed_exe_falls_back_to_release_exe(self) -> None:
+        # Mirrors the shell suite's pre-probe fallback test: an installed
+        # x0x.exe from before v0.46.5 rejects the probe argument with exit 2
+        # (and never logs), so the installer warns and falls back to the
+        # release's own x0x.exe for the check, then completes the install.
+        with scratch_directory() as tmp:
+            pre_probe = (
+                "#!/bin/sh\n"
+                'if [ "$1" = "--verify-release-manifest" ]; then\n'
+                '    echo "error: unexpected argument" >&2\n'
+                "    exit 2\n"
+                "fi\n"
+                "exit 0\n"
+            )
+
+            def pre_install(bindir: Path) -> None:
+                bindir.mkdir(parents=True, exist_ok=True)
+                write_executable(bindir / "x0x.exe", pre_probe)
+
+            rc, output, bindir, probe_calls = self.run_installer(
+                tmp, good_manifest, pre_install=pre_install
+            )
+            self.assertEqual(rc, 0, output)
+            self.assertIn("predates v0.46.5", self.flat(output))
+            self.assertIn("ML-DSA-65 manifest signature verified", output)
+            self.assertNotIn("by the installed x0x.exe", output)
+            self.assertIn("Installed:", output)
+            self.assertTrue((bindir / "x0xd.exe").exists())
+            # The good release replaces the pre-probe binary, and the
+            # release's own x0x.exe did the verifying.
+            self.assertNotEqual((bindir / "x0x.exe").read_text(encoding="utf-8"), pre_probe)
+            calls = probe_calls.read_text(encoding="utf-8").splitlines() if probe_calls.exists() else []
+            self.assertEqual(calls, ["probe"])
 
 
 if __name__ == "__main__":
