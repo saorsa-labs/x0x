@@ -2028,8 +2028,8 @@ impl GroupInfo {
 
     /// #1023: strip snapshot certificate bytes from every retained link
     /// older than [`state_commit::RETAINED_CERT_CARRY_LINKS`] (Engineer
-    /// ruling 31 Oct 2026 20:40 GMT: certificate bytes ride only the
-    /// newest links, so persisted growth stays small and fixed). A node
+    /// rulings 31 Oct 2026 20:40 + 23:52 GMT: certificate bytes ride the
+    /// HEAD LINK ONLY, so persisted growth stays small and fixed). A node
     /// that adopted or hydrated while a link carried bytes keeps what it
     /// seated. Every commit-log append site calls this.
     pub fn age_certificate_carry(&mut self) {

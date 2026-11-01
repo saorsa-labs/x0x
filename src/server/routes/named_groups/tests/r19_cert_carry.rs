@@ -2697,17 +2697,28 @@ async fn join_result_with_chain_bytes_stays_under_the_dm_budget() -> Result<()> 
     Ok(())
 }
 
-/// #1023: with the sidecar cleared (no cached evidence anywhere) and the
-/// chain byte-bearing, the SEAL itself runs the commit-log fallback: the
-/// admin hydrates from its own retained links with every holder offline.
+/// #1023 (Engineer ruling 31 Oct 23:52 GMT: the HEAD link is the carry):
+/// when the live roster lost its certificate bytes (the key-stripped /
+/// restart-before-hydration shape) and no cache or sidecar holds them,
+/// the SEAL itself re-hydrates every digest-only seat from the head
+/// link's snapshots — no holder needs to be online.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn seal_time_hydrate_falls_back_to_the_commit_log() -> Result<()> {
-    let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 15, true, false, false)
-            .await?;
+async fn seal_time_hydrate_falls_back_to_the_head_link() -> Result<()> {
+    let s = creator_offline_scenario(Promotion::SignedCommit).await?;
+    {
+        let mut groups = s.admin.named_groups.write().await;
+        let info = groups.get_mut(&s.group_id).expect("admin's group");
+        for seat in info.members_v2.values_mut() {
+            // The committed digests stay; only the bytes are lost.
+            seat.certificate = None;
+        }
+    }
+    // The seal works on a clone of the live record; its success IS the
+    // proof — the verdict refuses while the creator's seat is digest-only,
+    // so reaching a commit means the fallback re-hydrated the seats.
     let commit = promoted_admin_seals_new_joiner(&s, &[])
         .await
-        .unwrap_or_else(|err| panic!("the seal must hydrate from the group's own chain: {err}"));
+        .unwrap_or_else(|err| panic!("the seal must re-hydrate from the head link: {err}"));
     assert!(!commit.roster_root.is_empty());
     s.admin.agent.shutdown().await;
     Ok(())

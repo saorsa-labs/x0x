@@ -184,12 +184,13 @@ impl PartialEq for RosterMemberSnapshot {
 }
 
 /// #1023: how many NEWEST retained commits keep their snapshot
-/// certificate bytes; older links age to digest-only when a new commit
-/// is retained. A node that adopted or
+/// certificate bytes — the HEAD LINK ONLY (Engineer ruling 31 Oct 2026
+/// 23:52 GMT); older links age to digest-only when a new commit is
+/// retained. A node that adopted or
 /// hydrated while a link still carried bytes keeps what it SEATED, so
 /// nothing seated is lost — the bound only stops the persisted and served
 /// log from copying every seat's certificate into every commit forever.
-pub const RETAINED_CERT_CARRY_LINKS: usize = 8;
+pub const RETAINED_CERT_CARRY_LINKS: usize = 1;
 
 /// #1023: serde codec for the snapshot `certificate` field — one base64
 /// string of the bincode form (the exact bytes the committed digest

@@ -1249,7 +1249,8 @@ creator and every other holder offline. Install is digest-anchored
 everywhere (`apply_reconstructed_roster`, `hydrate_member_certificates`):
 bytes that hash to a different digest never seat. Snapshot equality is
 committed-state equality (the bytes never participate), the signed root
-never moves, and only the newest `RETAINED_CERT_CARRY_LINKS` (8) retained
-commits keep the bytes; older links age to digest-only. Invite links stay
+never moves, and only the HEAD retained commit keeps the bytes
+(`RETAINED_CERT_CARRY_LINKS` = 1, Engineer ruling 31 Oct 2026); older
+links age to digest-only. Invite links stay
 digest-only (DM budget). The seal gate is unchanged: a certificate carried
 nowhere still blocks with `OwnerCertMemberPending`.
