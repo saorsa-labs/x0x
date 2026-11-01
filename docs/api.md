@@ -41,6 +41,7 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | GET | `/profile` | `x0x profile` | Stored self-profile names (human/display/machine, ADR-0036) |
 | PUT | `/profile` | `x0x profile set` | Partial update of self-profile names (persists across restart) |
 | GET | `/owner/agents` | `x0x owner agents` | Roster of agents certified by this install's owner (ADR-0036) |
+| POST | `/owner/groups/:id/recovery-mandate` | `x0x owner groups recovery-mandate <GROUP_ID> --promoted <AGENT_ID>` | Owner-sign an `OwnerRecoveryMandateV1` for an `OwnerCertified` group whose admins are all revoked (ADR 0110 §4b(1)) |
 
 ## Network and diagnostics
 
