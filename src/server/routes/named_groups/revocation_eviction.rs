@@ -49,6 +49,7 @@ use x0x::groups::eviction::{
 use x0x::groups::{GroupInfo, GroupMemberState, GroupRole};
 
 pub(super) mod crypto_exclusion;
+pub(super) mod displaced_certs;
 mod frame_stash;
 mod handoff_log;
 mod mandate_store;
