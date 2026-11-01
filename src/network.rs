@@ -459,6 +459,45 @@ pub(crate) fn both_stale_candidate_indexes(
         .collect()
 }
 
+/// Whether a one-sided sample shape was made by this node's own probe
+/// (#1419).
+///
+/// ant-quic 0.27.61 records the probe envelope's send as peer activity.
+/// A probe on a both-directions-stale peer then leaves `sent` fresh and
+/// `received` stale, which is exactly the immediate rule's shape. While
+/// the probe cooldown is live, that shape is this node's own send, not
+/// peer traffic, so the immediate rule must not act on it: an
+/// inconclusive probe must not degrade or re-dial through the back door,
+/// and a confirming probe keeps its own verdict window.
+fn probe_made_one_sided(sample: &LinkAgeSample, entry: &OneSidedRepair, now: Instant) -> bool {
+    entry
+        .both_stale_probe_at
+        .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF)
+        && sample.age.one_sided()
+        && direction_flowing(sample.age.sent_ago)
+        && direction_stale(sample.age.received_ago)
+}
+
+/// The immediate same-peer rule's peers, minus the shapes this node's own
+/// probes made (#1419).
+fn immediate_one_sided_peer_ids(
+    samples: &[LinkAgeSample],
+    map: &HashMap<AntPeerId, OneSidedRepair>,
+    now: Instant,
+) -> Vec<AntPeerId> {
+    one_sided_peer_ids_from(samples)
+        .into_iter()
+        .filter(|peer| {
+            !samples.iter().any(|sample| {
+                sample.peer == *peer
+                    && map
+                        .get(peer)
+                        .is_some_and(|entry| probe_made_one_sided(sample, entry, now))
+            })
+        })
+        .collect()
+}
+
 /// Order one tick's both-stale probe list (#1419): never-probed peers
 /// first, then the longest since their last probe. The per-tick cap then
 /// cannot starve the tail of a large quiet set. The sort is stable, so
@@ -594,7 +633,7 @@ fn plan_one_sided_repairs(
             .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF);
         in_backoff || still_one_sided || still_confirmed || probe_cooldown
     });
-    let mut peers = one_sided_peer_ids_from(samples);
+    let mut peers = immediate_one_sided_peer_ids(samples, map, now);
     peers.extend(samples.iter().filter_map(|sample| {
         if !sample.age.both_directions_stale() {
             return None;
@@ -3739,7 +3778,7 @@ impl NetworkNode {
         samples: &[LinkAgeSample],
     ) -> Vec<AntPeerId> {
         let now = Instant::now();
-        let mut degraded = one_sided_peer_ids_from(samples);
+        let mut degraded;
         let mut to_probe = Vec::new();
         let mut probe_ats: HashMap<AntPeerId, Instant> = HashMap::new();
         {
@@ -3750,12 +3789,16 @@ impl NetworkNode {
             // A peer this node probed successfully just now is fresh only
             // because of that probe. It must not qualify another quiet
             // peer for probing.
+            // The window covers the reply too: ant-quic stamps the
+            // receive activity when the ack arrives, up to one probe
+            // budget after the tick began.
+            let probe_fresh_window = ONE_SIDED_FLOWING + ONE_SIDED_PROBE_OUTER_TIMEOUT;
             let probe_fresh: std::collections::HashSet<AntPeerId> = map
                 .iter()
                 .filter(|(_, entry)| {
                     !entry.both_stale_confirmed
                         && entry.both_stale_probe_at.is_some_and(|at| {
-                            now.saturating_duration_since(at) <= ONE_SIDED_FLOWING
+                            now.saturating_duration_since(at) <= probe_fresh_window
                         })
                 })
                 .map(|(peer, _)| *peer)
@@ -3764,6 +3807,9 @@ impl NetworkNode {
                 both_stale_candidate_indexes(samples, &probe_fresh)
                     .into_iter()
                     .collect();
+            // The immediate rule's peers, minus the shapes this node's
+            // own probe sends made.
+            degraded = immediate_one_sided_peer_ids(samples, &map, now);
             for (index, sample) in samples.iter().enumerate() {
                 if !sample.age.both_directions_stale() {
                     continue;
@@ -3824,6 +3870,11 @@ impl NetworkNode {
             // and counts as a probe timeout.
             let probes = to_probe.iter().map(|peer| async move {
                 // `None` means the node is gone: inconclusive, not fresh.
+                // Teardown started also means gone: a probe must not hold
+                // a Node clone past shutdown.
+                if self.shutdown_state.started.load(Ordering::Acquire) {
+                    return None;
+                }
                 let node = self.node.read().await.as_ref().cloned()?;
                 let peer = *peer;
                 #[cfg(test)]
@@ -11234,6 +11285,74 @@ mod tests {
         assert_eq!(map[&peer].both_stale_confirmed_at, None);
     }
 
+    /// #1419: the probe envelope's own send is not peer traffic. While
+    /// the probe cooldown is live, the send-fresh/receive-stale shape the
+    /// probe itself creates must not reach the immediate rule, or an
+    /// inconclusive probe would degrade and re-dial through the back
+    /// door. The reverse shape, a real inbound direction, still applies.
+    #[test]
+    fn both_stale_probe_send_is_not_peer_traffic() {
+        let probe_made = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(1)),
+            received_ago: Some(Duration::from_secs(90)),
+        };
+        let real_inbound = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(90)),
+            received_ago: Some(Duration::from_secs(1)),
+        };
+        let peer = test_ant_peer(1);
+        let other = test_ant_peer(2);
+        let fresh = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(1)),
+            received_ago: Some(Duration::from_secs(1)),
+        };
+        let now = Instant::now();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            peer,
+            OneSidedRepair {
+                both_stale_probe_at: Some(now),
+                ..OneSidedRepair::default()
+            },
+        );
+
+        let samples = [
+            LinkAgeSample {
+                peer,
+                age: probe_made,
+            },
+            LinkAgeSample {
+                peer: other,
+                age: fresh,
+            },
+        ];
+        assert!(
+            plan_one_sided_repairs(&mut map, &samples, now).is_empty(),
+            "the probe's own send does not act through the immediate rule"
+        );
+        assert!(
+            map.contains_key(&peer),
+            "the probe cooldown keeps the entry"
+        );
+
+        let samples = [
+            LinkAgeSample {
+                peer,
+                age: real_inbound,
+            },
+            LinkAgeSample {
+                peer: other,
+                age: fresh,
+            },
+        ];
+        map.get_mut(&peer).expect("entry").warned = false;
+        assert_eq!(
+            plan_one_sided_repairs(&mut map, &samples, now),
+            vec![peer],
+            "a real inbound direction still applies the immediate rule"
+        );
+    }
+
     /// #1419: a confirmed both-stale episode warns once across passes, an
     /// inconclusive verdict keeps its cooldown entry without dialling, and
     /// traffic on either direction is recovery.
@@ -11903,6 +12022,17 @@ mod tests {
         assert!(
             a.one_sided_probe_flights.lock().unwrap().is_empty(),
             "shutdown aborts and joins the detached probe flight"
+        );
+        let probes_after = a.one_sided_probes.load(Ordering::Relaxed);
+        a.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            a.one_sided_probes.load(Ordering::Relaxed),
+            probes_after,
+            "a resolve after teardown starts no probe"
+        );
+        assert!(
+            a.one_sided_probe_flights.lock().unwrap().is_empty(),
+            "no flight outlives shutdown"
         );
         b.try_shutdown().await.unwrap();
         c.try_shutdown().await.unwrap();

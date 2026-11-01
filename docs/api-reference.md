@@ -28,9 +28,10 @@ bounded liveness probe fails (issue #1419). Those ages are
 application-data ages. A quiet peer, with both directions idle, answers
 the probe and is not degraded. A probe the endpoint could not run, for a
 busy endpoint or a peer without probe support, is not a failure. A peer
-is probed only while another peer has traffic, and a confirmed peer
-stays `degraded` until its link carries traffic again or the verdict
-window ends. `GET /status` uses the same stored set and the same rule.
+is probed only while another peer has traffic, a peer already confirmed
+broken is probed again after its window, and a confirmed peer stays
+`degraded` until its link carries traffic again or the verdict window
+ends. A successful re-dial removes the peer from the set at once. `GET /status` uses the same stored set and the same rule.
 `GET /peers` sets `link` to `degraded` for each peer in that set. Fleet
 deployments under a supervisor can additionally set `zero_peer_restart_secs = <secs>` in the
 daemon TOML to make the process exit (for `Restart=always` self-heal) after
@@ -441,7 +442,8 @@ most 10 s old, or both directions are at least 60 s old while another peer
 has traffic and the liveness probe fails. The reason is appended to
 `warnings`. A quiet peer, with both directions idle, answers the probe and
 is not degraded. A confirmed peer stays `degraded` until its link carries
-traffic again or the verdict window ends. `GET /health`, `GET /status`, and
+traffic again or the verdict window ends; a successful re-dial removes
+the peer from the set at once. `GET /health`, `GET /status`, and
 `GET /peers` read the one-sided set the health refresher stored.
 
 `revocation_resync_required` is false on a healthy node. It is true when a
