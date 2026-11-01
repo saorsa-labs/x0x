@@ -9,6 +9,11 @@ use std::time::Duration;
 
 const BOOT_FD: &str = "X0X_M2_BOOT_FD";
 
+/// How long a held build waits on a stray descriptor 3 for a launcher
+/// permit before starting normally. A real launcher writes the permit
+/// immediately after spawn; only silence or garbage follows a stray.
+const HELD_PERMIT_TIMEOUT: Duration = Duration::from_millis(250);
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Permit {
@@ -223,9 +228,117 @@ pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
         return Ok(());
     }
     if !super::ENABLED {
-        return Err(invalid("M2 launcher activation is held"));
+        return held_boot(version);
     }
     candidate_boot_owned(version)
+}
+
+/// ADR 0094 §6: never brick startup while activation is held. No published
+/// build carries the launcher, so fd 3 under the marker is an unrelated
+/// descriptor unless a launcher channel delivers a permit on it. A stray
+/// marker is dropped with one warning line and the daemon starts normally;
+/// only a present permit that fails its checks refuses the boot (#1375).
+fn held_boot(version: &str) -> io::Result<()> {
+    let marker = std::env::var_os(BOOT_FD);
+    std::env::remove_var(BOOT_FD);
+    held_boot_with(marker.as_deref(), held_channel(), version)
+}
+
+/// The held-boot decision, split from the env and descriptor glue so tests
+/// can drive it with synthetic descriptors.
+fn held_boot_with(
+    marker: Option<&std::ffi::OsStr>,
+    channel: Result<i32, &'static str>,
+    version: &str,
+) -> io::Result<()> {
+    if marker != Some(std::ffi::OsStr::new("3")) {
+        return stray_boot("the marker does not name descriptor 3");
+    }
+    let channel = match channel {
+        Ok(channel) => channel,
+        Err(reason) => return stray_boot(reason),
+    };
+    match held_permit(channel) {
+        Some(permit) => {
+            let observed = observed_for(&permit)?;
+            check_permit(&permit, &observed, version)
+        }
+        None => stray_boot("no launcher permit arrived on descriptor 3"),
+    }
+}
+
+/// One warning line, then normal startup.
+fn stray_boot(reason: &str) -> io::Result<()> {
+    eprintln!("warning: ignoring stray {BOOT_FD} (M2 launcher activation is held): {reason}");
+    Ok(())
+}
+
+/// Probe descriptor 3 for a launcher channel. The descriptor belongs to
+/// whoever opened it and stays theirs: the probe only polls it and receives
+/// with per-call `MSG_DONTWAIT`, so it never blocks long and never changes
+/// the shared open-file flags.
+fn held_channel() -> Result<i32, &'static str> {
+    // SAFETY: fcntl and fstat take no pointers this process does not own;
+    // every failure mode returns -1 and becomes a stray reason.
+    unsafe {
+        if libc::fcntl(3, libc::F_GETFD) == -1 {
+            return Err("descriptor 3 is not open");
+        }
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(3, &mut stat) == -1 {
+            return Err("descriptor 3 could not be inspected");
+        }
+        if (stat.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
+            return Err("descriptor 3 is not a socket");
+        }
+        Ok(3)
+    }
+}
+
+/// Read one bounded permit line under a poll deadline. Silence, a timeout or
+/// bytes that are not a permit all mean stray.
+fn held_permit(fd: i32) -> Option<Permit> {
+    let deadline = std::time::Instant::now() + HELD_PERMIT_TIMEOUT;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(pos) = bytes.iter().position(|&byte| byte == b'\n') {
+            bytes.truncate(pos + 1);
+            return serde_json::from_slice(&bytes).ok();
+        }
+        if bytes.len() >= 1024 * 1024 {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let wait_ms = (deadline - now).as_millis() as i32;
+        // SAFETY: poll reads only the pollfd this loop owns.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, wait_ms) };
+        if ready != 1 || pollfd.revents & libc::POLLIN == 0 {
+            return None;
+        }
+        // SAFETY: recv with MSG_DONTWAIT writes only into this loop's
+        // buffer and never changes the shared descriptor flags.
+        let read = unsafe {
+            libc::recv(
+                fd,
+                chunk.as_mut_ptr().cast(),
+                chunk.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if read <= 0 {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..read as usize]);
+    }
 }
 
 /// The permit must carry the paths the candidate compares against: its own
@@ -257,25 +370,24 @@ pub(crate) fn candidate_boot_owned(version: &str) -> io::Result<()> {
     let mut bytes = Vec::new();
     std::io::BufRead::read_until(&mut reader.by_ref().take(1024 * 1024), b'\n', &mut bytes)?;
     let permit: Permit = serde_json::from_slice(&bytes)?;
-    let current = identity(std::process::id())?;
-    // SAFETY: getppid takes no pointers and has no failure mode.
-    let parent = identity(unsafe { libc::getppid() } as u32)?;
-    let executable = std::env::current_exe()?.canonicalize()?;
-    let cwd = std::env::current_dir()?;
-    let argv = std::env::args_os().collect();
-    let sha256 = filesystem::hash(&permit.executable)?;
-    let observed = Observed {
-        current,
-        parent,
-        executable,
-        cwd,
-        argv,
-        sha256,
-        now_ns: Clock::now()?.ms.saturating_mul(1_000_000),
-    };
+    let observed = observed_for(&permit)?;
     check_permit(&permit, &observed, version)?;
     journal::write_record(&permit.root.join(journal::BOOT_FILE_NAME), &permit.record)?;
     reader.get_mut().write_all(&[1])
+}
+
+/// Everything the boot check compares, captured from this process.
+fn observed_for(permit: &Permit) -> io::Result<Observed> {
+    Ok(Observed {
+        current: identity(std::process::id())?,
+        // SAFETY: getppid takes no pointers and has no failure mode.
+        parent: identity(unsafe { libc::getppid() } as u32)?,
+        executable: std::env::current_exe()?.canonicalize()?,
+        cwd: std::env::current_dir()?,
+        argv: std::env::args_os().collect(),
+        sha256: filesystem::hash(&permit.executable)?,
+        now_ns: Clock::now()?.ms.saturating_mul(1_000_000),
+    })
 }
 
 fn take_boot_fd() -> io::Result<()> {
@@ -460,10 +572,9 @@ mod tests {
 
     #[test]
     fn launcher_child_boot_fd_env_is_taken_once_and_must_be_3() {
-        // The only test that touches X0X_M2_BOOT_FD: env is process-global.
-        std::env::set_var(BOOT_FD, "3");
-        let held = candidate_boot("0.49.0").unwrap_err();
-        assert_eq!(held.to_string(), "M2 launcher activation is held");
+        // The only in-process test that touches X0X_M2_BOOT_FD: env is
+        // process-global. The held stray-marker boot itself is covered by
+        // the boot_guards re-exec tests, which own their descriptor 3.
         std::env::set_var(BOOT_FD, "4");
         let error = take_boot_fd().unwrap_err();
         assert_eq!(error.to_string(), "invalid private boot descriptor");
@@ -473,7 +584,35 @@ mod tests {
         assert!(std::env::var_os(BOOT_FD).is_none());
         let error = take_boot_fd().unwrap_err();
         assert_eq!(error.to_string(), "boot descriptor missing");
-        candidate_boot("0.49.0").unwrap();
+    }
+
+    #[test]
+    fn launcher_child_held_boot_ignores_unreadable_channels() {
+        // A marker naming another descriptor never touches fd 3.
+        held_boot_with(
+            Some(std::ffi::OsStr::new("4")),
+            Err("descriptor 3 is not open"),
+            "0.49.0",
+        )
+        .unwrap();
+        // Bytes that are not a permit are stray, not a refusal.
+        let (mut writer, channel) = UnixStream::pair().unwrap();
+        writer.write_all(b"not-a-permit\n").unwrap();
+        held_boot_with(
+            Some(std::ffi::OsStr::new("3")),
+            Ok(channel.as_raw_fd()),
+            "0.49.0",
+        )
+        .unwrap();
+        // A socket whose peer is closed without sending is stray too.
+        let (_writer, silent) = UnixStream::pair().unwrap();
+        drop(_writer);
+        held_boot_with(
+            Some(std::ffi::OsStr::new("3")),
+            Ok(silent.as_raw_fd()),
+            "0.49.0",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -535,8 +674,9 @@ mod tests {
 }
 
 /// Boot invariants that hold even while activation is held: the boot
-/// marker must not outlive the fd-3 take, argv compares as OS bytes, and
-/// a symlinked install captures canonical paths.
+/// marker must not outlive the fd-3 take, argv compares as OS bytes, a
+/// symlinked install captures canonical paths, and a stray marker never
+/// bricks startup (ADR 0094 §6).
 #[cfg(test)]
 mod boot_guards {
     use super::*;
@@ -620,6 +760,102 @@ mod boot_guards {
             std::process::exit(0);
         }
         std::process::exit(42);
+    }
+
+    #[test]
+    fn held_boot_ignores_a_stray_marker_and_boots_normally() {
+        if let Some(role) = std::env::var_os(BOOT_ROLE) {
+            match role.to_str() {
+                Some("2") => held_stray_role(),
+                Some("3") => held_permit_role(),
+                _ => boot_fd_role(),
+            }
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(
+                "launcher::child::boot_guards::held_boot_ignores_a_stray_marker_and_boots_normally",
+            )
+            .env(BOOT_ROLE, "2")
+            .env(BOOT_FD, "3")
+            .stdin(Stdio::null());
+        // SAFETY: closing descriptor 3 in the forked child leaves the
+        // marker naming nothing — the shape a leaked marker has while the
+        // launcher is dormant. The closure only calls async-signal-safe
+        // close.
+        unsafe {
+            command.pre_exec(|| {
+                libc::close(3);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "child exited with {status}");
+    }
+
+    fn held_stray_role() {
+        // ADR 0094 §6: the held build boots normally instead of refusing,
+        // and drops the marker so a later self-update child cannot mistake
+        // its own descriptor 3 for a boot channel.
+        candidate_boot("fixture-version").unwrap();
+        if std::env::var_os(BOOT_FD).is_none() {
+            std::process::exit(0);
+        }
+        std::process::exit(42);
+    }
+
+    #[test]
+    fn held_boot_refuses_a_present_permit_that_fails_its_checks() {
+        if let Some(role) = std::env::var_os(BOOT_ROLE) {
+            match role.to_str() {
+                Some("2") => held_stray_role(),
+                Some("3") => held_permit_role(),
+                _ => boot_fd_role(),
+            }
+            return;
+        }
+        let (mut parent, channel) = UnixStream::pair().unwrap();
+        let fd = channel.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg(
+                "launcher::child::boot_guards::held_boot_refuses_a_present_permit_that_fails_its_checks",
+            )
+            .env(BOOT_ROLE, "3")
+            .env(BOOT_FD, "3")
+            .stdin(Stdio::null());
+        // SAFETY: the same descriptor contract `Owned::spawn` installs; the
+        // child closure only calls async-signal-safe descriptor operations.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, 3) == -1 || libc::fcntl(3, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(channel);
+        let mut bytes = serde_json::to_vec(&fixture_permit()).unwrap();
+        bytes.push(b'\n');
+        parent.write_all(&bytes).unwrap();
+        drop(parent);
+        let status = child.wait().unwrap();
+        assert!(status.success(), "child exited with {status}");
+    }
+
+    fn held_permit_role() {
+        // The fixture permit names a nonexistent executable, so a permit
+        // that really arrives cannot pass its checks: the held build keeps
+        // the refusal and never acks or writes a boot record.
+        match candidate_boot("fixture-version") {
+            Err(_) => std::process::exit(0),
+            Ok(()) => std::process::exit(43),
+        }
     }
 
     #[test]

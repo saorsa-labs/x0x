@@ -17,6 +17,7 @@
 //! ```
 
 use anyhow::{Context, Result};
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -93,17 +94,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
-    // dhat heap profiler. Each daemon writes its own file so multi-daemon
-    // runs don't overwrite each other's dump. Set DHAT_OUT_DIR to override.
-    #[cfg(feature = "profile-heap")]
-    let _dhat_profiler = {
-        let dir = std::env::var("DHAT_OUT_DIR").unwrap_or_else(|_| ".".to_string());
-        let path = format!("{}/dhat-heap-{}.json", dir, std::process::id());
-        eprintln!("dhat: writing heap dump to {} on exit", path);
-        dhat::Profiler::builder().file_name(&path).build()
-    };
-
-    let args: Vec<String> = std::env::args().collect();
+    // argv is not guaranteed UTF-8; args_os() keeps the raw OS bytes, so a
+    // non-UTF-8 argument is refused by the flag that consumes it instead of
+    // panicking at collection, before logging exists (#1375).
+    let args: Vec<OsString> = std::env::args_os().collect();
 
     // Handle --version and --help before anything else
     if args.iter().any(|a| a == "--version" || a == "-V") {
@@ -191,12 +185,12 @@ async fn run_daemon() -> anyhow::Result<()> {
         x0x::connect::LoadMode::DefaultPath
     };
 
-    let check_only = args.contains(&"--check".to_string());
-    let check_updates_only = args.contains(&"--check-updates".to_string());
-    let skip_update_check = args.contains(&"--skip-update-check".to_string());
+    let check_only = args.iter().any(|a| a == "--check");
+    let check_updates_only = args.iter().any(|a| a == "--check-updates");
+    let skip_update_check = args.iter().any(|a| a == "--skip-update-check");
     let doctor_mode = args.iter().any(|arg| arg == "doctor" || arg == "--doctor");
-    let no_hard_coded_bootstrap = args.contains(&"--no-hard-coded-bootstrap".to_string());
-    let legacy_no_bootstrap = args.contains(&"--no-bootstrap".to_string());
+    let no_hard_coded_bootstrap = args.iter().any(|a| a == "--no-hard-coded-bootstrap");
+    let legacy_no_bootstrap = args.iter().any(|a| a == "--no-bootstrap");
     if legacy_no_bootstrap {
         eprintln!("warning: --no-bootstrap is deprecated; use --no-hard-coded-bootstrap");
     }
@@ -206,9 +200,9 @@ async fn run_daemon() -> anyhow::Result<()> {
     // ant-quic's best-effort UPnP IGD on networks without IGD support or
     // where operator policy forbids unsolicited router port mappings. This
     // overrides the daemon config's `port_mapping_enabled` field.
-    let cli_no_port_mapping = args.contains(&"--no-port-mapping".to_string());
-    let cli_disable_peer_cache = args.contains(&"--disable-peer-cache".to_string());
-    let cli_relay = args.contains(&"--relay".to_string());
+    let cli_no_port_mapping = args.iter().any(|a| a == "--no-port-mapping");
+    let cli_disable_peer_cache = args.iter().any(|a| a == "--disable-peer-cache");
+    let cli_relay = args.iter().any(|a| a == "--relay");
 
     // Parse --api-port for overriding the API server port
     let api_port_override = if let Some(idx) = args.iter().position(|a| a == "--api-port") {
@@ -216,6 +210,8 @@ async fn run_daemon() -> anyhow::Result<()> {
             .get(idx + 1)
             .context("--api-port requires a port number")?;
         let port: u16 = port_str
+            .to_str()
+            .context("--api-port value must be valid UTF-8")?
             .parse()
             .context("--api-port value must be a valid port number (0-65535)")?;
         Some(port)
@@ -228,17 +224,32 @@ async fn run_daemon() -> anyhow::Result<()> {
         let name = args
             .get(idx + 1)
             .context("--name requires an instance name")?
-            .clone();
+            .to_str()
+            .context("--name value must be valid UTF-8")?
+            .to_owned();
         Some(InstanceName::try_from(name)?)
     } else {
         None
     };
 
     // Handle --list: discover running instances and exit
-    if args.contains(&"--list".to_string()) {
+    if args.iter().any(|a| a == "--list") {
         x0x::server::list_instances().await?;
         return Ok(());
     }
+
+    // dhat heap profiler. Each daemon writes its own file so multi-daemon
+    // runs don't overwrite each other's dump. Set DHAT_OUT_DIR to override.
+    // Started only after argv is accepted: dhat's own exit path collects
+    // argv with std::env::args(), which panics on the non-UTF-8 arguments
+    // the refusals above reject (#1375).
+    #[cfg(feature = "profile-heap")]
+    let _dhat_profiler = {
+        let dir = std::env::var("DHAT_OUT_DIR").unwrap_or_else(|_| ".".to_string());
+        let path = format!("{}/dhat-heap-{}.json", dir, std::process::id());
+        eprintln!("dhat: writing heap dump to {} on exit", path);
+        dhat::Profiler::builder().file_name(&path).build()
+    };
 
     // Whether a config file was actually loaded (explicit `--config`, or the
     // instance's default path). A named instance with a file must declare its

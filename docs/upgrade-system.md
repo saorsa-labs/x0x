@@ -274,6 +274,16 @@ not build it until the activation slice. The launcher gives a candidate its boot
 permit as one JSON line on descriptor 3 (`X0X_M2_BOOT_FD=3`). This contract is
 provisional and dormant; it is frozen before `ENABLED = true`.
 
+While activation is held, the dormant launcher child cannot brick a daemon
+start. `x0xd` reads `X0X_M2_BOOT_FD` before runtime creation; a marker with
+no launcher permit behind it (an unrelated or missing descriptor 3) is
+dropped with one warning line and the daemon starts normally. ADR 0094 §6
+requires this: fail closed means "start the configured binary normally and
+report degraded", never brick startup. The refusal stays only where a real
+launcher permit arrives on descriptor 3 and fails its checks. When
+activation turns the engine on, the full boot barrier applies as specified:
+permit checks, boot record write, then the barrier ack.
+
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes
 again before mutation. It copies each old binary beside its target, using that
