@@ -4596,6 +4596,9 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
     // ADR-0064 (§1b): the per-agent mandate-capability map is local
     // observation state — it never rides an outbound snapshot.
     group.mandate_capability.clear();
+    // #1650: displaced rebind certificates are local evidence retention —
+    // they never ride an outbound snapshot.
+    group.displaced_certificates.clear();
     group.join_requests.clear();
     group.shared_secret = None;
     group.secret_epoch = 0;
@@ -4635,6 +4638,10 @@ pub(in crate::server) fn validate_public_group_bootstrap(
         // local per-agent observation state, never legitimately minted
         // into an outbound snapshot.
         || !group.mandate_capability.is_empty()
+        // #1650: same rule for displaced rebind certificates — local
+        // evidence retention, never legitimately minted into an outbound
+        // snapshot.
+        || !group.displaced_certificates.is_empty()
         || !group.has_active_member(local_agent_hex)
         || !group
             .caller_role(sender_hex)
@@ -4924,6 +4931,9 @@ pub(in crate::server) fn apply_signed_public_revision_catchup(
         || snapshot.invite_lineage.is_some()
         || snapshot.fork_quarantine.is_some()
         || !snapshot.mandate_capability.is_empty()
+        // #1650: displaced rebind certificates are local evidence
+        // retention — an inbound snapshot never legitimately carries them.
+        || !snapshot.displaced_certificates.is_empty()
         || snapshot.stable_group_id() != local.stable_group_id()
         || snapshot.state_revision != local.state_revision.saturating_add(1)
         || snapshot.prev_state_hash.as_deref() != Some(local.state_hash.as_str())
@@ -4979,6 +4989,12 @@ pub(in crate::server) fn apply_signed_public_revision_catchup(
     next.home.clone_from(&snapshot.home);
     next.policy = snapshot.policy.clone();
     next.members_v2.clone_from(&snapshot.members_v2);
+    // #1650 (review P2): the installed head may be a certificate rebind
+    // winner, so the replaced roster displaces certificate bytes this
+    // node holds from the parent. Retain them — the sanitized snapshot
+    // carries no foreign retained evidence — so a competing sibling
+    // rebind on the same parent still verifies as fork evidence.
+    x0x::groups::cert_rebind::retain_displaced_by_roster_replacement(&mut next, local);
     next.state_revision = snapshot.state_revision;
     next.prev_state_hash.clone_from(&snapshot.prev_state_hash);
     next.withdrawn = snapshot.withdrawn;
@@ -39902,6 +39918,17 @@ pub(in crate::server) async fn load_named_groups_merged(
     .await
 }
 
+/// #1650 (ADR 0110 §5): load the retained displaced rebind certificates
+/// from their S4 sidecar `revocation-evictions.rdc` into the freshly
+/// loaded groups. Neither legacy JSON ever carries them, so this reload
+/// is what restores the local fork-evidence retention across a restart.
+pub(in crate::server) async fn load_displaced_certs_sidecar(
+    groups: &mut HashMap<String, x0x::groups::GroupInfo>,
+    data_dir: &std::path::Path,
+) {
+    revocation_eviction::displaced_certs::load_into(groups, data_dir).await;
+}
+
 /// Review r2 (#451, item 3): a store written by a pre-#451 Home-Suite
 /// binary holds the REAL owner-certified entries directly in
 /// `named_groups.json` (no sidecar). Loading it is fine for the new
@@ -42522,6 +42549,16 @@ async fn save_named_groups_store_checked(
     // ADR 0109 §4 (#1570 rc4): a placeheld group's committed legacy form
     // advances only when this write landed.
     group_recovery::commit_legacy_write(state, &outcome);
+    // #1650 (ADR 0110 §5): neither legacy JSON carries displaced rebind
+    // certificates; the retained evidence persists in its own S4
+    // sidecar, refreshed once the roster save landed (`NotReplaced` and
+    // a failed write leave the previous projection standing).
+    if matches!(
+        outcome,
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::ReplacedNotDurable)
+    ) {
+        revocation_eviction::displaced_certs::sync_after_save(state).await;
+    }
     outcome
 }
 
