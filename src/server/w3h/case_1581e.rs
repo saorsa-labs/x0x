@@ -22,18 +22,18 @@
 //!   quarantine marker, and publish no saved sibling (D and C stay on
 //!   D's single commit, unquarantined; A's divergent key cannot claim H
 //!   across the real fork). The containment is watched on A's side, not
-//!   only through the receivers: the saved event's two push paths are
-//!   each watched where they are exact — a count-only fabric rule
-//!   counts every direct-carrier frame A sends toward D or C that
-//!   carries the saved exclusion event (a `member_removed` or
-//!   `member_banned` naming B whose commit `state_hash` is the saved
-//!   event's own result head, so a legitimate forward of D's competing
-//!   event never counts), and A's gossip publishes of the saved event
-//!   are counted at the source through the test-only publish recorder,
-//!   which sees every publish attempt before the network or a relay.
-//!   A non-zero count on either names `CAUSE_SIBLING_PUBLISHED` — the
-//!   arm cannot go GREEN while A pushes its saved sibling, however
-//!   firmly the receivers refuse it.
+//!   only through the receivers: the saved event's push path on this
+//!   tree — the direct carrier — is watched by a count-only fabric rule
+//!   that counts every frame A sends toward D or C carrying the saved
+//!   exclusion event (a `member_removed` or `member_banned` naming B
+//!   whose commit `state_hash` is the saved event's own result head, so
+//!   a legitimate forward of D's competing event never counts), and a
+//!   possible second path — the metadata publish lane — is watched at
+//!   the source through the test-only publish recorder, which sees
+//!   every publish attempt before the network or a relay. A non-zero
+//!   count on either names `CAUSE_SIBLING_PUBLISHED` — the arm cannot
+//!   go GREEN while A pushes its saved sibling, however firmly the
+//!   receivers refuse it.
 //!   On `main` that count is zero (the stale-replica protection — an
 //!   unknown holder head conflicts the round — withholds the resend; an
 //!   injected resend, never committed, is caught by the count and names
@@ -577,6 +577,17 @@ fn refused_typed(status: StatusCode) -> bool {
     status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND
 }
 
+/// A's typed refusal in the fork arm, one shape further than
+/// [`refused_typed`]: once the §3 fix puts the public fork-quarantine
+/// marker on A, the secure endpoints stop the call at admission with
+/// `409 Conflict`, whose body carries the stable `fork_quarantined`
+/// reason (ADR 0066 §5) — also a typed refusal, and the expected one
+/// then. B keeps [`refused_typed`]: B carries no marker, so its refusal
+/// is the group layer's own `400/404`.
+fn a_refused_typed(status: StatusCode, reply: &str) -> bool {
+    refused_typed(status) || (status == StatusCode::CONFLICT && reply.contains("fork_quarantined"))
+}
+
 /// The publication blackout: while set, every frame `target` sends
 /// toward any label in `others` is dropped, on every lane except
 /// plane-hello. Frames toward `target` always flow, so the §2 round's
@@ -627,35 +638,38 @@ impl SenderBlackout {
 }
 
 /// The sibling watch (ADR 0110's "publish no saved sibling", watched on
-/// A's side): the saved event has two push paths, and each is watched
-/// where it is exact. This, the fabric half, counts — passing, never
-/// dropping — every frame on the direct carrier (the saved delivery's
-/// own write path) from A toward D or C whose bytes carry the saved
-/// exclusion event: a `member_removed` or `member_banned` naming B
-/// whose commit `state_hash` is the saved event's own result head.
-/// [`saved_event_publishes`] is the source half: it counts A's gossip
-/// publishes of the same event through the test-only publish recorder,
-/// which sees every publish attempt before the network or a relay — a
-/// copy the fabric cannot observe still counts. A non-zero count on
-/// either half feeds `CAUSE_SIBLING_PUBLISHED`, so the fork arm cannot
-/// go GREEN while A pushes its saved sibling, however firmly the
-/// receivers refuse it. A catch-up page A serves to a holder's pull is
-/// neither push path — it is the receiver's own request, embedded in a
-/// larger state bundle, and the receiver's validation is the judge: the
-/// end-state evidence fails if any receiver ever takes A's event.
-/// Count-only, like [`SenderBlackout`]: no frame is changed. The
-/// oversized-event reference egress is out of scope — the saved event
-/// of this row is a few KB, far under the reference threshold.
+/// A's side): on this tree the saved event's push path is the direct
+/// carrier, and the metadata publish lane is a possible second path a
+/// change could add — each is watched where it is exact. This, the
+/// fabric half, counts — passing, never dropping — every frame on the
+/// direct carrier (the saved delivery's own write path) from A toward D
+/// or C whose bytes carry the saved exclusion event: a `member_removed`
+/// or `member_banned` naming B whose commit `state_hash` is the saved
+/// event's own result head. [`saved_event_publishes`] is the source
+/// half, the defence in depth: it counts A's gossip publishes of the
+/// same event through the test-only publish recorder, which sees every
+/// publish attempt before the network or a relay — a copy the fabric
+/// cannot observe still counts. A non-zero count on either half feeds
+/// `CAUSE_SIBLING_PUBLISHED`, so the fork arm cannot go GREEN while A
+/// pushes its saved sibling, however firmly the receivers refuse it. A
+/// catch-up page A serves to a holder's pull is neither push path — it
+/// is the receiver's own request, embedded in a larger state bundle,
+/// and the receiver's validation is the judge: the end-state evidence
+/// fails if any receiver ever takes A's event. Count-only, like
+/// [`SenderBlackout`]: no frame is changed. The oversized-event
+/// reference egress is out of scope — the saved event of this row is a
+/// few KB, far under the reference threshold.
 struct SiblingWatch {
     seen: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Whether `bytes` carry A's saved exclusion event: both push paths
-/// frame the JSON event verbatim (the direct carrier with a header, the
-/// gossip publish as the payload), so the serde tag, the subject's
-/// 64-hex id and the commit's `state_hash` (the saved event's result
-/// head) are all present. An unknown result head (an empty marker)
-/// matches nothing rather than counting every removal of the subject.
+/// Whether `bytes` carry A's saved exclusion event: every push path
+/// frames the JSON event verbatim (the direct carrier with a header,
+/// the metadata publish as the payload), so the serde tag, the
+/// subject's 64-hex id and the commit's `state_hash` (the saved event's
+/// result head) are all present. An unknown result head (an empty
+/// marker) matches nothing rather than counting every removal of the
+/// subject.
 fn carries_saved_removal(bytes: &[u8], subject_hex: &str, result_head: &str) -> bool {
     fn carries(bytes: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle)
@@ -1436,16 +1450,17 @@ async fn scenario(
     // Fork arm: ADR 0110 §3's "fork evidence and typed manual-resolution
     // exit survive" is proven across a second crash restart — the final
     // reads below are taken after it, so a marker or a typed wait that
-    // did not persist fails the arm. Before A goes down again, its
-    // first boot's gossip publishes are counted at the source: the
-    // recorder dies with the node, so each boot is read before it ends.
+    // did not persist fails the arm. Before A goes down again, the
+    // gossip publishes of its first boot after the crash restart (its
+    // second boot overall) are counted at the source: the recorder dies
+    // with the node, so each boot is read before it ends.
     let mut survives = !competing;
     let mut publishes_first_boot = 0;
     if competing {
         publishes_first_boot = saved_event_publishes(sim, &b_hex, &a_result_head).await?;
         if publishes_first_boot > 0 {
             sibling.get_or_insert(format!(
-                "A published its saved exclusion over gossip in its first boot: \
+                "A published its saved exclusion over gossip after its first restart: \
                  {publishes_first_boot} metadata publishes"
             ));
         }
@@ -1511,7 +1526,7 @@ async fn scenario(
         publishes_second_boot = saved_event_publishes(sim, &b_hex, &a_result_head).await?;
         if publishes_second_boot > 0 {
             sibling.get_or_insert(format!(
-                "A published its saved exclusion over gossip in its second boot: \
+                "A published its saved exclusion over gossip after its second restart: \
                  {publishes_second_boot} metadata publishes"
             ));
         }
@@ -1591,8 +1606,8 @@ async fn scenario(
             format!(
                 "{}; first sibling sighting: {:?}; first past-e0+1 sighting: {:?}; frames A sent \
                  toward B/C before its crash: {}; removal-event frames A sent toward D/C after \
-                 its restart: {}; gossip publishes of the saved event: {} (first boot) + {} \
-                 (second boot)",
+                 its restart: {}; gossip publishes of the saved event: {} (after the first \
+                 restart) + {} (after the second)",
                 describe_all(&end),
                 sibling,
                 second_rotation,
@@ -1625,10 +1640,13 @@ async fn scenario(
         // answered by its own daemon with the group layer's typed
         // refusal, not a dead path — cannot.
         let b_refused_typed = !b_after.0 && refused_typed(b_after.1);
-        // A's failure must be typed too — its daemon answered and its
-        // divergent key failed the group's crypto — not a dead path.
-        let a_refused_typed = !a_after.0 && refused_typed(a_after.1);
-        let fork_data_plane = c_after.0 && b_refused_typed && a_refused_typed;
+        // A's failure must be typed too, in either fixed shape: its
+        // divergent key failing the group's crypto (400/404 on main),
+        // or the fork-quarantine marker the §3 fix puts on A refusing
+        // the call at admission (409 fork_quarantined). Not a dead
+        // path.
+        let a_refused = !a_after.0 && a_refused_typed(a_after.1, &a_after.2);
+        let fork_data_plane = c_after.0 && b_refused_typed && a_refused;
         receipt.evidence(
             "the_fork_is_real_on_the_data_plane",
             fork_data_plane,
@@ -1981,41 +1999,60 @@ fn w3h_1581e_control_crash_commit_same_chain_resume() -> Result<()> {
     })
 }
 
-/// The sibling watch's matcher, pinned against today's frame format with
-/// literal bytes: a serde rename of the event tag or of the commit's
-/// `state_hash` field would silently turn the watch into a permanent
-/// zero, so the fixtures are not re-serialised through the same types
-/// the watch reads. The positive control for the count itself is the
+/// The sibling watch's matcher, pinned against the real wire format:
+/// the fixture is serialised from the real `MemberRemoved` event, so a
+/// serde rename of the event tag or of the commit's `state_hash` field
+/// changes the fixture while the matcher's needles stay literal — the
+/// assertion fails instead of the watch silently turning into a
+/// permanent zero. The positive control for the count itself is the
 /// injected-resend red run (see the PR body and the receipts).
 #[test]
 fn sibling_watch_matches_only_as_saved_event() {
+    use crate::groups::state_commit::GroupStateCommit;
+    use crate::server::routes::named_groups::NamedGroupMetadataEvent as Event;
     let subject = "e490dda93bc645405ed9280193336c4ed97aa93413a3a1b0f940be5a56087596";
     let actor = "f40671618ddb7c2afa540f8de91adccd933ecbef4ca1a4cd2036d83e3be8b561";
     let saved_head = "df900d53d9f6cbdc6c9fb97a3fb72a308a4a05ecca97fcd3ca4edf366c97cc8e";
     let competing_head = "5fd2f2c9443ec53ff634a760e2b2ac42b976e83071cb259a16650166bebf3542";
-    let event = |head: &str| {
-        format!(
-            "{{\"event\":\"member_removed\",\"group_id\":\"g\",\"revision\":6,\
-             \"actor\":\"{actor}\",\"agent_id\":\"{subject}\",\"commit\":\
-             {{\"state_hash\":\"{head}\",\"committed_by\":\"{actor}\"}}}}"
-        )
+    let commit = |head: &str| GroupStateCommit {
+        group_id: "g".to_string(),
+        revision: 6,
+        prev_state_hash: Some("parent".to_string()),
+        roster_root: String::new(),
+        policy_hash: String::new(),
+        public_meta_hash: String::new(),
+        security_binding: None,
+        state_hash: head.to_string(),
+        withdrawn: false,
+        committed_by: actor.to_string(),
+        committed_at: 0,
+        signer_public_key: actor.to_string(),
+        signature: String::new(),
     };
-    let frame = |body: &str| {
+    let event = |head: &str| {
+        serde_json::to_vec(&Event::MemberRemoved {
+            group_id: "g".to_string(),
+            revision: 6,
+            actor: actor.to_string(),
+            agent_id: subject.to_string(),
+            treekem_commit_b64: None,
+            treekem_epoch: Some(4),
+            secret_epoch: None,
+            commit: Some(commit(head)),
+        })
+        .expect("serialise the removal event")
+    };
+    let frame = |body: &[u8]| {
         let mut bytes = vec![crate::network::DIRECT_MESSAGE_STREAM_TYPE];
         bytes.extend_from_slice(&[0u8; 32]);
-        bytes.extend_from_slice(body.as_bytes());
+        bytes.extend_from_slice(body);
         bytes
     };
-    let saved = frame(&event(saved_head));
+    let saved = event(saved_head);
+    // The direct carrier frames the JSON with a header; the metadata
+    // publish hands the same JSON to the transport bare. Both count.
+    assert!(carries_saved_removal(&frame(&saved), subject, saved_head));
     assert!(carries_saved_removal(&saved, subject, saved_head));
-    // The gossip publish path hands the same JSON to the transport with
-    // no direct-carrier header, and counts at the source with the same
-    // matcher.
-    assert!(carries_saved_removal(
-        event(saved_head).as_bytes(),
-        subject,
-        saved_head
-    ));
     // D's competing event names another head: a forward or a serve of it
     // is not A's saved sibling.
     assert!(!carries_saved_removal(
@@ -2023,14 +2060,7 @@ fn sibling_watch_matches_only_as_saved_event() {
         subject,
         saved_head
     ));
-    // Another subject, or bytes with no event at all, never counts.
-    assert!(!carries_saved_removal(
-        &frame(&format!(
-            "{{\"event\":\"member_removed\",\"agent_id\":\"{actor}\"}}"
-        )),
-        subject,
-        saved_head
-    ));
+    // Bytes with no event at all never counts.
     assert!(!carries_saved_removal(
         b"\x10a control-blob reference names no event bytes",
         subject,
