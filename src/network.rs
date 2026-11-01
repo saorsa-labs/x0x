@@ -2853,6 +2853,10 @@ pub struct NetworkNode {
     /// does not await it. The slot and `shutdown_state.started` share this
     /// lock so a spawn cannot land after teardown has taken the handle.
     one_sided_repair_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Detached both-stale probe flights (#1419). A probe keeps running
+    /// past the outer bound so ant-quic always sees it finish; shutdown
+    /// aborts and joins them so no flight outlives the endpoint.
+    one_sided_probe_flights: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// How many one-sided re-dials this node has started.
     #[cfg(test)]
     one_sided_redials: Arc<std::sync::atomic::AtomicU32>,
@@ -3359,6 +3363,7 @@ impl NetworkNode {
             one_sided_dial_gate: Arc::new(Mutex::new(HashMap::new())),
             one_sided_repair_inflight: Arc::new(AtomicBool::new(false)),
             one_sided_repair_task: Arc::new(Mutex::new(None)),
+            one_sided_probe_flights: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             one_sided_redials: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             #[cfg(test)]
@@ -3809,12 +3814,14 @@ impl NetworkNode {
             // tick inside the probe budget. The probe runs as its own
             // task: dropping it mid-flight would leave ant-quic's
             // in-flight mark stuck and fail every later probe on that
-            // connection, so the bound is applied to the task handle and
-            // the probe always finishes inside ant-quic. The node handle
-            // is taken before that bound, so a lock wait spends no probe
-            // budget. The outer bound is one second longer, so ant-quic's
-            // own verdict decides whenever it can; only a stall before
-            // the reply wait elapses here and counts as a probe timeout.
+            // connection, so the bound is applied to a reply channel and
+            // the probe always finishes inside ant-quic. Shutdown aborts
+            // and joins the detached flights, so none outlives the
+            // endpoint. The node handle is taken before that bound, so a
+            // lock wait spends no probe budget. The outer bound is one
+            // second longer, so ant-quic's own verdict decides whenever
+            // it can; only a stall before the reply wait elapses here
+            // and counts as a probe timeout.
             let probes = to_probe.iter().map(|peer| async move {
                 // `None` means the node is gone: inconclusive, not fresh.
                 let node = self.node.read().await.as_ref().cloned()?;
@@ -3824,6 +3831,7 @@ impl NetworkNode {
                     Arc::clone(&self.one_sided_probes),
                     Arc::clone(&self.one_sided_probe_pause),
                 );
+                let (verdict, verdict_rx) = tokio::sync::oneshot::channel();
                 let flight = tokio::spawn(async move {
                     #[cfg(test)]
                     {
@@ -3835,14 +3843,19 @@ impl NetworkNode {
                             tokio::time::sleep(pause).await;
                         }
                     }
-                    node.probe_peer(&peer, ONE_SIDED_PROBE_TIMEOUT).await
+                    let result = node.probe_peer(&peer, ONE_SIDED_PROBE_TIMEOUT).await;
+                    // The waiter may be gone: the probe still finishes, so
+                    // ant-quic clears its own in-flight mark.
+                    let _ = verdict.send(result);
                 });
-                match tokio::time::timeout(ONE_SIDED_PROBE_OUTER_TIMEOUT, flight).await {
+                self.remember_one_sided_probe_flight(flight);
+                match tokio::time::timeout(ONE_SIDED_PROBE_OUTER_TIMEOUT, verdict_rx).await {
                     Ok(Ok(result)) => Some(result),
-                    // The probe task failed without a verdict: not fresh
-                    // and not evidence of a broken link.
-                    Ok(Err(_)) => None,
-                    Err(_) => Some(Err(ant_quic::NodeError::Endpoint(
+                    // The flight was aborted without a verdict, for example
+                    // by shutdown: not fresh and not evidence of a broken
+                    // link.
+                    Ok(Err(_aborted)) => None,
+                    Err(_elapsed) => Some(Err(ant_quic::NodeError::Endpoint(
                         ant_quic::EndpointError::ProbeTimeout,
                     ))),
                 }
@@ -3994,6 +4007,17 @@ impl NetworkNode {
             .one_sided_probe_pause
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = pause;
+    }
+
+    /// Track one detached probe flight so shutdown can abort and join it
+    /// (#1419). Finished flights are reaped on the way in.
+    fn remember_one_sided_probe_flight(&self, flight: tokio::task::JoinHandle<()>) {
+        let mut flights = match self.one_sided_probe_flights.lock() {
+            Ok(flights) => flights,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        flights.retain(|flight| !flight.is_finished());
+        flights.push(flight);
     }
 
     fn mark_one_sided_warned(&self, peer: &AntPeerId) -> bool {
@@ -6526,6 +6550,7 @@ impl NetworkNode {
         let node = Arc::clone(&self.node);
         let background_tasks = Arc::clone(&self.background_tasks);
         let one_sided_repair_task = Arc::clone(&self.one_sided_repair_task);
+        let one_sided_probe_flights = Arc::clone(&self.one_sided_probe_flights);
         let authenticated_sessions = Arc::clone(&self.authenticated_sessions);
         #[cfg(test)]
         let shutdown_failure = Arc::clone(&self.shutdown_failure_for_test);
@@ -6540,6 +6565,21 @@ impl NetworkNode {
                 if let Some(handle) = repair {
                     handle.abort();
                     let _ = handle.await;
+                }
+                // A probe flight can outlive its outer bound by design, so
+                // teardown aborts and joins them too. Aborting is safe here:
+                // the endpoint is going away, so ant-quic's in-flight mark
+                // no longer matters.
+                let flights: Vec<tokio::task::JoinHandle<()>> = match one_sided_probe_flights.lock()
+                {
+                    Ok(mut flights) => flights.drain(..).collect(),
+                    Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+                };
+                for flight in &flights {
+                    flight.abort();
+                }
+                for flight in flights {
+                    let _ = flight.await;
                 }
                 let handles: Vec<tokio::task::JoinHandle<()>> = match background_tasks.lock() {
                     Ok(mut tasks) => tasks.drain(..).collect(),
@@ -11853,8 +11893,17 @@ mod tests {
                 "the elapsed case is recorded as a confirmed timeout"
             );
         }
+        assert_eq!(
+            a.one_sided_probe_flights.lock().unwrap().len(),
+            1,
+            "the detached flight that outlived its outer bound is tracked"
+        );
 
         a.try_shutdown().await.unwrap();
+        assert!(
+            a.one_sided_probe_flights.lock().unwrap().is_empty(),
+            "shutdown aborts and joins the detached probe flight"
+        );
         b.try_shutdown().await.unwrap();
         c.try_shutdown().await.unwrap();
     }
