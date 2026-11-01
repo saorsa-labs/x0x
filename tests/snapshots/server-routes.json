@@ -2941,7 +2941,7 @@
     "method": "GET",
     "path": "/upgrade",
     "cli_name": "upgrade",
-    "description": "Daemon-side check for updates over x0x/release manifests (the CLI x0x upgrade is a standalone GitHub updater and does not call this)",
+    "description": "Daemon-side check for updates over x0x/release manifests (CLI x0x upgrade --check reads GitHub and calls local /health)",
     "category": "upgrade",
     "request": {
       "kind": "none"
@@ -2951,7 +2951,7 @@
     "method": "POST",
     "path": "/upgrade/apply",
     "cli_name": "upgrade --apply",
-    "description": "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade applies via its standalone GitHub path instead)",
+    "description": "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)",
     "category": "upgrade",
     "request": {
       "kind": "none"
