@@ -3,7 +3,7 @@ use super::*;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::{net::UnixStream, process::CommandExt};
+use std::os::unix::{ffi::OsStrExt, net::UnixStream, process::CommandExt};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ struct Permit {
     executable: PathBuf,
     sha256: [u8; 32],
     version: String,
-    argv: Vec<String>,
+    argv: Vec<Vec<u8>>,
     cwd: PathBuf,
 }
 
@@ -79,6 +79,8 @@ impl Owned {
             let child_identity = identity(child.id())?;
             trial.child = Some(child_identity.clone());
             trial.save(path)?;
+            let (executable, cwd) =
+                captured_spawn_paths(&participant.executable, &participant.cwd)?;
             let permit = Permit {
                 record: journal::BootRecord {
                     schema_version: 1,
@@ -95,11 +97,15 @@ impl Owned {
                 },
                 parent: identity(std::process::id())?,
                 root: participant.data_root.clone(),
-                executable: participant.executable.clone(),
+                executable,
                 sha256,
                 version: version.into(),
-                argv: participant.argv.clone(),
-                cwd: participant.cwd.clone(),
+                argv: participant
+                    .argv
+                    .iter()
+                    .map(|argument| argument.as_bytes().to_vec())
+                    .collect(),
+                cwd,
             };
             parent.set_write_timeout(Some(Duration::from_secs(1)))?;
             let mut bytes = serde_json::to_vec(&permit)?;
@@ -222,6 +228,22 @@ pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
     candidate_boot_owned(version)
 }
 
+/// The permit must carry the paths the candidate compares against: its own
+/// `current_exe()` is canonicalized, its `current_dir()` is kernel-resolved,
+/// and the boot hash opens with `O_NOFOLLOW`. A symlinked install is
+/// therefore canonicalized when the participant is captured, instead of
+/// being refused by the boot check (#1375).
+fn captured_spawn_paths(executable: &Path, cwd: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    Ok((executable.canonicalize()?, cwd.canonicalize()?))
+}
+
+/// argv is not guaranteed UTF-8, and a String-based collection panics on
+/// raw bytes. The permit carries the same OS bytes, so the boot
+/// comparison stays exact and can only refuse, never panic (#1375).
+fn argv_bytes<I: Iterator<Item = OsString>>(argv: I) -> Vec<Vec<u8>> {
+    argv.map(|argument| argument.as_bytes().to_vec()).collect()
+}
+
 pub(crate) fn candidate_boot_owned(version: &str) -> io::Result<()> {
     take_boot_fd()?;
     // SAFETY: the private parent contract transfers descriptor 3 to this
@@ -285,12 +307,7 @@ fn check_permit(permit: &Permit, observed: &Observed, version: &str) -> io::Resu
         || observed.parent != permit.parent
         || observed.executable != permit.executable
         || observed.cwd != permit.cwd
-        || observed.argv
-            != permit
-                .argv
-                .iter()
-                .map(|arg| OsString::from(arg.as_str()))
-                .collect::<Vec<_>>()
+        || argv_bytes(observed.argv.iter().cloned()) != permit.argv
         || version != permit.version
         || observed.sha256 != permit.sha256
         || observed.now_ns >= permit.record.deadline_ns
@@ -375,7 +392,7 @@ mod tests {
             executable: "/usr/bin/x0xd".into(),
             sha256: [9; 32],
             version: "0.49.0".into(),
-            argv: vec!["x0xd".into(), "--name".into(), "alice".into()],
+            argv: vec![b"x0xd".to_vec(), b"--name".to_vec(), b"alice".to_vec()],
             cwd: "/var/lib/x0x".into(),
         }
     }
@@ -430,9 +447,14 @@ mod tests {
     fn launcher_child_argv_is_compared_as_os_strings() {
         let mut seen = observed();
         seen.argv[2] = OsString::from_vec(b"alice\xff".to_vec());
+        // The permit carries OS bytes, so the lossy UTF-8 spelling of the
+        // same argument is a different byte string and must be refused.
         let mut lossy = permit();
-        lossy.argv[2] = seen.argv[2].to_string_lossy().into_owned();
-        assert_eq!(lossy.argv[2], "alice\u{FFFD}");
+        lossy.argv[2] = seen.argv[2].to_string_lossy().into_owned().into_bytes();
+        assert_eq!(
+            String::from_utf8(lossy.argv[2].clone()).unwrap(),
+            "alice\u{FFFD}"
+        );
         assert!(check_permit(&lossy, &seen, "0.49.0").is_err());
     }
 
@@ -509,5 +531,141 @@ mod tests {
         assert!(absent(&stale).unwrap());
         stop_and_reap(&mut child).unwrap();
         assert!(absent(&theirs).unwrap());
+    }
+}
+
+/// Boot invariants that hold even while activation is held: the boot
+/// marker must not outlive the fd-3 take, argv compares as OS bytes, and
+/// a symlinked install captures canonical paths.
+#[cfg(test)]
+mod boot_guards {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    const BOOT_ROLE: &str = "X0X_1375_S2_BOOT_FD_ROLE";
+
+    fn fixture_permit() -> Permit {
+        Permit {
+            record: journal::BootRecord {
+                schema_version: 1,
+                record_kind: "boot".into(),
+                transaction_id: "transaction-1".into(),
+                generation: 1,
+                instance_id: "alice".into(),
+                attempt: 1,
+                pid: 1,
+                process_start: 1,
+                boot_id: "boot-1".into(),
+                started_at_ns: 0,
+                deadline_ns: u64::MAX,
+            },
+            parent: Identity {
+                pid: 1,
+                start: 1,
+                boot: "boot-1".into(),
+            },
+            root: PathBuf::from("/nonexistent-x0x-boot-guard"),
+            executable: PathBuf::from("/nonexistent-x0x-boot-guard/x0xd"),
+            sha256: [0; 32],
+            version: "fixture-version".into(),
+            argv: vec![b"x0xd".to_vec()],
+            cwd: PathBuf::from("/nonexistent-x0x-boot-guard"),
+        }
+    }
+
+    #[test]
+    fn boot_fd_is_cleared_once_fd_3_is_taken() {
+        if std::env::var_os(BOOT_ROLE).is_some() {
+            boot_fd_role();
+            return;
+        }
+        let (mut parent, channel) = UnixStream::pair().unwrap();
+        let fd = channel.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        // The launcher module is mounted at the bin crate root, so the
+        // exact selector carries no `upgrade::` prefix.
+        command
+            .arg("--exact")
+            .arg("launcher::child::boot_guards::boot_fd_is_cleared_once_fd_3_is_taken")
+            .env(BOOT_ROLE, "1")
+            .env(BOOT_FD, "3")
+            .stdin(Stdio::null());
+        // SAFETY: the descriptor contract under test is the one
+        // `Owned::spawn` installs; the child closure only calls
+        // async-signal-safe descriptor operations.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, 3) == -1 || libc::fcntl(3, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(channel);
+        let mut bytes = serde_json::to_vec(&fixture_permit()).unwrap();
+        bytes.push(b'\n');
+        parent.write_all(&bytes).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "child exited with {status}");
+    }
+
+    fn boot_fd_role() {
+        // Non-Linux refuses the boot right after the take; Linux refuses it
+        // on the fixture identity. Either way the marker must already be
+        // gone, or a later self-update child would treat its own unrelated
+        // descriptor 3 as a boot channel.
+        let _ = candidate_boot_owned("fixture-version");
+        if std::env::var_os(BOOT_FD).is_none() {
+            std::process::exit(0);
+        }
+        std::process::exit(42);
+    }
+
+    #[test]
+    fn argv_bytes_keep_non_utf8_without_panicking() {
+        let raw = OsString::from_vec(b"daemon\xff".to_vec());
+        // A String-based args() collection panics on these bytes; the byte
+        // collection keeps them, so the boot check refuses raw argv instead
+        // of dying before logging exists.
+        assert_eq!(
+            argv_bytes(std::iter::once(raw)),
+            vec![b"daemon\xff".to_vec()]
+        );
+        // The permit carries the same OS bytes, so equal argv passes the
+        // boot comparison and only genuinely different argv is refused.
+        assert_eq!(
+            argv_bytes(std::iter::once(OsString::from("x0xd"))),
+            fixture_permit().argv
+        );
+    }
+
+    #[test]
+    fn captured_paths_are_canonical_so_a_symlinked_install_boots() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real_executable = real_dir.join("x0xd");
+        std::fs::write(&real_executable, b"candidate-bytes").unwrap();
+        let linked_executable = dir.path().join("linked-x0xd");
+        std::os::unix::fs::symlink(&real_executable, &linked_executable).unwrap();
+        let linked_cwd = dir.path().join("linked-cwd");
+        std::os::unix::fs::symlink(&real_dir, &linked_cwd).unwrap();
+
+        let (executable, cwd) = captured_spawn_paths(&linked_executable, &linked_cwd).unwrap();
+
+        // The candidate compares these against its own canonical
+        // current_exe() and kernel-resolved current_dir(), so a
+        // Homebrew-style link boots instead of spending all three attempts
+        // and rolling back.
+        assert_eq!(executable, real_executable.canonicalize().unwrap());
+        assert_eq!(cwd, real_dir.canonicalize().unwrap());
+        // The O_NOFOLLOW boot hash agrees with the captured path: it opens
+        // the real file, never the symlink the plan was captured with.
+        assert_eq!(
+            filesystem::hash(&executable).unwrap(),
+            <[u8; 32]>::from(Sha256::digest(b"candidate-bytes"))
+        );
+        assert!(filesystem::hash(&linked_executable).is_err());
     }
 }
