@@ -52,15 +52,7 @@ impl DaemonClient {
             None => "x0x".to_string(),
         };
 
-        let base_url = if let Some(api) = api_override {
-            if api.starts_with("http://") || api.starts_with("https://") {
-                api.to_string()
-            } else {
-                format!("http://{api}")
-            }
-        } else {
-            Self::discover_api(name, &data_dir, &dir_name)?
-        };
+        let base_url = Self::resolve_base_url(name, api_override, &data_dir)?;
 
         // Read API token.
         // Priority: X0X_API_TOKEN env var > data directory file.
@@ -111,6 +103,30 @@ impl DaemonClient {
             })
         );
         Ok(serde_json::json!({ "ok": true }))
+    }
+
+    /// Base URL for `name` and `api_override`.
+    ///
+    /// Priority matches [`DaemonClient::new`]: `api_override`, then the port
+    /// file for `name`, then `http://127.0.0.1:12700` when `name` is absent.
+    /// A named instance with no port file is an error. It does not fall
+    /// through to the default instance.
+    pub(crate) fn resolve_base_url(
+        name: Option<&str>,
+        api_override: Option<&str>,
+        data_dir: &std::path::Path,
+    ) -> Result<String> {
+        if let Some(api) = api_override {
+            if api.starts_with("http://") || api.starts_with("https://") {
+                return Ok(api.to_string());
+            }
+            return Ok(format!("http://{api}"));
+        }
+        let dir_name = match name {
+            Some(n) => format!("x0x-{n}"),
+            None => "x0x".to_string(),
+        };
+        Self::discover_api(name, data_dir, &dir_name)
     }
 
     fn discover_api(
