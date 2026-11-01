@@ -31,8 +31,8 @@
 //!
 //! - The fsync cut points of ADR 0108 §5a have no injection seam; the
 //!   case models the damage as the on-disk bytes it leaves (a valid v2
-//!   header over a body that cannot decode), as #1759's lifecycle case
-//!   does for the header forms.
+//!   header over a body that cannot decode), the same on-disk shape
+//!   the header-damage forms of the `s4_sidecar_lifecycle` row use.
 //! - The trigger is a self-leave, not a revocation: a loaded
 //!   revocation record stores a `Notify` permit at boot
 //!   (`RevocationIntake::note_loaded`), which wakes a second worker
@@ -40,7 +40,11 @@
 //!   `rebuilding_obligation_store` wait before the API can read it. A
 //!   self-leave derives from the verified chain with no intake wake,
 //!   so the pass-1 wait stays readable for a whole worker tick
-//!   ([`S4_WORKER_TICK`], 1 s).
+//!   ([`S4_WORKER_TICK`], 1 s). Nothing enforces that window: a boot
+//!   path that called `request_reconcile` would end it early. The
+//!   paused clock and the fixed seed keep today's boot quiet, so the
+//!   reading is deterministic; a boot wake introduced later would fail
+//!   the arm with [`CAUSE_NO_REBUILDING`] and this note explains why.
 //! - The row's "restart A with no holder of the head online" variant
 //!   is not driven: after both other members leave, no active member
 //!   remains to serve A's catch-up, so the leave that opens the row
@@ -51,6 +55,9 @@
 //! anywhere (S4 derives no such trigger today — every kind is durable
 //! in the revocation store, on the verified chain or as a committed
 //! certificate, per the §5 comment in `revocation_eviction.rs`); the
+//! rebuilt row's fresh T_obs (the budget restart at re-derivation —
+//! the case proves the one-rotation completion but not the reset
+//! timing); the
 //! `.evjournal` damage between its prepare and the legacy commit (with
 //! and without the landed commit); the `.evs` case inside an ADR 0094
 //! trial; the no-holder restart form; the self-revocation and
@@ -80,8 +87,8 @@ const COMPLETE: Duration = Duration::from_secs(60);
 /// The case waits this long after the completion and re-reads, so a
 /// second rotation (another epoch step) is seen.
 const SETTLE: Duration = Duration::from_secs(10);
-/// How long the red arm watches the new trigger's wait under the
-/// newer-format sidecar.
+/// How long the newer-file arm watches the new trigger's wait under
+/// the newer-format sidecar.
 const WATCH: Duration = Duration::from_secs(45);
 
 /// A `.evs` whose v2 header is valid but whose body cannot decode: the
@@ -305,8 +312,8 @@ async fn store_view(
     ))
 }
 
-/// The `.evs` history and pending copy names in `dir` (the `.<evs>.q-…`
-/// family), split into `(history, pending)`.
+/// The `.evs` history and pending copy names in `dir` (the
+/// `<evs>.q-…` family), split into `(history, pending)`.
 fn quarantine_names(dir: &Path) -> (Vec<String>, Vec<String>) {
     let mut history = Vec::new();
     let mut pending = Vec::new();
@@ -555,13 +562,23 @@ async fn control_arm(
     let (state, detail, rebuilt_from) = store_view(sim, "A", group).await?;
     let (history_after, pending_after) = quarantine_names(&dir);
     let replacement = read_evs(sim, "A")?;
+    // The one new history copy must name the same txid the store
+    // publishes (and the replacement must carry it too).
+    let new_history = history_after
+        .iter()
+        .filter(|name| !history_before.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let replacement_txid = replacement
+        .as_ref()
+        .and_then(|body| body.rebuilt_from.first().map(hex::encode));
     let rebuilt_ok = state == "rebuilt"
         && rebuilt_from.len() == 1
         && history_after.len() == history_before.len() + 1
         && pending_after.is_empty()
-        && replacement
-            .as_ref()
-            .is_some_and(|body| body.rebuilt_from.len() == rebuilt_from.len());
+        && new_history.len() == 1
+        && new_history[0].contains(&format!(".q-{}-", rebuilt_from[0]))
+        && replacement_txid.as_deref() == rebuilt_from.first().map(String::as_str);
     passed &= record_check(
         receipt,
         "the_damaged_body_is_quarantined_and_rebuilt",
@@ -570,11 +587,11 @@ async fn control_arm(
         Some(format!("state={state} detail={detail:?}")),
         format!(
             "state={state:?} detail={detail:?} rebuilt_from={rebuilt_from:?}; history {} -> {}, \
-             pending {:?}; the replacement decodes: {}",
+             pending {:?}; the new history copy: {new_history:?}; the replacement's txid: \
+             {replacement_txid:?}",
             history_before.len(),
             history_after.len(),
             pending_after,
-            replacement.is_some()
         ),
         at(sim),
     );
@@ -617,7 +634,7 @@ async fn control_arm(
     // The row then waits for the new head round — the typed
     // `waiting_for_head_sync` from the passes after the rebuild flag
     // cleared until the new restart sync wait passes.
-    let mut head_sync_seen = rebuilding_seen;
+    let mut head_sync_seen = false;
     let head_watch = sim
         .until(
             "the rebuilt row shows waiting_for_head_sync",
@@ -983,7 +1000,7 @@ async fn expect(case: &str, seed: u64, labels: &[&str], arm: Arm) -> Result<()> 
 }
 
 const CONTROL_LABELS: &[&str] = &["A", "B", "C"];
-const RED_LABELS: &[&str] = &["A", "B"];
+const NEWER_LABELS: &[&str] = &["A", "B"];
 
 /// ADR 0110 `s4_sidecar_rebuild`, the `.evs` body-damage rebuild: A
 /// holds the open self-leave row held by its boot head gate, the body
@@ -1036,7 +1053,7 @@ fn w3h_1581h_control_sidecar_rebuild_newer_file_memory_only() -> Result<()> {
         expect(
             "w3h_1581h_control_sidecar_rebuild_newer_file_memory_only",
             0x1581_000f,
-            RED_LABELS,
+            NEWER_LABELS,
             Arm::NewerFile,
         )
         .await
