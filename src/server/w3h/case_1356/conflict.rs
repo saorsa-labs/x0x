@@ -16,9 +16,10 @@
 //! 3. Partition B (every message to or from B is dropped). B renames
 //!    (r+3′). A renames (r+3); C applies it, and nothing from A, M1 or
 //!    M2 reaches J.
-//! 4. J's messages reach B and C again, on any relay path. B's messages
-//!    to J are delayed by [`B_LATE`] and C's by [`C_LATE`]; transport
-//!    control passes on time. A write that B made while partitioned stays
+//! 4. J's messages reach B and C again, on any relay path, and B's pulls
+//!    of J's messages (IWANT) pass on time. B's messages to J are delayed
+//!    by [`B_LATE`] and C's by [`C_LATE`]; transport control passes on
+//!    time. A write that B made while partitioned stays
 //!    dropped (by message ID), so r+3′ never reaches J. J first gets
 //!    current capability adverts from B and C (they expire after 15 min,
 //!    and only a current one makes a target). J asks B, then C. C's ATA
@@ -90,11 +91,15 @@ struct Nodes {
 }
 
 /// The fabric rule of this row. A gossip frame's origin is the node that
-/// first wrote its message ID, so a relay keeps its origin.
+/// first wrote its message ID, so a relay keeps its origin. An IWANT's
+/// header names the first message it asks for, so an IWANT's origin is
+/// that message's origin, not the node that asks.
 struct Hold {
     phase: Arc<Mutex<Phase>>,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
     replays: Arc<std::sync::atomic::AtomicUsize>,
+    /// B's IWANTs for J's messages that passed in step 4.
+    pulls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Hold {
@@ -109,18 +114,26 @@ impl Hold {
         let phase = Arc::new(Mutex::new(Phase::Open));
         let dropped = Arc::new(AtomicUsize::new(0));
         let replays = Arc::new(AtomicUsize::new(0));
+        let pulls = Arc::new(AtomicUsize::new(0));
         let origins: Mutex<HashMap<[u8; 32], Key>> = Mutex::new(HashMap::new());
         let partitioned: Mutex<HashSet<[u8; 32]>> = Mutex::new(HashSet::new());
-        let (rule_phase, rule_dropped, rule_replays) = (
+        let (rule_phase, rule_dropped, rule_replays, rule_pulls) = (
             Arc::clone(&phase),
             Arc::clone(&dropped),
             Arc::clone(&replays),
+            Arc::clone(&pulls),
         );
         sim.fabric().add_rule(move |write| {
             let header = (write.lane.class == LaneClass::PubSub)
                 .then(|| pubsub_header(&write.bytes))
                 .flatten();
             let (topic, msg_id) = (header.map(|(t, _)| t), header.map(|(_, id)| id));
+            let iwant = header.is_some()
+                && write
+                    .bytes
+                    .get(1..)
+                    .and_then(saorsa_gossip_pubsub::peek_message_kind)
+                    == Some(saorsa_gossip_types::MessageKind::IWant);
             let origin = match msg_id {
                 Some(id) => match origins.lock() {
                     Ok(mut map) => *map.entry(id).or_insert(write.lane.src),
@@ -170,6 +183,14 @@ impl Hold {
                     } else if origin == nodes.j && dst == nodes.b {
                         // J's messages reach B, on any relay path.
                         Fault::Pass
+                    } else if iwant && origin == nodes.j && src == nodes.b {
+                        // B pulls one of J's messages that a peer offered
+                        // it (lazy push). Without this, J's request reaches
+                        // B only by an eager push, so a B that J holds lazy
+                        // never gets it, and J backs off past the window
+                        // (s3 job, run 41233639089 attempt 2, iteration 3).
+                        rule_pulls.fetch_add(1, Ordering::SeqCst);
+                        Fault::Pass
                     } else if origin == nodes.b && dst == nodes.j {
                         late(write.lane.class, B_LATE)
                     } else if origin == nodes.b && to_j_inbox {
@@ -198,6 +219,7 @@ impl Hold {
             phase,
             dropped,
             replays,
+            pulls,
         })
     }
 
@@ -212,9 +234,11 @@ impl Hold {
     fn counts(&self) -> String {
         use std::sync::atomic::Ordering;
         format!(
-            "dropped {}, replays of partitioned writes dropped {}",
+            "dropped {}, replays of partitioned writes dropped {}, B's pulls of J's messages \
+             passed {}",
             self.dropped.load(Ordering::SeqCst),
-            self.replays.load(Ordering::SeqCst)
+            self.replays.load(Ordering::SeqCst),
+            self.pulls.load(Ordering::SeqCst)
         )
     }
 }
