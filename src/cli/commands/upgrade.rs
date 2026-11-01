@@ -1383,4 +1383,54 @@ mod tests {
         );
         assert!(!report.contains(APPLY_HINT), "{report}");
     }
+
+    #[test]
+    fn issue1104_check_edges_the_coverage_run_left_red() {
+        let lines = cli_not_upgraded_lines(Path::new("/tmp/x0x"), None, "1.0.0", "1.2.0");
+        assert!(
+            lines[1].contains("is not beside the running daemon.")
+                && !lines[1].contains("running daemon /"),
+            "{lines:?}"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let empty_name = root.path().join("x0x-");
+        std::fs::create_dir(&empty_name).unwrap();
+        assert!(expected_daemon_name(&empty_name).is_none());
+
+        let named = root.path().join("x0x-alice");
+        std::fs::create_dir(&named).unwrap();
+        let skipped = root.path().join("x0x-bob");
+        std::fs::create_dir(&skipped).unwrap();
+        // APFS rejects a non-UTF-8 name. Linux coverage still walks that entry.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = root
+                .path()
+                .join(std::ffi::OsString::from_vec(b"x0x-\xff".to_vec()));
+            std::fs::create_dir(&bad).unwrap();
+        }
+        std::fs::write(named.join("api.port"), "example.com\n").unwrap();
+        assert_eq!(endpoint_key("example.com").as_deref(), Some("example.com"));
+        assert!(!health_addr_allowed("example.com"));
+        assert!(!health_addr_allowed(&format!(
+            "http://{}.example",
+            "a".repeat(130)
+        )));
+        assert!(split_host_port("1:2:3").is_none());
+        assert_eq!(
+            instance_dir_for_endpoint(root.path(), "example.com").as_deref(),
+            Some(named.as_path())
+        );
+
+        assert!(argv_from_procargs2(&[]).is_none());
+        assert!(argv_from_procargs2(&0i32.to_ne_bytes()).is_none());
+        let mut short = 1i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/x0xd");
+        assert!(argv_from_procargs2(&short).is_none());
+
+        #[cfg(target_os = "linux")]
+        assert!(process_executable(std::process::id(), None).is_none());
+    }
 }
