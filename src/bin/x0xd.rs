@@ -267,7 +267,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         x0x::gui::startup_config_path(config_path.as_deref().map(Path::new), &default_config_path);
     let config_file_loaded = loaded_config_path.is_some();
     let (mut config, mut config_findings) = match loaded_config_path.as_ref() {
-        Some(path) => load_config(path.to_str().unwrap_or("/etc/x0x/config.toml")).await?,
+        Some(path) => load_config(path).await?,
         None => (DaemonConfig::default(), Vec::new()),
     };
 
@@ -702,10 +702,13 @@ async fn run_doctor(config: &DaemonConfig) -> Result<()> {
 /// Returns the config and its non-fatal findings as warning lines, which the
 /// caller emits once logging is initialised (N7). A plane-isolation key
 /// (`network_id`, `mdns_enabled`) below the top level is fatal here.
-async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
+/// The path is raw OS bytes end to end: an explicit `--config` value that is
+/// not UTF-8 names the file it names, never a silent fallback to the system
+/// config (#1375). Only the file *contents* must be UTF-8 TOML.
+async fn load_config(path: &Path) -> Result<(DaemonConfig, Vec<String>)> {
     let content = tokio::fs::read_to_string(path)
         .await
-        .with_context(|| format!("failed to read config file: {path}"))?;
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
     // Issue #385 / N7: name every key the schema drops (any depth) instead
     // of letting it vanish into a default. Only plane-isolation keys are
     // fatal: an ignored `network_id` joins the prod plane. Every other
@@ -713,9 +716,9 @@ async fn load_config(path: &str) -> Result<(DaemonConfig, Vec<String>)> {
     // prod configs carry stray keys and rejecting them would stop the
     // daemon after a self-update.
     let (config, findings) = x0x::server::config::analyze(&content)
-        .with_context(|| format!("failed to parse config file: {path}"))?;
+        .with_context(|| format!("failed to parse config file: {}", path.display()))?;
     if let Some(message) = findings.plane_error() {
-        anyhow::bail!("{message} (config file: {path})");
+        anyhow::bail!("{message} (config file: {})", path.display());
     }
     // ADR-0064 §1b: an out-of-range enforcement value changes security
     // behaviour (a 0-day grace would refuse every recorded-capable
@@ -1139,13 +1142,12 @@ mod tests {
     async fn invalid_history_rule_refuses_startup_even_with_history_disabled() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        let path_str = path.to_str().expect("utf-8 path").to_owned();
         std::fs::write(
             &path,
             "[history]\nenabled = false\n\n[[history.class_limits]]\nclass = \"durable\"\n",
         )
         .expect("write config");
-        let error = super::load_config(&path_str)
+        let error = super::load_config(&path)
             .await
             .expect_err("an invalid [history] rule must refuse startup");
         let message = format!("{error:#}");
@@ -1157,9 +1159,45 @@ mod tests {
 
         std::fs::write(&path, "[history]\nenabled = false\n").expect("rewrite config");
         assert!(
-            super::load_config(&path_str).await.is_ok(),
+            super::load_config(&path).await.is_ok(),
             "a config without the new rules still loads"
         );
+    }
+
+    /// #1375: the config path is raw OS bytes, so a `--config` value that is
+    /// not UTF-8 must load the file it names — never a silent fallback to
+    /// `/etc/x0x/config.toml`. APFS refuses to create a name that is not
+    /// UTF-8, so off Linux the raw path must at least reach the read error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_config_reads_a_file_whose_name_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw = std::ffi::OsString::from_vec(b"config\xff.toml".to_vec());
+        let path = dir.path().join(raw);
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::write(&path, "[history]\nenabled = false\n").expect("write config");
+            let (config, _findings) = super::load_config(&path).await.expect(
+                "the named file must load; a fallback to the system config is a silent plane change",
+            );
+            assert!(
+                !config.history.enabled,
+                "the loaded values came from the named file"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let error = super::load_config(&path)
+                .await
+                .expect_err("the raw path must reach the read error, not a fallback");
+            let message = format!("{error:#}");
+            let lossy = path.display().to_string();
+            assert!(
+                message.contains("failed to read config file") && message.contains(lossy.as_str()),
+                "the error must name the file the flag named, losslessly: {message}"
+            );
+        }
     }
 
     /// ADR-0074 §3: a non-loopback `[socks] listen` refuses config load.
@@ -1167,9 +1205,8 @@ mod tests {
     async fn load_config_refuses_non_loopback_socks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        let path_str = path.to_str().expect("utf-8 path").to_owned();
         std::fs::write(&path, "[socks]\nlisten = \"0.0.0.0:1080\"\n").expect("write config");
-        let error = super::load_config(&path_str)
+        let error = super::load_config(&path)
             .await
             .expect_err("non-loopback socks listen must refuse startup");
         let message = format!("{error:#}").to_ascii_lowercase();

@@ -667,8 +667,9 @@ mod tests {
 
 /// Boot invariants that hold even while activation is held: the boot
 /// marker must not outlive the fd-3 take, argv compares as OS bytes, a
-/// symlinked install captures canonical paths, and a stray marker never
-/// bricks startup (ADR 0094 §6).
+/// symlinked install captures canonical paths, a stray marker never
+/// bricks startup, and a present permit that fails its checks refuses
+/// the boot (ADR 0094 §6, #1375).
 #[cfg(test)]
 mod boot_guards {
     use super::*;
@@ -739,7 +740,13 @@ mod boot_guards {
         bytes.push(b'\n');
         parent.write_all(&bytes).unwrap();
         let status = child.wait().unwrap();
-        assert!(status.success(), "child exited with {status}");
+        // 75, not 0: libtest also exits 0 when --exact matches no test,
+        // so a rename of this test would otherwise pass vacuously.
+        assert_eq!(
+            status.code(),
+            Some(75),
+            "child exited with {status}; exit 0 would also mean the --exact filter matched nothing"
+        );
     }
 
     fn boot_fd_role() {
@@ -749,19 +756,16 @@ mod boot_guards {
         // descriptor 3 as a boot channel.
         let _ = candidate_boot_owned("fixture-version");
         if std::env::var_os(BOOT_FD).is_none() {
-            std::process::exit(0);
+            // 75, not 0: libtest also exits 0 when --exact matches nothing.
+            std::process::exit(75);
         }
         std::process::exit(42);
     }
 
     #[test]
     fn held_boot_ignores_a_stray_marker_and_boots_normally() {
-        if let Some(role) = std::env::var_os(BOOT_ROLE) {
-            match role.to_str() {
-                Some("2") => held_stray_role(),
-                Some("3") => held_permit_role(),
-                _ => boot_fd_role(),
-            }
+        if std::env::var_os(BOOT_ROLE).is_some() {
+            held_stray_role();
             return;
         }
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -785,7 +789,13 @@ mod boot_guards {
         }
         let mut child = command.spawn().unwrap();
         let status = child.wait().unwrap();
-        assert!(status.success(), "child exited with {status}");
+        // 75, not 0: libtest also exits 0 when --exact matches no test,
+        // so a rename of this test would otherwise pass vacuously.
+        assert_eq!(
+            status.code(),
+            Some(75),
+            "child exited with {status}; exit 0 would also mean the --exact filter matched nothing"
+        );
     }
 
     fn held_stray_role() {
@@ -794,59 +804,66 @@ mod boot_guards {
         // its own descriptor 3 for a boot channel.
         candidate_boot("fixture-version").unwrap();
         if std::env::var_os(BOOT_FD).is_none() {
-            std::process::exit(0);
+            // 75, not 0: libtest also exits 0 when --exact matches nothing.
+            std::process::exit(75);
         }
         std::process::exit(42);
     }
 
     #[test]
     fn held_boot_refuses_a_present_permit_that_fails_its_checks() {
-        if let Some(role) = std::env::var_os(BOOT_ROLE) {
-            match role.to_str() {
-                Some("2") => held_stray_role(),
-                Some("3") => held_permit_role(),
-                _ => boot_fd_role(),
-            }
-            return;
-        }
-        let (mut parent, channel) = UnixStream::pair().unwrap();
-        let fd = channel.as_raw_fd();
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .arg("--exact")
-            .arg(
-                "launcher::child::boot_guards::held_boot_refuses_a_present_permit_that_fails_its_checks",
-            )
-            .env(BOOT_ROLE, "3")
-            .env(BOOT_FD, "3")
-            .stdin(Stdio::null());
-        // SAFETY: the same descriptor contract `Owned::spawn` installs; the
-        // child closure only calls async-signal-safe descriptor operations.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(fd, 3) == -1 || libc::fcntl(3, libc::F_SETFD, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().unwrap();
-        drop(channel);
-        let mut bytes = serde_json::to_vec(&fixture_permit()).unwrap();
+        // In-process, not a re-exec: the old child fixture named a
+        // nonexistent executable, so hashing failed before `check_permit`
+        // (and identity failed first off Linux); a held path that skipped
+        // the check stayed green (#1375). Here every earlier step runs
+        // against a real temp executable — parsing, hashing, observing
+        // this process — so the refusal can only come from the check. The
+        // temp file is hashed, never executed.
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("x0xd");
+        std::fs::write(&staged, b"candidate-bytes").unwrap();
+        let executable = staged.canonicalize().unwrap();
+        let mut permit = fixture_permit();
+        permit.root = dir.path().to_path_buf();
+        permit.executable = executable;
+        permit.sha256 = filesystem::hash(&permit.executable).unwrap();
+        // The executable and cwd fields are the deliberate mismatch with
+        // this process's own observed state; the hash and version match.
+        let (mut writer, channel) = UnixStream::pair().unwrap();
+        let mut bytes = serde_json::to_vec(&permit).unwrap();
         bytes.push(b'\n');
-        parent.write_all(&bytes).unwrap();
-        drop(parent);
-        let status = child.wait().unwrap();
-        assert!(status.success(), "child exited with {status}");
-    }
-
-    fn held_permit_role() {
-        // The fixture permit names a nonexistent executable, so a permit
-        // that really arrives cannot pass its checks: the held build keeps
-        // the refusal and never acks or writes a boot record.
-        match candidate_boot("fixture-version") {
-            Err(_) => std::process::exit(0),
-            Ok(()) => std::process::exit(43),
+        // The permit is buffered before the call, so the 250 ms poll
+        // deadline never matters; the writer stays open so the channel
+        // does not read as hung up.
+        writer.write_all(&bytes).unwrap();
+        let error = held_boot_with(
+            Some(std::ffi::OsStr::new("3")),
+            Ok(channel.as_raw_fd()),
+            "fixture-version",
+        )
+        .unwrap_err();
+        #[cfg(target_os = "linux")]
+        {
+            // Custody, hashing and path capture all succeeded, so only
+            // `check_permit` can refuse, with its authority-mismatch line.
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not match launcher authority"),
+                "held boot refused before check_permit: {error}"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Every well-formed permit still refuses the boot off Linux
+            // today: observed identity is unavailable, so the refusal
+            // fires in `observed_for` before any field is compared.
+            assert!(
+                error
+                    .to_string()
+                    .contains("launcher process custody requires Linux"),
+                "unexpected refusal: {error}"
+            );
         }
     }
 

@@ -4915,16 +4915,29 @@ impl AnnouncementAssistSnapshot {
 /// #398: explicit operator opt-in for announcing relay/coordinator
 /// capability without verified public reachability (manually
 /// port-forwarded hosts, hosts behind an operator-trusted edge). Checked
-/// once per process; absent by default.
+/// once per process; absent by default. argv is compared as raw OS bytes
+/// because collecting it as `String`s would panic on non-UTF-8 argv
+/// mid-daemon (#1375).
 fn relay_opt_in_explicit() -> bool {
     static OPT_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OPT_IN.get_or_init(|| {
-        // Command line: --relay / --relay-opt-in flag present.
-        let argv_opt_in = std::env::args().any(|arg| arg == "--relay" || arg == "--relay-opt-in");
-        // Environment: X0X_RELAY_OPT_IN=1.
-        let env_opt_in = std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1");
-        argv_opt_in || env_opt_in
+        relay_opt_in_from(std::env::args_os(), std::env::var_os("X0X_RELAY_OPT_IN"))
     })
+}
+
+/// Pure decision core of [`relay_opt_in_explicit`], split out so the
+/// argv/env byte handling is unit-testable without owning process argv.
+fn relay_opt_in_from<I>(argv: I, env: Option<std::ffi::OsString>) -> bool
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    // Command line: --relay / --relay-opt-in flag present.
+    let argv_opt_in = argv
+        .into_iter()
+        .any(|arg| arg == "--relay" || arg == "--relay-opt-in");
+    // Environment: X0X_RELAY_OPT_IN=1.
+    let env_opt_in = env.is_some_and(|v| v == "1");
+    argv_opt_in || env_opt_in
 }
 
 struct IdentityAnnouncementBuildOptions<'a> {
@@ -39814,6 +39827,53 @@ fn push_unique_works_with_empty() {
     let mut items: Vec<i32> = vec![];
     push_unique(&mut items, 42);
     assert_eq!(items, vec![42]);
+}
+
+#[test]
+fn relay_opt_in_from_relay_flag_opts_in() {
+    let argv = ["x0xd", "--relay"]
+        .into_iter()
+        .map(std::ffi::OsString::from);
+    assert!(relay_opt_in_from(argv, None));
+}
+
+#[test]
+fn relay_opt_in_from_relay_opt_in_flag_opts_in() {
+    let argv = ["x0xd", "--relay-opt-in"]
+        .into_iter()
+        .map(std::ffi::OsString::from);
+    assert!(relay_opt_in_from(argv, None));
+}
+
+#[test]
+fn relay_opt_in_from_env_one_opts_in() {
+    assert!(relay_opt_in_from(
+        Vec::new(),
+        Some(std::ffi::OsString::from("1"))
+    ));
+}
+
+#[test]
+fn relay_opt_in_from_env_zero_does_not_opt_in() {
+    assert!(!relay_opt_in_from(
+        Vec::new(),
+        Some(std::ffi::OsString::from("0"))
+    ));
+}
+
+#[test]
+fn relay_opt_in_from_empty_is_false() {
+    assert!(!relay_opt_in_from(Vec::new(), None));
+}
+
+// #1375: argv can carry non-UTF-8 bytes; the check must neither panic
+// mid-daemon nor treat the mangled flag as opt-in.
+#[cfg(unix)]
+#[test]
+fn relay_opt_in_from_non_utf8_arg_does_not_panic_or_match() {
+    use std::os::unix::ffi::OsStringExt;
+    let argv = vec![std::ffi::OsString::from_vec(b"--relay\xff".to_vec())];
+    assert!(!relay_opt_in_from(argv, None));
 }
 
 #[cfg(test)]
