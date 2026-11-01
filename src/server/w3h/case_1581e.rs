@@ -9,7 +9,10 @@
 //! toward B or C is dropped: the roster volley and the direct removal
 //! deliveries of A's commit never reach a peer. A is then crash-stopped
 //! with the row `committed_delivery_pending`. The two arms cover §3's
-//! two restart outcomes of a saved delivery-pending row:
+//! two restart outcomes of a saved delivery-pending row (the row's own
+//! cast names this shape its control — the no-sibling-publication and
+//! containment assertions; this module carries those assertions inside
+//! the two outcome arms instead of a separate control run):
 //!
 //! - the fork arm: while A is down, D is restarted and, as the
 //!   designated admin, commits a competing exclusion from the same
@@ -22,7 +25,9 @@
 //!   only through the receivers: from A's restart on, a count-only
 //!   fabric rule counts every direct-carrier frame A sends toward D or
 //!   C that carries the saved exclusion event (a `member_removed` or
-//!   `member_banned` naming B), and a non-zero count names
+//!   `member_banned` naming B whose commit `state_hash` is the saved
+//!   event's own result head, so a legitimate forward of D's competing
+//!   event never counts), and a non-zero count names
 //!   `CAUSE_SIBLING_PUBLISHED` — the arm cannot go GREEN while A
 //!   resends its saved sibling, however firmly the receivers refuse it.
 //!   On `main` that count is zero (the stale-replica protection — an
@@ -158,7 +163,8 @@ const CAUSE_SIBLING_PUBLISHED: &str = "a competing sibling was published across 
                                        the other admin's commit or left the one exclusion it \
                                        had settled on";
 const CAUSE_SECOND_ROTATION: &str = "the exclusion was not exactly one rotation: a node moved \
-                                     past e0 + 1 after the outcome";
+                                     past e0 + 1 after the outcome, or never held the one \
+                                     rotation at the end";
 const CAUSE_NO_RESUME: &str = "A never finished the saved delivery on the same chain: its row \
                                stayed open, or C never reached A's commit";
 const CAUSE_DATA_PLANE: &str = "the commits converged but the data plane did not follow: a \
