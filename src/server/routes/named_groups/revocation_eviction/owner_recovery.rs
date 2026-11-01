@@ -4900,6 +4900,21 @@ mod tests {
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let (status, Json(body)) = sign_recovery_mandate(&state, owner, &stable, &local_hex).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        // The route starts its own drive. Finish it before the head syncs:
+        // before the sync it only records the head-sync wait. If its
+        // `try_commit` runs after the sync and before the quarantine
+        // below, it commits the recovery and consumes the mandate, so the
+        // refusal under test never runs (main CI 2be90c1d).
+        let tasks = {
+            let mut tasks = state
+                .detached_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tasks.as_mut().map(std::mem::take).unwrap_or_default()
+        };
+        for task in tasks {
+            task.await.unwrap();
+        }
         sync_head(&state, &info).await;
 
         let quarantined = {
