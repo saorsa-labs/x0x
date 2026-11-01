@@ -3173,6 +3173,16 @@ pub fn build_spawn_args(argv: &[String]) -> Vec<String> {
 // Old-process side (I2 steps 1–3)
 // ---------------------------------------------------------------------------
 
+/// The M2 launcher marks its private fd-3 boot handoff with this variable
+/// (#1375). Handoff children never boot as launcher candidates, and fd 3 in
+/// them is some unrelated descriptor, so they must not inherit it.
+const LAUNCHER_BOOT_FD_ENV: &str = "X0X_M2_BOOT_FD";
+
+/// Strip the launcher boot descriptor from a handoff child's environment.
+fn scrub_launcher_boot_fd(cmd: &mut std::process::Command) {
+    cmd.env_remove(LAUNCHER_BOOT_FD_ENV);
+}
+
 /// Start the transactional handoff from the old daemon after a swap Success.
 ///
 /// Writes the handoff file, spawns a detached helper (in a new session, so it
@@ -3209,6 +3219,7 @@ pub fn begin_transactional_handoff(
     let mut cmd = std::process::Command::new(&helper_binary);
     cmd.arg(UPGRADE_HANDOFF_FLAG).arg(handoff_path);
     cmd.stdin(std::process::Stdio::null());
+    scrub_launcher_boot_fd(&mut cmd);
     detach_from_terminal(&mut cmd);
 
     match cmd.spawn() {
@@ -3463,6 +3474,7 @@ fn spawn_and_await_health(
         cmd.current_dir(&handoff.cwd);
     }
     cmd.stdin(std::process::Stdio::null());
+    scrub_launcher_boot_fd(&mut cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -5128,6 +5140,15 @@ mod tests {
                 "/etc/x0x/config.toml".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn handoff_children_do_not_inherit_the_launcher_boot_descriptor() {
+        let mut cmd = std::process::Command::new("x0xd-never-spawned-placeholder");
+        scrub_launcher_boot_fd(&mut cmd);
+        assert!(cmd
+            .get_envs()
+            .any(|(key, value)| key == LAUNCHER_BOOT_FD_ENV && value.is_none()));
     }
 
     #[test]
