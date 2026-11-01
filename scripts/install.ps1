@@ -3,11 +3,18 @@
 # Usage:
 #   irm https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.ps1 | iex
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/saorsa-labs/x0x/main/scripts/install.ps1))) -Start
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.45.0 -Start
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v0.48.0 -Start
+#
+# Versions before v0.46.5 predate the --verify-release-manifest probe in the
+# release binaries and no longer install.
 #
 # What it does:
 #   1. Resolves the latest release (or -Version)
-#   2. Downloads x0x-windows-x64.zip and verifies its SHA-256 checksum and its
+#   2. Downloads x0x-windows-x64.zip and verifies its SHA-256 checksum, the
+#      signed ML-DSA-65 release manifest, whose version and channel must
+#      match the resolved release tag (through an installed x0x.exe when
+#      available, else the release's own binary — the updater's verify
+#      path — before the zip is extracted), and, when gpg is present, the
 #      GPG signature against the pinned Saorsa Labs release key
 #   3. Stops any running x0xd, installs x0xd.exe + x0x.exe to
 #      %LOCALAPPDATA%\x0x\bin (or -InstallDir)
@@ -15,9 +22,9 @@
 #   5. Optionally starts x0xd (-Start)
 #
 # Signature verification needs gpg.exe (Gpg4win, or the copy bundled with Git
-# for Windows). As in install.sh, the SHA-256 checksum is always verified; if
-# gpg is absent the installer prints a loud warning and continues on the
-# checksum alone.
+# for Windows). As in install.sh, the SHA-256 checksum and the signed ML-DSA
+# manifest are always verified; if gpg is absent the installer prints a loud
+# warning and continues without the independent GPG signature.
 
 param(
     [string]$Version = "latest",
@@ -89,6 +96,20 @@ function Test-ReleaseSignature([string]$Gpg, [string]$Artifact, [string]$Signatu
     }
 }
 
+function Expand-ReleaseZip([string]$Zip, [string]$Destination) {
+    # Extract into a fresh subfolder, never next to the downloaded
+    # manifest: a crafted zip carrying its own release-manifest.json and
+    # .sig must not be able to replace the files the binding and the
+    # signature check read. The Windows zip is flat: x0xd.exe and x0x.exe
+    # sit at the archive root.
+    Expand-Archive -LiteralPath $Zip -DestinationPath $Destination -Force
+    foreach ($bin in @("x0xd.exe", "x0x.exe")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Destination $bin) -PathType Leaf)) {
+            throw "Release archive is missing $bin at its root; the release layout may have changed."
+        }
+    }
+}
+
 Write-Host "x0x installer (Windows)" -ForegroundColor Blue
 
 # ── Resolve release ─────────────────────────────────────────────────────────
@@ -133,26 +154,169 @@ try {
         Test-ReleaseSignature $gpg $zip "$zip.asc" (Join-Path $Tmp "SAORSA_PUBLIC_KEY.asc") $Tmp
         Write-Host "  GPG signature verified ($TrustedFingerprint)" -ForegroundColor Green
     } else {
-        # Same policy and wording as install.sh: warn loudly, continue on checksum.
+        # Same policy and wording as install.sh: warn loudly, and say
+        # plainly that without gpg, when no post-v0.46.5 x0x is
+        # installed, the manifest check is self-attested by the
+        # downloaded binary.
         Write-Host ""
         Write-Host "################################################################" -ForegroundColor Yellow
         Write-Host "# WARNING: gpg NOT FOUND - the GPG signature was NOT verified. #" -ForegroundColor Yellow
-        Write-Host "# Only the SHA-256 checksum was checked, and that checksum was #" -ForegroundColor Yellow
-        Write-Host "# downloaded from the same place as the archive. Install gpg   #" -ForegroundColor Yellow
-        Write-Host "# and re-run to verify this release was signed by Saorsa Labs. #" -ForegroundColor Yellow
+        Write-Host "# The checksum and the ML-DSA manifest were checked. With      #" -ForegroundColor Yellow
+        Write-Host "# no installed post-v0.46.5 x0x, the manifest is checked by    #" -ForegroundColor Yellow
+        Write-Host "# the downloaded binary itself, not by an independent key.     #" -ForegroundColor Yellow
+        Write-Host "# Install gpg and re-run for a check that does not depend      #" -ForegroundColor Yellow
+        Write-Host "# on this download.                                            #" -ForegroundColor Yellow
         Write-Host "################################################################" -ForegroundColor Yellow
         Write-Host ""
     }
 
-    # ── Extract ─────────────────────────────────────────────────────────────
+    # ── Signed release manifest (ML-DSA-65, as the updater checks it) ──────
+    #
+    # The updater refuses a release whose manifest signature fails against
+    # the release key compiled into the binary (src/upgrade/signature.rs).
+    # This installer reuses that verify path instead of adding a second
+    # implementation. Four steps, in this order:
+    #
+    #   1. Bind: the manifest's version and channel must match the resolved
+    #      release tag (stable, non-prerelease, same version), before any
+    #      of the archive's bytes run. A genuinely-signed manifest for a
+    #      different release is refused. The stable, non-prerelease shape
+    #      is the updater's rule (src/upgrade/monitor.rs); matching the
+    #      tag is this installer's addition.
+    #   2. Bind: the manifest's archive_sha256 entry for this platform
+    #      must name the downloaded zip, still before extraction.
+    #   3. Sign: an already-installed x0x.exe — its key was trusted by an
+    #      earlier install — runs the inert --verify-release-manifest
+    #      probe (src/upgrade/verification_probe.rs), which reads only
+    #      the two downloaded files, and this runs before the zip is
+    #      extracted at all. The bound hash and the verified signature
+    #      therefore always apply to the same bytes.
+    #   4. Only then is the zip extracted, into a fresh subfolder, so its
+    #      entries can never replace the manifest and signature that were
+    #      bound and checked. On a first install, or when the installed
+    #      x0x.exe predates v0.46.5 (exit 2 on the probe argument), the
+    #      release's own x0x.exe from that subfolder does the check
+    #      instead — a stated self-attest limit; the pinned GPG signature
+    #      stays the independent anchor there.
+    #
+    # A missing manifest or signature, a bad signature, a version or
+    # channel that differs from the release tag, or a hash that differs
+    # from the manifest entry stops the install.
 
-    # The Windows zip is flat: x0xd.exe and x0x.exe sit at the archive root.
-    $extract = Join-Path $Tmp "extract"
-    Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
-    foreach ($bin in @("x0xd.exe", "x0x.exe")) {
-        if (-not (Test-Path -LiteralPath (Join-Path $extract $bin) -PathType Leaf)) {
-            throw "Release archive is missing $bin at its root; the release layout may have changed."
+    $manifest = Join-Path $Tmp "release-manifest.json"
+    $manifestSig = Join-Path $Tmp "release-manifest.json.sig"
+    Get-Download "$BaseUrl/release-manifest.json" $manifest
+    Get-Download "$BaseUrl/release-manifest.json.sig" $manifestSig
+
+    # The version and channel must match the resolved tag: a manifest
+    # from one release cannot be served for another. The stable,
+    # non-prerelease shape is the updater's rule (src/upgrade/monitor.rs);
+    # matching the tag is this installer's addition, and the tag itself
+    # comes from the unauthenticated latest-release API, so this is not
+    # downgrade protection. Strip exactly one leading "v", as the
+    # updater's version_from_tag does.
+    $releaseManifest = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+    $manifestVersion = [string]$releaseManifest.version
+    $manifestChannel = [string]$releaseManifest.channel
+    if (-not $manifestVersion -or -not $manifestChannel) {
+        throw "The signed manifest is missing its version or channel."
+    }
+    if ($manifestVersion -like "*-*" -or $manifestChannel -cne "stable") {
+        throw "The signed manifest names $manifestVersion ($manifestChannel); the updater rule accepts stable, non-prerelease releases only."
+    }
+    $tagVersion = if ($Tag.StartsWith("v")) { $Tag.Substring(1) } else { $Tag }
+    if ($manifestVersion -cne $tagVersion) {
+        throw "The signed manifest names version $manifestVersion ($manifestChannel), but release $Tag was requested. Nothing was installed."
+    }
+    Write-Host "  Manifest version $manifestVersion ($manifestChannel) matches $Tag"
+
+    # The manifest's archive_sha256 must name this zip before extraction:
+    # this refuses a swapped archive without executing any of its content.
+    $assetEntry = @($releaseManifest.assets | Where-Object { $_.target -ceq "x86_64-pc-windows-msvc" })
+    if ($assetEntry.Count -ne 1 -or -not $assetEntry[0].archive_sha256) {
+        throw "The signed manifest has no archive_sha256 entry for x86_64-pc-windows-msvc."
+    }
+    $manifestSha = ([string]$assetEntry[0].archive_sha256).ToLowerInvariant()
+    if ($manifestSha -notmatch "^[0-9a-f]{64}$" -or $manifestSha -ne $actual) {
+        throw "SHA-256 mismatch between $Asset and the manifest (expected $manifestSha, got $actual)."
+    }
+    Write-Host "  Archive hash matches the manifest entry" -ForegroundColor Green
+
+    # ── Manifest signature: installed verifier first, extraction after ────
+    #
+    # Like Test-ReleaseSignature: the probe may write to stderr, and
+    # Windows PowerShell 5.1 turns redirected native stderr into a
+    # terminating error under "Stop", so relax around the invocations and
+    # catch, so a launch failure becomes the repair message instead of a
+    # raw OS error. $LASTEXITCODE is cleared before each: if the exe fails
+    # to launch at all, a stale success from an earlier native call must
+    # not read as "verified". The verifier's own error output is kept, so
+    # a refusal says what the verifier actually objected to.
+    #
+    # Prefer an already-installed x0x.exe as the verifier: its key was
+    # trusted by an earlier install, so the check does not depend on this
+    # download. The probe runs before the zip is extracted, and the
+    # manifest and signature it reads are the downloaded files, which no
+    # archive byte has touched. Installed binaries from v0.46.5 know
+    # --verify-release-manifest and exit 0 (valid) or 1 (invalid); a
+    # pre-probe installed binary rejects the unknown argument with exit
+    # code 2, and first installs have no binary yet, so both fall back to
+    # the release's own x0x.exe from a fresh extraction subfolder. An
+    # installed x0x.exe that exists but cannot launch at all (corrupt,
+    # wrong architecture, quarantined) stops the install instead: falling
+    # back to the downloaded binary would let an unverified download
+    # decide its own install. Limit, stated plainly: on those fallback
+    # paths the manifest is checked by the downloaded binary itself, so
+    # an attacker controlling the whole origin could self-attest; the
+    # pinned GPG signature stays the independent check there.
+    $ErrorActionPreference = "Continue"
+    $extract = $null
+    $verifyBin = $null
+    $probeExit = $null
+    $probeOutput = @()
+    $installedCli = Join-Path $InstallDir "x0x.exe"
+    if (Test-Path -LiteralPath $installedCli -PathType Leaf) {
+        $global:LASTEXITCODE = $null
+        try {
+            $probeOutput = & $installedCli --verify-release-manifest $manifest $manifestSig 2>&1
+        } catch {
+            $probeOutput = @($_)
         }
+        $installedExit = $LASTEXITCODE
+        if ($null -eq $installedExit) {
+            $ErrorActionPreference = "Stop"
+            throw "$installedCli exists but could not be launched to verify the manifest. Repair or remove it, then re-run; nothing was installed."
+        }
+        if ($installedExit -ne 2) {
+            $verifyBin = $installedCli
+            $probeExit = $installedExit
+        } else {
+            Write-Warning ("The installed x0x.exe predates v0.46.5 and cannot check the manifest, " +
+                "so the downloaded x0x.exe verifies its own release. " +
+                "The pinned GPG signature stays the independent check for this install.")
+        }
+    }
+    if ($null -eq $probeExit) {
+        $extract = Join-Path $Tmp "extract"
+        Expand-ReleaseZip $zip $extract
+        $verifyBin = Join-Path $extract "x0x.exe"
+        $global:LASTEXITCODE = $null
+        try {
+            $probeOutput = & $verifyBin --verify-release-manifest $manifest $manifestSig 2>&1
+        } catch {
+            $probeOutput = @($_)
+        }
+        $probeExit = $LASTEXITCODE
+    }
+    $ErrorActionPreference = "Stop"
+    if ($null -eq $probeExit -or $probeExit -ne 0) {
+        $detail = (@($probeOutput) | Where-Object { "$_" }) -join " "
+        throw "ML-DSA manifest signature FAILED for release-manifest.json. The download may have been tampered with. Verifier said: $detail"
+    }
+    if ($verifyBin -eq $installedCli) {
+        Write-Host "  ML-DSA-65 manifest signature verified (by the installed x0x.exe)" -ForegroundColor Green
+    } else {
+        Write-Host "  ML-DSA-65 manifest signature verified" -ForegroundColor Green
     }
 
     # ── Stop any running instance ───────────────────────────────────────────
@@ -168,6 +332,12 @@ try {
     }
 
     # ── Install ─────────────────────────────────────────────────────────────
+
+    # The installed-verifier path skipped the earlier extraction; extract now.
+    if (-not $extract) {
+        $extract = Join-Path $Tmp "extract"
+        Expand-ReleaseZip $zip $extract
+    }
 
     # A running .exe cannot be overwritten on Windows but can be renamed, so
     # move the old binary aside first, then move the new one into place.
