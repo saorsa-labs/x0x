@@ -988,6 +988,9 @@ async fn scenario(
         // (`seen.verify` below), never a late pass.
         let mut seen = Observations::default();
         let mut completed = false;
+        // First H inside the budget, recorded against the one deadline:
+        // a completion that only lands past it stays `None` here.
+        let mut first_h_at: Option<Duration> = None;
         let waited = sim
             .until(
                 "the survivors reach H",
@@ -1003,6 +1006,7 @@ async fn scenario(
                         && row.is_some_and(|row| row["phase"].as_str() == Some("complete"));
                     if done {
                         completed = true;
+                        first_h_at.get_or_insert(s.fabric().now().saturating_sub(t0));
                     }
                     done
                 },
@@ -1058,10 +1062,13 @@ async fn scenario(
             ),
         };
         let data_plane = a_ok && c_ok && b_class == BDecrypt::LacksNewEpochSecret;
+        let deadline_offset = completion_deadline.saturating_sub(t0);
         receipt.note(format!(
-            "after the resume: completed {completed}; A's row {final_row:?}; A resolves the \
-             package again: {a_got_package}; {}; A decrypt: {a_detail}; C decrypt: {c_detail}; B \
-             decrypt ({b_class:?}): {b_detail}",
+            "after the resume: completed {completed}; first H {first_h_at:?} after t=0 against the \
+             one completion deadline {deadline_offset:?} after t=0 (release at W+Δ = {:?} after \
+             t=0); A's row {final_row:?}; A resolves the package again: {a_got_package}; {}; A \
+             decrypt: {a_detail}; C decrypt: {c_detail}; B decrypt ({b_class:?}): {b_detail}",
+            w + delta,
             describe_all(&end)
         ));
 
