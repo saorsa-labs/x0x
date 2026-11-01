@@ -128,12 +128,6 @@ impl Hold {
                 .then(|| pubsub_header(&write.bytes))
                 .flatten();
             let (topic, msg_id) = (header.map(|(t, _)| t), header.map(|(_, id)| id));
-            let iwant = header.is_some()
-                && write
-                    .bytes
-                    .get(1..)
-                    .and_then(saorsa_gossip_pubsub::peek_message_kind)
-                    == Some(saorsa_gossip_types::MessageKind::IWant);
             let origin = match msg_id {
                 Some(id) => match origins.lock() {
                     Ok(mut map) => *map.entry(id).or_insert(write.lane.src),
@@ -183,12 +177,19 @@ impl Hold {
                     } else if origin == nodes.j && dst == nodes.b {
                         // J's messages reach B, on any relay path.
                         Fault::Pass
-                    } else if iwant && origin == nodes.j && src == nodes.b {
+                    } else if origin == nodes.j
+                        && src == nodes.b
+                        && header.is_some()
+                        && is_iwant(&write.bytes)
+                    {
                         // B pulls one of J's messages that a peer offered
-                        // it (lazy push). Without this, J's request reaches
-                        // B only by an eager push, so a B that J holds lazy
-                        // never gets it, and J backs off past the window
-                        // (s3 job, run 41233639089 attempt 2, iteration 3).
+                        // it (lazy push), to any peer: an IWANT carries only
+                        // message IDs, and the reply is J's message, which
+                        // passes. Without this, J's request reaches B only
+                        // by an eager push, so a B that J holds lazy never
+                        // gets it, and J backs off past the window (s3 job,
+                        // run 41233639089 attempt 2, iteration 3). An IWANT
+                        // whose first ID is not J's message stays dropped.
                         rule_pulls.fetch_add(1, Ordering::SeqCst);
                         Fault::Pass
                     } else if origin == nodes.b && dst == nodes.j {
@@ -241,6 +242,14 @@ impl Hold {
             self.pulls.load(Ordering::SeqCst)
         )
     }
+}
+
+/// A pubsub write (after its stream-type byte) is an IWANT.
+fn is_iwant(bytes: &[u8]) -> bool {
+    bytes
+        .get(1..)
+        .and_then(saorsa_gossip_pubsub::peek_message_kind)
+        == Some(saorsa_gossip_types::MessageKind::IWant)
 }
 
 /// A late message: the message lanes are delayed; transport control

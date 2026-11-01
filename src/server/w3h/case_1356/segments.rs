@@ -287,7 +287,9 @@ fn segment_boundary(run: &Run) -> bool {
 async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let run64 = gap_run(sim, ATA_MAX_LINKS - 1).await?;
     receipt.setup_done(at(sim));
-    // The 64-link run sends no request (`one_segment`); the 65-link run may.
+    // The 64-link run sends no request: its join carry holds all 64 links,
+    // so no segment is exhausted (and `one_segment` fails on any answer).
+    // The 65-link run may ask A from r+64.
     let run65 = gap_run(sim, ATA_MAX_LINKS).await?;
     after_responder_interval(sim).await?;
     let run66 = gap_run(sim, ATA_MAX_LINKS + 1).await?;
