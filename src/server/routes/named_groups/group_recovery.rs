@@ -8333,6 +8333,7 @@ mod tests {
                 state: x0x::groups::GroupMemberState::Active,
                 treekem_key_package_hash: None,
                 certificate_digest: None,
+                certificate: None,
             },
         );
         invite.base_roster = Some(roster);
@@ -8381,6 +8382,7 @@ mod tests {
                     state: x0x::groups::GroupMemberState::Active,
                     treekem_key_package_hash: None,
                     certificate_digest: None,
+                    certificate: None,
                 },
             );
         }
@@ -15509,6 +15511,7 @@ mod tests {
                 state: x0x::groups::GroupMemberState::Active,
                 treekem_key_package_hash: None,
                 certificate_digest: None,
+                certificate: None,
             },
         )]));
         invite.sign_v4(signer, None).map_err(anyhow::Error::msg)?;

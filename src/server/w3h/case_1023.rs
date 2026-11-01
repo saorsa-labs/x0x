@@ -192,6 +192,13 @@
 //!   the wait fail-closed. GREEN on `main` and GREEN under a correct S5
 //!   (pending throughout). The receipt names the first terminal refusal.
 //!
+//! #1023 note (31 Oct 2026): with certificate carry on the HEAD retained
+//! link, "A holds none of the missing bytes" now also requires that A's
+//! own head link carries none (A never sealed over a byte-bearing roster
+//! in the red shape). The RED cause stays `OwnerCertMemberPending` while
+//! that holds. The carry itself is with David under ADR 0088 G6; if it
+//! moves into S5, this case lands with it.
+//!
 //! All four tests are declared `#[ignore]` (#1559, ADR 0025 §3–4): their
 //! observation is a verdict under seeded entropy and the virtual wall
 //! clock, which only the W3-H harness tier provides (`nextest --profile

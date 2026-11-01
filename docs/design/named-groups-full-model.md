@@ -1235,3 +1235,21 @@ We should commit to this product direction explicitly:
 > x0x will have one first-class named-group system that supports private secure spaces, public request-access secure spaces, open public communities, and announcement channels under one policy-driven architecture, with stable `group_id`s, authority-signed `state_hash` commits, and partition-tolerant gossip discovery instead of a DHT.
 
 That is the right long-term model, and it gives us a sane path from the current named-group + MLS split to a real product.
+
+## Certificate carriage with group state (#1023)
+
+A roster seat commits to its owner-issued certificate by BLAKE3 digest
+inside the signed roster root. The BYTES also travel with group state
+(#1023). The `RosterMemberSnapshot.certificate` field is optional. It
+holds base64(bincode) certificate bytes. Only the HEAD retained commit
+keeps the field (`RETAINED_CERT_CARRY_LINKS` = 1, Engineer ruling of
+31 Oct 2026). Older links age to digest-only.
+
+A member that reads the head link can seat the bytes when the creator and
+all other holders are offline. Install is digest-anchored at both sites
+(`apply_reconstructed_roster`, `hydrate_member_certificates`). Bytes that
+hash to a different digest never seat. Snapshot equality covers the
+committed fields only, so the bytes never change a comparison. The signed
+root does not move. Invite links stay digest-only, because of the direct
+message budget. The seal gate is unchanged: a certificate that no link
+carried still blocks the seal with `OwnerCertMemberPending`.

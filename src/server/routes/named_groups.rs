@@ -5025,6 +5025,8 @@ pub(in crate::server) fn apply_signed_public_revision_catchup(
             let overflow = next.commit_log.len() - x0x::groups::COMMIT_LOG_CAP;
             next.commit_log.drain(0..overflow);
         }
+        // #1023: every append site ages the certificate carry.
+        next.age_certificate_carry();
     }
     Some(next)
 }
@@ -30584,9 +30586,10 @@ pub(in crate::server) async fn hydrate_digest_only_seats_at_seat_time(
                 .map(|cert| (member.clone(), cert))
         })
         .collect();
-    if pairs.is_empty() {
-        return 0;
-    }
+    // #1023 (Engineer ruling 31 Oct 2026 20:40 GMT): call through with no
+    // cached pairs too — `hydrate_member_certificates` then falls back to
+    // the group's own retained-commit snapshots, so a node holding the
+    // chain hydrates with every holder offline and nothing cached.
     let hydrated = info.hydrate_member_certificates(&pairs);
     if hydrated > 0 {
         tracing::info!(
@@ -45382,7 +45385,33 @@ pub(in crate::server) async fn join_result_payload_with_roster_certificates(
             roster_certificates_b64.clear();
         }
     }
-    let bare = serde_json::to_vec(&response)?;
+    let mut bare = serde_json::to_vec(&response)?;
+    let mut stripped_chain_bytes = false;
+    if bare.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        // #1023 (Engineer rulings 31 Oct 2026 20:40 + 23:44 GMT): served
+        // chain-link certificate bytes are discretionary size — strip them
+        // (the result-level sidecar carries certificates inside the same
+        // budget) until the WHOLE payload fits, so certificate carry never
+        // pushes a joiner onto the blob path.
+        if let JoinResultMessage::Result { chain, .. } = &mut response {
+            for link in chain {
+                for snapshot in link.roster.values_mut() {
+                    snapshot.certificate = None;
+                }
+            }
+            stripped_chain_bytes = true;
+        }
+        // Take the stripped form unconditionally: if it now fits, the
+        // sidecar loop below trims against the DM budget, so certificate
+        // carry is never the reason a result goes oversized.
+        bare = serde_json::to_vec(&response)?;
+    }
+    if stripped_chain_bytes {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            "join result: stripped chain-link certificate bytes to stay under the DM budget"
+        );
+    }
     let mut sidecar =
         seat_cert_fetch::roster_certificate_sidecar(state, group_id, member_agent_id).await;
     let budget = if bare.len() <= x0x::dm::MAX_PAYLOAD_BYTES {

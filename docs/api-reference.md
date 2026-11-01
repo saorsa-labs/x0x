@@ -2432,9 +2432,14 @@ commits — paired with the roster projection it effected:
   limit, count, has_more, next_from_revision, commits }`, where each
   `commits[]` entry is `{ commit, roster, roster_root_verified }`.
   `roster` is the `{ agent_id: { role, state } }` projection of `Active` +
-  `Banned` members; `roster_root_verified` recomputes the root over that
-  projection and compares it to the commit's signed `roster_root`, so any
-  at-rest corruption surfaces rather than serving silently-wrong history.
+  `Banned` members — entries may additionally carry `treekem_key_package_hash`,
+  `certificate_digest` and, since #1023, an optional `certificate`
+  (base64(bincode) `AgentCertificate`) on the head retained commit, so
+  certificates travel with the served chain; `roster_root_verified`
+  recomputes the root over that projection and compares it to the commit's
+  signed `roster_root`, so any at-rest corruption surfaces rather than
+  serving silently-wrong history. Members-only disclosure applies: these
+  are owner certificates of a members-only endpoint.
   `limit` is capped at 500.
 
 Scope and honest limits: retention is **not retroactive** — history begins
