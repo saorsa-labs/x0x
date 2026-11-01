@@ -1644,6 +1644,9 @@ struct CreatorOfflineScenario {
     /// The creator's JoinResult for the admin, served by the production
     /// builder before the creator went offline (never delivered).
     served_join_result: Vec<u8>,
+    /// #1023: the same builder for a GAP joiner crossing from revision 0
+    /// — the served chain rides inside, byte-bearing links included.
+    gap_join_result: Vec<u8>,
 }
 
 /// Build the R19 shape through production code:
@@ -1818,20 +1821,38 @@ async fn creator_offline_scenario_on_plane(
             roster_certificates_b64.clear();
         }
     }
+    let gapless_join_result_base = || JoinResultMessage::Result {
+        event: Box::new(seat_event.clone()),
+        chain: Vec::new(),
+        head_attestation: None,
+        roster_certificates_b64: Vec::new(),
+        intervening_events: Vec::new(),
+        admin_attestation: None,
+    };
     let served_join_result = join_result_payload_with_roster_certificates(
         &creator,
         &group_id,
         &admin_hex,
-        JoinResultMessage::Result {
-            event: Box::new(seat_event.clone()),
-            chain: Vec::new(),
-            head_attestation: None,
-            roster_certificates_b64: Vec::new(),
-            intervening_events: Vec::new(),
-            admin_attestation: None,
-        },
+        gapless_join_result_base(),
     )
     .await?;
+    // #1023: the gap-joiner shape — the served chain (the intervening
+    // links from revision 0, byte-bearing snapshots included) rides
+    // inside the same production builder.
+    let gap_chain = creator
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .map(|info| intervening_chain_from(info, 0, info.state_revision))
+        .unwrap_or_default();
+    let mut gap_response = gapless_join_result_base();
+    if let JoinResultMessage::Result { chain, .. } = &mut gap_response {
+        *chain = gap_chain;
+    }
+    let gap_join_result =
+        join_result_payload_with_roster_certificates(&creator, &group_id, &admin_hex, gap_response)
+            .await?;
     // (5a) With `Promotion::SignedCommit` the creator promotes the admin
     // through the production role route BEFORE going offline, and the
     // published signed role-update commit is captured for delivery.
@@ -2028,6 +2049,7 @@ async fn creator_offline_scenario_on_plane(
         owner,
         seat_event,
         served_join_result,
+        gap_join_result,
     })
 }
 
@@ -2555,6 +2577,7 @@ async fn creator_offline_chain_carrier_scenario(
         owner,
         seat_event,
         served_join_result: Vec::new(),
+        gap_join_result: Vec::new(),
     })
 }
 
@@ -2627,6 +2650,65 @@ async fn old_format_chain_without_snapshot_bytes_stays_pending() -> Result<()> {
         }
         other => panic!("expected OwnerCertMemberPending, got {other}"),
     }
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// #1023 (Engineer rulings 31 Oct 2026 20:40 + 23:44 GMT): the served
+/// JoinResult — chain with byte-bearing links AND the certificate sidecar
+/// — must stay under the direct-message budget, so certificate carry
+/// never pushes a joiner onto the blob path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_result_with_chain_bytes_stays_under_the_dm_budget() -> Result<()> {
+    // A multi-seat group's gap join (joiner at revision 0 crossing to the
+    // terminal): the served chain's byte-bearing snapshots alone would
+    // push the result over the budget; with them stripped the whole
+    // payload fits, so certificate carry never sends this joiner to the
+    // blob path.
+    let s =
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 2, false, true, false)
+            .await?;
+    assert!(
+        !s.gap_join_result.is_empty(),
+        "the production builder produced the gap join result"
+    );
+    assert!(
+        s.gap_join_result.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
+        "gap join result is {} B, over the {} B budget",
+        s.gap_join_result.len(),
+        x0x::dm::MAX_PAYLOAD_BYTES
+    );
+    // The strip keeps the chain's committed shape: the payload still
+    // decodes as a Result whose links are present, digest-only.
+    let JoinResultMessage::Result { chain, .. } = serde_json::from_slice(&s.gap_join_result)?
+    else {
+        panic!("served payload is a Result");
+    };
+    assert!(!chain.is_empty(), "the trimmed payload keeps its chain");
+    for link in &chain {
+        assert!(
+            link.roster
+                .values()
+                .all(|snapshot| snapshot.certificate.is_none()),
+            "the served chain links travel digest-only inside the DM budget"
+        );
+    }
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// #1023: with the sidecar cleared (no cached evidence anywhere) and the
+/// chain byte-bearing, the SEAL itself runs the commit-log fallback: the
+/// admin hydrates from its own retained links with every holder offline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seal_time_hydrate_falls_back_to_the_commit_log() -> Result<()> {
+    let s =
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 15, true, false, false)
+            .await?;
+    let commit = promoted_admin_seals_new_joiner(&s, &[])
+        .await
+        .unwrap_or_else(|err| panic!("the seal must hydrate from the group's own chain: {err}"));
+    assert!(!commit.roster_root.is_empty());
     s.admin.agent.shutdown().await;
     Ok(())
 }
