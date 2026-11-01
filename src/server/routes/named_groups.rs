@@ -5783,7 +5783,7 @@ async fn install_fork_evidence(
         Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename) => {
             tracing::debug!(
                 group_id = %LogHexId::group(group_key),
-                "#468: fork evidence install was a no-op (lineage gone or already carries evidence)"
+                "#468: fork evidence install replaced nothing (no-op: lineage gone or already carries evidence; or the durability preflight refused)"
             );
             false
         }
@@ -7604,10 +7604,9 @@ async fn compare_and_restore_named_groups(
 /// #470 test fault cell for the roster save itself (same idiom as
 /// [`DeleteFault`]): forces `save_named_groups_checked_unlocked` to return
 /// a chosen outcome so the compare-and-restore rollback matrix can be
-/// exercised through the PRODUCTION persist path. The check is compiled
-/// into production code but constant-false there (`cfg!(test)`); only the
-/// setter is test-gated, and the RAII guard clears the cell on drop so a
-/// failing test cannot leak it.
+/// exercised through the PRODUCTION persist path. Every read of the cell
+/// is `#[cfg(test)]`, so a release build never consults it; the RAII
+/// guard clears the cell on drop so a failing test cannot leak it.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

@@ -75,6 +75,31 @@ async fn a_mutation_refuses_a_durability_preflight_refusal() -> Result<()> {
         })
         .await
     }
+    async fn assert_refusal_changed_nothing(
+        state: &AppState,
+        key: &str,
+        expected_name: &str,
+    ) -> Result<()> {
+        assert_eq!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(key)
+                .map(|stored| stored.name.clone()),
+            Some(expected_name.to_string()),
+            "nothing of the refused mutation is in the live map"
+        );
+        assert_eq!(
+            load_named_groups(&state.named_groups_path)
+                .await?
+                .get(key)
+                .map(|stored| stored.name.clone()),
+            Some(expected_name.to_string()),
+            "the visible file keeps the old record"
+        );
+        Ok(())
+    }
     {
         let fault = set_save_fault(&state, SaveFault::ReplacedNotDurableAfterWrite);
         let outcome = call(&state, &key, &mut ran).await;
@@ -120,6 +145,7 @@ async fn a_mutation_refuses_a_durability_preflight_refusal() -> Result<()> {
             "a hard save error stays an error: {outcome:?}"
         );
         assert!(!ran, "the mutation closure still did not run");
+        assert_refusal_changed_nothing(&state, &key, &info.name).await?;
         assert!(state
             .named_groups_requires_durability_confirmation
             .load(std::sync::atomic::Ordering::SeqCst));
@@ -135,6 +161,7 @@ async fn a_mutation_refuses_a_durability_preflight_refusal() -> Result<()> {
             "a refusal before any rename stays `NotReplaced`: {outcome:?}"
         );
         assert!(!ran);
+        assert_refusal_changed_nothing(&state, &key, &info.name).await?;
         assert!(state
             .named_groups_requires_durability_confirmation
             .load(std::sync::atomic::Ordering::SeqCst));
@@ -151,6 +178,7 @@ async fn a_mutation_refuses_a_durability_preflight_refusal() -> Result<()> {
             "the after-rename refusal shape reports `NotReplaced` here: {outcome:?}"
         );
         assert!(!ran, "the mutation closure still did not run");
+        assert_refusal_changed_nothing(&state, &key, &info.name).await?;
         assert!(state
             .named_groups_requires_durability_confirmation
             .load(std::sync::atomic::Ordering::SeqCst));
@@ -173,6 +201,14 @@ async fn a_mutation_refuses_a_durability_preflight_refusal() -> Result<()> {
             .map(|stored| stored.name.clone()),
         Some("renamed-by-mutation".to_string()),
         "the retry installed the mutation"
+    );
+    assert_eq!(
+        load_named_groups(&state.named_groups_path)
+            .await?
+            .get(&key)
+            .map(|stored| stored.name.clone()),
+        Some("renamed-by-mutation".to_string()),
+        "the retry's durable save put the mutation on disk"
     );
     assert!(!state
         .named_groups_requires_durability_confirmation
@@ -247,6 +283,25 @@ async fn a_quarantine_clear_refuses_a_durability_preflight_refusal() -> Result<(
         })
         .await
     }
+    async fn assert_refusal_kept_the_marker(state: &AppState, key: &str) -> Result<()> {
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(key)
+                .is_some_and(|stored| stored.fork_quarantine.is_some()),
+            "the live record stays armed"
+        );
+        assert!(
+            load_named_groups(&state.named_groups_path)
+                .await?
+                .get(key)
+                .is_some_and(|stored| stored.fork_quarantine.is_some()),
+            "the visible file keeps the marker"
+        );
+        Ok(())
+    }
     {
         let fault = set_save_fault(&state, SaveFault::ReplacedNotDurableAfterWrite);
         let outcome = call(&state, &key, &mut ran).await;
@@ -290,6 +345,7 @@ async fn a_quarantine_clear_refuses_a_durability_preflight_refusal() -> Result<(
             "a hard save error stays an error: {outcome:?}"
         );
         assert!(!ran, "the clear closure still did not run");
+        assert_refusal_kept_the_marker(&state, &key).await?;
         assert!(state
             .named_groups_requires_durability_confirmation
             .load(std::sync::atomic::Ordering::SeqCst));
@@ -305,6 +361,7 @@ async fn a_quarantine_clear_refuses_a_durability_preflight_refusal() -> Result<(
             "a refusal before any rename stays `NotReplaced`: {outcome:?}"
         );
         assert!(!ran);
+        assert_refusal_kept_the_marker(&state, &key).await?;
         assert!(state
             .named_groups_requires_durability_confirmation
             .load(std::sync::atomic::Ordering::SeqCst));
@@ -321,6 +378,7 @@ async fn a_quarantine_clear_refuses_a_durability_preflight_refusal() -> Result<(
             "the after-rename refusal shape reports `NotReplaced` here: {outcome:?}"
         );
         assert!(!ran, "the clear closure still did not run");
+        assert_refusal_kept_the_marker(&state, &key).await?;
         assert!(state
             .named_groups_requires_durability_confirmation
             .load(std::sync::atomic::Ordering::SeqCst));
@@ -342,6 +400,13 @@ async fn a_quarantine_clear_refuses_a_durability_preflight_refusal() -> Result<(
             .get(&key)
             .is_some_and(|stored| stored.fork_quarantine.is_none()),
         "the retry published the cleared record"
+    );
+    assert!(
+        load_named_groups(&state.named_groups_path)
+            .await?
+            .get(&key)
+            .is_some_and(|stored| stored.fork_quarantine.is_none()),
+        "the retry's durable save put the cleared record on disk"
     );
     assert!(!state
         .named_groups_requires_durability_confirmation
