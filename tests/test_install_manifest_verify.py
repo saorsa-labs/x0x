@@ -56,7 +56,9 @@ TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
 # install.sh demands .asc files the fake release does not serve and the
 # install dies before the manifest gate (Greptile P1 on #1753). `sh` is
 # here too: the fake release's shebangs run `#!/usr/bin/env sh`, and env
-# resolves sh through the child PATH.
+# resolves sh through the child PATH. `gzip` is tar's, not install.sh's:
+# GNU tar (the Linux runners) execs an external gzip for -z, while bsdtar
+# (macOS) decompresses in-process and never uses the link.
 INSTALLER_TOOLS = (
     "sh",
     "mktemp",
@@ -66,6 +68,7 @@ INSTALLER_TOOLS = (
     "mkdir",
     "grep",
     "tar",
+    "gzip",
     "sleep",
     "cat",
     "cp",

@@ -22,7 +22,8 @@
 #   6. Starts the daemon
 #   7. Optionally configures autostart on boot (--autostart)
 #
-# Requirements: curl or wget, tar, sh, sha256sum or shasum. gpg is strongly
+# Requirements: curl or wget, tar, gzip (GNU tar execs it for .tar.gz), sh,
+# sha256sum or shasum. gpg is strongly
 # recommended; without it the checksum and the signed ML-DSA manifest are
 # verified but not the independent GPG signature (with a warning).
 # No root/sudo required (except --autostart on Linux uses systemd).
