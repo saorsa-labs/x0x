@@ -60,30 +60,40 @@
 //!   is not what the typed mark keys on.
 //! - The self-left form ("or A leaves") is not driven: on `main` the
 //!   public `DELETE /groups/:id` leave drops the leaver's local group
-//!   record outright, so no public row exists to mislabel — an even
-//!   stronger divergence from §4 L274 than the demoted form's
-//!   mislabel, recorded on #1581 by name. The sole-admin-revoked and
-//!   genuinely-admin-empty repeats guard on paths the public APIs
-//!   refuse; those variants stay uncovered on #1581 (the exits are
-//!   the `s4_owner_recovery` / `s4_ordinary_admin_revoked` rows per
-//!   the ADR).
+//!   record outright, so no public row exists at all — a stronger
+//!   divergence from §4 L274 than the demoted form's mislabel. This
+//!   corrects the account #1751 recorded on #1581 (a mislabelled row):
+//!   that was a code reading of `evaluate_row`; the leave path never
+//!   serves the row. The "D removes A" form, the sole-admin-revoked
+//!   repeat and the genuinely-admin-empty repeat are not driven this
+//!   round either; they stay named on #1581 (the exits are the
+//!   `s4_owner_recovery` / `s4_ordinary_admin_revoked` rows per the
+//!   ADR).
 //!
 //! Before t = 0 the ordinary `private_secure` (TreeKEM) group is
 //! settled (every node at A's state revision r0 and epoch e0, four
 //! leaves) and a data-plane probe opens on B and C; every node is past
-//! its boot head gate. The arms assert: A never authors an exclusion
-//! commit after its exit; D's resume commits B's exclusion on the
-//! survivors' heads (the epoch read from those heads, not pinned — the
-//! revoked arm's exit opens a second obligation for A's own seat whose
-//! completion order is not this row's claim, and D's own obligation-row
-//! phase completes with its delivery bookkeeping, which can trail the
-//! commit while a member recovers from the exit-window blackout, so it
-//! is recorded rather than gated); A's row for B completes
-//! from the learned exclusion while A retains a record of the group,
-//! and where the record ends — the revoked arm, once A's own removal
-//! applies — the shared evidence is asserted instead (D's row
-//! complete, B's revocation record still held, §4 L276); and the data
-//! plane follows (C decrypts the survivors' new traffic, B does not).
+//! its boot head gate. The arms assert:
+//!
+//! - A authors no commit past r0 beyond the exit's own roster change
+//!   (the retained logs decide this, not the current heads).
+//! - D resumes on the exit, not on the fallback clock: B's exclusion is
+//!   committed before T_obs + W, on the survivors' heads, and the
+//!   commit that removed B is D's on every holder's retained log. The
+//!   epoch is read from those heads, not pinned — the revoked arm's
+//!   exit opens a second obligation for A's own seat whose completion
+//!   order is not this row's claim, and D's own obligation-row phase
+//!   completes with its delivery bookkeeping, which can trail the
+//!   commit while a member recovers from the exit-window blackout, so
+//!   it is recorded rather than gated.
+//! - A's row for B completes from the learned exclusion while A retains
+//!   a record of the group. Where the record ends — the revoked arm,
+//!   once A's own removal applies — the shared evidence is asserted
+//!   instead: D still holds B's row and B's revocation record (§4
+//!   L276), and the survivors have applied A's removal.
+//! - The data plane follows: C decrypts the survivors' new traffic, B
+//!   does not.
+//!
 //! Receipts use `w3h.receipt/1`.
 
 #![cfg(test)]
@@ -117,14 +127,17 @@ const CAUSE_NO_PENDING: &str = "no pending work on A at the exit: A's row for B 
                                 an exclusion commit moved before the exit";
 const CAUSE_WRONG_MARK: &str = "the exit was marked local_committer_ineligible, but the mark \
                                 did not name D or first showed only after the row completed";
-const CAUSE_A_SEALED: &str = "A sealed after its exit: A authored an exclusion commit, or A's \
-                              head moved at an epoch no survivor committed for it";
+const CAUSE_A_SEALED: &str = "A sealed after its exit: A authored a commit past r0 beyond the \
+                              exit's own roster change";
 const CAUSE_NO_RESUME: &str = "D never resumed: within the bound the survivors' heads did not \
-                               carry B's exclusion signed by D";
+                               carry B's exclusion";
+const CAUSE_LATE_FALLBACK: &str = "D only acted at its fallback time, not on the exit: B's \
+                                   exclusion committed no earlier than T_obs + W";
 const CAUSE_NO_COMPLETION: &str = "A's row for B never completed from the learned exclusion, \
                                    or was erased by the exit instead of kept";
-const CAUSE_SECOND_ROTATION: &str = "B's exclusion did not hold: after the resume a survivor \
-                                     relisted B, moved to a divergent head, or quarantined";
+const CAUSE_SECOND_ROTATION: &str = "B's exclusion did not hold as D's commit: after the resume \
+                                     a survivor relisted B, moved to a divergent head, \
+                                     quarantined, or the removal commit was not D's";
 const CAUSE_DATA_PLANE: &str = "D completed B's exclusion, but the data plane did not follow: \
                                 C did not decrypt the new traffic, or B still could";
 const CAUSE_NO_MARK: &str = "no typed local_committer_ineligible: after A's local authority \
@@ -247,6 +260,57 @@ fn describe_all(views: &[(&str, Option<View>)]) -> String {
         .join("; ")
 }
 
+/// What `label`'s retained commit log shows past `r0`: how many commits
+/// A authored, and who signed the commit that removed `target` — the
+/// first commit past `r0` whose roster projection no longer carries the
+/// target as a seated member. The retained projections make both facts
+/// independent of the current head, so a later commit by someone else
+/// cannot hide either.
+struct LogScan {
+    a_commits: usize,
+    removed_by: Option<String>,
+}
+
+async fn scan_log(
+    sim: &Sim,
+    label: &str,
+    group: &str,
+    target_hex: &str,
+    a_hex: &str,
+    r0: u64,
+) -> Result<Option<LogScan>> {
+    let state = sim.state(label)?;
+    let scan = {
+        let groups = state.named_groups.read().await;
+        let Some((_, info)) = crate::server::resolve_group_entry_locked(&groups, group) else {
+            return Ok(None);
+        };
+        let mut a_commits = 0usize;
+        let mut removed_by = None;
+        let mut prev_lists_target = None;
+        for retained in &info.commit_log {
+            let lists = retained
+                .roster
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(target_hex));
+            if retained.commit.revision > r0 {
+                if retained.commit.committed_by.eq_ignore_ascii_case(a_hex) {
+                    a_commits += 1;
+                }
+                if removed_by.is_none() && prev_lists_target == Some(true) && !lists {
+                    removed_by = Some(retained.commit.committed_by.to_ascii_lowercase());
+                }
+            }
+            prev_lists_target = Some(lists);
+        }
+        LogScan {
+            a_commits,
+            removed_by,
+        }
+    };
+    Ok(Some(scan))
+}
+
 /// A invites `member`; A lists it and it reports itself active.
 async fn seat(sim: &Sim, member: &str, group: &str) -> Result<()> {
     let link = invite(sim, "A", group).await?;
@@ -351,7 +415,8 @@ async fn holds_revocation(sim: &Sim, label: &str, subject_hex: &str) -> Result<b
 }
 
 /// Wait until every holder holds the subject's revocation record; a
-/// timeout is INFRA (the record never reached its target).
+/// timeout makes the caller's evidence stage fail (INFRA — the record
+/// never reached its target).
 async fn await_holders(sim: &Sim, holders: &[&str], subject_hex: &str) -> Result<()> {
     let mut seen = Observations::default();
     let what = "the holders hold the revocation";
@@ -934,8 +999,8 @@ async fn scenario(
         })
         .await
         .is_ok()
-            && !sees_admin(sim, "D", &group, "A").await.unwrap_or(false)
-            && !sees_admin(sim, "C", &group, "A").await.unwrap_or(false)
+            && !sees_admin(sim, "D", &group, "A").await.unwrap_or(true)
+            && !sees_admin(sim, "C", &group, "A").await.unwrap_or(true)
     } else {
         await_holders(sim, &["D", "C"], &a_hex).await.is_ok()
             && holds_revocation(sim, "D", &a_hex).await.unwrap_or(false)
@@ -952,28 +1017,28 @@ async fn scenario(
         at(sim),
     );
 
-    // D resumes: D's authoritative row for B completes the exclusion,
-    // and the survivors' heads carry it — B gone from every roster at a
-    // common epoch past e0, no fork-quarantine, signed by D. A's own
-    // obligation (the revoked arm's second row) may follow at its own
-    // epoch, so the epoch is read, not pinned.
+    // D resumes: the survivors' heads carry B's exclusion — B gone from
+    // every roster at a common epoch past e0, no fork-quarantine — and
+    // the commit that removed B is D's (checked from the retained logs
+    // at the end; see below). D's own obligation row completes with its
+    // delivery bookkeeping, which on main can trail the commit while a
+    // member's lanes recover from the exit-window blackout, so the row's
+    // phase and `result_epoch` are recorded, not gated. The takeover is
+    // tied to the exit: D's commit must land before its rank-1 fallback
+    // time (T_obs + W; every holder observed B's record from t = 0, so
+    // W past t0 bounds the fallback), which proves D acted on the
+    // designation change, not on the fallback clock.
     let bound = w
         .saturating_add(timing.completion_bound)
         .saturating_add(secs(10));
-    let mut a_authored = false;
     let mut b_epoch: Option<u64> = None;
     let mut b_result_epoch: Option<u64> = None;
+    let mut d_first_move: Option<Duration> = None;
     let waited = sim
         .until(
             "D resumes and commits B's exclusion",
             bound,
             async |s: &Sim| {
-                // D's resume is its commit on the survivors' heads; D's
-                // own obligation row completes with its delivery
-                // bookkeeping, which on main can trail the commit while a
-                // member's lanes recover from the exit-window blackout,
-                // so the row's phase and `result_epoch` are recorded,
-                // not gated.
                 if let Ok(Some(row)) = s4_row(s, "D", &group, &b_hex).await {
                     if row["phase"].as_str() == Some("complete") {
                         b_result_epoch = row["result_epoch"].as_u64();
@@ -993,14 +1058,14 @@ async fn scenario(
                     if seen.lists_b || seen.quarantined || epoch <= e0 {
                         return false;
                     }
-                    seen.head_committed_by.as_deref().inspect(|signer| {
-                        a_authored |= *signer == a_hex && epoch > e0;
-                    });
                     match common {
                         None => common = Some(epoch),
                         Some(first) if first != epoch => return false,
                         Some(_) => {}
                     }
+                }
+                if d_first_move.is_none() && common.is_some() {
+                    d_first_move = Some(s.fabric().now().saturating_sub(t0));
                 }
                 b_epoch = common;
                 true
@@ -1013,10 +1078,12 @@ async fn scenario(
         }
     }
     let resumed = b_epoch.is_some();
+    let resumed_before_fallback = d_first_move.is_some_and(|moved| moved < w);
     let resumed_views = views_now(sim, &["D", "C"], &group, &b, &a_id).await?;
     receipt.note(format!(
         "D's resume: B's exclusion committed at epoch {b_epoch:?} (D's row result_epoch so far: \
-         {b_result_epoch:?}, e0={e0}, leaves0={leaves0}); {}",
+         {b_result_epoch:?}, e0={e0}, leaves0={leaves0}); D's first move {d_first_move:?} after \
+         t=0 (the fallback clock would allow it at W = {w:?}); {}",
         describe_all(&resumed_views)
     ));
 
@@ -1053,19 +1120,20 @@ async fn scenario(
                         a_completed
                     }
                     Ok(None) => {
-                        a_row_vanished = true;
+                        // A vanished row counts only when the group
+                        // record itself is gone (a transient non-2xx
+                        // read is not an ended record).
+                        let record_gone = try_view_now(s, "A", &group, &b, &a_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_none();
+                        a_row_vanished |= record_gone;
                         // The record ended with the removal that ended
                         // A's local retention (§4 L275/D128); this arm's
-                        // end state is then the shared completion on D.
-                        a_completed
-                            || (matches!(
-                                s4_row(s, "D", &group, &b_hex).await,
-                                Ok(Some(row)) if row["phase"].as_str() == Some("complete")
-                            ) && try_view_now(s, "A", &group, &b, &a_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .is_none())
+                        // end state is then the committed exclusion the
+                        // resume watch already observed.
+                        a_completed || (record_gone && b_epoch.is_some())
                     }
                     Err(_) => false,
                 }
@@ -1110,6 +1178,31 @@ async fn scenario(
     let a_row_final = final_row
         .as_ref()
         .is_some_and(|row| row["phase"].as_str() == Some("complete"));
+
+    // The retained commit logs decide authorship, not the current
+    // heads: past r0 every commit must be D's, except exactly the one
+    // roster change the red arm's exit itself authors (A's demotion),
+    // and the commit that removed B must be D's on both survivors' logs
+    // (A's own log is gone where its record ended, §4 L275/D128).
+    let expected_a_commits = usize::from(demoted);
+    let a_scan = scan_log(sim, "A", &group, &b_hex, &a_hex, r0).await?;
+    let d_scan = scan_log(sim, "D", &group, &b_hex, &a_hex, r0).await?;
+    let c_scan = scan_log(sim, "C", &group, &b_hex, &a_hex, r0).await?;
+    let log_scans = [&a_scan, &d_scan, &c_scan];
+    let a_authored = log_scans.iter().any(|scan| {
+        scan.as_ref()
+            .is_some_and(|scan| scan.a_commits > expected_a_commits)
+    });
+    let b_removed_by_d = [&d_scan, &c_scan].into_iter().all(|scan| {
+        scan.as_ref()
+            .is_some_and(|scan| scan.removed_by.as_deref() == Some(d_hex.as_str()))
+    });
+    // Where A's own record ended (the revoked arm's second obligation),
+    // the survivors must have applied A's removal too.
+    let survivors_dropped_a = end
+        .iter()
+        .all(|(label, seen)| *label == "A" || seen.as_ref().is_some_and(|seen| !seen.lists_a));
+
     // The shared obligation on D survives the exit (§4 L276): D still
     // holds B's row — whatever phase its delivery bookkeeping is in —
     // and B's revocation record.
@@ -1122,12 +1215,20 @@ async fn scenario(
     let a_own_row = s4_row(sim, "D", &group, &a_hex).await?;
     receipt.note(format!(
         "after the settle (A retains a record: {a_holds_record}; A's row for B: phase {:?}, \
-         result_epoch {:?}; the exclusion sits at epoch {b_epoch:?}): {}; A's own row on D: \
-         {:?}; shared evidence kept on D: {shared_evidence_kept}",
+         result_epoch {:?}; the exclusion sits at epoch {b_epoch:?}; past-r0 log scans — A \
+         authored {expected_a_commits} + {} more, B removed by {:?} on D; survivors dropped A: \
+         {survivors_dropped_a}): {}; A's own row on D: {:?}; shared evidence kept on D: \
+         {shared_evidence_kept}",
         final_row.as_ref().and_then(|row| row["phase"].as_str()),
         final_row
             .as_ref()
             .and_then(|row| row["result_epoch"].as_u64()),
+        log_scans
+            .iter()
+            .filter_map(|scan| scan.as_ref())
+            .map(|scan| scan.a_commits.saturating_sub(expected_a_commits))
+            .sum::<usize>(),
+        d_scan.as_ref().and_then(|scan| scan.removed_by.clone()),
         describe_all(&end),
         a_own_row
             .as_ref()
@@ -1155,27 +1256,34 @@ async fn scenario(
         c_after.1, b_after.1, a_after.1
     ));
 
-    receipt.evidence(
-        "a_never_sealed_after_its_exit",
-        !a_authored,
-        format!("A authored an exclusion commit: {a_authored}"),
-        at(sim),
-    );
+    receipt.note(format!(
+        "A authored {} commits past r0 beyond its exit's own roster change (expected \
+         {expected_a_commits}); B's removal commit signed by D on both survivors: \
+         {b_removed_by_d}",
+        log_scans
+            .iter()
+            .filter_map(|scan| scan.as_ref())
+            .map(|scan| scan.a_commits)
+            .max()
+            .unwrap_or(0)
+    ));
     let completion_kept = if a_holds_record {
         a_completed && a_row_final && !a_row_vanished
     } else {
         // The record ended with the removal that ended A's local
         // retention (§4 L275/D128): the shared obligation on D must be
-        // intact instead (§4 L276).
-        shared_evidence_kept
+        // intact instead (§4 L276), and the survivors must have
+        // applied A's removal.
+        shared_evidence_kept && survivors_dropped_a
     };
     receipt.evidence(
         "the_exclusion_holds_and_is_signed_by_d",
-        b_gone_everywhere && still_signed_by_d && completion_kept,
+        b_gone_everywhere && still_signed_by_d && b_removed_by_d && completion_kept,
         format!(
             "B gone everywhere: {b_gone_everywhere}; heads past e0 signed by D: \
-             {still_signed_by_d}; A's row kept and complete: {a_row_final} (A's record ended: \
-             {}, an on-A completion was observed: {a_completed}); {}",
+             {still_signed_by_d}; B's removal commit signed by D: {b_removed_by_d}; A's row kept \
+             and complete: {a_row_final} (A's record ended: {}, an on-A completion was observed: \
+             {a_completed}); {}",
             !a_holds_record,
             describe_all(&end)
         ),
@@ -1187,9 +1295,11 @@ async fn scenario(
         && mark_names_d
         && row_open_at_mark
         && resumed
+        && resumed_before_fallback
         && completion_kept
         && b_gone_everywhere
         && still_signed_by_d
+        && b_removed_by_d
         && !a_authored
         && data_plane;
     if !passed {
@@ -1220,6 +1330,15 @@ async fn scenario(
                     describe_all(&resumed_views)
                 ),
             )
+        } else if !resumed_before_fallback {
+            (
+                CAUSE_LATE_FALLBACK,
+                !strict_red,
+                format!(
+                    "D's first move {d_first_move:?} after t=0; the fallback clock allows it at \
+                     W = {w:?}"
+                ),
+            )
         } else if !completion_kept {
             (
                 CAUSE_NO_COMPLETION,
@@ -1233,8 +1352,15 @@ async fn scenario(
             )
         } else if a_authored {
             (CAUSE_A_SEALED, !strict_red, describe_all(&end))
-        } else if !b_gone_everywhere || !still_signed_by_d {
-            (CAUSE_SECOND_ROTATION, !strict_red, describe_all(&end))
+        } else if !b_gone_everywhere || !still_signed_by_d || !b_removed_by_d {
+            (
+                CAUSE_SECOND_ROTATION,
+                !strict_red,
+                format!(
+                    "B's removal commit signed by D on both survivors: {b_removed_by_d}; {}",
+                    describe_all(&end)
+                ),
+            )
         } else if !data_plane {
             (
                 CAUSE_DATA_PLANE,
@@ -1242,11 +1368,13 @@ async fn scenario(
                 format!("{}; {}", c_after.1, b_after.1),
             )
         } else if mark_seen {
-            // The mark showed, but wrongly: a genuine failure on both
-            // arms, distinct from a mark that never showed.
+            // The mark showed, but wrongly: a genuine failure, distinct
+            // from a mark that never showed. On the red arm it stays
+            // RED-ineligible (ok=false): the pin must not be met by a
+            // wrong mark.
             (
                 CAUSE_WRONG_MARK,
-                true,
+                !strict_red,
                 format!(
                     "mark names D: {mark_names_d}; row open at the mark: {row_open_at_mark}; \
                      causes seen: {observed_causes:?}"
