@@ -2055,8 +2055,9 @@ pub(in crate::server) async fn receive(
                             sibling = Some(kind);
                             Err(cr::CertificateRebindRefusal::HeadMismatch)
                         }
-                        // #1533 r11: this node's branch no longer holds
-                        // the parent's certificate bytes, so the sibling
+                        // #1533 r11: this node holds no bytes for the
+                        // parent's committed digest — neither live nor the
+                        // retained displaced copy (#1650) — so the sibling
                         // cannot be checked. It stays unvalidated and
                         // records nothing; a fetch of the current bytes
                         // would not supply the parent's.
@@ -3536,13 +3537,11 @@ pub(super) mod restart_tests {
 
         /// A second, different rebind on the same parent: a competing
         /// commit at the same revision (#1579) — the admin renews the
-        /// `peer` member, so a different roster root and result head. It
-        /// does not rebind the same seat again: after one of the pair
-        /// installs, that seat's committed certificate is the renewal,
-        /// and #1533 r11's sibling rule leaves a same-seat sibling
-        /// unvalidated (`CertificateEvidenceMissing` — the parent's
-        /// certificate bytes are gone). A sibling of another seat keeps
-        /// every certificate the rule reads, whichever frame installs.
+        /// `peer` member, so a different roster root and result head. A
+        /// same-seat sibling stays verifiable too since #1650 (the parent
+        /// certificate is retained displaced); this pair keeps the two
+        /// branches on different seats, which every certificate the rule
+        /// reads holds live, whichever frame installs.
         fn competing_frame(&self) -> Result<(Vec<u8>, String)> {
             let now_ms = now_unix_ms();
             let renewal = AgentCertificate::issue_with_expiry(
@@ -4707,9 +4706,22 @@ pub(super) mod restart_tests {
         seat: &AgentKeypair,
         signer: &AgentKeypair,
     ) -> Result<(Vec<u8>, String)> {
+        sibling_frame_with_expiry(parent, issuer, seat, signer, 6000)
+    }
+
+    /// [`sibling_frame`] with the renewal's expiry offset in seconds
+    /// exposed, so two valid same-seat siblings can carry different
+    /// renewals (#1650).
+    fn sibling_frame_with_expiry(
+        parent: &GroupInfo,
+        issuer: &UserKeypair,
+        seat: &AgentKeypair,
+        signer: &AgentKeypair,
+        expiry_offset: u64,
+    ) -> Result<(Vec<u8>, String)> {
         let now_ms = now_unix_ms();
         let renewal =
-            AgentCertificate::issue_with_expiry(issuer, seat, Some(now_ms / 1000 + 6000))?;
+            AgentCertificate::issue_with_expiry(issuer, seat, Some(now_ms / 1000 + expiry_offset))?;
         let (next, frame) = cr::seal(
             parent,
             *seat.agent_id().as_bytes(),
@@ -4719,6 +4731,22 @@ pub(super) mod restart_tests {
         )
         .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
         Ok((cr::encode_frame(&frame)?, next.state_hash))
+    }
+
+    /// The admin's self-renewal on `base` — the retained parent of
+    /// [`removal_race`] without the removal: every seat stays Active at
+    /// the parent, so a later rebind of a seat on this parent is a sibling
+    /// of another rebind, not of a removal (#1650).
+    fn renewal_parent(
+        owner: &UserKeypair,
+        base: &GroupInfo,
+        admin: &AgentKeypair,
+    ) -> Result<GroupInfo> {
+        let now_ms = now_unix_ms();
+        let renewal = AgentCertificate::issue_with_expiry(owner, admin, Some(now_ms / 1000 + 900))?;
+        let (parent, _) = cr::seal(base, *admin.agent_id().as_bytes(), &renewal, admin, now_ms)
+            .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+        Ok(parent)
     }
 
     async fn quarantine_of(state: &AppState, stable: &str) -> Option<x0x::groups::ForkQuarantine> {
@@ -4858,6 +4886,98 @@ pub(super) mod restart_tests {
             "the containment survives a restart"
         );
         restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Issue #1650 (ADR 0110 §2 fork containment, §4a run (10)): two valid
+    /// self-rebinds of the SAME seat on one parent — the admin's
+    /// self-renewal, with the seat still Active. A receiver that holds the
+    /// parent applies the first sibling it sees; the second is a valid
+    /// sibling of the applied branch, so every receiver keeps it as fork
+    /// evidence (`waiting_for_fork_resolution`) and no node applies both.
+    /// Before the fix the second sibling never became evidence: the
+    /// applied sibling's install had replaced the seat's parent
+    /// certificate, `validate_sibling` found no bytes for the parent
+    /// digest and `receive` mapped `CertificateEvidenceMissing` to
+    /// `HeadMismatch` with no quarantine.
+    #[tokio::test]
+    async fn two_valid_same_seat_rebind_siblings_contain_every_receiver() -> Result<()> {
+        let owner = UserKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let member = AgentKeypair::generate()?;
+        // Each receiver is seated in its own base, so every node rebuilds
+        // its parent and frames; the loop covers both branch orders.
+        for second_comes_first in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let receiver = offline_daemon(dir.path(), None).await?;
+            let me = receiver.agent.identity().agent_keypair();
+            let base = certified_group(&owner, &admin, &[&member, me])?;
+            let parent = renewal_parent(&owner, &base, &admin)?;
+            let stable = parent.stable_group_id().to_string();
+            hold_persisted(&receiver, &parent).await?;
+
+            let (frame_a, head_a) =
+                sibling_frame_with_expiry(&parent, &owner, &member, &member, 6000)?;
+            let (frame_b, head_b) =
+                sibling_frame_with_expiry(&parent, &owner, &member, &member, 7000)?;
+            let (applied, applied_head, refused, refused_head) = if second_comes_first {
+                (&frame_b, &head_b, &frame_a, &head_a)
+            } else {
+                (&frame_a, &head_a, &frame_b, &head_b)
+            };
+
+            // The first sibling chains from this node's head (the parent),
+            // so it is applied, not quarantined.
+            let outcome = receive(&receiver, member.agent_id(), applied).await;
+            assert_eq!(outcome, ReceiveOutcome::Applied);
+            assert_eq!(
+                head_of(&receiver, &stable).await.as_ref(),
+                Some(applied_head),
+                "the first sibling is the node's new head"
+            );
+
+            // #1650 (ADR 0110 §5): the displaced parent certificate
+            // persists only in the S4 sidecar — neither legacy JSON
+            // format changes.
+            let sidecar = dir.path().join("revocation-evictions.rdc");
+            assert!(
+                tokio::fs::try_exists(&sidecar).await.unwrap_or(false),
+                "the retained evidence is durable in its S4 sidecar"
+            );
+            for legacy in ["named_groups.json", "home-suite-groups.json"] {
+                let json = tokio::fs::read_to_string(dir.path().join(legacy))
+                    .await
+                    .unwrap_or_default();
+                assert!(
+                    !json.contains("displaced_certificates"),
+                    "{legacy} never carries the retained evidence"
+                );
+            }
+
+            // The competing sibling is valid on the same parent. The seat
+            // is still Active, so the `HeadMismatch` arm falls through to
+            // its typed refusal; the frame is fork evidence either way.
+            let outcome = receive(&receiver, member.agent_id(), refused).await;
+            assert_eq!(
+                outcome,
+                ReceiveOutcome::Refused(cr::CertificateRebindRefusal::HeadMismatch)
+            );
+            let marker = quarantine_of(&receiver, &stable)
+                .await
+                .context("the competing same-seat sibling contains the receiver")?;
+            assert_eq!(marker.state_hash, *refused_head);
+            assert_eq!(marker.revision, parent.state_revision + 1);
+            assert_eq!(
+                marker.snapshot.classification.as_deref(),
+                Some(ng::FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY)
+            );
+            assert_eq!(
+                head_of(&receiver, &stable).await.as_ref(),
+                Some(applied_head),
+                "no node applies both siblings"
+            );
+            receiver.agent.shutdown().await;
+        }
         Ok(())
     }
 
