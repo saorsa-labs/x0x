@@ -12,7 +12,7 @@
 //!   `LocalCommitterIneligible` cause on the local seat still being
 //!   an Active admin, which holds for the revoked-committer form.
 //! - red arm, the demoted form ("D's public role API demotes A" in
-//!   the row text): D demotes A to `member` through the public role
+//!   the row text): A is demoted to `member` through the public role
 //!   route while A's row for B is open. §4 L274 wants the same
 //!   `local_committer_ineligible` mark for a demoted worker, and
 //!   §4 L275 (D72) keeps a demoted worker a member that retains its
@@ -21,7 +21,9 @@
 //!   `waiting_for_designated_admin` instead (the divergence #1751
 //!   recorded on #1581, diverging from §4 L274 and
 //!   `docs/api-reference.md`). Expected RED on `main` with
-//!   [`CAUSE_NO_MARK`]; GREEN when the `evaluate_row` fix lands.
+//!   [`CAUSE_NO_MARK`]; GREEN when the `evaluate_row` fix lands. The
+//!   RED is eligible only with the mislabel itself observed — a row
+//!   that never evaluated the exit is not the named divergence.
 //!
 //! Harness honesty, three departures the row needs stated plainly:
 //!
@@ -33,8 +35,22 @@
 //!   dropped while B stays connected to A, so B's self-revocation
 //!   still opens A's row but no holder can answer A's round and the
 //!   row stays `pending` with the typed `waiting_for_head_sync`
-//!   until the exit, deterministically. The hold releases once A has
-//!   exited (a stopped worker needs no ask-path hold).
+//!   until the exit, deterministically.
+//! - The exit window needs its own determinism: the `waiting` the
+//!   public route serves is the worker's last stored evaluation, and
+//!   on `main` D's completion of B's exclusion can reach A in the
+//!   same anti-entropy frame as the exit evidence, closing the row
+//!   before A's worker ever evaluated the exit (observed in local
+//!   runs of the D-authored demotion). Both arms therefore apply the
+//!   exit on A itself — the revoked arm through A's own self-revoke
+//!   route, the demoted arm through A demoting itself on the same
+//!   public role route the row names (the typed mark is keyed on the
+//!   roster event, not on who authored it) — and from the frozen
+//!   instant the route answers, every application frame toward A is
+//!   dropped until the mark watch ends. Nothing can complete A's
+//!   open row before A's own worker has evaluated the exit; the
+//!   holds release when the watch ends, the exit evidence propagates
+//!   (the transport retries the dropped frames), and D resumes.
 //! - The row text's "issuer revokes A" needs a user issuer the sim
 //!   fabric does not provision; the control arm drives the same
 //!   verified Agent-subject revocation record for A through A's own
@@ -56,10 +72,13 @@
 //! settled (every node at A's state revision r0 and epoch e0, four
 //! leaves) and a data-plane probe opens on B and C; every node is past
 //! its boot head gate. The arms assert: A never authors an exclusion
-//! commit after its exit; D's resume completes B's exclusion (the
-//! epoch read from D's authoritative row, not pinned — the revoked
-//! arm's exit opens a second obligation for A's own seat whose
-//! completion order is not this row's claim); A's row for B completes
+//! commit after its exit; D's resume commits B's exclusion on the
+//! survivors' heads (the epoch read from those heads, not pinned — the
+//! revoked arm's exit opens a second obligation for A's own seat whose
+//! completion order is not this row's claim, and D's own obligation-row
+//! phase completes with its delivery bookkeeping, which can trail the
+//! commit while a member recovers from the exit-window blackout, so it
+//! is recorded rather than gated); A's row for B completes
 //! from the learned exclusion while A retains a record of the group,
 //! and where the record ends — the revoked arm, once A's own removal
 //! applies — the shared evidence is asserted instead (D's row
@@ -94,13 +113,14 @@ const PROBE: &[u8] = b"w3h-1581f probe";
 const FINAL_CONTROL: &str = "a_marks_local_committer_ineligible_and_d_resumes_the_exclusion";
 const FINAL_RED: &str = "a_demoted_worker_marks_local_committer_ineligible";
 const CAUSE_NO_PENDING: &str = "no pending work on A at the exit: A's row for B was not open \
-                                with the typed head-sync wait while A held the designation";
-const CAUSE_EARLY_SEAL: &str = "an exclusion commit landed before A's local authority exit, \
-                                while A was the designated admin with pending work";
+                                with the typed head-sync wait while A held the designation, or \
+                                an exclusion commit moved before the exit";
+const CAUSE_WRONG_MARK: &str = "the exit was marked local_committer_ineligible, but the mark \
+                                did not name D or first showed only after the row completed";
 const CAUSE_A_SEALED: &str = "A sealed after its exit: A authored an exclusion commit, or A's \
                               head moved at an epoch no survivor committed for it";
-const CAUSE_NO_RESUME: &str = "D never resumed: within the bound D's row for B did not complete \
-                               the exclusion on a survivor head signed by D";
+const CAUSE_NO_RESUME: &str = "D never resumed: within the bound the survivors' heads did not \
+                               carry B's exclusion signed by D";
 const CAUSE_NO_COMPLETION: &str = "A's row for B never completed from the learned exclusion, \
                                    or was erased by the exit instead of kept";
 const CAUSE_SECOND_ROTATION: &str = "B's exclusion did not hold: after the resume a survivor \
@@ -438,6 +458,48 @@ async fn decrypts(sim: &Sim, label: &str, group: &str, ciphertext: &str) -> Resu
     Ok((ok, format!("{label} decrypt: {status} {body}")))
 }
 
+/// Drops every frame toward `target` except plane-hello (QUIC link
+/// liveness) while held, and counts them: direct, relayed DM, pubsub,
+/// bulk, stream — and the gossip membership lane, which carries the
+/// named-group roster anti-entropy (#1581c's primitive). The fabric
+/// cannot delay stream lanes, so a drop with the transport's own
+/// retries is the stream-safe expression of a held catch-up: while it
+/// is set, no completion, roster batch or revocation record from any
+/// survivor can reach the target.
+struct InboundHold {
+    held: Arc<std::sync::atomic::AtomicBool>,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl InboundHold {
+    fn install(sim: &Sim, target: &str) -> Result<Self> {
+        use crate::network::sim::{Fault, LaneClass};
+        use std::sync::atomic::Ordering;
+        let machine = sim.peer(target)?.0;
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (rule_held, rule_dropped) = (Arc::clone(&held), Arc::clone(&dropped));
+        sim.fabric().add_rule(move |write| {
+            let group_state = !matches!(write.lane.class, LaneClass::PlaneHello);
+            if rule_held.load(Ordering::SeqCst) && write.lane.dst == machine && group_state {
+                rule_dropped.fetch_add(1, Ordering::SeqCst);
+                Fault::Drop
+            } else {
+                Fault::Pass
+            }
+        });
+        Ok(Self { held, dropped })
+    }
+
+    fn set(&self, held: bool) {
+        self.held.store(held, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn dropped(&self) -> usize {
+        self.dropped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Drops direct and relayed-DM frames in both directions between
 /// `target` and each label in `others` while set: the §2 head round's
 /// ask path. Everything else — the roster anti-entropy on the gossip
@@ -747,20 +809,22 @@ async fn scenario(
     );
 
     // The local authority exit (§4 L274), while the row is still open:
-    // the red arm's demotion by D's public role API, or the control
-    // arm's agent revocation.
+    // the red arm's demotion through the public role API — A demotes
+    // itself, see the module doc — or the control arm's agent
+    // revocation. Both apply on A the moment the route answers, so the
+    // instant after, every application frame toward A is dropped until
+    // the mark watch ends: no completion, roster batch or later
+    // evidence from any survivor can reach A's open row before A's
+    // own worker has evaluated the exit.
+    let inbound_hold = InboundHold::install(sim, "A")?;
     let t1 = sim.fabric().now();
-    let exit_kind = if demoted {
-        "demoted-by-D"
-    } else {
-        "agent-revoked"
-    };
+    let exit_kind = if demoted { "demoted" } else { "agent-revoked" };
     sim.fabric().mark(format!(
         "case: t1 local authority exit — A {exit_kind} mid-window"
     ));
     let (exit_status, exit_body) = if demoted {
         sim.api(
-            "D",
+            "A",
             Method::PATCH,
             &format!("/groups/{group}/members/{a_hex}/role"),
             Some(json!({"role": "member"})),
@@ -786,11 +850,20 @@ async fn scenario(
         at(sim),
     );
 
+    // The exit is applied on A; from this frozen instant (no barrier is
+    // open between the route's answer and the arming) nothing further
+    // reaches A.
+    inbound_hold.set(true);
+    sim.fabric()
+        .mark("fault: every application frame toward A dropped (exit-window blackout)");
+
     // The typed mark (§4 L274): A's public row for B names the exit with
     // `local_committer_ineligible`, naming D, while the row is still
-    // open. Polled from the first instant after the exit; every cause
-    // the row did show — and a row that is gone outright — is kept for
-    // the receipt.
+    // open. The `waiting` the route serves is the worker's last stored
+    // evaluation, so the watch polls until A's worker has re-evaluated
+    // the open row after the exit — under the blackout nothing can
+    // complete the row first — and every cause the row did show is kept
+    // for the receipt.
     let mut mark_seen = false;
     let mut mark_names_d = false;
     let mut row_open_at_mark = false;
@@ -840,8 +913,17 @@ async fn scenario(
             .and_then(|row| row["waiting"]["cause"].as_str()),
     ));
 
-    // The exit's evidence reaches the survivors before the hold releases.
-    if demoted {
+    dm_hold.set(false);
+    inbound_hold.set(false);
+    sim.fabric().mark(format!(
+        "case: holds released at {} us (A–D/C DM: {} frames dropped; toward A: {})",
+        sim.fabric().now().as_micros(),
+        dm_hold.dropped(),
+        inbound_hold.dropped()
+    ));
+
+    // The exit's evidence reaches the survivors once the holds release.
+    let survivors_hold_exit = if demoted {
         sim.until("D and C see A's demotion", EVIDENCE, async |s: &Sim| {
             for observer in ["D", "C"] {
                 if sees_admin(s, observer, &group, "A").await.unwrap_or(true) {
@@ -850,19 +932,18 @@ async fn scenario(
             }
             true
         })
-        .await?;
+        .await
+        .is_ok()
+            && !sees_admin(sim, "D", &group, "A").await.unwrap_or(false)
+            && !sees_admin(sim, "C", &group, "A").await.unwrap_or(false)
     } else {
-        await_holders(sim, &["D", "C"], &a_hex).await?;
-    }
-    dm_hold.set(false);
-    sim.fabric().mark(format!(
-        "case: ask-path hold released at {} us ({} frames dropped)",
-        sim.fabric().now().as_micros(),
-        dm_hold.dropped()
-    ));
+        await_holders(sim, &["D", "C"], &a_hex).await.is_ok()
+            && holds_revocation(sim, "D", &a_hex).await.unwrap_or(false)
+            && holds_revocation(sim, "C", &a_hex).await.unwrap_or(false)
+    };
     receipt.evidence(
         "the_exit_evidence_reached_the_survivors",
-        true,
+        survivors_hold_exit,
         format!(
             "A {exit_kind} at {} us after t=0; survivors hold the exit evidence; mark seen: \
              {mark_seen} (naming D: {mark_names_d})",
@@ -880,21 +961,24 @@ async fn scenario(
         .saturating_add(timing.completion_bound)
         .saturating_add(secs(10));
     let mut a_authored = false;
+    let mut b_epoch: Option<u64> = None;
     let mut b_result_epoch: Option<u64> = None;
     let waited = sim
         .until(
-            "D resumes and completes B's exclusion",
+            "D resumes and commits B's exclusion",
             bound,
             async |s: &Sim| {
-                let mut d_row_complete = None;
+                // D's resume is its commit on the survivors' heads; D's
+                // own obligation row completes with its delivery
+                // bookkeeping, which on main can trail the commit while a
+                // member's lanes recover from the exit-window blackout,
+                // so the row's phase and `result_epoch` are recorded,
+                // not gated.
                 if let Ok(Some(row)) = s4_row(s, "D", &group, &b_hex).await {
                     if row["phase"].as_str() == Some("complete") {
-                        d_row_complete = row["result_epoch"].as_u64().filter(|epoch| *epoch > e0);
+                        b_result_epoch = row["result_epoch"].as_u64();
                     }
                 }
-                let Some(want_epoch) = d_row_complete else {
-                    return false;
-                };
                 let Ok(views) = views_now(s, &["D", "C"], &group, &b, &a_id).await else {
                     return false;
                 };
@@ -906,7 +990,7 @@ async fn scenario(
                     let Some(epoch) = seen.epoch else {
                         return false;
                     };
-                    if seen.lists_b || seen.quarantined || epoch < want_epoch {
+                    if seen.lists_b || seen.quarantined || epoch <= e0 {
                         return false;
                     }
                     seen.head_committed_by.as_deref().inspect(|signer| {
@@ -918,7 +1002,7 @@ async fn scenario(
                         Some(_) => {}
                     }
                 }
-                b_result_epoch = Some(want_epoch);
+                b_epoch = common;
                 true
             },
         )
@@ -928,11 +1012,11 @@ async fn scenario(
             return Err(error);
         }
     }
-    let resumed = b_result_epoch.is_some();
+    let resumed = b_epoch.is_some();
     let resumed_views = views_now(sim, &["D", "C"], &group, &b, &a_id).await?;
     receipt.note(format!(
-        "D's resume: B's exclusion complete at result epoch {b_result_epoch:?} (e0={e0}, \
-         leaves0={leaves0}); {}",
+        "D's resume: B's exclusion committed at epoch {b_epoch:?} (D's row result_epoch so far: \
+         {b_result_epoch:?}, e0={e0}, leaves0={leaves0}); {}",
         describe_all(&resumed_views)
     ));
 
@@ -954,16 +1038,14 @@ async fn scenario(
             async |s: &Sim| {
                 match s4_row(s, "A", &group, &b_hex).await {
                     Ok(Some(row)) => {
-                        if row["phase"].as_str() == Some("complete")
-                            && row["result_epoch"].as_u64() == b_result_epoch
-                        {
+                        if row["phase"].as_str() == Some("complete") {
                             let caught_up = try_view_now(s, "A", &group, &b, &a_id)
                                 .await
                                 .ok()
                                 .flatten()
                                 .is_some_and(|seen| {
                                     seen.epoch
-                                        .zip(b_result_epoch)
+                                        .zip(b_epoch)
                                         .is_some_and(|(epoch, want)| epoch >= want)
                                 });
                             a_completed |= caught_up;
@@ -1025,22 +1107,27 @@ async fn scenario(
         }
     });
     let final_row = s4_row(sim, "A", &group, &b_hex).await?;
-    let a_row_final = final_row.as_ref().is_some_and(|row| {
-        row["phase"].as_str() == Some("complete") && row["result_epoch"].as_u64() == b_result_epoch
-    });
+    let a_row_final = final_row
+        .as_ref()
+        .is_some_and(|row| row["phase"].as_str() == Some("complete"));
+    // The shared obligation on D survives the exit (§4 L276): D still
+    // holds B's row — whatever phase its delivery bookkeeping is in —
+    // and B's revocation record.
     let shared_evidence_kept = holds_revocation(sim, "D", &b_hex).await.unwrap_or(false)
-        && matches!(
-            s4_row(sim, "D", &group, &b_hex).await,
-            Ok(Some(row)) if row["phase"].as_str() == Some("complete")
-        );
+        && s4_row(sim, "D", &group, &b_hex)
+            .await
+            .is_ok_and(|row| row.is_some());
     // A's own obligation (the row A's revocation opens for A itself) is
     // recorded, not gated: the §4b exits are other rows' cases.
     let a_own_row = s4_row(sim, "D", &group, &a_hex).await?;
     receipt.note(format!(
-        "after the settle (A retains a record: {a_holds_record}; A's row for B: phase {:?} at \
-         result {b_result_epoch:?}): {}; A's own row on D: {:?}; shared evidence kept on D: \
-         {shared_evidence_kept}",
+        "after the settle (A retains a record: {a_holds_record}; A's row for B: phase {:?}, \
+         result_epoch {:?}; the exclusion sits at epoch {b_epoch:?}): {}; A's own row on D: \
+         {:?}; shared evidence kept on D: {shared_evidence_kept}",
         final_row.as_ref().and_then(|row| row["phase"].as_str()),
+        final_row
+            .as_ref()
+            .and_then(|row| row["result_epoch"].as_u64()),
         describe_all(&end),
         a_own_row
             .as_ref()
@@ -1106,11 +1193,14 @@ async fn scenario(
         && !a_authored
         && data_plane;
     if !passed {
-        // On the red arm only the missing mark is the expected RED; any
-        // other failure keeps ok=false (INFRA), so the gate's
-        // --expect=RED pin cannot be satisfied by an unrelated
-        // regression while the evaluate_row fix waits.
+        // On the red arm only the missing mark is the expected RED, and
+        // only with the mislabel itself observed: every other failure
+        // keeps ok=false (a false-cause stage makes the run not-RED), so
+        // the gate's --expect=RED pin cannot be met while any other
+        // failure persists or while A's row never showed the mislabel
+        // the pin names.
         let strict_red = demoted;
+        let mislabel_observed = observed_causes.contains("waiting_for_designated_admin");
         let (cause, ok, observed) = if !pending_ok {
             (
                 CAUSE_NO_PENDING,
@@ -1121,21 +1211,12 @@ async fn scenario(
                     at_exit_view.describe()
                 ),
             )
-        } else if early_move.is_some() {
-            (
-                CAUSE_EARLY_SEAL,
-                !strict_red,
-                format!(
-                    "an exclusion commit moved {early_move:?} after t=0, before the exit at {} us",
-                    t1.saturating_sub(t0).as_micros()
-                ),
-            )
         } else if !resumed {
             (
                 CAUSE_NO_RESUME,
                 !strict_red,
                 format!(
-                    "B's exclusion result epoch on D: {b_result_epoch:?} (e0={e0}); {}",
+                    "B's exclusion epoch on the survivors: {b_epoch:?} (e0={e0}); {}",
                     describe_all(&resumed_views)
                 ),
             )
@@ -1145,8 +1226,8 @@ async fn scenario(
                 !strict_red,
                 format!(
                     "A's row for B completed on A: {a_completed} (final read {}), A retains a \
-                     record: {a_holds_record}, shared evidence kept: {shared_evidence_kept}; \
-                     wanted result epoch {b_result_epoch:?}",
+                     record: {a_holds_record}, shared evidence kept: {shared_evidence_kept}; the \
+                     exclusion sits at epoch {b_epoch:?}",
                     a_row_final
                 ),
             )
@@ -1160,11 +1241,26 @@ async fn scenario(
                 !strict_red,
                 format!("{}; {}", c_after.1, b_after.1),
             )
+        } else if mark_seen {
+            // The mark showed, but wrongly: a genuine failure on both
+            // arms, distinct from a mark that never showed.
+            (
+                CAUSE_WRONG_MARK,
+                true,
+                format!(
+                    "mark names D: {mark_names_d}; row open at the mark: {row_open_at_mark}; \
+                     causes seen: {observed_causes:?}"
+                ),
+            )
         } else {
             // Only the typed mark is missing: the row's named failure.
+            // On the red arm the pin is RED-eligible only when the
+            // mislabel (`waiting_for_designated_admin`) was observed
+            // live — a row that never evaluated the exit at all is not
+            // the named divergence.
             (
                 CAUSE_NO_MARK,
-                true,
+                !strict_red || mislabel_observed,
                 format!(
                     "A {exit_kind}; causes A's row showed instead: {observed_causes:?}; mark names \
                      D: {mark_names_d}; row open at the mark: {row_open_at_mark}"
