@@ -399,30 +399,6 @@ enum CommitError {
     Persist(String),
 }
 
-/// Whether `next`'s head is the installed roster head of `group_key`.
-/// #1574 item 1: `persist_named_group_info` also returns
-/// `ReplacedNotDurable` from its durability preflight, where an earlier
-/// write was still unconfirmed and its re-save failed again, so this
-/// candidate was never staged (the flag short-circuit in
-/// `persist_named_group_info_inner`). That outcome installed nothing. The
-/// commit sites below treat `ReplacedNotDurable` as committed only after
-/// this check. The read holds `named_groups_persistence_lock`, so it sees
-/// only installed or restored roster state.
-///
-/// Known open gap (#1574): the preflight early return itself is not
-/// fixed here. `named_groups.rs` is fenced to the slice that owns it
-/// (#1627 and the card-routes run). Until that slice changes the
-/// preflight, this caller-side check is the guard for it.
-async fn roster_head_installed(state: &AppState, group_key: &str, next: &GroupInfo) -> bool {
-    let _committed = state.named_groups_persistence_lock.lock().await;
-    state
-        .named_groups
-        .read()
-        .await
-        .get(group_key)
-        .is_some_and(|info| info.state_hash == next.state_hash)
-}
-
 /// Seal, check, persist and schedule delivery of one rebind. The caller
 /// holds `group_key`'s membership lock and read `info` under it.
 ///
@@ -484,17 +460,17 @@ async fn commit_locked(
     }
     let persisted = match ng::persist_named_group_info(state, group_key, next.clone()).await {
         Ok(ng::AtomicWriteOutcome::Durable) => Ok(()),
-        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable)
-            if roster_head_installed(state, group_key, &next).await =>
-        {
+        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
             // The replacement is visible on disk and in memory, so the
             // commit stands and its delivery is scheduled. The guarded
             // egress sends nothing until the re-save is durable (§5).
             //
             // #1574 item 1: treating this arm as committed is enough for
-            // the drops below. The persist keeps the candidate in the map
-            // on this outcome (it rolls back only `NotReplaced` and hard
-            // errors), so this process never sees the install revert.
+            // the drops below. The outcome always means the candidate is
+            // staged: the persist keeps it in the map on this outcome
+            // (it rolls back only `NotReplaced` and hard errors), and
+            // the durability preflight reports its refusal as
+            // `NotReplaced` (#1574 slice 3), which takes the arms below.
             // A power loss before a confirming save is the one revert.
             // It erases the memory-only `admin_waits`/`renewals`/`held`
             // entries whether or not they were dropped. The durable frame
@@ -508,14 +484,12 @@ async fn commit_locked(
             tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: certificate rebind persisted without a durability confirmation");
             Ok(())
         }
-        // #1574 item 1: the durability preflight returned
-        // `ReplacedNotDurable` without staging this candidate (an earlier
-        // write is still unconfirmed and its re-save failed again).
-        // Nothing was installed, so the commit does not stand.
-        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
-            Err("durability preflight refused the replacement".to_string())
-        }
-        Ok(ng::AtomicWriteOutcome::NotReplaced) => Err("not replaced".to_string()),
+        // The preflight refusal (either shape) staged nothing, so the
+        // commit does not stand.
+        Ok(
+            ng::AtomicWriteOutcome::NotReplaced
+            | ng::AtomicWriteOutcome::PreflightRefusedAfterRename,
+        ) => Err("not replaced".to_string()),
         Err(error) => Err(error.to_string()),
     };
     if let Err(error) = persisted {
@@ -2055,8 +2029,9 @@ pub(in crate::server) async fn receive(
                             sibling = Some(kind);
                             Err(cr::CertificateRebindRefusal::HeadMismatch)
                         }
-                        // #1533 r11: this node's branch no longer holds
-                        // the parent's certificate bytes, so the sibling
+                        // #1533 r11: this node holds no bytes for the
+                        // parent's committed digest — neither live nor the
+                        // retained displaced copy (#1650) — so the sibling
                         // cannot be checked. It stays unvalidated and
                         // records nothing; a fetch of the current bytes
                         // would not supply the parent's.
@@ -2155,25 +2130,22 @@ pub(in crate::server) async fn receive(
             return ReceiveOutcome::Refused(cr::CertificateRebindRefusal::StateMismatch);
         }
     };
-    let installed = match ng::persist_named_group_info(state, &group_key, next.clone()).await {
-        // #1574 item 1: `Applied` on the non-durable outcome is enough for
-        // the drops below. The frame was made durable before the install
-        // (`write_received` above), and a restart puts a received frame
-        // above the loaded head back through the stash, so a power-loss
-        // revert re-runs this install and these drops on the durable
-        // frame. The dropped `renewals`/`admin_waits` entries are
-        // memory-only, and the reverted roster re-derives them: the seat's
-        // expiry obligation opens again, so the renewal hand-off and the
-        // admin wait are re-armed.
-        Ok(ng::AtomicWriteOutcome::Durable) => true,
-        // The preflight can return this outcome without staging this
-        // candidate (#1574 item 1, `roster_head_installed`): the install
-        // then did not happen, and the frame stays for a retry.
-        Ok(ng::AtomicWriteOutcome::ReplacedNotDurable) => {
-            roster_head_installed(state, &group_key, &next).await
-        }
-        Ok(ng::AtomicWriteOutcome::NotReplaced) | Err(_) => false,
-    };
+    // #1574 item 1: `Applied` on the non-durable outcome is enough for
+    // the drops below. The frame was made durable before the install
+    // (`write_received` above), and a restart puts a received frame
+    // above the loaded head back through the stash, so a power-loss
+    // revert re-runs this install and these drops on the durable
+    // frame. The dropped `renewals`/`admin_waits` entries are
+    // memory-only, and the reverted roster re-derives them: the seat's
+    // expiry obligation opens again, so the renewal hand-off and the
+    // admin wait are re-armed. A `ReplacedNotDurable` here always means
+    // the candidate is staged (the preflight reports its refusal as
+    // `NotReplaced`, #1574 slice 3), so a refused install never reaches
+    // the drops; the frame stays for a retry.
+    let installed = matches!(
+        ng::persist_named_group_info(state, &group_key, next.clone()).await,
+        Ok(ng::AtomicWriteOutcome::Durable | ng::AtomicWriteOutcome::ReplacedNotDurable)
+    );
     if !installed {
         // A local fault: the frame stays durable and in the stash.
         return ReceiveOutcome::LocalFailure;
@@ -3536,13 +3508,11 @@ pub(super) mod restart_tests {
 
         /// A second, different rebind on the same parent: a competing
         /// commit at the same revision (#1579) — the admin renews the
-        /// `peer` member, so a different roster root and result head. It
-        /// does not rebind the same seat again: after one of the pair
-        /// installs, that seat's committed certificate is the renewal,
-        /// and #1533 r11's sibling rule leaves a same-seat sibling
-        /// unvalidated (`CertificateEvidenceMissing` — the parent's
-        /// certificate bytes are gone). A sibling of another seat keeps
-        /// every certificate the rule reads, whichever frame installs.
+        /// `peer` member, so a different roster root and result head. A
+        /// same-seat sibling stays verifiable too since #1650 (the parent
+        /// certificate is retained displaced); this pair keeps the two
+        /// branches on different seats, which every certificate the rule
+        /// reads holds live, whichever frame installs.
         fn competing_frame(&self) -> Result<(Vec<u8>, String)> {
             let now_ms = now_unix_ms();
             let renewal = AgentCertificate::issue_with_expiry(
@@ -3701,14 +3671,15 @@ pub(super) mod restart_tests {
         Ok(())
     }
 
-    /// #1574 item 1: the durability preflight's `ReplacedNotDurable`
-    /// stages nothing (the confirming re-save failed again), so a
-    /// receiver reports a local failure, not `Applied`: the frame stays
-    /// durable for the retry and the roster keeps the parent. Before the
-    /// fix the receiver returned `Applied` and dropped the seat's waits
-    /// for an install that never happened.
+    /// #1574 item 1: the durability preflight's refusal stages nothing
+    /// (the confirming re-save failed again), so a receiver reports a
+    /// local failure, not `Applied`: the frame stays durable for the
+    /// retry and the roster keeps the parent. Before the root fix the
+    /// refusal read as `ReplacedNotDurable` — staged — so the receiver
+    /// returned `Applied` and dropped the seat's waits for an install
+    /// that never happened.
     #[tokio::test]
-    async fn a_received_rebind_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()> {
+    async fn a_received_rebind_refuses_a_durability_preflight_refusal() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let receiver = offline_daemon(dir.path(), None).await?;
         let fixture = RebindFixture::new(receiver.agent.identity().agent_keypair())?;
@@ -3744,8 +3715,8 @@ pub(super) mod restart_tests {
 
     /// #1574 item 1, the other arm: a received rebind still applies a
     /// `ReplacedNotDurable` that staged its candidate (the #1508 r6
-    /// rule). The installed check refuses only the preflight outcome that
-    /// stages nothing.
+    /// rule). A preflight refusal reports its own non-staged outcomes
+    /// and never reaches this arm.
     #[tokio::test]
     async fn a_received_rebind_still_applies_a_staged_replaced_not_durable() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -4317,16 +4288,16 @@ pub(super) mod restart_tests {
         Ok(())
     }
 
-    /// #1574 item 1: the plain roster persist also returns
-    /// `ReplacedNotDurable` from its durability preflight — an earlier
-    /// write is still unconfirmed and its re-save fails again — and that
-    /// outcome stages no candidate. The admin rebind must not treat it as
-    /// an install: nothing landed, so the renewal is kept, the wait stays
-    /// and no delivery is scheduled. Before the fix the commit dropped
-    /// the renewal and the wait and scheduled a delivery for a roster the
-    /// map never installed.
+    /// #1574 item 1: the plain roster persist also refuses while an
+    /// earlier write is still unconfirmed and its re-save fails again —
+    /// that refusal stages no candidate. The admin rebind must not treat
+    /// it as an install: nothing landed, so the renewal is kept, the wait
+    /// stays and no delivery is scheduled. Before the root fix the
+    /// refusal read as `ReplacedNotDurable` — staged — and the commit
+    /// dropped the renewal and the wait and scheduled a delivery for a
+    /// roster the map never installed.
     #[tokio::test]
-    async fn an_admin_rebind_refuses_a_replaced_not_durable_that_staged_nothing() -> Result<()> {
+    async fn an_admin_rebind_refuses_a_durability_preflight_refusal() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let owner = UserKeypair::generate()?;
         let seat = AgentKeypair::generate()?;
@@ -4415,8 +4386,9 @@ pub(super) mod restart_tests {
     }
 
     /// #1574 item 1, the other arm: a `ReplacedNotDurable` that did stage
-    /// its candidate still commits. The installed check must not
-    /// over-refuse the non-durable install the #1508 r6 rule keeps.
+    /// its candidate still commits — the non-durable install the #1508
+    /// r6 rule keeps. A preflight refusal reports its own non-staged
+    /// outcomes and never reaches this arm.
     #[tokio::test]
     async fn an_admin_rebind_still_commits_a_staged_replaced_not_durable() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -4707,9 +4679,22 @@ pub(super) mod restart_tests {
         seat: &AgentKeypair,
         signer: &AgentKeypair,
     ) -> Result<(Vec<u8>, String)> {
+        sibling_frame_with_expiry(parent, issuer, seat, signer, 6000)
+    }
+
+    /// [`sibling_frame`] with the renewal's expiry offset in seconds
+    /// exposed, so two valid same-seat siblings can carry different
+    /// renewals (#1650).
+    fn sibling_frame_with_expiry(
+        parent: &GroupInfo,
+        issuer: &UserKeypair,
+        seat: &AgentKeypair,
+        signer: &AgentKeypair,
+        expiry_offset: u64,
+    ) -> Result<(Vec<u8>, String)> {
         let now_ms = now_unix_ms();
         let renewal =
-            AgentCertificate::issue_with_expiry(issuer, seat, Some(now_ms / 1000 + 6000))?;
+            AgentCertificate::issue_with_expiry(issuer, seat, Some(now_ms / 1000 + expiry_offset))?;
         let (next, frame) = cr::seal(
             parent,
             *seat.agent_id().as_bytes(),
@@ -4719,6 +4704,22 @@ pub(super) mod restart_tests {
         )
         .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
         Ok((cr::encode_frame(&frame)?, next.state_hash))
+    }
+
+    /// The admin's self-renewal on `base` — the retained parent of
+    /// [`removal_race`] without the removal: every seat stays Active at
+    /// the parent, so a later rebind of a seat on this parent is a sibling
+    /// of another rebind, not of a removal (#1650).
+    fn renewal_parent(
+        owner: &UserKeypair,
+        base: &GroupInfo,
+        admin: &AgentKeypair,
+    ) -> Result<GroupInfo> {
+        let now_ms = now_unix_ms();
+        let renewal = AgentCertificate::issue_with_expiry(owner, admin, Some(now_ms / 1000 + 900))?;
+        let (parent, _) = cr::seal(base, *admin.agent_id().as_bytes(), &renewal, admin, now_ms)
+            .map_err(|refused| anyhow::anyhow!("seal: {}", refused.as_str()))?;
+        Ok(parent)
     }
 
     async fn quarantine_of(state: &AppState, stable: &str) -> Option<x0x::groups::ForkQuarantine> {
@@ -4858,6 +4859,98 @@ pub(super) mod restart_tests {
             "the containment survives a restart"
         );
         restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Issue #1650 (ADR 0110 §2 fork containment, §4a run (10)): two valid
+    /// self-rebinds of the SAME seat on one parent — the admin's
+    /// self-renewal, with the seat still Active. A receiver that holds the
+    /// parent applies the first sibling it sees; the second is a valid
+    /// sibling of the applied branch, so every receiver keeps it as fork
+    /// evidence (`waiting_for_fork_resolution`) and no node applies both.
+    /// Before the fix the second sibling never became evidence: the
+    /// applied sibling's install had replaced the seat's parent
+    /// certificate, `validate_sibling` found no bytes for the parent
+    /// digest and `receive` mapped `CertificateEvidenceMissing` to
+    /// `HeadMismatch` with no quarantine.
+    #[tokio::test]
+    async fn two_valid_same_seat_rebind_siblings_contain_every_receiver() -> Result<()> {
+        let owner = UserKeypair::generate()?;
+        let admin = AgentKeypair::generate()?;
+        let member = AgentKeypair::generate()?;
+        // Each receiver is seated in its own base, so every node rebuilds
+        // its parent and frames; the loop covers both branch orders.
+        for second_comes_first in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let receiver = offline_daemon(dir.path(), None).await?;
+            let me = receiver.agent.identity().agent_keypair();
+            let base = certified_group(&owner, &admin, &[&member, me])?;
+            let parent = renewal_parent(&owner, &base, &admin)?;
+            let stable = parent.stable_group_id().to_string();
+            hold_persisted(&receiver, &parent).await?;
+
+            let (frame_a, head_a) =
+                sibling_frame_with_expiry(&parent, &owner, &member, &member, 6000)?;
+            let (frame_b, head_b) =
+                sibling_frame_with_expiry(&parent, &owner, &member, &member, 7000)?;
+            let (applied, applied_head, refused, refused_head) = if second_comes_first {
+                (&frame_b, &head_b, &frame_a, &head_a)
+            } else {
+                (&frame_a, &head_a, &frame_b, &head_b)
+            };
+
+            // The first sibling chains from this node's head (the parent),
+            // so it is applied, not quarantined.
+            let outcome = receive(&receiver, member.agent_id(), applied).await;
+            assert_eq!(outcome, ReceiveOutcome::Applied);
+            assert_eq!(
+                head_of(&receiver, &stable).await.as_ref(),
+                Some(applied_head),
+                "the first sibling is the node's new head"
+            );
+
+            // #1650 (ADR 0110 §5): the displaced parent certificate
+            // persists only in the S4 sidecar — neither legacy JSON
+            // format changes.
+            let sidecar = dir.path().join("revocation-evictions.rdc");
+            assert!(
+                tokio::fs::try_exists(&sidecar).await.unwrap_or(false),
+                "the retained evidence is durable in its S4 sidecar"
+            );
+            for legacy in ["named_groups.json", "home-suite-groups.json"] {
+                let json = tokio::fs::read_to_string(dir.path().join(legacy))
+                    .await
+                    .unwrap_or_default();
+                assert!(
+                    !json.contains("displaced_certificates"),
+                    "{legacy} never carries the retained evidence"
+                );
+            }
+
+            // The competing sibling is valid on the same parent. The seat
+            // is still Active, so the `HeadMismatch` arm falls through to
+            // its typed refusal; the frame is fork evidence either way.
+            let outcome = receive(&receiver, member.agent_id(), refused).await;
+            assert_eq!(
+                outcome,
+                ReceiveOutcome::Refused(cr::CertificateRebindRefusal::HeadMismatch)
+            );
+            let marker = quarantine_of(&receiver, &stable)
+                .await
+                .context("the competing same-seat sibling contains the receiver")?;
+            assert_eq!(marker.state_hash, *refused_head);
+            assert_eq!(marker.revision, parent.state_revision + 1);
+            assert_eq!(
+                marker.snapshot.classification.as_deref(),
+                Some(ng::FORK_EVIDENCE_CLASSIFICATION_SIGNER_ONLY)
+            );
+            assert_eq!(
+                head_of(&receiver, &stable).await.as_ref(),
+                Some(applied_head),
+                "no node applies both siblings"
+            );
+            receiver.agent.shutdown().await;
+        }
         Ok(())
     }
 
