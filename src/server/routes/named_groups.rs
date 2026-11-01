@@ -7012,9 +7012,17 @@ where
             // refusal as `NotReplaced`. The flag stays set (the re-save's
             // own handling keeps it), so the next save retries this
             // preflight; a hard error stays an error.
-            Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::ReplacedNotDurable) => {
-                return Ok(AtomicWriteOutcome::NotReplaced)
-            }
+            // #1729 (merged at cf707096) gave the after-rename refusal
+            // its own outcome. No producer feeds that variant to this
+            // whole-map re-save, and no caller of this entry point does
+            // outcome-keyed S3 arming, so it folds into the refusal
+            // arm: like every refusal shape, this clear replaced
+            // nothing.
+            Ok(
+                AtomicWriteOutcome::NotReplaced
+                | AtomicWriteOutcome::ReplacedNotDurable
+                | AtomicWriteOutcome::PreflightRefusedAfterRename,
+            ) => return Ok(AtomicWriteOutcome::NotReplaced),
             Err(error) => return Err(error),
         }
     }
@@ -7239,9 +7247,17 @@ where
             // Report the refusal as `NotReplaced`. The flag stays set
             // (the re-save's own handling keeps it), so the next save
             // retries this preflight; a hard error stays an error.
-            Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::ReplacedNotDurable) => {
-                return Ok(AtomicWriteOutcome::NotReplaced)
-            }
+            // #1729 (merged at cf707096) gave the after-rename refusal
+            // its own outcome. No producer feeds that variant to this
+            // whole-map re-save, and no caller of this entry point does
+            // outcome-keyed S3 arming, so it folds into the refusal
+            // arm: like every refusal shape, this mutation replaced
+            // nothing.
+            Ok(
+                AtomicWriteOutcome::NotReplaced
+                | AtomicWriteOutcome::ReplacedNotDurable
+                | AtomicWriteOutcome::PreflightRefusedAfterRename,
+            ) => return Ok(AtomicWriteOutcome::NotReplaced),
             Err(error) => return Err(error),
         }
     }
@@ -7628,6 +7644,13 @@ pub(in crate::server) enum SaveFault {
     /// sidecar journal is written, then the legacy journal write (the
     /// commit point) fails: no live file changes.
     JournalWriteFails = 8,
+    /// #1574 (the #1729 fold): `Ok(AtomicWriteOutcome::
+    /// PreflightRefusedAfterRename)` — the after-rename refusal shape,
+    /// so a test can drive the folded refusal arm of the two whole-map
+    /// persist preflights. No production save yields the variant before
+    /// them; the folded arm states their contract: every refusal shape
+    /// reports `NotReplaced`.
+    PreflightRefusedAfterRename = 9,
 }
 
 // #470 — per-instance fault helpers; all `#[cfg(test)]` so no trace in
@@ -7643,6 +7666,7 @@ fn save_fault_short_circuit(state: &AppState) -> Option<AtomicWriteOutcome> {
     {
         1 => Some(AtomicWriteOutcome::NotReplaced),
         3 => Some(AtomicWriteOutcome::ReplacedNotDurable),
+        9 => Some(AtomicWriteOutcome::PreflightRefusedAfterRename),
         _ => None,
     }
 }

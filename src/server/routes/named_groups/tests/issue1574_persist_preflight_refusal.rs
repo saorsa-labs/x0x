@@ -9,9 +9,11 @@
 //! false: the refusal reports the confirming re-save of the EARLIER
 //! unconfirmed replacement, and nothing of the caller's candidate is
 //! staged. Every refusal shape is covered: after a rename whose fsync
-//! failed again, a plain `NotReplaced`, and a hard error (an error stays
-//! an error). Local temp state only: no network config, sockets or
-//! bootstrap.
+//! failed again, a plain `NotReplaced`, the #1729 after-rename refusal
+//! shape (`PreflightRefusedAfterRename`, driven through the fault seam
+//! — no production save yields it before these cores), and a hard
+//! error (an error stays an error). Local temp state only: no network
+//! config, sockets or bootstrap.
 
 use super::*;
 
@@ -24,9 +26,10 @@ use super::*;
 /// could keep its candidate and proceed for a mutation that never ran.
 /// The refusal is `NotReplaced`, the closure did not run, the live map
 /// and the visible file keep the old record, and the flag stays set. A
-/// plain `NotReplaced` re-save keeps reporting `NotReplaced`; a hard
-/// error stays an error; and once the re-save is durable, the same
-/// mutation lands.
+/// plain `NotReplaced` re-save keeps reporting `NotReplaced`; the #1729
+/// after-rename refusal shape folds into the same `NotReplaced` report;
+/// a hard error stays an error; and once the re-save is durable, the
+/// same mutation lands.
 #[tokio::test]
 async fn a_mutation_refuses_a_durability_preflight_refusal() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -136,6 +139,22 @@ async fn a_mutation_refuses_a_durability_preflight_refusal() -> Result<()> {
             .named_groups_requires_durability_confirmation
             .load(std::sync::atomic::Ordering::SeqCst));
     }
+    // The #1729 after-rename refusal shape (merged at cf707096), driven
+    // through the fault seam because no production save yields it
+    // before this core: the folded arm reports it as a refusal too.
+    {
+        let fault = set_save_fault(&state, SaveFault::PreflightRefusedAfterRename);
+        let outcome = call(&state, &key, &mut ran).await;
+        drop(fault);
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::NotReplaced)),
+            "the after-rename refusal shape reports `NotReplaced` here: {outcome:?}"
+        );
+        assert!(!ran, "the mutation closure still did not run");
+        assert!(state
+            .named_groups_requires_durability_confirmation
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     // No fault is armed: the preflight re-save is durable and the same
     // mutation lands.
@@ -170,8 +189,9 @@ async fn a_mutation_refuses_a_durability_preflight_refusal() -> Result<()> {
 /// a claim about a clear that never ran. The refusal is `NotReplaced`,
 /// the closure did not run, the live record and the visible file keep
 /// the marker, and the flag stays set. A plain `NotReplaced` re-save
-/// keeps reporting `NotReplaced`; a hard error stays an error; and once
-/// the re-save is durable, the same clear lands.
+/// keeps reporting `NotReplaced`; the #1729 after-rename refusal shape
+/// folds into the same `NotReplaced` report; a hard error stays an
+/// error; and once the re-save is durable, the same clear lands.
 #[tokio::test]
 async fn a_quarantine_clear_refuses_a_durability_preflight_refusal() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -285,6 +305,22 @@ async fn a_quarantine_clear_refuses_a_durability_preflight_refusal() -> Result<(
             "a refusal before any rename stays `NotReplaced`: {outcome:?}"
         );
         assert!(!ran);
+        assert!(state
+            .named_groups_requires_durability_confirmation
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+    // The #1729 after-rename refusal shape (merged at cf707096), driven
+    // through the fault seam because no production save yields it
+    // before this core: the folded arm reports it as a refusal too.
+    {
+        let fault = set_save_fault(&state, SaveFault::PreflightRefusedAfterRename);
+        let outcome = call(&state, &key, &mut ran).await;
+        drop(fault);
+        assert!(
+            matches!(outcome, Ok(AtomicWriteOutcome::NotReplaced)),
+            "the after-rename refusal shape reports `NotReplaced` here: {outcome:?}"
+        );
+        assert!(!ran, "the clear closure still did not run");
         assert!(state
             .named_groups_requires_durability_confirmation
             .load(std::sync::atomic::Ordering::SeqCst));
