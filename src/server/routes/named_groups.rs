@@ -11006,18 +11006,42 @@ async fn request_treekem_catchup_for_gap(
     let Some(frontier) = treekem_membership_event_frontier(event) else {
         return;
     };
-    let (from_revision, from_epoch, current_state_hash) = {
+    // #1685 round 10: this gap ask fans out to several peers at once,
+    // each from the SAME cursor — the shape the truncated-page stop
+    // must judge against (P1 review threads 1 and 2). Resolve the
+    // fence aliases under the same read that fills the request; each
+    // admitted peer's ask cursor is recorded once its send LEFT (see
+    // the note at the send below).
+    let (from_revision, from_epoch, current_state_hash, fence_aliases) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(group_id) else {
+        let resolved = groups
+            .get_key_value(group_id)
+            .map(|(key, info)| (key.clone(), info.clone()))
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+                    .map(|(key, info)| (key.clone(), info.clone()))
+            });
+        let Some((register_key, info)) = resolved else {
             return;
         };
         if info.withdrawn {
             return;
         }
+        let mut fence_aliases = vec![
+            group_id.to_string(),
+            register_key,
+            info.mls_group_id.clone(),
+            info.stable_group_id().to_string(),
+        ];
+        fence_aliases.sort();
+        fence_aliases.dedup();
         (
             info.state_revision,
             info.secret_epoch,
             info.state_hash.clone(),
+            fence_aliases,
         )
     };
     for peer in peers {
@@ -11051,12 +11075,28 @@ async fn request_treekem_catchup_for_gap(
                 continue;
             }
         };
-        if let Err(e) = state
+        // #1685 round 10: unlike the page-stream asks (recorded at
+        // initiation), a gap ask records its cursor only once the send
+        // LEFT. The gap ask fires from the refused page's own
+        // evaluation — recording it here at the CURRENT cursor would
+        // judge that page against an ask it does not answer and stop
+        // the very stream the round 10 rule must keep paging (a peer
+        // whose gap send failed keeps its older, honest row instead;
+        // one whose gap send succeeded really has a current-cursor ask
+        // in flight, and its answer is judged against it).
+        match state
             .agent
             .send_direct_with_config(&peer, payload, direct_message_send_config())
             .await
         {
-            tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
+            Ok(_) => treekem_page_ask_cursor_note(
+                &fence_aliases,
+                &peer_hex,
+                (from_revision, from_epoch, current_state_hash.clone()),
+            ),
+            Err(e) => {
+                tracing::debug!(group_id = %group_id, peer = %peer_hex, "TreeKEM catch-up request failed: {e}");
+            }
         }
     }
 }
@@ -11081,6 +11121,11 @@ async fn replay_pending_treekem_events(
         pending.get(group_id).is_some_and(|queue| !queue.is_empty())
     };
     if !pending_before {
+        // #1685 round 10 (P1 review thread 3): an empty queue still
+        // owes the stopped rows their movement check — the caller's
+        // own applies (this replay runs after them) may have moved
+        // the cursor, and nothing else on the eviction paths checks.
+        maybe_rearm_stopped_treekem_pages(state, group_id, skip_rearm_peer).await;
         return;
     }
     let _replay_fence = SelfLeaveReplayFence::enter(group_id);
@@ -11089,9 +11134,10 @@ async fn replay_pending_treekem_events(
     // event that leaves the catch-up cursor (revision, TreeKEM epoch,
     // state hash) unmoved — e.g. a GroupCardPublished cache update —
     // did not clear the dependency the stop waits on, so an ask would
-    // re-fetch the identical page and stop again. Read the cursor before
-    // the batch applies and compare it after.
-    let cursor_before = treekem_catchup_cursor(state, group_id).await;
+    // re-fetch the identical page and stop again. Round 10 moved the
+    // compare itself into [`maybe_rearm_stopped_treekem_pages`]
+    // against the stop's recorded baseline, so movement OUTSIDE this
+    // drain window (before the replay entered) counts too.
     let entries = {
         let mut pending = state.treekem_pending_events.write().await;
         let Some(queue) = pending.get_mut(group_id) else {
@@ -11176,10 +11222,15 @@ async fn replay_pending_treekem_events(
     // [`spawn_stopped_treekem_catchup_rearms`] keeps one re-arm task per
     // (group, peer) in flight.
     drop(_replay_fence);
-    let cursor_after = treekem_catchup_cursor(state, group_id).await;
-    if cursor_after != cursor_before {
-        spawn_stopped_treekem_catchup_rearms(state, group_id, skip_rearm_peer);
-    }
+    // #1685 round 10 (P1 review thread 3): the resumption trigger is
+    // cursor MOVEMENT against the stop's recorded baseline — a
+    // superset of round 5's own-window compare, which missed every
+    // movement that happened before this replay entered (the
+    // listener's direct applies, another peer's page) and left a
+    // stopped peer's open fence with no exit in a quiet group. The
+    // baseline check-and-set keeps one spawn per movement; the sends
+    // stay inside the detached re-arm tasks.
+    maybe_rearm_stopped_treekem_pages(state, group_id, skip_rearm_peer).await;
     schedule_self_leave_rekey_if_idle(state, group_id).await;
 }
 
@@ -13007,7 +13058,12 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     // page whose events all sit at or below this cursor (a duplicate
     // from a second peer, or a stale page that lost a race to gossip)
     // does NOT meet that bar: its peer's next ask carries the moved
-    // cursor and can still make progress.
+    // cursor and can still make progress. Round 10 adds the second leg:
+    // the stop must also hold against the cursor this page's REQUEST
+    // left from (see [`treekem_page_ask_cursor_permits_stop`]) — a page
+    // that arrives after another peer advanced the head answers an
+    // older ask, and a fresh ask from the moved head would not repeat
+    // it, so the loop pages on instead of stopping.
     let cursor_before = (
         response_info.state_revision,
         response_info.secret_epoch,
@@ -13147,6 +13203,15 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             .await;
         })
         .await;
+    // #1685 round 10 (P1 review thread 3): this page's applies may
+    // have moved the catch-up cursor OUTSIDE the replay's own
+    // window (the replay reads its baseline after them), and a
+    // movement anywhere falsifies every stopped row's premise.
+    // The sender is skipped either way — a truncated page's own
+    // branches below manage its stream, and a terminal page is
+    // about to clear its row — so one peer never holds two
+    // parallel page streams.
+    maybe_rearm_stopped_treekem_pages(state, &response.group_id, Some(&sender_hex)).await;
     // #846: retire the armed record once the attested terminal actually
     // LINKED (the group reached its revision) — a stale record must never
     // arm the gate against a head the current hash is already past. The
@@ -13196,22 +13261,42 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     if was_truncated {
         // #1685: stop the page loop only when the page provably cannot
         // make progress: it served a still-new event, nothing applied,
-        // and the cursor did not move — so the next page request would
-        // repeat this cursor and the responder would re-serve the
-        // identical page. The requeue kept the pending events (no state
-        // is hidden); catch-up re-arms when a later incoming event
-        // queues (the 5 s-throttled gap ask), an epoch-ahead signal
-        // asks again, or a replay MOVES the catch-up cursor (round 5:
-        // the stopped peer is re-asked at the moved cursor by a
-        // detached task — see
-        // `spawn_stopped_treekem_catchup_rearms`). There is no timer; a
-        // quiet group whose gap never clears stays idle. The peer's
-        // page fence stays open, exactly as it does for a page request
-        // that could not be sent.
+        // the cursor did not move — and (round 10) the page answers an
+        // ask that LEFT from this cursor, so the next page request
+        // would repeat it and the responder would re-serve the
+        // identical page. A page answering a pre-advance ask pages on
+        // from the moved cursor instead. The requeue kept the pending
+        // events (no state is hidden); catch-up re-arms when a later
+        // incoming event queues (the 5 s-throttled gap ask), an
+        // epoch-ahead signal asks again, or the catch-up cursor MOVES
+        // anywhere — a replay's drain, another peer's page, or a
+        // listener apply — which re-asks the stopped peer from the
+        // moved cursor through a detached task (round 3 review
+        // 5712505625, round 5 review at 5319f206, round 10 review
+        // thread 3; see `maybe_rearm_stopped_treekem_pages`). There is
+        // no timer; a quiet group whose gap never clears stays idle.
+        // The peer's page fence stays open, exactly as it does for a
+        // page request that could not be sent.
         let cursor_after = treekem_catchup_cursor(state, &response.group_id).await;
+        // #1685 round 10 (P1 review threads 1 and 2): the no-progress
+        // test is judged against the cursor this page's REQUEST left
+        // from, not merely the head it arrived against. A page that
+        // answers an ask sent before another peer's page advanced the
+        // head carries a stale cursor — a fresh ask from the moved
+        // head would fetch a different page — so it pages on instead
+        // of stopping (no row, no open-fence wait, and its stream
+        // reaches the terminal page that closes its fence).
         let stop_reason = match cursor_after {
             None => Some(TREEKEM_CATCHUP_PAGE_STOP_GROUP_MISSING),
-            Some(cursor) if cursor == cursor_before && page_served_ahead => {
+            Some(cursor)
+                if cursor == cursor_before
+                    && page_served_ahead
+                    && treekem_page_ask_cursor_permits_stop(
+                        &fence_ids,
+                        &sender_hex,
+                        &cursor_before,
+                    ) =>
+            {
                 Some(TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS)
             }
             Some(_) => None,
@@ -13289,6 +13374,15 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 // machine-aware revocation gate a page from this peer
                 // must pass.
                 treekem_page_stopped_peers_note(&fence_ids, &sender_hex, machine_id);
+                // #1685 round 10 (P1 review thread 3): the stop SCHEDULES
+                // its own resumption. The premise breaks wherever the
+                // cursor next moves — a replay's drain, another peer's
+                // page, or a listener apply that runs no replay — so the
+                // baseline records the cursor this stop decided on, and
+                // [`maybe_rearm_stopped_treekem_pages`] compares every
+                // post-apply seam against it: the first movement resumes
+                // this armed row (and any other) from the moved cursor.
+                treekem_page_rearm_baseline_note(&fence_ids, cursor_before.clone());
             }
         } else {
             // The page moved the cursor, so this peer's stream is live
@@ -13373,15 +13467,17 @@ const SELF_LEAVE_CATCHUP_PAGE_SENDS: u32 = 3;
 
 /// #1685: the typed stop reason for a truncated catch-up page that made
 /// no progress — it served an event still ahead of the local cursor,
-/// nothing applied, and the catch-up cursor (revision, TreeKEM epoch,
-/// state hash) did not move. The responder filters and sorts its page
-/// on the requester's cursor, so the next page request would serve that
+/// nothing applied, the catch-up cursor (revision, TreeKEM epoch,
+/// state hash) did not move, and (round 10) the ask this page answers
+/// left from that same cursor, so the responder would re-serve that
 /// same stuck event first again. Paging stops with this reason; the
-/// pending TreeKEM queue keeps its events, and catch-up re-arms when a
-/// later incoming event queues (the 5 s-throttled gap ask), an
-/// epoch-ahead signal asks again, or a replay MOVES the cursor and
-/// re-arms this peer through a detached task (round 3 review 5712505625,
-/// round 5 review at 5319f206). There is no
+/// pending TreeKEM queue keeps its events, and catch-up re-arms when
+/// a later incoming event queues (the 5 s-throttled gap ask), an
+/// epoch-ahead signal asks again, or the catch-up cursor moves
+/// ANYWHERE — a replay's drain, another peer's page, or a listener
+/// apply — which re-arms this peer through a detached task (round 3
+/// review 5712505625, round 5 review at 5319f206, round 10 review
+/// thread 3). There is no
 /// timer: a quiet group whose gap never clears stays idle.
 const TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS: &str = "truncated_page_no_progress";
 
@@ -13721,6 +13817,284 @@ fn treekem_page_stopped_peer_rows(
     rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_bytes().cmp(b.1.as_bytes())));
     rows.dedup_by(|a, b| a.0 == b.0);
     rows
+}
+
+/// #1685 round 10: how long one row of
+/// [`TREEKEM_PAGE_ASK_CURSORS`] stays meaningful. A row answers one
+/// in-flight ask, so an hour bounds even a slow peer's round trip;
+/// past it the row is worthless (the response either landed or never
+/// will), and a page that arrives with no row is judged by the
+/// pre-round-10 rule instead.
+const TREEKEM_PAGE_ASK_CURSOR_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// #1685 round 10: the row budget of [`TREEKEM_PAGE_ASK_CURSORS`]
+/// across every group. Past-TTL rows go first; if that is not enough,
+/// the oldest rows go, so the map stays O(live groups × asked peers).
+const TREEKEM_PAGE_ASK_CURSOR_CAP: usize = 4096;
+
+/// #1685 round 10 (Claude + Engineer reviews, 1 Nov 2026): the cursor
+/// each TreeKEM catch-up page REQUEST left from, per group alias and
+/// peer — `(state_revision, secret_epoch, state_hash, sent at)`. The
+/// stop decision used to sample the cursor when a truncated page
+/// ARRIVED; catch-up asks several peers at once, so a peer whose ask
+/// left from revision R could answer only after another peer's page
+/// had already advanced the head past R, and the arrival-sampled
+/// no-progress test wrongly stopped its stream — a fresh ask from the
+/// moved cursor would have fetched a different page (P1 review
+/// threads 1 and 2). A page may now stop the loop only when the head
+/// it arrived against is the SAME head its request left from; a page
+/// answering a pre-advance ask pages on from the moved cursor. Rows
+/// are written under the fence aliases at ask initiation (before any
+/// send can park or fail), read by the stop branch, and never cleared
+/// — the next ask overwrites a peer's row, and TTL/cap pruning bounds
+/// the map. A missing row (an unsolicited page, or a pruned row)
+/// keeps the pre-round-10 verdict: the stop may fire, and the armed
+/// row plus the round 10 resumption baseline still gives it an exit.
+static TREEKEM_PAGE_ASK_CURSORS: std::sync::LazyLock<
+    std::sync::Mutex<TreekemPageAskCursorsByGroup>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// #1685 round 10 (CI clippy, `clippy::type_complexity` — the round 6
+/// precedent): the value of [`TREEKEM_PAGE_ASK_CURSORS`] — per group
+/// alias, each asked peer's ask cursor and the instant it left. A
+/// named alias, not a new type; the map's shape is a plain HashMap.
+type TreekemPageAskCursorsByGroup = std::collections::HashMap<
+    String,
+    std::collections::HashMap<String, (u64, u64, String, std::time::Instant)>,
+>;
+
+/// #1685 round 10: record the cursor one page ask left from, under
+/// the fence aliases, at ask initiation. Over budget, past-TTL rows
+/// are pruned first, then the oldest rows until the map is inside its
+/// cap.
+fn treekem_page_ask_cursor_note(group_ids: &[String], peer: &str, cursor: (u64, u64, String)) {
+    let mut guard = TREEKEM_PAGE_ASK_CURSORS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for group_id in group_ids {
+        guard.entry(group_id.clone()).or_default().insert(
+            peer.to_string(),
+            (
+                cursor.0,
+                cursor.1,
+                cursor.2.clone(),
+                std::time::Instant::now(),
+            ),
+        );
+    }
+    let total: usize = guard.values().map(std::collections::HashMap::len).sum();
+    if total <= TREEKEM_PAGE_ASK_CURSOR_CAP {
+        return;
+    }
+    guard.retain(|_, peers| {
+        peers.retain(|_, (_, _, _, sent)| sent.elapsed() < TREEKEM_PAGE_ASK_CURSOR_TTL);
+        !peers.is_empty()
+    });
+    let mut rows: Vec<(std::time::Instant, String, String)> = guard
+        .iter()
+        .flat_map(|(group_id, peers)| {
+            peers
+                .iter()
+                .map(move |(peer, (_, _, _, sent))| (*sent, group_id.clone(), peer.clone()))
+        })
+        .collect();
+    rows.sort();
+    let excess = rows.len().saturating_sub(TREEKEM_PAGE_ASK_CURSOR_CAP);
+    for (_, group_id, peer) in rows.into_iter().take(excess) {
+        if let Some(peers) = guard.get_mut(&group_id) {
+            peers.remove(&peer);
+        }
+    }
+    guard.retain(|_, peers| !peers.is_empty());
+}
+
+/// #1685 round 10: may a truncated page from `peer` STOP on
+/// `cursor`? Only when the head it arrived against is the same head
+/// its recorded ask left from — a page answering an ask that left
+/// from an older head would be re-served differently by a fresh ask
+/// from `cursor`, so stopping it would strand an open page fence a
+/// live stream should close. No row at all (an unsolicited page, or a
+/// pruned row) keeps the pre-round-10 verdict: the stop may fire.
+fn treekem_page_ask_cursor_permits_stop(
+    group_ids: &[String],
+    peer: &str,
+    cursor: &(u64, u64, String),
+) -> bool {
+    let guard = TREEKEM_PAGE_ASK_CURSORS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut newest: Option<&(u64, u64, String, std::time::Instant)> = None;
+    for group_id in group_ids {
+        if let Some(row) = guard.get(group_id).and_then(|peers| peers.get(peer)) {
+            if newest.is_none_or(|best| row.3 > best.3) {
+                newest = Some(row);
+            }
+        }
+    }
+    match newest {
+        None => true,
+        Some((revision, epoch, hash, _)) => {
+            *revision == cursor.0 && *epoch == cursor.1 && *hash == cursor.2
+        }
+    }
+}
+
+/// #1685 round 10: how long one row of
+/// [`TREEKEM_PAGE_REARM_BASELINES`] survives. Rows pair with the
+/// 24 h stopped-loop rows; the same window keeps a baseline from
+/// outliving the row it was armed with.
+const TREEKEM_PAGE_REARM_BASELINE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// #1685 round 10: the baseline budget of
+/// [`TREEKEM_PAGE_REARM_BASELINES`] across every group, pruned
+/// past-TTL-first like the stopped-loop rows.
+const TREEKEM_PAGE_REARM_BASELINE_CAP: usize = 1024;
+
+/// #1685 round 10 (P1 review thread 3): the catch-up cursor each
+/// group's stopped page loops were armed AT — the resumption baseline
+/// a no-progress stop records, per fence alias. The stop premise ("a
+/// fresh ask at THIS cursor would re-fetch the identical page") is
+/// falsified only by cursor movement, and movement must be detected
+/// wherever it happens, not only inside a replay's own drain window:
+/// a dependency that arrives through the listener (a direct apply
+/// that runs no replay) or through another peer's page moved the head
+/// just as surely, and the stopped peer's still-open fence defers
+/// self-leave rekey until something asks that peer again.
+/// [`maybe_rearm_stopped_treekem_pages`] compares the live cursor
+/// against this baseline at every post-apply seam and resumes the
+/// armed rows on movement. A pruned baseline with live rows only
+/// re-baselines (no ask), so pruning can never spam re-arms.
+static TREEKEM_PAGE_REARM_BASELINES: std::sync::LazyLock<
+    std::sync::Mutex<TreekemPageRearmBaselinesByGroup>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// #1685 round 10 (CI clippy, `clippy::type_complexity` — the round 6
+/// precedent): the value of [`TREEKEM_PAGE_REARM_BASELINES`] — per
+/// group alias, the cursor the group's stops were armed at and the
+/// instant it was recorded. A named alias, not a new type.
+type TreekemPageRearmBaselinesByGroup =
+    std::collections::HashMap<String, ((u64, u64, String), std::time::Instant)>;
+
+/// #1685 round 10: arm one group's resumption baseline under the
+/// fence aliases, at the cursor a no-progress stop decided on. Over
+/// budget, past-TTL rows are pruned first, then the oldest.
+fn treekem_page_rearm_baseline_note(group_ids: &[String], cursor: (u64, u64, String)) {
+    let mut guard = TREEKEM_PAGE_REARM_BASELINES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for group_id in group_ids {
+        guard.insert(
+            group_id.clone(),
+            (cursor.clone(), std::time::Instant::now()),
+        );
+    }
+    if guard.len() <= TREEKEM_PAGE_REARM_BASELINE_CAP {
+        return;
+    }
+    guard.retain(|_, (_, armed)| armed.elapsed() < TREEKEM_PAGE_REARM_BASELINE_TTL);
+    let mut rows: Vec<(std::time::Instant, String)> = guard
+        .iter()
+        .map(|(group_id, (_, armed))| (*armed, group_id.clone()))
+        .collect();
+    rows.sort();
+    let excess = rows.len().saturating_sub(TREEKEM_PAGE_REARM_BASELINE_CAP);
+    for (_, group_id) in rows.into_iter().take(excess) {
+        guard.remove(&group_id);
+    }
+}
+
+/// #1685 round 10 (P1 review thread 3): the resumption half of the
+/// stop decision. A no-progress stop leaves the peer's page fence
+/// open and arms its row; the stop premise holds only until the
+/// catch-up cursor MOVES, and the movement can happen anywhere an
+/// event applies — another peer's page, a replay's drain, or a
+/// listener apply that runs no replay at all. Every such seam calls
+/// this check: it resolves the group's aliases, reads the live
+/// cursor, and spawns [`spawn_stopped_treekem_catchup_rearms`] once
+/// per movement while rows stay armed (the baseline check-and-set
+/// holds one lock, so concurrent seams cannot double-spawn; the
+/// per-(group, peer) in-flight claim deduplicates whatever slips
+/// through). The check is cheap on healthy groups — no armed rows,
+/// no spawn — and it never sends inline: the asks stay in the
+/// detached re-arm tasks the spawner owns. `skip_peer` is the peer
+/// whose own page stream the CALLER is managing (the page handler's
+/// truncated sender), so one peer never holds two parallel streams.
+async fn maybe_rearm_stopped_treekem_pages(
+    state: &Arc<AppState>,
+    group_id: &str,
+    skip_peer: Option<&str>,
+) {
+    let (aliases, cursor) = {
+        let groups = state.named_groups.read().await;
+        let resolved = groups
+            .get_key_value(group_id)
+            .map(|(key, info)| (key.clone(), info.clone()))
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+                    .map(|(key, info)| (key.clone(), info.clone()))
+            });
+        let Some((register_key, info)) = resolved else {
+            return;
+        };
+        let mut aliases = vec![
+            group_id.to_string(),
+            register_key,
+            info.mls_group_id.clone(),
+            info.stable_group_id().to_string(),
+        ];
+        aliases.sort();
+        aliases.dedup();
+        (
+            aliases,
+            (
+                info.state_revision,
+                info.secret_epoch,
+                info.state_hash.clone(),
+            ),
+        )
+    };
+    if treekem_page_stopped_peer_rows(&aliases).is_empty() {
+        return;
+    }
+    let should_spawn = {
+        let mut guard = TREEKEM_PAGE_REARM_BASELINES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard
+            .iter()
+            .filter(|(group_id, _)| aliases.contains(group_id))
+            .max_by_key(|(_, (_, armed))| *armed)
+        {
+            Some((_, (baseline, _))) if *baseline == cursor => false,
+            Some(_) => {
+                for group_id in &aliases {
+                    guard.insert(
+                        group_id.clone(),
+                        (cursor.clone(), std::time::Instant::now()),
+                    );
+                }
+                true
+            }
+            // A pruned baseline with live rows only re-baselines: the
+            // next movement resumes the rows, so pruning cannot turn
+            // into a re-arm storm.
+            None => {
+                for group_id in &aliases {
+                    guard.insert(
+                        group_id.clone(),
+                        (cursor.clone(), std::time::Instant::now()),
+                    );
+                }
+                false
+            }
+        }
+    };
+    if should_spawn {
+        spawn_stopped_treekem_catchup_rearms(state, group_id, skip_peer);
+    }
 }
 
 /// #1685 round 5 (Engineer ruling, 30 Oct 2026): the (group, peer)
@@ -14186,6 +14560,47 @@ async fn request_treekem_catchup_page(
     group_id: &str,
     peer: &AgentId,
 ) -> bool {
+    // #1685 round 10 (P1 review threads 1 and 2): record the cursor
+    // this ask leaves from BEFORE anything can park or fail, so a
+    // truncated answer is judged against the head its REQUEST was
+    // sent from — not the head it happens to land on after another
+    // peer's page moved it. The alias family is resolved under the
+    // same read that fills the request, so every spelling of the
+    // group a response can carry finds the row.
+    let (from_revision, from_epoch, current_state_hash, fence_aliases) = {
+        let groups = state.named_groups.read().await;
+        let resolved = groups
+            .get_key_value(group_id)
+            .map(|(key, info)| (key.clone(), info.clone()))
+            .or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+                    .map(|(key, info)| (key.clone(), info.clone()))
+            });
+        let Some((register_key, info)) = resolved else {
+            return false;
+        };
+        let mut fence_aliases = vec![
+            group_id.to_string(),
+            register_key,
+            info.mls_group_id.clone(),
+            info.stable_group_id().to_string(),
+        ];
+        fence_aliases.sort();
+        fence_aliases.dedup();
+        (
+            info.state_revision,
+            info.secret_epoch,
+            info.state_hash.clone(),
+            fence_aliases,
+        )
+    };
+    treekem_page_ask_cursor_note(
+        &fence_aliases,
+        &hex::encode(peer.as_bytes()),
+        (from_revision, from_epoch, current_state_hash.clone()),
+    );
     #[cfg(test)]
     {
         detached_send_test_seam::park(&format!("treekem-catchup-page:{group_id}")).await;
@@ -14205,21 +14620,6 @@ async fn request_treekem_catchup_page(
         }
     }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let (from_revision, from_epoch, current_state_hash) = {
-        let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(group_id).or_else(|| {
-            groups
-                .values()
-                .find(|info| info.stable_group_id() == group_id)
-        }) else {
-            return false;
-        };
-        (
-            info.state_revision,
-            info.secret_epoch,
-            info.state_hash.clone(),
-        )
-    };
     let request = TreeKemCatchupRequest {
         message_type: "treekem_catchup_request".to_string(),
         group_id: group_id.to_string(),
@@ -19466,8 +19866,9 @@ pub(in crate::server) async fn apply_listener_metadata_event(
     // record (ADR 0109 §3 step 2); the contained live record keeps its
     // post-advance state until the swap.
     let group_id = named_group_metadata_event_group_id(&event).to_string();
+    let group_id_for_rearm = group_id.clone();
     // Boxed: the apply future is large; keep it off this caller's frame.
-    state
+    let applied = state
         .run_shielded(Box::pin(async move {
             let stagings = &apply_state.reseat_stagings;
             stagings
@@ -19483,7 +19884,18 @@ pub(in crate::server) async fn apply_listener_metadata_event(
                 )
                 .await
         }))
-        .await
+        .await;
+    // #1685 round 10 (P1 review thread 3): a listener apply that
+    // moves the catch-up cursor runs NO replay of its own, so this is
+    // the only seam that can see the movement — a stopped page loop's
+    // premise died with it, and its still-open fence defers rekey
+    // until the armed row is asked again. The check is cheap (no
+    // armed rows, no spawn), never sends inline, and no-ops when the
+    // apply did not move the cursor (refusals, cache updates).
+    if applied.is_some() {
+        maybe_rearm_stopped_treekem_pages(state, &group_id_for_rearm, None).await;
+    }
+    applied
 }
 
 /// Spawn every gossip listener a member needs for a named group.

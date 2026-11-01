@@ -3297,3 +3297,295 @@ async fn an_inline_next_page_ask_that_cannot_send_leaves_no_trace() -> Result<()
     );
     Ok(())
 }
+
+/// #1685 round 10 (P1 review threads 1 and 2 — the stale-ask page):
+/// catch-up asks several peers at once from one cursor, so a peer's
+/// truncated page can land only AFTER another peer's page advanced the
+/// head past the cursor its own ask left from. That page serves
+/// already-applied events plus a still-ahead unapplicable one, nothing
+/// applies, and the arrival cursor equals the post-advance head — the
+/// old no-progress test sampled the cursor at ARRIVAL, stopped this
+/// peer's stream and left its page fence open with no retry, although
+/// a fresh ask from the moved head would fetch a different page. The
+/// stop must hold against the cursor the REQUEST left from: the page
+/// pages on from the moved cursor, and its stream reaches the terminal
+/// page that closes its fence (thread 2: self-leave rekey is not left
+/// deferred behind a fence nothing will close).
+#[tokio::test]
+async fn a_truncated_page_answering_a_pre_advance_ask_pages_on_from_the_moved_cursor() -> Result<()>
+{
+    let group_id = "22".repeat(32);
+    let (mut state, _dir) = secure_endpoint_test_state().await?;
+    super::super::revocation_eviction::zero_restart_wait_for_test(&mut state);
+    let admin_id = state.agent.agent_id();
+    let group_id_bytes = hex::decode(&group_id)?;
+    let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+    let mut admin_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, admin_id, &seed)?;
+    let member_kp = AgentKeypair::generate()?;
+    let member_id = member_kp.agent_id();
+    let member_hex = hex::encode(member_id.as_bytes());
+    let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(member_id, &[9u8; 32])?;
+    let kp_bytes = prepared.key_package_bytes().to_vec();
+    let added = admin_group.add_member(member_id, &kp_bytes)?;
+    let _leaver_group = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &added.welcome)?;
+    let epoch_before = admin_group.epoch();
+
+    let mut info = x0x::groups::GroupInfo::new(
+        "issue1685-stale-ask".to_string(),
+        String::new(),
+        admin_id,
+        group_id.clone(),
+    );
+    info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    info.add_member(
+        member_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(hex::encode(admin_id.as_bytes())),
+        None,
+    );
+    // Peer B: the slow responder whose truncated page lands after peer
+    // A's page advanced the head past the cursor B's ask left from.
+    let other = AgentKeypair::generate()?;
+    let other_id = other.agent_id();
+    let other_hex = hex::encode(other_id.as_bytes());
+    info.add_member(
+        other_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        Some(hex::encode(admin_id.as_bytes())),
+        None,
+    );
+    info.set_member_treekem_key_package(
+        &member_hex,
+        base64::engine::general_purpose::STANDARD.encode(&kp_bytes),
+    );
+    info.secret_epoch = epoch_before;
+    info.security_binding = Some(format!("treekem:epoch={epoch_before}"));
+    info.recompute_state_hash();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+    state.treekem_groups.write().await.insert(
+        group_id.clone(),
+        Arc::new(tokio::sync::Mutex::new(admin_group)),
+    );
+    let fence_ids = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group");
+        [
+            group_id.clone(),
+            info.mls_group_id.clone(),
+            info.stable_group_id().to_string(),
+        ]
+    };
+
+    // The member's linked self-leave — the event peer A's page applies
+    // to advance the head while peer B's ask is in flight.
+    let mut leaving = {
+        let groups = state.named_groups.read().await;
+        groups.get(&group_id).cloned().expect("group")
+    };
+    leaving.roster_revision = leaving.roster_revision.saturating_add(1);
+    let revision = leaving.roster_revision;
+    leaving.remove_member(&member_hex, Some(member_hex.clone()));
+    let commit = leaving.seal_commit(&member_kp, now_millis_u64())?;
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: group_id.clone(),
+        revision,
+        actor: member_hex.clone(),
+        agent_id: member_hex,
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(commit),
+    };
+    let base_cursor = cursor(&state, &group_id).await;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The ask peer B's page will answer leaves from the base head.
+    assert!(
+        request_treekem_catchup_page(&state, &group_id, &other_id).await,
+        "CONTROL: the recorded ask left"
+    );
+    assert_eq!(page_requests(&state), 1, "CONTROL: one ask went out");
+
+    // 2. Peer A's page applies the linked self-leave and moves the head
+    //    past the cursor B's ask left from (its own stream re-requests).
+    handle_treekem_catchup_response(
+        &state,
+        &member_id,
+        &clean_sender_machine(),
+        true,
+        truncated_page(&group_id, event),
+    )
+    .await;
+    let moved_cursor = cursor(&state, &group_id).await;
+    assert_ne!(
+        moved_cursor, base_cursor,
+        "CONTROL: peer A's page advanced the head"
+    );
+    assert_eq!(page_requests(&state), 2, "peer A's own stream re-requests");
+
+    // 3. Peer B's truncated page arrives: its ahead event cannot apply
+    //    (the fork shape), nothing else in it is new, and the cursor
+    //    does not move — but its ask left from the base head, so the
+    //    next ask carries the moved cursor and can still make
+    //    progress. It must PAGE ON, not stop.
+    handle_treekem_catchup_response(
+        &state,
+        &other_id,
+        &clean_sender_machine(),
+        true,
+        truncated_page(
+            &group_id,
+            fork_removal_page_event(&group_id, &other, moved_cursor.0 + 1),
+        ),
+    )
+    .await;
+    assert_eq!(
+        page_requests(&state),
+        3,
+        "the stale-ask page re-requests from the moved cursor instead of stopping"
+    );
+    assert!(
+        state
+            .named_group_test_recorders
+            .catchup_page_stops
+            .lock()
+            .expect("page-stop recorder")
+            .is_empty(),
+        "a page answering a pre-advance ask records no stop"
+    );
+    assert!(
+        treekem_page_stopped_peers(&fence_ids).is_empty(),
+        "no row armed: the peer's stream never stopped"
+    );
+
+    // 4. The live stream reaches the terminal page that closes peer
+    //    B's fence, so the open fence cannot defer self-leave rekey.
+    handle_treekem_catchup_response(
+        &state,
+        &other_id,
+        &clean_sender_machine(),
+        true,
+        terminal_page(&group_id, vec![]),
+    )
+    .await;
+    assert!(
+        !self_leave_rekey_fence_peer_open(&fence_ids, &other_hex),
+        "peer B's terminal page closed its page fence"
+    );
+    Ok(())
+}
+
+/// #1685 round 10 (P1 review thread 3 — the resumed stream): the stop
+/// leaves the peer's fence open and its premise dies wherever the
+/// cursor next MOVES. Round 5 detected movement only inside a replay's
+/// own drain window, so a dependency that arrived through the LISTENER
+/// (a direct apply that runs no replay at all) moved the head with
+/// nothing asking the stopped peer again — the open peer fence
+/// deferred self-leave rekey indefinitely in a quiet group. The stop
+/// now records a resumption baseline and every post-apply seam checks
+/// it; the listener's own apply of the missing link must re-arm the
+/// stopped peer from the moved cursor, and its ask is bounded and
+/// typed like every re-arm.
+#[tokio::test]
+async fn a_listener_applied_advance_rearms_the_stopped_peer() -> Result<()> {
+    let group_id = "23".repeat(32);
+    let pair = issue1685_chain_pair(&group_id, None).await?;
+    let Issue1685ChainPair {
+        state,
+        responder,
+        responder_hex,
+        responder_machine,
+        event1,
+        event2,
+        fence_ids,
+        ..
+    } = pair;
+    state
+        .named_group_test_recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // 1. The responder stops on the ahead event E2 (it only lacks E1):
+    //    the row arms, the fence opens and the resumption baseline is
+    //    recorded at this cursor.
+    let base_cursor = cursor(&state, &group_id).await;
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        truncated_page(&group_id, event2),
+    )
+    .await;
+    assert_eq!(
+        treekem_page_stopped_peers(&fence_ids),
+        vec![responder_hex.clone()],
+        "CONTROL: the responder's stopped row is armed"
+    );
+    assert!(
+        self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "CONTROL: the responder's page fence is open"
+    );
+    assert_eq!(pending_len(&state, &group_id).await, 1, "E2 stays queued");
+
+    // 2. The missing link E1 arrives through the LISTENER — a direct
+    //    apply that runs no replay, the round 10 gap. The head moves;
+    //    the still-queued E2 is not replayed by it. (The author is the
+    //    sender, the gossip shape of a self-leave: the page handler
+    //    resolves the same author for its own applies.)
+    let e1_author = verified_catchup_member_removed_author(&event1)
+        .expect("E1 carries its authenticated author");
+    let applied = apply_listener_metadata_event(&state, event1, e1_author, true, None).await;
+    assert!(applied.is_some(), "CONTROL: the listener apply completed");
+    assert_ne!(
+        cursor(&state, &group_id).await,
+        base_cursor,
+        "CONTROL: E1 advanced the head"
+    );
+    assert_eq!(
+        pending_len(&state, &group_id).await,
+        1,
+        "the listener apply replays nothing: E2 stays queued"
+    );
+
+    // 3. The movement is detected at the listener seam: the stopped
+    //    peer is asked for its next page at the moved cursor (the
+    //    typed re-arm), its row clears on the send, and its fence
+    //    stays open until its own terminal page.
+    assert!(
+        eventually(|| rearm_requests(&state).len() == 1).await,
+        "the listener-applied advance re-armed the stopped peer"
+    );
+    assert_eq!(
+        rearm_requests(&state),
+        vec![(group_id.clone(), responder_hex.clone(), "replay_applied")],
+        "the re-arm names the group, the stopped peer and the typed reason"
+    );
+    assert!(
+        eventually(|| treekem_page_stopped_peers(&fence_ids).is_empty()).await,
+        "the successful re-arm ask cleared the stopped row"
+    );
+
+    // 4. The re-asked stream reaches its terminal page and closes the
+    //    fence — the deferred self-leave rekey is unblocked.
+    handle_treekem_catchup_response(
+        &state,
+        &responder.agent_id(),
+        &responder_machine,
+        true,
+        terminal_page(&group_id, vec![]),
+    )
+    .await;
+    assert!(
+        !self_leave_rekey_fence_peer_open(&fence_ids, &responder_hex),
+        "the resumed stream's terminal page closed the peer fence"
+    );
+    Ok(())
+}
