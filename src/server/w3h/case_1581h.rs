@@ -8,21 +8,24 @@
 //! history copy and an empty replacement written
 //! (`rebuilt_from` names the quarantine transaction), the rebuilt store
 //! re-derives the open row from the verified chain in its first pass —
-//! the row shows the typed `rebuilding_obligation_store` — then the
+//! the row shows the typed `rebuilding_obligation_store`, then the
 //! typed `waiting_for_head_sync` until the new restart sync wait
-//! passes, and the designated A completes the exclusion with exactly
+//! passes — and the designated A completes the exclusion with exactly
 //! one rotation (`result_epoch` e0 + 1, no second rekey).
 //!
-//! The second arm is the row's newer-file variant: a `X0XEVICT3\0`
-//! sidecar (v2 is readable since #1508) and a new self-leave trigger
-//! while the store runs memory-only. ADR 0110 line 451 wants the new
-//! trigger to show `waiting_for_durable_intake`; `main`'s memory-only
-//! shortcut ("every trigger S4 derives today is durable elsewhere",
-//! `revocation_eviction.rs` §5) never shows it, so the arm is wired as
-//! an expected RED with [`CAUSE_NO_DURABLE_WAIT`]. It turns GREEN with
-//! a per-trigger durability check; the divergence is recorded on #1581
-//! by name, and the fix sits in `revocation_eviction.rs`, which open
-//! #1755 fences.
+//! The second arm is the row's newer-file variant, read with ADR 0110
+//! line 378 ("Memory-only durability"): a `X0XEVICT3\0` sidecar (v2 is
+//! readable since #1508) runs memory-only, and a new self-leave
+//! trigger — durable on the verified chain — is sealed without the
+//! `waiting_for_durable_intake` wait (GREEN on main). The arm also
+//! guards the other side of line 378: if the wait ever appears for a
+//! chain-durable trigger, the arm fails with
+//! [`CAUSE_DURABLE_WAIT_SHOWN`]. Line 451's "a new trigger whose
+//! evidence is not yet in the revocation store" names the other kind —
+//! a trigger with no durable record anywhere — and S4 derives no such
+//! trigger today, so that variant is not drivable and is recorded by
+//! name below (the FOR ENGINEER question on the PR body asks David to
+//! confirm this reading of line 451 against line 378).
 //!
 //! Harness honesty:
 //!
@@ -44,12 +47,16 @@
 //!   can never reach the restarted A (left members are not catch-up
 //!   candidates). Recorded by name below.
 //!
-//! Not covered, by name: the `.evjournal` damage between its prepare
-//! and the legacy commit (with and without the landed commit), the
-//! `.evs` case inside an ADR 0094 trial, the no-holder restart form,
-//! the self-revocation and certificate-expiry trigger forms, the fsync
-//! failures at §5a steps 2, 4 and 5, and the row's expiry-only
-//! "derivable set" member. Receipts use `w3h.receipt/1`.
+//! Not covered, by name: line 451's new trigger with no durable record
+//! anywhere (S4 derives no such trigger today — every kind is durable
+//! in the revocation store, on the verified chain or as a committed
+//! certificate, per the §5 comment in `revocation_eviction.rs`); the
+//! `.evjournal` damage between its prepare and the legacy commit (with
+//! and without the landed commit); the `.evs` case inside an ADR 0094
+//! trial; the no-holder restart form; the self-revocation and
+//! certificate-expiry trigger forms; the fsync failures at §5a steps
+//! 2, 4 and 5; and the row's expiry-only "derivable set" member.
+//! Receipts use `w3h.receipt/1`.
 
 #![cfg(test)]
 
@@ -85,22 +92,33 @@ const DAMAGED_BODY: &[u8] = b"X0XEVICT2\0not a postcard body";
 const NEWER_EVS: &[u8] = b"X0XEVICT3\0future layout";
 
 const FINAL_CONTROL: &str = "the_rebuilt_store_rederives_the_open_row_and_completes_one_rotation";
-const FINAL_RED: &str = "the_newer_format_sidecar_holds_the_new_trigger_at_intake";
+const FINAL_NEWER: &str = "the_memory_only_sidecar_seals_the_chain_durable_trigger";
 const CAUSE_NO_REBUILD: &str = "the damaged .evs body was not quarantined and rebuilt: the store \
                                 state, the history copy, the pending copies or the replacement's \
                                 rebuilt_from did not meet ADR 0108 §5a";
 const CAUSE_NO_REBUILDING: &str = "no typed rebuilding_obligation_store: the rebuilt row's first \
                                    passes showed no rebuild wait";
+const CAUSE_NO_HEAD_SYNC: &str = "no typed waiting_for_head_sync: the rebuilt row's waits never \
+                                  named the head while the restart sync wait held it";
 const CAUSE_ROW_LOST: &str = "the rebuilt store did not re-derive and complete the open row: A's \
                               row for B never completed, or the survivors never reached the \
                               single exclusion";
 const CAUSE_SECOND_ROTATION: &str = "the rebuilt completion was not exactly one rotation: the \
                                      survivors moved past e0 + 1, or the row's result_epoch is \
                                      not the survivors' epoch";
-const CAUSE_NO_DURABLE_WAIT: &str = "no typed waiting_for_durable_intake: under the newer-format \
-                                     sidecar the new trigger's wait never named the intake, so \
-                                     main's memory-only shortcut let the trigger act (ADR 0110 \
-                                     line 451)";
+const CAUSE_NEWER_MISCLASSIFIED: &str =
+    "the newer-format .evs was not classified memory-only: the \
+                                         store did not publish sidecar_newer_format with the \
+                                         version detail";
+const CAUSE_NEWER_TOUCHED: &str = "the newer-format .evs was rewritten: ADR 0108 §5a leaves a \
+                                   newer layout untouched, byte-identical";
+const CAUSE_DURABLE_WAIT_SHOWN: &str = "waiting_for_durable_intake shown for a chain-durable \
+                                        self-leave under a memory-only sidecar: ADR 0110's \
+                                        Memory-only durability rule (line 378) seals it without \
+                                        the intake wait";
+const CAUSE_NEWER_ROW_INCOMPLETE: &str = "the chain-durable trigger under the newer file did not \
+                                          complete its one exclusion: the row never completed, \
+                                          or A's epoch is not e0 + 1";
 
 /// `label`'s view of `group`; `None` when it holds no record of it.
 #[derive(Debug, Clone)]
@@ -401,7 +419,7 @@ async fn setup(
 
 /// Open B's self-leave row on A while A sits inside its fresh boot head
 /// gate, so the row stays `pending` with the typed
-/// `waiting_for_head_sync` and cannot seal. Returns `(t_obs, phase)`.
+/// `waiting_for_head_sync` and cannot seal.
 async fn open_held_row(
     sim: &mut Sim,
     receipt: &mut Receipt,
@@ -596,8 +614,42 @@ async fn control_arm(
         at(sim),
     );
 
-    // The row then waits for the new head round and completes with one
-    // rotation.
+    // The row then waits for the new head round — the typed
+    // `waiting_for_head_sync` from the passes after the rebuild flag
+    // cleared until the new restart sync wait passes.
+    let mut head_sync_seen = rebuilding_seen;
+    let head_watch = sim
+        .until(
+            "the rebuilt row shows waiting_for_head_sync",
+            Duration::from_secs(5),
+            async |s: &Sim| {
+                head_sync_seen |= s4_row(s, "A", group, b_hex)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| {
+                        row["waiting"]["cause"].as_str() == Some("waiting_for_head_sync")
+                    });
+                head_sync_seen
+            },
+        )
+        .await;
+    if let Err(error) = head_watch {
+        if !expired(&error) {
+            return Err(error);
+        }
+    }
+    passed &= record_check(
+        receipt,
+        "the_rebuilt_row_names_waiting_for_head_sync",
+        head_sync_seen,
+        CAUSE_NO_HEAD_SYNC,
+        Some("no head-sync wait observed while the restart wait held the row".to_string()),
+        "the row's stored wait through the restart sync window".to_string(),
+        at(sim),
+    );
+
+    // The row then completes with one rotation.
     let _ = sim
         .until("the rebuilt row completes", COMPLETE, async |s: &Sim| {
             s4_row(s, "A", group, b_hex)
@@ -684,11 +736,21 @@ async fn control_arm(
     Ok(())
 }
 
-/// The red arm body: the newer-format `.evs` runs memory-only, a new
-/// self-leave trigger opens a row, and the arm watches for the typed
-/// `waiting_for_durable_intake` ADR 0110 line 451 names.
-async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str, b_hex: &str) -> Result<()> {
+/// The newer-file arm body: the newer-format `.evs` runs memory-only,
+/// a new self-leave trigger — chain-durable — opens a row and is
+/// sealed without the `waiting_for_durable_intake` wait (ADR 0110
+/// line 378, "Memory-only durability"), the file stays untouched and
+/// the exclusion completes with one rotation.
+async fn newer_file_arm(
+    sim: &mut Sim,
+    receipt: &mut Receipt,
+    group: &str,
+    b_hex: &str,
+    e0: u64,
+    leaves0: u32,
+) -> Result<()> {
     let at = |sim: &Sim| sim.fabric().now().as_micros();
+    let mut passed = true;
     sim.stop("A", RestartMode::Crash).await?;
     sim.fabric()
         .mark("case: A stopped; the newer-format .evs is planted");
@@ -715,18 +777,15 @@ async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str, b_hex: &str)
         )
         .await;
     let (state, detail, _) = store_view(sim, "A", group).await?;
-    let classified = state == "sidecar_newer_format" && detail.as_deref() == Some("version 3");
-    receipt.evidence(
+    passed &= record_check(
+        receipt,
         "the_sidecar_runs_memory_only_newer_format",
-        classified,
+        state == "sidecar_newer_format" && detail.as_deref() == Some("version 3"),
+        CAUSE_NEWER_MISCLASSIFIED,
+        Some(format!("state={state} detail={detail:?}")),
         format!("state={state:?} detail={detail:?}; the file must stay untouched"),
         at(sim),
     );
-    if !classified {
-        return Err(anyhow::anyhow!(
-            "the newer-format .evs was not classified: {state} {detail:?}"
-        ));
-    }
 
     // The new trigger: B's self-leave opens a row under the newer file.
     let (status, body) = b_leaves(sim, group).await?;
@@ -737,13 +796,15 @@ async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str, b_hex: &str)
         format!("DELETE /groups/{group} from B: {status}"),
         at(sim),
     );
+    let mut row_pending = false;
     let row_opened = sim
         .until("the new trigger opens a row on A", BOOT, async |s: &Sim| {
-            s4_row(s, "A", group, b_hex)
+            row_pending |= s4_row(s, "A", group, b_hex)
                 .await
                 .ok()
                 .flatten()
-                .is_some_and(|row| row["phase"].as_str() == Some("pending"))
+                .is_some_and(|row| row["phase"].as_str() == Some("pending"));
+            row_pending
         })
         .await;
     if let Err(error) = row_opened {
@@ -751,13 +812,10 @@ async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str, b_hex: &str)
             return Err(error);
         }
     }
-    let row = s4_row(sim, "A", group, b_hex)
-        .await?
-        .context("A's row for B")?;
     receipt.evidence(
         "the_new_trigger_opens_a_row_under_the_newer_file",
-        true,
-        format!("A's S4 row for B under the memory-only store: {row}"),
+        row_pending,
+        "A's public S4 row for B reached `pending` under the memory-only store".to_string(),
         at(sim),
     );
 
@@ -786,27 +844,19 @@ async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str, b_hex: &str)
             return Err(error);
         }
     }
-    let durable_wait_seen = causes.contains("waiting_for_durable_intake");
-    receipt.evidence(
-        "the_newer_file_stays_byte_identical",
-        std::fs::read(&path)? == NEWER_EVS,
-        format!(
-            "the causes the row named: {:?}; final phase {final_phase:?}",
-            causes.iter().collect::<Vec<_>>()
-        ),
-        at(sim),
+    let causes_line = format!(
+        "the causes the row named: {:?}; final phase {final_phase:?}",
+        causes.iter().collect::<Vec<_>>()
     );
-    // The cause records the named failure as confirmed: on main the
-    // typed wait never appears, so the arm is RED. With the §5
-    // durability fix the wait appears, the cause is not confirmed and
-    // the arm passes — flip the CI pin with the fix.
-    receipt.cause(
-        CAUSE_NO_DURABLE_WAIT,
-        Some(format!(
-            "causes seen: {:?}; final phase {final_phase:?}",
-            causes.iter().collect::<Vec<_>>()
-        )),
-        !durable_wait_seen,
+    // ADR 0110 line 378: a chain-durable self-leave seals under a
+    // memory-only file, so the intake wait must not appear for it.
+    passed &= record_check(
+        receipt,
+        "the_chain_durable_trigger_never_waits_for_intake",
+        !causes.contains("waiting_for_durable_intake"),
+        CAUSE_DURABLE_WAIT_SHOWN,
+        Some(causes_line.clone()),
+        causes_line,
         at(sim),
     );
     // A short settle before the teardown: the arm ends while the
@@ -820,7 +870,49 @@ async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str, b_hex: &str)
         },
     )
     .await?;
-    receipt.finish(FINAL_RED, durable_wait_seen, at(sim));
+    let row = s4_row(sim, "A", group, b_hex)
+        .await?
+        .context("A's row for B")?;
+    let view = view_now(sim, "A", group, b_hex).await?;
+    let a_hex = sim.agent_hex("A")?;
+    passed &= record_check(
+        receipt,
+        "the_chain_durable_trigger_completes_one_rotation",
+        row["phase"].as_str() == Some("complete")
+            && row["result_epoch"].as_u64() == Some(e0 + 1)
+            && view.epoch == Some(e0 + 1)
+            && view.leaves == Some(leaves0 - 1)
+            && !view.lists_b
+            && !view.quarantined
+            && view.head_committed_by.as_deref() == Some(a_hex.as_str()),
+        CAUSE_NEWER_ROW_INCOMPLETE,
+        Some(format!(
+            "phase={} result_epoch={:?}; A: {}",
+            row["phase"].as_str().unwrap_or_default(),
+            row["result_epoch"].as_u64(),
+            view.describe()
+        )),
+        format!(
+            "the row: phase={} result_epoch={:?}; A: {}",
+            row["phase"].as_str().unwrap_or_default(),
+            row["result_epoch"].as_u64(),
+            view.describe()
+        ),
+        at(sim),
+    );
+    passed &= record_check(
+        receipt,
+        "the_newer_file_stays_byte_identical",
+        std::fs::read(&path)? == NEWER_EVS,
+        CAUSE_NEWER_TOUCHED,
+        Some(format!("the file at {} changed", path.display())),
+        format!(
+            "the {}-byte {NEWER_EVS:?} form is unchanged after the seal",
+            NEWER_EVS.len()
+        ),
+        at(sim),
+    );
+    receipt.finish(FINAL_NEWER, passed, at(sim));
     Ok(())
 }
 
@@ -854,7 +946,9 @@ async fn run(case: &str, seed: u64, labels: &[&str], arm: Arm) -> Receipt {
                     Arm::Control => {
                         control_arm(&mut sim, &mut receipt, &group, &b_hex, e0, leaves0).await
                     }
-                    Arm::NewerFile => red_arm(&mut sim, &mut receipt, &group, &b_hex).await,
+                    Arm::NewerFile => {
+                        newer_file_arm(&mut sim, &mut receipt, &group, &b_hex, e0, leaves0).await
+                    }
                 },
                 Err(error) => Err(error),
             };
@@ -869,7 +963,7 @@ async fn run(case: &str, seed: u64, labels: &[&str], arm: Arm) -> Receipt {
     }
     let final_name = match arm {
         Arm::Control => FINAL_CONTROL,
-        Arm::NewerFile => FINAL_RED,
+        Arm::NewerFile => FINAL_NEWER,
     };
     if receipt.verdict().is_none() || receipt.has_infra() {
         receipt.reclassify(final_name);
@@ -878,25 +972,13 @@ async fn run(case: &str, seed: u64, labels: &[&str], arm: Arm) -> Receipt {
     receipt
 }
 
-async fn expect(case: &str, seed: u64, labels: &[&str], arm: Arm, want: Verdict) -> Result<()> {
+async fn expect(case: &str, seed: u64, labels: &[&str], arm: Arm) -> Result<()> {
     let receipt = run(case, seed, labels, arm).await;
     ensure!(
-        receipt.verdict() == Some(want),
-        "{case}: expected {want:?}, got {:?}",
+        receipt.verdict() == Some(Verdict::Green),
+        "{case}: expected Green, got {:?}",
         receipt.verdict()
     );
-    // While the §5 durability gap waits for its fix, this arm's RED
-    // must be exactly the typed-intake cause: the CI gate checks only
-    // the verdict, so the test itself names the cause, and any other
-    // RED (an INFRA-grade regression) fails here instead of meeting
-    // the pin.
-    if want == Verdict::Red {
-        ensure!(
-            receipt.named_causes() == [CAUSE_NO_DURABLE_WAIT],
-            "{case}: expected the RED cause {CAUSE_NO_DURABLE_WAIT:?}, got {:?}",
-            receipt.named_causes()
-        );
-    }
     Ok(())
 }
 
@@ -926,17 +1008,18 @@ fn w3h_1581h_control_sidecar_rebuild_body_damage_rederives() -> Result<()> {
             0x1581_000e,
             CONTROL_LABELS,
             Arm::Control,
-            Verdict::Green,
         )
         .await
     })
 }
 
-/// ADR 0110 `s4_sidecar_rebuild`, the newer-file variant: with a
-/// `X0XEVICT3\0` sidecar running memory-only, a new self-leave trigger
-/// must show `waiting_for_durable_intake` (line 451). RED on `main`,
-/// whose memory-only shortcut never shows it (recorded on #1581 by
-/// name); GREEN with a per-trigger durability check.
+/// ADR 0110 `s4_sidecar_rebuild`, the newer-file variant, read with
+/// line 378 ("Memory-only durability"): with a `X0XEVICT3\0` sidecar
+/// running memory-only, a new self-leave trigger — durable on the
+/// verified chain — is sealed without the `waiting_for_durable_intake`
+/// wait, the file stays untouched and the exclusion completes with one
+/// rotation. If the intake wait ever appears for a chain-durable
+/// trigger, the arm fails (line 378 seals it).
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -948,17 +1031,13 @@ fn w3h_1581h_control_sidecar_rebuild_body_damage_rederives() -> Result<()> {
               --run-ignored all); plain suites run unseeded entropy, which is not an \
               observation"
 )]
-fn w3h_1581h_red_sidecar_rebuild_newer_file_intake() -> Result<()> {
+fn w3h_1581h_control_sidecar_rebuild_newer_file_memory_only() -> Result<()> {
     super::block_on_paused(async move {
         expect(
-            "w3h_1581h_red_sidecar_rebuild_newer_file_intake",
+            "w3h_1581h_control_sidecar_rebuild_newer_file_memory_only",
             0x1581_000f,
             RED_LABELS,
             Arm::NewerFile,
-            // RED on main: CAUSE_NO_DURABLE_WAIT — the memory-only
-            // shortcut lets the new trigger act without the typed
-            // intake wait (ADR 0110 line 451).
-            Verdict::Red,
         )
         .await
     })
