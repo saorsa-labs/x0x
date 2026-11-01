@@ -16,8 +16,10 @@ leading "v" stripped. An older, genuinely-signed release served for a newer
 tag is refused before any archive byte executes.
 
 The fixture build is cached under the repo target directory, keyed by a hash
-of its sources; the cached throwaway signing key never leaves that directory.
-A fixture build failure fails the suite; only a missing cargo skips it.
+of its sources; each cache entry keeps its own copy of the binary next to its
+throwaway signing key, so a shared cargo target directory cannot pair one
+entry's key with another entry's binary. A fixture build failure fails the
+suite; only a missing cargo skips it.
 """
 
 from __future__ import annotations
@@ -40,9 +42,66 @@ SIGNATURE_RS = ROOT / "src" / "upgrade" / "signature.rs"
 PLATFORM = "linux-x64-gnu"
 TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
 
-# Minimal PATH: everything install.sh needs, and no host gpg, so the GPG
-# branch never runs against fixture files it cannot check.
-TEST_PATH_SUFFIX = "/usr/bin:/bin"
+# The external commands scripts/install.sh resolves from PATH. The
+# installer's PATH in these tests is a directory holding exactly these, as
+# absolute symlinks — never /usr/bin or /bin wholesale — so a host gpg
+# cannot be found wherever the host keeps it: found, the GPG branch
+# (install.sh:212) demands .asc files the fake release does not serve and
+# the install dies before the manifest gate (Greptile P1 on #1753). `sh` is
+# here too: the fake release's shebangs run `#!/usr/bin/env sh`, and env
+# resolves sh through the child PATH.
+INSTALLER_TOOLS = (
+    "sh",
+    "mktemp",
+    "rm",
+    "tr",
+    "awk",
+    "mkdir",
+    "grep",
+    "tar",
+    "sleep",
+    "cat",
+    "cp",
+    "chmod",
+    "mv",
+    "nohup",
+)
+# install.sh accepts sha256sum (Linux) or shasum (macOS); at least one must
+# resolve. A perl-script shasum still runs: its #! interpreter is absolute
+# and needs no PATH entry.
+CHECKSUM_TOOLS = ("sha256sum", "shasum")
+
+
+def build_installer_tools(
+    dest: Path, source_path: str | None = None, extra: tuple[str, ...] = ()
+) -> Path:
+    """Symlink exactly the tools install.sh looks up on PATH into `dest`,
+    resolving each against `source_path` (default: the ambient PATH); `extra`
+    names further tools the caller's own fakes need. Because `dest` holds
+    only these links, gpg — wherever the host keeps it — is never on the
+    installer's PATH."""
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for tool in (*INSTALLER_TOOLS, *extra, *CHECKSUM_TOOLS):
+        if tool in resolved:
+            continue
+        found = shutil.which(tool, path=source_path)
+        if found is None:
+            if tool not in CHECKSUM_TOOLS:
+                missing.append(tool)
+        else:
+            resolved[tool] = found
+    if missing:
+        raise RuntimeError(
+            f"installer tests need these tools on PATH: {', '.join(missing)}"
+        )
+    if not set(CHECKSUM_TOOLS) & resolved.keys():
+        raise RuntimeError("installer tests need sha256sum or shasum on PATH")
+    dest.mkdir(parents=True, exist_ok=True)
+    for tool, found in resolved.items():
+        os.symlink(found, dest / tool)
+    return dest
+
 
 FIXTURE_MAIN_RS = """#[allow(dead_code)]
 // Copied next to this file by the test harness: the real
@@ -148,9 +207,12 @@ def build_fixture() -> tuple[Path, Path]:
     """Compile the manifest signing/verification fixture and return
     (binary, secret-key) paths. Cached per source hash. The key pair is a
     throwaway fixture key, never a release key. The cache key contains no
-    absolute paths, so every checkout of this repo shares one cache root —
-    and therefore one binary/key pairing, which lives in the shared cargo
-    target directory."""
+    absolute paths, so every checkout of this repo shares one cache root.
+    Each entry keeps its own copy of the finished binary next to its key:
+    cargo writes every source hash to one output path in a shared target
+    directory (CARGO_TARGET_DIR, or a global build.target-dir), so a cache
+    that served that path could pair another entry's freshly keyed binary
+    with this entry's secret key (Greptile P2 on #1753)."""
     sources = {
         "Cargo.toml": FIXTURE_CARGO_TOML,
         "build.rs": FIXTURE_BUILD_RS,
@@ -166,12 +228,13 @@ def build_fixture() -> tuple[Path, Path]:
         )
     ).hexdigest()[:16]
     root = target_root() / "install-test-fixture" / digest
-    binary = cargo_output_dir(root) / "install-manifest-fixture"
+    build_output = cargo_output_dir(root) / "install-manifest-fixture"
+    binary = root / "install-manifest-fixture"
     public = root / "public-key.bin"
     secret = root / "test-signing-secret.bin"
-    # The stamp is written only after the feature build; without it, a
-    # half-finished cache could serve the stage-1 binary, which embeds the
-    # production key and would refuse every fixture signature.
+    # The stamp is written only after the entry's binary copy exists; without
+    # it, a half-finished cache could serve the stage-1 binary, which embeds
+    # the production key and would refuse every fixture signature.
     stamp = root / ".feature-build-done"
     if stamp.exists() and binary.exists() and public.exists() and secret.exists():
         return binary, secret
@@ -215,12 +278,16 @@ def build_fixture() -> tuple[Path, Path]:
     # trusts exactly the fixture key pair.
     cargo("--offline")
     subprocess.run(
-        [binary, "keygen", str(public), str(secret)],
+        [build_output, "keygen", str(public), str(secret)],
         check=True,
         cwd=root,
         timeout=60,
     )
     cargo("--offline", "--features", "upgrade-test-signing")
+    # Pin this entry's binary/key pairing before the stamp: the cargo output
+    # path may be shared across source hashes and worktrees, so the entry
+    # must serve its own copy, not that path.
+    shutil.copy2(build_output, binary)
     stamp.write_text("ok", encoding="utf-8")
     return binary, secret
 
@@ -265,6 +332,9 @@ class InstallManifestVerifyTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         if shutil.which("cargo") is None:
             raise unittest.SkipTest("cargo is required to build the manifest fixture")
+        tools = tempfile.TemporaryDirectory(prefix="x0x-installer-tools-")
+        cls.addClassCleanup(tools.cleanup)
+        cls.tools_dir = build_installer_tools(Path(tools.name))
         # A failed fixture build must fail the suite, not skip it: the gate
         # these tests pin is only as good as its evidence.
         cls.verifier, cls.secret = build_fixture()
@@ -311,6 +381,7 @@ class InstallManifestVerifyTests(unittest.TestCase):
         secret: Path | None = None,
         archive_probe_delegates: bool = True,
         tag: str | None = "v0.48.0",
+        tools_dir: Path | None = None,
     ) -> tuple[int, str, Path, Path]:
         """Build a fake release, serve it through a fake curl, run install.sh
         in a scratch HOME, and return (rc, combined output, probe-calls log,
@@ -325,8 +396,10 @@ class InstallManifestVerifyTests(unittest.TestCase):
         `archive_probe_delegates=False` the release's x0x accepts any
         manifest, isolating the installed-verifier preference. `tag` is the
         tag_name the fake GitHub API serves for the "latest" release (None:
-        the API answers nothing). The manifest signature is real: signed by
-        the fixture key the verifier binary embeds."""
+        the API answers nothing). `tools_dir` overrides the class's tool
+        directory (the gpg guard resolves one from a simulated host). The
+        manifest signature is real: signed by the fixture key the verifier
+        binary embeds."""
         fake_bin = tmp / "fake-bin"
         archive_dir = tmp / "archive" / f"x0x-{PLATFORM}"
         home = tmp / "home"
@@ -435,7 +508,7 @@ esac
             {
                 "HOME": str(home),
                 "XDG_DATA_HOME": str(tmp / "data"),
-                "PATH": f"{fake_bin}{os.pathsep}{TEST_PATH_SUFFIX}",
+                "PATH": f"{fake_bin}{os.pathsep}{tools_dir or self.tools_dir}",
                 "TMPDIR": str(tmp),
                 "PROBE_CALLS": str(probe_calls),
             }
@@ -493,6 +566,79 @@ esac
                 self.assertEqual(
                     probe_calls.read_text(encoding="utf-8").splitlines(), ["probe"]
                 )
+
+    def test_installer_path_excludes_host_gpg(self) -> None:
+        # Greptile P1 on #1753: Linux commonly keeps gpg in /usr/bin, so a
+        # PATH holding that directory verbatim finds the host gpg; the GPG
+        # branch (install.sh:212) then demands .asc files this fake release
+        # does not serve and the install dies before the manifest gate.
+        # Simulate exactly that host — every tool plus a gpg in one
+        # directory — and prove the built tool set keeps gpg off the
+        # installer's PATH while the good path still reaches the gate.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            simulated_usr_bin = tmp / "usr-bin"
+            simulated_usr_bin.mkdir()
+            for tool in (*INSTALLER_TOOLS, *CHECKSUM_TOOLS):
+                found = shutil.which(tool)
+                if found is not None:
+                    os.symlink(found, simulated_usr_bin / tool)
+            write_executable(
+                simulated_usr_bin / "gpg", "#!/usr/bin/env sh\nexit 0\n"
+            )
+            host_path = (
+                f"{simulated_usr_bin}{os.pathsep}{os.environ.get('PATH', os.defpath)}"
+            )
+            # The simulated host really exposes gpg on PATH — the failure
+            # mode of putting whole system directories there.
+            self.assertIsNotNone(shutil.which("gpg", path=host_path))
+            tools_dir = build_installer_tools(tmp / "tools", source_path=host_path)
+            self.assertIsNone(shutil.which("gpg", path=str(tools_dir)))
+            rc, output, probe_calls, bin_dir = self.run_installer(
+                tmp, manifest_bytes, tools_dir=tools_dir
+            )
+            self.assertEqual(rc, 0, output)
+            self.assertIn("ML-DSA-65 manifest signature verified", output)
+
+    def test_cached_verifier_is_entry_local_not_the_shared_cargo_output(self) -> None:
+        # Greptile P2 on #1753: with CARGO_TARGET_DIR (or a global
+        # build.target-dir) every source hash compiles to the same
+        # debug/install-manifest-fixture, so another worktree's later build
+        # can leave a differently keyed binary at that path while this
+        # entry's stamp and secret survive. The cache must serve the entry's
+        # own copy, so replacing whatever sits at the shared output path
+        # changes nothing.
+        shared = cargo_output_dir(self.verifier.parent) / "install-manifest-fixture"
+        original = shared.read_bytes()
+        try:
+            write_executable(shared, "#!/usr/bin/env sh\nexit 1\n")
+            binary, secret = build_fixture()
+            self.assertNotEqual(binary, shared)
+            self.assertTrue(
+                binary.is_relative_to(target_root() / "install-test-fixture"),
+                binary,
+            )
+            # And the pair still works: a manifest signed by the returned
+            # secret verifies under the returned binary.
+            with tempfile.TemporaryDirectory() as tmpdir:
+                scratch = Path(tmpdir) / "signing"
+                scratch.mkdir()
+                manifest = scratch / "release-manifest.json"
+                signature = scratch / "release-manifest.json.sig"
+                manifest.write_bytes(manifest_bytes("0" * 64))
+                subprocess.run(
+                    [str(binary), "sign", str(manifest), str(secret), str(signature)],
+                    check=True,
+                    timeout=60,
+                )
+                subprocess.run(
+                    [str(binary), "verify", str(manifest), str(signature)],
+                    check=True,
+                    timeout=60,
+                )
+        finally:
+            shared.write_bytes(original)
+            shared.chmod(0o755)
 
     # name, manifest (None/bytes/factory), served override, missing release
     # files, expected output needles, whether the probe gets to run at all,

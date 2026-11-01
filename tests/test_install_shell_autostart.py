@@ -7,21 +7,31 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_install_manifest_verify import build_installer_tools
+
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SH = ROOT / "scripts" / "install.sh"
 PLATFORM = "linux-x64-gnu"
 TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
 
-# Deliberately minimal PATH: everything install.sh needs lives in /usr/bin and
-# /bin, and this keeps a host gpg out of the test, so the gpg branch never
-# runs against fixture files it cannot check.
-TEST_PATH_SUFFIX = "/usr/bin:/bin"
+
+def installer_tools(tmp: Path) -> Path:
+    """The PATH half next to each test's fake binaries: exactly the tools
+    scripts/install.sh resolves from PATH (see
+    test_install_manifest_verify.build_installer_tools) plus python3, which
+    the fake sleep delegates to. Never /usr/bin or /bin wholesale: on a host
+    with gpg there, the GPG branch (install.sh:212) would demand .asc files
+    the fake release does not serve and the install would die before the
+    checks these tests pin (Greptile P1 on #1753)."""
+    return build_installer_tools(tmp / "installer-tools", extra=("python3",))
 
 
 def write_executable(path: Path, contents: str) -> None:
@@ -196,7 +206,7 @@ esac
                 {
                     "HOME": str(home),
                     "XDG_DATA_HOME": str(data_home),
-                    "PATH": f"{fake_bin}{os.pathsep}{TEST_PATH_SUFFIX}",
+                    "PATH": f"{fake_bin}{os.pathsep}{installer_tools(tmp)}",
                     "TMPDIR": str(tmp),
                     "XOX_CALLS": str(calls),
                     "XOXD_CALLS": str(daemon_calls),
@@ -234,7 +244,7 @@ esac
                 {
                     "HOME": str(home),
                     "XDG_DATA_HOME": str(data_home),
-                    "PATH": TEST_PATH_SUFFIX,
+                    "PATH": str(installer_tools(tmp)),
                     "TMPDIR": str(tmp),
                 }
             )
@@ -311,7 +321,7 @@ printf '%s\\n' stale-daemon
                 {
                     "HOME": str(home),
                     "XDG_DATA_HOME": str(data_home),
-                    "PATH": f"{fake_bin}{os.pathsep}{TEST_PATH_SUFFIX}",
+                    "PATH": f"{fake_bin}{os.pathsep}{installer_tools(tmp)}",
                     "TMPDIR": str(tmp),
                     "NOHUP_CALLS": str(nohup_calls),
                 }
@@ -390,7 +400,7 @@ printf '%s\\n' "127.0.0.1:65535" > "$DIR/api.port"
                 {
                     "HOME": str(home),
                     "XDG_DATA_HOME": str(data_home),
-                    "PATH": f"{fake_bin}{os.pathsep}{TEST_PATH_SUFFIX}",
+                    "PATH": f"{fake_bin}{os.pathsep}{installer_tools(tmp)}",
                     "TMPDIR": str(tmp),
                 }
             )
