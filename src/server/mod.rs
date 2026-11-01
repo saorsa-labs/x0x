@@ -5012,7 +5012,11 @@ async fn handle_predecessor_relay_typed_payload_inner(
                                 "ADR 0028: rollback is visible but not directory-durable after admission failure"
                             );
                         }
-                        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                        Ok(
+                            AtomicWriteOutcome::NotReplaced
+                            | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                        )
+                        | Err(_) => {
                             tracing::error!(
                                 group_id = %group_id_str,
                                 "ADR 0028: rollback was not replaced after admission failure"
@@ -5103,7 +5107,11 @@ async fn handle_predecessor_relay_typed_payload_inner(
                                     "ADR 0028: rollback is visible but not directory-durable after outbox save failure"
                                 );
                             }
-                            Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                            Ok(
+                                AtomicWriteOutcome::NotReplaced
+                                | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                            )
+                            | Err(_) => {
                                 tracing::error!(
                                     group_id = %group_id_str,
                                     "ADR 0028: rollback was not replaced after outbox save failure"
