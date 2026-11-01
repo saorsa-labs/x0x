@@ -122,40 +122,55 @@ impl UpgradeMonitor {
     /// Check GitHub for a newer release with a signed manifest.
     ///
     /// Returns `Some(VerifiedRelease)` if a newer version is available with a valid
-    /// signed manifest, `None` otherwise.
+    /// signed manifest, `None` otherwise. A current or older release still has a
+    /// published version; [`Self::fetch_release_for_check`] keeps it.
     pub async fn check_for_updates(&self) -> Result<Option<VerifiedRelease>, UpgradeError> {
+        Ok(self.fetch_release_for_check().await?.update)
+    }
+
+    /// Fetched GitHub release, including when it is not an update.
+    ///
+    /// `check_for_updates` returns only `update`. Callers that print the
+    /// published version use this so a current CLI does not hide the release.
+    pub(crate) async fn fetch_release_for_check(&self) -> Result<FetchedRelease, UpgradeError> {
         let release = self.fetch_latest_github_release().await?;
-
-        let latest_version_str = version_from_tag(&release.tag_name);
-        let latest_version = Version::parse(latest_version_str).map_err(|e| {
-            UpgradeError::ManifestFetchFailed(format!(
-                "Invalid version in tag '{}': {e}",
-                release.tag_name
-            ))
-        })?;
-
-        if latest_version <= self.current_version {
-            debug!(
-                current_version = %self.current_version,
-                "Already on latest version {}",
-                self.current_version
-            );
-            return Ok(None);
-        }
-
-        info!(
-            current_version = %self.current_version,
-            new_version = %latest_version,
-            "New version available: {}",
-            latest_version
-        );
-
-        // Fetch and verify the signed manifest
-        match self.fetch_verified_manifest(&release).await {
-            Ok(verified) => Ok(Some(verified)),
-            Err(e) => {
-                warn!(error = %e, "Failed to fetch/verify release manifest, falling back to skip");
-                Err(e)
+        match version_when_not_newer(&self.current_version, &release.tag_name)? {
+            Some(version) => {
+                debug!(
+                    current_version = %self.current_version,
+                    release_version = %version,
+                    "Already on latest version {}",
+                    self.current_version
+                );
+                Ok(FetchedRelease {
+                    version,
+                    update: None,
+                })
+            }
+            None => {
+                let latest_version = version_from_tag(&release.tag_name);
+                info!(
+                    current_version = %self.current_version,
+                    new_version = %latest_version,
+                    "New version available: {}",
+                    latest_version
+                );
+                match self.fetch_verified_manifest(&release).await {
+                    Ok(verified) => {
+                        let version = verified.manifest.version.clone();
+                        Ok(FetchedRelease {
+                            version,
+                            update: Some(verified),
+                        })
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to fetch/verify release manifest, falling back to skip"
+                        );
+                        Err(e)
+                    }
+                }
             }
         }
     }
@@ -310,6 +325,34 @@ impl UpgradeMonitor {
     }
 }
 
+/// A fetched GitHub release and, when it is newer, its verified manifest.
+pub(crate) struct FetchedRelease {
+    /// Tag version when this binary is current or ahead. Manifest version
+    /// when a newer release verified.
+    pub version: String,
+    /// Set only when the release is newer and its manifest verifies.
+    pub update: Option<VerifiedRelease>,
+}
+
+/// Published semver from `tag` when that release is not newer than `current`.
+///
+/// `Ok(None)` means the tag is newer, so the caller verifies the manifest and
+/// uses that version. `Ok(Some)` is the version a current check must keep.
+pub(crate) fn version_when_not_newer(
+    current: &Version,
+    tag: &str,
+) -> Result<Option<String>, UpgradeError> {
+    let published = version_from_tag(tag);
+    let latest = Version::parse(published).map_err(|e| {
+        UpgradeError::ManifestFetchFailed(format!("Invalid version in tag '{tag}': {e}"))
+    })?;
+    if latest <= *current {
+        Ok(Some(published.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Strip the `v` prefix from a git tag to get the semver version.
 pub fn version_from_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
@@ -379,6 +422,63 @@ mod tests {
         assert_eq!(version_from_tag("v0.4.0"), "0.4.0");
         assert_eq!(version_from_tag("0.4.0"), "0.4.0");
         assert_eq!(version_from_tag("v1.2.3-rc1"), "1.2.3-rc1");
+    }
+
+    #[test]
+    fn version_when_not_newer_keeps_the_published_release() {
+        let current = Version::parse("1.2.3").unwrap();
+        assert_eq!(
+            version_when_not_newer(&current, "v1.2.3")
+                .unwrap()
+                .as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            version_when_not_newer(&current, "v1.0.0")
+                .unwrap()
+                .as_deref(),
+            Some("1.0.0"),
+            "a local build ahead of the release still keeps that release"
+        );
+        assert!(version_when_not_newer(&current, "v1.3.0")
+            .unwrap()
+            .is_none());
+        assert!(version_when_not_newer(&current, "not-a-version").is_err());
+    }
+
+    #[tokio::test]
+    async fn current_release_keeps_the_published_release() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await.unwrap();
+                let body = br#"{"tag_name":"v1.2.3","assets":[]}"#;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+            }
+        });
+
+        let mut current = UpgradeMonitor::new("owner/repo", "x0x", "1.2.3").unwrap();
+        current.api_base = format!("http://{addr}");
+        let fetched = current.fetch_release_for_check().await.unwrap();
+        assert_eq!(fetched.version, "1.2.3");
+        assert!(fetched.update.is_none());
+        assert!(current.check_for_updates().await.unwrap().is_none());
+
+        let mut ahead = UpgradeMonitor::new("owner/repo", "x0x", "1.4.0").unwrap();
+        ahead.api_base = format!("http://{addr}");
+        let fetched = ahead.fetch_release_for_check().await.unwrap();
+        assert_eq!(fetched.version, "1.2.3");
+        assert!(fetched.update.is_none());
     }
 
     #[test]

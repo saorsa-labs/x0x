@@ -47,7 +47,8 @@ pub(crate) struct CheckFacts<'a> {
     pub daemon_version: Option<&'a str>,
     pub release_version: Option<&'a str>,
     pub force: bool,
-    /// Set when the release list has nothing newer and the release version was not fetched.
+    /// Set when the fetched release is not newer than this CLI.
+    /// The published version is still in `release_version`.
     pub already_current: bool,
     /// Set when `--force` finds no GitHub release.
     pub missing_release: bool,
@@ -278,9 +279,11 @@ pub async fn run(
             Err(e) => fetch_error = Some(e),
         }
     } else {
-        match monitor.check_for_updates().await {
-            Ok(Some(verified)) => release_version = Some(verified.manifest.version),
-            Ok(None) => already_current = true,
+        match monitor.fetch_release_for_check().await {
+            Ok(fetched) => {
+                already_current = fetched.update.is_none();
+                release_version = Some(fetched.version);
+            }
             Err(e) => fetch_error = Some(e),
         }
     }
@@ -1209,6 +1212,51 @@ mod tests {
         });
         assert!(missing.contains("No release found on GitHub."), "{missing}");
         assert!(!missing.contains("Update available"), "{missing}");
+    }
+
+    #[test]
+    fn current_check_prints_the_published_release() {
+        let current = check_report(&CheckFacts {
+            cli_version: "1.2.3",
+            cli_path: None,
+            daemon_exe: None,
+            split: SplitView::Unknown,
+            daemon_version: Some("1.2.3"),
+            release_version: Some("1.2.3"),
+            force: false,
+            already_current: true,
+            missing_release: false,
+        });
+        assert!(current.contains("Release v1.2.3"), "{current}");
+        assert!(
+            current.contains("Already on the latest version (v1.2.3)."),
+            "{current}"
+        );
+        assert!(!current.contains("Update available"), "{current}");
+        assert!(
+            !current.contains("is not newer than"),
+            "a normal current check names the release without the force line: {current}"
+        );
+
+        let ahead = check_report(&CheckFacts {
+            cli_version: "1.4.0",
+            cli_path: None,
+            daemon_exe: None,
+            split: SplitView::Beside,
+            daemon_version: Some("1.2.3"),
+            release_version: Some("1.2.3"),
+            force: false,
+            already_current: true,
+            missing_release: false,
+        });
+        assert!(ahead.contains("x0x v1.4.0"), "{ahead}");
+        assert!(ahead.contains("Daemon v1.2.3"), "{ahead}");
+        assert!(ahead.contains("Release v1.2.3"), "{ahead}");
+        assert!(
+            ahead.contains("Already on the latest version (v1.4.0)."),
+            "{ahead}"
+        );
+        assert!(!ahead.contains("Update available"), "{ahead}");
     }
 
     #[test]

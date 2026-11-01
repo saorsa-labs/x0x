@@ -128,9 +128,11 @@ instance when neither is set. The address comes from the same discovery as
 the other CLI commands. That includes `127.0.0.1:12700` when no port file
 exists. `localhost` and `127.0.0.1` are the same endpoint. The request stays
 on loopback and does not use a proxy. `--check` still completes when no
-daemon answers. `--check --force` fetches the current release and compares
-versions. It prints "Update available" only when that release is strictly
-newer than this CLI. An equal, older or unparseable release is not an update.
+daemon answers. A normal check prints the published release version from the
+release tag even when that release is not newer than this CLI. `--check
+--force` fetches the current release manifest and compares versions. It
+prints "Update available" only when that release is strictly newer than this
+CLI. An equal, older or unparseable release is not an update.
 
 The check compares this CLI with the executable of that running daemon.
 It resolves both paths to their real directories, so a symlink to the CLI
