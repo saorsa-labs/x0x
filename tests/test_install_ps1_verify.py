@@ -32,6 +32,7 @@ import contextlib
 import functools
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -48,6 +49,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_install_manifest_verify import build_fixture, manifest_bytes, write_executable
 
 ROOT = Path(__file__).resolve().parents[1]
+# CSI sequences such as "\x1b[31;1m" from pwsh's coloured error display.
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 INSTALL_PS1 = ROOT / "scripts" / "install.ps1"
 EVIDENCE_PWSH = Path.home() / "x0x-zcode" / "evidence" / "1355" / "tools" / "pwsh" / "pwsh"
 EVIDENCE_SCRATCH = Path.home() / "x0x-zcode" / "evidence" / "1355" / "ps1scratch"
@@ -300,6 +303,11 @@ class InstallPs1VerifyTests(unittest.TestCase):
             env.update(
                 {
                     "PROBE_CALLS": str(probe_calls),
+                    # pwsh on the GitHub runner renders errors with ANSI
+                    # colour even when stderr is a pipe; the escapes land
+                    # inside wrapped throw messages and split the needles.
+                    # NO_COLOR sets $PSStyle.OutputRendering to PlainText.
+                    "NO_COLOR": "1",
                     # An empty PATH keeps host gpg out of the script: the GPG
                     # branch downloads files this fake release does not
                     # carry. The probe exes run by absolute path.
@@ -338,10 +346,12 @@ class InstallPs1VerifyTests(unittest.TestCase):
 
     @staticmethod
     def flat(output: str) -> str:
-        """Collapse whitespace and the `|` gutters of pwsh's error display:
-        long throw messages wrap across lines, so needles must not depend
-        on where the wrap falls. No needle contains a pipe."""
-        return " ".join(output.replace("|", " ").split())
+        """Remove ANSI escapes, then collapse whitespace and the `|` gutters
+        of pwsh's error display: long throw messages wrap across lines, so
+        needles must not depend on where the wrap falls. No needle contains
+        a pipe. The escape strip backs up NO_COLOR for pwsh builds that
+        colour their output anyway."""
+        return " ".join(ANSI_ESCAPE.sub("", output).replace("|", " ").split())
 
     def assert_refused(
         self,
