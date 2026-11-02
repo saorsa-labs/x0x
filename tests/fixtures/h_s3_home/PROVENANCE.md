@@ -41,8 +41,10 @@ The H-S3-home gate (#1571) starts the released binaries on copies of them.
 ## Not deterministic
 
 ML-DSA signatures, the random agent and machine keys, and timestamps change
-on each run. The layout and the placeholder form do not change. If you
-generate the fixture again, update the hashes below.
+on each run. The layout and the placeholder form do not change. The
+generator replaces only the variant directories and `manifest.json`; it
+keeps this file. If you generate the fixture again, update the hashes
+below: `h_s3_home_provenance_matches_files` fails until they match.
 
 ## ADR 0085 rule 6 status
 
