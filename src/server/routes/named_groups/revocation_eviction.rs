@@ -6448,6 +6448,79 @@ pub(super) mod tests {
         Ok(())
     }
 
+    /// #1023 (Claude review at 8adc863e, blocking; ADR 0110 §1a: an admin
+    /// whose own certificate is expired may not seal): the held-creator S4
+    /// pass lets OTHER admins seal past a held creator, never the held
+    /// creator itself. A held creator is `DigestPending`, not `Failed`, so
+    /// without the signer check the queued-ban drain (which checks only
+    /// admin rank and head sync) let an expired creator seal a ban.
+    #[tokio::test]
+    async fn a_held_creator_cannot_sign_an_s4_seal() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let now_ms = now_unix_ms();
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let signing_kp = state.agent.identity().agent_keypair();
+        // THIS node is the creator, and its own certificate is expired.
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let expired_local = x0x::identity::AgentCertificate::issue_with_expiry(
+            &owner,
+            signing_kp,
+            Some(now_ms / 1000 - 3_600),
+        )?;
+        let other_admin = x0x::identity::AgentKeypair::generate()?;
+        let other_hex = hex::encode(other_admin.agent_id().as_bytes());
+        let other_cert = x0x::identity::AgentCertificate::issue(&owner, &other_admin)?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let target_hex = hex::encode(target.agent_id().as_bytes());
+        let target_cert = x0x::identity::AgentCertificate::issue(&owner, &target)?;
+
+        let mut info = GroupInfo::new(
+            "s4-held-signer".into(),
+            String::new(),
+            state.agent.agent_id(),
+            "a8".repeat(16),
+        );
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        info.set_member_certificate(&local_hex, expired_local)
+            .expect("the creator's seat binds its certificate");
+        info.add_member(other_hex.clone(), GroupRole::Admin, None, None);
+        info.set_member_certificate(&other_hex, other_cert)
+            .expect("the admin's seat binds its certificate");
+        info.add_member(target_hex.clone(), GroupRole::Member, None, None);
+        info.set_member_certificate(&target_hex, target_cert)
+            .expect("the target's seat binds its certificate");
+        info.recompute_state_hash();
+        assert!(
+            info.creator_expired_certificate_hold(&local_hex, now_ms / 1000),
+            "premise: this node is the held creator"
+        );
+        info.remove_member(&target_hex, Some(local_hex.clone()));
+        let scope = EvictionSealScope {
+            stable_group_id: info.stable_group_id().to_string(),
+            target_hex: target_hex.clone(),
+            pending_targets: BTreeSet::new(),
+            prepared_removal: false,
+        };
+        let sealed = S4_EVICTION_SEAL
+            .scope(
+                scope,
+                crate::server::routes::named_groups::seal_commit_owner_certified(
+                    &state, &mut info, signing_kp, now_ms,
+                ),
+            )
+            .await;
+        match sealed {
+            Err(x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
+                members, ..
+            }) => assert_eq!(members, vec![local_hex.clone()]),
+            other => panic!("a held creator may not sign the S4 seal: {other:?}"),
+        }
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
     /// ADR 0110 §1a hand-off evidence (#1508 review P2 #5): a verified
     /// expiry hand-off carries the bytes of a digest-only seat's committed
     /// certificate. The receiver verifies and installs them, and its

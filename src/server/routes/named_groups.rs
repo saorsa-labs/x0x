@@ -32275,6 +32275,13 @@ async fn seal_owner_certified_unbounded(
         let now_unix = evidence.now_unix();
         let in_grace = verdict.in_grace();
         let digest_pending = verdict.digest_pending();
+        // ADR 0110 §1a: an admin whose own certificate is expired may not
+        // seal. A held creator is DigestPending, not Failed, so the S4
+        // passes below must refuse it as the signer themselves.
+        let signer_is_held_creator = info.creator_expired_certificate_hold(
+            &hex::encode(signing_kp.agent_id().as_bytes()),
+            now_unix,
+        );
         let failed = verdict.failed();
         if !failed.is_empty() {
             let members: Vec<String> = failed.iter().map(|(hex, _)| hex.clone()).collect();
@@ -32290,6 +32297,7 @@ async fn seal_owner_certified_unbounded(
             // seal while the group's other open S4 targets still fail; each
             // gets its own transition (ADR-0038 B3, no prune).
             if in_grace.is_empty()
+                && !signer_is_held_creator
                 && !pending_blocks_seal
                 && revocation_eviction::s4_eviction_seal_tolerates(info, &members)
             {
@@ -32310,6 +32318,7 @@ async fn seal_owner_certified_unbounded(
         // creator does not block the removal's seal (see
         // `s4_eviction_seal_passes_a_held_creator`).
         if in_grace.is_empty()
+            && !signer_is_held_creator
             && revocation_eviction::s4_eviction_seal_passes_a_held_creator(
                 info,
                 &digest_pending,
