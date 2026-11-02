@@ -30761,8 +30761,10 @@ async fn owner_certified_seal_with_eviction(
         info.owner_cert_verdict(&evidence)
     };
     // The members that remain seated once the Failed set is gone: Clean ∪
-    // InGrace, per the operation's single verdict.
-    let in_grace_initially = !verdict.in_grace().is_empty();
+    // InGrace ∪ DigestPending, per the operation's single verdict. A
+    // digest-pending seat (a digest-only seat, or a held creator, #1023)
+    // is not Clean, so it keeps the restore quarantine set like InGrace.
+    let pending_initially = !verdict.in_grace().is_empty() || !verdict.digest_pending().is_empty();
     // Work queue: EXACTLY the operation-verdict's Failed set, evicted one
     // member per sealed transition. The verdict is frozen for this
     // operation — no re-evaluation, so mid-operation grace expiry cannot
@@ -30780,12 +30782,13 @@ async fn owner_certified_seal_with_eviction(
                 //
                 // Round-5 quarantine rule (documented): the operation ends
                 // with every remaining member Clean IN THE OPERATION'S
-                // VERDICT iff no member was InGrace initially — the Failed
+                // VERDICT iff no member was InGrace or DigestPending
+                // initially (#1023: a held creator is DigestPending) — the Failed
                 // set is fully evicted and the rest were Clean at
                 // evaluation. Exactly then the restore quarantine lifts,
                 // here, explicitly (no clean seal is minted to do it).
                 // Otherwise it stays set until a later all-clean seal.
-                if !in_grace_initially {
+                if !pending_initially {
                     // ADR-0064 slice 4 r2 (review item 3): the flag AND
                     // the eviction-arm marker clear happen ONLY inside
                     // the persist transaction — no pre-transaction
@@ -32268,7 +32271,8 @@ async fn seal_owner_certified_unbounded(
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {
         let group_id = info.stable_group_id().to_string();
-        let now_unix = now_ms / 1000;
+        // The hold is re-checked at the verdict's own evidence time.
+        let now_unix = evidence.now_unix();
         let in_grace = verdict.in_grace();
         let digest_pending = verdict.digest_pending();
         let failed = verdict.failed();

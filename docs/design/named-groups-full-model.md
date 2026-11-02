@@ -1261,12 +1261,17 @@ both sites (`apply_reconstructed_roster`, `hydrate_member_certificates`).
 Bytes that hash to a different digest never seat. Snapshot equality
 covers the committed fields only, so the bytes never change a
 comparison. The signed root does not move. Invite links stay
-digest-only, because of the direct message budget. The seal gate is
-unchanged: a certificate that no link carried still blocks the seal with
-`OwnerCertMemberPending`.
+digest-only, because of the direct message budget. A certificate that no
+link carried still blocks the seal with `OwnerCertMemberPending`. The one
+exception is the held creator in an S4 removal or ban (see below).
 
 The creator seat never becomes eviction-eligible from its own expired
 certificate alone (Engineer ruling of 1 Nov 2026): the verdict holds the
 seat at `DigestPending`, the S4 expiry trigger skips it, and an expiry
 row persisted by an earlier build ends with `creator_seat_exempt`. An
 ordinary member's expired certificate stays eviction-eligible as before.
+The held creator does not block an S4 removal or ban: when the working
+copy has excluded its target and every digest-pending seat is a held
+creator, that seal goes through. Ordinary seals still refuse with
+`OwnerCertMemberPending`, and the restore quarantine stays set while any
+seat is digest-pending.

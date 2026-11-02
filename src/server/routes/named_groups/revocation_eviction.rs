@@ -6386,6 +6386,41 @@ pub(super) mod tests {
             other => panic!("an ordinary seal refuses on the held creator: {other:?}"),
         }
 
+        // A held creator alongside a genuinely digest-pending seat: the S4
+        // pass needs EVERY pending seat to be a held creator, so this
+        // still refuses (red if the check were weakened to "any").
+        let mut with_pending = info.clone();
+        let other = x0x::identity::AgentKeypair::generate()?;
+        let other_hex = hex::encode(other.agent_id().as_bytes());
+        let other_cert = x0x::identity::AgentCertificate::issue(&owner, &other)?;
+        with_pending.add_member(other_hex.clone(), GroupRole::Member, None, None);
+        with_pending
+            .members_v2
+            .get_mut(&other_hex)
+            .expect("pending seat")
+            .certificate_digest =
+            Some(x0x::groups::owner_cert::certificate_digest_hex(&other_cert));
+        let mixed = S4_EVICTION_SEAL
+            .scope(
+                scope.clone(),
+                crate::server::routes::named_groups::seal_commit_owner_certified(
+                    &state,
+                    &mut with_pending,
+                    signing_kp,
+                    now_ms,
+                ),
+            )
+            .await;
+        match mixed {
+            Err(x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
+                members, ..
+            }) => assert!(
+                members.contains(&other_hex),
+                "the digest-pending seat is named: {members:?}"
+            ),
+            other => panic!("a non-creator pending seat keeps the refusal: {other:?}"),
+        }
+
         // The S4 removal seals: the revoked member is evicted while the
         // creator is held. RED before the fix: `OwnerCertMemberPending`.
         let sealed = S4_EVICTION_SEAL
