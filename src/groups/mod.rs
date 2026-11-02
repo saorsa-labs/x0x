@@ -1610,6 +1610,38 @@ impl GroupInfo {
             .collect()
     }
 
+    /// #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): whether `agent_hex`
+    /// is this group's CREATOR whose own EMBEDDED certificate is expired —
+    /// the seat every eviction path must spare. The hold keys on the
+    /// COMMITTED (embedded) certificate's failure, never an announced
+    /// one, so a creator whose committed certificate fails for any other
+    /// reason (wrong owner, wrong agent, a bad signature) is NOT held,
+    /// and a creator without bytes is not "its own expired certificate".
+    /// `owner_cert_verdict` holds such a seat at `DigestPending`; the S4
+    /// eviction paths use this same predicate to treat the held creator
+    /// as non-blocking, so revocation evictions of other members still
+    /// seal.
+    #[must_use]
+    pub fn creator_expired_certificate_hold(&self, agent_hex: &str, now_unix: u64) -> bool {
+        if agent_hex != hex::encode(self.creator.as_bytes()) {
+            return false;
+        }
+        let Some(cert) = self
+            .members_v2
+            .get(agent_hex)
+            .and_then(|member| member.certificate.as_ref())
+        else {
+            return false;
+        };
+        let Some(owner) = self.policy.admission.owner_certified_user_id() else {
+            return false;
+        };
+        matches!(
+            owner_cert::verify_cert_against_owner(owner, agent_hex, cert, false, now_unix),
+            Err(owner_cert::OwnerCertFailure::Expired)
+        )
+    }
+
     /// Round-4 prescriptive: THE single grace-aware, digestpending-fetch
     /// aware evaluation of an OwnerCertified roster. Called ONCE per
     /// operation; every seal path consumes the returned
@@ -1625,7 +1657,11 @@ impl GroupInfo {
     /// including an expired/stale embedded cert mid-rotation) or totally
     /// missing → `InGrace` (first observation stamps
     /// `certificate_missing_since_ms`); any other present-but-failing
-    /// certificate → `Failed` (definitive, no grace).
+    /// certificate → `Failed` (definitive, no grace) — EXCEPT the
+    /// creator's own EXPIRED certificate, which holds at `DigestPending`
+    /// ([`Self::creator_expired_certificate_hold`], Engineer ruling 1 Nov
+    /// 2026 02:36 GMT: never eviction-eligible from that alone, never
+    /// `Clean` until a renewal lands).
     ///
     /// ADR 0108 §4 (the Home verdict rule, #1143): in a committed Home
     /// scope ([`Self::is_home_scope`]) the canonical anonymous announced
@@ -1653,10 +1689,6 @@ impl GroupInfo {
             };
         };
         let home_scope = self.is_home_scope();
-        // Engineer ruling 1 Nov 2026 02:36 GMT: the CREATOR seat never
-        // becomes eviction-eligible from its own expired certificate
-        // alone. `creator_hex` feeds that hold below.
-        let creator_hex = hex::encode(self.creator.as_bytes());
         let now = evidence.now_unix();
         let now_ms = now_millis();
         let grace_ms = owner_cert::OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS * 1_000;
@@ -1752,6 +1784,16 @@ impl GroupInfo {
                         );
                     }
                     None => {
+                        // #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): an
+                        // unfetchable renewal must not make the creator's
+                        // own expired certificate eviction-eligible through
+                        // the grace window either — the hold applies past
+                        // the window too.
+                        if self.creator_expired_certificate_hold(&agent_hex, now) {
+                            per_member
+                                .insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
+                            continue;
+                        }
                         per_member.insert(
                             agent_hex,
                             owner_cert::MemberCertStatus::Failed {
@@ -1772,17 +1814,21 @@ impl GroupInfo {
                     .unwrap_or(owner_cert::OwnerCertFailure::NoCertificate);
                 // Engineer ruling 1 Nov 2026 02:36 GMT: the creator seat
                 // never becomes eviction-eligible from its own EXPIRED
-                // certificate alone. An expired committed certificate on
-                // the creator holds like a digest-only seat — `DigestPending`
-                // is never in `OwnerCertVerdict::failed()`, so no eviction
-                // path can target the creator seat while its renewal is
-                // outstanding, and every operation that needs valid creator
-                // bytes still fails closed (`is_all_clean` stays false).
-                // Any other failure (revocation is checked above; wrong
-                // owner or agent, a bad signature) stays `Failed`.
-                if agent_hex == creator_hex
-                    && matches!(reason, owner_cert::OwnerCertFailure::Expired)
-                {
+                // certificate alone. The hold keys on the COMMITTED
+                // (embedded) certificate's failure — never an announced
+                // one — and an expired committed certificate on the
+                // creator holds like a digest-only seat: `DigestPending`
+                // is never in `OwnerCertVerdict::failed()`, so no
+                // ordinary-seal eviction set names the creator seat while
+                // its renewal is outstanding, while every operation that
+                // needs valid creator bytes still fails closed
+                // (`is_all_clean` stays false). The S4 eviction paths
+                // treat a held creator as non-blocking
+                // (`creator_expired_certificate_hold`), so revocation
+                // evictions of other members still seal. Any other
+                // failure (revocation is checked above; wrong owner or
+                // agent, a bad signature) stays `Failed`.
+                if self.creator_expired_certificate_hold(&agent_hex, now) {
                     per_member.insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
                     continue;
                 }
@@ -3975,6 +4021,39 @@ mod tests {
                 Some(owner_cert::MemberCertStatus::Failed { .. })
             ),
             "a non-expiry creator failure is not held"
+        );
+
+        // Claude review (2 Nov 2026 16:49, finding 3): the hold keys on the
+        // COMMITTED certificate. An announced certificate that is merely
+        // expired does not hold a creator whose committed certificate fails
+        // for another reason (red before: the reason came from the
+        // announced certificate first).
+        let mut announced_expired = owner_cert::OwnerCertEvidence::new(10_000_000);
+        announced_expired.insert_cert(creator_hex.clone(), expired_creator.clone());
+        let announced_verdict = strict.owner_cert_verdict(&announced_expired);
+        assert!(
+            matches!(
+                announced_verdict.per_member.get(&creator_hex),
+                Some(owner_cert::MemberCertStatus::Failed { .. })
+            ),
+            "an expired ANNOUNCED certificate does not hold a creator whose committed one fails otherwise"
+        );
+
+        // Claude review (2 Nov 2026 16:49, finding 2): an announced renewal
+        // that cannot be fetched past the grace window does not make the
+        // held creator eviction-eligible (red before: `Failed {
+        // NoCertificate }`).
+        let mut unfetchable = owner_cert::OwnerCertEvidence::new(10_000_000);
+        unfetchable.observe_pending_digest(creator_hex.clone(), [9; 32]);
+        info.members_v2
+            .get_mut(&creator_hex)
+            .unwrap()
+            .certificate_missing_since_ms = Some(1);
+        let grace_verdict = info.owner_cert_verdict(&unfetchable);
+        assert_eq!(
+            grace_verdict.per_member.get(&creator_hex),
+            Some(&owner_cert::MemberCertStatus::DigestPending),
+            "past the grace window the creator's own expired certificate still holds"
         );
     }
 

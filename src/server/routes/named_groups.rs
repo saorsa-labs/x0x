@@ -30850,28 +30850,37 @@ async fn owner_certified_seal_with_eviction(
                     }
                     return Some(Ok((commit, evicted_total.clone(), fork_marker_cleared)));
                 }
-                // InGrace members remain (they were NOT evicted — not in
-                // this operation's Failed set): typed, retryable refusal;
-                // the evicted transitions are already committed/published.
+                // InGrace or DigestPending members remain (they were NOT
+                // evicted — not in this operation's Failed set): typed,
+                // retryable refusal; the evicted transitions are already
+                // committed/published. The pending list names BOTH classes
+                // — a held creator (#1023, 02:36 ruling) is a pending
+                // creator the operator must renew, never an empty list.
+                let mut still_pending = verdict.in_grace();
+                still_pending.extend(verdict.digest_pending());
                 return Some(Err(api_error(
                     StatusCode::CONFLICT,
                     format!(
                         "owner-certified group has members pending certificate resolution: {:?}; \
                          evictions committed, retry the seal once evidence converges",
-                        verdict.in_grace()
+                        still_pending
                     ),
                 )));
             }
             if !verdict.is_all_clean() {
-                // No Failed members but some are InGrace — no clean seal
-                // may mint on a non-clean verdict, and the restore
-                // quarantine must stay set. Typed, retryable.
+                // No Failed members but some are InGrace or DigestPending —
+                // no clean seal may mint on a non-clean verdict, and the
+                // restore quarantine must stay set. Typed, retryable; the
+                // list names BOTH classes (the R17 log's empty `[]` was this
+                // line reporting only in_grace).
+                let mut still_pending = verdict.in_grace();
+                still_pending.extend(verdict.digest_pending());
                 return Some(Err(api_error(
                     StatusCode::CONFLICT,
                     format!(
                         "owner-certified group has members pending certificate resolution: {:?}; \
                          retry the seal once evidence converges",
-                        verdict.in_grace()
+                        still_pending
                     ),
                 )));
             }
@@ -32259,14 +32268,25 @@ async fn seal_owner_certified_unbounded(
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {
         let group_id = info.stable_group_id().to_string();
+        let now_unix = now_ms / 1000;
+        let in_grace = verdict.in_grace();
+        let digest_pending = verdict.digest_pending();
         let failed = verdict.failed();
         if !failed.is_empty() {
             let members: Vec<String> = failed.iter().map(|(hex, _)| hex.clone()).collect();
+            // #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): a HELD
+            // creator — its own expired certificate, reported
+            // `DigestPending` — blocks nothing: the S4 eviction seal must
+            // still evict a revoked member while the creator's renewal is
+            // outstanding. Every OTHER pending seat keeps the gate.
+            let pending_blocks_seal = digest_pending
+                .iter()
+                .any(|hex| !info.creator_expired_certificate_hold(hex, now_unix));
             // ADR 0110 §3: an S4 removal of one revoked or expired seat may
             // seal while the group's other open S4 targets still fail; each
             // gets its own transition (ADR-0038 B3, no prune).
-            if verdict.in_grace().is_empty()
-                && verdict.digest_pending().is_empty()
+            if in_grace.is_empty()
+                && !pending_blocks_seal
                 && revocation_eviction::s4_eviction_seal_tolerates(info, &members)
             {
                 return info.seal_commit_evicting(signing_kp, now_ms);
@@ -32282,8 +32302,20 @@ async fn seal_owner_certified_unbounded(
         // digest-pending — so the operator sees exactly who is pending
         // (the R17 log's empty `[]` was this line reporting only
         // in_grace).
-        let mut pending = verdict.in_grace();
-        pending.extend(verdict.digest_pending());
+        // #1023 (02:36 ruling): inside an S4 removal or ban, a held
+        // creator does not block the removal's seal (see
+        // `s4_eviction_seal_passes_a_held_creator`).
+        if in_grace.is_empty()
+            && revocation_eviction::s4_eviction_seal_passes_a_held_creator(
+                info,
+                &digest_pending,
+                now_unix,
+            )
+        {
+            return info.seal_commit_evicting(signing_kp, now_ms);
+        }
+        let mut pending = in_grace;
+        pending.extend(digest_pending);
         return Err(
             x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
                 group_id,

@@ -2439,9 +2439,11 @@ commits — paired with the roster projection it effected:
   with the served chain, within the direct-message budget. `roster_root_verified`
   recomputes the root over that projection and compares it to the commit's
   signed `roster_root`, so any at-rest corruption surfaces rather than
-  serving silently-wrong history. The members-only disclosure rule covers
-  these certificates, live or from a withdrawn local tombstone: both are
-  owner certificates served by a members-only endpoint.
+  serving silently-wrong history. While the group is live, the endpoint is
+  members-only, so these owner certificates go only to a local caller whose
+  agent holds an active seat. After the group is withdrawn, the local
+  tombstone's history is `PublicRead` to the local API caller, and the
+  newest retained commits still carry their certificate bytes.
   `limit` is capped at 500.
 
 Scope and honest limits: retention is **not retroactive** — history begins
