@@ -259,7 +259,7 @@ fn forgeries(
 
 /// H-S3-d3 (ADR 0109 §10).
 pub(super) async fn authorisation_refusals(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
-    let Some(p) = fork_prefix(sim, receipt, false, true).await? else {
+    let Some(p) = fork_prefix(sim, receipt, false, true, FINAL_D3).await? else {
         return Ok(());
     };
     let (group, j_hex) = (p.group.clone(), p.j_hex.clone());

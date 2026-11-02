@@ -32,20 +32,42 @@ class ShardPlanTest(unittest.TestCase):
 
     def test_filter_matches_the_same_cases_as_the_assignment(self):
         import re
+
+        def matches(pattern, name):
+            return re.search(rf'(^|::){pattern}', name) is not None
+
         assigned = SHARDS.assign(self.names)
+        names = [group for group, _pattern in SHARDS.GROUPS]
         for group, cases in assigned.items():
             expr = SHARDS.filter_expr(group)
             if group == 'rest':
-                excluded = [re.compile(rf'(^|::){prefix}') for _g, prefix in SHARDS.GROUPS]
-                matched = [
-                    name for name in self.names
-                    if not any(pattern.search(name) for pattern in excluded)
-                ]
+                earlier, own = SHARDS.GROUPS, None
             else:
-                prefix = dict(SHARDS.GROUPS)[group]
-                pattern = re.compile(rf'(^|::){prefix}')
-                matched = [name for name in self.names if pattern.search(name)]
+                earlier = SHARDS.GROUPS[:names.index(group)]
+                own = dict(SHARDS.GROUPS)[group]
+            matched = [
+                name for name in self.names
+                if (own is None or matches(own, name))
+                and not any(matches(pattern, name) for _g, pattern in earlier)
+            ]
             self.assertEqual(matched, cases, expr)
+
+    def test_each_owner_axis_row_has_its_own_shard(self):
+        # One rerun of each H-S3-c/c2/c3/d8/d3 row is the longest S3 case, so
+        # each row runs its 20 reruns on its own runner.
+        rows = {
+            's3-c': 'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node',
+            's3-c2': 'w3h_1356_red_s3_c2_reseat_retires_marker_and_gap',
+            's3-c3': 'w3h_1356_control_s3_c3_owner_reseats_owner_axis_node',
+            's3-d8': 'w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node',
+            's3-d3': 'w3h_1356_control_s3_d3_authorisation_refusals_typed',
+        }
+        assigned = SHARDS.assign(self.names)
+        for group, name in rows.items():
+            self.assertEqual(assigned.get(group), [name])
+        self.assertEqual(SHARDS.group_of(
+            'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node_more'), 's3')
+        self.assertFalse(set(rows.values()) & set(assigned.get('s3', [])))
 
     def test_s3_and_s4_prefixes_do_not_fall_through_to_rest(self):
         self.assertEqual(SHARDS.group_of('w3h_1356_future_case'), 's3')
