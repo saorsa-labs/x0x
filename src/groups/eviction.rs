@@ -1258,6 +1258,9 @@ pub const MAX_QUEUED_INTAKE: usize = 4096;
 struct IntakeInner {
     queue: VecDeque<VerifiedAgentRevocation>,
     reconcile_all: bool,
+    /// Record hashes from a live route whose revocation-store write has
+    /// not succeeded yet (#1765). A startup-loaded record is never here.
+    not_durable: BTreeSet<[u8; 32]>,
 }
 
 /// The queue between the revocation choke point in `lib.rs` and the S4
@@ -1299,17 +1302,18 @@ impl RevocationIntake {
         let crate::revocation::RevokedSubject::Agent(agent) = &record.subject else {
             return;
         };
+        let record_hash = record.record_hash();
         let item = VerifiedAgentRevocation {
             target: *agent.as_bytes(),
-            record_hash: record.record_hash(),
+            record_hash,
             record_bytes: bincode::serialize(record).unwrap_or_default(),
             from_startup_load,
         };
         {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = self.lock();
+            if !from_startup_load {
+                inner.not_durable.insert(record_hash);
+            }
             if inner.queue.len() >= MAX_QUEUED_INTAKE {
                 inner.queue.pop_front();
                 inner.reconcile_all = true;
@@ -1319,22 +1323,56 @@ impl RevocationIntake {
         self.notify.notify_one();
     }
 
-    /// Ask the worker for a full reconciliation pass.
-    pub fn request_reconcile(&self) {
+    fn lock(&self) -> std::sync::MutexGuard<'_, IntakeInner> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .reconcile_all = true;
+    }
+
+    /// Ask the worker for a full reconciliation pass.
+    pub fn request_reconcile(&self) {
+        self.lock().reconcile_all = true;
         self.notify.notify_one();
+    }
+
+    /// The live-route record hashes whose revocation-store write has not
+    /// succeeded yet. Take this before the store snapshot is encoded:
+    /// every hash in it is then in the snapshot (#1765).
+    #[must_use]
+    pub fn not_durable_hashes(&self) -> BTreeSet<[u8; 32]> {
+        self.lock().not_durable.clone()
+    }
+
+    /// The revocation-store write that held `hashes` succeeded: they are
+    /// durable now. The worker wakes, so a row held for them re-evaluates.
+    pub fn note_durable(&self, hashes: &BTreeSet<[u8; 32]>) {
+        if hashes.is_empty() {
+            return;
+        }
+        self.lock()
+            .not_durable
+            .retain(|hash| !hashes.contains(hash));
+        self.notify.notify_one();
+    }
+
+    /// Whether every one of `hashes` is in the revocation store on disk
+    /// (ADR 0110 "Memory-only durability"). A record that a live route
+    /// verified stays not durable until its store write succeeds.
+    #[must_use]
+    pub fn all_durable(&self, hashes: &BTreeSet<[u8; 32]>) -> bool {
+        self.lock().not_durable.is_disjoint(hashes)
+    }
+
+    /// Whether any live-route record still waits for its store write.
+    #[must_use]
+    pub fn has_not_durable(&self) -> bool {
+        !self.lock().not_durable.is_empty()
     }
 
     /// Take every queued item and the reconcile flag.
     #[must_use]
     pub fn drain(&self) -> (Vec<VerifiedAgentRevocation>, bool) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.lock();
         let items = inner.queue.drain(..).collect();
         let reconcile = std::mem::take(&mut inner.reconcile_all);
         (items, reconcile)
@@ -2045,6 +2083,44 @@ mod tests {
         assert_eq!(items[0].target, *kp.agent_id().as_bytes());
         assert!(!items[0].from_startup_load);
         assert!(items[1].from_startup_load);
+    }
+
+    /// #1765: a live-route record is not durable until its store write
+    /// succeeds; a loaded record and a later record are tracked apart.
+    #[test]
+    fn a_live_revocation_is_durable_only_after_its_store_write() {
+        let sign = |seq| {
+            let kp = crate::identity::AgentKeypair::generate().expect("kp");
+            crate::revocation::RevocationRecord::sign(
+                crate::revocation::RevokedSubject::Agent(kp.agent_id()),
+                kp.public_key(),
+                kp.secret_key(),
+                seq,
+                None,
+            )
+            .expect("sign")
+        };
+        let intake = RevocationIntake::new();
+        let (live, loaded, later) = (sign(1), sign(2), sign(3));
+        let hashes = |records: &[&crate::revocation::RevocationRecord]| {
+            records
+                .iter()
+                .map(|record| record.record_hash())
+                .collect::<BTreeSet<_>>()
+        };
+        intake.note_loaded(&loaded);
+        assert!(intake.all_durable(&hashes(&[&loaded])));
+        intake.note_verified(&live);
+        assert!(!intake.all_durable(&hashes(&[&live, &loaded])));
+        // The write that took this snapshot fails: nothing changes.
+        let snapshot = intake.not_durable_hashes();
+        assert_eq!(snapshot, hashes(&[&live]));
+        // A record verified after the snapshot is not in its bytes.
+        intake.note_verified(&later);
+        intake.note_durable(&snapshot);
+        assert!(intake.all_durable(&hashes(&[&live, &loaded])));
+        assert!(!intake.all_durable(&hashes(&[&later])));
+        assert_eq!(intake.not_durable_hashes(), hashes(&[&later]));
     }
 
     fn sample_row() -> ObligationRow {

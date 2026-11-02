@@ -3937,22 +3937,11 @@ async fn apply_legacy_revocation_records(
         persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
     }
     if !newly_inserted.is_empty() {
-        let persisted_bytes = revocation_set.read().await.to_bytes();
-        let id_dir = identity_dir.clone();
-        tokio::spawn(async move {
-            match persisted_bytes {
-                Ok(bytes) => {
-                    if let Err(e) =
-                        storage::save_revocation_set_bytes(bytes, id_dir.as_deref()).await
-                    {
-                        if !storage::revocation_persistence_is_blocked(&e) {
-                            tracing::warn!("failed to persist revocation set: {e}");
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("failed to encode revocation set for persistence: {e}"),
-            }
-        });
+        spawn_persist_s4_revocations(
+            std::sync::Arc::clone(revocation_set),
+            s4_intake.clone(),
+            identity_dir.clone(),
+        );
         for record in newly_inserted {
             match &record.subject {
                 revocation::RevokedSubject::Agent(agent_id) => {
@@ -4008,6 +3997,7 @@ async fn apply_v2_revocation_records(
 ) {
     let mut inserted = false;
     let mut share_grant_inserted = false;
+    let mut v1_inserted = false;
     {
         let _share_grant_barrier = owner_trust
             .share_grant_revocation_barrier(&records, revocation_set)
@@ -4032,6 +4022,11 @@ async fn apply_v2_revocation_records(
                     s4_intake.note_verified(&hook_record);
                     inserted = true;
                     share_grant_inserted |= is_share_grant;
+                    v1_inserted |= matches!(
+                        hook_record.subject,
+                        revocation::RevokedSubject::Agent(_)
+                            | revocation::RevokedSubject::Machine(_)
+                    );
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -4047,13 +4042,28 @@ async fn apply_v2_revocation_records(
         let persisted = revocation_set.read().await.to_bytes_v2();
         let id_dir = identity_dir.clone();
         tokio::spawn(async move {
-            if let Ok(bytes) = persisted {
-                if let Some(dir) = id_dir {
-                    let _ = storage::save_private_bytes_to(&dir.join("revocations-v2.bin"), bytes)
-                        .await;
+            let saved = match (persisted, id_dir) {
+                (Ok(bytes), Some(dir)) => {
+                    storage::save_private_bytes_to(&dir.join("revocations-v2.bin"), bytes).await
+                }
+                (Ok(_), None) => Ok(()),
+                (Err(e), _) => Err(e),
+            };
+            if let Err(e) = saved {
+                if !storage::revocation_persistence_is_blocked(&e) {
+                    tracing::warn!("failed to persist v2 revocation set: {e}");
                 }
             }
         });
+    }
+    // An Agent or Machine subject lives in the v1 store, never in
+    // `revocations-v2.bin`; S4 waits for that write (#1765).
+    if v1_inserted {
+        spawn_persist_s4_revocations(
+            std::sync::Arc::clone(revocation_set),
+            s4_intake.clone(),
+            identity_dir.clone(),
+        );
     }
     persist_completed_revocation_rebuild(revocation_set, identity_dir.as_deref()).await;
 }
@@ -6831,6 +6841,58 @@ fn raw_dm_history_record(
 
 /// File (in the identity dir) holding ADR-0070 share-grant revocations.
 pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
+
+/// First delay before a failed revocation-store write that S4 waits for
+/// is retried (#1765). Each retry doubles it up to [`S4_PERSIST_RETRY_MAX`].
+const S4_PERSIST_RETRY_MIN: std::time::Duration = std::time::Duration::from_millis(250);
+/// Largest delay between those retries.
+const S4_PERSIST_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Write the v1 revocation store, which holds every Agent subject, and
+/// tell S4 which live-route records are durable now (ADR 0110 §5,
+/// "Memory-only durability"; #1765). The pending hashes are read before
+/// the snapshot, so each of them is in the bytes written.
+async fn persist_s4_revocations(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    s4_intake: &groups::eviction::RevocationIntake,
+    identity_dir: Option<&std::path::Path>,
+) -> error::Result<()> {
+    let pending = s4_intake.not_durable_hashes();
+    let bytes = revocation_set.read().await.to_bytes()?;
+    storage::save_revocation_set_bytes(bytes, identity_dir).await?;
+    s4_intake.note_durable(&pending);
+    Ok(())
+}
+
+/// [`persist_s4_revocations`] off the receive path. A failed write is
+/// logged and retried with backoff while S4 still waits for a record, so
+/// the row shows `waiting_for_durable_intake` until a write succeeds. A
+/// blocked store logs through its own rate limit and is not retried here.
+fn spawn_persist_s4_revocations(
+    revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: groups::eviction::RevocationIntake,
+    identity_dir: Option<std::path::PathBuf>,
+) {
+    tokio::spawn(async move {
+        let mut delay = S4_PERSIST_RETRY_MIN;
+        loop {
+            match persist_s4_revocations(&revocation_set, &s4_intake, identity_dir.as_deref()).await
+            {
+                Ok(()) => return,
+                Err(e) if storage::revocation_persistence_is_blocked(&e) => return,
+                Err(e) => tracing::warn!(
+                    retry = ?delay,
+                    "failed to persist revocation set (S4 waiting_for_durable_intake): {e}"
+                ),
+            }
+            if !s4_intake.has_not_durable() {
+                return;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(S4_PERSIST_RETRY_MAX);
+        }
+    });
+}
 
 /// After a trusted authority opens a carrier, write that live file (#1116).
 ///
@@ -17157,11 +17219,22 @@ impl Agent {
                 }
             }
             _ => {
-                storage::save_revocation_set(
-                    &*self.revocation_set.read().await,
+                let saved = persist_s4_revocations(
+                    &self.revocation_set,
+                    &self.s4_revocation_intake,
                     self.identity_dir.as_deref(),
                 )
-                .await
+                .await;
+                if saved.is_err() {
+                    // #1765: S4 holds this record's row until a retry
+                    // writes it; the caller still sees the error.
+                    spawn_persist_s4_revocations(
+                        std::sync::Arc::clone(&self.revocation_set),
+                        self.s4_revocation_intake.clone(),
+                        self.identity_dir.clone(),
+                    );
+                }
+                saved
             }
         };
         if matches!(
