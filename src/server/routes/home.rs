@@ -323,17 +323,38 @@ pub(in crate::server) async fn resolve_home(state: &Arc<AppState>) -> HomeResolu
     // adoption a device is briefly seated in both its old duplicate and the
     // canonical Home; without this, `find_home`'s smallest-id rule could
     // keep answering with the duplicate.
+    //
+    // #824: the register names the group's STABLE id, but the roster is
+    // keyed by the id the group was created or joined under, and a pre-pin
+    // legacy record carries a map key that differs from its stable id.
+    // Matching the pointer against the map key alone misses such an entry
+    // and hands the resolution to `find_home`'s smallest-id fallback, which
+    // can answer with the duplicate. Match both, as `is_provably_retired`
+    // and the seat guard do, and return the MAP KEY so downstream lookups
+    // (the invite mint, the duplicates scan) address the group they
+    // resolved.
     if let Some(canonical) = canonical.as_deref() {
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
         let groups = state.named_groups.read().await;
-        if let Some(info) = groups.get(canonical).filter(|info| {
-            !info.withdrawn
-                && info.home.is_some()
-                && is_home_policy(&info.policy, &owner)
-                && info.has_active_member(&hex::encode(state.agent.agent_id().as_bytes()))
-        }) {
+        let preferred = groups
+            .iter()
+            .filter(|(id, info)| {
+                (id.as_str() == canonical || info.stable_group_id() == canonical)
+                    && !info.withdrawn
+                    && info.home.is_some()
+                    && is_home_policy(&info.policy, &owner)
+                    && info.has_active_member(&local_hex)
+            })
+            .map(|(id, info)| (id.clone(), info.clone()))
+            .min_by(|(a_id, a), (b_id, b)| {
+                a.stable_group_id()
+                    .cmp(b.stable_group_id())
+                    .then_with(|| a_id.cmp(b_id))
+            });
+        if let Some((group_id, info)) = preferred {
             return HomeResolution::Local {
-                group_id: canonical.to_string(),
-                info: Box::new(info.clone()),
+                group_id,
+                info: Box::new(info),
             };
         }
     }
@@ -5049,6 +5070,101 @@ pub(in crate::server::routes) mod tests {
         let (status, body) = seat(&state, &"7d".repeat(32)).await?;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(issued_invite_count(&state).await, before);
+        Ok(())
+    }
+
+    /// WHY (#824): the register names the canonical Home by its STABLE id
+    /// (`home_pointer_from_state`), but a legacy roster can key the same
+    /// group under a map key that differs from it. When the prefer-canonical
+    /// branch of `resolve_home` matched the pointer against the map key
+    /// only, such an entry was missed even though this device was seated in
+    /// it: the resolution fell through to `find_home`'s smallest-stable-id
+    /// rule, which answers with the duplicate, and the seat refused (or,
+    /// with no pointer at all, minted) against the wrong Home. The seat must
+    /// resolve to the canonical Home the register names, so the fixture
+    /// re-keys the canonical entry exactly like a legacy record, points the
+    /// register at its stable id, and requires the mint to land there and
+    /// only there.
+    #[tokio::test]
+    async fn home_seat_resolves_to_the_canonical_home_named_by_its_stable_id() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x84; 32]).await?;
+        provision_home(&state).await;
+        provision_duplicate_home(&state).await?;
+        let owner = owner_of(&state);
+
+        // Two real Homes. The one with the LARGER stable id is made the
+        // canonical one, so `find_home`'s smallest-stable-id rule would pick
+        // the duplicate whenever the pointer is ignored or missed.
+        let mut homes: Vec<(String, String)> = {
+            let groups = state.named_groups.read().await;
+            groups
+                .iter()
+                .filter(|(_, info)| info.home.is_some() && is_home_policy(&info.policy, &owner))
+                .map(|(id, info)| (id.clone(), info.stable_group_id().to_string()))
+                .collect()
+        };
+        assert_eq!(homes.len(), 2, "fixture must seat two Home-shaped groups");
+        homes.sort_by(|(_, a), (_, b)| a.cmp(b));
+        let (duplicate_key, _) = homes[0].clone();
+        let (canonical_key, canonical_stable) = homes[1].clone();
+
+        // Legacy shape: the entry keeps its genesis — so its stable id is
+        // unchanged — but lives under a map key that differs from it.
+        let alias = format!("legacy-{canonical_key}");
+        anyhow::ensure!(
+            alias != canonical_stable,
+            "the alias key must differ from the stable id the register names"
+        );
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups
+                .remove(&canonical_key)
+                .ok_or_else(|| anyhow::anyhow!("canonical entry present"))?;
+            groups.insert(alias.clone(), info);
+        }
+
+        // The register names the STABLE id, exactly as the production mint
+        // (`home_pointer_from_state`) does.
+        commit_canonical_home(&state, &canonical_stable).await?;
+
+        let before = issued_invite_count(&state).await;
+        let (status, body) = seat(&state, &"7c".repeat(32)).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["group_id"], alias.as_str(), "{body}");
+
+        // Exactly one invite, recorded in the canonical Home — the duplicate
+        // mints nothing.
+        assert_eq!(issued_invite_count(&state).await, before + 1);
+        {
+            let groups = state.named_groups.read().await;
+            assert_eq!(
+                groups
+                    .get(&alias)
+                    .expect("canonical held")
+                    .issued_invites
+                    .len(),
+                1,
+                "the invite must be recorded in the canonical Home"
+            );
+            assert_eq!(
+                groups
+                    .get(&duplicate_key)
+                    .expect("duplicate held")
+                    .issued_invites
+                    .len(),
+                0,
+                "the duplicate must not mint"
+            );
+        }
+
+        // GET /home agrees the served Home is the canonical one.
+        let (status, body) =
+            response_json(get_home(State(Arc::clone(&state))).await.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "local", "{body}");
+        assert_eq!(body["group_id"], alias.as_str(), "{body}");
         Ok(())
     }
 

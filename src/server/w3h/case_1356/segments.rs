@@ -20,6 +20,18 @@
 //!   case reads the exhausted state; A's answer from r+64 then shows that
 //!   the segment ended there.
 //!
+//! **One responder interval between runs.** A, the one admin, answers J
+//! at most once per `RESPONDER_PER_REQUESTER_INTERVAL` (§11), and that
+//! limit is per requester, across groups. The three runs share A and J
+//! and take about 6–30 virtual seconds together. When J asks A in the
+//! 65-link run, A refused J's r+64 request in the 66-link run with
+//! `rate_limited` (s3 job, run 41233639089 attempt 1, iteration 17/20).
+//! The refusal replaced `segment_exhausted` before a poll read it, and J
+//! took the rest from its join-result poll, not from an answer. So the
+//! 66-link run starts only after A's interval for J's requests in the
+//! 65-link run has passed. The 64-link run sends A no request, so the
+//! case waits one interval (plus a margin) before the 66-link run only.
+//!
 //! In each run, any ATA that A sends J in answer starts at r+64, and J
 //! never holds a marker. The case does not count the join-carry entries
 //! directly (J arms and retires that ATA within one poll). The 64-link
@@ -50,6 +62,7 @@ use super::gaps::{recovery_route, recovery_text, s0, seal_j};
 use super::*;
 use crate::groups::recovery::{
     decode_message, AttestAnswer, GroupRecoveryMessageV1, ATA_MAX_LINKS,
+    RESPONDER_PER_REQUESTER_INTERVAL,
 };
 
 const LABELS: &[&str] = &["A", "M1", "M2", "J"];
@@ -120,6 +133,21 @@ impl Run {
     fn converged_from_r(&self) -> bool {
         self.head_at_seal == self.base && self.caught_up && self.marked.is_none()
     }
+}
+
+/// Waits out A's per-requester interval for any request J sent in the run
+/// before. J stops asking once it catches up, which ends that run; the
+/// margin covers a request still in flight to A then.
+async fn after_responder_interval(sim: &Sim) -> Result<()> {
+    let wait = RESPONDER_PER_REQUESTER_INTERVAL + Duration::from_secs(5);
+    sim.within(
+        "A's per-requester interval for J passes",
+        wait + Duration::from_secs(2),
+        async {
+            tokio::time::sleep(wait).await;
+        },
+    )
+    .await
 }
 
 /// Drops every gossip write to J on `group`'s metadata topic.
@@ -259,7 +287,11 @@ fn segment_boundary(run: &Run) -> bool {
 async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let run64 = gap_run(sim, ATA_MAX_LINKS - 1).await?;
     receipt.setup_done(at(sim));
+    // The 64-link run sends no request: its join carry holds all 64 links,
+    // so no segment is exhausted (and `one_segment` fails on any answer).
+    // The 65-link run may ask A from r+64.
     let run65 = gap_run(sim, ATA_MAX_LINKS).await?;
+    after_responder_interval(sim).await?;
     let run66 = gap_run(sim, ATA_MAX_LINKS + 1).await?;
     let runs = [&run64, &run65, &run66];
     receipt.evidence(
