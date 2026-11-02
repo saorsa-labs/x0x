@@ -1178,3 +1178,58 @@ mod refusal_diagnostics_tests {
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }
+
+/// #1588: the Windows record barrier opens files and directories for
+/// `FlushFileBuffers`. These run the real calls on a Windows host.
+#[cfg(all(test, windows))]
+mod windows_exec_regressions {
+    use super::*;
+
+    fn boot_record(generation: u64) -> Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "record_kind": "boot",
+            "transaction_id": "transaction-a",
+            "generation": generation,
+            "instance_id": "alice",
+            "attempt": 1,
+            "pid": 5678,
+            "process_start": 200,
+            "boot_id": "boot-a",
+            "started_at_ns": 300,
+            "deadline_ns": 600
+        })
+    }
+
+    #[test]
+    fn windows_open_for_sync_flushes_a_file_and_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("record.json");
+        std::fs::write(&file_path, b"{}").unwrap();
+        let file = open_for_sync(&file_path, false).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let directory = open_for_sync(dir.path(), true).unwrap();
+        assert!(directory.metadata().unwrap().is_dir());
+        directory.sync_all().unwrap();
+    }
+
+    #[test]
+    fn windows_record_barrier_support_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        check_record_barrier_support(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn windows_write_record_writes_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(BOOT_FILE_NAME);
+        for generation in [3, 4] {
+            write_record(&path, &boot_record(generation)).unwrap();
+            let bytes = read_bytes(&path).unwrap();
+            let stored: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(stored, boot_record(generation));
+            assert!(matches!(read_record(&path, "boot"), RecordRead::Boot(_)));
+        }
+    }
+}

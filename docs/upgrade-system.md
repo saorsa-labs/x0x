@@ -276,10 +276,12 @@ On Unix, a new legacy handoff keeps all released fields and adds
 ignore those additional fields. Both the old unversioned form and this
 marked form remain diagnostic intent. The unmanaged Windows helper keeps the
 unversioned form; this compatibility path makes no M2 directory-durability
-claim. Supervised Windows apply uses the record barrier below.
+claim. Supervised Windows apply uses the same record barrier; the Windows
+directory sync is described under [Windows](#windows).
 
-Unix record writes require a file sync, replacement rename and parent
-directory sync. A failed barrier is a refusal, not an acknowledgement.
+Record writes require a file sync, replacement rename and parent
+directory sync. On Windows the directory sync is `FlushFileBuffers` on a
+directory handle. A failed barrier is a refusal, not an acknowledgement.
 The applying daemon checks directory-sync support before download or swap.
 If the filesystem rejects it, use an operator-managed update after resolving
 the storage fault; do not bypass the failed barrier. Configured startup still
@@ -732,7 +734,8 @@ root (`~/.x0x` by default): a symlink is not a verified store root, and its
 target is not walked or fsynced. The refusal names the offending path, in
 the flush error and in the logs, so the operator can find and remove it
 (issue #1595). The same refusal surfaces **before** an upgrade is
-attempted: flush admission runs the same walk — metadata only, no fsync —
+attempted: flush admission runs the same walk — no writes and no fsync
+(on Windows it opens each file with write access, as the flush will) —
 over the exact roots the flush will walk, and a supervised apply is
 refused with the offending path before any byte changes. A symlink an
 operator put there therefore stops the next upgrade attempt up front,
@@ -840,6 +843,17 @@ The platform parts are:
   with `first_pipe_instance` against squatting and rejects remote clients.
   It creates the next pipe instance before it hands out the connected one.
   It still checks the API token on each request.
+- **Requirements for a future arm client** (no Windows client exists yet):
+  the pipe name is in the machine-wide named-pipe namespace and anyone can
+  derive it, so another local user can create it first. The daemon then
+  fails safe: it does not serve. A client must not treat a successful
+  connect to the derived name as proof that it reached the daemon. Before
+  it sends the API token, it must verify the server, for example with
+  `GetNamedPipeServerProcessId` and a check that the server process owner
+  SID is the expected daemon user. On Unix the socket is in the `0600`
+  data directory, so this exposure does not exist there. A second
+  concurrent client can get `ERROR_PIPE_BUSY`; the client must retry with
+  `WaitNamedPipe` or a backoff.
 - The failed-upgrade hold and the startup stale-record cleanup also run on
   Windows.
 
@@ -850,6 +864,12 @@ wrapper propagates every other exit status. The readback accepts only
 version 2. A version-1 wrapper refuses supervised self-update; run
 `x0x autostart` to regenerate it. Before #1588, Windows refused every
 supervised apply, so no working setup loses self-update.
+
+CI (`Test Suite (Windows)`, `windows-latest`) runs the pipe, clock,
+record-barrier and foreground exit-status tests
+(`cargo test --lib windows_exec_regressions`,
+`cargo test --test upgrade_journal`). It does not run a Windows service
+or a second local user.
 
 Owed: final acceptance is a supervised self-update run on a Windows VM.
 That run is not done yet.

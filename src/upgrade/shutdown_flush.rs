@@ -55,7 +55,7 @@ pub(crate) const MAX_LIMIT: Duration = Duration::from_secs(3600);
 /// ordinary refusals (engineer ruling, 23 Oct 2026).
 type Hook = Arc<dyn Fn(Deadline, &AtomicBool) -> io::Result<()> + Send + Sync>;
 
-/// Metadata preflight the flush owner registers with the roots its hook
+/// Admission preflight the flush owner registers with the roots its hook
 /// walks: it names the first path the flush would refuse, so upgrade
 /// admission can surface it before any byte changes (issue #1595).
 pub(crate) type Preflight = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
@@ -151,10 +151,12 @@ impl Deadline {
         })
     }
 
-    /// Ceiling for the metadata-only admission preflight (issue #1595): no
-    /// fsync runs under it, so the generous bound only stops a walk that is
-    /// not making progress. Built on the same suspend-inclusive clock the
-    /// flush itself checks.
+    /// Ceiling for the admission preflight walk (issue #1595). The walk
+    /// writes no bytes and runs no fsync. On Windows it opens each file and
+    /// directory with write access, to prove the later flush can open them
+    /// (#1588). The generous bound only stops a walk that is not making
+    /// progress. Built on the same suspend-inclusive clock the flush itself
+    /// checks.
     pub(crate) fn preflight() -> io::Result<Self> {
         let limit = LIMIT.saturating_mul(4);
         let (boot_id, now) = clock()?;
@@ -241,7 +243,7 @@ pub(crate) fn register(root: PathBuf, hook: Hook) -> io::Result<Registration> {
     register_inner(root, hook, LIMIT, None)
 }
 
-/// Register with the metadata preflight that admission runs before any
+/// Register with the admission preflight that runs before any
 /// upgrade byte changes (issue #1595). The daemon's flush owner uses this
 /// to refuse early — naming the offending path — on state its hook could
 /// never walk.
@@ -1622,5 +1624,52 @@ mod windows_clock_regressions {
         deadline.check().expect("a fresh deadline has not expired");
         #[cfg(windows)]
         assert!(boot.starts_with("windows-boot-"));
+    }
+}
+
+/// Windows-only: these run on the windows-latest CI runner (#1588). They
+/// read the kernel tick count and the `BootId` registry value only.
+#[cfg(all(test, windows))]
+mod windows_exec_regressions {
+    use super::*;
+
+    #[test]
+    fn windows_boot_id_names_the_kernel_boot_and_is_stable() {
+        let boot = windows_clock::boot_id().expect("kernel BootId");
+        let number = boot
+            .strip_prefix("windows-boot-")
+            .expect("windows-boot-<n> form");
+        number.parse::<u32>().expect("BootId is a DWORD");
+        assert_eq!(boot, windows_clock::boot_id().expect("kernel BootId"));
+        assert_eq!(boot, boot_identity().expect("boot identity"));
+    }
+
+    #[test]
+    fn windows_tick_clock_is_nonzero_and_non_decreasing() {
+        let first = windows_clock::monotonic_ms();
+        assert!(first > 0);
+        std::thread::sleep(Duration::from_millis(20));
+        let second = windows_clock::monotonic_ms();
+        assert!(second >= first);
+        let (boot, now) = clock().expect("suspend-inclusive clock");
+        assert!(now >= second);
+        assert_eq!(boot, windows_clock::boot_id().expect("kernel BootId"));
+    }
+
+    /// The deadlines the flush and the admission preflight check read the
+    /// same Windows clock; a different boot refuses as an overrun.
+    #[test]
+    fn windows_deadlines_use_the_live_clock_and_boot() {
+        let deadline = Deadline::for_test(Duration::from_secs(5)).expect("deadline");
+        deadline.check().expect("a fresh deadline has not expired");
+        let preflight = Deadline::preflight().expect("preflight deadline");
+        preflight
+            .check()
+            .expect("a fresh preflight has not expired");
+        assert_eq!(deadline.boot_id, preflight.boot_id);
+        let other_boot = format!("{}-other", deadline.boot_id);
+        let refused = check_clock(&other_boot, deadline.deadline_ms, deadline.instant)
+            .expect_err("a different boot must refuse");
+        assert_eq!(refused.kind(), io::ErrorKind::TimedOut);
     }
 }

@@ -19,6 +19,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 #[cfg(unix)]
 const SOCKET: &str = "upgrade-flush.sock";
 const MAX_REQUEST: usize = 1024 * 1024;
+/// Consecutive accept errors the control loop absorbs before it stops:
+/// `ACCEPT_RETRIES` × `ACCEPT_BACKOFF`, about 10 s of failures in a row.
+const ACCEPT_RETRIES: u32 = 100;
+/// Pause after one failed accept, before the control loop tries again.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 pub(super) struct FlushOwner {
     _registration: shutdown_flush::Registration,
@@ -48,7 +53,7 @@ enum ArmFailure {
     FlushFailed(shutdown_flush::FlushFailure),
 }
 impl ArmFailure {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn kind(&self) -> io::ErrorKind {
         match self {
             ArmFailure::Refused(error) => error.kind(),
@@ -147,43 +152,34 @@ impl FlushOwner {
         let control_exit = Arc::clone(&exit);
         let control_logs = Arc::clone(&logs);
         let control = tokio::spawn(async move {
+            let mut accept_failures = 0_u32;
             loop {
                 #[cfg(unix)]
                 let accepted = listener.accept().await.map(|(stream, _)| stream);
                 #[cfg(windows)]
                 let accepted = listener.accept().await;
-                let Ok(mut stream) = accepted else { break };
-                let mut bytes = Vec::new();
-                let read = tokio::time::timeout(Duration::from_secs(5), async {
-                    let mut reader = tokio::io::BufReader::new(&mut stream);
-                    tokio::io::AsyncReadExt::take(&mut reader, (MAX_REQUEST + 1) as u64)
-                        .read_until(b'\n', &mut bytes)
-                        .await
-                })
-                .await;
-                let response = if matches!(read, Ok(Ok(_))) && bytes.len() <= MAX_REQUEST {
-                    let state = Arc::clone(&state);
-                    let root = root.clone();
-                    tokio::task::spawn_blocking(move || arm(&state, &root, &bytes))
-                        .await
-                        .map_err(|error| ArmFailure::Refused(io::Error::other(error)))
-                        .and_then(|result| result)
-                } else {
-                    Err(ArmFailure::Refused(io::Error::other(
-                        "invalid or incomplete arm-and-flush request",
-                    )))
+                let mut stream = match accepted {
+                    Ok(stream) => {
+                        accept_failures = 0;
+                        stream
+                    }
+                    // A transient accept error (for example EMFILE, or a
+                    // pipe client that closed before connect) must not end
+                    // the control plane until restart.
+                    Err(error) => {
+                        accept_failures += 1;
+                        if accept_failures >= ACCEPT_RETRIES {
+                            tracing::error!(%error, "upgrade control accept keeps failing; stopping");
+                            break;
+                        }
+                        tracing::warn!(%error, "upgrade control accept failed; retrying");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
                 };
+                let response = serve_request(&mut stream, &state, &root).await;
                 let started_flush_failed = matches!(response, Err(ArmFailure::FlushFailed(_)));
                 let success_exit = response.as_ref().ok().map(|armed| armed.exit_code);
-                let value = match response {
-                    Ok(armed) => serde_json::json!({"receipt": armed.receipt}),
-                    Err(error) => serde_json::json!({"error": error.to_string()}),
-                };
-                if let Ok(mut bytes) = serde_json::to_vec(&value) {
-                    bytes.push(b'\n');
-                    let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&bytes))
-                        .await;
-                }
                 if let Some(code) = success_exit {
                     // The live receipt proves the barriers completed. End the
                     // old participant after the existing bounded reply attempt,
@@ -313,6 +309,48 @@ struct AdmittedArm {
 struct ArmedFlush {
     receipt: shutdown_flush::Receipt,
     exit_code: i32,
+}
+
+/// Serve one request on an accepted control stream (Unix socket or Windows
+/// pipe): a bounded read of one line, `arm`, then one bounded reply. The
+/// caller acts on the result after the reply attempt.
+async fn serve_request<S>(
+    stream: &mut S,
+    state: &Arc<ControlContext>,
+    root: &Path,
+) -> Result<ArmedFlush, ArmFailure>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut bytes = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut reader = tokio::io::BufReader::new(&mut *stream);
+        tokio::io::AsyncReadExt::take(&mut reader, (MAX_REQUEST + 1) as u64)
+            .read_until(b'\n', &mut bytes)
+            .await
+    })
+    .await;
+    let response = if matches!(read, Ok(Ok(_))) && bytes.len() <= MAX_REQUEST {
+        let state = Arc::clone(state);
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || arm(&state, &root, &bytes))
+            .await
+            .map_err(|error| ArmFailure::Refused(io::Error::other(error)))
+            .and_then(|result| result)
+    } else {
+        Err(ArmFailure::Refused(io::Error::other(
+            "invalid or incomplete arm-and-flush request",
+        )))
+    };
+    let value = match &response {
+        Ok(armed) => serde_json::json!({"receipt": armed.receipt}),
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    };
+    if let Ok(mut bytes) = serde_json::to_vec(&value) {
+        bytes.push(b'\n');
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.write_all(&bytes)).await;
+    }
+    response
 }
 
 fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<AdmittedArm> {
@@ -635,11 +673,13 @@ fn sync_tree(path: &Path, deadline: &shutdown_flush::Deadline) -> io::Result<()>
     sync_tree_with(path, deadline, &mut std::fs::File::sync_all)
 }
 
-/// Metadata-only walk of the flush roots with the flush's own refusal
-/// rules (issue #1595). No fsync runs, so a long clock ceiling bounds only
-/// the walk. Sockets — including this control plane's own — are accepted
-/// exactly as at flush time; the first refused path is named in the error
-/// so admission can surface it before an upgrade changes any byte.
+/// Walk of the flush roots with the flush's own refusal rules (issue
+/// #1595). It writes no bytes and runs no fsync, so a long clock ceiling
+/// bounds only the walk. On Windows each open asks for write access, as
+/// the flush does (#1588). Sockets — including this control plane's own —
+/// are accepted exactly as at flush time; the first refused path is named
+/// in the error so admission can surface it before an upgrade changes any
+/// byte.
 pub(super) fn scan_flush_state(roots: &[PathBuf]) -> io::Result<()> {
     let deadline = shutdown_flush::Deadline::preflight()?;
     for root in roots {
@@ -783,6 +823,18 @@ fn process_start() -> io::Result<u64> {
 /// it from the canonical data root, as a Unix requester derives
 /// `<data_root>/upgrade-flush.sock`. Windows paths are case-insensitive, so
 /// the root is lowercased before hashing.
+///
+/// Security requirement for a future arm client (engineer ruling, #1588):
+/// the name is in the machine-wide named-pipe namespace and anyone can
+/// derive it, so a local user can create it first. The daemon fails safe:
+/// `first_pipe_instance` refuses a name another process holds. But a
+/// client MUST NOT treat a successful connect to this name as server
+/// authentication. Before it sends the API token, it must verify the
+/// server, for example the pipe server process from
+/// `GetNamedPipeServerProcessId` and an owner SID that matches the
+/// expected daemon user. A concurrent second client can also get
+/// `ERROR_PIPE_BUSY` before the daemon creates the next instance, so the
+/// client must retry with `WaitNamedPipe` or a backoff.
 #[cfg(any(windows, test))]
 pub(super) fn pipe_name(root: &Path) -> String {
     let digest = Sha256::digest(root.to_string_lossy().to_lowercase().as_bytes());
@@ -886,11 +938,15 @@ mod windows_pipe {
         }
 
         /// Wait for one client. The next instance is created before the
-        /// connected one is handed out, so the name is never unowned.
+        /// connected one is handed out, so the name is never unowned. A
+        /// failed connect also replaces its instance, which may be broken
+        /// (for example a client that closed first), so the control loop
+        /// can retry on a fresh pending instance.
         pub(super) async fn accept(&mut self) -> io::Result<NamedPipeServer> {
-            self.server.connect().await?;
+            let connected = self.server.connect().await;
             let next = create(&self.name, &self.descriptor, false)?;
-            Ok(std::mem::replace(&mut self.server, next))
+            let current = std::mem::replace(&mut self.server, next);
+            connected.map(|()| current)
         }
     }
 
@@ -1301,5 +1357,127 @@ mod windows_control_channel_regressions {
             pipe_name(Path::new(r"\\?\c:\users\alice\appdata\roaming\x0x"))
         );
         assert_ne!(name, pipe_name(Path::new(r"\\?\C:\Users\Bob\x0x")));
+    }
+}
+
+/// Windows-only: these run on the windows-latest CI runner (#1588). They use
+/// a local pipe named from a temp dir and no daemon, journal or network.
+#[cfg(all(test, windows))]
+mod windows_exec_regressions {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    fn unique_pipe() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let name = pipe_name(dir.path());
+        (dir, name)
+    }
+
+    #[tokio::test]
+    async fn pipe_exchanges_bytes_and_keeps_a_pending_instance() {
+        let (_dir, name) = unique_pipe();
+        let mut listener = windows_pipe::PipeListener::bind(&name).expect("bind");
+        // first_pipe_instance: a second server cannot take the held name.
+        assert!(windows_pipe::PipeListener::bind(&name).is_err());
+
+        let mut client = ClientOptions::new().open(&name).expect("first client");
+        let mut server = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept in time")
+            .expect("accept");
+        client.write_all(b"ping\n").await.expect("client write");
+        let mut received = [0_u8; 5];
+        server.read_exact(&mut received).await.expect("server read");
+        assert_eq!(&received, b"ping\n");
+        server.write_all(b"pong\n").await.expect("server write");
+        client.read_exact(&mut received).await.expect("client read");
+        assert_eq!(&received, b"pong\n");
+
+        // The next instance exists before the first is handed out, so a
+        // second client connects while the first is still open.
+        let _second_client = ClientOptions::new().open(&name).expect("second client");
+        let _second_server = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept in time")
+            .expect("second accept");
+        // The squatter refusal holds after instances were handed out.
+        assert!(windows_pipe::PipeListener::bind(&name).is_err());
+    }
+
+    #[tokio::test]
+    async fn pipe_name_is_free_again_after_every_instance_closes() {
+        let (_dir, name) = unique_pipe();
+        let listener = windows_pipe::PipeListener::bind(&name).expect("bind");
+        drop(listener);
+        let _again = windows_pipe::PipeListener::bind(&name).expect("rebind");
+    }
+
+    /// The real handler, driven through the pipe: a wrong API token is
+    /// refused before the journal is read, and no receipt is sent.
+    #[tokio::test]
+    async fn pipe_request_with_a_wrong_token_is_refused() {
+        let (dir, name) = unique_pipe();
+        let root = dir.path().canonicalize().expect("canonical root");
+        let mut listener = windows_pipe::PipeListener::bind(&name).expect("bind");
+        let state = Arc::new(ControlContext {
+            api_token: "owned fixture credential".into(),
+            api_address: std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            identity_root: root.clone(),
+        });
+        let artifact = serde_json::json!({
+            "target_path": root.join("x0xd.exe"), "staged_path": root.join("x0xd.staged"),
+            "backup_path": root.join("x0xd.backup"),
+            "previous_sha256": vec![1_u8; 32], "candidate_sha256": vec![2_u8; 32],
+        });
+        let request = serde_json::json!({
+            "token": "wrong credential", "transaction_id": "fixture", "generation": 1,
+            "instance_id": "alice",
+            "plan": {
+                "previous_version": "1.0.0", "candidate_version": "2.0.0",
+                "manifest_sha256": vec![3_u8; 32], "daemon": artifact, "cli": artifact,
+                "participants": [],
+            },
+        });
+        let mut line = serde_json::to_vec(&request).expect("request json");
+        line.push(b'\n');
+
+        let mut client = ClientOptions::new().open(&name).expect("client");
+        let mut server = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept in time")
+            .expect("accept");
+        client.write_all(&line).await.expect("client write");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_request(&mut server, &state, &root),
+        )
+        .await
+        .expect("handler in time");
+        let failure = outcome.expect_err("a wrong token must refuse");
+        assert!(matches!(failure, ArmFailure::Refused(_)));
+        assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
+
+        let mut reply = Vec::new();
+        let mut reader = tokio::io::BufReader::new(&mut client);
+        tokio::time::timeout(Duration::from_secs(5), reader.read_until(b'\n', &mut reply))
+            .await
+            .expect("reply in time")
+            .expect("reply");
+        let reply: serde_json::Value = serde_json::from_slice(&reply).expect("reply json");
+        assert_eq!(reply["error"], "invalid control credential");
+        assert!(reply.get("receipt").is_none());
+        assert!(!root.join(shutdown_flush::RECORD).exists());
+    }
+
+    #[test]
+    fn process_creation_time_is_nonzero_and_stable() {
+        let first = windows_pipe::process_creation_time().expect("creation time");
+        assert!(first > 0);
+        assert_eq!(
+            first,
+            windows_pipe::process_creation_time().expect("creation time")
+        );
+        assert_eq!(first, process_start().expect("process start"));
     }
 }

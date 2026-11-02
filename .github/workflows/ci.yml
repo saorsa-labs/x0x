@@ -1019,6 +1019,16 @@ jobs:
       - name: Run the instance-lock suite
         run: cargo test --lib instance_lock
 
+      # #1588: the Windows flush owner (named pipe, boot clock, record
+      # directory barrier) and the `x0x start --foreground` exit propagation
+      # were compile-only. These selectors are inert: temp dirs, local pipes
+      # and child `cmd` processes only, no daemon and no network.
+      - name: Run the Windows flush-owner suite
+        run: cargo test --lib windows_exec_regressions
+
+      - name: Run the upgrade journal integration tests
+        run: cargo test --test upgrade_journal
+
   coverage:
     name: Coverage Gate
     runs-on: ubuntu-latest
