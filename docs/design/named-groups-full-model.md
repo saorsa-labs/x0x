@@ -1242,16 +1242,16 @@ A roster seat commits to its owner-issued certificate by BLAKE3 digest
 inside the signed roster root. The BYTES also travel with group state
 (#1023). The `RosterMemberSnapshot.certificate` field is optional. It
 holds base64(bincode) certificate bytes. The newest
-`RETAINED_CERT_CARRY_LINKS` retained commits keep the field (2 links —
-the terminal link plus one; Engineer ruling of 2 Nov 2026, over the
-31 Oct head-link-only form). Older links age to digest-only.
+`RETAINED_CERT_CARRY_LINKS` retained commits keep the field. That window
+is 2 links: the terminal link plus one (Engineer ruling of 2 Nov 2026,
+over the 31 Oct head-link-only form). Older links age to digest-only.
 
 The second-newest link matters because a JoinResult serves only the
 links strictly before its terminal revision. With a one-link window
 those links were always digest-only, so no production path delivered
 the bytes to a gap joiner. With two links the newest SERVED link stays
 byte-bearing, and the terminal link still covers catch-up and
-`GET /groups/:id/state/commits` readers. A JoinResult that would pass
+`GET /groups/:id/state/commits` readers. A JoinResult that would exceed
 the direct-message budget drops the chain bytes first, so certificate
 carry never moves a joiner onto the blob path.
 
@@ -1261,12 +1261,18 @@ both sites (`apply_reconstructed_roster`, `hydrate_member_certificates`).
 Bytes that hash to a different digest never seat. Snapshot equality
 covers the committed fields only, so the bytes never change a
 comparison. The signed root does not move. Invite links stay
-digest-only, because of the direct message budget. The seal gate is
-unchanged: a certificate that no link carried still blocks the seal with
-`OwnerCertMemberPending`.
+digest-only, because of the direct message budget. The seal gate keeps
+its refusal: a certificate that no link carried still blocks an ordinary
+seal with `OwnerCertMemberPending`. The 1 Nov 2026 Engineer ruling adds
+one exception (#1023). Inside an S4 removal or ban whose working copy
+has excluded its target, a held creator does not block the seal. A held
+creator is the creator seat with its own expired certificate, reported
+`DigestPending`. Every other pending seat keeps the gate. The
+`OwnerCertMemberPending` refusal lists both in-grace and digest-pending
+seats.
 
 The creator seat never becomes eviction-eligible from its own expired
-certificate alone (Engineer ruling of 1 Nov 2026): the verdict holds the
-seat at `DigestPending`, the S4 expiry trigger skips it, and an expiry
+certificate alone (Engineer ruling of 1 Nov 2026). The verdict holds the
+seat at `DigestPending`, and the S4 expiry trigger skips it. An expiry
 row persisted by an earlier build ends with `creator_seat_exempt`. An
 ordinary member's expired certificate stays eviction-eligible as before.

@@ -4607,7 +4607,16 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
         member.treekem_key_package_b64 = None;
         member.treekem_key_package_hash = None;
     }
-    let head = group.commit_log.last()?.clone();
+    let mut head = group.commit_log.last()?.clone();
+    // Review finding 10 (#1023 round): the receiver verifies certificates
+    // from `members_v2` and the roster root from the snapshots' DIGESTS, so
+    // the head link's certificate bytes carry nothing it needs — while
+    // doubling every certified seat's payload against the 48 KiB
+    // direct-message budget, past which the bootstrap never delivers. Serve
+    // the head link digest-only, like the KEM strip above.
+    for snapshot in head.roster.values_mut() {
+        snapshot.certificate = None;
+    }
     group.commit_log.clear();
     group.commit_log.push(head);
     Some(group)
@@ -30760,9 +30769,9 @@ async fn owner_certified_seal_with_eviction(
         // (`mark_bound_machine_anonymous_announces`).
         info.owner_cert_verdict(&evidence)
     };
-    // The members that remain seated once the Failed set is gone: Clean ∪
-    // InGrace, per the operation's single verdict.
-    let in_grace_initially = !verdict.in_grace().is_empty();
+    // The members that remain seated once the Failed set is gone: Clean,
+    // InGrace and DigestPending, per the operation's single verdict.
+    let pending_initially = !verdict.in_grace().is_empty() || !verdict.digest_pending().is_empty();
     // Work queue: EXACTLY the operation-verdict's Failed set, evicted one
     // member per sealed transition. The verdict is frozen for this
     // operation — no re-evaluation, so mid-operation grace expiry cannot
@@ -30780,12 +30789,14 @@ async fn owner_certified_seal_with_eviction(
                 //
                 // Round-5 quarantine rule (documented): the operation ends
                 // with every remaining member Clean IN THE OPERATION'S
-                // VERDICT iff no member was InGrace initially — the Failed
-                // set is fully evicted and the rest were Clean at
-                // evaluation. Exactly then the restore quarantine lifts,
-                // here, explicitly (no clean seal is minted to do it).
-                // Otherwise it stays set until a later all-clean seal.
-                if !in_grace_initially {
+                // VERDICT iff no member was InGrace OR DigestPending
+                // initially — the Failed set is fully evicted and the rest
+                // were Clean at evaluation. Exactly then the restore
+                // quarantine lifts, here, explicitly (no clean seal is
+                // minted to do it). Otherwise — a held creator or any other
+                // digest-only seat still pending — it stays set until a
+                // later all-clean seal.
+                if !pending_initially {
                     // ADR-0064 slice 4 r2 (review item 3): the flag AND
                     // the eviction-arm marker clear happen ONLY inside
                     // the persist transaction — no pre-transaction
@@ -32268,7 +32279,10 @@ async fn seal_owner_certified_unbounded(
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {
         let group_id = info.stable_group_id().to_string();
-        let now_unix = now_ms / 1000;
+        // #1023 finding 8: the verdict above and both hold reads below use
+        // ONE clock — the evidence's stamp. A separate `now_ms` read could
+        // cross a second boundary between them and make them disagree.
+        let now_unix = evidence.now_unix();
         let in_grace = verdict.in_grace();
         let digest_pending = verdict.digest_pending();
         let failed = verdict.failed();
@@ -56815,6 +56829,60 @@ pub(in crate::server) mod tests {
             &tampered,
             &authority_hex,
             &recipient_hex
+        ));
+        Ok(())
+    }
+
+    /// Review finding 10 (#1023 round): the served bootstrap's head link
+    /// carries no certificate BYTES. The receiver verifies certificates
+    /// from `members_v2` and the roster root from the snapshots' digests,
+    /// so the bytes only doubled every certified seat against the 48 KiB
+    /// direct-message budget. The seats keep their bytes, and the stripped
+    /// snapshot still validates.
+    #[test]
+    fn bootstrap_head_link_serves_digest_only_snapshots() -> Result<()> {
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let authority_hex = hex::encode(authority.agent_id().as_bytes());
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Carry".to_string(),
+            String::new(),
+            authority.agent_id(),
+            "ac".repeat(32),
+            x0x::groups::policy::GroupPolicy {
+                admission: x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id()),
+                confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+                ..Default::default()
+            },
+        );
+        let authority_cert = x0x::identity::AgentCertificate::issue(&owner, &authority)?;
+        group
+            .set_member_certificate(&authority_hex, authority_cert)
+            .expect("the authority's seat binds its certificate");
+        let now_ms = now_millis_u64();
+        let verdict = group.owner_cert_verdict(&x0x::groups::owner_cert::OwnerCertEvidence::new(
+            now_ms / 1000,
+        ));
+        group
+            .seal_commit_with_owner_certs(&authority, now_ms, &verdict)
+            .map(|(commit, _)| commit)?;
+
+        let snapshot = signed_public_bootstrap_snapshot(group).context("public snapshot")?;
+        assert!(
+            snapshot.commit_log[0]
+                .roster
+                .values()
+                .all(|snap| snap.certificate.is_none()),
+            "the served head link is digest-only"
+        );
+        assert!(
+            snapshot.members_v2[&authority_hex].certificate.is_some(),
+            "the seats keep their certificate bytes"
+        );
+        assert!(validate_public_group_bootstrap(
+            &snapshot,
+            &authority_hex,
+            &authority_hex
         ));
         Ok(())
     }

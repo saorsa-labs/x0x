@@ -6413,6 +6413,542 @@ pub(super) mod tests {
         Ok(())
     }
 
+    /// Claude review of PR #1753/#1755 (2 Nov 2026), blocking finding 2:
+    /// the eviction arm of the explicit seal lifted the restore quarantine
+    /// when the ONLY pending seats left were DigestPending — a held
+    /// creator. The 409 refusal that keeps `owner_cert_reverify_required`
+    /// set was unreachable, so the flag (and the fork marker) cleared
+    /// while the creator still waited for its renewal. RED before the
+    /// fix: `Ok` with the flag cleared on the live record.
+    #[tokio::test]
+    async fn an_evicting_seal_keeps_the_restore_quarantine_while_a_held_creator_pends(
+    ) -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let target_hex = hex::encode(target.agent_id().as_bytes());
+        let target_cert = x0x::identity::AgentCertificate::issue(&owner, &target)?;
+        // A verified self-revocation puts the target in the verdict's
+        // Failed set (ADR-0018: self-revocation is authority-verifiable
+        // from the record alone).
+        self_revoke(&state, &owner, &target).await?;
+        let (mut info, creator_hex, local_hex) = held_creator_group(
+            &state,
+            &owner,
+            "9d",
+            GroupRole::Member,
+            &[(target, Some(target_cert))],
+        )
+        .await?;
+        let group_id = info.stable_group_id().to_string();
+        assert!(
+            info.creator_expired_certificate_hold(&creator_hex, now_unix_ms() / 1000),
+            "premise: the creator seat is held"
+        );
+        info.owner_cert_reverify_required = true;
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let result =
+            super::super::owner_certified_seal_with_eviction(&state, &group_id, &local_hex).await;
+        let Some(Err((code, Json(body)))) = result else {
+            panic!("pending seats remain: the seal must refuse")
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("members pending certificate resolution"),
+            "the typed refusal names the pending seats: {error}"
+        );
+        assert!(
+            error.contains(&creator_hex),
+            "the pending list names the held creator: {error}"
+        );
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert_eq!(
+            live.members_v2[&target_hex].state,
+            GroupMemberState::Removed,
+            "the revoked member's eviction still committed"
+        );
+        assert!(
+            live.owner_cert_reverify_required,
+            "the restore quarantine stays set while the creator pends"
+        );
+        drop(groups);
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// An OwnerCertified, plaintext (SignedPublic) policy — the #1023
+    /// review-round fixture shape. The seal under test is the quarantine
+    /// and pending logic, not the survivor-envelope preflight a GSS
+    /// rotation adds.
+    fn owner_certified_signed_public(
+        owner: &x0x::identity::UserId,
+    ) -> x0x::groups::policy::GroupPolicy {
+        x0x::groups::policy::GroupPolicy {
+            discoverability: x0x::groups::policy::GroupDiscoverability::Hidden,
+            admission: x0x::groups::policy::GroupAdmission::OwnerCertified(*owner),
+            confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+            read_access: x0x::groups::policy::GroupReadAccess::MembersOnly,
+            write_access: x0x::groups::policy::GroupWriteAccess::MembersOnly,
+        }
+    }
+
+    /// The #1023 review-round fixture: an OwnerCertified group built by a
+    /// remote creator whose OWN certificate is expired (a held creator at
+    /// `creator_role`), this local node as a clean admin, and one extra
+    /// seat per `extras` entry — `Some(cert)` seats the bytes, `None`
+    /// leaves a committed digest with no bytes (a digest-only seat).
+    /// Returns the info, the creator hex and the local hex.
+    async fn held_creator_group(
+        state: &Arc<AppState>,
+        owner: &x0x::identity::UserKeypair,
+        mls_id: &str,
+        creator_role: GroupRole,
+        extras: &[(
+            x0x::identity::AgentKeypair,
+            Option<x0x::identity::AgentCertificate>,
+        )],
+    ) -> anyhow::Result<(GroupInfo, String, String)> {
+        let creator_kp = x0x::identity::AgentKeypair::generate()?;
+        let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
+        let expired_creator = x0x::identity::AgentCertificate::issue_with_expiry(
+            owner,
+            &creator_kp,
+            Some(now_unix_ms() / 1000 - 3_600),
+        )?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let local_cert =
+            x0x::identity::AgentCertificate::issue(owner, state.agent.identity().agent_keypair())?;
+        let mut info = GroupInfo::with_policy(
+            format!("s4-{mls_id}"),
+            String::new(),
+            creator_kp.agent_id(),
+            mls_id.repeat(16),
+            owner_certified_signed_public(&owner.user_id()),
+        );
+        info.set_member_certificate(&creator_hex, expired_creator)
+            .expect("the creator's seat binds its certificate");
+        info.members_v2
+            .get_mut(&creator_hex)
+            .expect("creator seat")
+            .role = creator_role;
+        info.add_member(local_hex.clone(), GroupRole::Admin, None, None);
+        info.set_member_certificate(&local_hex, local_cert)
+            .expect("the admin's seat binds its certificate");
+        for (kp, cert) in extras {
+            let hex_id = hex::encode(kp.agent_id().as_bytes());
+            info.add_member(
+                hex_id.clone(),
+                GroupRole::Member,
+                Some(local_hex.clone()),
+                None,
+            );
+            match cert {
+                Some(cert) => info
+                    .set_member_certificate(&hex_id, cert.clone())
+                    .expect("the seat binds its certificate"),
+                None => {
+                    info.members_v2
+                        .get_mut(&hex_id)
+                        .expect("seat")
+                        .certificate_digest = Some("6e".repeat(32))
+                }
+            }
+        }
+        info.recompute_state_hash();
+        Ok((info, creator_hex, local_hex))
+    }
+
+    /// A verified self-revocation of `kp` in `state`'s set (ADR-0018:
+    /// self-revocation is authority-verifiable from the record alone).
+    async fn self_revoke(
+        state: &Arc<AppState>,
+        owner: &x0x::identity::UserKeypair,
+        kp: &x0x::identity::AgentKeypair,
+    ) -> anyhow::Result<()> {
+        let cert = x0x::identity::AgentCertificate::issue(owner, kp)?;
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(kp.agent_id()),
+            kp.public_key(),
+            kp.secret_key(),
+            now_unix_ms() / 1000,
+            Some("#1023 regression".to_string()),
+        )?;
+        state
+            .agent
+            .revocation_set()
+            .write()
+            .await
+            .verify_and_insert(record, Some(&cert))?;
+        Ok(())
+    }
+
+    /// #1023 finding 6a (Claude review, 2 Nov 2026): the S4 held-creator
+    /// pass is an `.all`, not an `.any`. A held creator PLUS a second,
+    /// genuinely digest-pending seat (a non-creator seat with a committed
+    /// digest and no bytes) must still refuse — that seat is evidence
+    /// convergence the seal waits for. A weakening to `.any` lets the
+    /// removal seal and must fail here.
+    #[tokio::test]
+    async fn an_s4_seal_refuses_a_digest_pending_seat_beside_the_held_creator() -> anyhow::Result<()>
+    {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let target_hex = hex::encode(target.agent_id().as_bytes());
+        let target_cert = x0x::identity::AgentCertificate::issue(&owner, &target)?;
+        let digest_only = x0x::identity::AgentKeypair::generate()?;
+        let digest_hex = hex::encode(digest_only.agent_id().as_bytes());
+        let (mut info, creator_hex, local_hex) = held_creator_group(
+            &state,
+            &owner,
+            "aa",
+            GroupRole::Member,
+            &[(target, Some(target_cert)), (digest_only, None)],
+        )
+        .await?;
+        info.remove_member(&target_hex, Some(local_hex.clone()));
+        let scope = EvictionSealScope {
+            stable_group_id: info.stable_group_id().to_string(),
+            target_hex: target_hex.clone(),
+            pending_targets: BTreeSet::new(),
+            prepared_removal: true,
+        };
+        let refused = S4_EVICTION_SEAL
+            .scope(
+                scope,
+                crate::server::routes::named_groups::seal_commit_owner_certified(
+                    &state,
+                    &mut info,
+                    state.agent.identity().agent_keypair(),
+                    now_unix_ms(),
+                ),
+            )
+            .await;
+        match refused {
+            Err(x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
+                members, ..
+            }) => {
+                assert!(
+                    members.contains(&creator_hex),
+                    "names the held creator: {members:?}"
+                );
+                assert!(
+                    members.contains(&digest_hex),
+                    "names the digest-only seat: {members:?}"
+                );
+            }
+            other => panic!("the digest-only seat keeps the gate: {other:?}"),
+        }
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1023 finding 6b: the failed-members arm of the seal. A revoked or
+    /// expired seat plus a NON-creator digest-pending seat is
+    /// `OwnerCertifiedEvictionRequired` — not `MemberPending` — even inside
+    /// an S4 scope whose tolerance would otherwise cover the failing seat
+    /// (`pending_blocks_seal` stays true).
+    #[tokio::test]
+    async fn a_digest_pending_non_creator_keeps_the_eviction_required_refusal() -> anyhow::Result<()>
+    {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let now_ms = now_unix_ms();
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let target_hex = hex::encode(target.agent_id().as_bytes());
+        let target_cert = x0x::identity::AgentCertificate::issue(&owner, &target)?;
+        let failing = x0x::identity::AgentKeypair::generate()?;
+        let failing_hex = hex::encode(failing.agent_id().as_bytes());
+        // An expired NON-creator certificate: a definitive failure.
+        let failing_cert = x0x::identity::AgentCertificate::issue_with_expiry(
+            &owner,
+            &failing,
+            Some(now_ms / 1000 - 3_600),
+        )?;
+        let digest_only = x0x::identity::AgentKeypair::generate()?;
+        let (mut info, _creator_hex, local_hex) = held_creator_group(
+            &state,
+            &owner,
+            "ab",
+            GroupRole::Member,
+            &[
+                (target, Some(target_cert)),
+                (failing, Some(failing_cert)),
+                (digest_only, None),
+            ],
+        )
+        .await?;
+        info.remove_member(&target_hex, Some(local_hex.clone()));
+        let scope = EvictionSealScope {
+            stable_group_id: info.stable_group_id().to_string(),
+            target_hex: target_hex.clone(),
+            // The failing seat is another open row: tolerance alone would
+            // let this removal seal (ADR 0110 §3).
+            pending_targets: BTreeSet::from([failing_hex.clone()]),
+            prepared_removal: true,
+        };
+        let tolerated = S4_EVICTION_SEAL
+            .scope(scope.clone(), async {
+                s4_eviction_seal_tolerates(&info, std::slice::from_ref(&failing_hex))
+            })
+            .await;
+        assert!(
+            tolerated,
+            "premise: the scope tolerates the other failing seat"
+        );
+        let refused = S4_EVICTION_SEAL
+            .scope(
+                scope,
+                crate::server::routes::named_groups::seal_commit_owner_certified(
+                    &state,
+                    &mut info,
+                    state.agent.identity().agent_keypair(),
+                    now_unix_ms(),
+                ),
+            )
+            .await;
+        match refused {
+            Err(x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
+                members,
+                ..
+            }) => assert_eq!(members, vec![failing_hex]),
+            other => panic!("the digest-only seat keeps the eviction gate: {other:?}"),
+        }
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1023 finding 6c: the hold is identity-based, not role-based. The
+    /// existing test demotes the creator to Member; here the creator keeps
+    /// the Owner role and the S4 eviction of the revoked member still
+    /// seals.
+    #[tokio::test]
+    async fn an_s4_eviction_seals_while_the_held_creator_keeps_the_owner_role() -> anyhow::Result<()>
+    {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let target_hex = hex::encode(target.agent_id().as_bytes());
+        let target_cert = x0x::identity::AgentCertificate::issue(&owner, &target)?;
+        self_revoke(&state, &owner, &target).await?;
+        let (mut info, creator_hex, local_hex) = held_creator_group(
+            &state,
+            &owner,
+            "ad",
+            GroupRole::Owner,
+            &[(target, Some(target_cert))],
+        )
+        .await?;
+        info.remove_member(&target_hex, Some(local_hex.clone()));
+        let scope = EvictionSealScope {
+            stable_group_id: info.stable_group_id().to_string(),
+            target_hex: target_hex.clone(),
+            pending_targets: BTreeSet::new(),
+            prepared_removal: true,
+        };
+        let sealed = S4_EVICTION_SEAL
+            .scope(
+                scope,
+                crate::server::routes::named_groups::seal_commit_owner_certified(
+                    &state,
+                    &mut info,
+                    state.agent.identity().agent_keypair(),
+                    now_unix_ms(),
+                ),
+            )
+            .await;
+        assert!(
+            sealed.is_ok(),
+            "the S4 removal seals past the held Owner: {sealed:?}"
+        );
+        assert_eq!(
+            info.members_v2[&creator_hex].state,
+            GroupMemberState::Active
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1023 findings 6d/6e: the same scenario through the real route
+    /// handler (`POST /groups/:id/state/seal`). The revoked member is
+    /// evicted, and the response is the typed 409 — "members pending
+    /// certificate resolution" — naming the held creator, so the restore
+    /// quarantine stays set.
+    #[tokio::test]
+    async fn the_seal_route_evicts_a_revoked_member_and_refuses_on_the_held_creator(
+    ) -> anyhow::Result<()> {
+        let (mut state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        // ADR 0110 §2: the route's seal gate waits for head sync like the
+        // worker; start past the restart wait so the seal is not deferred.
+        Arc::get_mut(&mut state)
+            .expect("the fresh test state is not shared yet")
+            .revocation_evictions = S4Runtime::new(s4::S4Timing {
+            restart_sync_wait: Duration::ZERO,
+            ..s4::S4Timing::default()
+        });
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let target = x0x::identity::AgentKeypair::generate()?;
+        let target_hex = hex::encode(target.agent_id().as_bytes());
+        let target_cert = x0x::identity::AgentCertificate::issue(&owner, &target)?;
+        self_revoke(&state, &owner, &target).await?;
+        let (info, creator_hex, _local_hex) = held_creator_group(
+            &state,
+            &owner,
+            "ae",
+            GroupRole::Member,
+            &[(target, Some(target_cert))],
+        )
+        .await?;
+        let group_id = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let response = super::super::seal_group_state(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path(group_id.clone()),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(status, StatusCode::CONFLICT, "the route refuses: {body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("members pending certificate resolution"),
+            "the typed refusal names the pending seats: {error}"
+        );
+        assert!(
+            error.contains(&creator_hex),
+            "the pending list names the held creator: {error}"
+        );
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert_eq!(
+            live.members_v2[&target_hex].state,
+            GroupMemberState::Removed,
+            "the revoked member's eviction committed"
+        );
+        drop(groups);
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1023 finding 7 (decision, 2 Nov 2026): the hold protects the
+    /// creator's SEAT from eviction; it does not grant an expired creator
+    /// seal AUTHORITY. ADR 0110 §1a stands: an admin whose own selected
+    /// (committed) certificate is expired may not seal. The eligibility
+    /// check is certificate-direct — `local_certificate_expired` reads the
+    /// seat's committed bytes, never the verdict's Failed set — so the
+    /// hold's DigestPending classification of the creator seat does not
+    /// make this node an eligible S4 committer.
+    #[test]
+    fn an_expired_creator_still_may_not_be_the_local_s4_committer() {
+        let now = now_unix_ms() / 1000;
+        let owner = x0x::identity::UserKeypair::generate().expect("owner");
+        let creator_kp = x0x::identity::AgentKeypair::generate().expect("creator");
+        let local = *creator_kp.agent_id().as_bytes();
+        let expired = x0x::identity::AgentCertificate::issue_with_expiry(
+            &owner,
+            &creator_kp,
+            Some(now - 48 * 3_600),
+        )
+        .expect("expired creator cert");
+        let mut info = group_with(local, [2; 32]);
+        info.policy = owner_certified_signed_public(&owner.user_id());
+        info.set_member_certificate(&hex::encode(local), expired)
+            .expect("the creator's seat binds its certificate");
+        let verdict =
+            info.owner_cert_verdict(&x0x::groups::owner_cert::OwnerCertEvidence::new(now));
+        assert_eq!(
+            verdict.digest_pending(),
+            vec![hex::encode(local)],
+            "premise: the hold reports the local creator DigestPending"
+        );
+        assert!(
+            verdict.failed().is_empty(),
+            "the hold keeps the creator out of the Failed set"
+        );
+        assert!(
+            local_certificate_expired(&info, &local, now),
+            "the certificate-direct check still refuses the expired creator as committer"
+        );
+    }
+
+    /// #1023 finding 6f: carried bytes that hash to the committed digest
+    /// but are EXPIRED on a NON-creator seat are `Failed` — not Clean, not
+    /// held. Only the creator's own expired certificate holds, so the seal
+    /// takes the eviction path for this seat, never the pending path.
+    #[test]
+    fn an_expired_non_creator_certificate_is_failed_not_held() {
+        let now = now_unix_ms() / 1000;
+        let owner = x0x::identity::UserKeypair::generate().expect("owner");
+        let creator_kp = x0x::identity::AgentKeypair::generate().expect("creator");
+        let member_kp = x0x::identity::AgentKeypair::generate().expect("member");
+        let member_hex = hex::encode(member_kp.agent_id().as_bytes());
+        let mut info = GroupInfo::with_policy(
+            "expired-member".into(),
+            String::new(),
+            creator_kp.agent_id(),
+            "af".repeat(16),
+            owner_certified_signed_public(&owner.user_id()),
+        );
+        info.set_member_certificate(
+            &hex::encode(creator_kp.agent_id().as_bytes()),
+            x0x::identity::AgentCertificate::issue(&owner, &creator_kp)
+                .expect("valid creator cert"),
+        )
+        .expect("the creator's seat binds its certificate");
+        info.add_member(member_hex.clone(), GroupRole::Member, None, None);
+        info.set_member_certificate(
+            &member_hex,
+            x0x::identity::AgentCertificate::issue_with_expiry(
+                &owner,
+                &member_kp,
+                Some(now - 3_600),
+            )
+            .expect("expired member cert"),
+        )
+        .expect("the member's seat binds its certificate");
+        let verdict =
+            info.owner_cert_verdict(&x0x::groups::owner_cert::OwnerCertEvidence::new(now));
+        assert_eq!(
+            verdict.failed(),
+            vec![(
+                member_hex.clone(),
+                x0x::groups::owner_cert::OwnerCertFailure::Expired
+            )],
+            "an expired non-creator certificate is a definitive failure"
+        );
+        assert!(
+            !info.creator_expired_certificate_hold(&member_hex, now),
+            "the hold is the creator's alone"
+        );
+        assert!(
+            verdict.digest_pending().is_empty(),
+            "the seal must not wait on this seat"
+        );
+    }
+
     /// ADR 0110 §1a hand-off evidence (#1508 review P2 #5): a verified
     /// expiry hand-off carries the bytes of a digest-only seat's committed
     /// certificate. The receiver verifies and installs them, and its
