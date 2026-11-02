@@ -1,0 +1,41 @@
+{
+  "creator": {
+    "agent_id": "a1169194af5f63f896f59f4e4b01de99b2306fea1f49a9bf7c29601d8630effb",
+    "expected_failure": false,
+    "grecov": "group-recovery/4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe.grecov",
+    "grecov_sha256": "3a593d6ec6d4cd0598ed2fa712cb302a4052acdd9d0831a4f1430f4e7cbaedaa",
+    "group_ids": [
+      "4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe"
+    ],
+    "group_key": "4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe",
+    "home_json_sha256": "7ae8cbd7b35fbf76b9cb4f382de471c01803bcb03236672ac313a27eba1b3e5f",
+    "owner_install": true,
+    "stable_group_id": "4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe"
+  },
+  "device": {
+    "agent_id": "eeae41cd26226ae62fbc6581525097a0b7d74ed2a0d7cc7039d7839cb8c0dcb2",
+    "expected_failure": false,
+    "grecov": "group-recovery/4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe.grecov",
+    "grecov_sha256": "79f0c85ef91f1158f2360595bb3e192d5cc8cbf37fcbbd3a20a28d2fb9b33463",
+    "group_ids": [
+      "4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe"
+    ],
+    "group_key": "4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe",
+    "home_json_sha256": null,
+    "owner_install": false,
+    "stable_group_id": "4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe"
+  },
+  "owner_device": {
+    "agent_id": "7e6c3438e122d27d83832767dba9b864ef0e85af8aefb5f4434d0f30080e879f",
+    "expected_failure": false,
+    "grecov": "group-recovery/4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe.grecov",
+    "grecov_sha256": "babf732e45c2b2a63edc8a5571f95efbe2f1125c5b7482b14c9c1bcc0f0487c3",
+    "group_ids": [
+      "4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe"
+    ],
+    "group_key": "4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe",
+    "home_json_sha256": null,
+    "owner_install": true,
+    "stable_group_id": "4bb0c6e2233f0a137e563ae0bf81c632e404b571588732e3c04da79a6cca1cbe"
+  }
+}
