@@ -9,7 +9,8 @@ pub(super) fn hash(path: &Path) -> io::Result<[u8; 32]> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    if !file.metadata()?.is_file() || file.metadata()?.len() > MAX_BINARY_BYTES {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_BINARY_BYTES {
         return Err(invalid("not a bounded regular binary"));
     }
     hash_bounded(&mut file, MAX_BINARY_BYTES)
@@ -75,7 +76,7 @@ pub(super) fn restore_one(a: &journal::ArtifactPlan) -> io::Result<()> {
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -120,6 +121,54 @@ mod tests {
         assert!(restore_one(&plan).is_err());
         assert_eq!(std::fs::read(target).unwrap(), b"candidate");
         assert_eq!(std::fs::read(backup).unwrap(), b"damaged");
+    }
+
+    #[test]
+    fn launcher_hash_is_sha256_of_regular_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon");
+        std::fs::write(&path, b"candidate bytes").unwrap();
+        let expected: [u8; 32] = Sha256::digest(b"candidate bytes").into();
+        assert_eq!(hash(&path).unwrap(), expected);
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(hash(&empty).unwrap(), <[u8; 32]>::from(Sha256::digest(b"")));
+    }
+
+    #[test]
+    fn launcher_hash_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("daemon");
+        let link = dir.path().join("link");
+        std::fs::write(&target, b"candidate").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let error = hash(&link).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ELOOP));
+    }
+
+    #[test]
+    fn launcher_hash_refuses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = hash(dir.path()).unwrap_err();
+        assert_eq!(error.to_string(), "not a bounded regular binary");
+    }
+
+    #[test]
+    fn launcher_hash_refuses_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: name is a live nul-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // With no writer, a blocking open would hang here.
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(hash(&fifo).map_err(|error| error.to_string()));
+        });
+        let result = wait
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "not a bounded regular binary");
     }
 
     #[test]
