@@ -1849,9 +1849,11 @@ the member signs its live ML-KEM-768 public key — the key its daemon
 can open sealed shares under — in the domain
 `x0x.member-key-republish.v1` and sends the typed `X0XKR1` frame to
 its group peers; each peer that verifies the signature, the signer's
-Active seat, the encrypted GSS plane and the frame's per-seat monotonic
-counter seats the key on the member's row (replays, stale keys, and
-unsigned or wrong-signer frames are refused). The republication is
+Active seat, the encrypted GSS plane and the frame's per-seat position
+(`state_revision`, `key_sequence`) seats the key on the member's row
+(replays, stale keys, frames signed before the seat's current
+admission, and unsigned or wrong-signer frames are refused; see the
+`X0XKR1` entry below). The republication is
 automatic: the keyless install itself sends it, and a node that boots
 into the keyless state — or into the keyed state whose share never
 installed — sends it at startup. A send the carrier does not accept is
@@ -1910,17 +1912,73 @@ not on the metadata topic and not in a legacy-decoded container:
 - `X0XKR1` — `MemberKeyRepublishV1` (#1663, bit 12 `key_republish_v1`).
   An Active member of an encrypted GSS group republishes its ML-KEM-768
   public key on its own seat — the recovery of the keyless survivor state
-  above, without a leave and re-join. The body is signed in domain
-  `x0x.member-key-republish.v1` by the member's agent key, which the body
-  carries, and which must derive the member's agent ID. It rides the
-  direct-message carrier only. Receivers verify the signature, the
-  signer's Active seat, the encrypted GSS plane and the frame's per-seat
-  monotonic counter (`key_sequence`). Refusals are typed; for example, a
-  replay or stale key is refused as `stale_key`, a wrong signer as
-  `bad_signature`, and an unseated signer as `actor_ineligible`. A daemon
-  sends it only to a member whose current verified advert sets bit 12.
-  A member that is removed and then admitted again starts a new counter:
-  its `kem_key_sequence` resets when its seat returns to Active.
+  above, without a leave and re-join. The frame is a
+  `SignedMemberKeyRepublishV1`: a `MemberKeyRepublishBodyV1` and an
+  ML-DSA-65 signature over it in domain `x0x.member-key-republish.v1`. The
+  body fields, in postcard order, are:
+  - `stable_group_id` — the group's stable ID.
+  - `actor` — the republishing member's raw agent ID. The key seats on
+    this member's own row only.
+  - `agent_public_key_b64` — the actor's ML-DSA-65 agent public key
+    (base64). It verifies the
+    signature and must derive `actor`.
+  - `kem_public_key_b64` — the ML-KEM-768 public key (base64) to seat.
+    It must parse as an
+    ML-KEM-768 public key; a correct length alone is not sufficient.
+  - `state_revision` — the group state revision (the signed state-commit
+    chain) that the actor held when it signed. This is the admission
+    binding (David's 2 Nov 2026 ruling).
+  - `key_sequence` — the republication counter within the admission. `0`
+    is refused.
+
+  It rides the direct-message carrier only. A daemon sends it only to a
+  member whose current verified advert sets bit 12. Receivers verify the
+  signature, the signer's Active seat, the encrypted GSS plane and the
+  frame's position. Each seat has a local position
+  `(kem_key_revision, kem_key_sequence)` (absent parts read as `0`). The
+  frame's `(state_revision, key_sequence)` must order strictly after it,
+  compared first by revision; if it does not, the frame is refused as
+  `stale_key`. A seated frame moves the position to its own.
+
+  **Re-admission.** A row that becomes Active from absent, `Removed` or
+  `Banned` (by an add, an unban, or a catch-up apply) is a re-admission.
+  The receiver clears the counter and sets the floor `kem_key_revision` to
+  the state revision it held at that time. The removal commit advanced the
+  chain, so a frame that the actor signed in an earlier admission carries
+  a lower revision. If any peer relays that old frame, receivers refuse
+  it as `stale_key`. Limits that remain:
+  - A receiver that first learns the seat from a catch-up snapshot, with
+    no earlier local row, uses its own revision before the apply as the
+    floor. It can not tell an older admission apart from the current one
+    for frames signed at or after that floor. A relay is then possible
+    only for a frame signed at a revision at or above that floor.
+  - If the actor's own state revision is lower than a receiver's floor,
+    that receiver refuses the actor's frame as `stale_key`. The actor must
+    republish at a later revision.
+  - The actor can sign any revision. The binding stops relays of the
+    actor's old frames; it does not defend against the actor itself.
+
+  Typed refusals (`MemberKeyRepublishRefusal`):
+  - `wrong_prefix` — the payload is not an `X0XKR1` payload.
+  - `malformed` — the body does not decode, is not consumed exactly, has
+    `key_sequence` `0`, or its KEM key is not an ML-KEM-768 public key.
+  - `bad_signature` — the signature does not verify, or the embedded agent
+    public key does not derive `actor`.
+  - `group_mismatch` — the group ID is not this group's ID.
+  - `group_contained` — the group is withdrawn or holds a fork-quarantine
+    marker.
+  - `actor_ineligible` — the signer is not an Active member on the named
+    seat. An absent row and the join's key-only marker row (Pending) are
+    not seated.
+  - `crypto_plane_unsupported` — the group is not a GSS `MlsEncrypted`
+    group.
+  - `stale_key` — the position does not order after the seat's position:
+    a replay, a stale key, or a frame signed before the seat's current
+    admission.
+
+  Two receiver outcomes are local and are not refusals: the group is not
+  known on this node (nothing to seat), or the frame is sound but a local
+  fault stopped the save.
 
 - `X0XORC1` — owner recovery (ADR 0110 §4b(1), bit 7
   `owner_recovery_v1`). One postcard frame type with two variants: the

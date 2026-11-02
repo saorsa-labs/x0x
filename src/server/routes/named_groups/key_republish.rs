@@ -68,6 +68,13 @@ const KEY_REPUBLISH_MAX_RETRY_INTERVAL: std::time::Duration = std::time::Duratio
 /// harmless: the receiver refuses it as `StaleKey`.
 const KEY_REPUBLISH_ACCEPTED_SENDS: u8 = 6;
 
+/// #1663 review (Claude, 2 Nov): the total time limit of one group's debt,
+/// from the record of its current frame. A recipient whose advert stays
+/// unknown would keep the sweep alive for ever; at this limit the sweep
+/// drops every recipient still owed. The startup pass rebuilds the debt
+/// after a restart if the seat still waits for its share.
+const KEY_REPUBLISH_DEBT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// The built republication of this node's own seat: the encoded frame, the
 /// recipients (every other Active member), and the sequence it seats.
 pub(super) struct OwnRepublish {
@@ -75,6 +82,7 @@ pub(super) struct OwnRepublish {
     pub(super) stable_group_id: String,
     pub(super) recipients: Vec<[u8; 32]>,
     pub(super) kem_public_key_b64: String,
+    pub(super) state_revision: u64,
     pub(super) key_sequence: u64,
 }
 
@@ -94,6 +102,9 @@ pub(in crate::server) struct PendingKeyRepublish {
     /// sweep, up to [`KEY_REPUBLISH_MAX_RETRY_INTERVAL`].
     interval: std::time::Duration,
     next_at: std::time::Instant,
+    /// The end of this debt: [`KEY_REPUBLISH_DEBT_LIMIT`] after the record
+    /// of the current `payload`.
+    expires_at: std::time::Instant,
 }
 
 /// The per-state pending-republish map, keyed by stable group id.
@@ -207,6 +218,13 @@ pub(super) async fn build_own_republish(
     // and can sit at its ceiling; a checked add keeps a republish from
     // wrapping to a sequence every receiver refuses.
     let key_sequence = member.kem_key_sequence.unwrap_or(0).checked_add(1)?;
+    // David's ruling (2 Nov 2026 20:34 GMT): sign the state revision this
+    // node holds, which binds the frame to the seat's current admission.
+    // The seat's own floor never runs ahead of the chain this node
+    // applied; the max keeps the own install's ordering if it ever did.
+    let state_revision = info
+        .state_revision
+        .max(member.kem_key_revision.unwrap_or(0));
     let kem_public_key_b64 =
         base64::engine::general_purpose::STANDARD.encode(&state.agent_kem_keypair.public_bytes);
     let body = kr::MemberKeyRepublishBodyV1 {
@@ -221,6 +239,7 @@ pub(super) async fn build_own_republish(
                 .as_bytes(),
         ),
         kem_public_key_b64: kem_public_key_b64.clone(),
+        state_revision,
         key_sequence,
     };
     let frame = kr::sign(body, state.agent.identity().agent_keypair()).ok()?;
@@ -243,6 +262,7 @@ pub(super) async fn build_own_republish(
         stable_group_id,
         recipients,
         kem_public_key_b64,
+        state_revision,
         key_sequence,
     })
 }
@@ -275,6 +295,7 @@ async fn seat_own_republish(
         if !staged.install_republished_kem_key(
             &local_hex,
             &own.kem_public_key_b64,
+            own.state_revision,
             own.key_sequence,
         ) {
             return false;
@@ -328,6 +349,19 @@ pub(in crate::server) async fn receive(
     else {
         return RepublishOutcome::NotApplicable;
     };
+    // #1663 review (Claude, 2 Nov): a cheap pre-check under the read lock.
+    // A frame from a non-member sender, or for an actor without an Active
+    // row, does not take the membership lock or the global write lock.
+    // The check under the lock below stays the authoritative one.
+    {
+        let groups = state.named_groups.read().await;
+        let Some(current) = groups.get(&group_key) else {
+            return RepublishOutcome::NotApplicable;
+        };
+        if let Err(refusal) = receipt_precheck(current, &sender, &body.actor) {
+            return RepublishOutcome::Refused(refusal);
+        }
+    }
     let membership_lock = ng::group_membership_lock(state, &group_key).await;
     let _membership_guard = membership_lock.lock().await;
     let actor_hex = hex::encode(body.actor);
@@ -353,6 +387,7 @@ pub(in crate::server) async fn receive(
         if !staged.install_republished_kem_key(
             &actor_hex,
             &body.kem_public_key_b64,
+            body.state_revision,
             body.key_sequence,
         ) {
             return RepublishOutcome::Refused(Refusal::StaleKey);
@@ -364,7 +399,7 @@ pub(in crate::server) async fn receive(
     // keyed seat inside that write, and the head/round observers read the
     // roster without the membership guard — a restored head answered in
     // the gap between the install and a later arm would converge the
-    // now-keyged seat and remove the row this debt holds open. Arming
+    // now-keyed seat and remove the row this debt holds open. Arming
     // first makes key visibility and the obligation move together; the
     // failed save rolls the arm back with the seat below.
     let armed = super::revocation_eviction::crypto_exclusion::owe_gss_shares_after_republish(
@@ -414,8 +449,51 @@ pub(in crate::server) async fn receive(
     RepublishOutcome::Installed
 }
 
+/// #1663 review (Claude, 2 Nov): the read-lock pre-check of [`receive`].
+/// The sender must be the actor or an Active member, and the actor must
+/// have an Active row. It refuses with the reason the locked check gives.
+fn receipt_precheck(
+    info: &x0x::groups::GroupInfo,
+    sender: &AgentId,
+    actor: &[u8; 32],
+) -> Result<(), kr::MemberKeyRepublishRefusal> {
+    let sender_ok =
+        sender.as_bytes() == actor || info.has_active_member(&hex::encode(sender.as_bytes()));
+    let actor_ok = info
+        .members_v2
+        .get(&hex::encode(actor))
+        .is_some_and(|seat| seat.state == x0x::groups::member::GroupMemberState::Active);
+    if sender_ok && actor_ok {
+        Ok(())
+    } else {
+        Err(kr::MemberKeyRepublishRefusal::ActorIneligible)
+    }
+}
+
+/// #1663 review (Claude, 2 Nov): the most `X0XKR1` receipts that run at
+/// the same time in this process. A frame that arrives while all slots
+/// are in use is dropped; the sender's sweep sends it again.
+const KEY_REPUBLISH_RECEIPT_SLOTS: usize = 16;
+
+/// The process-wide receipt slots ([`KEY_REPUBLISH_RECEIPT_SLOTS`]).
+fn receipt_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(KEY_REPUBLISH_RECEIPT_SLOTS))
+    })
+}
+
+/// Take one receipt slot, or `None` when all slots are in use.
+fn try_receipt_slot(
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    std::sync::Arc::clone(slots).try_acquire_owned().ok()
+}
+
 /// The direct carrier's receipt of one `X0XKR1` frame; verified off the
-/// listener loop, as every typed frame is.
+/// listener loop, as every typed frame is. #1663 review (Claude, 2 Nov):
+/// the receipts in flight are bounded ([`KEY_REPUBLISH_RECEIPT_SLOTS`]).
 pub(in crate::server) fn spawn_receipt(
     state: &std::sync::Arc<AppState>,
     sender: AgentId,
@@ -425,8 +503,16 @@ pub(in crate::server) fn spawn_receipt(
     if !verified {
         return;
     }
+    let Some(slot) = try_receipt_slot(receipt_slots()) else {
+        tracing::debug!(
+            sender = %hex::encode(sender.as_bytes()),
+            "#1663: key republish receipt dropped — all receipt slots in use"
+        );
+        return;
+    };
     let task_state = std::sync::Arc::clone(state);
     let _spawned = state.spawn_detached(async move {
+        let _slot = slot;
         let _ = receive(&task_state, sender, &payload).await;
     });
 }
@@ -532,12 +618,14 @@ fn record_into(
             owed: std::collections::BTreeMap::new(),
             interval: KEY_REPUBLISH_RETRY_INTERVAL,
             next_at: now + KEY_REPUBLISH_RETRY_INTERVAL,
+            expires_at: now + KEY_REPUBLISH_DEBT_LIMIT,
         });
     if entry.payload.as_slice() != payload.as_slice() {
         entry.payload = std::sync::Arc::new(payload);
         entry.owed.values_mut().for_each(|accepted| *accepted = 0);
         entry.interval = KEY_REPUBLISH_RETRY_INTERVAL;
         entry.next_at = now + KEY_REPUBLISH_RETRY_INTERVAL;
+        entry.expires_at = now + KEY_REPUBLISH_DEBT_LIMIT;
     }
     for recipient in owed {
         entry.owed.entry(*recipient).or_insert(0);
@@ -575,8 +663,21 @@ fn note_accepted_into(
 /// The due step of one sweep: snapshot each group whose retry time came,
 /// and back off its next retry (#1663 review round 5, Claude, 30 Oct). The
 /// interval doubles after each sweep of the group, up to
-/// [`KEY_REPUBLISH_MAX_RETRY_INTERVAL`].
+/// [`KEY_REPUBLISH_MAX_RETRY_INTERVAL`]. A group whose debt reached
+/// [`KEY_REPUBLISH_DEBT_LIMIT`] is dropped, not swept (#1663 review,
+/// Claude, 2 Nov).
 fn take_due(pending: &mut PendingMap, now: std::time::Instant) -> Vec<DueRepublish> {
+    pending.retain(|stable, entry| {
+        if entry.expires_at > now {
+            return true;
+        }
+        tracing::info!(
+            stable_group_id = %stable,
+            owed = entry.owed.len(),
+            "#1663: key republish debt reached its time limit; the owed recipients are dropped"
+        );
+        false
+    });
     let mut due = Vec::new();
     for (stable, entry) in pending.iter_mut() {
         if entry.next_at > now {
@@ -934,6 +1035,115 @@ mod tests {
         assert_eq!(waits, vec![10, 20, 40, 80, 80, 80]);
     }
 
+    /// #1663 review (Claude, 2 Nov): a debt whose advert stays unknown
+    /// ends at the time limit; a newer frame starts the limit again.
+    #[test]
+    fn key_republish_debt_ends_at_the_time_limit() {
+        let mut pending = PendingMap::new();
+        let t0 = Instant::now();
+        record_into(&mut pending, "g", vec![1], &[R1], t0);
+        record_into(&mut pending, "h", vec![1], &[R1], t0);
+        // "h" gets a newer frame half-way: its limit starts again.
+        let half = t0 + KEY_REPUBLISH_DEBT_LIMIT / 2;
+        record_into(&mut pending, "h", vec![2], &[R1], half);
+        let before = t0 + KEY_REPUBLISH_DEBT_LIMIT - Duration::from_secs(1);
+        assert_eq!(take_due(&mut pending, before).len(), 2, "both still owed");
+        let at_limit = t0 + KEY_REPUBLISH_DEBT_LIMIT;
+        let due = take_due(&mut pending, at_limit);
+        assert!(owed_of(&pending, "g").is_empty(), "the debt of g expired");
+        assert!(due.iter().all(|due| due.stable_group_id == "h"));
+        assert_eq!(owed_of(&pending, "h"), vec![R1], "h's newer frame is owed");
+        assert!(take_due(&mut pending, half + KEY_REPUBLISH_DEBT_LIMIT).is_empty());
+        assert!(pending.is_empty(), "the last expired debt empties the map");
+    }
+
+    /// #1663 review (Claude, 2 Nov): the receipt slots bound the receipts
+    /// in flight; a released slot is free again.
+    #[test]
+    fn key_republish_receipt_slots_bound_concurrent_receipts() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(KEY_REPUBLISH_RECEIPT_SLOTS));
+        let mut held: Vec<_> = (0..KEY_REPUBLISH_RECEIPT_SLOTS)
+            .filter_map(|_| try_receipt_slot(&slots))
+            .collect();
+        assert_eq!(held.len(), KEY_REPUBLISH_RECEIPT_SLOTS);
+        assert!(try_receipt_slot(&slots).is_none(), "all slots in use");
+        held.pop();
+        assert!(
+            try_receipt_slot(&slots).is_some(),
+            "a released slot is free"
+        );
+    }
+
+    /// #1663 review (Claude, 2 Nov): a verified frame that arrives while
+    /// every receipt slot is in use is dropped, not queued; with a free
+    /// slot the same frame seats.
+    #[tokio::test]
+    async fn key_republish_spawn_receipt_drops_a_frame_when_the_slots_are_full() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let actor = x0x::identity::AgentKeypair::generate()?;
+        let actor_hex = hex::encode(actor.agent_id().as_bytes());
+        let (group_key, stable) = gss_group(&state, &[actor.agent_id()]).await;
+        let payload = frame(&state, &actor, &stable, 1)?;
+        let seated = |state: Arc<AppState>| {
+            let group_key = group_key.clone();
+            let actor_hex = actor_hex.clone();
+            async move {
+                state
+                    .named_groups
+                    .read()
+                    .await
+                    .get(&group_key)
+                    .and_then(|info| info.members_v2.get(&actor_hex))
+                    .is_some_and(|seat| seat.kem_key_sequence == Some(1))
+            }
+        };
+        let held: Vec<_> = std::iter::from_fn(|| try_receipt_slot(receipt_slots())).collect();
+        assert!(!held.is_empty());
+        spawn_receipt(&state, actor.agent_id(), true, payload.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!seated(Arc::clone(&state)).await, "the frame was dropped");
+        drop(held);
+        spawn_receipt(&state, actor.agent_id(), true, payload);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !seated(Arc::clone(&state)).await {
+            assert!(Instant::now() < deadline, "the control frame seats");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+
+    /// #1663 review (Claude, 2 Nov): a non-member relay and an actor
+    /// without an Active row are refused before the membership lock. The
+    /// test holds that lock; a refusal that waited for it would time out.
+    #[tokio::test]
+    async fn key_republish_receive_prechecks_before_the_membership_lock() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let actor = x0x::identity::AgentKeypair::generate()?;
+        let banned = x0x::identity::AgentKeypair::generate()?;
+        let (group_key, stable) = gss_group(&state, &[actor.agent_id(), banned.agent_id()]).await;
+        edit_group(&state, &group_key, |info| {
+            info.ban_member(&hex::encode(banned.agent_id().as_bytes()), None)
+        })
+        .await;
+        let relayed = frame(&state, &actor, &stable, 1)?;
+        let banned_own = frame(&state, &banned, &stable, 1)?;
+        let membership_lock = ng::group_membership_lock(&state, &group_key).await;
+        let _held = membership_lock.lock().await;
+        let limit = Duration::from_secs(2);
+        let outsider = AgentId([0x41; 32]);
+        assert_eq!(
+            tokio::time::timeout(limit, receive(&state, outsider, &relayed)).await?,
+            INELIGIBLE,
+            "a non-member relay"
+        );
+        assert_eq!(
+            tokio::time::timeout(limit, receive(&state, banned.agent_id(), &banned_own)).await?,
+            INELIGIBLE,
+            "an actor whose row is not Active"
+        );
+        Ok(())
+    }
+
     /// A GSS `MlsEncrypted` group owned by `state`, with each of
     /// `members` as an Active Member. Returns the storage key and the
     /// stable id.
@@ -1006,6 +1216,7 @@ mod tests {
             actor: *actor.agent_id().as_bytes(),
             agent_public_key_b64: b64.encode(actor.public_key().as_bytes()),
             kem_public_key_b64: b64.encode(&state.agent_kem_keypair.public_bytes),
+            state_revision: 0,
             key_sequence,
         };
         let signed = kr::sign(body, actor).map_err(|refusal| anyhow::anyhow!(refusal.as_str()))?;

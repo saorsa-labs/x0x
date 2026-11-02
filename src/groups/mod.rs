@@ -2629,6 +2629,7 @@ impl GroupInfo {
         kem_public_key_b64: Option<String>,
     ) {
         let now = now_millis();
+        let admission_revision = self.state_revision;
         self.members_v2
             .entry(agent_id_hex.clone())
             .and_modify(|m| {
@@ -2638,9 +2639,10 @@ impl GroupInfo {
                 // new, so a retained counter would refuse its every
                 // republication as stale. The reset rides the signed
                 // re-admission every peer applies alike; an already-Active
-                // row keeps its counter.
+                // row keeps its counter. The admission floor (David's
+                // ruling, 2 Nov) refuses a frame signed before it.
                 if m.state != GroupMemberState::Active {
-                    m.kem_key_sequence = None;
+                    m.note_readmission(admission_revision);
                 }
                 m.role = role;
                 m.state = GroupMemberState::Active;
@@ -2667,6 +2669,7 @@ impl GroupInfo {
                 removed_by: None,
                 kem_public_key_b64,
                 kem_key_sequence: None,
+                kem_key_revision: Some(admission_revision),
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
                 certificate: None,
@@ -2686,26 +2689,31 @@ impl GroupInfo {
     }
 
     /// #1663: seat a verified republished KEM key on `agent_id_hex`'s
-    /// Active row. `key_sequence` is the seat's monotonic republication
-    /// counter: the install refuses a replay or a stale key (a sequence
-    /// the row already reached), exactly
+    /// Active row. `(state_revision, key_sequence)` is the frame's signed
+    /// position: the install refuses a replay, a stale key, or a frame
+    /// signed before the seat's admission (a position at or before the
+    /// row's [`GroupMember::republish_position`]), exactly
     /// [`crate::groups::key_republish::validate_against_seat`]. The key and
-    /// the counter are local data — the roster root and the state hash do
-    /// not hash them, so this install changes neither. Returns whether the
-    /// row changed.
+    /// the position are local data — the roster root and the state hash
+    /// do not hash them, so this install changes neither. Returns whether
+    /// the row changed.
     pub fn install_republished_kem_key(
         &mut self,
         agent_id_hex: &str,
         kem_public_key_b64: &str,
+        state_revision: u64,
         key_sequence: u64,
     ) -> bool {
         let Some(m) = self.members_v2.get_mut(agent_id_hex) else {
             return false;
         };
-        if m.state != GroupMemberState::Active || key_sequence <= m.kem_key_sequence.unwrap_or(0) {
+        if m.state != GroupMemberState::Active
+            || (state_revision, key_sequence) <= m.republish_position()
+        {
             return false;
         }
         m.kem_public_key_b64 = Some(kem_public_key_b64.to_string());
+        m.kem_key_revision = Some(state_revision);
         m.kem_key_sequence = Some(key_sequence);
         m.updated_at = now_millis();
         true
@@ -2776,6 +2784,7 @@ impl GroupInfo {
                 removed_by: banned_by,
                 kem_public_key_b64: None,
                 kem_key_sequence: None,
+                kem_key_revision: None,
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
                 certificate: None,
@@ -2788,6 +2797,9 @@ impl GroupInfo {
     pub fn unban_member(&mut self, agent_id_hex: &str) {
         if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
             if m.state == GroupMemberState::Banned {
+                // #1663: an unban is a re-admission — the same fresh
+                // republication epoch as `add_member_with_kem`.
+                m.note_readmission(self.state_revision);
                 m.state = GroupMemberState::Active;
                 m.updated_at = now_millis();
                 m.removed_by = None;

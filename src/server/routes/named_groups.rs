@@ -4865,16 +4865,30 @@ fn restore_local_member_key_material(
         // `kem_key_sequence` is local data too.
         member.kem_public_key_b64 = None;
         member.kem_key_sequence = None;
+        member.kem_key_revision = None;
         member.treekem_key_package_b64 = None;
         member.treekem_key_package_hash = None;
         member.certificate_missing_since_ms = None;
-        let Some(previous) = local.members_v2.get(id) else {
+        let previous = local.members_v2.get(id);
+        // #1663 (David's ruling, 2 Nov 2026): a row this apply makes Active
+        // from absent, Removed or Banned is a re-admission. Its
+        // republication floor is the revision this node held before the
+        // apply, so a frame signed in an earlier admission is refused.
+        if member.state == x0x::groups::member::GroupMemberState::Active
+            && previous.is_none_or(|row| row.state != x0x::groups::member::GroupMemberState::Active)
+        {
+            member.note_readmission(local.state_revision);
+        }
+        let Some(previous) = previous else {
             continue;
         };
         member
             .kem_public_key_b64
             .clone_from(&previous.kem_public_key_b64);
-        member.kem_key_sequence = previous.kem_key_sequence;
+        if previous.state == x0x::groups::member::GroupMemberState::Active {
+            member.kem_key_sequence = previous.kem_key_sequence;
+            member.kem_key_revision = previous.kem_key_revision;
+        }
         member
             .treekem_key_package_b64
             .clone_from(&previous.treekem_key_package_b64);
@@ -15650,6 +15664,7 @@ pub(in crate::server) fn set_join_request_created(
                 removed_by: None,
                 kem_public_key_b64: Some(kem_b64),
                 kem_key_sequence: None,
+                kem_key_revision: None,
                 treekem_key_package_b64: treekem_key_package_b64.clone(),
                 treekem_key_package_hash: None,
                 certificate: None,
@@ -23745,6 +23760,7 @@ fn invite_join_group_info(
                         removed_by: None,
                         kem_public_key_b64: None,
                         kem_key_sequence: None,
+                        kem_key_revision: None,
                         treekem_key_package_b64: None,
                         treekem_key_package_hash: snap.treekem_key_package_hash,
                         certificate: None,
@@ -25261,6 +25277,7 @@ pub(super) async fn join_group_via_invite_inner(
                         removed_by: None,
                         kem_public_key_b64: Some(kem_b64.clone()),
                         kem_key_sequence: None,
+                        kem_key_revision: None,
                         treekem_key_package_b64: None,
                         treekem_key_package_hash: None,
                         certificate: None,
@@ -42751,6 +42768,7 @@ fn build_listener_request_candidate_for_restart(
                         removed_by: None,
                         kem_public_key_b64: Some(kem_b64),
                         kem_key_sequence: None,
+                        kem_key_revision: None,
                         treekem_key_package_b64: treekem_key_package_b64.clone(),
                         certificate_digest: None,
                         treekem_key_package_hash: None,
@@ -51373,50 +51391,86 @@ pub(in crate::server) mod tests {
     }
 
     /// #1663 review round 4 (Claude, 30 Oct): the republication counter is
-    /// local data; a catch-up snapshot's value must not land.
+    /// local data; a catch-up snapshot's value must not land. #1663 review
+    /// (Claude, 2 Nov): the test drives the real catch-up apply
+    /// ([`apply_signed_public_revision_catchup`]). A retained Active row
+    /// keeps its local key, counter and floor; a row Removed here and
+    /// Active in the snapshot is a re-admission: no counter, and the floor
+    /// is the revision this node held before the apply.
     #[test]
     fn a_catchup_apply_keeps_the_local_kem_key_sequence() {
-        let admin = AgentId([0x16; 32]);
-        let admin_hex = hex::encode(admin.as_bytes());
+        let authority = x0x::identity::AgentKeypair::generate().expect("authority");
+        let authority_hex = hex::encode(authority.agent_id().as_bytes());
         let member_hex = "63".repeat(32);
         let newcomer_hex = "77".repeat(32);
-        let mut local = x0x::groups::GroupInfo::new(
+        let readmitted_hex = "88".repeat(32);
+        let mut group = x0x::groups::GroupInfo::with_policy(
             "Catch-up".to_string(),
             String::new(),
-            admin,
+            authority.agent_id(),
             "ab".repeat(32),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
         );
-        local.add_member(
-            member_hex.clone(),
-            x0x::groups::GroupRole::Member,
-            Some(admin_hex.clone()),
-            None,
-        );
+        for id in [&member_hex, &readmitted_hex] {
+            group.add_member(
+                id.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(authority_hex.clone()),
+                None,
+            );
+        }
+        group.remove_member(&readmitted_hex, None);
+        group
+            .seal_commit(&authority, now_millis_u64())
+            .expect("first seal");
+        let mut local = group.clone();
+        assert!(local.state_revision > 0, "the floor is a real revision");
         let local_member = local.members_v2.get_mut(&member_hex).expect("local member");
         local_member.kem_public_key_b64 = Some("local-kem".to_string());
         local_member.kem_key_sequence = Some(2);
-        // The responder's snapshot rows carry a hostile key AND counter.
-        let mut snapshot = local.clone();
-        snapshot.add_member(
+        local_member.kem_key_revision = Some(1);
+        let local_removed = local
+            .members_v2
+            .get_mut(&readmitted_hex)
+            .expect("local removed row");
+        local_removed.kem_key_sequence = Some(5);
+        local_removed.kem_key_revision = Some(0);
+        // The next signed head adds a newcomer and re-admits the row.
+        group.add_member(
             newcomer_hex.clone(),
             x0x::groups::GroupRole::Member,
-            Some(admin_hex),
+            Some(authority_hex.clone()),
             None,
         );
-        for id in [&member_hex, &newcomer_hex] {
+        group
+            .members_v2
+            .get_mut(&readmitted_hex)
+            .expect("re-admitted row")
+            .state = x0x::groups::member::GroupMemberState::Active;
+        group
+            .seal_commit(&authority, now_millis_u64().saturating_add(1))
+            .expect("second seal");
+        let mut snapshot = signed_public_bootstrap_snapshot(group).expect("snapshot");
+        // The responder's snapshot rows carry a hostile key AND counter.
+        for id in [&member_hex, &newcomer_hex, &readmitted_hex] {
             let hostile = snapshot.members_v2.get_mut(id).expect("snapshot member");
             hostile.kem_public_key_b64 = Some("remote-kem".to_string());
             hostile.kem_key_sequence = Some(9);
+            hostile.kem_key_revision = Some(9);
         }
-        // The apply's member adoption, then the local-data restore.
-        let mut next = local.clone();
-        next.members_v2.clone_from(&snapshot.members_v2);
-        restore_local_member_key_material(&mut next, &local);
+        let next = apply_signed_public_revision_catchup(
+            &local,
+            &snapshot,
+            &authority_hex,
+            &member_hex,
+            |_| false,
+        )
+        .expect("the chained head applies");
         let kept = next.members_v2.get(&member_hex).expect("retained member");
         assert_eq!(
-            kept.kem_key_sequence,
-            Some(2),
-            "the responder's counter must not land"
+            (kept.kem_key_sequence, kept.kem_key_revision),
+            (Some(2), Some(1)),
+            "the responder's counter and floor must not land"
         );
         assert_eq!(kept.kem_public_key_b64.as_deref(), Some("local-kem"));
         let added = next
@@ -51428,6 +51482,15 @@ pub(in crate::server) mod tests {
             "a member with no local row takes no counter"
         );
         assert_eq!(added.kem_public_key_b64.as_deref(), None);
+        let readmitted = next
+            .members_v2
+            .get(&readmitted_hex)
+            .expect("re-admitted member");
+        assert_eq!(
+            (readmitted.kem_key_sequence, readmitted.kem_key_revision),
+            (None, Some(local.state_revision)),
+            "a re-admission restarts the counter at the local revision floor"
+        );
     }
 
     /// ADR 0108 §8 (#1575): the notice currently staged for one
@@ -58088,6 +58151,7 @@ pub(in crate::server) mod tests {
                 removed_by: None,
                 kem_public_key_b64: Some("joiner-kem".to_string()),
                 kem_key_sequence: None,
+                kem_key_revision: None,
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
                 certificate: None,

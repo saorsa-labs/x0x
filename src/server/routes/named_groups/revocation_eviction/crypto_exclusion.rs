@@ -6845,6 +6845,7 @@ mod daemon_tests {
             actor: *stranger.agent_id().as_bytes(),
             agent_public_key_b64: stranger_b64(&stranger),
             kem_public_key_b64: own.kem_public_key_b64.clone(),
+            state_revision: 0,
             key_sequence: 1,
         };
         let signed = kr::sign(forged.clone(), &stranger)?;
@@ -6865,6 +6866,7 @@ mod daemon_tests {
                 actor: *stranger.agent_id().as_bytes(),
                 agent_public_key_b64: stranger_b64(&stranger),
                 kem_public_key_b64: own.kem_public_key_b64.clone(),
+                state_revision: 0,
                 key_sequence: 1,
             },
             &stranger,
@@ -7890,6 +7892,26 @@ mod daemon_tests {
             .await
             .context("the survivor builds its republication")?;
         assert_eq!(own.key_sequence, 1);
+        // #1663 review (Claude, 2 Nov): the live seat's key and position.
+        // While the persist waits, the live entry must still show them.
+        let live_seat = |state: std::sync::Arc<AppState>| {
+            let group_id = fx.group_id.clone();
+            let survivor_hex = survivor_hex.clone();
+            async move {
+                state
+                    .named_groups
+                    .read()
+                    .await
+                    .get(&group_id)
+                    .and_then(|info| info.members_v2.get(&survivor_hex))
+                    .map(|seat| (seat.kem_public_key_b64.clone(), seat.republish_position()))
+            }
+        };
+        let author_before = live_seat(std::sync::Arc::clone(&fx.state)).await;
+        assert!(
+            author_before.is_some(),
+            "the author holds the survivor's seat"
+        );
 
         // The peer ingest: it takes the guard, stages the seat on a clone
         // and waits on the frozen persistence lock — the membership guard
@@ -7916,6 +7938,11 @@ mod daemon_tests {
             guarded,
             "the ingest holds the membership guard while the persist waits"
         );
+        assert_eq!(
+            live_seat(std::sync::Arc::clone(&fx.state)).await,
+            author_before,
+            "the live seat is unchanged while the persist waits"
+        );
         drop(persistence);
         assert_eq!(
             ingest.await.context("the ingest task")?,
@@ -7933,6 +7960,8 @@ mod daemon_tests {
         );
 
         // The own seat: the same pin on the send side.
+        let replica_before = live_seat(std::sync::Arc::clone(&fx.replica)).await;
+        assert!(replica_before.is_some(), "the replica holds its own seat");
         let persistence = fx.replica.named_groups_persistence_lock.lock().await;
         let republish = {
             let replica = std::sync::Arc::clone(&fx.replica);
@@ -7953,6 +7982,11 @@ mod daemon_tests {
         assert!(
             guarded,
             "the own republication holds the membership guard while the persist waits"
+        );
+        assert_eq!(
+            live_seat(std::sync::Arc::clone(&fx.replica)).await,
+            replica_before,
+            "the live own seat is unchanged while the persist waits"
         );
         drop(persistence);
         assert!(

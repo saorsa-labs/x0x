@@ -171,6 +171,16 @@ pub struct GroupMember {
     /// join-keyed or keyless seat) counts as `0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kem_key_sequence: Option<u64>,
+    /// #1663 (David's ruling, 2 Nov 2026 20:34 GMT): the admission floor
+    /// of this seat's republications, a group `state_revision`. A
+    /// re-admission (a row that becomes Active from absent, Removed or
+    /// Banned) sets it to the state revision the node held then and
+    /// clears `kem_key_sequence`; an installed republication sets it to the
+    /// frame's signed `state_revision`. A frame must order strictly after
+    /// `(kem_key_revision, kem_key_sequence)`, so a frame the actor signed
+    /// in an earlier admission is refused. Local data, like the counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem_key_revision: Option<u64>,
     /// Base64 TreeKEM KeyPackage used to bind this roster entry to its ratchet
     /// tree leaf. Required for verified TreeKEM removals; absent for legacy GSS
     /// members and old pre-Phase-3 rosters.
@@ -210,6 +220,27 @@ pub struct GroupMember {
 }
 
 impl GroupMember {
+    /// #1663: the seat's republication position
+    /// `(kem_key_revision, kem_key_sequence)`, absent parts read as `0`. A
+    /// republication frame must order strictly after it.
+    #[must_use]
+    pub fn republish_position(&self) -> (u64, u64) {
+        (
+            self.kem_key_revision.unwrap_or(0),
+            self.kem_key_sequence.unwrap_or(0),
+        )
+    }
+
+    /// #1663 (David's ruling, 2 Nov 2026): the row is admitted again at
+    /// `state_revision`. The republication counter restarts and the
+    /// admission floor moves to `state_revision`, so a frame the actor
+    /// signed in an earlier admission (signed at a lower revision) can not
+    /// seat a key on the new seat.
+    pub fn note_readmission(&mut self, state_revision: u64) {
+        self.kem_key_sequence = None;
+        self.kem_key_revision = Some(state_revision);
+    }
+
     /// Create the initial Admin record for a new group.
     #[must_use]
     pub fn new_admin(agent_id_hex: String, display_name: Option<String>, now_ms: u64) -> Self {
@@ -225,6 +256,7 @@ impl GroupMember {
             removed_by: None,
             kem_public_key_b64: None,
             kem_key_sequence: None,
+            kem_key_revision: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,
@@ -249,6 +281,7 @@ impl GroupMember {
             removed_by: None,
             kem_public_key_b64: None,
             kem_key_sequence: None,
+            kem_key_revision: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,
@@ -277,6 +310,7 @@ impl GroupMember {
             removed_by: None,
             kem_public_key_b64: None,
             kem_key_sequence: None,
+            kem_key_revision: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,

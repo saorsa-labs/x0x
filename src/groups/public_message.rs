@@ -1131,6 +1131,7 @@ mod tests {
             removed_by: None,
             kem_public_key_b64: None,
             kem_key_sequence: None,
+            kem_key_revision: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,
