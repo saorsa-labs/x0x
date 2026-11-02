@@ -1966,6 +1966,7 @@ async fn fetch_chunk(s: &Fixture, reference: &BlobRef) {
     super::super::control_blob::handle_control_blob_message(
         &s.authority,
         &s.j2.agent.agent_id(),
+        &s.j2.agent.machine_id(),
         true,
         super::super::control_blob::ControlBlobMessage::Fetch {
             reference: reference.clone(),
@@ -3775,6 +3776,7 @@ async fn s8a_r5_g8_chunk_fetch_admission_is_validated_and_fair() -> anyhow::Resu
     super::super::control_blob::handle_control_blob_message(
         &s.authority,
         &b_member,
+        &super::clean_sender_machine(),
         true,
         super::super::control_blob::ControlBlobMessage::Fetch {
             reference: reference_b.clone(),
@@ -3802,6 +3804,7 @@ async fn s8a_r5_g8_chunk_fetch_admission_is_validated_and_fair() -> anyhow::Resu
         super::super::control_blob::handle_control_blob_message(
             &s.authority,
             &s.j2.agent.agent_id(),
+            &s.j2.agent.machine_id(),
             true,
             super::super::control_blob::ControlBlobMessage::Fetch {
                 reference: reference_a.clone(),
@@ -3814,6 +3817,7 @@ async fn s8a_r5_g8_chunk_fetch_admission_is_validated_and_fair() -> anyhow::Resu
     super::super::control_blob::handle_control_blob_message(
         &s.authority,
         &b_member,
+        &super::clean_sender_machine(),
         true,
         super::super::control_blob::ControlBlobMessage::Fetch {
             reference: reference_b,

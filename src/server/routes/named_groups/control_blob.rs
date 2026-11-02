@@ -7,6 +7,7 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::Semaphore;
 
 const CHUNK_BYTES: usize = x0x::files::DEFAULT_CHUNK_SIZE;
+
 // The existing TreeKEM recovery-control cache has an 8 MiB encoded-JSON
 // budget. Use that explicit control-plane precedent for one exact blob and
 // one peer's outstanding bytes. Larger (even otherwise legal) historical
@@ -955,6 +956,25 @@ fn exact_blob_matches_ref(reference: &ControlBlobRef, bytes: &[u8]) -> bool {
         && hex::encode(blake3::hash(bytes).as_bytes()) == reference.digest
 }
 
+/// #1664 review round 3: record the handler's drop decision for a
+/// machine- or binding-revoked sender (test builds only), so a test pins
+/// the HANDLER gate independently of the send seam's write-time re-check.
+#[cfg(test)]
+fn record_revoked_control_blob_drop(
+    state: &AppState,
+    arm: &'static str,
+    reference: &ControlBlobRef,
+    sender_hex: &str,
+) {
+    if let Ok(mut drops) = state
+        .named_group_test_recorders
+        .control_blob_revoked_drops
+        .lock()
+    {
+        drops.push((arm, reference.group_id.clone(), sender_hex.to_string()));
+    }
+}
+
 async fn reference_admitted(state: &AppState, reference: &ControlBlobRef) -> bool {
     let known_group = {
         let groups = state.named_groups.read().await;
@@ -987,21 +1007,46 @@ async fn reference_admitted(state: &AppState, reference: &ControlBlobRef) -> boo
 pub(in crate::server) async fn handle_control_blob_message(
     state: &Arc<AppState>,
     sender: &AgentId,
+    machine_id: &MachineId,
     verified: bool,
     message: ControlBlobMessage,
 ) {
     let sender_hex = hex::encode(sender.as_bytes());
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let revoked = {
+    // #1664 (ADR 0110 §3; the #1657 ladder): this lane answers an
+    // authenticated DM, so the QUIC-authenticated sender machine refuses
+    // a revoked device exactly as the TreeKEM catch-up serve does — a
+    // machine revocation denies that device only (the portable agent
+    // keeps its Active seat) and a binding revocation retires the pairing
+    // only, so neither the roster nor the reference header checks can
+    // refuse either. A machine- or binding-revoked device gets NO answer:
+    // the blob is withheld and NO frame is sent (Engineer ruling,
+    // 31 Oct 2026 03:40 GMT — `treekem_catchup_refusal_v1`, bit 13, stays
+    // TreeKEM catch-up only, as on main since #1714, unreleased; a typed
+    // control-blob refusal would be a separate wire question). The agent
+    // revocation and a pending revocation resync keep main's silent
+    // drop, as they always did.
+    let (machine_refused, binding_refused) = {
         let revocation_set = state.agent.revocation_set();
         let guard = revocation_set.read().await;
-        guard.is_agent_revoked(sender) || guard.revocation_resync_required()
+        if guard.is_agent_revoked(sender) || guard.revocation_resync_required() {
+            return;
+        }
+        (
+            guard.is_machine_revoked(machine_id),
+            guard.is_binding_revoked(sender, machine_id),
+        )
     };
-    if revoked {
-        return;
-    }
     match message {
         ControlBlobMessage::Reference { reference } => {
+            if machine_refused || binding_refused {
+                // Review of 4d40b3bf, finding 2: the handler's drop is
+                // recorded here too, so the Reference gate is provable
+                // alone, exactly as the Fetch, Chunk and Release gates.
+                #[cfg(test)]
+                record_revoked_control_blob_drop(state, "reference", &reference, &sender_hex);
+                return;
+            }
             if !incoming_reference_header_valid(&reference, &sender_hex, &local_hex, verified)
                 || !reference_admitted(state, &reference).await
             {
@@ -1052,6 +1097,25 @@ pub(in crate::server) async fn handle_control_blob_message(
             if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
                 return;
             }
+            // #1664: bit 13 (`treekem_catchup_refusal_v1`) is NOT widened
+            // to this lane (Engineer ruling, 31 Oct 2026 03:40 GMT) — it
+            // stays TreeKEM catch-up only, as on main since #1714,
+            // unreleased. A
+            // machine- or binding-revoked fetcher gets the silent drop:
+            // the blob is withheld and no frame is sent. The header check
+            // above bound the authenticated sender to
+            // `reference.recipient`, so the withheld blob is exactly the
+            // one the revoked device asked for.
+            if machine_refused || binding_refused {
+                #[cfg(test)]
+                record_revoked_control_blob_drop(state, "fetch", &reference, &sender_hex);
+                tracing::debug!(
+                    group_id = %LogHexId::group(&reference.group_id),
+                    requester = %LogHexId::agent(&sender_hex),
+                    "control-blob fetch from a revoked requester dropped: no answer"
+                );
+                return;
+            }
             if reference.kind == ControlBlobKind::JoinResult {
                 // ADR 0107 (review r2): a staged join result is a COPY of a
                 // join artifact, so each chunk is a serve. The chunk is read
@@ -1098,6 +1162,9 @@ pub(in crate::server) async fn handle_control_blob_message(
                 };
                 let task_state = Arc::clone(state);
                 let recipient = *sender;
+                // #1664: the chunk answers THIS machine — the authenticated
+                // sender of the fetch DM — not a binding resolution.
+                let requester_machine = *machine_id;
                 let group_id = reference.group_id.clone();
                 let member_hex = reference.recipient.clone();
                 // r5: the task, like the copy, dies at the original's
@@ -1136,9 +1203,10 @@ pub(in crate::server) async fn handle_control_blob_message(
                                 return;
                             }
                         };
-                        match super::send_join_artifact(
+                        match super::send_join_artifact_to_machine(
                             &task_state,
                             &recipient,
+                            requester_machine,
                             &payload,
                             &group,
                             "join_result_chunk",
@@ -1177,6 +1245,10 @@ pub(in crate::server) async fn handle_control_blob_message(
             let guard = state.control_blobs.staged_serve_guard(&reference);
             let task_state = Arc::clone(state);
             let recipient = *sender;
+            // #1664: the chunk answers THIS machine — the authenticated
+            // sender of the fetch DM — never an agent-level resolution a
+            // revoked device holding the portable agent key can occupy.
+            let requester_machine = *machine_id;
             // #1269: shutdown-owned; the send holds the Agent.
             state.spawn_detached(async move {
                 let _permit = permit;
@@ -1194,14 +1266,24 @@ pub(in crate::server) async fn handle_control_blob_message(
                         return;
                     }
                 }
-                let agent = &task_state.agent;
                 let message = ControlBlobMessage::Chunk {
                     reference,
                     sequence,
                     data_b64: BASE64.encode(chunk),
                 };
-                if let Err(reason) = send_message(agent, &recipient, &message).await {
-                    tracing::warn!(reason, "control blob chunk send failed");
+                let payload = match encode_message(&message) {
+                    Ok(payload) => payload,
+                    Err(reason) => {
+                        tracing::warn!(reason, "control blob chunk encode failed");
+                        return;
+                    }
+                };
+                if let Err(reason) = task_state
+                    .agent
+                    .send_machine_addressed_dm(&recipient, requester_machine, &payload)
+                    .await
+                {
+                    tracing::warn!(reason = %reason, "control blob chunk send failed");
                 }
             });
         }
@@ -1210,6 +1292,11 @@ pub(in crate::server) async fn handle_control_blob_message(
             sequence,
             data_b64,
         } => {
+            if machine_refused || binding_refused {
+                #[cfg(test)]
+                record_revoked_control_blob_drop(state, "chunk", &reference, &sender_hex);
+                return;
+            }
             if !incoming_reference_header_valid(&reference, &sender_hex, &local_hex, verified)
                 || data_b64.len() > CHUNK_BYTES.div_ceil(3) * 4
             {
@@ -1239,6 +1326,11 @@ pub(in crate::server) async fn handle_control_blob_message(
             // the fetch header check enforces sender == reference.recipient
             // and local == reference.source, and the exact reference
             // (digest + length) keys the removal.
+            if machine_refused || binding_refused {
+                #[cfg(test)]
+                record_revoked_control_blob_drop(state, "release", &reference, &sender_hex);
+                return;
+            }
             if !incoming_fetch_header_valid(&reference, &sender_hex, &local_hex, verified) {
                 return;
             }
@@ -1865,7 +1957,14 @@ mod tests {
                     reference: reference.clone(),
                 })?;
                 let message: ControlBlobMessage = serde_json::from_slice(&wire)?;
-                handle_control_blob_message(&state, &recipient, true, message).await;
+                handle_control_blob_message(
+                    &state,
+                    &recipient,
+                    &state.agent.machine_id(),
+                    true,
+                    message,
+                )
+                .await;
             }
         }
         Ok(())
