@@ -1511,7 +1511,10 @@ pub(in crate::server) async fn admit_public_group_bootstrap(
             if matches!(caught_up, Ok(AtomicWriteOutcome::ReplacedNotDurable)) {
                 return Err("public-group bootstrap catch-up was not directory-durable".to_string());
             }
-            return Err("public-group bootstrap frontier is not the installed one".to_string());
+            return Err(
+                "public-group bootstrap catch-up did not install (frontier not the installed one, or the durability preflight refused)"
+                    .to_string(),
+            );
         }
         // D272 consent covers the catch-up branch only. An exact frontier
         // still needs a Known contact or a GroupInvite grant before this
