@@ -5,6 +5,9 @@ Each shard runs its cases with the same `--stress-count 20` gate profile.
 The summary job merges the trace directories and runs `w3h-trace-check.py`.
 A case name matches exactly one shard. A new `w3h_1356_` or `w3h_1357_`
 case joins the S3 or S4 shard. Any other new `w3h_` case joins `rest`.
+The four ADR 0109 owner-axis rows (H-S3-c, H-S3-c2, H-S3-c3, H-S3-d8)
+each have their own shard: one rerun of each row is the longest S3 case,
+and 20 reruns of them in one job do not fit the S3 test deadline.
 
 The S3 shard is omitted when the tree has no `w3h_1356_` test, so `main`
 does not spend a runner on an empty filter. Adding those tests makes the
@@ -17,10 +20,17 @@ import sys
 from pathlib import Path
 
 # First match wins. `rest` is every w3h_ test that matches none of these.
-# Prefixes are the test function name, not a module path.
+# Each pattern is a regular expression on the test function name (not a
+# module path), anchored at its start. A pattern that ends in `$` names one
+# case. The owner-axis rows come before `s3`, so `s3` takes the other
+# `w3h_1356_` cases.
 GROUPS = (
     ('long-1023', 'w3h_1023_'),
     ('s4', 'w3h_1357_'),
+    ('s3-c', 'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node$'),
+    ('s3-c2', 'w3h_1356_red_s3_c2_reseat_retires_marker_and_gap$'),
+    ('s3-c3', 'w3h_1356_control_s3_c3_owner_reseats_owner_axis_node$'),
+    ('s3-d8', 'w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node$'),
     ('s3', 'w3h_1356_'),
 )
 
@@ -29,8 +39,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def group_of(name):
     """Return the shard id for one test function name."""
-    for group, prefix in GROUPS:
-        if name.startswith(prefix):
+    for group, pattern in GROUPS:
+        if re.match(pattern, name):
             return group
     return 'rest'
 
@@ -39,17 +49,20 @@ def filter_expr(group):
     """Nextest filterset for one shard.
 
     The `w3h-gate` profile already intersects this with
-    `test(/(^|::)w3h_/)`. `rest` excludes the named prefixes so a case
-    cannot run twice.
+    `test(/(^|::)w3h_/)`. A group excludes the patterns of the groups
+    before it, and `rest` excludes all of them, so a case cannot run twice.
     """
-    known = {name for name, _prefix in GROUPS}
+    names = [name for name, _pattern in GROUPS]
     if group == 'rest':
-        clauses = [f'not test(/(^|::){prefix}/)' for _name, prefix in GROUPS]
-        return ' and '.join(clauses)
-    if group not in known:
+        earlier = GROUPS
+    elif group in names:
+        earlier = GROUPS[:names.index(group)]
+    else:
         raise SystemExit(f'unknown W3-H shard {group!r}')
-    prefix = dict(GROUPS)[group]
-    return f'test(/(^|::){prefix}/)'
+    clauses = [f'not test(/(^|::){pattern}/)' for _name, pattern in earlier]
+    if group != 'rest':
+        clauses.insert(0, f'test(/(^|::){dict(GROUPS)[group]}/)')
+    return ' and '.join(clauses)
 
 
 def discover(root=ROOT):
@@ -94,7 +107,7 @@ def assign(names):
 def matrix(names):
     """GitHub Actions matrix. Group order follows GROUPS, then `rest`."""
     assigned = assign(names)
-    order = [group for group, _prefix in GROUPS if group in assigned]
+    order = [group for group, _pattern in GROUPS if group in assigned]
     if 'rest' in assigned:
         order.append('rest')
     return {'group': order}
