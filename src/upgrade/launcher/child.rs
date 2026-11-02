@@ -1,0 +1,456 @@
+//! Only this owner starts, signals and waits for its candidate.
+use super::*;
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::{ffi::OsStrExt, net::UnixStream, process::CommandExt};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::Duration;
+
+const BOOT_FD: &str = "X0X_M2_BOOT_FD";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Permit {
+    record: journal::BootRecord,
+    parent: Identity,
+    root: PathBuf,
+    executable: PathBuf,
+    sha256: [u8; 32],
+    version: String,
+    argv: Vec<Vec<u8>>,
+    cwd: PathBuf,
+}
+
+pub(super) struct Owned {
+    child: Child,
+    identity: Identity,
+    channel: Option<UnixStream>,
+    booted: bool,
+}
+
+impl Owned {
+    pub(super) fn spawn(
+        trial: &mut Trial,
+        path: &Path,
+        participant: &journal::Participant,
+        version: &str,
+        sha256: [u8; 32],
+    ) -> io::Result<Option<Self>> {
+        let clock = Clock::now()?;
+        if trial.phase != Phase::Booting {
+            return Err(invalid("attempt not reserved"));
+        }
+        let (mut parent, channel) = UnixStream::pair()?;
+        let fd = channel.as_raw_fd();
+        let mut command = Command::new(&participant.executable);
+        command
+            .args(participant.argv.iter().skip(1))
+            .arg0(
+                participant
+                    .argv
+                    .first()
+                    .ok_or_else(|| invalid("missing argv"))?,
+            )
+            .current_dir(&participant.cwd)
+            .env_clear()
+            .envs(&participant.env)
+            .env(BOOT_FD, "3")
+            .stdin(Stdio::null());
+        // SAFETY: the child closure only calls async-signal-safe descriptor
+        // operations. The owned stream keeps fd valid until spawn completes.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, 3) == -1 || libc::fcntl(3, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                trial.cause = Some(format!("exec failed: {error}"));
+                return Ok(None);
+            }
+        };
+        drop(channel);
+        let setup = (|| {
+            let child_identity = identity(child.id())?;
+            trial.child = Some(child_identity.clone());
+            trial.save(path)?;
+            let (executable, cwd) =
+                captured_spawn_paths(&participant.executable, &participant.cwd)?;
+            let permit = Permit {
+                record: journal::BootRecord {
+                    schema_version: 1,
+                    record_kind: "boot".into(),
+                    transaction_id: trial.binding.transaction.clone(),
+                    generation: trial.binding.generation,
+                    instance_id: trial.instance.clone(),
+                    attempt: trial.attempts,
+                    pid: child_identity.pid,
+                    process_start: child_identity.start,
+                    boot_id: child_identity.boot.clone(),
+                    started_at_ns: clock.ms.saturating_mul(1_000_000),
+                    deadline_ns: trial.deadline_ms.saturating_mul(1_000_000),
+                },
+                parent: identity(std::process::id())?,
+                root: participant.data_root.clone(),
+                executable,
+                sha256,
+                version: version.into(),
+                argv: participant
+                    .argv
+                    .iter()
+                    .map(|argument| argument.as_bytes().to_vec())
+                    .collect(),
+                cwd,
+            };
+            parent.set_write_timeout(Some(Duration::from_secs(1)))?;
+            let mut bytes = serde_json::to_vec(&permit)?;
+            bytes.push(b'\n');
+            parent.write_all(&bytes)?;
+            parent.set_nonblocking(true)?;
+            Ok(child_identity)
+        })();
+        match setup {
+            Ok(identity) => Ok(Some(Self {
+                child,
+                identity,
+                channel: Some(parent),
+                booted: false,
+            })),
+            Err(error) => {
+                stop_and_reap(&mut child)?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn poll_boot(&mut self) -> io::Result<bool> {
+        if self.booted {
+            return Ok(true);
+        }
+        let mut byte = [0];
+        match self
+            .channel
+            .as_mut()
+            .ok_or_else(|| invalid("boot channel missing"))?
+            .read(&mut byte)
+        {
+            Ok(1) if byte == [1] => {
+                self.booted = true;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            _ => Err(invalid("candidate did not acknowledge its boot barrier")),
+        }
+    }
+
+    pub(super) fn exited(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    pub(super) fn restored(p: &journal::Participant) -> io::Result<Self> {
+        let mut child = Command::new(&p.executable)
+            .arg0(p.argv.first().ok_or_else(|| invalid("missing argv"))?)
+            .args(p.argv.iter().skip(1))
+            .env_clear()
+            .envs(&p.env)
+            .env_remove(BOOT_FD)
+            .current_dir(&p.cwd)
+            .stdin(Stdio::null())
+            .spawn()?;
+        match identity(child.id()) {
+            Ok(identity) => Ok(Self {
+                child,
+                identity,
+                channel: None,
+                booted: true,
+            }),
+            Err(error) => {
+                stop_and_reap(&mut child)?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    pub(super) fn reap(mut self) -> io::Result<Identity> {
+        stop_and_reap(&mut self.child)?;
+        Ok(self.identity.clone())
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        let _ = stop_and_reap(&mut self.child);
+    }
+}
+
+pub(super) fn stop_and_reap(child: &mut Child) -> io::Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+    child.kill()?;
+    let start = Clock::now()?;
+    let until = start.ms.saturating_add(REAP_MS);
+    while child.try_wait()?.is_none() {
+        let now = Clock::now()?;
+        if now.boot != start.boot || now.ms >= until {
+            return Err(invalid("recovery-failed: child reap timeout"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+/// This is before runtime creation, logging, config or store initialization.
+pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
+    if std::env::var_os(BOOT_FD).is_none() {
+        return Ok(());
+    }
+    if !super::ENABLED {
+        return Err(invalid("M2 launcher activation is held"));
+    }
+    candidate_boot_owned(version)
+}
+
+/// The permit must carry the paths the candidate compares against: its own
+/// `current_exe()` is canonicalized, its `current_dir()` is kernel-resolved,
+/// and the boot hash opens with `O_NOFOLLOW`. A symlinked install is
+/// therefore canonicalized when the participant is captured, instead of
+/// being refused by the boot check (#1375).
+fn captured_spawn_paths(executable: &Path, cwd: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    Ok((executable.canonicalize()?, cwd.canonicalize()?))
+}
+
+/// argv is not guaranteed UTF-8, and a String-based `args()` collection
+/// panics on raw bytes. The permit carries the same OS bytes, so the boot
+/// comparison stays exact and can only refuse, never panic (#1375).
+fn argv_bytes<I: Iterator<Item = OsString>>(argv: I) -> Vec<Vec<u8>> {
+    argv.map(|argument| argument.as_bytes().to_vec()).collect()
+}
+
+fn live_argv() -> Vec<Vec<u8>> {
+    argv_bytes(std::env::args_os())
+}
+
+pub(crate) fn candidate_boot_owned(version: &str) -> io::Result<()> {
+    let value = std::env::var_os(BOOT_FD).ok_or_else(|| invalid("boot descriptor missing"))?;
+    if value != "3" {
+        return Err(invalid("invalid private boot descriptor"));
+    }
+    // SAFETY: the private parent contract transfers descriptor 3 to this
+    // process. A bad or closed descriptor fails its first socket operation.
+    if unsafe { libc::fcntl(3, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let channel = unsafe { UnixStream::from_raw_fd(3) };
+    // The descriptor is taken, so the marker must go now: a later x0xd
+    // process (for example a self-update handoff child) would otherwise
+    // read its own unrelated descriptor 3 as a boot channel. Still on the
+    // main thread; the async runtime and its threads do not exist yet.
+    std::env::remove_var(BOOT_FD);
+    channel.set_read_timeout(Some(Duration::from_secs(120)))?;
+    let mut reader = std::io::BufReader::new(channel);
+    let mut bytes = Vec::new();
+    std::io::BufRead::read_until(&mut reader.by_ref().take(1024 * 1024), b'\n', &mut bytes)?;
+    let permit: Permit = serde_json::from_slice(&bytes)?;
+    let current = identity(std::process::id())?;
+    // SAFETY: getppid takes no pointers and has no failure mode.
+    let parent = identity(unsafe { libc::getppid() } as u32)?;
+    if current.pid != permit.record.pid
+        || current.start != permit.record.process_start
+        || current.boot != permit.record.boot_id
+        || parent != permit.parent
+        || std::env::current_exe()?.canonicalize()? != permit.executable
+        || std::env::current_dir()? != permit.cwd
+        || live_argv() != permit.argv
+        || version != permit.version
+        || filesystem::hash(&permit.executable)? != permit.sha256
+        || Clock::now()?.ms.saturating_mul(1_000_000) >= permit.record.deadline_ns
+    {
+        return Err(invalid("candidate boot does not match launcher authority"));
+    }
+    journal::write_record(&permit.root.join(journal::BOOT_FILE_NAME), &permit.record)?;
+    reader.get_mut().write_all(&[1])
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn identity(pid: u32) -> io::Result<Identity> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let start = stat
+        .rsplit_once(')')
+        .ok_or_else(|| invalid("bad process stat"))?
+        .1
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| invalid("missing process start"))?
+        .parse()
+        .map_err(invalid)?;
+    Ok(Identity {
+        pid,
+        start,
+        boot: Clock::now()?.boot,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn identity(_pid: u32) -> io::Result<Identity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "launcher process custody requires Linux",
+    ))
+}
+
+pub(super) fn absent(expected: &Identity) -> io::Result<bool> {
+    if expected.boot != Clock::now()?.boot {
+        return Ok(true);
+    }
+    match identity(expected.pid) {
+        Ok(actual) => Ok(actual != *expected),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Boot invariants that hold even while activation is held: the boot
+/// marker must not outlive the fd-3 take, argv compares as OS bytes, and
+/// a symlinked install captures canonical paths.
+#[cfg(test)]
+mod boot_guards {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    const BOOT_ROLE: &str = "X0X_1375_S2_BOOT_FD_ROLE";
+
+    fn fixture_permit() -> Permit {
+        Permit {
+            record: journal::BootRecord {
+                schema_version: 1,
+                record_kind: "boot".into(),
+                transaction_id: "transaction-1".into(),
+                generation: 1,
+                instance_id: "alice".into(),
+                attempt: 1,
+                pid: 1,
+                process_start: 1,
+                boot_id: "boot-1".into(),
+                started_at_ns: 0,
+                deadline_ns: u64::MAX,
+            },
+            parent: Identity {
+                pid: 1,
+                start: 1,
+                boot: "boot-1".into(),
+            },
+            root: PathBuf::from("/nonexistent-x0x-boot-guard"),
+            executable: PathBuf::from("/nonexistent-x0x-boot-guard/x0xd"),
+            sha256: [0; 32],
+            version: "fixture-version".into(),
+            argv: vec![b"x0xd".to_vec()],
+            cwd: PathBuf::from("/nonexistent-x0x-boot-guard"),
+        }
+    }
+
+    #[test]
+    fn boot_fd_is_cleared_once_fd_3_is_taken() {
+        if std::env::var_os(BOOT_ROLE).is_some() {
+            boot_fd_role();
+            return;
+        }
+        let (mut parent, channel) = UnixStream::pair().unwrap();
+        let fd = channel.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        // The launcher module is mounted at the bin crate root, so the
+        // exact selector carries no `upgrade::` prefix.
+        command
+            .arg("--exact")
+            .arg("launcher::child::boot_guards::boot_fd_is_cleared_once_fd_3_is_taken")
+            .env(BOOT_ROLE, "1")
+            .env(BOOT_FD, "3")
+            .stdin(Stdio::null());
+        // SAFETY: the descriptor contract under test is the one
+        // `Owned::spawn` installs; the child closure only calls
+        // async-signal-safe descriptor operations.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, 3) == -1 || libc::fcntl(3, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(channel);
+        let mut bytes = serde_json::to_vec(&fixture_permit()).unwrap();
+        bytes.push(b'\n');
+        parent.write_all(&bytes).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "child exited with {status}");
+    }
+
+    fn boot_fd_role() {
+        // Non-Linux refuses the boot right after the take; Linux refuses it
+        // on the fixture identity. Either way the marker must already be
+        // gone, or a later self-update child would treat its own unrelated
+        // descriptor 3 as a boot channel.
+        let _ = candidate_boot_owned("fixture-version");
+        if std::env::var_os(BOOT_FD).is_none() {
+            std::process::exit(0);
+        }
+        std::process::exit(42);
+    }
+
+    #[test]
+    fn argv_bytes_keep_non_utf8_without_panicking() {
+        let raw = OsString::from_vec(b"daemon\xff".to_vec());
+        // A String-based args() collection panics on these bytes; the byte
+        // collection keeps them, so the boot check refuses raw argv instead
+        // of dying before logging exists.
+        assert_eq!(
+            argv_bytes(std::iter::once(raw)),
+            vec![b"daemon\xff".to_vec()]
+        );
+        // The permit carries the same OS bytes, so equal argv passes the
+        // boot comparison and only genuinely different argv is refused.
+        assert_eq!(
+            argv_bytes(std::iter::once(OsString::from("x0xd"))),
+            fixture_permit().argv
+        );
+    }
+
+    #[test]
+    fn captured_paths_are_canonical_so_a_symlinked_install_boots() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real_executable = real_dir.join("x0xd");
+        std::fs::write(&real_executable, b"candidate-bytes").unwrap();
+        let linked_executable = dir.path().join("linked-x0xd");
+        std::os::unix::fs::symlink(&real_executable, &linked_executable).unwrap();
+        let linked_cwd = dir.path().join("linked-cwd");
+        std::os::unix::fs::symlink(&real_dir, &linked_cwd).unwrap();
+
+        let (executable, cwd) = captured_spawn_paths(&linked_executable, &linked_cwd).unwrap();
+
+        // The candidate compares these against its own canonical
+        // current_exe() and kernel-resolved current_dir(), so a
+        // Homebrew-style link boots instead of spending all three attempts
+        // and rolling back.
+        assert_eq!(executable, real_executable.canonicalize().unwrap());
+        assert_eq!(cwd, real_dir.canonicalize().unwrap());
+        // The O_NOFOLLOW boot hash agrees with the captured path: it opens
+        // the real file, never the symlink the plan was captured with.
+        assert_eq!(
+            filesystem::hash(&executable).unwrap(),
+            <[u8; 32]>::from(Sha256::digest(b"candidate-bytes"))
+        );
+        assert!(filesystem::hash(&linked_executable).is_err());
+    }
+}

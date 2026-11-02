@@ -3399,7 +3399,7 @@ async fn queued_treekem_replay_clear_notifies_the_live_handle_759() -> Result<()
             queued_at: std::time::Instant::now(),
         });
 
-    replay_pending_treekem_events(&state, &group_id).await;
+    replay_pending_treekem_events(&state, &group_id, None).await;
 
     assert!(
         !state
@@ -3476,7 +3476,7 @@ async fn non_durable_queued_replay_does_not_notify_759() -> Result<()> {
         });
 
     let _fault = set_save_fault(&state, SaveFault::NotReplaced);
-    replay_pending_treekem_events(&state, &group_id).await;
+    replay_pending_treekem_events(&state, &group_id, None).await;
     drop(_fault);
 
     assert!(
@@ -3768,7 +3768,7 @@ async fn replaced_not_durable_queued_replay_withholds_the_notification_759() -> 
         });
 
     let _fault = set_save_fault(&state, SaveFault::ReplacedNotDurableAfterWriteThenError);
-    replay_pending_treekem_events(&state, &group_id).await;
+    replay_pending_treekem_events(&state, &group_id, None).await;
     drop(_fault);
 
     {
