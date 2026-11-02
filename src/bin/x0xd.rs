@@ -47,6 +47,34 @@ pub static MALLOC_CONF: &[u8] =
 
 use x0x::server::{DaemonConfig, InstanceName, ServeOptions};
 
+/// First `--name value` or `--name=value` on `args`.
+///
+/// An empty value is the same error as a missing value. `x0xd` and the CLI
+/// split check both accept these two spellings. argv is raw OS bytes, so a
+/// non-UTF-8 name is refused here rather than panicking at collection (#1375).
+fn cli_name_argument(args: &[OsString]) -> Result<Option<String>> {
+    for (index, arg) in args.iter().enumerate() {
+        let value = if arg == "--name" {
+            args.get(index + 1)
+                .context("--name requires an instance name")?
+                .as_os_str()
+        } else if let Some(value) = arg.as_encoded_bytes().strip_prefix(b"--name=") {
+            // Match on bytes so a non-UTF-8 `--name=` value is refused, not
+            // skipped as an unrelated argument.
+            let value = std::str::from_utf8(value).context("--name value must be valid UTF-8")?;
+            std::ffi::OsStr::new(value)
+        } else {
+            continue;
+        };
+        let value = value.to_str().context("--name value must be valid UTF-8")?;
+        if value.is_empty() {
+            anyhow::bail!("--name requires an instance name");
+        }
+        return Ok(Some(value.to_owned()));
+    }
+    Ok(None)
+}
+
 /// Resolve CLI/config precedence before deriving any instance-scoped ACL path.
 ///
 /// A CLI name is already validated because it may be needed to locate the
@@ -220,16 +248,10 @@ async fn run_daemon() -> anyhow::Result<()> {
     };
 
     // Parse and validate --name before using it to locate a named config file.
-    let cli_instance_name = if let Some(idx) = args.iter().position(|a| a == "--name") {
-        let name = args
-            .get(idx + 1)
-            .context("--name requires an instance name")?
-            .to_str()
-            .context("--name value must be valid UTF-8")?
-            .to_owned();
-        Some(InstanceName::try_from(name)?)
-    } else {
-        None
+    // `--name alice` and `--name=alice` are the same flag.
+    let cli_instance_name = match cli_name_argument(&args)? {
+        Some(name) => Some(InstanceName::try_from(name)?),
+        None => None,
     };
 
     // Handle --list: discover running instances and exit
@@ -240,15 +262,19 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // dhat heap profiler. Each daemon writes its own file so multi-daemon
     // runs don't overwrite each other's dump. Set DHAT_OUT_DIR to override.
-    // Started only after argv is accepted: dhat's own exit path collects
-    // argv with std::env::args(), which panics on the non-UTF-8 arguments
-    // the refusals above reject (#1375).
+    // dhat's own exit path collects argv with std::env::args(), which panics
+    // on a non-UTF-8 argument. Some flags (`--config`) accept raw OS bytes,
+    // so the profiler runs only when every argument is UTF-8; otherwise that
+    // panic would hide the daemon's own exit error (#1375).
     #[cfg(feature = "profile-heap")]
-    let _dhat_profiler = {
+    let _dhat_profiler = if args.iter().all(|a| a.to_str().is_some()) {
         let dir = std::env::var("DHAT_OUT_DIR").unwrap_or_else(|_| ".".to_string());
         let path = format!("{}/dhat-heap-{}.json", dir, std::process::id());
         eprintln!("dhat: writing heap dump to {} on exit", path);
-        dhat::Profiler::builder().file_name(&path).build()
+        Some(dhat::Profiler::builder().file_name(&path).build())
+    } else {
+        eprintln!("dhat: heap profiler off, an argument is not UTF-8");
+        None
     };
 
     // Whether a config file was actually loaded (explicit `--config`, or the
@@ -1034,6 +1060,44 @@ mod tests {
     fn valid_name(raw: &str) -> InstanceName {
         InstanceName::try_from(raw.to_owned())
             .unwrap_or_else(|e| panic!("{raw:?}: expected valid instance name, got {e}"))
+    }
+
+    #[test]
+    fn name_flag_accepts_the_equals_spelling() {
+        let separate = cli_name_argument(&["x0xd".into(), "--name".into(), "alice".into()])
+            .expect("two-argument form");
+        assert_eq!(separate.as_deref(), Some("alice"));
+        let equals =
+            cli_name_argument(&["x0xd".into(), "--name=alice".into()]).expect("equals form");
+        assert_eq!(equals.as_deref(), Some("alice"));
+        assert!(cli_name_argument(&["x0xd".into()]).unwrap().is_none());
+        let missing = cli_name_argument(&["x0xd".into(), "--name".into()]).unwrap_err();
+        assert!(missing.to_string().contains("requires an instance name"));
+        let empty = cli_name_argument(&["x0xd".into(), "--name=".into()]).unwrap_err();
+        assert!(empty.to_string().contains("requires an instance name"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn name_flag_refuses_non_utf8_in_both_spellings() {
+        use std::os::unix::ffi::OsStringExt;
+        let separate = cli_name_argument(&[
+            "x0xd".into(),
+            "--name".into(),
+            OsString::from_vec(b"al\xffce".to_vec()),
+        ])
+        .unwrap_err();
+        assert!(separate.to_string().contains("valid UTF-8"));
+        let equals = cli_name_argument(&[
+            "x0xd".into(),
+            OsString::from_vec(b"--name=al\xffce".to_vec()),
+        ])
+        .unwrap_err();
+        assert!(equals.to_string().contains("valid UTF-8"));
+        // An unrelated non-UTF-8 argument is not this flag's business.
+        let other = cli_name_argument(&["x0xd".into(), OsString::from_vec(b"\xff".to_vec())])
+            .expect("unrelated argument");
+        assert!(other.is_none());
     }
 
     #[test]
