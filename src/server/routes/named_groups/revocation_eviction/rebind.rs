@@ -2175,7 +2175,7 @@ pub(in crate::server) async fn receive(
     }
     // Later commits that queued behind this link can now chain.
     if next.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-        ng::replay_pending_treekem_events(state, &group_key).await;
+        ng::replay_pending_treekem_events(state, &group_key, None).await;
     }
     state.agent.s4_revocation_intake().request_reconcile();
     ReceiveOutcome::Applied
