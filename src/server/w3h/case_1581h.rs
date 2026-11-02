@@ -71,7 +71,7 @@ use super::control::{create_group, invite, join, members, mesh};
 use super::home::membership_state;
 use super::receipt::{Receipt, Verdict};
 use super::*;
-use crate::groups::eviction::{decode_evs, EVS_FILE_NAME};
+use crate::groups::eviction::{decode_evs, quarantine_hash_hex, EVS_FILE_NAME};
 use anyhow::{ensure, Context as _};
 use std::path::{Path, PathBuf};
 
@@ -105,8 +105,9 @@ const CAUSE_NO_REBUILD: &str = "the damaged .evs body was not quarantined and re
                                 rebuilt_from did not meet ADR 0108 §5a";
 const CAUSE_NO_REBUILDING: &str = "no typed rebuilding_obligation_store: the rebuilt row's first \
                                    passes showed no rebuild wait";
-const CAUSE_NO_HEAD_SYNC: &str = "no typed waiting_for_head_sync: the rebuilt row's waits never \
-                                  named the head while the restart sync wait held it";
+const CAUSE_NO_HEAD_SYNC: &str = "no typed waiting_for_head_sync holding the exclusion: after \
+                                  the rebuild the row never named the head while still pending \
+                                  at e0";
 const CAUSE_ROW_LOST: &str = "the rebuilt store did not re-derive and complete the open row: A's \
                               row for B never completed, or the survivors never reached the \
                               single exclusion";
@@ -562,23 +563,37 @@ async fn control_arm(
     let (state, detail, rebuilt_from) = store_view(sim, "A", group).await?;
     let (history_after, pending_after) = quarantine_names(&dir);
     let replacement = read_evs(sim, "A")?;
-    // The one new history copy must name the same txid the store
-    // publishes (and the replacement must carry it too).
+    // The one new history copy must be the §5a name for the published
+    // txid and the damaged bytes (`<evs>.q-<txid>-<h>`), hold exactly
+    // those bytes, and the replacement must name the same txid.
     let new_history = history_after
         .iter()
         .filter(|name| !history_before.contains(*name))
         .cloned()
         .collect::<Vec<_>>();
-    let replacement_txid = replacement
-        .as_ref()
-        .and_then(|body| body.rebuilt_from.first().map(hex::encode));
+    let expected_history = rebuilt_from.first().map(|txid| {
+        format!(
+            "{EVS_FILE_NAME}.q-{txid}-{}",
+            quarantine_hash_hex(DAMAGED_BODY)
+        )
+    });
+    let history_bytes = match new_history.as_slice() {
+        [name] => std::fs::read(dir.join(name)).ok(),
+        _ => None,
+    };
+    let replacement_txids = replacement.as_ref().map(|body| {
+        body.rebuilt_from
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+    });
     let rebuilt_ok = state == "rebuilt"
         && rebuilt_from.len() == 1
         && history_after.len() == history_before.len() + 1
         && pending_after.is_empty()
-        && new_history.len() == 1
-        && new_history[0].contains(&format!(".q-{}-", rebuilt_from[0]))
-        && replacement_txid.as_deref() == rebuilt_from.first().map(String::as_str);
+        && new_history.first() == expected_history.as_ref()
+        && history_bytes.as_deref() == Some(DAMAGED_BODY)
+        && replacement_txids.as_ref() == Some(&rebuilt_from);
     passed &= record_check(
         receipt,
         "the_damaged_body_is_quarantined_and_rebuilt",
@@ -587,11 +602,13 @@ async fn control_arm(
         Some(format!("state={state} detail={detail:?}")),
         format!(
             "state={state:?} detail={detail:?} rebuilt_from={rebuilt_from:?}; history {} -> {}, \
-             pending {:?}; the new history copy: {new_history:?}; the replacement's txid: \
-             {replacement_txid:?}",
+             pending {:?}; the new history copy: {new_history:?} (expected \
+             {expected_history:?}), its bytes are the damaged body: {}; the replacement's \
+             rebuilt_from: {replacement_txids:?}",
             history_before.len(),
             history_after.len(),
             pending_after,
+            history_bytes.as_deref() == Some(DAMAGED_BODY),
         ),
         at(sim),
     );
@@ -633,20 +650,32 @@ async fn control_arm(
 
     // The row then waits for the new head round — the typed
     // `waiting_for_head_sync` from the passes after the rebuild flag
-    // cleared until the new restart sync wait passes.
+    // cleared until the new restart sync wait passes. The wait must
+    // hold the exclusion: at the same reading the row is still
+    // `pending` and A is still at e0, so a rebuild that skips the gate
+    // and excludes early cannot pass.
     let mut head_sync_seen = false;
+    let mut last_reading = String::from("no row read");
     let head_watch = sim
         .until(
-            "the rebuilt row shows waiting_for_head_sync",
+            "the rebuilt row shows waiting_for_head_sync with the exclusion held",
             Duration::from_secs(5),
             async |s: &Sim| {
-                head_sync_seen |= s4_row(s, "A", group, b_hex)
+                let Ok(Some(row)) = s4_row(s, "A", group, b_hex).await else {
+                    return false;
+                };
+                let epoch = view_now(s, "A", group, b_hex)
                     .await
                     .ok()
-                    .flatten()
-                    .is_some_and(|row| {
-                        row["waiting"]["cause"].as_str() == Some("waiting_for_head_sync")
-                    });
+                    .and_then(|seen| seen.epoch);
+                last_reading = format!(
+                    "cause={:?} phase={:?} A epoch={epoch:?}",
+                    row["waiting"]["cause"].as_str(),
+                    row["phase"].as_str()
+                );
+                head_sync_seen = row["waiting"]["cause"].as_str() == Some("waiting_for_head_sync")
+                    && row["phase"].as_str() == Some("pending")
+                    && epoch == Some(e0);
                 head_sync_seen
             },
         )
@@ -661,8 +690,11 @@ async fn control_arm(
         "the_rebuilt_row_names_waiting_for_head_sync",
         head_sync_seen,
         CAUSE_NO_HEAD_SYNC,
-        Some("no head-sync wait observed while the restart wait held the row".to_string()),
-        "the row's stored wait through the restart sync window".to_string(),
+        Some(format!(
+            "no pending head-sync wait at e0={e0} after the rebuild; the last reading: \
+             {last_reading}"
+        )),
+        format!("after the rebuild, at e0={e0}: {last_reading}"),
         at(sim),
     );
 
@@ -866,12 +898,19 @@ async fn newer_file_arm(
         causes.iter().collect::<Vec<_>>()
     );
     // ADR 0110 line 378: a chain-durable self-leave seals under a
-    // memory-only file, so the intake wait must not appear for it.
+    // memory-only file, so the intake wait must not appear for it. The
+    // absence counts only when the watch saw the row through to
+    // `complete`: a row stalled at another wait never showed the seal.
+    let intake_shown = causes.contains("waiting_for_durable_intake");
     passed &= record_check(
         receipt,
-        "the_chain_durable_trigger_never_waits_for_intake",
-        !causes.contains("waiting_for_durable_intake"),
-        CAUSE_DURABLE_WAIT_SHOWN,
+        "the_chain_durable_trigger_seals_without_the_intake_wait",
+        !intake_shown && final_phase == "complete",
+        if intake_shown {
+            CAUSE_DURABLE_WAIT_SHOWN
+        } else {
+            CAUSE_NEWER_ROW_INCOMPLETE
+        },
         Some(causes_line.clone()),
         causes_line,
         at(sim),
