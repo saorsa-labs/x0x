@@ -596,9 +596,9 @@ jobs:
   w3h-plan:
     # Names the case groups for the matrix. A case is in exactly one group.
     # S3 (`w3h_1356_`) and S4 (`w3h_1357_`) each have a group, so more of
-    # those cases extend that shard only. The H-S3-c and H-S3-c2 rows each
-    # have their own S3 group (`s3-c`, `s3-c2`). A group is omitted when
-    # the tree has no matching test.
+    # those cases extend that shard only. The H-S3-c/c2/c3 rows each have
+    # their own S3 group (`s3-c`, `s3-c2`, `s3-c3`). A group is omitted
+    # when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -625,7 +625,7 @@ jobs:
     name: W3-H shard (${{ matrix.group }})
     needs: w3h-plan
     runs-on: ubuntu-latest
-    # Every S3 group (`s3`, and `s3-c`, `s3-c2` for the H-S3-c/c2
+    # Every S3 group (`s3`, and `s3-c`, `s3-c2`, `s3-c3` for the H-S3-c/c2/c3
     # owner-axis rows) gets 185 min (Engineer ruling, 30 Oct, 165 min;
     # raised by option (b) of the 31 Oct ruling, #1727). Every other group
     # keeps 120 min. The isolated test phase has its own deadline
@@ -691,7 +691,8 @@ jobs:
           # 185-min job; every other group keeps 6600 s. One rerun is as
           # long as its longest case: with the H-S3-c/c2 rows in `s3`, a
           # rerun took 490 s and 20 reruns did not fit 9300 s (job
-          # 124802273633, 18 of 20). So each of those rows has its own
+          # 124802273633, 18 of 20). The PR body of #1733 has the measured
+          # time of each S3 group. So each H-S3-c/c2/c3 row has its own
           # group. `isolated-runtime.py` caps the value at 21600 s.
           X0X_RUNTIME_TIMEOUT_SECONDS: ${{ startsWith(matrix.group, 's3') && 9300 || 6600 }}
         # `--run-ignored all`: include LD_PRELOAD-only unit tests declared
@@ -913,6 +914,8 @@ jobs:
           --expect w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node=GREEN
           --require w3h_1356_red_s3_c2_reseat_retires_marker_and_gap
           --expect w3h_1356_red_s3_c2_reseat_retires_marker_and_gap=GREEN
+          --require w3h_1356_control_s3_c3_owner_reseats_owner_axis_node
+          --expect w3h_1356_control_s3_c3_owner_reseats_owner_axis_node=GREEN
           --require w3h_1666_control_certificate_only_admin_seals
           --expect w3h_1666_control_certificate_only_admin_seals=GREEN
           --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
