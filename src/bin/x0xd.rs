@@ -262,15 +262,19 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // dhat heap profiler. Each daemon writes its own file so multi-daemon
     // runs don't overwrite each other's dump. Set DHAT_OUT_DIR to override.
-    // Started only after argv is accepted: dhat's own exit path collects
-    // argv with std::env::args(), which panics on the non-UTF-8 arguments
-    // the refusals above reject (#1375).
+    // dhat's own exit path collects argv with std::env::args(), which panics
+    // on a non-UTF-8 argument. Some flags (`--config`) accept raw OS bytes,
+    // so the profiler runs only when every argument is UTF-8; otherwise that
+    // panic would hide the daemon's own exit error (#1375).
     #[cfg(feature = "profile-heap")]
-    let _dhat_profiler = {
+    let _dhat_profiler = if args.iter().all(|a| a.to_str().is_some()) {
         let dir = std::env::var("DHAT_OUT_DIR").unwrap_or_else(|_| ".".to_string());
         let path = format!("{}/dhat-heap-{}.json", dir, std::process::id());
         eprintln!("dhat: writing heap dump to {} on exit", path);
-        dhat::Profiler::builder().file_name(&path).build()
+        Some(dhat::Profiler::builder().file_name(&path).build())
+    } else {
+        eprintln!("dhat: heap profiler off, an argument is not UTF-8");
+        None
     };
 
     // Whether a config file was actually loaded (explicit `--config`, or the
