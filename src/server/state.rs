@@ -1643,6 +1643,34 @@ pub(super) struct NamedGroupTestRecorders {
     /// the HANDLER's drop decision, so a test pins this gate independently
     /// of the send seam, which re-checks at the write.
     pub(super) control_blob_revoked_drops: StdMutex<Vec<(&'static str, String, String)>>,
+    /// #1685: every typed stop of the truncated-page re-request loop, as
+    /// `(group, peer, reason)` — the page applied nothing, the catch-up
+    /// cursor did not move, and the identical next page request was
+    /// deliberately not sent. Tests read the reason here.
+    pub(super) catchup_page_stops: StdMutex<Vec<(String, String, &'static str)>>,
+    /// #1685 round 3: every page-loop re-arm that was sent, as
+    /// `(group, peer, reason)` — a replay applied retained state, so a
+    /// peer stopped with `truncated_page_no_progress` was asked for its
+    /// next page again at the moved cursor. Tests read the reason here.
+    pub(super) catchup_page_rearms: StdMutex<Vec<(String, String, &'static str)>>,
+    /// #1685 round 4, in its round 8 shape (Engineer ruling, 31 Oct
+    /// 2026): every stopped peer the re-arm pre-check retired as
+    /// departed — the agent is revoked, or it holds no Active seat on
+    /// the live roster any more — as `(group, peer, reason)`: no
+    /// re-arm ask, its stopped-loop row dropped, its page fence
+    /// closed. Tests read the reason here.
+    pub(super) catchup_page_departed: StdMutex<Vec<(String, String, &'static str)>>,
+    /// #1685 rounds 8 and 9 (Engineer rulings, 31 Oct 2026): every
+    /// stopped peer the re-arm pre-check DEFERRED — the agent keeps its
+    /// Active seat but a machine or binding revocation, or a pending
+    /// revocation resync, holds pages from the machine its stopped page
+    /// came from — as `(group, peer, reason)`. `revocation_hold_ask_sent`
+    /// (round 9): the deferred ask went to the agent anyway and the
+    /// stopped-loop row stays armed until a valid page closes it;
+    /// `revocation_hold`: nothing was sent (a pending resync holds the
+    /// apply gate, or every send failed) and the row stays armed. The
+    /// page fence stays open in both shapes. Tests read the reason here.
+    pub(super) catchup_page_deferred: StdMutex<Vec<(String, String, &'static str)>>,
 }
 
 #[cfg(test)]

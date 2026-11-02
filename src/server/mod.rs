@@ -837,9 +837,12 @@ pub async fn serve_with_options(
     recover_home_suite_sidecar_journals(&home_suite_groups_path, &treekem_dir)
         .await
         .map_err(|e| anyhow::anyhow!("failed to recover Home-Suite sidecar journal: {e}"))?;
-    let named_groups = load_named_groups_merged(&named_groups_path, &home_suite_groups_path)
+    let mut named_groups = load_named_groups_merged(&named_groups_path, &home_suite_groups_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load named groups: {e}"))?;
+    // #1650 (ADR 0110 §5): retained displaced rebind certificates reload
+    // from their S4 sidecar — the legacy JSON never carries them.
+    routes::named_groups::load_displaced_certs_sidecar(&mut named_groups, &config.data_dir).await;
     let treekem_member_key_packages = load_treekem_member_key_packages(
         &treekem_dir.join("member-key-packages.json"),
         &named_groups,
@@ -5015,7 +5018,11 @@ async fn handle_predecessor_relay_typed_payload_inner(
                                 "ADR 0028: rollback is visible but not directory-durable after admission failure"
                             );
                         }
-                        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                        Ok(
+                            AtomicWriteOutcome::NotReplaced
+                            | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                        )
+                        | Err(_) => {
                             tracing::error!(
                                 group_id = %group_id_str,
                                 "ADR 0028: rollback was not replaced after admission failure"
@@ -5106,7 +5113,11 @@ async fn handle_predecessor_relay_typed_payload_inner(
                                     "ADR 0028: rollback is visible but not directory-durable after outbox save failure"
                                 );
                             }
-                            Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                            Ok(
+                                AtomicWriteOutcome::NotReplaced
+                                | AtomicWriteOutcome::PreflightRefusedAfterRename,
+                            )
+                            | Err(_) => {
                                 tracing::error!(
                                     group_id = %group_id_str,
                                     "ADR 0028: rollback was not replaced after outbox save failure"
