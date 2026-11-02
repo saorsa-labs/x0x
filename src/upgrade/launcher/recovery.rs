@@ -151,7 +151,14 @@ impl Host {
             }
             let result = (|| {
                 record.phase = journal::Phase::RollingBack;
-                record.cause = Some(cause);
+                // A recorded Failed cause is never downgraded to Interrupted
+                // by a later launcher restart (ADR 0094 S4).
+                if !matches!(
+                    &record.cause,
+                    Some(existing) if existing.class == journal::CauseClass::Failed
+                ) {
+                    record.cause = Some(cause);
+                }
                 self.save(record)?;
                 // The cause remains in the journal through Restored. An
                 // unresolved M2 record already blocks all apply ingress.
@@ -334,6 +341,25 @@ mod tests {
             assert_eq!(filesystem::hash(&a.target_path).unwrap(), a.previous_sha256);
         }
         assert!(record.daemon_progress.restored && record.cli_progress.restored);
+    }
+
+    /// A restore that re-enters after a launcher restart keeps a Failed
+    /// cause already in the journal (ADR 0094: a held release stays held).
+    #[test]
+    fn restore_keeps_a_failed_journal_cause() {
+        let (_dir, root, _host, mut record) = fixture(journal::Phase::RollingBack);
+        record.cause = Some(cause(journal::CauseClass::Failed));
+        journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+        let host = Host::new(root.clone(), record).unwrap();
+        let trials = [(root.join("trial.json"), trial(&host))];
+        let interrupted = journal::Cause {
+            class: journal::CauseClass::Interrupted,
+            reason: "launcher died during rollback".into(),
+        };
+        host.restore(&trials, interrupted).unwrap();
+        let kept = journal_record(&root).cause.unwrap();
+        assert_eq!(kept.class, journal::CauseClass::Failed);
+        assert_eq!(kept.reason, "fixture cause");
     }
 
     /// Restore never runs while an OLD or candidate process still exists.
