@@ -36,7 +36,7 @@ mod routes;
 mod sse;
 mod state;
 mod update_check;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod upgrade_flush;
 pub use update_check::run_update_check_and_report;
 // W3-H (#1164): deterministic simulation harness (test builds only:
@@ -1483,12 +1483,12 @@ pub async fn serve_with_options(
     // instance lock taken above proves that owner exited (it held the lock
     // for its whole flush); clear the debris, log the cause and leave that
     // upgrade failed so a later apply is not refused forever.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     crate::upgrade::shutdown_flush::clear_stale_records(&config.data_dir);
 
     // The control listener survives the HTTP drain, so a peer can receive
     // its durable receipt after every normal request and producer has stopped.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let upgrade_flush = if self_update_enabled {
         let setup = async {
             let identity_root = match identity_dir.clone() {
@@ -3481,7 +3481,7 @@ pub async fn serve_with_options(
             server_result
         };
         let result = combine_server_shutdown_results(server_result, agent_shutdown_result);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(owner) = &upgrade_flush {
             // An HTTP producer aborted at the drain bound is as unfinished as
             // an aborted background task (ADR 0094 §4): the receipt refuses,

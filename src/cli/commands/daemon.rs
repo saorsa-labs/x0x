@@ -46,7 +46,10 @@ pub async fn start(name: Option<&str>, config: Option<&Path>, foreground: bool) 
         {
             let status = cmd.status().context("failed to run x0xd")?;
             if !status.success() {
-                anyhow::bail!("x0xd exited with {status}");
+                // Keep x0xd's exact status for a supervisor, as the Unix exec
+                // does: 100 asks for a restart on new bytes, 75 (EX_TEMPFAIL)
+                // for a restart on the restored binary (#1588).
+                std::process::exit(status.code().unwrap_or(1));
             }
             return Ok(());
         }
@@ -1827,6 +1830,7 @@ mod tests {
             )
         }));
         assert!(script.lines().any(|l| l == "$x0xRestartOnExit100 = $true"));
+        assert!(script.lines().any(|l| l == "$x0xRestartOnExit75 = $true"));
         // The cross-pin that keeps the renderer and the verifier honest: the
         // generated template is exactly what the upgrade-time readback
         // accepts for the instance it was rendered for.
