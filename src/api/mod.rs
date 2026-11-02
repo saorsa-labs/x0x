@@ -1784,7 +1784,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Get,
         path: "/upgrade",
         cli_name: "upgrade",
-        description: "Daemon-side check for updates over x0x/release manifests (CLI x0x upgrade --check reads GitHub directly)",
+        description: "Daemon-side check for updates over x0x/release manifests (CLI x0x upgrade --check reads GitHub and calls local /health)",
         category: "upgrade",
         request: RequestSpec::None,
     },
