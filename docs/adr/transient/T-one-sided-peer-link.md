@@ -10,7 +10,7 @@
 
 A MASQUE relay can supersede the live link on one side only (ant-quic#332). The other side still reports the old connection as connected. `GET /health`, `GET /peers` and `GET /status` then read healthy. The eph `r0481pre-e2e` run also saw both directions idle on one peer, 610 s sent and 725 s received, while every other pair stayed under 2 s.
 
-`last_sent_at` and `last_received_at` in ant-quic 0.27.60 count application data only. A healthy peer can be quiet on both directions. Ages alone cannot tell that quiet link from a broken one.
+`last_sent_at` and `last_received_at` in ant-quic 0.27.61 count application data only. A healthy peer can be quiet on both directions. Ages alone cannot tell that quiet link from a broken one.
 
 ant-quic owns the connection winner. This decision does not change that crate or the plane gate. Until ant-quic#332 is fixed, x0x detects a one-sided link and makes one bounded re-dial.
 

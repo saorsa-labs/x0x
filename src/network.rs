@@ -609,9 +609,14 @@ fn plan_one_sided_repairs(
             if sample.age.one_sided() {
                 // A fresh direction ends the both-stale episode. The
                 // immediate rule owns the peer, so its WARN must not say
-                // both directions are idle.
-                entry.both_stale_confirmed = false;
-                entry.both_stale_confirmed_at = None;
+                // both directions are idle. A shape this node's own probe
+                // made is different: the probe's send is the only fresh
+                // direction, and a probe that named the link broken keeps
+                // its verdict for its window.
+                if !probe_made_one_sided(sample, entry, now) {
+                    entry.both_stale_confirmed = false;
+                    entry.both_stale_confirmed_at = None;
+                }
                 continue;
             }
             if sample.age.fresh_direction() || !entry.both_stale_confirmed {
@@ -3771,8 +3776,10 @@ impl NetworkNode {
     /// degraded or re-dialled on inconclusive evidence alone. A peer stays
     /// in the degraded set while a confirming probe sits inside the window
     /// and its sample stays both-directions stale, even when other peers
-    /// go quiet. A peer this node probed successfully inside the last
-    /// [`ONE_SIDED_FLOWING`] does not count as the flowing peer for
+    /// go quiet. A peer this node probed inside the probe-fresh window
+    /// ([`ONE_SIDED_FLOWING`] plus [`ONE_SIDED_PROBE_OUTER_TIMEOUT`]), with
+    /// no live broken-link verdict — successful or inconclusive — does not
+    /// count as the flowing peer for
     /// another candidate, so probing cannot bootstrap probing on a quiet
     /// node. Each peer is probed at most once per
     /// [`ONE_SIDED_REDIAL_BACKOFF`], never-probed candidates go first,
@@ -3803,7 +3810,7 @@ impl NetworkNode {
             let probe_fresh: std::collections::HashSet<AntPeerId> = map
                 .iter()
                 .filter(|(_, entry)| {
-                    !entry.both_stale_confirmed
+                    !confirmed_inside_window(entry, now)
                         && entry.both_stale_probe_at.is_some_and(|at| {
                             now.saturating_duration_since(at) <= probe_fresh_window
                         })
@@ -3819,6 +3826,16 @@ impl NetworkNode {
             degraded = immediate_one_sided_peer_ids(samples, &map, now);
             for (index, sample) in samples.iter().enumerate() {
                 if !sample.age.both_directions_stale() {
+                    // A probe that timed out stamps its own send, so the
+                    // peer looks one-sided on the next tick. A live
+                    // confirmation still degrades it (#1419).
+                    let probe_masked = map.get(&sample.peer).is_some_and(|entry| {
+                        confirmed_inside_window(entry, now)
+                            && probe_made_one_sided(sample, entry, now)
+                    });
+                    if probe_masked {
+                        degraded.push(sample.peer);
+                    }
                     continue;
                 }
                 let peer = sample.peer;
@@ -11954,6 +11971,133 @@ mod tests {
             );
         }
         node.try_shutdown().await.unwrap();
+    }
+
+    /// #1419: a probe that named the link broken stamps its own send, so
+    /// the peer looks one-sided — not both-directions-stale — on the next
+    /// tick. The live confirmation must still degrade the peer, the plan
+    /// must keep the verdict, and the episode must not re-arm its WARN.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_probe_made_one_sided_shape_keeps_the_degrade() {
+        let plane = "issue1419-probe-masked";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let config = |host: u8| NetworkConfig {
+            bind_addr: Some(SocketAddr::from(([198, 18, 0, host], 5483))),
+            network_id: Some(plane.to_string()),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..NetworkConfig::default()
+        };
+        let a = NetworkNode::new(config(1), None, None).await.unwrap();
+        let b = NetworkNode::new(config(2), None, None).await.unwrap();
+        let c = NetworkNode::new(config(3), None, None).await.unwrap();
+        let peer_b = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 2], 5483)))
+            .await
+            .unwrap();
+        let peer_c = a
+            .connect_addr(SocketAddr::from(([198, 18, 0, 3], 5483)))
+            .await
+            .unwrap();
+        assert_eq!(peer_b, b.peer_id());
+        assert_eq!(peer_c, c.peer_id());
+        let a_link = Arc::clone(a.sim_link.as_ref().expect("sim link"));
+        let b_link = Arc::clone(b.sim_link.as_ref().expect("sim link"));
+        let c_link = Arc::clone(c.sim_link.as_ref().expect("sim link"));
+        let peer_a = a.peer_id();
+        a_link.send(&peer_b, b"\x7fab").unwrap();
+        b_link.send(&peer_a, b"\x7fba").unwrap();
+        a_link.send(&peer_c, b"\x7fac").unwrap();
+        c_link.send(&peer_a, b"\x7fca").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let (old, new) = fabric
+            .supersede_one_sided_for_test(&peer_a, &peer_b)
+            .expect("the A-B link exists");
+        assert_ne!(old, new);
+        tokio::time::sleep(ONE_SIDED_STALE + Duration::from_secs(10)).await;
+        a_link.send(&peer_c, b"\x7fac2").unwrap();
+        c_link.send(&peer_a, b"\x7fca2").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let samples = a.connected_link_ages().await;
+        let degraded = a.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            degraded,
+            vec![peer_b],
+            "the failed liveness probe degrades the both-directions-stale link"
+        );
+        let probes_after_confirm = a.one_sided_probes.load(Ordering::Relaxed);
+
+        // The failed probe's own send is now the only fresh direction on
+        // the A-B link: B looks one-sided, not both-directions-stale.
+        let masked = a.connected_link_ages().await;
+        let masked_b = masked
+            .iter()
+            .find(|sample| sample.peer == peer_b)
+            .expect("B stays connected");
+        assert!(
+            masked_b.age.one_sided()
+                && masked_b
+                    .age
+                    .sent_ago
+                    .is_some_and(|ago| ago <= ONE_SIDED_FLOWING)
+                && masked_b
+                    .age
+                    .received_ago
+                    .is_some_and(|ago| ago >= ONE_SIDED_STALE),
+            "the probe's own send leaves B looking one-sided: {:?}",
+            masked_b.age
+        );
+        let still = a.resolve_one_sided_peers(&masked).await;
+        assert_eq!(
+            still,
+            vec![peer_b],
+            "a live confirmation stays degraded behind the probe-made one-sided shape"
+        );
+        assert_eq!(
+            a.one_sided_probes.load(Ordering::Relaxed),
+            probes_after_confirm,
+            "the masked shape is not probed again inside the cooldown"
+        );
+        a.repair_one_sided_links(&masked).await;
+        {
+            let repairs = a.one_sided_repairs.lock().unwrap();
+            assert!(
+                repairs[&peer_b].both_stale_confirmed,
+                "a probe-made one-sided shape does not spend the verdict"
+            );
+        }
+
+        // A both-directions-stale sample inside the window — the probe
+        // send cannot keep its stamp fresh for long on the real clock —
+        // plans the kept verdict: one WARN, and the second pass stays
+        // silent.
+        let both_stale = [LinkAgeSample {
+            peer: peer_b,
+            age: LinkTrafficAge {
+                sent_ago: Some(Duration::from_secs(90)),
+                received_ago: Some(Duration::from_secs(90)),
+            },
+        }];
+        a.repair_one_sided_links(&both_stale).await;
+        assert_eq!(
+            a.one_sided_warnings.load(Ordering::Relaxed),
+            1,
+            "one WARN when the kept verdict plans on a both-directions-stale sample"
+        );
+        a.repair_one_sided_links(&both_stale).await;
+        assert_eq!(
+            a.one_sided_warnings.load(Ordering::Relaxed),
+            1,
+            "the kept verdict does not re-arm the WARN"
+        );
+
+        a.try_shutdown().await.unwrap();
+        b.try_shutdown().await.unwrap();
+        c.try_shutdown().await.unwrap();
     }
 
     /// #1419: one health tick probes at most two both-stale candidates,
