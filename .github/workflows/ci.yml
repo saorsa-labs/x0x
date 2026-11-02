@@ -911,6 +911,10 @@ jobs:
           --expect w3h_1581e_red_crash_commit_fork_contained=RED
           --require w3h_1581e_control_crash_commit_same_chain_resume
           --expect w3h_1581e_control_crash_commit_same_chain_resume=GREEN
+          --require w3h_1581h_control_sidecar_rebuild_body_damage_rederives
+          --expect w3h_1581h_control_sidecar_rebuild_body_damage_rederives=GREEN
+          --require w3h_1581h_control_sidecar_rebuild_newer_file_memory_only
+          --expect w3h_1581h_control_sidecar_rebuild_newer_file_memory_only=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable
