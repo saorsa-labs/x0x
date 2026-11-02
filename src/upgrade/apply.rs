@@ -23,6 +23,60 @@ use super::{UpgradeError, UpgradeResult, Upgrader};
 pub(crate) const HTTP_DEFERRED_RESTART_DELAY: std::time::Duration =
     std::time::Duration::from_millis(750);
 
+/// CLI-only reinstall for a binary this apply did not replace (#1104).
+///
+/// `scripts/install.sh` has no CLI-only mode: it stops the daemon and
+/// installs `x0xd` as well. This command installs only the `x0x` binary.
+pub(crate) const CLI_REINSTALL_HINT: &str = "\
+This command installs only the x0x CLI. It does not replace x0xd:
+  cargo install x0x --bin x0x --force";
+
+/// Packaged CLI file name for this platform.
+pub(crate) fn cli_file_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "x0x.exe"
+    } else {
+        "x0x"
+    }
+}
+
+/// Packaged daemon file name for this platform.
+pub(crate) fn daemon_file_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "x0xd.exe"
+    } else {
+        "x0xd"
+    }
+}
+
+/// Sibling `x0x` beside the daemon path apply is replacing.
+///
+/// This uses that path's own directory. It does not resolve a symlink first.
+/// `install_path` is the daemon swap target; the CLI swap target is the
+/// `x0x` next to it. A symlinked `x0xd` therefore replaces the `x0x` beside
+/// the link, which is the directory the operator invoked.
+pub(crate) fn sibling_cli_path(daemon_install: &Path) -> Result<PathBuf, UpgradeError> {
+    let parent = daemon_install
+        .parent()
+        .ok_or_else(|| UpgradeError::Other("target has no parent directory".to_string()))?;
+    Ok(parent.join(cli_file_name()))
+}
+
+/// `Some` when no sibling CLI file exists. Callers log it at debug, not warn.
+///
+/// A CLI in another directory is not visible on this path. The CLI process
+/// reports that case (#1104).
+pub(crate) fn missing_sibling_cli_message(cli_binary: &Path) -> Option<String> {
+    if cli_binary.is_file() {
+        None
+    } else {
+        Some(format!(
+            "sibling CLI file is missing: {}",
+            cli_binary.display()
+        ))
+    }
+}
+
 /// The probe runs with the existing install locks held, before admission.
 type ProbeAdmission = Box<dyn FnOnce(&AtomicBool) -> Result<(), UpgradeError> + Send>;
 
@@ -1437,16 +1491,15 @@ impl AutoApplyUpgrader {
         // Prepare an optional companion replace; both locks run off-worker below.
         let mut companion = None;
         if self.binary_name == "x0xd" {
-            let parent_dir = target_path
-                .parent()
-                .ok_or_else(|| UpgradeError::Other("target has no parent directory".to_string()))?;
-            let x0x_name = if cfg!(target_os = "windows") {
-                "x0x.exe"
+            let x0x_path = sibling_cli_path(&target_path)?;
+            // #1104: replace only a sibling x0x. A missing file is not a split
+            // install. Do not search the rest of the host. The CLI process
+            // reports a binary that lives in another directory.
+            if let Some(message) = missing_sibling_cli_message(&x0x_path) {
+                debug!("{message}");
             } else {
-                "x0x"
-            };
-            let x0x_path = parent_dir.join(x0x_name);
-            if x0x_path.exists() {
+                // The path is this daemon's sibling CLI file. Apply replaces
+                // that file only. It does not search the rest of the host.
                 info!("Found x0x CLI companion in same directory, upgrading it too...");
                 #[cfg(unix)]
                 {
@@ -1459,7 +1512,7 @@ impl AutoApplyUpgrader {
                 {
                     let extracted_x0x = temp_dir.join("extracted-x0x");
                     if let Err(e) =
-                        extract_binary_from_archive(&archive_path, &extracted_x0x, x0x_name)
+                        extract_binary_from_archive(&archive_path, &extracted_x0x, cli_file_name())
                     {
                         warn!("Failed to extract companion x0x binary: {e}");
                     } else {
@@ -4717,6 +4770,90 @@ mod tests {
         assert!(
             !scratch.exists(),
             "temp dir must be gone after drop-before-process::exit"
+        );
+    }
+
+    #[test]
+    fn missing_sibling_cli_is_a_debug_note_not_a_split_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join(cli_file_name());
+        let note = missing_sibling_cli_message(&missing).expect("missing sibling");
+        assert!(
+            note.contains("missing"),
+            "a missing sibling must say the file is missing: {note}"
+        );
+        assert!(
+            !note.contains("not beside") && !note.contains("CLI not upgraded"),
+            "a missing sibling is not a split-install warning: {note}"
+        );
+        assert!(
+            !note.contains(CLI_REINSTALL_HINT),
+            "a missing sibling must not print the reinstall hint: {note}"
+        );
+        std::fs::write(&missing, b"cli").unwrap();
+        assert!(missing_sibling_cli_message(&missing).is_none());
+    }
+
+    /// A symlinked `x0xd` with a real `x0x` beside the link replaces that
+    /// `x0x`. The CLI in the symlink target's directory is a different file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_daemon_swaps_the_cli_beside_the_link() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("opt");
+        std::fs::create_dir_all(&real).unwrap();
+        let real_daemon = real.join(daemon_file_name());
+        std::fs::write(&real_daemon, b"real-daemon").unwrap();
+        let decoy = real.join(cli_file_name());
+        std::fs::write(&decoy, b"decoy-cli").unwrap();
+
+        let link_dir = root.path().join("link");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let link = link_dir.join(daemon_file_name());
+        symlink(&real_daemon, &link).unwrap();
+        let cli = link_dir.join(cli_file_name());
+        std::fs::write(&cli, b"old-cli").unwrap();
+
+        let swap = sibling_cli_path(&link).expect("sibling");
+        assert_eq!(swap, cli);
+
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        std::fs::write(scratch.join("archive.bin"), b"payload").unwrap();
+        let incoming_daemon = scratch.join("daemon");
+        std::fs::write(&incoming_daemon, b"new-daemon").unwrap();
+        let incoming_cli = scratch.join("cli");
+        std::fs::write(&incoming_cli, b"new-cli").unwrap();
+
+        let result = apply_replacements_offloaded(
+            Upgrader::new(link.clone(), semver::Version::new(1, 0, 0)),
+            incoming_daemon,
+            semver::Version::new(2, 0, 0),
+            Some((
+                Upgrader::new(swap, semver::Version::new(1, 0, 0)),
+                incoming_cli,
+            )),
+            TempDirGuard { path: scratch },
+            None,
+            None,
+        )
+        .await
+        .expect("replace");
+        assert!(matches!(result, UpgradeResult::Success { .. }));
+        assert_eq!(std::fs::read(&cli).unwrap(), b"new-cli");
+        assert_eq!(std::fs::read(&link).unwrap(), b"new-daemon");
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy-cli");
+        assert_eq!(std::fs::read(&real_daemon).unwrap(), b"real-daemon");
+        let lock_name = format!("{}.upgrade.lock", cli_file_name());
+        assert!(
+            link_dir.join(&lock_name).is_file(),
+            "the CLI lock stays beside the link"
+        );
+        assert!(
+            !real.join(&lock_name).exists(),
+            "the real directory is not the CLI swap target"
         );
     }
 }
