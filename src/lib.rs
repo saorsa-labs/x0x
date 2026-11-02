@@ -10383,13 +10383,6 @@ impl Agent {
     /// ([`Self::send_direct_with_config`]) can hand it a page or a chunk
     /// meant for the clean device that asked.
     ///
-    /// Delivery shape is the #1657 refusal lane's
-    /// ([`Self::send_treekem_refusal_reply`]) with the data payload this
-    /// lane already carries: the ant-quic PeerId IS the machine id, so the
-    /// frame travels the authenticated raw-QUIC path to `machine_id` and
-    /// nothing else, and the receiving daemon dispatches it exactly as it
-    /// dispatches any DM of the same type. No new wire message.
-    ///
     /// Gates: the ADR-0043 signing gate (the same egress refusal as every
     /// DM path), the raw payload bound, and — review rounds 1 and 2 — the
     /// full revocation ladder (agent, machine, binding/placement, resync)
@@ -10401,8 +10394,10 @@ impl Agent {
     /// DM takes.
     ///
     /// #1664: send one machine-addressed DATA answer (a TreeKEM catch-up
-    /// page, a control-blob chunk) to `machine_id` — the
-    /// QUIC-authenticated machine the answered request came from. The
+    /// page, a control-blob chunk) to `machine_id` — the machine the
+    /// answered request authenticated (QUIC on a direct DM; the
+    /// machine-key attestation or a stored binding when the DM arrived
+    /// over gossip). The
     /// answer rides the SAME pinned exchange a join-result chunk uses
     /// ([`Self::send_direct_pinned_admitted_machine_inner`]): the connect
     /// ladder (repair, then the pinned redial of exactly the asking
@@ -10558,7 +10553,8 @@ impl Agent {
     }
 
     /// #1664: [`Self::send_direct_pinned_admitted`] with the target FIXED
-    /// to the QUIC-authenticated machine the answered request came from,
+    /// to the machine the answered request authenticated (QUIC on a
+    /// direct DM; attestation or stored binding over gossip),
     /// instead of the recipient's (moveable) binding resolution. Used by
     /// the join-artifact exchange for a chunk that ANSWERS a control-blob
     /// fetch: the admission seam still re-checks this agent's revocation
@@ -10636,6 +10632,15 @@ impl Agent {
         connected
     }
 
+    /// #1664 r4: shared core of the machine-pinned exchange for the
+    /// network path and the offline test stand-in. The two arms agree on
+    /// the ladder and the seam but diverge AFTER a ladder that finds no
+    /// connection: the stand-in returns `Err` at once, while the network
+    /// path logs and still runs the admission seam and
+    /// `send_direct_pinned`, which fails on its own (no live generation
+    /// to write). Either way no frame is written, and a revocation
+    /// landing before that point is still refused under its own
+    /// sentence — only the reported error differs.
     async fn send_direct_pinned_admitted_machine_inner(
         &self,
         to: &identity::AgentId,

@@ -1638,7 +1638,7 @@ pub(super) struct NamedGroupTestRecorders {
     /// DECISION (before any egress). Tests read the payload here.
     pub(super) catchup_refusals: StdMutex<Vec<Vec<u8>>>,
     /// #1664 review round 3: every control-blob frame the entry ladder
-    /// dropped because the QUIC-authenticated sender is machine- or
+    /// dropped because the authenticated sender is machine- or
     /// binding-revoked, as `(arm, group id, requester hex)` — recorded at
     /// the HANDLER's drop decision, so a test pins this gate independently
     /// of the send seam, which re-checks at the write.

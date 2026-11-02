@@ -1014,7 +1014,7 @@ pub(in crate::server) async fn handle_control_blob_message(
     let sender_hex = hex::encode(sender.as_bytes());
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     // #1664 (ADR 0110 §3; the #1657 ladder): this lane answers an
-    // authenticated DM, so the QUIC-authenticated sender machine refuses
+    // authenticated DM, so the authenticated sender machine refuses
     // a revoked device exactly as the TreeKEM catch-up serve does — a
     // machine revocation denies that device only (the portable agent
     // keeps its Active seat) and a binding revocation retires the pairing

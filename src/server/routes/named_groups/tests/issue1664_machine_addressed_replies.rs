@@ -1,5 +1,5 @@
 //! #1664: an answer that an authenticated request earned goes to the
-//! MACHINE that asked — the DM's QUIC-authenticated sender — never to
+//! MACHINE that asked — the DM's authenticated sender — never to
 //! "whichever device currently resolves for the agent", which a revoked
 //! device that still holds the portable agent key can occupy (discovery
 //! cache, capability binding, newest connection). Since round 4 the

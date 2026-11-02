@@ -12456,7 +12456,8 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
         };
         let serve_state = Arc::clone(state);
         let requester = *sender;
-        // #1616: the QUIC-authenticated sender machine of the DM, so the
+        // #1616: the authenticated sender machine of the DM (QUIC on a
+        // direct DM; attestation or a stored binding over gossip), so the
         // serve can refuse a revoked device (ADR 0110 D70).
         let sender_machine = *machine_id;
         let _admitted = state.spawn_detached(async move {
@@ -12709,7 +12710,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // check below alone cannot refuse it.
     // #1616 (ADR 0110 D70): a machine revocation denies that device only;
     // the portable agent keeps its Active seat, so the same roster check
-    // cannot refuse the device either — the DM's QUIC-authenticated
+    // cannot refuse the device either — the DM's authenticated
     // sender machine refuses it, under its own operator sentence.
     // #1622 (ADR 0110 D70): a binding revocation retires the pairing
     // only — the agent keeps its seat and the device stays clean — so
@@ -12900,7 +12901,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
             }
         };
         // #1664: the page answers the machine whose DM this node served
-        // (the QUIC-authenticated requester), never "whichever device
+        // (the authenticated requester machine), never "whichever device
         // currently resolves for the agent" — a revoked device holding
         // the portable agent key must not read a page meant for the
         // clean device that asked.
@@ -12954,8 +12955,8 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     }
     #[cfg(test)]
     detached_send_test_seam::park(&format!("treekem-catchup-serve:{sender_hex}")).await;
-    // #1664: the page is machine-addressed to the QUIC-authenticated
-    // requester — the same revocation-clean (agent, machine) pair the
+    // #1664: the page is machine-addressed to the authenticated
+    // requester machine — the same revocation-clean (agent, machine) pair the
     // #1657 ladder above cleared — so a revoked device that still holds
     // the portable agent key cannot be handed this answer by an
     // agent-level resolution (discovery cache, capability binding or
@@ -13496,7 +13497,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 // would re-fetch the identical page; only a moved cursor
                 // can falsify it, so a replay that moves the cursor asks
                 // this peer again (round 5: from a detached task). The
-                // row records the QUIC-authenticated machine this page
+                // row records the authenticated machine this page
                 // came from, so the re-arm pre-check can run the same
                 // machine-aware revocation gate a page from this peer
                 // must pass.
@@ -13690,7 +13691,7 @@ const TREEKEM_PAGE_STOPPED_PEERS_CAP: usize = 1024;
 
 /// #1685 round 6 (CI clippy, `clippy::type_complexity`): the value of
 /// [`TREEKEM_PAGE_STOPPED_PEERS`] — per group, each stopped peer's
-/// armed row: the QUIC-authenticated machine its stopped page came
+/// armed row: the authenticated machine its stopped page came
 /// from and the stop instant. A named alias, not a new type; the
 /// map's shape is unchanged.
 type TreekemPageStoppedPeersByGroup = std::collections::HashMap<
@@ -13701,7 +13702,7 @@ type TreekemPageStoppedPeersByGroup = std::collections::HashMap<
 /// #1685 round 3 (review 5712505625): peers whose truncated-page loop
 /// stopped with [`TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS`], per group,
 /// keyed by the same page-fence aliases the peer fence uses. The row
-/// also records the QUIC-authenticated machine the stopped page came
+/// also records the authenticated machine the stopped page came
 /// from (round 5), so the re-arm pre-check can run the same
 /// machine-aware revocation gate a page from this peer must pass. This
 /// map is liveness bookkeeping, not safety state: the peer fence itself
@@ -48379,7 +48380,7 @@ pub(super) async fn send_join_artifact(
 
 /// #1664: the machine-pinned variant for a chunk that ANSWERS a
 /// control-blob fetch. The exchange targets `machine_id` — the
-/// QUIC-authenticated machine the fetch DM came from — instead of the
+/// machine the fetch DM authenticated — instead of the
 /// recipient's binding resolution, which a revoked device still holding
 /// the agent key can hold the newest advert for. The admission seam and
 /// every lifecycle recorder stay exactly the exchange's.
@@ -51621,7 +51622,7 @@ pub(in crate::server) mod tests {
     mod wp_c;
 
     /// #1616: the transport machine of a simulated DM whose sender device
-    /// is clean. The catch-up handlers thread the QUIC-authenticated sender
+    /// is clean. The catch-up handlers thread the authenticated sender
     /// machine of the direct message; tests that do not exercise a machine
     /// revocation pass this id, which no test revokes.
     fn clean_sender_machine() -> MachineId {
