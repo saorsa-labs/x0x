@@ -75,6 +75,11 @@
 //! leaves) and a data-plane probe opens on B and C; every node is past
 //! its boot head gate. The arms assert:
 //!
+//! - The exit lands inside A's designated window: A's first
+//!   observation of B's row plus `designated_window` is the wall-clock
+//!   deadline the production fallback clock runs on, and the exit's
+//!   answer is held to it. A late arm never reaches the assertions
+//!   below (INFRA) instead of silently running a past-window exit.
 //! - A authors no commit past r0 beyond the exit's own roster change
 //!   (the retained logs decide this, not the current heads).
 //! - D resumes on the exit, not on the fallback clock: B's exclusion is
@@ -432,12 +437,25 @@ async fn await_holders(sim: &Sim, holders: &[&str], subject_hex: &str) -> Result
             true
         })
         .await;
-    if let Err(error) = waited {
-        if !expired(&error) {
-            return Err(error);
+    holders_outcome(waited, &seen, what)
+}
+
+/// The holders-wait outcome: `Ok(())` only when the wait completed with
+/// every read successful. A failed or cut-off read is reported first
+/// (`verify`); a budget expiry over clean reads is still an error — the
+/// holders answered without ever holding the record, which is missing
+/// evidence (INFRA), not delivery (#1757 review).
+fn holders_outcome(waited: Result<()>, seen: &Observations, what: &str) -> Result<()> {
+    match waited {
+        Ok(()) => seen.verify(what),
+        Err(error) if expired(&error) => {
+            seen.verify(what)?;
+            Err(error.context(format!(
+                "INFRA: {what}: the budget ran out with a holder still missing the record"
+            )))
         }
+        Err(error) => Err(error),
     }
-    seen.verify(what)
 }
 
 /// `label`'s persisted S4 row for `target` (the `.evs` sidecar): its
@@ -854,6 +872,9 @@ async fn scenario(
         persisted_t_obs(s, "A", b.as_bytes()).is_ok_and(|t_obs| t_obs.is_some())
     })
     .await?;
+    let a_t_obs = persisted_t_obs(sim, "A", b.as_bytes())
+        .context("read A's .evs row for B")?
+        .context("A's durable row for B carries no first-observation time")?;
     let at_exit_view = view_now(sim, "A", &group, &b, &a_id).await?;
     let pending_ok = typed_head_sync
         && d_names_a
@@ -915,12 +936,50 @@ async fn scenario(
         at(sim),
     );
 
+    // The row's own premise, gated (§4 L274, the mid-window exit): the
+    // evidence waits above carry 60 s budgets against an 18 s window,
+    // so a slow arm can arm the exit only after A's designated window
+    // already ended — a run that never tested the row's claim. A's T_obs
+    // plus W is the wall-clock deadline the production fallback clock
+    // runs on, so the exit's answer is held to it (#1757 review).
+    let window_ends_unix_ms =
+        a_t_obs.saturating_add(u64::try_from(w.as_millis()).unwrap_or(u64::MAX));
+    let exit_unix_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("wall clock before the unix epoch")?
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let window_left_ms = window_ends_unix_ms.saturating_sub(exit_unix_ms);
+    receipt.evidence(
+        "the_exit_fires_inside_a_designated_window",
+        window_left_ms > 0,
+        format!(
+            "A first observed B's row at {a_t_obs} unix ms; the window ({w:?}) ends at \
+             {window_ends_unix_ms}; the {exit_kind} answered at {exit_unix_ms}, {window_left_ms} \
+             ms left ({} us after t=0 on the fabric clock)",
+            t1.saturating_sub(t0).as_micros(),
+        ),
+        at(sim),
+    );
+    ensure!(
+        window_left_ms > 0,
+        "INFRA: A's {exit_kind} exit answered after A's designated window ended — the row's \
+         mid-window claim went untested"
+    );
+
     // The exit is applied on A; from this frozen instant (no barrier is
     // open between the route's answer and the arming) nothing further
     // reaches A.
     inbound_hold.set(true);
     sim.fabric()
         .mark("fault: every application frame toward A dropped (exit-window blackout)");
+    // Whether A's own roster applied the exit's role change: the red
+    // arm's RED is eligible only once A itself no longer seats A as an
+    // admin (#1757 review). Read under the blackout, so it is A's own
+    // application, not a survivor's frame.
+    let a_admin_after_exit = sees_admin(sim, "A", &group, "A").await?;
 
     // The typed mark (§4 L274): A's public row for B names the exit with
     // `local_committer_ineligible`, naming D, while the row is still
@@ -933,6 +992,7 @@ async fn scenario(
     let mut mark_names_d = false;
     let mut row_open_at_mark = false;
     let mut observed_causes = std::collections::BTreeSet::new();
+    let mut watch_reads_clean = true;
     let waited = sim
         .until(
             "A's public row marks the exit",
@@ -953,9 +1013,11 @@ async fn scenario(
                         }
                     }
                     Ok(None) => {
+                        watch_reads_clean = false;
                         observed_causes.insert("<no public row for B on A>".to_string());
                     }
                     Err(_) => {
+                        watch_reads_clean = false;
                         observed_causes.insert("<row read failed>".to_string());
                     }
                 }
@@ -971,7 +1033,8 @@ async fn scenario(
     let mark_sample = s4_row(sim, "A", &group, &b_hex).await?;
     receipt.note(format!(
         "A's public row for B after the exit: phase {:?}, waiting {:?}; causes seen during the \
-         watch: {observed_causes:?}",
+         watch: {observed_causes:?}; every watch read returned the row: {watch_reads_clean}; A \
+         still seats itself as an admin after the exit: {a_admin_after_exit}",
         mark_sample.as_ref().and_then(|row| row["phase"].as_str()),
         mark_sample
             .as_ref()
@@ -1002,9 +1065,11 @@ async fn scenario(
             && !sees_admin(sim, "D", &group, "A").await.unwrap_or(true)
             && !sees_admin(sim, "C", &group, "A").await.unwrap_or(true)
     } else {
-        await_holders(sim, &["D", "C"], &a_hex).await.is_ok()
-            && holds_revocation(sim, "D", &a_hex).await.unwrap_or(false)
-            && holds_revocation(sim, "C", &a_hex).await.unwrap_or(false)
+        // A timeout or a failed read here is missing evidence (INFRA),
+        // not a false evidence row: the record never reached a survivor
+        // (#1757 review).
+        await_holders(sim, &["D", "C"], &a_hex).await?;
+        holds_revocation(sim, "D", &a_hex).await? && holds_revocation(sim, "C", &a_hex).await?
     };
     receipt.evidence(
         "the_exit_evidence_reached_the_survivors",
@@ -1129,11 +1194,14 @@ async fn scenario(
                             .flatten()
                             .is_none();
                         a_row_vanished |= record_gone;
-                        // The record ended with the removal that ended
-                        // A's local retention (§4 L275/D128); this arm's
-                        // end state is then the committed exclusion the
-                        // resume watch already observed.
-                        a_completed || (record_gone && b_epoch.is_some())
+                        // Only the revoked arm's record may end — with
+                        // the removal that ended A's local retention
+                        // (§4 L275/D128); its end state is then the
+                        // committed exclusion the resume watch already
+                        // observed. The demoted worker stays a member
+                        // (D72), so a lost record there is a failure,
+                        // never a completion (#1757 review).
+                        a_completed || (!demoted && record_gone && b_epoch.is_some())
                     }
                     Err(_) => false,
                 }
@@ -1162,13 +1230,15 @@ async fn scenario(
     // The survivors must carry the settled exclusion; A's view counts
     // only while A retains a record of the group (its local retention
     // ends with its own removal, §4 L275/D128 — an ended record lists
-    // no one).
+    // no one). Only the revoked arm may end A's record: the demoted
+    // worker stays a member (D72), so its absent record fails here.
+    let a_record_may_end = !demoted;
     let b_gone_everywhere = end.iter().all(|(label, seen)| match seen {
-        None => *label == "A",
+        None => *label == "A" && a_record_may_end,
         Some(seen) => !seen.lists_b && !seen.quarantined,
     });
     let still_signed_by_d = end.iter().all(|(label, seen)| match seen {
-        None => *label == "A",
+        None => *label == "A" && a_record_may_end,
         Some(seen) => {
             seen.epoch.is_some_and(|epoch| epoch <= e0)
                 || seen.head_committed_by.as_deref() == Some(d_hex.as_str())
@@ -1270,11 +1340,12 @@ async fn scenario(
     let completion_kept = if a_holds_record {
         a_completed && a_row_final && !a_row_vanished
     } else {
-        // The record ended with the removal that ended A's local
-        // retention (§4 L275/D128): the shared obligation on D must be
-        // intact instead (§4 L276), and the survivors must have
-        // applied A's removal.
-        shared_evidence_kept && survivors_dropped_a
+        // The revoked arm only: the record ended with the removal that
+        // ended A's local retention (§4 L275/D128), so the shared
+        // obligation on D must be intact instead (§4 L276), and the
+        // survivors must have applied A's removal. A demoted worker
+        // must keep its record and its completed row (D72).
+        a_record_may_end && shared_evidence_kept && survivors_dropped_a
     };
     receipt.evidence(
         "the_exclusion_holds_and_is_signed_by_d",
@@ -1310,7 +1381,14 @@ async fn scenario(
         // failure persists or while A's row never showed the mislabel
         // the pin names.
         let strict_red = demoted;
-        let mislabel_observed = observed_causes.contains("waiting_for_designated_admin");
+        // The named divergence, and only it: A applied its own demotion,
+        // every watch read returned A's row, and the row showed the
+        // mislabel after the exit (#1757 review). A failed read, an
+        // absent row or a row that stayed on `waiting_for_head_sync` is
+        // not the divergence the pin names.
+        let mislabel_observed = !a_admin_after_exit
+            && watch_reads_clean
+            && observed_causes.contains("waiting_for_designated_admin");
         let (cause, ok, observed) = if !pending_ok {
             (
                 CAUSE_NO_PENDING,
@@ -1390,8 +1468,10 @@ async fn scenario(
                 CAUSE_NO_MARK,
                 !strict_red || mislabel_observed,
                 format!(
-                    "A {exit_kind}; causes A's row showed instead: {observed_causes:?}; mark names \
-                     D: {mark_names_d}; row open at the mark: {row_open_at_mark}"
+                    "A {exit_kind}; causes A's row showed instead: {observed_causes:?}; every \
+                     watch read returned the row: {watch_reads_clean}; A still an admin on its \
+                     own roster: {a_admin_after_exit}; mark names D: {mark_names_d}; row open at \
+                     the mark: {row_open_at_mark}"
                 ),
             )
         };
@@ -1506,4 +1586,79 @@ fn w3h_1581f_red_local_authority_exit_demoted_form() -> Result<()> {
         )
         .await
     })
+}
+
+/// `holders_outcome` keeps the holders wait honest without a daemon
+/// (#1757 review): plain unit tests, so every suite checks the shape.
+mod holders_outcome_tests {
+    use super::*;
+
+    fn holders_queried(reads: usize) -> Observations {
+        Observations {
+            started: reads,
+            completed: reads,
+            failures: Vec::new(),
+        }
+    }
+
+    /// A budget expiry is missing evidence (INFRA), not delivery: every
+    /// read can have succeeded while no holder ever held the record.
+    #[test]
+    fn w3h_1581f_holders_timeout_is_not_delivery() {
+        let waited = Err(anyhow::Error::new(BudgetExceeded {
+            barrier: "the holders hold the revocation".to_string(),
+            budget: EVIDENCE,
+        }));
+        let outcome = holders_outcome(
+            waited,
+            &holders_queried(2),
+            "the holders hold the revocation",
+        );
+        let error = outcome.expect_err("a holders-wait timeout must not read as delivery");
+        assert!(
+            error
+                .to_string()
+                .starts_with("INFRA: the holders hold the revocation"),
+            "the timeout must name its stage INFRA, got: {error}"
+        );
+    }
+
+    /// A failed read is reported before the expiry: the stage names the
+    /// broken read, not only the missing record.
+    #[test]
+    fn w3h_1581f_holders_read_failure_reported_before_timeout() {
+        let waited = Err(anyhow::Error::new(BudgetExceeded {
+            barrier: "the holders hold the revocation".to_string(),
+            budget: EVIDENCE,
+        }));
+        let seen = Observations {
+            started: 2,
+            completed: 2,
+            failures: vec!["D GET /identity/revocations: 500".to_string()],
+        };
+        let outcome = holders_outcome(waited, &seen, "the holders hold the revocation");
+        let error = outcome.expect_err("a failed holder read must not read as delivery");
+        assert!(
+            error.to_string().contains("reads failed"),
+            "the failed read must be named first, got: {error}"
+        );
+    }
+
+    /// The only success shape is a completed wait over successful
+    /// reads; a wait that read nothing still fails through `verify`.
+    #[test]
+    fn w3h_1581f_holders_delivered_only_when_the_wait_completed() {
+        assert!(holders_outcome(
+            Ok(()),
+            &holders_queried(3),
+            "the holders hold the revocation"
+        )
+        .is_ok());
+        assert!(holders_outcome(
+            Ok(()),
+            &Observations::default(),
+            "the holders hold the revocation"
+        )
+        .is_err());
+    }
 }
