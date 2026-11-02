@@ -30769,8 +30769,10 @@ async fn owner_certified_seal_with_eviction(
         // (`mark_bound_machine_anonymous_announces`).
         info.owner_cert_verdict(&evidence)
     };
-    // The members that remain seated once the Failed set is gone: Clean,
-    // InGrace and DigestPending, per the operation's single verdict.
+    // The members that remain seated once the Failed set is gone: Clean ∪
+    // InGrace ∪ DigestPending, per the operation's single verdict. A
+    // digest-pending seat (a digest-only seat, or a held creator, #1023)
+    // is not Clean, so it keeps the restore quarantine set like InGrace.
     let pending_initially = !verdict.in_grace().is_empty() || !verdict.digest_pending().is_empty();
     // Work queue: EXACTLY the operation-verdict's Failed set, evicted one
     // member per sealed transition. The verdict is frozen for this
@@ -30789,12 +30791,12 @@ async fn owner_certified_seal_with_eviction(
                 //
                 // Round-5 quarantine rule (documented): the operation ends
                 // with every remaining member Clean IN THE OPERATION'S
-                // VERDICT iff no member was InGrace OR DigestPending
-                // initially — the Failed set is fully evicted and the rest
-                // were Clean at evaluation. Exactly then the restore
+                // VERDICT iff no member was InGrace or DigestPending
+                // initially (#1023: a held creator is DigestPending) —
+                // the Failed set is fully evicted and the rest were
+                // Clean at evaluation. Exactly then the restore
                 // quarantine lifts, here, explicitly (no clean seal is
-                // minted to do it). Otherwise — a held creator or any other
-                // digest-only seat still pending — it stays set until a
+                // minted to do it). Otherwise it stays set until a
                 // later all-clean seal.
                 if !pending_initially {
                     // ADR-0064 slice 4 r2 (review item 3): the flag AND
@@ -32279,9 +32281,7 @@ async fn seal_owner_certified_unbounded(
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {
         let group_id = info.stable_group_id().to_string();
-        // #1023 finding 8: the verdict above and both hold reads below use
-        // ONE clock — the evidence's stamp. A separate `now_ms` read could
-        // cross a second boundary between them and make them disagree.
+        // The hold is re-checked at the verdict's own evidence time.
         let now_unix = evidence.now_unix();
         let in_grace = verdict.in_grace();
         let digest_pending = verdict.digest_pending();

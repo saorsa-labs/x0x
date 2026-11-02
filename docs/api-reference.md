@@ -1739,10 +1739,10 @@ every wait. A wait always names its cause; it does not stop silently.
 - `phase` — `pending`, `prepared`, `committed_delivery_pending`, `complete`
   or `terminated`. `termination_cause` is `group_deleted`,
   `certificate_valid` or `creator_seat_exempt` for a `terminated` row.
-  `creator_seat_exempt` closes an expiry row that an earlier build opened
-  against the creator. No new creator row can open, because the creator
-  seat never becomes eviction-eligible from its own expired certificate
-  alone.
+  `creator_seat_exempt` ends an expiry row that names the group's creator
+  (#1023). The row was opened by an earlier build; no new creator row can
+  open, because the creator's own expired certificate does not make it
+  eviction-eligible.
 - `waiting.cause` — one of:
   - `waiting_for_designated_admin` — another admin is designated. `detail`
     is `rank` (this node waits for its fallback time, `remaining_ms`) or
