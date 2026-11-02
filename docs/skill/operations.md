@@ -21,17 +21,17 @@ Bootstrap peers: 6 global nodes by default; override with `bootstrap_peers = [..
 curl "http://$API/upgrade" -H "Authorization: Bearer $TOKEN"           # DAEMON surface: GET /upgrade (check)
 curl -X POST "http://$API/upgrade/apply" -H "Authorization: Bearer $TOKEN"   # install
 x0x upgrade --apply                 # authenticated daemon install
-x0x upgrade --check                 # standalone CLI check only (no daemon involved)
+x0x upgrade --check                 # GitHub check; also local /health
 ```
 
 `x0x upgrade --apply` uses authenticated `POST /upgrade/apply`. The selected
 daemon is the only binary writer. Apply fails if no daemon is available.
 
-Bare `x0x upgrade` and `--force` alone do not install. `--check` performs a
-standalone, read-only GitHub check and takes precedence over `--apply`.
-`--check --force` fetches the current manifest regardless of version;
-`--force` cannot bypass daemon apply checks. `x0xd --check-updates` only
-reports; it installs neither binaries nor SKILL.md.
+Bare `x0x upgrade` and `--force` alone do not install. `--check` reads GitHub
+and local `/health` (`--api` or `--name`). It precedes `--apply`. Read-only.
+`--check --force` reports an update only when the release is newer
+than this CLI. `--force` cannot bypass daemon apply checks.
+`x0xd --check-updates` only reports; it installs neither binaries nor SKILL.md.
 
 The daemon REST surface owns installation and restart and is governed by the daemon config. `[update] enabled = false` disables the daemon side (`GET /upgrade` → `{"update_available":false,"reason":"updates disabled"}`). `--skip-update-check` also disables the process's self-update install/restart paths, including `POST /upgrade/apply` (which returns `"self-update disabled for this process"`); both it and `[update] enabled` must allow an apply. Verified-release manifests only. See [docs/upgrade-system.md](https://github.com/saorsa-labs/x0x/blob/main/docs/upgrade-system.md).
 
