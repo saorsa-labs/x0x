@@ -471,3 +471,163 @@ fn unit_metadata_refuses_service_or_unknown_properties_and_redacts_all_variants(
         }
     }
 }
+
+fn service_state_refused(property: &str, bytes: &[u8]) {
+    let error = parse_service_state_property(property, bytes).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), "invalid systemd property reply");
+    assert!(!format!("{error:?}").contains("PRIVATE-STATE"));
+}
+
+#[test]
+fn service_state_keeps_three_distinct_unsigned_pid_reports_including_zero() {
+    for value in [0, 1, 12345, i32::MAX as u32, u32::MAX] {
+        for (property, expected) in [
+            ("MainPID", ServiceStateProperty::MainPid(value)),
+            ("ControlPID", ServiceStateProperty::ControlPid(value)),
+            ("ExecMainPID", ServiceStateProperty::ExecMainPid(value)),
+        ] {
+            let bytes = format!(r#"{{"type":"u","data":{value}}}"#);
+            assert_eq!(parse_service_state_property(property, bytes.as_bytes()).unwrap(), expected);
+            refused(property, bytes.as_bytes());
+            unit_refused(property, bytes.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn service_state_refuses_pid_overflow_signed_float_string_and_wrong_signature() {
+    for property in ["MainPID", "ControlPID", "ExecMainPID"] {
+        for value in ["-1", "4294967296", "18446744073709551616", "1.0", "1e0", "-0", "true", "null", "\"12\"", "[12]", "{\"pid\":12}"] {
+            service_state_refused(property, format!(r#"{{"type":"u","data":{value}}}"#).as_bytes());
+        }
+        for signature in ["t", "i", "s", "b", "au", "v", "U", ""] {
+            service_state_refused(property, &reply(signature, json!(12)));
+        }
+    }
+}
+
+#[test]
+fn service_state_preserves_literal_type_and_pidfile_without_resolution() {
+    for value in ["", "simple", "forking", "oneshot", "notify-reload", "future-type", "/run/private daemon.pid", "../raw", "%i", "$HOME", "名前\t\n", "PRIVATE-STATE"] {
+        for (property, expected) in [
+            ("Type", ServiceStateProperty::Type(value.into())),
+            ("PIDFile", ServiceStateProperty::PidFile(value.into())),
+        ] {
+            assert_eq!(parse_service_state_property(property, &reply("s", json!(value))).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn service_state_keeps_both_boolean_projections_without_implicit_defaults() {
+    for value in [true, false] {
+        for (property, expected) in [
+            ("RemainAfterExit", ServiceStateProperty::RemainAfterExit(value)),
+            ("GuessMainPID", ServiceStateProperty::GuessMainPid(value)),
+        ] {
+            assert_eq!(parse_service_state_property(property, &reply("b", json!(value))).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn service_state_refuses_wrong_text_boolean_shapes_and_nul() {
+    for (property, signature, value) in [
+        ("Type", "s", json!("PRIVATE-STATE")),
+        ("PIDFile", "s", json!("PRIVATE-STATE")),
+        ("RemainAfterExit", "b", json!(true)),
+        ("GuessMainPID", "b", json!(false)),
+    ] {
+        for bad_signature in ["o", "u", "as", "a{sv}", "v", ""] {
+            service_state_refused(property, &reply(bad_signature, value.clone()));
+        }
+        for bad_value in [json!(null), json!(0), json!([value]), json!({"value":value})] {
+            service_state_refused(property, &reply(signature, bad_value));
+        }
+    }
+    for property in ["Type", "PIDFile"] {
+        service_state_refused(property, &reply("s", json!(true)));
+        service_state_refused(property, &reply("s", json!("PRIVATE-STATE\0suffix")));
+    }
+    for property in ["RemainAfterExit", "GuessMainPID"] {
+        service_state_refused(property, &reply("b", json!("true")));
+    }
+}
+
+#[test]
+fn service_state_refuses_duplicate_missing_extra_trailing_or_nonobject_envelopes() {
+    for bytes in [
+        b"".as_slice(), b"[]", b"\xff", b"\0{}", b"\x0b{}",
+        br#"["u",12]"#, br#"{"type":"u"}"#, br#"{"data":12}"#,
+        br#"{"type":"u","type":"u","data":12}"#,
+        br#"{"type":"u","data":12,"data":13}"#,
+        br#"{"type":"u","data":12,"extra":"PRIVATE-STATE"}"#,
+        br#"{"type":"u","data":12}{}"#,
+    ] {
+        service_state_refused("MainPID", bytes);
+    }
+    assert_eq!(parse_service_state_property("MainPID", b" \t{\"data\":0,\"type\":\"u\"}\r\n").unwrap(), ServiceStateProperty::MainPid(0));
+}
+
+#[test]
+fn service_state_bounds_all_wire_types_inclusively() {
+    for (property, signature, value) in [("MainPID", "u", json!(0)), ("Type", "s", json!("")), ("GuessMainPID", "b", json!(false))] {
+        let mut bytes = reply(signature, value);
+        bytes.resize(MAX_BYTES, b' ');
+        assert!(parse_service_state_property(property, &bytes).is_ok());
+        bytes.push(b' ');
+        service_state_refused(property, &bytes);
+    }
+}
+
+#[test]
+fn service_state_entry_point_refuses_other_interfaces_context_and_unknown_names() {
+    for property in ["", "User", "DynamicUser", "LoadState", "ActiveState", "SubState", "ExecStart", "Environment", "MainPid", "Service.MainPID", "PRIVATE-STATE"] {
+        service_state_refused(property, &reply("s", json!("PRIVATE-STATE")));
+    }
+}
+
+#[test]
+fn service_state_debug_redacts_every_variant_even_when_nested() {
+    for (property, signature, value) in [
+        ("MainPID", "u", json!(12345)), ("ControlPID", "u", json!(12345)), ("ExecMainPID", "u", json!(12345)),
+        ("Type", "s", json!("PRIVATE-STATE")), ("PIDFile", "s", json!("PRIVATE-STATE")),
+        ("RemainAfterExit", "b", json!(true)), ("GuessMainPID", "b", json!(false)),
+    ] {
+        let parsed = parse_service_state_property(property, &reply(signature, value)).unwrap();
+        assert_eq!(format!("{parsed:?}"), format!("{property}(<redacted>)"));
+        assert_eq!(format!("{:?}", vec![parsed]), format!("[{property}(<redacted>)]"));
+    }
+}
+
+#[test]
+fn unit_runtime_states_preserve_literal_values_and_stay_on_unit_interface() {
+    for value in ["", "active", "inactive", "failed", "activating", "deactivating", "running", "exited", "dead", "auto-restart", "future-state", "名前\t\n", "PRIVATE-STATE"] {
+        for (property, expected) in [("ActiveState", UnitProperty::ActiveState(value.into())), ("SubState", UnitProperty::SubState(value.into()))] {
+            let bytes = reply("s", json!(value));
+            let parsed = parse_unit_property(property, &bytes).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(format!("{parsed:?}"), format!("{property}(<redacted>)"));
+            refused(property, &bytes);
+            service_state_refused(property, &bytes);
+        }
+    }
+}
+
+#[test]
+fn unit_runtime_states_refuse_invalid_shapes_nul_and_excessive_replies() {
+    for property in ["ActiveState", "SubState"] {
+        for value in [json!(null), json!(false), json!(0), json!(["active"]), json!({"state":"active"}), json!("PRIVATE-STATE\0suffix")] {
+            unit_refused(property, &reply("s", value));
+        }
+        for signature in ["o", "as", "b", "u", "v", ""] {
+            unit_refused(property, &reply(signature, json!("active")));
+        }
+        let mut bytes = reply("s", json!("PRIVATE-STATE"));
+        bytes.resize(MAX_BYTES, b' ');
+        assert!(parse_unit_property(property, &bytes).is_ok());
+        bytes.push(b' ');
+        unit_refused(property, &bytes);
+    }
+}

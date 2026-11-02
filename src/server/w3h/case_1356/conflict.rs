@@ -16,9 +16,10 @@
 //! 3. Partition B (every message to or from B is dropped). B renames
 //!    (r+3′). A renames (r+3); C applies it, and nothing from A, M1 or
 //!    M2 reaches J.
-//! 4. J's messages reach B and C again, on any relay path. B's messages
-//!    to J are delayed by [`B_LATE`] and C's by [`C_LATE`]; transport
-//!    control passes on time. A write that B made while partitioned stays
+//! 4. J's messages reach B and C again, on any relay path, and B's pulls
+//!    of J's messages (IWANT) pass on time. B's messages to J are delayed
+//!    by [`B_LATE`] and C's by [`C_LATE`]; transport control passes on
+//!    time. A write that B made while partitioned stays
 //!    dropped (by message ID), so r+3′ never reaches J. J first gets
 //!    current capability adverts from B and C (they expire after 15 min,
 //!    and only a current one makes a target). J asks B, then C. C's ATA
@@ -30,8 +31,12 @@
 //!    [`AFTER_HEAL`].
 //!
 //! Desired (§2): J's sidecar holds C's ATA as the active one and B's ATA
-//! as the recorded conflict. They diverge after the seal (r+3 against
-//! r+3′), so nothing past the common prefix (r+2) applies: J's state
+//! as the recorded conflict, or (in 1 of 74 CI iterations, when B's answer
+//! from r arrives first) B's as the active one and C's as the conflict.
+//! The delays do not fix the order, and §2 records the second diverging
+//! ATA as the conflict whichever admin signed it, so the row accepts
+//! both. The ATAs diverge after the seal (r+3 against r+3′), so nothing
+//! past the common prefix (r+2) applies: J's state
 //! revision never passes r+2, and J never holds r+3 or r+3′. J shows
 //! `reseat_required {attestation_conflict}` to the end. The ATAs are read
 //! from J's sidecar file with the production decoder.
@@ -86,11 +91,15 @@ struct Nodes {
 }
 
 /// The fabric rule of this row. A gossip frame's origin is the node that
-/// first wrote its message ID, so a relay keeps its origin.
+/// first wrote its message ID, so a relay keeps its origin. An IWANT's
+/// header names the first message it asks for, so an IWANT's origin is
+/// that message's origin, not the node that asks.
 struct Hold {
     phase: Arc<Mutex<Phase>>,
     dropped: Arc<std::sync::atomic::AtomicUsize>,
     replays: Arc<std::sync::atomic::AtomicUsize>,
+    /// B's IWANTs for J's messages that passed in step 4.
+    pulls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Hold {
@@ -105,12 +114,14 @@ impl Hold {
         let phase = Arc::new(Mutex::new(Phase::Open));
         let dropped = Arc::new(AtomicUsize::new(0));
         let replays = Arc::new(AtomicUsize::new(0));
+        let pulls = Arc::new(AtomicUsize::new(0));
         let origins: Mutex<HashMap<[u8; 32], Key>> = Mutex::new(HashMap::new());
         let partitioned: Mutex<HashSet<[u8; 32]>> = Mutex::new(HashSet::new());
-        let (rule_phase, rule_dropped, rule_replays) = (
+        let (rule_phase, rule_dropped, rule_replays, rule_pulls) = (
             Arc::clone(&phase),
             Arc::clone(&dropped),
             Arc::clone(&replays),
+            Arc::clone(&pulls),
         );
         sim.fabric().add_rule(move |write| {
             let header = (write.lane.class == LaneClass::PubSub)
@@ -166,6 +177,21 @@ impl Hold {
                     } else if origin == nodes.j && dst == nodes.b {
                         // J's messages reach B, on any relay path.
                         Fault::Pass
+                    } else if origin == nodes.j
+                        && src == nodes.b
+                        && header.is_some()
+                        && is_iwant(&write.bytes)
+                    {
+                        // B pulls one of J's messages that a peer offered
+                        // it (lazy push), to any peer: an IWANT carries only
+                        // message IDs, and the reply is J's message, which
+                        // passes. Without this, J's request reaches B only
+                        // by an eager push, so a B that J holds lazy never
+                        // gets it, and J backs off past the window (s3 job,
+                        // run 41233639089 attempt 2, iteration 3). An IWANT
+                        // whose first ID is not J's message stays dropped.
+                        rule_pulls.fetch_add(1, Ordering::SeqCst);
+                        Fault::Pass
                     } else if origin == nodes.b && dst == nodes.j {
                         late(write.lane.class, B_LATE)
                     } else if origin == nodes.b && to_j_inbox {
@@ -194,6 +220,7 @@ impl Hold {
             phase,
             dropped,
             replays,
+            pulls,
         })
     }
 
@@ -208,11 +235,21 @@ impl Hold {
     fn counts(&self) -> String {
         use std::sync::atomic::Ordering;
         format!(
-            "dropped {}, replays of partitioned writes dropped {}",
+            "dropped {}, replays of partitioned writes dropped {}, B's pulls of J's messages \
+             passed {}",
             self.dropped.load(Ordering::SeqCst),
-            self.replays.load(Ordering::SeqCst)
+            self.replays.load(Ordering::SeqCst),
+            self.pulls.load(Ordering::SeqCst)
         )
     }
+}
+
+/// A pubsub write (after its stream-type byte) is an IWANT.
+fn is_iwant(bytes: &[u8]) -> bool {
+    bytes
+        .get(1..)
+        .and_then(saorsa_gossip_pubsub::peek_message_kind)
+        == Some(saorsa_gossip_types::MessageKind::IWant)
 }
 
 /// A late message: the message lanes are delayed; transport control
@@ -466,6 +503,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     for admin in ["B", "C"] {
         fresh_advert(sim, "J", admin).await?;
     }
+    // A responder answers only a requester whose current advert it holds,
+    // and sends nothing at all otherwise (§2), so B and C need J's too.
+    for admin in ["B", "C"] {
+        fresh_advert(sim, admin, "J").await?;
+    }
     let hashes = (main.state_hash.as_str(), fork.state_hash.as_str());
     let mut seen = Seen::default();
     seen.watch(
@@ -520,13 +562,21 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let conflict = seen.conflict_at.is_some()
         && seen.left_conflict.is_none()
         && end_text == "reseat_required{attestation_conflict}";
-    // §2: C's ATA is the active one and B's is the recorded conflict; C's
-    // sequence holds r+3 and B's holds r+3′.
+    // §2: J's sidecar holds one ATA as the active one and the other as the
+    // recorded conflict. C's sequence holds r+3 and B's holds r+3′. The
+    // step 4 delays make C's ATA arrive first in most runs, but they do
+    // not fix the order: in 1 of 74 CI iterations (run 41182384539, job
+    // 124482285010) B's answer from r arrived first and armed, and C's
+    // answer from r+1 became the conflict. That run met every other
+    // check. §2 records the second diverging ATA as the conflict whichever
+    // admin signed it, so the check accepts either order.
     let signed = |ata: &Option<Ata>, by: &str, hash: &str| {
         ata.as_ref()
             .is_some_and(|(signer, _, sequence)| signer == by && sequence.iter().any(|h| h == hash))
     };
-    let recorded = signed(&atas.0, "C", &main.state_hash) && signed(&atas.1, "B", &fork.state_hash);
+    let c_active = signed(&atas.0, "C", &main.state_hash) && signed(&atas.1, "B", &fork.state_hash);
+    let b_active = signed(&atas.0, "B", &fork.state_hash) && signed(&atas.1, "C", &main.state_hash);
+    let recorded = c_active || b_active;
     let short_ata = |ata: &Option<Ata>| {
         ata.as_ref().map(|(by, from, sequence)| {
             let hashes: Vec<&str> = sequence.iter().map(|h| short(h)).collect();
@@ -534,11 +584,19 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         })
     };
     receipt.note(format!(
-        "J's sidecar at the conflict: active {:?}, conflict {:?}; r+3 {} r+3' {}",
+        "J's sidecar at the conflict: active {:?}, conflict {:?}; r+3 {} r+3' {}; active \
+         signer {}",
         short_ata(&atas.0),
         short_ata(&atas.1),
         short(&main.state_hash),
-        short(&fork.state_hash)
+        short(&fork.state_hash),
+        if b_active {
+            "B"
+        } else if c_active {
+            "C"
+        } else {
+            "neither"
+        }
     ));
     receipt.note(format!(
         "J at the conflict {}; J at the end {}; J states {:?}; J max revision {}; J held r+3 \

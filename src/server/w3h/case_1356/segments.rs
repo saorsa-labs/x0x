@@ -15,7 +15,22 @@
 //! - **66 links** (65 renames). The join-carry ATA ends at r+64, and the
 //!   link after it is a rename, not the terminal. The exhausted segment
 //!   admits nothing: J shows `awaiting_attestation {segment_exhausted}` at
-//!   r+64 only. J then converges.
+//!   r+64 only, and asks A again from r+64. J then converges. J asks at
+//!   once from its new head (#1726), so the answer can arrive before the
+//!   case reads the exhausted state; A's answer from r+64 then shows that
+//!   the segment ended there.
+//!
+//! **One responder interval between runs.** A, the one admin, answers J
+//! at most once per `RESPONDER_PER_REQUESTER_INTERVAL` (§11), and that
+//! limit is per requester, across groups. The three runs share A and J
+//! and take about 6–30 virtual seconds together. When J asks A in the
+//! 65-link run, A refused J's r+64 request in the 66-link run with
+//! `rate_limited` (s3 job, run 41233639089 attempt 1, iteration 17/20).
+//! The refusal replaced `segment_exhausted` before a poll read it, and J
+//! took the rest from its join-result poll, not from an answer. So the
+//! 66-link run starts only after A's interval for J's requests in the
+//! 65-link run has passed. The 64-link run sends A no request, so the
+//! case waits one interval (plus a margin) before the 66-link run only.
 //!
 //! In each run, any ATA that A sends J in answer starts at r+64, and J
 //! never holds a marker. The case does not count the join-carry entries
@@ -47,6 +62,7 @@ use super::gaps::{recovery_route, recovery_text, s0, seal_j};
 use super::*;
 use crate::groups::recovery::{
     decode_message, AttestAnswer, GroupRecoveryMessageV1, ATA_MAX_LINKS,
+    RESPONDER_PER_REQUESTER_INTERVAL,
 };
 
 const LABELS: &[&str] = &["A", "M1", "M2", "J"];
@@ -101,10 +117,37 @@ impl Run {
         self.states.iter().any(|state| state == EXHAUSTED)
     }
 
+    /// The join-carry segment ended at r+64: J showed `segment_exhausted`,
+    /// or A answered J's request from r+64. J asks again from a new head
+    /// at once (#1726), so A's answer can arrive inside one poll and the
+    /// case never reads the exhausted state. In iteration 10/20 of s3 job
+    /// 124525597881 the 66-link run had states null, catching_up, null and
+    /// one answer (71, 2) from r+64. The answer is the stronger evidence:
+    /// J asks from r+64 only because the segment admits nothing past it.
+    fn segment_ended(&self) -> bool {
+        let end = self.base + ATA_MAX_LINKS as u64;
+        self.exhausted() || self.answered.iter().any(|(from, _)| *from == end)
+    }
+
     /// J started at r and converged with no marker.
     fn converged_from_r(&self) -> bool {
         self.head_at_seal == self.base && self.caught_up && self.marked.is_none()
     }
+}
+
+/// Waits out A's per-requester interval for any request J sent in the run
+/// before. J stops asking once it catches up, which ends that run; the
+/// margin covers a request still in flight to A then.
+async fn after_responder_interval(sim: &Sim) -> Result<()> {
+    let wait = RESPONDER_PER_REQUESTER_INTERVAL + Duration::from_secs(5);
+    sim.within(
+        "A's per-requester interval for J passes",
+        wait + Duration::from_secs(2),
+        async {
+            tokio::time::sleep(wait).await;
+        },
+    )
+    .await
 }
 
 /// Drops every gossip write to J on `group`'s metadata topic.
@@ -244,7 +287,11 @@ fn segment_boundary(run: &Run) -> bool {
 async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let run64 = gap_run(sim, ATA_MAX_LINKS - 1).await?;
     receipt.setup_done(at(sim));
+    // The 64-link run sends no request: its join carry holds all 64 links,
+    // so no segment is exhausted (and `one_segment` fails on any answer).
+    // The 65-link run may ask A from r+64.
     let run65 = gap_run(sim, ATA_MAX_LINKS).await?;
+    after_responder_interval(sim).await?;
     let run66 = gap_run(sim, ATA_MAX_LINKS + 1).await?;
     let runs = [&run64, &run65, &run66];
     receipt.evidence(
@@ -267,7 +314,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     );
     let ok64 = one_segment(&run64);
     let ok65 = segment_boundary(&run65);
-    let ok66 = segment_boundary(&run66) && run66.exhausted();
+    let ok66 = segment_boundary(&run66) && run66.segment_ended();
     for (name, ok, run) in [
         ("gap_64_one_join_carry_ata_and_no_request", ok64, &run64),
         ("gap_65_join_carry_ata_of_64_then_one_link", ok65, &run65),
@@ -332,6 +379,12 @@ fn w3h_1356_s64_segment_shapes() {
     };
     assert!(one_segment(&run));
     assert!(segment_boundary(&run), "64 + the terminal");
+    assert!(!run.segment_ended(), "no exhausted state and no answer");
+    run.answered = vec![(69, 2)];
+    assert!(run.segment_ended(), "an answer from r+64 ends the segment");
+    run.answered = vec![(70, 1)];
+    assert!(!run.segment_ended(), "an answer not from r+64");
+    run.answered.clear();
     run.head_at_seal = 6;
     assert!(!one_segment(&run), "J did not start at r");
     assert!(!segment_boundary(&run), "J did not start at r");

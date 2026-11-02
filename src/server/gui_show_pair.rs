@@ -142,13 +142,13 @@ async fn remote_show_opens_on_the_other_owner_daemon() {
     // Owner trust reads that certificate. Both daemons announce it the same
     // way `POST /announce` does.
     //
-    // `announced_at` has one-second precision and a merge accepts an equal
-    // value. A startup announcement built before consent has no certificate.
-    // If it arrives after the disclosure of the same second, it removes the
-    // cached certificate and the show is refused. Consent is recorded when
-    // the first disclosure returns, so every later announcement carries the
-    // certificate. The second disclosure is in a later second, so every
-    // announcement without the certificate is older and is ignored.
+    // #1643: consent is recorded only after the disclosure publishes, and
+    // a same-second anonymous beat no longer drops a cached certificate on
+    // the peer, so one disclosure per daemon is enough — a beat built
+    // before consent landed is the same-second case the merge rule itself
+    // now covers. The second disclosure in a later second stays as pure
+    // belt-and-braces and exercises the strictly-fresher identity announce
+    // peers see from the 3 s re-announce.
     for state in [&state_a, &state_b] {
         state
             .agent

@@ -1,7 +1,7 @@
-//! Supplied systemd v255 context and Unit properties for dormant inventory.
+//! Supplied systemd v255 context, service state and Unit inventory properties.
 //!
 //! Decode one `busctl --json=short get-property` reply. Separate entry points
-//! accept Service context properties and Unit metadata. The collector
+//! accept Service context, Service state and Unit metadata. The collector
 //! must bind it to its manager, unit, interface and property. These values do
 //! not establish effective accounts, roots, environment or launch authority.
 //! Empty strings, special working-directory spellings and unresolved paths
@@ -9,8 +9,12 @@
 //! not proof of which setting was explicitly configured. Unit state and source
 //! paths do not prove that on-disk files match loaded configuration, that a
 //! unit is persistent, or that all launch authorities have been found. Unknown
-//! state spellings remain evidence; no state implies approval. No I/O or caller.
-//! Unit signatures: systemd v255 `src/core/dbus-unit.c` Unit vtable.
+//! state spellings remain evidence; no state implies approval. PIDs, including
+//! zero, are raw manager reports, not process identities or a complete process
+//! list. ExecMainPID can describe a past execution; PIDFile is a path report,
+//! not a file read. Separate property replies are not an atomic snapshot.
+//! No I/O or caller. Signatures: systemd v255 `src/core/dbus-unit.c`,
+//! `dbus-service.c` and `dbus-execute.h` vtables.
 #![cfg(unix)]
 #![allow(dead_code)]
 
@@ -65,6 +69,8 @@ pub(crate) enum UnitProperty {
     UnitFileState(String),
     Transient(bool),
     NeedDaemonReload(bool),
+    ActiveState(String),
+    SubState(String),
 }
 
 impl fmt::Debug for UnitProperty {
@@ -77,6 +83,34 @@ impl fmt::Debug for UnitProperty {
             Self::UnitFileState(_) => "UnitFileState(<redacted>)",
             Self::Transient(_) => "Transient(<redacted>)",
             Self::NeedDaemonReload(_) => "NeedDaemonReload(<redacted>)",
+            Self::ActiveState(_) => "ActiveState(<redacted>)",
+            Self::SubState(_) => "SubState(<redacted>)",
+        })
+    }
+}
+
+/// Raw `org.freedesktop.systemd1.Service` reports; no PID is inferred from another.
+#[derive(PartialEq, Eq)]
+pub(crate) enum ServiceStateProperty {
+    MainPid(u32),
+    ControlPid(u32),
+    ExecMainPid(u32),
+    Type(String),
+    PidFile(String),
+    RemainAfterExit(bool),
+    GuessMainPid(bool),
+}
+
+impl fmt::Debug for ServiceStateProperty {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::MainPid(_) => "MainPID(<redacted>)",
+            Self::ControlPid(_) => "ControlPID(<redacted>)",
+            Self::ExecMainPid(_) => "ExecMainPID(<redacted>)",
+            Self::Type(_) => "Type(<redacted>)",
+            Self::PidFile(_) => "PIDFile(<redacted>)",
+            Self::RemainAfterExit(_) => "RemainAfterExit(<redacted>)",
+            Self::GuessMainPid(_) => "GuessMainPID(<redacted>)",
         })
     }
 }
@@ -119,6 +153,27 @@ pub(crate) fn parse_unit_property(property: &str, bytes: &[u8]) -> io::Result<Un
         "UnitFileState" => UnitProperty::UnitFileState(text(bytes)?),
         "Transient" => UnitProperty::Transient(decode(bytes, "b")?),
         "NeedDaemonReload" => UnitProperty::NeedDaemonReload(decode(bytes, "b")?),
+        "ActiveState" => UnitProperty::ActiveState(text(bytes)?),
+        "SubState" => UnitProperty::SubState(text(bytes)?),
+        _ => return Err(refusal()),
+    })
+}
+
+/// The caller must bind these bytes to a Service-interface property read and
+/// independently bind any reported PID to a process incarnation before use.
+pub(crate) fn parse_service_state_property(
+    property: &str,
+    bytes: &[u8],
+) -> io::Result<ServiceStateProperty> {
+    check_reply(bytes)?;
+    Ok(match property {
+        "MainPID" => ServiceStateProperty::MainPid(decode(bytes, "u")?),
+        "ControlPID" => ServiceStateProperty::ControlPid(decode(bytes, "u")?),
+        "ExecMainPID" => ServiceStateProperty::ExecMainPid(decode(bytes, "u")?),
+        "Type" => ServiceStateProperty::Type(text(bytes)?),
+        "PIDFile" => ServiceStateProperty::PidFile(text(bytes)?),
+        "RemainAfterExit" => ServiceStateProperty::RemainAfterExit(decode(bytes, "b")?),
+        "GuessMainPID" => ServiceStateProperty::GuessMainPid(decode(bytes, "b")?),
         _ => return Err(refusal()),
     })
 }

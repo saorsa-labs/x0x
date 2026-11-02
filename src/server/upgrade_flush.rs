@@ -167,6 +167,9 @@ impl FlushOwner {
                     // Do not log or wait for another shutdown notification after
                     // the acknowledged log barrier. The frozen owner retains
                     // restart/reap/start authority; this only ends this process.
+                    // A transactional arm without an established restart-capable
+                    // owner is refused at admission and never reaches this
+                    // exit (#1670).
                     (control_exit)(code);
                 }
                 // Only after the reply is written does the failed flush end
@@ -336,9 +339,16 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
             .restart
             .supervised_exit_code
             .unwrap_or_else(crate::upgrade::restart::supervised_exit_code),
-        // Stop cleanly for the existing external handoff owner. This path
-        // neither requests a supervisor restart nor starts a helper/candidate.
-        journal::RestartOwner::TransactionalHandoff => 0,
+        // The participant stops cleanly only for an established external
+        // handoff owner that can reap it and start the candidate. No owner
+        // can be established yet (#1670), so refuse before the shutdown;
+        // the daemon keeps serving. This path neither requests a supervisor
+        // restart nor starts a helper/candidate.
+        journal::RestartOwner::TransactionalHandoff => {
+            crate::upgrade::restart::transactional_flush_owner(&participant.restart)
+                .map_err(|reason| io::Error::new(io::ErrorKind::Unsupported, reason))?;
+            0
+        }
         journal::RestartOwner::LauncherChild => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
