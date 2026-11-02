@@ -43,6 +43,53 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+/// Remove the files that the generator writes under `root`: the variant
+/// directories and `manifest.json`. Other files, such as `PROVENANCE.md`,
+/// stay.
+async fn clear_generated(root: &Path) -> anyhow::Result<()> {
+    let ignore_missing = |r: std::io::Result<()>| match r {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    for (name, _) in VARIANTS {
+        ignore_missing(tokio::fs::remove_dir_all(root.join(name)).await)?;
+    }
+    ignore_missing(tokio::fs::remove_file(root.join("manifest.json")).await)?;
+    Ok(())
+}
+
+/// The `sha256  ./path` lines of the `PROVENANCE.md` hash block.
+fn provenance_hashes(text: &str) -> std::collections::BTreeMap<String, String> {
+    let block = text
+        .split("## File hashes (sha256)")
+        .nth(1)
+        .and_then(|rest| rest.split("```").nth(1))
+        .unwrap_or_default();
+    block
+        .lines()
+        .filter_map(|line| line.split_once("  "))
+        .map(|(hash, path)| (path.trim_start_matches("./").to_string(), hash.to_string()))
+        .collect()
+}
+
+/// Every file under `dir`, relative to `base`, with its sha256.
+fn file_hashes(
+    base: &Path,
+    dir: &Path,
+    out: &mut std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            file_hashes(base, &path, out)?;
+        } else {
+            let rel = path.strip_prefix(base)?.to_string_lossy().into_owned();
+            out.insert(rel, sha256_hex(&std::fs::read(&path)?));
+        }
+    }
+    Ok(())
+}
+
 /// A daemon-shaped state on `dir`: keys under `identity/` (the gate's
 /// `identity_dir`), an owner-issued agent certificate, and the user key
 /// only for an owner install.
@@ -71,7 +118,8 @@ async fn variant_state(
     super::super::tests::secure_endpoint_test_state_at(dir, agent).await
 }
 
-/// Generate the fixture. Run by hand, then update `PROVENANCE.md`:
+/// Generate the fixture. It keeps `PROVENANCE.md`. Run by hand, then
+/// update the hashes in `PROVENANCE.md`:
 /// `cargo nextest run --all-features --lib --run-ignored only -E
 /// 'test(generate_h_s3_home_fixture)'`. ML-DSA signatures and timestamps
 /// differ on each run; the layout and the placeholder form do not.
@@ -115,7 +163,7 @@ async fn generate_h_s3_home_fixture() -> anyhow::Result<()> {
 
     let stable = info.stable_group_id().to_string();
     let root = fixture_root();
-    let _ = tokio::fs::remove_dir_all(&root).await;
+    clear_generated(&root).await?;
     let mut manifest = serde_json::Map::new();
     for ((name, owner_install), state) in VARIANTS.into_iter().zip(&states) {
         state
@@ -247,6 +295,45 @@ async fn h_s3_home_fixture_loads() -> anyhow::Result<()> {
             entry["home_json_sha256"].as_str(),
             "{name}"
         );
+    }
+    Ok(())
+}
+
+/// `PROVENANCE.md` is present, and its hash block lists every other file
+/// of the fixture with its current sha256. A regenerated fixture with a
+/// stale or lost `PROVENANCE.md` fails here.
+#[test]
+fn h_s3_home_provenance_matches_files() -> anyhow::Result<()> {
+    let root = fixture_root();
+    let listed = provenance_hashes(&std::fs::read_to_string(root.join("PROVENANCE.md"))?);
+    let mut actual = std::collections::BTreeMap::new();
+    file_hashes(&root, &root, &mut actual)?;
+    actual.remove("PROVENANCE.md");
+    assert!(!listed.is_empty());
+    assert_eq!(listed, actual);
+    Ok(())
+}
+
+/// The generator's clear step removes only generated files: the variant
+/// directories and `manifest.json`. `PROVENANCE.md` stays.
+#[tokio::test]
+async fn clear_generated_keeps_provenance() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let root = root.path();
+    for (name, _) in VARIANTS {
+        tokio::fs::create_dir_all(root.join(name).join("identity")).await?;
+        tokio::fs::write(root.join(name).join("named_groups.json"), b"{}").await?;
+    }
+    tokio::fs::write(root.join("manifest.json"), b"{}").await?;
+    tokio::fs::write(root.join("PROVENANCE.md"), b"notes").await?;
+
+    clear_generated(root).await?;
+    clear_generated(root).await?;
+
+    assert_eq!(tokio::fs::read(root.join("PROVENANCE.md")).await?, b"notes");
+    assert!(!root.join("manifest.json").exists());
+    for (name, _) in VARIANTS {
+        assert!(!root.join(name).exists(), "{name}");
     }
     Ok(())
 }
