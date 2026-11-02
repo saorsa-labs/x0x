@@ -45,7 +45,10 @@
 use super::control::create_group;
 use super::receipt::{Receipt, Verdict};
 use super::*;
-use crate::groups::eviction::{decode_evs, quarantine_pending_name, EVS_FILE_NAME};
+use crate::groups::eviction::{
+    decode_evs, parse_quarantine_pending_name, quarantine_hash_hex, quarantine_pending_name,
+    EVS_FILE_NAME,
+};
 use anyhow::{bail, Context as _};
 use std::path::{Path, PathBuf};
 
@@ -81,10 +84,54 @@ const LABELS: &[&str] = &["A"];
 const EVS_DAMAGE: &[(&str, &[u8])] = &[
     ("missing_prefix", b"X0XEVICU1\0damaged"),
     ("truncated_header_9_bytes", b"X0XEVICT1"),
-    ("version_byte_zero", b"X0XEVICT\0\0damaged"),
+    ("version_byte_zero", b"X0XEVICT0\0damaged"),
     ("version_byte_non_digit", b"X0XEVICT?\0damaged"),
     ("missing_nul", b"X0XEVICT1Xdamaged"),
 ];
+
+/// The history names in `history` that are not in `before`.
+fn new_names<'a>(history: &'a [String], before: &[String]) -> Vec<&'a String> {
+    history
+        .iter()
+        .filter(|name| !before.contains(name))
+        .collect()
+}
+
+/// Whether every name in `fresh` is a §5a history copy of `bytes` under its
+/// own name: `<family>.q-<txid>-<h>` with `h` over the bytes saved in that
+/// file and the saved bytes equal to `bytes`. With `txids`, the parsed txids
+/// are exactly `txids`, each once.
+fn history_named(
+    dir: &Path,
+    family: &str,
+    fresh: &[&String],
+    bytes: &[u8],
+    txids: Option<&[String]>,
+) -> bool {
+    let mut seen = Vec::with_capacity(fresh.len());
+    for name in fresh {
+        let Some((txid, h)) = parse_quarantine_pending_name(family, &format!("{name}.pending"))
+        else {
+            return false;
+        };
+        let Ok(saved) = std::fs::read(dir.join(name.as_str())) else {
+            return false;
+        };
+        if saved != bytes || h != quarantine_hash_hex(&saved) {
+            return false;
+        }
+        seen.push(hex::encode(txid));
+    }
+    match txids {
+        Some(txids) => {
+            let mut want = txids.to_vec();
+            want.sort();
+            seen.sort();
+            seen == want
+        }
+        None => true,
+    }
+}
 
 /// The quarantine history and pending names of one file family in `dir`.
 fn quarantine_names(dir: &Path, family: &str) -> (Vec<String>, Vec<String>) {
@@ -238,24 +285,29 @@ async fn damage_cycle(
     )
     .await?;
     let (history, pending) = quarantine_names(&dir, EVS_FILE);
-    let preserved = history
-        .iter()
-        .filter_map(|name| std::fs::read(dir.join(name)).ok())
-        .filter(|kept| kept.as_slice() == bytes)
-        .count();
     let (replaced, replaced_detail) = replacement_check(&dir, &rebuilt_from);
+    let new_history = new_names(&history, &history_before);
+    let named = history_named(
+        &dir,
+        EVS_FILE,
+        &new_history,
+        bytes,
+        Some(rebuilt_from.as_slice()),
+    );
     let ok = state == "rebuilt"
         && rebuilt_from.len() == 1
         && pending.is_empty()
+        && new_history.len() == 1
         && history.len() == history_before.len() + 1
-        && preserved == 1
+        && named
         && replaced;
     if !ok {
         receipt.cause(
             CAUSE_NOT_QUARANTINED,
             Some(format!(
                 "{form}: state={state} detail={detail:?} rebuilt_from={rebuilt_from:?} \
-                 history={} pending={} preserved={preserved} replacement: {replaced_detail}",
+                 history={} pending={} new_history={new_history:?} named={named} \
+                 replacement: {replaced_detail}",
                 history.len(),
                 pending.len(),
             )),
@@ -364,13 +416,25 @@ async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str) -> Result<()
     let (j_history, j_pending) = quarantine_names(&treekem, JOURNAL_FILE);
     let gone = !journal.exists();
     let evs_absent = !dir.join(EVS_FILE).exists();
-    let ok = gone && j_pending.is_empty() && j_history.len() == 1 && evs_absent && state == "ok";
+    // The history copy holds the planted 7 bytes under a well-formed §5a
+    // name whose hash is over those bytes. The txid is random and published
+    // nowhere (a journal fault writes no replacement), so only its form is
+    // checked.
+    let j_fresh: Vec<&String> = j_history.iter().collect();
+    let named = history_named(&treekem, JOURNAL_FILE, &j_fresh, b"X0XEVJ1", None);
+    let ok = gone
+        && j_pending.is_empty()
+        && j_history.len() == 1
+        && named
+        && evs_absent
+        && state == "ok";
     if !ok {
         receipt.cause(
             CAUSE_NOT_QUARANTINED,
             Some(format!(
-                "journal damage: gone={gone} history={} pending={} evs_absent={evs_absent} \
-                 state={state} detail={detail:?} rebuilt_from={rebuilt_from:?}",
+                "journal damage: gone={gone} history={} pending={} named={named} \
+                 evs_absent={evs_absent} state={state} detail={detail:?} \
+                 rebuilt_from={rebuilt_from:?}",
                 j_history.len(),
                 j_pending.len(),
             )),
@@ -453,19 +517,23 @@ async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str) -> Result<()
     )
     .await?;
     let (history, pendings) = quarantine_names(&dir, EVS_FILE);
-    let preserved = history
-        .iter()
-        .filter_map(|name| std::fs::read(dir.join(name)).ok())
-        .filter(|kept| kept.as_slice() == damaged)
-        .count();
     let (replaced, replaced_detail) = replacement_check(&dir, &rebuilt_from);
     let newer_kept = std::fs::read(&journal).unwrap_or_default() == JOURNAL_NEWER;
+    let new_history = new_names(&history, &history_before);
+    let named = history_named(
+        &dir,
+        EVS_FILE,
+        &new_history,
+        damaged,
+        Some(rebuilt_from.as_slice()),
+    );
     let ok = state == "rebuilt"
         && rebuilt_from.len() == 2
         && rebuilt_from.contains(&hex::encode([0x15; 16]))
         && pendings.is_empty()
+        && new_history.len() == 2
         && history.len() == history_before.len() + 2
-        && preserved == 2
+        && named
         && replaced
         && newer_kept;
     if !ok {
@@ -473,7 +541,8 @@ async fn red_arm(sim: &mut Sim, receipt: &mut Receipt, group: &str) -> Result<()
             CAUSE_RESUME_LOST,
             Some(format!(
                 "resume beside damage: state={state} rebuilt_from={rebuilt_from:?} history={} \
-                 pending={} preserved={preserved} newer_journal_kept={newer_kept} \
+                 pending={} new_history={new_history:?} named={named} \
+                 newer_journal_kept={newer_kept} \
                  replacement: {replaced_detail}",
                 history.len(),
                 pendings.len(),
