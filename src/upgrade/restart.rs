@@ -3958,7 +3958,11 @@ mod tests {
 
     #[test]
     fn restart_diagnostics_windows_argument_refusal_redacts_both_vectors() {
-        let script = windows_wrapper_script("1", "C:\\Tools\\x0xd.exe", "'--token=wrapper-secret'");
+        let script = windows_wrapper_script(
+            &WINDOWS_WRAPPER_TESTED_VERSION.to_string(),
+            "C:\\Tools\\x0xd.exe",
+            "'--token=wrapper-secret'",
+        );
         let mut argv = vec![
             "C:\\Tools\\x0xd.exe".into(),
             "--token=process-secret".into(),
@@ -3983,7 +3987,11 @@ mod tests {
 
     #[test]
     fn restart_diagnostics_windows_executable_refusal_redacts_argv_zero() {
-        let script = windows_wrapper_script("1", "C:\\wrapper-secret\\x0xd.exe", "");
+        let script = windows_wrapper_script(
+            &WINDOWS_WRAPPER_TESTED_VERSION.to_string(),
+            "C:\\wrapper-secret\\x0xd.exe",
+            "",
+        );
         let argv = vec!["C:\\process-secret\\x0xd.exe".into()];
         let WindowsWrapperReadback::NotGuaranteed { detail } =
             readback_windows_wrapper_script(&script, &argv)
