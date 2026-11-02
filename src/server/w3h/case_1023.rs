@@ -192,12 +192,18 @@
 //!   the wait fail-closed. GREEN on `main` and GREEN under a correct S5
 //!   (pending throughout). The receipt names the first terminal refusal.
 //!
-//! #1023 note (31 Oct 2026): with certificate carry on the HEAD retained
-//! link, "A holds none of the missing bytes" now also requires that A's
-//! own head link carries none (A never sealed over a byte-bearing roster
-//! in the red shape). The RED cause stays `OwnerCertMemberPending` while
-//! that holds. The carry itself is with David under ADR 0088 G6; if it
-//! moves into S5, this case lands with it.
+//! #1023 note (updated 2 Nov 2026 for the carry of Engineer ruling 2 Nov
+//! 14:27 GMT): certificate bytes ride the newest
+//! `RETAINED_CERT_CARRY_LINKS` retained links (terminal included), so "A
+//! holds none of the missing bytes" now also requires that A's own
+//! retained window carries none — A never sealed over a byte-bearing
+//! roster and never adopted a byte-bearing link in the red shape, and the
+//! seal-time commit-log fallback reads exactly that window. The RED cause
+//! stays `OwnerCertMemberPending` while that holds. David ruled on 1 Nov
+//! 09:37 GMT that the carry lands now, before S5; the rows and control
+//! arms are unchanged — the drop that makes A's state digest-only keeps
+//! every byte-carrying frame toward A and J away, whichever link would
+//! carry it.
 //!
 //! All four tests are declared `#[ignore]` (#1559, ADR 0025 §3–4): their
 //! observation is a verdict under seeded entropy and the virtual wall
@@ -503,10 +509,12 @@ async fn admin_everywhere(sim: &Sim, gid: &str, member: &str, observers: &[&str]
 }
 
 /// Whether `label` is an eligible holder of each digest: an active member
-/// of G that holds bytes for it, on the matching seat or in its
-/// durable announce cache. The result lists the digests it holds. A node
-/// with no entry for G is an error: every node that the case reads this
-/// way joined G during the setup.
+/// of G that holds bytes for it, on the matching seat, in its durable
+/// announce cache, or on a retained-commit snapshot inside the newest
+/// `RETAINED_CERT_CARRY_LINKS` links (the #1023 carry window, which the
+/// seal-time commit-log fallback reads). The result lists the digests it
+/// holds. A node with no entry for G is an error: every node that the case
+/// reads this way joined G during the setup.
 async fn held_digests(
     sim: &Sim,
     label: &str,
@@ -520,10 +528,14 @@ async fn held_digests(
     let what = format!("read {label}'s certificate bytes");
     let label = label.to_string();
     sim.at_instant(&what, async move {
-        let (active, on_seats) = {
+        let (active, on_seats, in_log) = {
             let groups = state.named_groups.read().await;
             let (_, info) = crate::server::resolve_group_entry_locked(&groups, &gid)
                 .with_context(|| format!("{label} has no entry for G"))?;
+            let carry_from = info
+                .commit_log
+                .len()
+                .saturating_sub(crate::groups::state_commit::RETAINED_CERT_CARRY_LINKS);
             (
                 info.has_active_member(&local),
                 info.members_v2
@@ -534,6 +546,17 @@ async fn held_digests(
                         crate::groups::owner_cert::certificate_digest_hex(cert)
                             .eq_ignore_ascii_case(digest)
                             .then(|| digest.to_ascii_lowercase())
+                    })
+                    .collect::<Vec<_>>(),
+                // #1023: the retained carry window is a holder too — the
+                // seal re-hydrates digest-only seats from it with every
+                // holder offline.
+                info.commit_log[carry_from..]
+                    .iter()
+                    .flat_map(|link| link.roster.values())
+                    .filter_map(|snapshot| {
+                        let cert = snapshot.certificate.as_ref()?;
+                        Some(crate::groups::owner_cert::certificate_digest_hex(cert))
                     })
                     .collect::<Vec<_>>(),
             )
@@ -550,7 +573,13 @@ async fn held_digests(
                 .find_by_cert_digest(&bytes)
                 .await
                 .is_some();
-            if cached || on_seats.contains(&digest.to_ascii_lowercase()) {
+            let lower = digest.to_ascii_lowercase();
+            if cached
+                || on_seats.contains(&lower)
+                || in_log
+                    .iter()
+                    .any(|carried| carried.eq_ignore_ascii_case(&lower))
+            {
                 held.push(digest);
             }
         }

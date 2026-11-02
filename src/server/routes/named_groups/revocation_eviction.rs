@@ -1974,8 +1974,16 @@ fn derive_triggers(
                 ));
             }
             // §1a: expiry of the committed certificate of an Active seat in
-            // an OwnerCertified group, on this node's own clock + τ.
-            if member.state == GroupMemberState::Active && owner_certified(info) {
+            // an OwnerCertified group, on this node's own clock + τ. The
+            // CREATOR seat is exempt (Engineer ruling 1 Nov 2026 02:36
+            // GMT): it must never become eviction-eligible from its own
+            // expired certificate alone, and the matching hold in
+            // `GroupInfo::owner_cert_verdict` keeps it out of every seal's
+            // eviction set, so no expiry row may target it either.
+            if member.state == GroupMemberState::Active
+                && owner_certified(info)
+                && member.agent_id != hex::encode(info.creator.as_bytes())
+            {
                 if let Some((digest, not_after)) = selected_certificate_expiry(member) {
                     if s4::own_expiry_trigger_due(not_after, now_unix) {
                         out.push((
@@ -2160,6 +2168,15 @@ fn reconcile_completion(
                     .get(&key)
                     .map(|row| row.expiry_only().then(|| row.expired_certificates.clone()));
                 if let Some(Some(expired)) = row_digests {
+                    // #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): the
+                    // creator seat never opens expiry work (the §1a guard
+                    // in `derive_triggers` and the hand-off filter above).
+                    // A row persisted by an earlier build that names the
+                    // creator ends here — the exemption is permanent.
+                    if target_hex == hex::encode(info.creator.as_bytes()) {
+                        changed |= store.terminate(&key, TerminationCause::CreatorSeatExempt);
+                        continue;
+                    }
                     let now_unix = now_unix_ms / 1000;
                     let renewed = selected_certificate_expiry(member).map_or(
                         member.certificate.is_some(),
@@ -3287,7 +3304,13 @@ fn expiry_handoff_triggers(
                     .get(&hex::encode(key.target))
                     .map(|member| (info, member))
             })
-            .filter(|(_, member)| member.state == GroupMemberState::Active)
+            // Engineer ruling 1 Nov 2026 02:36 GMT: the creator seat never
+            // opens expiry work (see `derive_triggers` §1a) — a hand-off
+            // naming it is dropped, like one whose seat changed.
+            .filter(|(info, member)| {
+                member.state == GroupMemberState::Active
+                    && member.agent_id != hex::encode(info.creator.as_bytes())
+            })
         else {
             return false;
         };
@@ -6124,6 +6147,100 @@ pub(super) mod tests {
             other.is_empty(),
             "a hand-off for another certificate is dropped"
         );
+    }
+
+    /// #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): the creator seat
+    /// never opens expiry work from its own expired certificate — not by
+    /// its own trigger, not by a kept hand-off, and a row persisted by an
+    /// earlier build ends at the reconcile pass. RED without the §1a
+    /// guard: the creator's own expired committed certificate derived a
+    /// `CertificateExpiry` trigger for the creator seat, while an ordinary
+    /// member's still does.
+    #[test]
+    fn the_expiry_trigger_skips_the_creator_seat() {
+        let now = now_unix_ms() / 1000;
+        let owner = x0x::identity::UserKeypair::generate().expect("owner");
+        let creator_kp = x0x::identity::AgentKeypair::generate().expect("creator");
+        let creator = *creator_kp.agent_id().as_bytes();
+        let expired = x0x::identity::AgentCertificate::issue_with_expiry(
+            &owner,
+            &creator_kp,
+            Some(now - 3_600),
+        )
+        .expect("expired creator cert");
+        let mut info = group_with(creator, [2; 32]);
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        info.set_member_certificate(&hex::encode(creator), expired.clone())
+            .expect("the creator's seat binds its certificate");
+        // An ordinary member with an equally expired certificate.
+        let member_kp = x0x::identity::AgentKeypair::generate().expect("member");
+        let member = *member_kp.agent_id().as_bytes();
+        let member_expired = x0x::identity::AgentCertificate::issue_with_expiry(
+            &owner,
+            &member_kp,
+            Some(now - 3_600),
+        )
+        .expect("expired member cert");
+        info.add_member(hex::encode(member), GroupRole::Member, None, None);
+        info.set_member_certificate(&hex::encode(member), member_expired)
+            .expect("the member's seat binds its certificate");
+        let stable = info.stable_group_id().to_string();
+        let groups = vec![("k".to_string(), info)];
+        let leaves = RetainedLeaves::default();
+        let triggers = derive_triggers(&groups, &leaves, &[], now);
+        assert!(
+            triggers.iter().all(|(key, _, _)| key.target != creator),
+            "no expiry row may target the creator seat"
+        );
+        assert!(
+            triggers.iter().any(|(key, trigger, _)| key.target == member
+                && matches!(trigger, EvictionTrigger::CertificateExpiry { .. })),
+            "an ordinary member's expired certificate still opens the work"
+        );
+
+        // A kept hand-off naming the creator is dropped, not converted
+        // into a trigger.
+        let digest = x0x::groups::owner_cert::certificate_digest_hex(&expired);
+        let key = EvictionKey::new(stable.clone(), creator);
+        let mut kept = BTreeMap::from([(
+            key.clone(),
+            ExpiryHandoff {
+                certificate_digest: digest.clone(),
+                received_unix_ms: now * 1000,
+            },
+        )]);
+        assert!(expiry_handoff_triggers(&mut kept, &groups, now * 1000).is_empty());
+        assert!(
+            kept.is_empty(),
+            "a hand-off naming the creator seat is dropped"
+        );
+
+        // A row persisted by an earlier build that names the creator ends
+        // at the reconcile pass, like a renewed row ends.
+        let mut inner = S4Inner::default();
+        inner.store.intake(
+            &key,
+            EvictionTrigger::CertificateExpiry {
+                certificate_digest: digest,
+                not_after: now - 3_600,
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        reconcile_and_retain(
+            &mut inner,
+            &groups,
+            &leaves,
+            &BTreeSet::new(),
+            now * 1000,
+            false,
+            true,
+        );
+        let row = inner.store.get(&key).expect("the ended row is kept");
+        assert_eq!(row.phase, Phase::Terminated);
+        assert_eq!(row.termination, Some(TerminationCause::CreatorSeatExempt));
     }
 
     /// ADR 0110 §1a hand-off evidence (#1508 review P2 #5): a verified

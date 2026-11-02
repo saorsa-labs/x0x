@@ -1817,9 +1817,18 @@ async fn creator_offline_scenario_on_plane(
                 "the production builder really trimmed the large group's sidecar"
             );
         }
-        if legacy_sidecar {
-            roster_certificates_b64.clear();
-        }
+    }
+    if legacy_sidecar {
+        // A 0.45-era publisher omits the sidecar altogether — for every
+        // group shape, including a one-seat roster.
+        let NamedGroupMetadataEvent::MemberAdded {
+            roster_certificates_b64,
+            ..
+        } = &mut seat_event
+        else {
+            panic!("seat event")
+        };
+        roster_certificates_b64.clear();
     }
     let gapless_join_result_base = || JoinResultMessage::Result {
         event: Box::new(seat_event.clone()),
@@ -1940,10 +1949,17 @@ async fn creator_offline_scenario_on_plane(
                 )
             })
             .collect();
-        assert!(
-            !missing.is_empty(),
-            "trimmed seats remain digest-only until fetched"
-        );
+        // The trimmed-sidecar R19 shape assumes a byte-free retained
+        // history: with `legacy_chain` the trimmed seats stay digest-only
+        // until fetched. A post-#1023 stub log is byte-bearing, so its
+        // own retained link legitimately hydrates them at apply (the
+        // commit-log fallback) — that shape has nothing missing.
+        if legacy_chain {
+            assert!(
+                !missing.is_empty(),
+                "trimmed seats remain digest-only until fetched"
+            );
+        }
         for (_, digest) in &missing {
             assert!(
                 admin
@@ -2103,9 +2119,17 @@ async fn promoted_admin_seals_new_joiner(
 /// seat digest-only and every seal refused with
 /// `OwnerCertMemberPending [creator]` for as long as the creator was
 /// offline: the 20 refusals in the R19 Singapore log.
+///
+/// Claude review (2 Nov 2026, finding 5): the stub's retained history is
+/// the pre-#1023 wire form (`legacy_chain`), so the seal-time commit-log
+/// fallback has nothing to read — the seat event is the ONLY carrier. The
+/// counterfactual leg (same shape, sidecar stripped from the event) keeps
+/// refusing, which is what makes the positive leg's seal depend on the
+/// seat event carrying the certificate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn promoted_admin_seals_join_while_creator_offline() -> Result<()> {
-    let s = creator_offline_scenario(Promotion::LocalRecord).await?;
+    let s = creator_offline_scenario_on_plane(Promotion::LocalRecord, false, 0, false, true, false)
+        .await?;
     let commit = promoted_admin_seals_new_joiner(&s, &[])
         .await
         .unwrap_or_else(|err| {
@@ -2115,7 +2139,10 @@ async fn promoted_admin_seals_join_while_creator_offline() -> Result<()> {
 
     // The creator's bytes reached the admin through the seat event: they
     // are on its seat, they are not in its announce cache, and the event
-    // carried exactly the creator's certificate.
+    // carried exactly the creator's certificate. The stub's retained
+    // history started byte-free (`legacy_chain`), so the only way the
+    // creator's seat holds bytes is the sidecar install at apply — the
+    // counterfactual below is what proves it.
     assert!(seat_has_bytes(&s.admin, &s.group_id, &s.creator_hex).await);
     assert!(s
         .admin
@@ -2137,6 +2164,23 @@ async fn promoted_admin_seals_join_while_creator_offline() -> Result<()> {
         "the seat event carries every other certified seat (here the creator), not the joiner's own"
     );
     s.admin.agent.shutdown().await;
+
+    // The counterfactual: the same shape with the seat event's sidecar
+    // stripped cannot seal — the stub's log is byte-free, so the seat
+    // event was the only carrier.
+    let bare =
+        creator_offline_scenario_on_plane(Promotion::LocalRecord, false, 0, true, true, false)
+            .await?;
+    let err = promoted_admin_seals_new_joiner(&bare, &[])
+        .await
+        .expect_err("without the seat event's sidecar the certificate never arrives");
+    match &err {
+        x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { members, .. } => {
+            assert_eq!(members, &vec![bare.creator_hex.clone()], "{err}");
+        }
+        other => panic!("expected OwnerCertMemberPending, got {other}"),
+    }
+    bare.admin.agent.shutdown().await;
     Ok(())
 }
 
@@ -2149,7 +2193,9 @@ async fn promoted_admin_seals_join_while_creator_offline() -> Result<()> {
 /// carries no certificates, so the creator's seat stays digest-only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_promoted_by_signed_commit_seals_join_while_creator_offline() -> Result<()> {
-    let s = creator_offline_scenario(Promotion::SignedCommit).await?;
+    let s =
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 0, false, true, false)
+            .await?;
     let commit = promoted_admin_seals_new_joiner(&s, &[])
         .await
         .unwrap_or_else(|err| {
@@ -2257,9 +2303,8 @@ async fn member_added_certificate_sidecar_is_wire_compatible() -> Result<()> {
 /// Runtime execution belongs to isolated Linux CI, never the macOS host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn treekem_home_promoted_admin_seals_while_creator_offline() -> Result<()> {
-    let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, true, 0, false, false, false)
-            .await?;
+    let s = creator_offline_scenario_on_plane(Promotion::SignedCommit, true, 0, false, true, false)
+        .await?;
     assert!(
         s.admin
             .treekem_groups
@@ -2653,24 +2698,48 @@ async fn old_format_chain_without_snapshot_bytes_stays_pending() -> Result<()> {
     Ok(())
 }
 
-/// #1023 (Engineer rulings 31 Oct 2026 20:40 + 23:44 GMT): the served
-/// JoinResult — chain with byte-bearing links AND the certificate sidecar
-/// — must stay under the direct-message budget, so certificate carry
-/// never pushes a joiner onto the blob path.
+/// #1023 (Engineer rulings 31 Oct 2026 20:40 + 23:44 GMT; carry widened 2
+/// Nov 14:27 GMT): a REAL byte-bearing gap join — the served chain built
+/// through the production `intervening_chain_from`, byte-bearing under the
+/// carry window — must stay under the direct-message budget, so
+/// certificate carry never pushes a joiner onto the blob path. Claude
+/// review (2 Nov 2026, finding 6): the previous form served an already
+/// digest-only chain (vacuous); this one proves the bytes were there
+/// before the bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn join_result_with_chain_bytes_stays_under_the_dm_budget() -> Result<()> {
-    // A multi-seat group's gap join (joiner at revision 0 crossing to the
-    // terminal): the served chain's byte-bearing snapshots alone would
-    // push the result over the budget; with them stripped the whole
-    // payload fits, so certificate carry never sends this joiner to the
-    // blob path.
+async fn join_result_bounds_a_byte_bearing_gap_chain_to_the_dm_budget() -> Result<()> {
+    // A five-seat group's gap join (joiner at revision 0 crossing to the
+    // terminal): the base link carries every seat's certificate — more
+    // than the whole budget on its own — so the builder must strip the
+    // chain's bytes for the payload to fit.
     let s =
-        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 2, false, true, false)
+        creator_offline_scenario_on_plane(Promotion::SignedCommit, false, 4, false, false, false)
             .await?;
     assert!(
         !s.gap_join_result.is_empty(),
         "the production builder produced the gap join result"
     );
+    // The chain really started byte-bearing (not the vacuous form): the
+    // stub's own retained rev-1 link is the same link the creator served
+    // (the stub is the sealed base), and with every seat's certificate it
+    // is over the budget on its own.
+    {
+        let groups = s.admin.named_groups.read().await;
+        let info = groups.get(&s.group_id).expect("admin's group");
+        let raw_bytes = serde_json::to_vec(&info.commit_log)?;
+        let carrying = info
+            .commit_log
+            .iter()
+            .flat_map(|link| link.roster.values())
+            .filter(|snapshot| snapshot.certificate.is_some())
+            .count();
+        assert!(
+            raw_bytes.len() > x0x::dm::MAX_PAYLOAD_BYTES && carrying >= 5,
+            "the byte-bearing chain ({} B, {carrying} byte-bearing seats) starts over the {} B budget",
+            raw_bytes.len(),
+            x0x::dm::MAX_PAYLOAD_BYTES
+        );
+    }
     assert!(
         s.gap_join_result.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
         "gap join result is {} B, over the {} B budget",
@@ -2843,6 +2912,386 @@ async fn seal_time_hydrate_falls_back_to_the_head_link() -> Result<()> {
         .await
         .unwrap_or_else(|err| panic!("the seal must re-hydrate from the head link: {err}"));
     assert!(!commit.roster_root.is_empty());
+    s.admin.agent.shutdown().await;
+    Ok(())
+}
+
+/// The kept-chain scenario's deliverables: the R19 cast plus the wire
+/// forms the joiner holds.
+struct KeptChainScenario {
+    scenario: CreatorOfflineScenario,
+    /// The creator's agent id (the actor of every event the joiner
+    /// replays).
+    creator_id: crate::identity::AgentId,
+    /// The creator's signed role-update commit for the admin.
+    role_event: NamedGroupMetadataEvent,
+}
+
+/// #1023 (Engineer ruling 2 Nov 2026 14:27 GMT): the KEPT-CHAIN shape, on
+/// the real path. A joiner two revisions behind receives the production
+/// JoinResult — the terminal is its own add, the served chain is the
+/// intervening link — cannot apply the terminal yet (the pre-Welcome
+/// joiner of ADR 0109 §2), and keeps exactly what the wire carried through
+/// `keep_served_chain`. The served link must still hold its certificate
+/// bytes, which is what a carry window of one never delivered
+/// (`intervening_chain_from` serves links strictly before the terminal).
+///
+/// Revisions: 1 = the base (creator seat byte-bearing), 2 = X's production
+/// add (its verified certificate seated), 3 = the admin-to-be's add (the
+/// terminal), 4 = the promotion (sealed AFTER the payload is built, so the
+/// carry window at serve time still covers the served link).
+async fn creator_offline_kept_chain_scenario() -> Result<KeptChainScenario> {
+    let seed: [u8; 32] = rand::random();
+    let owner = x0x::identity::UserKeypair::from_seed(&seed)?;
+    let (creator, _creator_dir, creator_cert) = owner_device_state(&seed).await?;
+    let (admin, admin_dir, admin_cert) = owner_device_state(&seed).await?;
+    let creator_hex = hex::encode(creator.agent.agent_id().as_bytes());
+    let admin_hex = hex::encode(admin.agent.agent_id().as_bytes());
+    let group_id = hex::encode(rand::random::<[u8; 32]>());
+
+    // (1) The base revision: the creator's owner-certified group, creator
+    // seat byte-bearing.
+    let mut base = x0x::groups::GroupInfo::with_policy(
+        "r1023-kept".to_string(),
+        String::new(),
+        creator.agent.agent_id(),
+        group_id.clone(),
+        x0x::groups::GroupPolicy {
+            discoverability: x0x::groups::GroupDiscoverability::Hidden,
+            admission: x0x::groups::GroupAdmission::OwnerCertified(owner.user_id()),
+            confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
+            read_access: x0x::groups::GroupReadAccess::MembersOnly,
+            write_access: x0x::groups::GroupWriteAccess::MembersOnly,
+        },
+    );
+    base.set_member_certificate(&creator_hex, creator_cert.clone())
+        .expect("the creator's certificate binds its own seat");
+    seal_commit_owner_certified(
+        &creator,
+        &mut base,
+        creator.agent.identity().agent_keypair(),
+        now_millis_u64(),
+    )
+    .await?;
+    let base_rev1 = base.clone();
+    creator
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), base);
+
+    // (2) Revision 2: a non-membership commit (a production rename). The
+    // served link below carries EXACTLY the creator's certificate: a link
+    // that also carries a second certified seat (a member added in the
+    // gap) crosses the direct-message budget next to the 26.7 KB
+    // MemberAdded event, and the builder strips it — pinned by
+    // `join_result_bounds_a_byte_bearing_gap_chain_to_the_dm_budget`.
+    // That shape keeps the #946 fetch path.
+    let response = update_named_group(
+        State(Arc::clone(&creator)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(UpdateGroupRequest {
+            name: None,
+            description: Some("renamed while the joiner was behind".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the creator renames");
+
+    // (3) Revision 3: the admin-to-be's add — the terminal of its
+    // JoinResult. The published seat event is captured.
+    install_discovery_cert(&creator, &admin.agent, &admin_cert).await;
+    creator
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .clear();
+    let response = add_named_group_member(
+        State(Arc::clone(&creator)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(AddNamedGroupMemberRequest {
+            agent_id: admin_hex.clone(),
+            display_name: None,
+            treekem_key_package_b64: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the creator admits");
+    let seat_event = creator
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .iter()
+        .filter_map(|(_topic, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .find(|event| {
+            matches!(event, NamedGroupMetadataEvent::MemberAdded { agent_id, .. }
+                if *agent_id == admin_hex)
+        })
+        .expect("the creator published the admin's seat event");
+
+    // (4) The JoinResult exactly as the wire serves it, built BEFORE the
+    // promotion: the terminal event plus the served chain from the
+    // joiner's revision 1, through the production chain chooser and the
+    // production payload builder.
+    let (terminal_revision, chain) = {
+        let groups = creator.named_groups.read().await;
+        let info = groups.get(&group_id).expect("creator's group");
+        (
+            info.state_revision,
+            intervening_chain_from(info, 1, info.state_revision),
+        )
+    };
+    assert_eq!(
+        terminal_revision, 3,
+        "rev 1 base, rev 2 the rename, rev 3 the admin's add"
+    );
+    assert_eq!(chain.len(), 1, "one intervening link for the gap");
+    let response = JoinResultMessage::Result {
+        event: Box::new(seat_event.clone()),
+        chain,
+        head_attestation: None,
+        roster_certificates_b64: Vec::new(),
+        intervening_events: Vec::new(),
+        admin_attestation: None,
+    };
+    let payload =
+        join_result_payload_with_roster_certificates(&creator, &group_id, &admin_hex, response)
+            .await?;
+
+    // (5) Revision 4: the promotion, sealed after the payload so the
+    // carry window at serve time still covered the served link.
+    let response = update_member_role(
+        State(Arc::clone(&creator)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((group_id.clone(), admin_hex.clone())),
+        Json(UpdateMemberRoleRequest {
+            role: "admin".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the creator promotes");
+    let role_event = creator
+        .named_group_test_recorders
+        .publish_bytes
+        .lock()
+        .expect("publish hook")
+        .iter()
+        .filter_map(|(_topic, bytes)| serde_json::from_slice::<NamedGroupMetadataEvent>(bytes).ok())
+        .find(|event| {
+            matches!(event, NamedGroupMetadataEvent::MemberRoleUpdated {
+                agent_id,
+                role: x0x::groups::GroupRole::Admin,
+                commit: Some(_),
+                ..
+            } if *agent_id == admin_hex)
+        })
+        .expect("the creator published a signed role-update commit");
+
+    // (6) The joiner's stub: revision 1, digest-only, NO retained history
+    // (a real joiner stub carries no commit log), no announce cache, and
+    // it never receives the result-level sidecar: it is the pre-Welcome
+    // joiner that cannot apply the terminal.
+    let mut stub = base_rev1;
+    for seat in stub.members_v2.values_mut() {
+        seat.certificate = None;
+    }
+    stub.commit_log.clear();
+    admin
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), stub);
+
+    // (7) The creator goes offline before the joiner processes anything.
+    let creator_id = creator.agent.agent_id();
+    creator.agent.shutdown().await;
+    drop(creator);
+
+    Ok(KeptChainScenario {
+        scenario: CreatorOfflineScenario {
+            creator_hex,
+            creator_cert,
+            admin,
+            _admin_dir: admin_dir,
+            group_id,
+            owner,
+            seat_event,
+            served_join_result: payload.clone(),
+            gap_join_result: payload,
+        },
+        creator_id,
+        role_event,
+    })
+}
+
+/// #1023 (Engineer ruling 2 Nov 2026 14:27 GMT): the real path — the
+/// production JoinResult → `keep_served_chain` (ADR 0109 §2: the
+/// pre-Welcome joiner keeps the served chain and refused terminal in the
+/// S3 sidecar) → `apply_link_state_only` (the kept-chain fold) → the kept
+/// terminal replays through the ordinary apply path. The served link
+/// arrives byte-bearing (this is RED on the old carry window of one:
+/// there, the link below the terminal had already aged to digest-only),
+/// the fold seats the bytes digest-anchored, and the promoted admin seals
+/// a new joiner with the creator offline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kept_chain_from_a_production_join_result_seats_bytes_and_seals_offline() -> Result<()> {
+    let k = creator_offline_kept_chain_scenario().await?;
+    let s = &k.scenario;
+
+    // The JoinResult exactly as the wire serves it: its event copy is
+    // sidecar-free (the builder moves certificates to the result level,
+    // which this refused joiner never consumes) and its chain link
+    // carries the byte-bearing snapshots.
+    let JoinResultMessage::Result {
+        event: wire_event,
+        chain,
+        ..
+    } = serde_json::from_slice::<JoinResultMessage>(&s.gap_join_result)?
+    else {
+        panic!("served payload is a Result");
+    };
+    let NamedGroupMetadataEvent::MemberAdded {
+        roster_certificates_b64: event_sidecar,
+        ..
+    } = wire_event.as_ref()
+    else {
+        panic!("the terminal is a MemberAdded");
+    };
+    assert!(
+        event_sidecar.is_empty(),
+        "the wire event copy carries no sidecar"
+    );
+    assert_eq!(chain.len(), 1, "one served link");
+    assert!(
+        chain[0]
+            .roster
+            .get(&s.creator_hex)
+            .and_then(|snapshot| snapshot.certificate.as_ref())
+            .is_some(),
+        "the served link carries the creator's certificate bytes"
+    );
+    assert!(
+        s.gap_join_result.len() <= x0x::dm::MAX_PAYLOAD_BYTES,
+        "the byte-bearing result is {} B, over the {} B budget",
+        s.gap_join_result.len(),
+        x0x::dm::MAX_PAYLOAD_BYTES
+    );
+    let terminal_commit = match wire_event.as_ref() {
+        NamedGroupMetadataEvent::MemberAdded { commit, .. } => {
+            commit.clone().expect("the terminal carries its commit")
+        }
+        _ => unreachable!("checked above"),
+    };
+
+    // `keep_served_chain`: the pre-Welcome joiner keeps the walk-valid
+    // served chain and refused terminal in the S3 sidecar.
+    let stub = {
+        let groups = s.admin.named_groups.read().await;
+        groups.get(&s.group_id).cloned().expect("the joiner's stub")
+    };
+    group_recovery::keep_served_chain(
+        &s.admin,
+        &stub,
+        &terminal_commit,
+        &chain,
+        wire_event.as_ref(),
+    )
+    .await;
+    let stable = stub.stable_group_id();
+    let sidecar_path = s
+        .admin
+        .data_dir
+        .join(x0x::groups::recovery::GROUP_RECOVERY_DIR)
+        .join(x0x::groups::recovery::sidecar_file_name(stable));
+    let sidecar_bytes =
+        std::fs::read(&sidecar_path).expect("keep_served_chain wrote the sidecar durably");
+    let sidecar =
+        x0x::groups::recovery::decode_sidecar(&sidecar_bytes).expect("the sidecar decodes");
+    let kept: Vec<x0x::groups::state_commit::RetainedCommit> = sidecar
+        .served_chain
+        .iter()
+        .map(|bytes| serde_json::from_slice(bytes).expect("the kept link decodes"))
+        .collect();
+    assert_eq!(kept.len(), 1, "the sidecar kept the served chain");
+    assert!(
+        kept[0]
+            .roster
+            .get(&s.creator_hex)
+            .and_then(|snapshot| snapshot.certificate.as_ref())
+            .is_some(),
+        "the KEPT link carries the creator's certificate bytes"
+    );
+
+    // The kept-chain fold (what `apply_kept_chain` runs per link once an
+    // attestation arms): state-only adoption through the production
+    // recovery apply.
+    {
+        let mut groups = s.admin.named_groups.write().await;
+        let info = groups.get_mut(&s.group_id).expect("stub");
+        let mut current = info.clone();
+        for link in &kept {
+            current = x0x::groups::recovery::apply_link_state_only(&current, link)
+                .expect("the kept link adopts");
+        }
+        *info = current;
+    }
+    // The kept terminal replays through the ordinary apply path, then the
+    // promotion's signed commit applies gaplessly on the adopted head.
+    let applied = apply_named_group_metadata_event(
+        &s.admin,
+        wire_event.as_ref().clone(),
+        k.creator_id,
+        true,
+        None,
+    )
+    .await;
+    assert!(applied.accepted, "the kept terminal replays");
+    group_recovery::retire_converged(&s.admin, &s.group_id).await;
+    let role_applied =
+        apply_named_group_metadata_event(&s.admin, k.role_event.clone(), k.creator_id, true, None)
+            .await;
+    assert!(
+        role_applied.accepted,
+        "the admin applies the creator's signed role-update commit"
+    );
+
+    // THE SEAL: with the creator offline and no sidecar, announce or
+    // JoinResult-level delivery ever reaching the joiner, the chain it
+    // kept is what seats the certificates.
+    let commit = promoted_admin_seals_new_joiner(s, &[])
+        .await
+        .unwrap_or_else(|err| {
+            panic!("the promoted admin must seal from the kept chain while every holder is offline: {err}")
+        });
+    assert!(!commit.roster_root.is_empty());
+    assert!(seat_has_bytes(&s.admin, &s.group_id, &s.creator_hex).await);
+    let seated = {
+        let groups = s.admin.named_groups.read().await;
+        groups
+            .get(&s.group_id)
+            .and_then(|info| info.committed_certificate(&s.creator_hex).cloned())
+    };
+    assert_eq!(
+        seated.as_ref(),
+        Some(&s.creator_cert),
+        "the seated bytes are exactly the creator's certificate"
+    );
+    assert!(
+        s.admin
+            .agent
+            .announce_blob_cache
+            .find_by_cert_digest(&digest_arr(&seat_digest(&s.creator_cert)))
+            .await
+            .is_none(),
+        "the bytes arrived with the chain, not the announce path"
+    );
     s.admin.agent.shutdown().await;
     Ok(())
 }

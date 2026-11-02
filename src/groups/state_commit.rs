@@ -184,13 +184,19 @@ impl PartialEq for RosterMemberSnapshot {
 }
 
 /// #1023: how many NEWEST retained commits keep their snapshot
-/// certificate bytes — the HEAD LINK ONLY (Engineer ruling 31 Oct 2026
-/// 23:52 GMT); older links age to digest-only when a new commit is
-/// retained. A node that adopted or
-/// hydrated while a link still carried bytes keeps what it SEATED, so
-/// nothing seated is lost — the bound only stops the persisted and served
-/// log from copying every seat's certificate into every commit forever.
-pub const RETAINED_CERT_CARRY_LINKS: usize = 1;
+/// certificate bytes — the TERMINAL LINK PLUS ONE (Engineer ruling 2 Nov
+/// 2026 14:27 GMT, over the 31 Oct 23:52 head-link-only form): the chain a
+/// JoinResult serves holds only links STRICTLY BEFORE the terminal
+/// revision (`intervening_chain_from`), so with a one-link window those
+/// links are always digest-only and no production path delivers the bytes
+/// to a gap joiner. Two links keep the newest SERVED link byte-bearing
+/// while the terminal link still covers catch-up and
+/// `GET /groups/:id/state/commits` readers; older links age to digest-only
+/// when a new commit is retained. A node that adopted or hydrated while a
+/// link still carried bytes keeps what it SEATED, so nothing seated is
+/// lost — the bound only stops the persisted and served log from copying
+/// every seat's certificate into every commit forever.
+pub const RETAINED_CERT_CARRY_LINKS: usize = 2;
 
 /// #1023: serde codec for the snapshot `certificate` field — one base64
 /// string of the bincode form (the exact bytes the committed digest
@@ -227,7 +233,11 @@ mod certificate_b64 {
         };
         // Cap the STRING before any decode work: a certificate is under
         // 8 KiB of bincode, so anything near the base64 of 64 KiB is not
-        // one.
+        // one. The check necessarily runs after serde has built the
+        // String (a `with` codec sees the field after deserialization);
+        // on every wire path the 48 KiB direct-message budget already
+        // bounds what can arrive, and the persisted store is local, so
+        // the late check is a depth bound, not a DoS surface.
         if encoded.len() > 90_000 {
             return Err(serde::de::Error::custom(
                 "snapshot certificate string exceeds the carry limit",
@@ -305,9 +315,12 @@ pub fn roster_root_of_projection(projection: &BTreeMap<String, RosterMemberSnaps
 }
 
 /// #1023: the projection with certificate BYTES stripped. The certificate
-/// carrier is the retained-commit chain (state commits, the roster snapshot
-/// served at join, JoinResult) — an invite LINK is not, and its DM budget
-/// is size-bound by design (#469 A1: "no certificate BYTES"), so the v4
+/// carrier is the retained-commit chain — the newest
+/// [`RETAINED_CERT_CARRY_LINKS`] links a node serves through state commits,
+/// catch-up, `GET /groups/:id/state/commits` and a JoinResult's served
+/// chain (the builder strips the bytes only past the direct-message
+/// budget). An invite LINK is not a carrier, and its DM budget is
+/// size-bound by design (#469 A1: "no certificate BYTES"), so the v4
 /// invite base roster embeds this form. The committed digests — and so the
 /// root the invite recomputes — are identical either way.
 #[must_use]
@@ -2508,11 +2521,17 @@ mod tests {
             "the legacy form re-derives the same signed root"
         );
 
-        // A byte-bearing snapshot round-trips through the new field.
+        // A byte-bearing snapshot round-trips through the new field. The
+        // manual PartialEq ignores the carriage bytes, so the round trip
+        // pins them explicitly (Claude review 2 Nov 2026, finding 7).
         let round_trip: BTreeMap<String, RosterMemberSnapshot> =
             serde_json::from_value(serde_json::to_value(&with_bytes).expect("encodes"))
                 .expect("the byte-bearing payload decodes");
         assert_eq!(round_trip, with_bytes);
+        assert_eq!(
+            round_trip[&agent_hex].certificate, with_bytes[&agent_hex].certificate,
+            "equality ignores the carriage bytes, so compare them directly"
+        );
         assert_eq!(roster_root_of_projection(&round_trip), root_with_bytes);
     }
 
@@ -2558,6 +2577,26 @@ mod tests {
         assert!(
             serde_json::from_value::<RosterMemberSnapshot>(oversized).is_err(),
             "an oversized certificate string fails closed before decoding"
+        );
+        // Claude review (2 Nov 2026, finding 8): valid base64 that is not
+        // valid bincode fails closed too.
+        let mut not_bincode = serde_json::to_value(&with_bytes[&agent_hex]).expect("encodes");
+        not_bincode["certificate"] = serde_json::json!("AAAAAAAA");
+        assert!(
+            serde_json::from_value::<RosterMemberSnapshot>(not_bincode).is_err(),
+            "valid base64 that is not a certificate fails closed"
+        );
+        // A string UNDER the 90,000-character cap that decodes to more
+        // than the 64 KiB bincode limit: the string cap alone does not
+        // bound the decode, the limit does.
+        use base64::Engine as _;
+        let big: Vec<u8> = vec![0u8; 65_536];
+        let mut under_cap = serde_json::to_value(&with_bytes[&agent_hex]).expect("encodes");
+        under_cap["certificate"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(big));
+        assert!(
+            serde_json::from_value::<RosterMemberSnapshot>(under_cap).is_err(),
+            "a payload under the string cap but over the bincode limit fails closed"
         );
     }
 

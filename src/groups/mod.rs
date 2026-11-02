@@ -1653,6 +1653,10 @@ impl GroupInfo {
             };
         };
         let home_scope = self.is_home_scope();
+        // Engineer ruling 1 Nov 2026 02:36 GMT: the CREATOR seat never
+        // becomes eviction-eligible from its own expired certificate
+        // alone. `creator_hex` feeds that hold below.
+        let creator_hex = hex::encode(self.creator.as_bytes());
         let now = evidence.now_unix();
         let now_ms = now_millis();
         let grace_ms = owner_cert::OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS * 1_000;
@@ -1766,6 +1770,22 @@ impl GroupInfo {
                     .and_then(|cert| check(cert).err())
                     .or_else(|| embedded.as_ref().and_then(|cert| check(cert).err()))
                     .unwrap_or(owner_cert::OwnerCertFailure::NoCertificate);
+                // Engineer ruling 1 Nov 2026 02:36 GMT: the creator seat
+                // never becomes eviction-eligible from its own EXPIRED
+                // certificate alone. An expired committed certificate on
+                // the creator holds like a digest-only seat — `DigestPending`
+                // is never in `OwnerCertVerdict::failed()`, so no eviction
+                // path can target the creator seat while its renewal is
+                // outstanding, and every operation that needs valid creator
+                // bytes still fails closed (`is_all_clean` stays false).
+                // Any other failure (revocation is checked above; wrong
+                // owner or agent, a bad signature) stays `Failed`.
+                if agent_hex == creator_hex
+                    && matches!(reason, owner_cert::OwnerCertFailure::Expired)
+                {
+                    per_member.insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
+                    continue;
+                }
                 per_member.insert(agent_hex, owner_cert::MemberCertStatus::Failed { reason });
                 continue;
             }
@@ -2049,10 +2069,12 @@ impl GroupInfo {
 
     /// #1023: strip snapshot certificate bytes from every retained link
     /// older than [`state_commit::RETAINED_CERT_CARRY_LINKS`] (Engineer
-    /// rulings 31 Oct 2026 20:40 + 23:52 GMT: certificate bytes ride the
-    /// HEAD LINK ONLY, so persisted growth stays small and fixed). A node
-    /// that adopted or hydrated while a link carried bytes keeps what it
-    /// seated. Every commit-log append site calls this.
+    /// rulings 31 Oct 2026 20:40 + 2 Nov 14:27 GMT: certificate bytes ride
+    /// the TERMINAL LINK PLUS ONE, so the chain a JoinResult serves still
+    /// holds bytes on its newest link while persisted growth stays small
+    /// and fixed). A node that adopted or hydrated while a link carried
+    /// bytes keeps what it seated. Every commit-log append site calls
+    /// this.
     pub fn age_certificate_carry(&mut self) {
         let carry_from = self
             .commit_log
@@ -3807,6 +3829,156 @@ mod tests {
     }
 
     #[test]
+    fn creator_seat_expired_certificate_never_becomes_eviction_eligible() {
+        // WHY (#1023, Engineer ruling 1 Nov 2026 02:36 GMT): with bytes
+        // arriving by chain, an expired committed certificate on the
+        // CREATOR seat would move it DigestPending → Failed(Expired) —
+        // eviction-eligible, so the ladder could remove the group's founder
+        // from its own expired certificate alone. The guard holds the
+        // creator seat at DigestPending: never in `failed()`, so no
+        // eviction path targets it, and never clean, so every operation
+        // needing valid creator bytes still fails closed until a renewal
+        // lands. An ordinary member's expired certificate stays Failed —
+        // still the eviction set — and a creator certificate failing for
+        // any other reason stays Failed too.
+        //
+        // Claude review (2 Nov 2026, finding 8): the expired bytes ARRIVE
+        // BY CHAIN — a byte-bearing projection folds through
+        // `apply_reconstructed_roster`, which installs them digest-anchored
+        // without an expiry check (the install is evidence-matching, the
+        // verdict is the check), and the verdict then really checks them.
+        let (user, creator_kp, _cert) = certified_fixture();
+        let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
+        let expired_creator =
+            crate::identity::AgentCertificate::issue_with_expiry(&user, &creator_kp, Some(1))
+                .expect("expired creator cert");
+        let member_kp = crate::identity::AgentKeypair::generate().unwrap();
+        let member_hex = hex::encode(member_kp.agent_id().as_bytes());
+        let expired_member =
+            crate::identity::AgentCertificate::issue_with_expiry(&user, &member_kp, Some(1))
+                .expect("expired member cert");
+
+        // The chain-carried projection: both seats byte-bearing with
+        // expired certificates.
+        let mut source = GroupInfo::new(
+            "S".into(),
+            String::new(),
+            creator_kp.agent_id(),
+            "aabb".repeat(8),
+        );
+        source
+            .set_member_certificate(&creator_hex, expired_creator.clone())
+            .expect("the source seat binds its certificate");
+        source.add_member(member_hex.clone(), GroupRole::Member, None, None);
+        source
+            .set_member_certificate(&member_hex, expired_member.clone())
+            .expect("the source seat binds its certificate");
+        let projection = state_commit::roster_projection(&source.members_v2);
+        assert!(
+            projection
+                .get(&creator_hex)
+                .and_then(|snap| snap.certificate.as_ref())
+                .is_some_and(|cert| *cert == expired_creator)
+                && projection
+                    .get(&member_hex)
+                    .and_then(|snap| snap.certificate.as_ref())
+                    .is_some_and(|cert| *cert == expired_member),
+            "the carried snapshots hold the expired bytes"
+        );
+
+        let mut policy = GroupPolicyPreset::PublicRequestSecure.to_policy();
+        policy.admission = GroupAdmission::OwnerCertified(user.user_id());
+        let mut info = GroupInfo::with_policy(
+            "T".into(),
+            String::new(),
+            creator_kp.agent_id(),
+            "aabb".repeat(8),
+            policy.clone(),
+        );
+        // Digest-only local seats (the adopter's shape before the fold).
+        info.members_v2
+            .get_mut(&creator_hex)
+            .unwrap()
+            .certificate_digest = Some(owner_cert::certificate_digest_hex(&expired_creator));
+        info.add_member(member_hex.clone(), GroupRole::Member, None, None);
+        info.members_v2
+            .get_mut(&member_hex)
+            .unwrap()
+            .certificate_digest = Some(owner_cert::certificate_digest_hex(&expired_member));
+        info.apply_reconstructed_roster(&projection);
+        assert!(
+            info.members_v2[&creator_hex].certificate.is_some()
+                && info.members_v2[&member_hex].certificate.is_some(),
+            "the chain-carried expired bytes install digest-anchored"
+        );
+
+        let evidence = owner_cert::OwnerCertEvidence::new(10_000_000);
+        let verdict = info.owner_cert_verdict(&evidence);
+        assert_eq!(
+            verdict.per_member.get(&creator_hex),
+            Some(&owner_cert::MemberCertStatus::DigestPending),
+            "the creator's own expired certificate holds the seat pending"
+        );
+        assert!(
+            verdict.failed().iter().all(|(hex, _)| hex != &creator_hex),
+            "the creator seat never enters the eviction set"
+        );
+        assert_eq!(
+            verdict.per_member.get(&member_hex),
+            Some(&owner_cert::MemberCertStatus::Failed {
+                reason: owner_cert::OwnerCertFailure::Expired
+            }),
+            "an ordinary member's expired certificate stays the eviction set"
+        );
+        assert!(
+            !verdict.is_all_clean(),
+            "an expired creator certificate still fails clean-required operations closed"
+        );
+
+        // The enforcement path removes the failed member and keeps the
+        // creator seated.
+        let failures = info.enforce_owner_certified_admission("authority", &verdict);
+        assert!(
+            failures.iter().all(|(hex, _)| hex != &creator_hex),
+            "no enforced removal may name the creator"
+        );
+        assert!(
+            info.members_v2.contains_key(&creator_hex),
+            "the creator stays seated"
+        );
+        assert_eq!(
+            info.members_v2.get(&member_hex).map(|seat| seat.state),
+            Some(GroupMemberState::Removed),
+            "the ordinary member is removed"
+        );
+
+        // The guard is expiry-ONLY: a creator certificate failing for
+        // another reason (issued by the wrong owner) is still a definitive
+        // failure.
+        let other_user = crate::identity::UserKeypair::generate().unwrap();
+        let wrong_owner =
+            crate::identity::AgentCertificate::issue(&other_user, &creator_kp).unwrap();
+        let mut strict = GroupInfo::with_policy(
+            "T".into(),
+            String::new(),
+            creator_kp.agent_id(),
+            "aabb".repeat(8),
+            policy,
+        );
+        strict
+            .set_member_certificate(&creator_hex, wrong_owner)
+            .expect("seat binds the bytes; verification happens at the verdict");
+        let strict_verdict = strict.owner_cert_verdict(&evidence);
+        assert!(
+            matches!(
+                strict_verdict.per_member.get(&creator_hex),
+                Some(owner_cert::MemberCertStatus::Failed { .. })
+            ),
+            "a non-expiry creator failure is not held"
+        );
+    }
+
+    #[test]
     fn apply_reconstructed_roster_copies_certificate_digest_across_gap() {
         // WHY (#458 ac-gap + #468/#469 design v5 D2): a joiner adopting
         // across a prev-hash gap materializes members from the VERIFIED
@@ -4594,8 +4766,22 @@ mod tests {
             serde_json::from_value::<crate::identity::AgentCertificate>(value)
                 .expect("tampered cert decodes")
         };
-        let cases: Vec<(&str, Option<crate::identity::AgentCertificate>, bool)> = vec![
-            ("invalid_signature", Some(tampered), false),
+        // Engineer ruling 1 Nov 2026 02:36 GMT: the creator's own EXPIRED
+        // certificate holds the seat at `DigestPending` (never
+        // eviction-eligible) instead of `Failed`. Every other invalid
+        // evidence — and revocation — still fails definitively, and no
+        // case is ever Clean.
+        enum Expect {
+            Failed,
+            Held,
+        }
+        let cases: Vec<(
+            &str,
+            Option<crate::identity::AgentCertificate>,
+            bool,
+            Expect,
+        )> = vec![
+            ("invalid_signature", Some(tampered), false, Expect::Failed),
             (
                 "wrong_owner",
                 Some(
@@ -4603,6 +4789,7 @@ mod tests {
                         .expect("cert"),
                 ),
                 false,
+                Expect::Failed,
             ),
             (
                 "wrong_agent",
@@ -4611,6 +4798,7 @@ mod tests {
                         .expect("cert"),
                 ),
                 false,
+                Expect::Failed,
             ),
             (
                 "expired",
@@ -4623,10 +4811,11 @@ mod tests {
                     .expect("cert"),
                 ),
                 false,
+                Expect::Held,
             ),
-            ("revoked", None, true),
+            ("revoked", None, true, Expect::Failed),
         ];
-        for (case, cert, revoked) in cases {
+        for (case, cert, revoked, expect) in cases {
             let mut info = base.info.clone();
             if let Some(cert) = cert {
                 seat_bytes(&mut info, &creator, cert);
@@ -4637,10 +4826,17 @@ mod tests {
                 evidence.mark_revoked(creator.clone());
             }
             let status = creator_status(&mut info, &creator, &evidence);
-            assert!(
-                matches!(status, owner_cert::MemberCertStatus::Failed { .. }),
-                "[{case}] must fail definitively, got {status:?}"
-            );
+            match expect {
+                Expect::Failed => assert!(
+                    matches!(status, owner_cert::MemberCertStatus::Failed { .. }),
+                    "[{case}] must fail definitively, got {status:?}"
+                ),
+                Expect::Held => assert_eq!(
+                    status,
+                    owner_cert::MemberCertStatus::DigestPending,
+                    "[{case}] the creator's expired certificate holds the seat"
+                ),
+            }
             assert_eq!(missing_since(&info, &creator), None, "[{case}] no grace");
         }
     }

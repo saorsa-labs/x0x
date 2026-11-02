@@ -46835,11 +46835,15 @@ pub(in crate::server) async fn join_result_payload_with_roster_certificates(
     let mut bare = serde_json::to_vec(&response)?;
     let mut stripped_chain_bytes = false;
     if bare.len() > x0x::dm::MAX_PAYLOAD_BYTES {
-        // #1023 (Engineer rulings 31 Oct 2026 20:40 + 23:44 GMT): served
-        // chain-link certificate bytes are discretionary size — strip them
-        // (the result-level sidecar carries certificates inside the same
-        // budget) until the WHOLE payload fits, so certificate carry never
-        // pushes a joiner onto the blob path.
+        // #1023 (Engineer rulings 31 Oct 2026 20:40 + 23:44 GMT, kept under
+        // the 2 Nov 14:27 GMT carry): a served chain that FITS the budget
+        // keeps its certificate bytes — they are the carrier the kept-chain
+        // (S3) path seats. Past the budget they are discretionary size —
+        // strip them until the WHOLE payload fits, so certificate carry
+        // never pushes a joiner onto the blob path. The strip also bounds
+        // ANY peer that carries bytes beyond its newest links (a mixed
+        // fleet, a future carrier): what arrives over budget never rides a
+        // result.
         if let JoinResultMessage::Result { chain, .. } = &mut response {
             for link in chain {
                 for snapshot in link.roster.values_mut() {
