@@ -1639,12 +1639,12 @@ fn w3h_1356_control_s3_c3_owner_reseats_owner_axis_node() -> Result<()> {
 }
 
 /// H-S3-d3 (authorisation refusals): a control; on `main` before S3 the
-/// route returned 404.
+/// route returned 404. Step (6) waits for the authorisation's expiry,
+/// which follows the daemons' wall clock, so the row needs the shim (wall
+/// clock = base + virtual time). Without it J never sees the expiry and
+/// re-seats. It runs in the W3-H gate only (`--run-ignored all`).
 #[test]
-#[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
-)]
+#[ignore = "needs the W3-H LD_PRELOAD shim: the W3-H gate runs it with --run-ignored all"]
 fn w3h_1356_control_s3_d3_authorisation_refusals_typed() -> Result<()> {
     let case = "w3h_1356_control_s3_d3_authorisation_refusals_typed";
     super::super::block_on_paused(expect(case, 0x1356_0111, Row::D3))
