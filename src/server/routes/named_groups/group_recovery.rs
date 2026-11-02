@@ -81,6 +81,10 @@ pub(in crate::server) struct S3Runtime {
     /// W3-H only: this node models a release without S3 ([`Self::model_pre_s3`]).
     #[cfg(test)]
     pre_s3: std::sync::atomic::AtomicBool,
+    /// H-S3-home only: ADR 0109 §4 Home activation, on by test
+    /// configuration ([`Self::activate_home`]).
+    #[cfg(test)]
+    home_activation: std::sync::atomic::AtomicBool,
 }
 
 impl Default for S3Runtime {
@@ -108,6 +112,8 @@ impl S3Runtime {
             restore_started: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             pre_s3: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            home_activation: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -120,6 +126,29 @@ impl S3Runtime {
     #[cfg(test)]
     pub(in crate::server) fn model_pre_s3(&self) {
         self.pre_s3.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// H-S3-home (ADR 0109 Validation, "Home activation on by test
+    /// configuration"): from now on this node issues, requests and arms
+    /// ATAs for Home-policy groups, so it writes S3 Home placeholders.
+    #[cfg(test)]
+    pub(in crate::server) fn activate_home(&self) {
+        self.home_activation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// §4 (D81): Home activation ships off. Only a release whose own
+    /// placeholder bytes pass H-S3-home (#1571) may turn it on.
+    fn home_activation_on(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.home_activation
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
     }
 
     /// Whether this node runs S3: always in a release build.
@@ -641,8 +670,8 @@ fn now_ms() -> u64 {
     super::now_millis_u64()
 }
 
-/// ADR 0109 §4 (D81): a Home-policy group. Home activation ships off, so
-/// S3 issues, requests and arms nothing for it.
+/// ADR 0109 §4 (D81): a Home-policy group, one with `home` metadata or
+/// whose policy is the Home policy for its owner ([`home_gate_closed`]).
 fn is_home_policy_group(info: &GroupInfo) -> bool {
     info.home.is_some()
         || info
@@ -650,6 +679,13 @@ fn is_home_policy_group(info: &GroupInfo) -> bool {
             .admission
             .owner_certified_user_id()
             .is_some_and(|owner| crate::server::routes::home::is_home_candidate(info, owner))
+}
+
+/// §4 (D81): `info` is a Home-policy group and Home activation is off, so
+/// S3 issues, requests and arms nothing for it, and writes no S3 Home
+/// placeholder.
+fn home_gate_closed(state: &AppState, info: &GroupInfo) -> bool {
+    is_home_policy_group(info) && !state.group_recovery.home_activation_on()
 }
 
 /// The node's own record of the group is contained (§1 `attester_quarantined`,
@@ -1287,14 +1323,22 @@ fn arms_snapshot<'a>(inner: &'a S3Inner, stable: &str) -> Option<&'a GroupRecove
 /// released binary lets the sidecar entry win, so it loads an inert group
 /// even when `named_groups.json` still holds the #451 placeholder (empty
 /// roster) after a crash in the arming save.
+///
+/// #1626, §4 "Placeholder": the `home-suite-groups.json` placeholder of a
+/// Home-policy group also keeps its `home` metadata, which released
+/// Home-Suite binaries parse (ADR 0114 §5). The split writes the #451
+/// form (no `home`) into `named_groups.json`. Only a node with Home
+/// activation on arms a Home-policy group ([`home_gate_closed`]), so only
+/// it writes this form.
 fn s3_placeholder(info: &GroupInfo) -> GroupInfo {
     let mut placeholder = super::legacy_safe_placeholder(info);
     placeholder.members_v2 = s3::placeholder_roster(info);
     if super::is_home_suite_group_entry(info) {
         // Only Home-Suite-aware binaries read the sidecar, so the
-        // OwnerCertified variant is safe there; the split still writes the
-        // default policy into `named_groups.json`.
+        // OwnerCertified variant and the `home` metadata are safe there;
+        // the split still writes the #451 form into `named_groups.json`.
         placeholder.policy = info.policy.clone();
+        placeholder.home = info.home.clone();
     }
     placeholder
 }
@@ -2033,16 +2077,17 @@ async fn arm_in_place(
         return false;
     }
     // §4 (D81): every arming path ends here, so the Home gate is checked
-    // here too, on the record as it is under the lock. Nothing is written
-    // for a Home-policy group: no sidecar and no placeholder.
-    let home = is_home_policy_group(captured)
+    // here too, on the record as it is under the lock. While Home
+    // activation is off, nothing is written for a Home-policy group: no
+    // sidecar and no placeholder.
+    let home_gated = home_gate_closed(state, captured)
         || state
             .named_groups
             .read()
             .await
             .get(group_key)
-            .is_none_or(is_home_policy_group);
-    if home {
+            .is_none_or(|info| home_gate_closed(state, info));
+    if home_gated {
         return false;
     }
     // §4 "Timing": every arming path ends here, so the ADR 0094 host-commit
@@ -2684,13 +2729,13 @@ async fn answer_request(state: &Arc<AppState>, sender: AgentId, request: GroupAt
     };
     // §4 (D81): Home activation (issuing an ATA for a Home-policy group)
     // ships off, and a Home subject never asks; S3 answers nothing there.
-    let home = state
+    let home_gated = state
         .named_groups
         .read()
         .await
         .get(&group_key)
-        .is_some_and(is_home_policy_group);
-    if home {
+        .is_some_and(|info| home_gate_closed(state, info));
+    if home_gated {
         return;
     }
     // Step 2: limits, before anything else.
@@ -3124,7 +3169,7 @@ pub(super) async fn join_carry_attestation(
     }
     let info = state.named_groups.read().await.get(group_key).cloned()?;
     let local = local_hex(state);
-    if is_home_policy_group(&info)
+    if home_gate_closed(state, &info)
         || !s3::signer_is_active_admin(&info, &local)
         || contained(state, &info).await
     {
@@ -3208,7 +3253,7 @@ pub(super) async fn apply_join_carry(
     };
     let local = local_hex(state);
     let stable = current.stable_group_id().to_string();
-    if is_home_policy_group(&current) {
+    if home_gate_closed(state, &current) {
         set_view(
             state,
             &stable,
@@ -4014,7 +4059,7 @@ async fn subject_tick(state: &Arc<AppState>) {
             }
             continue;
         }
-        if is_home_policy_group(&info) {
+        if home_gate_closed(state, &info) {
             set_view(
                 state,
                 &stable,
@@ -4421,7 +4466,7 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
     // §4 (D81): Home activation ships off. A Home-policy group takes no
     // other answer, asked for or not: no ATA arms it, as on the issuing and
     // requesting paths (`answer_request`, `subject_tick`).
-    if is_home_policy_group(&info) {
+    if home_gate_closed(state, &info) {
         tracing::info!(group_id = %LogHexId::group(&group_key), "ADR 0109 S3: answer for a Home-policy group ignored (Home activation is off)");
         return;
     }
@@ -15946,6 +15991,206 @@ mod tests {
             "the live record is unchanged"
         );
         assert_eq!(files().await, before, "the Home files are unchanged");
+        Ok(())
+    }
+
+    /// An OwnerCertified Home-policy group with a sealed chain head that
+    /// seats this node as Admin and `member` as a Member, as the Home
+    /// creator holds it.
+    fn owner_home_fixture(
+        state: &AppState,
+        member: &str,
+        group_id: &str,
+    ) -> anyhow::Result<(GroupInfo, x0x::identity::UserId)> {
+        let local = local_hex(state);
+        let owner = x0x::identity::UserKeypair::generate()?.user_id();
+        let mut info = GroupInfo::new(
+            "adr0109-home-placeholder".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.to_string(),
+        );
+        info.add_member(
+            member.to_string(),
+            x0x::groups::GroupRole::Member,
+            Some(local.clone()),
+            None,
+        );
+        info.seal_commit(state.agent.identity().agent_keypair(), 1_000)?;
+        // The store split and the S3 splice read only the admission and
+        // the head, so no certificate evidence is needed here (#1569).
+        info.policy.admission = x0x::groups::GroupAdmission::OwnerCertified(owner);
+        info.home = Some(x0x::groups::HomeMetadata {
+            primary_agent: local,
+            placements: std::collections::BTreeMap::new(),
+            provisioned_at_ms: 1,
+        });
+        anyhow::ensure!(is_home_policy_group(&info));
+        Ok((info, owner))
+    }
+
+    /// The legacy entries of `group_id` that a released binary loads
+    /// (`named_groups.json`, `home-suite-groups.json`), and the entry it
+    /// keeps once the sidecar entry wins.
+    async fn released_entries(
+        state: &AppState,
+        group_id: &str,
+    ) -> anyhow::Result<(GroupInfo, GroupInfo, GroupInfo)> {
+        let named = super::super::load_named_groups(&state.named_groups_path).await?;
+        let suite = super::super::load_home_suite_groups(&state.home_suite_groups_path).await?;
+        let named_entry = named
+            .get(group_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("named_groups.json entry"))?;
+        let suite_entry = suite
+            .get(group_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("home-suite-groups.json entry"))?;
+        let loaded = super::super::merge_home_suite_groups(named, suite)
+            .remove(group_id)
+            .ok_or_else(|| anyhow::anyhow!("released entry"))?;
+        Ok((named_entry, suite_entry, loaded))
+    }
+
+    /// #1626, ADR 0109 §4 "Placeholder": while a Home-policy group is
+    /// placeheld, its `home-suite-groups.json` entry is the S3 placeholder
+    /// that also keeps the group's policy and `home` metadata, which
+    /// released Home-Suite binaries parse (ADR 0114 §5). Its
+    /// `named_groups.json` entry keeps the #451 form. Before the fix both
+    /// entries dropped `home`, so a released Home-Suite binary loaded the
+    /// owner's Home as a group without Home metadata. Neither view seats
+    /// anyone, and this binary's load restores the real record. Local temp
+    /// state only.
+    #[tokio::test]
+    async fn a_home_placeholder_keeps_home_metadata_in_the_home_suite_view() -> anyhow::Result<()> {
+        let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let group_id = "1626".repeat(16);
+        let (info, owner) = owner_home_fixture(&state, &"ab".repeat(32), &group_id)?;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        begin_placehold(&state, &group_id, &info);
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+
+        let (named, suite, loaded) = released_entries(&state, &group_id).await?;
+        // `home-suite-groups.json`: the S3 placeholder with the policy and
+        // the `home` metadata.
+        assert!(s3::is_s3_placeholder(&suite));
+        assert!(suite.members_v2.values().all(|m| !m.is_active()));
+        assert_eq!(
+            suite.policy.admission,
+            x0x::groups::GroupAdmission::OwnerCertified(owner)
+        );
+        assert_eq!(
+            suite.home, info.home,
+            "#1626: the Home-Suite placeholder keeps the Home metadata"
+        );
+        assert_eq!(suite.state_revision, info.state_revision);
+        assert_eq!(suite.state_hash, info.state_hash);
+        // `named_groups.json`: the #451 form, with the all-Removed roster.
+        assert!(s3::is_s3_placeholder(&named));
+        assert!(named.members_v2.values().all(|m| !m.is_active()));
+        assert!(
+            named.home.is_none(),
+            "named_groups.json keeps the #451 form"
+        );
+        assert!(named.policy.admission.owner_certified_user_id().is_none());
+        // A released binary loads one inert Home: no Active seat, the
+        // same group ID set, and no `home.json` written.
+        assert!(loaded.members_v2.values().all(|m| !m.is_active()));
+        assert_eq!(loaded.home, info.home);
+        assert!(
+            !tokio::fs::try_exists(
+                dir.path()
+                    .join(crate::server::routes::home::HOME_MARKER_FILE)
+            )
+            .await?
+        );
+        // This binary's load splices the authoritative record back in.
+        let current = super::super::load_named_groups_merged(
+            &state.named_groups_path,
+            &state.home_suite_groups_path,
+        )
+        .await?;
+        assert_eq!(current.len(), 1);
+        let record = current
+            .get(&group_id)
+            .ok_or_else(|| anyhow::anyhow!("current entry"))?;
+        assert!(!s3::is_s3_placeholder(record));
+        assert_eq!(record.state_hash, info.state_hash);
+        assert_eq!(record.home, info.home);
+        Ok(())
+    }
+
+    /// #1626, ADR 0109 §4 (D81): Home activation is a switch, off unless a
+    /// test configuration turns it on (H-S3-home, #1571). Off, the arming
+    /// choke point writes nothing for a Home-policy group
+    /// (`a_home_policy_group_takes_no_attestation`). On, the same ATA arms
+    /// the group and the legacy views hold the S3 Home placeholder, so
+    /// H-S3-home can test the bytes that a release would write.
+    #[tokio::test]
+    async fn home_activation_on_arms_and_writes_the_home_placeholder() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let group_id = "1627".repeat(16);
+        let (info, owner) = owner_home_fixture(&state, &admin_hex, &group_id)?;
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info.clone());
+        assert!(matches!(
+            super::super::save_named_groups_checked(&state).await?,
+            super::super::AtomicWriteOutcome::Durable
+        ));
+        let ata = AdminTerminalAttestation::sign(
+            AtaFields {
+                group: stable.clone(),
+                subject: local,
+                attested_by: admin_hex,
+                signer_public_key: hex::encode(admin.public_key().as_bytes()),
+                from_revision: info.state_revision,
+                from_state_hash: info.state_hash.clone(),
+                sequence: vec!["a1".to_string(), "a2".to_string()],
+                segment_terminal_revision: info.state_revision + 2,
+                segment_terminal_epoch: None,
+                issued_at_ms: now_ms(),
+            },
+            &admin,
+        )?;
+        assert!(home_gate_closed(&state, &info), "Home activation ships off");
+        assert!(!arm_in_place(&state, &group_id, &info, ata.clone()).await);
+        assert!(!is_placeheld(&state, &stable));
+
+        state.group_recovery.activate_home();
+        assert!(!home_gate_closed(&state, &info));
+        assert!(arm_in_place(&state, &group_id, &info, ata).await);
+        assert!(is_placeheld(&state, &stable));
+        let (_, suite, loaded) = released_entries(&state, &group_id).await?;
+        assert!(s3::is_s3_placeholder(&suite));
+        assert_eq!(
+            suite.policy.admission,
+            x0x::groups::GroupAdmission::OwnerCertified(owner)
+        );
+        assert_eq!(suite.home, info.home);
+        assert!(loaded.members_v2.values().all(|m| !m.is_active()));
+        let sidecar = sidecar_snapshot(&state, &stable)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("sidecar"))?;
+        assert!(sidecar.active_ata.is_some());
+        assert!(sidecar.authoritative_record.is_some());
         Ok(())
     }
 
