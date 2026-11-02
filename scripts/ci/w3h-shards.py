@@ -5,8 +5,8 @@ Each shard runs its cases with the same `--stress-count 20` gate profile.
 The summary job merges the trace directories and runs `w3h-trace-check.py`.
 A case name matches exactly one shard. A new `w3h_1356_` or `w3h_1357_`
 case joins the S3 or S4 shard. Any other new `w3h_` case joins `rest`.
-The four ADR 0109 owner-axis rows (H-S3-c, H-S3-c2, H-S3-c3, H-S3-d8)
-each have their own shard: one rerun of each row is the longest S3 case,
+The five ADR 0109 owner-axis rows (H-S3-c, H-S3-c2, H-S3-c3, H-S3-d8,
+H-S3-d3) each have their own shard: one rerun of each row is the longest S3 case,
 and 20 reruns of them in one job do not fit the S3 test deadline.
 
 The S3 shard is omitted when the tree has no `w3h_1356_` test, so `main`
@@ -31,6 +31,7 @@ GROUPS = (
     ('s3-c2', 'w3h_1356_red_s3_c2_reseat_retires_marker_and_gap$'),
     ('s3-c3', 'w3h_1356_control_s3_c3_owner_reseats_owner_axis_node$'),
     ('s3-d8', 'w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node$'),
+    ('s3-d3', 'w3h_1356_control_s3_d3_authorisation_refusals_typed$'),
     ('s3', 'w3h_1356_'),
 )
 

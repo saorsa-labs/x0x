@@ -53,13 +53,14 @@ class ShardPlanTest(unittest.TestCase):
             self.assertEqual(matched, cases, expr)
 
     def test_each_owner_axis_row_has_its_own_shard(self):
-        # One rerun of each H-S3-c/c2/c3/d8 row is the longest S3 case, so
+        # One rerun of each H-S3-c/c2/c3/d8/d3 row is the longest S3 case, so
         # each row runs its 20 reruns on its own runner.
         rows = {
             's3-c': 'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node',
             's3-c2': 'w3h_1356_red_s3_c2_reseat_retires_marker_and_gap',
             's3-c3': 'w3h_1356_control_s3_c3_owner_reseats_owner_axis_node',
             's3-d8': 'w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node',
+            's3-d3': 'w3h_1356_control_s3_d3_authorisation_refusals_typed',
         }
         assigned = SHARDS.assign(self.names)
         for group, name in rows.items():

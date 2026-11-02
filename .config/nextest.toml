@@ -43,6 +43,14 @@ run-wrapper = 'w3h-sim'
 default-filter = 'test(/(^|::)w3h_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# H-S3-d3 runs about 2 h 15 min of virtual time (the authorisation's
+# 1 h lifetime, then the row's 1 h quiet advance): 520 s of wall time on
+# a 12-CPU Linux VM, so it gets 45 minutes.
+[[profile.w3h.overrides]]
+filter = 'test(/(^|::)w3h_1356_control_s3_d3_authorisation_refusals_typed$/)'
+slow-timeout = { period = "60s", terminate-after = 45 }
+priority = 60
+
 # The H-S3-c/c2/c3/d8 rows: see the `w3h-gate` override below.
 [[profile.w3h.overrides]]
 filter = 'test(/(^|::)w3h_1356_(red_s3_c2?_(promoted_admin_reseats_owner_axis_node|reseat_retires_marker_and_gap)|control_s3_(c3_owner|d8_removal_basis)_reseats_owner_axis_node)$/)'
@@ -71,6 +79,12 @@ run-wrapper = 'w3h-sim-dump'
 default-filter = 'test(/(^|::)w3h_/)'
 slow-timeout = { period = "60s", terminate-after = 5 }
 success-output = "final"
+
+# H-S3-d3 (#1572): about 2 h 15 min virtual, so 45 minutes (see `w3h`).
+[[profile.w3h-gate.overrides]]
+filter = 'test(/(^|::)w3h_1356_control_s3_d3_authorisation_refusals_typed$/)'
+slow-timeout = { period = "60s", terminate-after = 45 }
+priority = 60
 
 # ADR 0109 H-S3-c/c2/c3/d8 (#1689, #1572): each row runs a 30-minute (d8: 11-minute) virtual
 # advance and a re-seat on four nodes, 255-600 s of wall time per run (more
@@ -131,6 +145,12 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # Network integration tests need longer timeouts for QUIC handshakes
 # and gossip propagation on macOS
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+# H-S3-d3 (#1572): about 2 h 15 min virtual, so 45 minutes (see `w3h`).
+[[profile.default.overrides]]
+filter = 'test(/(^|::)w3h_1356_control_s3_d3_authorisation_refusals_typed$/)'
+slow-timeout = { period = "60s", terminate-after = 45 }
+priority = 60
 
 # ADR 0109 H-S3-c/c2/c3/d8 (#1689, #1572): the same rows as the `w3h` overrides
 # above. A GREEN run does the full 30-minute virtual advance and re-seat.
