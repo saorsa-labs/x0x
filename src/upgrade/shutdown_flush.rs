@@ -1629,7 +1629,8 @@ mod windows_clock_regressions {
 
 /// Windows-only: these run on the windows-latest CI runner (#1588). They
 /// read the kernel tick count and the `BootId` registry value only.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod windows_exec_regressions {
     use super::*;
 

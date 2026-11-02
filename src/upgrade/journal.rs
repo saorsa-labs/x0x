@@ -1181,7 +1181,8 @@ mod refusal_diagnostics_tests {
 
 /// #1588: the Windows record barrier opens files and directories for
 /// `FlushFileBuffers`. These run the real calls on a Windows host.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod windows_exec_regressions {
     use super::*;
 

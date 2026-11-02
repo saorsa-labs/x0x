@@ -1915,7 +1915,8 @@ mod tests {
 
 /// #1588: `x0x start --foreground` on Windows runs x0xd as a child, so the
 /// child's exit status must reach the wrapper unchanged.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod windows_exec_regressions {
     use super::foreground_exit_code;
 

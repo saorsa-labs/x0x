@@ -1362,7 +1362,8 @@ mod windows_control_channel_regressions {
 
 /// Windows-only: these run on the windows-latest CI runner (#1588). They use
 /// a local pipe named from a temp dir and no daemon, journal or network.
-#[cfg(all(test, windows))]
+#[cfg(test)]
+#[cfg(windows)]
 mod windows_exec_regressions {
     use super::*;
     use tokio::io::AsyncReadExt;
