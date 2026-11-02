@@ -216,6 +216,42 @@ pub(crate) const fn flush_failure_exit_code() -> i32 {
     75
 }
 
+/// Why an arm-and-flush request for a `TransactionalHandoff` participant is
+/// refused while no restart-capable owner exists (issue #1670).
+pub(crate) const TRANSACTIONAL_FLUSH_WITHOUT_OWNER: &str =
+    "no restart-capable owner is established for this transactional handoff: \
+     a completed socket flush ends the old participant with exit 0 and no \
+     supervisor restart, and neither the socket path nor the frozen plan \
+     provides an owner that can reap it and start the candidate (no helper \
+     is spawned; the launcher is not implemented). The arm is refused before \
+     the shutdown and the daemon keeps serving";
+
+/// Whether the frozen restart binding establishes a restart-capable owner
+/// that may stop a `TransactionalHandoff` participant through the socket
+/// flush (issue #1670).
+///
+/// The durable receipt proves the flush only. After the old participant
+/// ends, an owner outside the stopped process must reap it and start the
+/// candidate through the authorised path. Only two owners could hold that
+/// authority:
+///
+/// - the detached helper [`begin_transactional_handoff`] spawns on the
+///   in-process apply path. The socket arm path creates no helper; the
+///   requester must establish the owner instead.
+/// - the M2 launcher (#1375). It is not implemented, and the frozen
+///   `launcher` identity a plan may carry is captured evidence, not a
+///   verified loaded job, so it establishes no owner.
+///
+/// Until the launcher binding can be verified against the loaded job, this
+/// check refuses every binding. The arm path must then refuse before the
+/// shutdown and keep the old daemon serving: arming a transactional flush
+/// that nobody can complete leaves the service silently down.
+pub(crate) fn transactional_flush_owner(
+    _binding: &super::journal::RestartBinding,
+) -> Result<(), &'static str> {
+    Err(TRANSACTIONAL_FLUSH_WITHOUT_OWNER)
+}
+
 // ---------------------------------------------------------------------------
 // I0b — loaded launchd policy readback (ADR-0061 §3, #615)
 // ---------------------------------------------------------------------------
@@ -3173,6 +3209,16 @@ pub fn build_spawn_args(argv: &[String]) -> Vec<String> {
 // Old-process side (I2 steps 1–3)
 // ---------------------------------------------------------------------------
 
+/// The M2 launcher marks its private fd-3 boot handoff with this variable
+/// (#1375). Handoff children never boot as launcher candidates, and fd 3 in
+/// them is some unrelated descriptor, so they must not inherit it.
+const LAUNCHER_BOOT_FD_ENV: &str = "X0X_M2_BOOT_FD";
+
+/// Strip the launcher boot descriptor from a handoff child's environment.
+fn scrub_launcher_boot_fd(cmd: &mut std::process::Command) {
+    cmd.env_remove(LAUNCHER_BOOT_FD_ENV);
+}
+
 /// Start the transactional handoff from the old daemon after a swap Success.
 ///
 /// Writes the handoff file, spawns a detached helper (in a new session, so it
@@ -3209,6 +3255,7 @@ pub fn begin_transactional_handoff(
     let mut cmd = std::process::Command::new(&helper_binary);
     cmd.arg(UPGRADE_HANDOFF_FLAG).arg(handoff_path);
     cmd.stdin(std::process::Stdio::null());
+    scrub_launcher_boot_fd(&mut cmd);
     detach_from_terminal(&mut cmd);
 
     match cmd.spawn() {
@@ -3463,6 +3510,7 @@ fn spawn_and_await_health(
         cmd.current_dir(&handoff.cwd);
     }
     cmd.stdin(std::process::Stdio::null());
+    scrub_launcher_boot_fd(&mut cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -4007,6 +4055,37 @@ mod tests {
             plan_restart_mode(true, &signals),
             Ok(RestartMode::TransactionalHandoff)
         );
+    }
+
+    #[test]
+    fn transactional_flush_owner_refuses_every_binding_until_a_launcher_is_verified() {
+        // #1670: the socket flush may not stop a transactional participant
+        // while no restart-capable owner exists. A plain binding carries no
+        // owner form at all, and a captured launcher identity is evidence,
+        // not a verified loaded job, so it must not activate the flush
+        // either. Both refuse with the operator-facing reason.
+        let plain = crate::upgrade::journal::RestartBinding {
+            mode: crate::upgrade::journal::RestartOwner::TransactionalHandoff,
+            supervised_exit_code: None,
+            supervision_signal: None,
+            launchd_verified: None,
+            systemd_verified: None,
+            launcher: None,
+        };
+        let reason = transactional_flush_owner(&plain).unwrap_err();
+        assert!(reason.contains("restart-capable owner"), "{reason}");
+        let captured = crate::upgrade::journal::RestartBinding {
+            launcher: Some(crate::upgrade::journal::LauncherBinding {
+                executable: PathBuf::from("/opt/x0x/x0x-launcher"),
+                argv: vec!["x0x-launcher".into()],
+                pid: Some(42),
+                process_start: Some(1),
+                boot_id: "fixture-boot".into(),
+                manager_exit_code: 0,
+            }),
+            ..plain
+        };
+        assert_eq!(transactional_flush_owner(&captured).unwrap_err(), reason);
     }
 
     #[test]
@@ -5128,6 +5207,15 @@ mod tests {
                 "/etc/x0x/config.toml".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn handoff_children_do_not_inherit_the_launcher_boot_descriptor() {
+        let mut cmd = std::process::Command::new("x0xd-never-spawned-placeholder");
+        scrub_launcher_boot_fd(&mut cmd);
+        assert!(cmd
+            .get_envs()
+            .any(|(key, value)| key == LAUNCHER_BOOT_FD_ENV && value.is_none()));
     }
 
     #[test]
