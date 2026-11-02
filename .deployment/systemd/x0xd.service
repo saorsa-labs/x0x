@@ -5,6 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# ADR 0094 §5: bind ExecStart to /opt/x0x/x0x-launcher only after the §5
+# preconditions hold, including: the signed and verified launcher artifact
+# (hash, version, account rights); install.sh or x0x autostart --repair
+# installs it; an M2-capable daemon runs first under the direct job; the
+# authority inventory and the KillMode/restart readbacks accept a
+# launcher-owned job. The switch needs David's go.
 ExecStart=/opt/x0x/x0xd --config /etc/x0x/config.toml
 Restart=always
 RestartSec=5
