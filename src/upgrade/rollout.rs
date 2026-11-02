@@ -1,5 +1,34 @@
-//! Staged rollout: deterministic delay based on machine ID hash spreads
-//! upgrades across a configurable time window.
+//! Staged rollout: a deterministic delay derived from the machine ID
+//! spreads upgrades across a configurable time window.
+//!
+//! Production wiring (#1106): `staging::observe` calls
+//! `calculate_delay_for_version` when a node first sees a release, then
+//! freezes that delay in a durable receipt. `staging::decode` re-derives
+//! the delay on every later read, so the formula must stay stable across
+//! binaries. The window comes from `[update].rollout_window_minutes`
+//! (default 60 minutes, D183). `fleet_policy` raises the window to the
+//! 60-minute fleet minimum on deployment-authority hosts (D184).
+//!
+//! Delay construction: take the leading 64 bits of
+//! `SHA-256(node_id || version)`, multiply by the window seconds, and
+//! shift right by 64. The two fields are concatenated without length
+//! prefixes. That raw concatenation allows input collisions that no
+//! wired input can reach:
+//!
+//! * a boundary shift: `node_id = "ab"` with `version = "c"` and
+//!   `node_id = "a"` with `version = "bc"` hash the same bytes;
+//! * a salted delay with an empty node ID equals the unsalted delay for
+//!   the same bytes sent as the version.
+//!
+//! Wired inputs cannot collide this way. `machine_id` is a fixed 32-byte
+//! value and `version` is a bounded canonical semver string, so the node
+//! width pins the field boundary. `tests/upgrade_rollout.rs` pins both
+//! collisions for the general byte-slice API. A length-prefixed
+//! construction, as `staging::receipt_path` uses, would remove them, but
+//! it would move every chosen delay. Receipts that older binaries wrote
+//! would then fail the `staging::decode` re-derivation, and the staging
+//! tests pin the current constants. That change needs David's ruling
+//! before any slice makes it.
 
 use std::time::Duration;
 
@@ -36,6 +65,10 @@ impl StagedRollout {
     /// Calculate the rollout delay for this node.
     ///
     /// Returns Duration::ZERO if max_delay_minutes is 0.
+    ///
+    /// Unsalted variant: production staging always calls
+    /// [`Self::calculate_delay_for_version`]. This method stays as the
+    /// public compatibility surface.
     pub fn calculate_delay(&self) -> Duration {
         if self.max_delay_minutes == 0 {
             return Duration::ZERO;
@@ -48,6 +81,10 @@ impl StagedRollout {
     ///
     /// Includes the version string in the hash so that different releases
     /// produce different delay orderings across the fleet.
+    ///
+    /// The hash input is the raw concatenation `node_id || version`.
+    /// See the module docs for the input-collision limits of that
+    /// construction.
     pub fn calculate_delay_for_version(&self, version: &str) -> Duration {
         if self.max_delay_minutes == 0 {
             return Duration::ZERO;
@@ -107,7 +144,7 @@ mod tests {
     fn test_delay_within_expected_range() {
         let rollout = StagedRollout::new(b"test-node-1", 1440);
         let delay = rollout.calculate_delay();
-        assert!(delay <= Duration::from_secs(1440 * 60));
+        assert!(delay < Duration::from_secs(1440 * 60));
     }
 
     #[test]
@@ -133,8 +170,8 @@ mod tests {
         let short_delay = rollout_short.calculate_delay();
         let long_delay = rollout_long.calculate_delay();
 
-        assert!(short_delay <= Duration::from_secs(120 * 60));
-        assert!(long_delay <= Duration::from_secs(1440 * 60));
+        assert!(short_delay < Duration::from_secs(120 * 60));
+        assert!(long_delay < Duration::from_secs(1440 * 60));
         // The ratio should be approximately 120:1440 = 1:12
         // Allow some tolerance due to the hash distribution
         assert!(long_delay > short_delay);
@@ -153,7 +190,7 @@ mod tests {
     fn test_empty_node_id() {
         let rollout = StagedRollout::new(b"", 1440);
         let delay = rollout.calculate_delay();
-        assert!(delay <= Duration::from_secs(1440 * 60));
+        assert!(delay < Duration::from_secs(1440 * 60));
     }
 
     #[test]
@@ -161,7 +198,7 @@ mod tests {
         let large_id = vec![0xABu8; 1024];
         let rollout = StagedRollout::new(&large_id, 1440);
         let delay = rollout.calculate_delay();
-        assert!(delay <= Duration::from_secs(1440 * 60));
+        assert!(delay < Duration::from_secs(1440 * 60));
     }
 
     #[test]
@@ -178,7 +215,7 @@ mod tests {
         }
 
         // All delays should be within range
-        assert!(delays.iter().all(|&d| d <= max_secs));
+        assert!(delays.iter().all(|&d| d < max_secs));
 
         // Check reasonable spread: delays should span at least 50% of the window
         let min_delay = *delays.iter().min().unwrap();
