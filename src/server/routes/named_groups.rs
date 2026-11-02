@@ -5783,7 +5783,7 @@ async fn install_fork_evidence(
         Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename) => {
             tracing::debug!(
                 group_id = %LogHexId::group(group_key),
-                "#468: fork evidence install was a no-op (lineage gone or already carries evidence)"
+                "#468: fork evidence install replaced nothing (no-op: lineage gone or already carries evidence; or the durability preflight refused)"
             );
             false
         }
@@ -7002,7 +7002,28 @@ where
             Ok(AtomicWriteOutcome::Durable) => state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release),
-            outcome => return outcome,
+            // #1574: a refusal here reports the confirming re-save of the
+            // EARLIER unconfirmed replacement, not this caller's write.
+            // The clear below never ran; nothing of its candidate is
+            // staged. Sent on as `ReplacedNotDurable` (the behaviour
+            // before this fix), it claimed the #759 shape — "the clear's
+            // replacement is visible, only its directory fsync is
+            // unconfirmed" — for a clear that did not occur. Report the
+            // refusal as `NotReplaced`. The flag stays set (the re-save's
+            // own handling keeps it), so the next save retries this
+            // preflight; a hard error stays an error.
+            // #1729 (merged at cf707096) gave the after-rename refusal
+            // its own outcome. No producer feeds that variant to this
+            // whole-map re-save, and no caller of this entry point does
+            // outcome-keyed S3 arming, so it folds into the refusal
+            // arm: like every refusal shape, this clear replaced
+            // nothing.
+            Ok(
+                AtomicWriteOutcome::NotReplaced
+                | AtomicWriteOutcome::ReplacedNotDurable
+                | AtomicWriteOutcome::PreflightRefusedAfterRename,
+            ) => return Ok(AtomicWriteOutcome::NotReplaced),
+            Err(error) => return Err(error),
         }
     }
     persist_named_groups_quarantine_clear_gated_unlocked(
@@ -7215,7 +7236,29 @@ where
             Ok(AtomicWriteOutcome::Durable) => state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release),
-            outcome => return outcome,
+            // #1574: a refusal here reports the confirming re-save of the
+            // EARLIER unconfirmed replacement, not this caller's write.
+            // The mutation below never ran; nothing of its candidate is
+            // staged. Sent on as `ReplacedNotDurable` (the behaviour
+            // before this fix), it claimed the #759 shape — "the
+            // mutation's replacement is visible, only its directory
+            // fsync is unconfirmed" — the arm a caller uses to keep its
+            // candidate and proceed, for a mutation that did not occur.
+            // Report the refusal as `NotReplaced`. The flag stays set
+            // (the re-save's own handling keeps it), so the next save
+            // retries this preflight; a hard error stays an error.
+            // #1729 (merged at cf707096) gave the after-rename refusal
+            // its own outcome. No producer feeds that variant to this
+            // whole-map re-save, and no caller of this entry point does
+            // outcome-keyed S3 arming, so it folds into the refusal
+            // arm: like every refusal shape, this mutation replaced
+            // nothing.
+            Ok(
+                AtomicWriteOutcome::NotReplaced
+                | AtomicWriteOutcome::ReplacedNotDurable
+                | AtomicWriteOutcome::PreflightRefusedAfterRename,
+            ) => return Ok(AtomicWriteOutcome::NotReplaced),
+            Err(error) => return Err(error),
         }
     }
     let (before, after) = {
@@ -7561,10 +7604,9 @@ async fn compare_and_restore_named_groups(
 /// #470 test fault cell for the roster save itself (same idiom as
 /// [`DeleteFault`]): forces `save_named_groups_checked_unlocked` to return
 /// a chosen outcome so the compare-and-restore rollback matrix can be
-/// exercised through the PRODUCTION persist path. The check is compiled
-/// into production code but constant-false there (`cfg!(test)`); only the
-/// setter is test-gated, and the RAII guard clears the cell on drop so a
-/// failing test cannot leak it.
+/// exercised through the PRODUCTION persist path. Every read of the cell
+/// is `#[cfg(test)]`, so a release build never consults it; the RAII
+/// guard clears the cell on drop so a failing test cannot leak it.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -7601,6 +7643,13 @@ pub(in crate::server) enum SaveFault {
     /// sidecar journal is written, then the legacy journal write (the
     /// commit point) fails: no live file changes.
     JournalWriteFails = 8,
+    /// #1574 (the #1729 fold): `Ok(AtomicWriteOutcome::
+    /// PreflightRefusedAfterRename)` — the after-rename refusal shape,
+    /// so a test can drive the folded refusal arm of the two whole-map
+    /// persist preflights. No production save yields the variant before
+    /// them; the folded arm states their contract: every refusal shape
+    /// reports `NotReplaced`.
+    PreflightRefusedAfterRename = 9,
 }
 
 // #470 — per-instance fault helpers; all `#[cfg(test)]` so no trace in
@@ -7616,6 +7665,7 @@ fn save_fault_short_circuit(state: &AppState) -> Option<AtomicWriteOutcome> {
     {
         1 => Some(AtomicWriteOutcome::NotReplaced),
         3 => Some(AtomicWriteOutcome::ReplacedNotDurable),
+        9 => Some(AtomicWriteOutcome::PreflightRefusedAfterRename),
         _ => None,
     }
 }
@@ -51476,6 +51526,7 @@ pub(in crate::server) mod tests {
     mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
     mod issue1570_held_back_tombstone;
+    mod issue1574_persist_preflight_refusal;
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
