@@ -215,6 +215,21 @@ impl Receipt {
         }
     }
 
+    /// The expected-cause strings of the causes that classify (ok). An
+    /// expected-RED W3-H arm checks these, so its pin names the exact
+    /// failure it expects while a fix is pending, not any RED.
+    pub(crate) fn named_causes(&self) -> Vec<&str> {
+        self.stages
+            .iter()
+            .filter_map(|stage| match stage {
+                Stage::Cause {
+                    expected, ok: true, ..
+                } => Some(expected.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether an INFRA stage was recorded.
     pub(crate) fn has_infra(&self) -> bool {
         self.stages

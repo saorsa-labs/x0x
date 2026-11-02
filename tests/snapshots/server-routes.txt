@@ -172,8 +172,8 @@ GET  /files/transfers                                    transfers              
 GET  /files/transfers/:id                                transfer-status                                         Transfer status
 POST  /files/accept/:id                                   accept-file                                             Accept incoming transfer
 POST  /files/reject/:id                                   reject-file               body: reason                  Reject incoming transfer
-GET  /upgrade                                            upgrade                                                 Daemon-side check for updates over x0x/release manifests (the CLI x0x upgrade is a standalone GitHub updater and does not call this)
-POST  /upgrade/apply                                      upgrade --apply                                         Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade applies via its standalone GitHub path instead)
+GET  /upgrade                                            upgrade                                                 Daemon-side check for updates over x0x/release manifests (CLI x0x upgrade --check reads GitHub and calls local /health)
+POST  /upgrade/apply                                      upgrade --apply                                         Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade --apply delegates to this authenticated route)
 GET  /ws                                                 ws                                                      General-purpose WebSocket session
 GET  /ws/direct                                          ws direct                 query: backfill               WebSocket session for direct messaging
 GET  /ws/sessions                                        ws sessions                                             List WebSocket sessions

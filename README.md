@@ -170,7 +170,7 @@ Sync is owner-to-owner only (Tier 1: profile, names, Home roster pointer, sub-ag
 **9. Stay current.** The serving daemon is the only update writer. The CLI can check for a release or ask that daemon to install it:
 
 ```bash
-x0x upgrade --check    # read-only: checks GitHub for a signed release (no daemon needed)
+x0x upgrade --check    # read-only: GitHub release check, plus local /health when a daemon answers
 x0x upgrade --apply    # installs through the running daemon's authenticated POST /upgrade/apply
 x0x upgrade --apply --now  # skips staging only; eligibility, holds and transaction checks remain
 # Bare x0x upgrade and --force without --apply do not install.
