@@ -11,6 +11,16 @@ use crate::cli::{DaemonClient, OutputFormat};
 /// Bounded timeout for doctor's first `/health` probe (matches `ensure_running`).
 const DOCTOR_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The status `x0x start --foreground` exits with after x0xd stops where the
+/// Unix exec is not available. It keeps x0xd's exact status for a
+/// supervisor, as the Unix exec does: 100 asks for a restart on new bytes,
+/// 75 (EX_TEMPFAIL) for a restart on the restored binary (#1588). A status
+/// without a code is reported as 1.
+#[cfg(any(test, not(unix)))]
+fn foreground_exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
 /// `x0x start` — spawn x0xd as a background process.
 pub async fn start(name: Option<&str>, config: Option<&Path>, foreground: bool) -> Result<()> {
     // Find x0xd binary: same directory as x0x, then PATH.
@@ -46,7 +56,7 @@ pub async fn start(name: Option<&str>, config: Option<&Path>, foreground: bool) 
         {
             let status = cmd.status().context("failed to run x0xd")?;
             if !status.success() {
-                anyhow::bail!("x0xd exited with {status}");
+                std::process::exit(foreground_exit_code(status));
             }
             return Ok(());
         }
@@ -632,7 +642,8 @@ fn render_launchd_plist(executable: &str, args: &[String], log_path: &Path) -> R
 
 /// The versioned Windows supervision wrapper template (#621, ADR-0061 §3):
 /// a PowerShell script that restarts x0xd after exit 100 (the supervised
-/// upgrade request) and propagates every other exit status. The daemon
+/// upgrade request) and exit 75 (EX_TEMPFAIL, a restart on the restored
+/// binary, #1588) and propagates every other exit status. The daemon
 /// verifies the generated script at upgrade time through
 /// [`crate::upgrade::restart::readback_windows_wrapper_script`], so the
 /// template's marker lines must stay exactly what that readback parses.
@@ -659,7 +670,7 @@ fn ps_single_quote_escape(s: &str) -> String {
 }
 
 /// Render the Windows supervision wrapper script for one instance (#621):
-/// the tested wrapper version, the restart-on-exit-100 policy, and the
+/// the tested wrapper version, the restart-on-exit-100-and-75 policy, and the
 /// executable/arguments binding the upgrade-time readback verifies. ASCII
 /// only — Windows PowerShell 5.1 reads a no-BOM file as ANSI, so a non-ASCII
 /// path or `--name` would corrupt the binding silently. Empty arguments and
@@ -805,7 +816,7 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
             args.push(n.to_string());
         }
         // #621 / ADR-0061 §3: the supported Windows deployment is this
-        // versioned wrapper (restart after exit 100 only), which the daemon
+        // versioned wrapper (restart after exit 100 and 75 only), which the daemon
         // verifies at upgrade time before accepting a supervised exit.
         let config_dir = dirs::config_dir()
             .context("cannot determine config directory")?
@@ -872,11 +883,11 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
         }
         println!("  Wrapper: {}", wrapper_path.display());
         println!(
-            "  Policy:  the wrapper restarts x0xd after exit 100 (the upgrade request) and \
-             propagates every other exit. A supervised apply additionally needs the \
-             acknowledged-shutdown flush owner, which is Unix-only today: until it is \
-             ported, a supervised Windows apply is refused (no bytes change) and the \
-             unsupervised transactional path keeps working."
+            "  Policy:  the wrapper (template v2) restarts x0xd after exit 100 (the \
+             upgrade request) and exit 75 (EX_TEMPFAIL: a failed flush restored the \
+             previous binary, so it restarts on that binary), and propagates every other \
+             exit. A supervised apply (X0X_SUPERVISED=1) uses the acknowledged-shutdown \
+             flush owner on the local named pipe."
         );
         println!("  Remove:  x0x autostart --remove");
     }
@@ -1827,6 +1838,7 @@ mod tests {
             )
         }));
         assert!(script.lines().any(|l| l == "$x0xRestartOnExit100 = $true"));
+        assert!(script.lines().any(|l| l == "$x0xRestartOnExit75 = $true"));
         // The cross-pin that keeps the renderer and the verifier honest: the
         // generated template is exactly what the upgrade-time readback
         // accepts for the instance it was rendered for.
@@ -1884,5 +1896,51 @@ mod tests {
             &["--name".to_string(), "say \"hi\"".to_string()]
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_exit_code_keeps_the_child_status() {
+        // #1588: the supervisor reads 100 and 75 from `x0x start --foreground`.
+        for code in [75, 100, 3] {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("exit {code}"))
+                .status()
+                .expect("run sh");
+            assert_eq!(foreground_exit_code(status), code);
+        }
+    }
+}
+
+/// #1588: `x0x start --foreground` on Windows runs x0xd as a child, so the
+/// child's exit status must reach the wrapper unchanged.
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_exec_regressions {
+    use super::foreground_exit_code;
+
+    fn exit_code_of_cmd(code: i32) -> i32 {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(format!("exit {code}"))
+            .status()
+            .expect("run cmd");
+        foreground_exit_code(status)
+    }
+
+    #[test]
+    fn foreground_exit_keeps_ex_tempfail() {
+        assert_eq!(exit_code_of_cmd(75), 75);
+    }
+
+    #[test]
+    fn foreground_exit_keeps_the_upgrade_request() {
+        assert_eq!(exit_code_of_cmd(100), 100);
+    }
+
+    #[test]
+    fn foreground_exit_keeps_other_failures() {
+        assert_eq!(exit_code_of_cmd(3), 3);
     }
 }
