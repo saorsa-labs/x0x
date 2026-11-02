@@ -51,11 +51,11 @@ macro_rules! arm_flush_regression_tests {
 
             #[test]
             fn arm_flush_auth_and_frozen_binding_precede_the_actual_flush() {
+                // The base request stays on the supervised owner, where a
+                // correct arm succeeds: each mutated field below is then the
+                // only reason its request refuses.
                 let (dir, mut journal, mut request, state) = fixture();
                 let root = dir.path().canonicalize().unwrap();
-                journal["plan"]["participants"][0]["restart"]["mode"] = json!("TransactionalHandoff");
-                request["plan"] = journal["plan"].clone();
-                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
                 let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let counted = Arc::clone(&calls);
                 let owner = shutdown_flush::register(root.clone(), Arc::new(move |_, _| {
@@ -84,6 +84,28 @@ macro_rules! arm_flush_regression_tests {
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 assert!(!root.join(shutdown_flush::RECORD).exists());
                 assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
+                // #1670: with every authentication and frozen-binding check
+                // passed, the transactional arm still refuses — no
+                // restart-capable owner exists — so the flush is never
+                // armed and the shutdown hook never runs.
+                journal["plan"]["participants"][0]["restart"]["mode"] = json!("TransactionalHandoff");
+                journal["plan"]["participants"][0]["restart"]["supervised_exit_code"] = json!(null);
+                request["plan"] = journal["plan"].clone();
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
+                let failure =
+                    arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
+                assert_eq!(failure.kind(), io::ErrorKind::Unsupported);
+                assert!(failure.to_string().contains("restart-capable owner"));
+                owner.join_workers();
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert!(!root.join(shutdown_flush::RECORD).exists());
+                assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
+                // The supervised owner still arms; the receipt, handoff and
+                // durable binding machinery are unchanged on that path.
+                journal["plan"]["participants"][0]["restart"]["mode"] = json!("SupervisedExit");
+                journal["plan"]["participants"][0]["restart"]["supervised_exit_code"] = json!(75);
+                request["plan"] = journal["plan"].clone();
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
                 let receipt = arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap().receipt;
                 owner.join_workers();
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -94,10 +116,65 @@ macro_rules! arm_flush_regression_tests {
                 let other = shutdown_flush::Binding::new(binding.transaction_id.clone(), 3, &("other", plan)).unwrap();
                 assert!(receipt.authorize(&other).is_err());
                 let journal::RecordRead::Handoff(handoff) = journal::read_boot_records(&root).handoff else { panic!("missing handoff") };
-                assert_eq!(handoff.legacy["mode"], json!("TransactionalHandoff"));
+                assert_eq!(handoff.legacy["mode"], json!("SupervisedExit"));
                 let saved: Value = serde_json::from_slice(&std::fs::read(root.join(shutdown_flush::RECORD)).unwrap()).unwrap();
                 assert!(saved["receipt_id"].as_str().is_some());
                 assert_eq!(saved["binding"], serde_json::to_value(binding).unwrap());
+            }
+
+            #[test]
+            fn arm_transactional_flush_without_a_restart_owner_refuses_before_shutdown() {
+                // Issue #1670: an authenticated arm that matches the frozen
+                // transaction, generation and this live participant may
+                // still not stop a TransactionalHandoff participant. The
+                // completed flush would end this process with exit 0 and no
+                // supervisor restart, and nothing at this head can complete
+                // the restart after it — this path spawns no helper and the
+                // launcher is not implemented. Admission must refuse before
+                // the shutdown, with a reason that names the missing owner,
+                // and the daemon keeps serving the pre-arm state.
+                let (dir, mut journal, mut request, state) = fixture();
+                let root = dir.path().canonicalize().unwrap();
+                journal["plan"]["participants"][0]["restart"]["mode"] =
+                    json!("TransactionalHandoff");
+                journal["plan"]["participants"][0]["restart"]["supervised_exit_code"] = json!(null);
+                request["plan"] = journal["plan"].clone();
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &journal).unwrap();
+                let cli: PathBuf =
+                    serde_json::from_value(journal["plan"]["cli"]["target_path"].clone())
+                        .unwrap();
+                std::fs::write(&cli, b"swapped candidate cli").unwrap();
+                let journal_before = std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap();
+                let called = Arc::new(AtomicBool::new(false));
+                let observed = Arc::clone(&called);
+                let owner = shutdown_flush::register(root.clone(), Arc::new(move |_, _| {
+                    observed.store(true, Ordering::SeqCst);
+                    Ok(())
+                }))
+                .unwrap();
+                let failure =
+                    arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err();
+                owner.join_workers();
+                assert!(matches!(failure, ArmFailure::Refused(_)), "{failure}");
+                assert_eq!(failure.kind(), io::ErrorKind::Unsupported);
+                let refusal = failure.to_string();
+                assert!(refusal.contains("restart-capable owner"), "{refusal}");
+                assert!(!called.load(Ordering::SeqCst));
+                // Nothing armed, restored or resolved: a retry refuses the
+                // same way from the unchanged pre-arm state.
+                assert!(!root.join(shutdown_flush::RECORD).exists());
+                assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
+                assert_eq!(
+                    std::fs::read(root.join(journal::JOURNAL_FILE_NAME)).unwrap(),
+                    journal_before
+                );
+                assert_eq!(std::fs::read(&cli).unwrap(), b"swapped candidate cli");
+                shutdown_flush::ensure_ready(&root).unwrap();
+                assert!(matches!(
+                    arm(&state, &root, &serde_json::to_vec(&request).unwrap()).unwrap_err(),
+                    ArmFailure::Refused(_)
+                ));
+                owner.join_workers();
             }
 
             #[test]
@@ -801,7 +878,7 @@ macro_rules! arm_flush_regression_tests {
 
             // #1665: use the production socket, owner, durability hook and
             // restart callback. No external supervisor or candidate is started.
-            async fn socket_success_completion(mode: &str, lost_requester: bool, parked_tail: bool) {
+            async fn socket_success_completion(lost_requester: bool, parked_tail: bool) {
                 use std::io::Write;
                 use tracing_subscriber::prelude::*;
                 struct Sink;
@@ -813,7 +890,7 @@ macro_rules! arm_flush_regression_tests {
                 let root = dir.path().canonicalize().unwrap();
                 // An injected status distinct from both the clean-stop default
                 // and failure status proves the frozen supervisor value is used.
-                record["plan"]["participants"][0]["restart"]["mode"] = json!(mode);
+                record["plan"]["participants"][0]["restart"]["mode"] = json!("SupervisedExit");
                 record["plan"]["participants"][0]["restart"]["supervised_exit_code"] = json!(42);
                 request["plan"] = record["plan"].clone();
                 journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
@@ -909,7 +986,7 @@ macro_rules! arm_flush_regression_tests {
                 assert!(!root.join(shutdown_flush::HOLD_RECORD).exists());
                 let _ = guard.shutdown_until(Instant::now() + Duration::from_secs(1));
                 assert!(completed, "successful socket receipt left the stopped participant alive");
-                assert_eq!(code, if mode == "SupervisedExit" { 42 } else { 0 },
+                assert_eq!(code, 42,
                     "completion must respect the frozen restart owner, not reuse failed-flush exit 75");
                 assert_eq!(exit_calls.load(Ordering::SeqCst), 1);
             }
@@ -917,19 +994,78 @@ macro_rules! arm_flush_regression_tests {
             #[cfg_attr(not(target_os = "linux"), ignore = "requires isolated Linux network namespace")]
             #[tokio::test]
             async fn socket_success_receipt_completes_while_shutdown_tail_is_parked() {
-                socket_success_completion("SupervisedExit", false, true).await;
+                socket_success_completion(false, true).await;
             }
 
             #[cfg_attr(not(target_os = "linux"), ignore = "requires isolated Linux network namespace")]
             #[tokio::test]
             async fn socket_success_receipt_completes_after_requester_disappears() {
-                socket_success_completion("SupervisedExit", true, false).await;
+                socket_success_completion(true, false).await;
             }
 
+            // #1670: over the production socket, an authenticated
+            // transactional arm with no restart-capable owner is refused
+            // before the shutdown. The reply names the missing owner, the
+            // stop hook never fires, no receipt or handoff is written and
+            // the daemon keeps serving.
             #[cfg_attr(not(target_os = "linux"), ignore = "requires isolated Linux network namespace")]
             #[tokio::test]
-            async fn socket_success_receipt_preserves_external_handoff_owner() {
-                socket_success_completion("TransactionalHandoff", false, false).await;
+            async fn socket_transactional_arm_without_owner_refuses_before_shutdown() {
+                use std::io::Write;
+                use tracing_subscriber::prelude::*;
+                struct Sink;
+                impl Write for Sink {
+                    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { Ok(bytes.len()) }
+                    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+                }
+                let (dir, mut record, mut request, _, cli, _backup) = swapped_cli_fixture();
+                let root = dir.path().canonicalize().unwrap();
+                record["plan"]["participants"][0]["restart"]["mode"] = json!("TransactionalHandoff");
+                record["plan"]["participants"][0]["restart"]["supervised_exit_code"] = json!(null);
+                request["plan"] = record["plan"].clone();
+                journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+                let agent = Arc::new(crate::Agent::builder()
+                    .with_identity_dir(&root).with_user_key_path(root.join("user.key"))
+                    .with_machine_key(root.join("machine.key"))
+                    .with_agent_key_path(root.join("agent.key"))
+                    .with_agent_cert_path(root.join("agent.cert"))
+                    .with_contact_store_path(root.join("contacts.json"))
+                    .with_peer_cache_disabled().build().await.unwrap());
+                assert!(agent.network().is_none());
+                let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+                    &root, Arc::clone(&agent)).await.unwrap();
+                let stopped = state.shutdown_notify.subscribe();
+                request["token"] = json!(state.api_token);
+                let (writer, mut guard) = log_flush::acknowledged(Sink).unwrap();
+                let dispatch = tracing::Dispatch::new(tracing_subscriber::registry()
+                    .with(log_flush::FlushLayer::new(vec![writer]).unwrap()));
+                let exit_code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+                let observed_exit = Arc::clone(&exit_code);
+                let mut owner = tracing::dispatcher::with_default(&dispatch,
+                    || FlushOwner::start(&state, &root, &root,
+                        Arc::new(move |code| observed_exit.store(code, std::sync::atomic::Ordering::SeqCst))))
+                    .unwrap();
+                let mut stream = tokio::net::UnixStream::connect(root.join(SOCKET)).await.unwrap();
+                let mut encoded = serde_json::to_vec(&request).unwrap(); encoded.push(b'\n');
+                stream.write_all(&encoded).await.unwrap();
+                let mut response = String::new();
+                tokio::time::timeout(Duration::from_secs(5),
+                    tokio::io::BufReader::new(&mut stream).read_line(&mut response))
+                    .await.unwrap().unwrap();
+                let response: Value = serde_json::from_str(&response).unwrap();
+                let error = response["error"].as_str().unwrap();
+                assert!(error.contains("restart-capable owner"), "{error}");
+                // The arm completed before its reply, so a stop that had
+                // begun would already be observable here.
+                assert!(!*stopped.borrow());
+                assert_eq!(exit_code.load(std::sync::atomic::Ordering::SeqCst), -1);
+                assert!(!root.join(shutdown_flush::RECORD).exists());
+                assert!(!root.join(journal::HANDOFF_FILE_NAME).exists());
+                assert_eq!(std::fs::read(&cli).unwrap(), b"candidate cli");
+                owner.control.abort(); let _ = (&mut owner.control).await;
+                state.exec_service.shutdown().await;
+                agent.try_shutdown().await.unwrap();
+                let _ = guard.shutdown_until(Instant::now() + Duration::from_secs(1));
             }
 
             #[tokio::test(start_paused = true)]
