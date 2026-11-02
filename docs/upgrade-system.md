@@ -239,10 +239,13 @@ hashes, investigate the storage fault and use a supported repair procedure;
 do not delete the marker or edit a phase to bypass the refusal. The configured
 binary still starts normally.
 
-Managed Windows apply remains refused by the restart planner. Unmanaged
-Windows keeps its released legacy apply behavior and does not claim these
-Unix M2 durability/probe guarantees. The inert flag works on both binaries
-on Windows as well.
+On Windows, the restart planner resolves `SupervisedExit` only when
+`X0X_SUPERVISED=1` comes from a verified version-2 wrapper (see
+[Windows](#windows) below). Otherwise it refuses managed apply. Supervised
+Windows apply checks the record barrier before download or replacement.
+The candidate probe stays Unix-only. Unmanaged Windows keeps its released
+legacy apply behavior and does not claim these M2 durability/probe
+guarantees. The inert flag works on both binaries on Windows as well.
 
 ### Binary replacement (`mod.rs`)
 
@@ -273,7 +276,7 @@ On Unix, a new legacy handoff keeps all released fields and adds
 ignore those additional fields. Both the old unversioned form and this
 marked form remain diagnostic intent. The unmanaged Windows helper keeps the
 unversioned form; this compatibility path makes no M2 directory-durability
-claim. The existing Windows managed refusal is unchanged.
+claim. Supervised Windows apply uses the record barrier below.
 
 Unix record writes require a file sync, replacement rename and parent
 directory sync. A failed barrier is a refusal, not an acknowledgement.
@@ -738,8 +741,9 @@ failed-upgrade hold keeps the restart loop from re-applying a release
 whose flush did fail that way. `x0xd --doctor` does not yet run this
 check; the admission refusal is the diagnostic surface today.
 
-The local control listener is a Unix socket, `upgrade-flush.sock` in the
-data directory, mode `0600`. It accepts one JSON request line carrying the
+On Unix, the local control listener is a Unix socket, `upgrade-flush.sock`
+in the data directory, mode `0600`. Windows uses a named pipe with the same
+protocol (see [Windows](#windows) below). It accepts one JSON request line carrying the
 API token, the transaction ID, generation, instance ID and frozen plan, and
 answers `{"receipt": …}` or `{"error": …}`. The daemon-side listener exists
 and is authenticated; the client that drives it belongs to later stack
@@ -813,12 +817,42 @@ is no CLI or API for this.
 
 #### Windows
 
-Supervised self-update needs the acknowledged flush, and the flush owner
-exists only on Unix (it needs the suspend-inclusive boot clock and the Unix
-control socket). On Windows, a supervised apply (`X0X_SUPERVISED=1`) is
-refused with "acknowledged shutdown owner unavailable" before any byte is
-replaced — it fails safe. This is accepted until a later slice covers
-Windows; a follow-up issue tracks the Windows flush owner.
+Windows has the same acknowledged flush owner and contract as Unix (#1588).
+The platform parts are:
+
+- **Clock**: `GetTickCount64` gives milliseconds since boot. It includes
+  sleep and hibernation and ignores wall-clock changes. The boot identity is
+  `windows-boot-<n>`, from the kernel `BootId` registry value
+  (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters\BootId`).
+  A missing `BootId` is a clock error. The flush is then refused before the
+  stop, and the daemon keeps serving.
+- **Record barrier**: `journal::open_for_sync` opens files with write access
+  and directories with `FILE_FLAG_BACKUP_SEMANTICS`. `sync_all`
+  (`FlushFileBuffers`) is the directory barrier. If the file system refuses
+  the flush, the barrier is refused. The flush walk needs write access, so
+  a read-only-attribute file in the data or identity root refuses the
+  upgrade at admission, before any byte changes. Clear the attribute.
+- **Control channel**: the daemon serves the same newline-delimited JSON
+  arm-and-flush protocol on the local named pipe
+  `\\.\pipe\x0x-upgrade-flush-<hex>`. `<hex>` is the first 32 hex
+  characters of the SHA-256 of the lowercased canonical data root. The pipe
+  DACL is `D:P(A;;GA;;;OW)` (owner rights only). The daemon creates the pipe
+  with `first_pipe_instance` against squatting and rejects remote clients.
+  It creates the next pipe instance before it hands out the connected one.
+  It still checks the API token on each request.
+- The failed-upgrade hold and the startup stale-record cleanup also run on
+  Windows.
+
+The generated wrapper (`src/cli/commands/windows-wrapper.ps1`, template
+version 2) restarts `x0xd` after exit 100 and after exit 75. Exit 75
+(`EX_TEMPFAIL`) follows a failed flush that restored the old binary. The
+wrapper propagates every other exit status. The readback accepts only
+version 2. A version-1 wrapper refuses supervised self-update; run
+`x0x autostart` to regenerate it. Before #1588, Windows refused every
+supervised apply, so no working setup loses self-update.
+
+Owed: final acceptance is a supervised self-update run on a Windows VM.
+That run is not done yet.
 
 ### Migrating an existing launchd job
 

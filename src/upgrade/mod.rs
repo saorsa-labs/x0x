@@ -527,7 +527,7 @@ pub(crate) fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std:
         if parent.as_os_str().is_empty() || synced.contains(&parent) {
             continue;
         }
-        std::fs::File::open(parent)?.sync_all()?;
+        journal::open_for_sync(parent, true)?.sync_all()?;
         synced.push(parent);
     }
     Ok(())

@@ -50,8 +50,11 @@ pub(crate) const WINDOWS_WRAPPER_ENV_VAR: &str = "X0X_WRAPPER";
 /// the wrapper's semantics change, bump this, regenerate the script, and a
 /// deployment still on the old version refuses self-update until
 /// `x0x autostart` regenerates it — drift becomes visible, not silent.
+/// Version 2 (#1588) also restarts after exit 75 (EX_TEMPFAIL), the status a
+/// failed acknowledged flush exits with after it restored the old binary.
+/// A version-1 script ends there and leaves the service down, so it refuses.
 #[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
-pub(crate) const WINDOWS_WRAPPER_TESTED_VERSION: u32 = 1;
+pub(crate) const WINDOWS_WRAPPER_TESTED_VERSION: u32 = 2;
 
 /// Bound on the old process's graceful cancel before it hard-exits. The macOS
 /// SIGTERM-hang incident is why this must be bounded, not generous.
@@ -2426,6 +2429,7 @@ pub(crate) fn readback_windows_wrapper_script(
     let mut wrapper_executable: Option<String> = None;
     let mut arguments: Option<Vec<String>> = None;
     let mut restart_on_100 = false;
+    let mut restart_on_75 = false;
     let mut loop_restarts_on_100 = false;
     let mut restart_loop = false;
     let mut duplicates: Vec<&'static str> = Vec::new();
@@ -2459,7 +2463,14 @@ pub(crate) fn readback_windows_wrapper_script(
                 duplicates.push("$x0xRestartOnExit100");
             }
             restart_on_100 = true;
-        } else if line == "if ($x0xExit -ne 100) { exit $x0xExit }" {
+        } else if line.starts_with("$x0xRestartOnExit75 = ") {
+            if line != "$x0xRestartOnExit75 = $true" {
+                duplicates.push("a conflicting $x0xRestartOnExit75 value");
+            } else if restart_on_75 {
+                duplicates.push("$x0xRestartOnExit75");
+            }
+            restart_on_75 = true;
+        } else if line == "if ($x0xExit -ne 100 -and $x0xExit -ne 75) { exit $x0xExit }" {
             if loop_restarts_on_100 {
                 duplicates.push("the exit-propagation line");
             }
@@ -2494,9 +2505,15 @@ pub(crate) fn readback_windows_wrapper_script(
     if !restart_on_100 {
         return refused("declare `$x0xRestartOnExit100 = $true`");
     }
+    if !restart_on_75 {
+        return refused("declare `$x0xRestartOnExit75 = $true`");
+    }
     if !loop_restarts_on_100 {
+        // A failed acknowledged flush restores the old binary and exits 75;
+        // the wrapper must restart it there (#1588), not end the service.
         return refused(
-            "propagate every exit status except 100 (`if ($x0xExit -ne 100) { exit $x0xExit }`)",
+            "propagate every exit status except 100 and 75 \
+             (`if ($x0xExit -ne 100 -and $x0xExit -ne 75) { exit $x0xExit }`)",
         );
     }
     if !restart_loop {
@@ -4541,12 +4558,13 @@ mod tests {
              $x0xExecutable = '{executable}'\n\
              $x0xArguments = @({arguments})\n\
              $x0xRestartOnExit100 = $true\n\
+             $x0xRestartOnExit75 = $true\n\
              $env:X0X_SUPERVISED = '1'\n\
              $env:X0X_WRAPPER = $PSCommandPath\n\
              while ($true) {{\n\
                  & $x0xExecutable @x0xArguments\n\
                  $x0xExit = $LASTEXITCODE\n\
-                 if ($x0xExit -ne 100) {{ exit $x0xExit }}\n\
+                 if ($x0xExit -ne 100 -and $x0xExit -ne 75) {{ exit $x0xExit }}\n\
                  Start-Sleep -Seconds 5\n\
              }}\n"
         )
@@ -4594,7 +4612,8 @@ mod tests {
         );
         // A version the build has not tested must refuse, naming both
         // versions, so drift is visible.
-        let drifted = windows_wrapper_script("2", "C:\\Tools\\x0xd.exe", "'--name','alice'");
+        // Version 1 (before #1588) does not restart after EX_TEMPFAIL.
+        let drifted = windows_wrapper_script("1", "C:\\Tools\\x0xd.exe", "'--name','alice'");
         match readback_windows_wrapper_script(&drifted, &argv) {
             WindowsWrapperReadback::NotGuaranteed { detail } => {
                 assert!(detail.contains("tested version"), "detail: {detail}")
@@ -4604,7 +4623,11 @@ mod tests {
         for (what, script) in [
             (
                 "no version",
-                canonical.replacen("$x0xWrapperVersion = 1\n", "", 1),
+                canonical.replacen(
+                    &format!("$x0xWrapperVersion = {WINDOWS_WRAPPER_TESTED_VERSION}\n"),
+                    "",
+                    1,
+                ),
             ),
             (
                 "policy flag off",
@@ -4616,8 +4639,26 @@ mod tests {
             (
                 "restart-on-any-exit",
                 canonical.replace(
-                    "if ($x0xExit -ne 100) { exit $x0xExit }",
+                    "if ($x0xExit -ne 100 -and $x0xExit -ne 75) { exit $x0xExit }",
                     "if ($x0xExit -eq 999) { exit $x0xExit }",
+                ),
+            ),
+            (
+                "version-1 exit line: EX_TEMPFAIL ends the service",
+                canonical.replace(
+                    "if ($x0xExit -ne 100 -and $x0xExit -ne 75) { exit $x0xExit }",
+                    "if ($x0xExit -ne 100) { exit $x0xExit }",
+                ),
+            ),
+            (
+                "EX_TEMPFAIL policy flag missing",
+                canonical.replace("$x0xRestartOnExit75 = $true\n", ""),
+            ),
+            (
+                "EX_TEMPFAIL policy flag off",
+                canonical.replace(
+                    "$x0xRestartOnExit75 = $true",
+                    "$x0xRestartOnExit75 = $false",
                 ),
             ),
             (

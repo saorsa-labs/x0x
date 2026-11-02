@@ -1,5 +1,7 @@
 //! The approved local arm-and-flush control plane stays alive while HTTP drains.
-#![cfg(unix)]
+//! Unix serves it on `<data_root>/upgrade-flush.sock` (mode 0600). Windows
+//! serves the same newline-delimited JSON protocol on a local named pipe
+//! whose DACL admits only the pipe owner (#1588); see `pipe_name`.
 
 use super::state::AppState;
 use crate::upgrade::{journal, log_flush, shutdown_flush};
@@ -14,6 +16,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+#[cfg(unix)]
 const SOCKET: &str = "upgrade-flush.sock";
 const MAX_REQUEST: usize = 1024 * 1024;
 
@@ -21,6 +24,7 @@ pub(super) struct FlushOwner {
     _registration: shutdown_flush::Registration,
     complete: mpsc::SyncSender<io::Result<()>>,
     control: tokio::task::JoinHandle<()>,
+    #[cfg(unix)]
     socket: PathBuf,
     /// Process exit after a completed socket flush or a started failure.
     /// Tests capture the carried status instead of ending the test process.
@@ -44,7 +48,7 @@ enum ArmFailure {
     FlushFailed(shutdown_flush::FlushFailure),
 }
 impl ArmFailure {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn kind(&self) -> io::ErrorKind {
         match self {
             ArmFailure::Refused(error) => error.kind(),
@@ -65,6 +69,7 @@ impl std::fmt::Display for ArmFailure {
 impl Drop for FlushOwner {
     fn drop(&mut self) {
         self.control.abort();
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket);
     }
 }
@@ -76,22 +81,36 @@ impl FlushOwner {
         identity_root: &Path,
         exit: Arc<dyn Fn(i32) + Send + Sync>,
     ) -> io::Result<Self> {
-        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        // An unreadable suspend-inclusive clock (for example a missing
+        // Windows `BootId`) disables supervised apply here, at startup,
+        // instead of at the first arm.
+        shutdown_flush::boot_identity()?;
         let root = data_root.canonicalize()?;
         let identity_root = identity_root.canonicalize()?;
         let roots = vec![root.clone(), identity_root.clone()];
+        #[cfg(unix)]
         let socket = root.join(SOCKET);
-        match std::fs::symlink_metadata(&socket) {
-            Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(&socket)?,
-            Ok(_) => return Err(io::Error::other("upgrade control path is not a socket")),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        // Restrict this path before accepting requests. Authentication still
-        // checks the API token for a connection queued between bind and chmod.
-        // Do not change the process-wide umask while other threads create files.
-        let listener = tokio::net::UnixListener::bind(&socket)?;
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        #[cfg(unix)]
+        let listener = {
+            use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+            match std::fs::symlink_metadata(&socket) {
+                Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(&socket)?,
+                Ok(_) => return Err(io::Error::other("upgrade control path is not a socket")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            // Restrict this path before accepting requests. Authentication
+            // still checks the API token for a connection queued between bind
+            // and chmod. Do not change the process-wide umask while other
+            // threads create files.
+            let listener = tokio::net::UnixListener::bind(&socket)?;
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            listener
+        };
+        // The owner-only DACL applies from the first instance, before any
+        // client can connect; the API token is still checked per request.
+        #[cfg(windows)]
+        let mut listener = windows_pipe::PipeListener::bind(&pipe_name(&root))?;
         let logs = log_flush::capture(&tracing::dispatcher::get_default(Clone::clone))?;
         let hook_logs = Arc::clone(&logs);
         let stop = super::routes::daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
@@ -128,7 +147,12 @@ impl FlushOwner {
         let control_exit = Arc::clone(&exit);
         let control_logs = Arc::clone(&logs);
         let control = tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
+            loop {
+                #[cfg(unix)]
+                let accepted = listener.accept().await.map(|(stream, _)| stream);
+                #[cfg(windows)]
+                let accepted = listener.accept().await;
+                let Ok(mut stream) = accepted else { break };
                 let mut bytes = Vec::new();
                 let read = tokio::time::timeout(Duration::from_secs(5), async {
                     let mut reader = tokio::io::BufReader::new(&mut stream);
@@ -198,6 +222,7 @@ impl FlushOwner {
             _registration: registration,
             complete,
             control,
+            #[cfg(unix)]
             socket,
             exit,
             flush_failed,
@@ -326,7 +351,7 @@ fn admit(state: &ControlContext, root: &Path, bytes: &[u8]) -> io::Result<Admitt
         || !participant.was_running
         || participant.process_start != Some(process_start()?)
         || participant.old_pid != Some(std::process::id())
-        || participant.boot_id != crate::upgrade::probe::ProbeClock::now()?.boot_id
+        || participant.boot_id != shutdown_flush::boot_identity()?
         || participant.executable
             != crate::upgrade::apply::current_binary_path().map_err(io::Error::other)?
     {
@@ -591,7 +616,7 @@ fn restore_arm(
                 if serde_json::to_vec(&current)? == serde_json::to_vec(handoff)? =>
             {
                 std::fs::remove_file(root.join(journal::HANDOFF_FILE_NAME))?;
-                std::fs::File::open(root)?.sync_all()?;
+                journal::open_for_sync(root, true)?.sync_all()?;
             }
             _ => return Err(io::Error::other("arm recovery handoff changed; preserved")),
         }
@@ -603,7 +628,7 @@ fn restore_arm(
         uuid::Uuid::new_v4()
     ));
     std::fs::rename(&journal_path, &archive)?;
-    std::fs::File::open(root)?.sync_all()
+    journal::open_for_sync(root, true)?.sync_all()
 }
 
 fn sync_tree(path: &Path, deadline: &shutdown_flush::Deadline) -> io::Result<()> {
@@ -663,17 +688,33 @@ fn sync_tree_with(
     }
     if meta.is_dir() || meta.is_file() {
         deadline.check()?;
-        let file = match std::fs::File::open(path) {
+        // Windows opens with write access for FlushFileBuffers, so a
+        // read-only-attribute file refuses here. The admission preflight
+        // runs this same open, so that refusal comes before any byte changes.
+        let file = match journal::open_for_sync(path, meta.is_dir()) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot open shutdown state {}: {error}", path.display()),
+                ))
+            }
         };
         deadline.check()?;
         sync(&file)?;
         deadline.check()?;
     } else {
-        use std::os::unix::fs::FileTypeExt;
-        if !meta.file_type().is_socket() {
+        // Only the Unix control socket is accepted. The Windows control pipe
+        // lives in the pipe namespace, not in the data root.
+        #[cfg(unix)]
+        let accepted = {
+            use std::os::unix::fs::FileTypeExt;
+            meta.file_type().is_socket()
+        };
+        #[cfg(not(unix))]
+        let accepted = false;
+        if !accepted {
             return Err(io::Error::other(format!(
                 "unsupported shutdown state file type: {}",
                 path.display()
@@ -683,7 +724,8 @@ fn sync_tree_with(
     Ok(())
 }
 
-// Native start identity: Linux /proc start ticks, Darwin start microseconds.
+// Native start identity: Linux /proc start ticks, Darwin start microseconds,
+// Windows creation time in 100 ns FILETIME units.
 fn process_start() -> io::Result<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -724,7 +766,11 @@ fn process_start() -> io::Result<u64> {
             .and_then(|n| n.checked_add(info.pbi_start_tvusec))
             .ok_or_else(|| io::Error::other("process start identity overflow"))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        windows_pipe::process_creation_time()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -733,11 +779,165 @@ fn process_start() -> io::Result<u64> {
     }
 }
 
-#[cfg(test)]
+/// Windows control pipe for one data root (#1588): a local requester derives
+/// it from the canonical data root, as a Unix requester derives
+/// `<data_root>/upgrade-flush.sock`. Windows paths are case-insensitive, so
+/// the root is lowercased before hashing.
+#[cfg(any(windows, test))]
+pub(super) fn pipe_name(root: &Path) -> String {
+    let digest = Sha256::digest(root.to_string_lossy().to_lowercase().as_bytes());
+    let hex: String = digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(r"\\.\pipe\x0x-upgrade-flush-{hex}")
+}
+
+/// Owner-only pipe DACL: protected (no inherited ACEs), full access for the
+/// `OWNER RIGHTS` SID only. Other local users cannot open the pipe, and
+/// `reject_remote_clients` refuses network clients.
+#[cfg(windows)]
+const PIPE_SDDL: &str = "D:P(A;;GA;;;OW)";
+
+#[cfg(windows)]
+mod windows_pipe {
+    use std::{ffi::c_void, io, os::windows::ffi::OsStrExt};
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl: *const u16,
+            revision: u32,
+            descriptor: *mut *mut c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessTimes(
+            process: isize,
+            creation: *mut u64,
+            exit: *mut u64,
+            kernel: *mut u64,
+            user: *mut u64,
+        ) -> i32;
+    }
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        length: u32,
+        descriptor: *mut c_void,
+        inherit: i32,
+    }
+
+    /// A self-relative security descriptor owned by `LocalFree`.
+    struct Descriptor(*mut c_void);
+    // SAFETY: the descriptor is immutable after creation and only read by
+    // CreateNamedPipeW; LocalFree runs once, in Drop.
+    unsafe impl Send for Descriptor {}
+    unsafe impl Sync for Descriptor {}
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            // SAFETY: the pointer came from the SDDL conversion and is freed once.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    pub(super) struct PipeListener {
+        name: String,
+        descriptor: Descriptor,
+        server: NamedPipeServer,
+    }
+
+    impl PipeListener {
+        pub(super) fn bind(name: &str) -> io::Result<Self> {
+            let sddl: Vec<u16> = std::ffi::OsStr::new(super::PIPE_SDDL)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let mut descriptor = std::ptr::null_mut();
+            // SAFETY: `sddl` is a nul-terminated UTF-16 buffer that outlives
+            // the call; the output pointer is owned by `Descriptor` on success.
+            if unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let descriptor = Descriptor(descriptor);
+            // The first instance refuses a name another process already
+            // holds, so a squatter cannot receive the owner's requests.
+            let server = create(name, &descriptor, true)?;
+            Ok(Self {
+                name: name.to_owned(),
+                descriptor,
+                server,
+            })
+        }
+
+        /// Wait for one client. The next instance is created before the
+        /// connected one is handed out, so the name is never unowned.
+        pub(super) async fn accept(&mut self) -> io::Result<NamedPipeServer> {
+            self.server.connect().await?;
+            let next = create(&self.name, &self.descriptor, false)?;
+            Ok(std::mem::replace(&mut self.server, next))
+        }
+    }
+
+    fn create(name: &str, descriptor: &Descriptor, first: bool) -> io::Result<NamedPipeServer> {
+        let mut attributes = SecurityAttributes {
+            length: std::mem::size_of::<SecurityAttributes>() as u32,
+            descriptor: descriptor.0,
+            inherit: 0,
+        };
+        // SAFETY: `attributes` is a valid SECURITY_ATTRIBUTES whose descriptor
+        // stays alive in the listener for every instance it creates.
+        unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(
+                    name,
+                    (&mut attributes as *mut SecurityAttributes).cast(),
+                )
+        }
+    }
+
+    pub(super) fn process_creation_time() -> io::Result<u64> {
+        let (mut creation, mut exit, mut kernel, mut user) = (0_u64, 0_u64, 0_u64, 0_u64);
+        // SAFETY: the pseudo-handle needs no close; each output is an owned,
+        // 8-byte FILETIME-sized buffer.
+        if unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(creation)
+    }
+}
+
+#[cfg(all(test, unix))]
 include!("../../tests/upgrade_arm_flush.rs");
-#[cfg(test)]
+#[cfg(all(test, unix))]
 arm_flush_regression_tests!();
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod arm_flush_regressions_unused_reservation {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1082,5 +1282,24 @@ mod arm_flush_regressions_unused_reservation {
             "an overrun before the stop must not exit EX_TEMPFAIL"
         );
         assert!(!cancel.is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod windows_control_channel_regressions {
+    use super::*;
+
+    #[test]
+    fn pipe_name_is_local_stable_per_root_and_case_insensitive() {
+        let root = Path::new(r"\\?\C:\Users\Alice\AppData\Roaming\x0x");
+        let name = pipe_name(root);
+        assert!(name.starts_with(r"\\.\pipe\x0x-upgrade-flush-"));
+        assert_eq!(name.len(), r"\\.\pipe\x0x-upgrade-flush-".len() + 32);
+        assert_eq!(name, pipe_name(root));
+        assert_eq!(
+            name,
+            pipe_name(Path::new(r"\\?\c:\users\alice\appdata\roaming\x0x"))
+        );
+        assert_ne!(name, pipe_name(Path::new(r"\\?\C:\Users\Bob\x0x")));
     }
 }

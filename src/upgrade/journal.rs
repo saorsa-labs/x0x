@@ -715,9 +715,9 @@ pub(crate) fn write_record(path: &Path, record: &impl Serialize) -> io::Result<(
 /// A passing preflight cannot predict later I/O failure, so the writer still
 /// checks every barrier and never acknowledges a failed operation.
 pub(crate) fn check_record_barrier_support(data_dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        let directory = File::open(data_dir).map_err(|error| {
+        let directory = open_for_sync(data_dir, true).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("cannot open upgrade record directory: {error}"),
@@ -736,7 +736,7 @@ pub(crate) fn check_record_barrier_support(data_dir: &Path) -> io::Result<()> {
             )
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = data_dir;
         Err(io::Error::new(
@@ -744,6 +744,30 @@ pub(crate) fn check_record_barrier_support(data_dir: &Path) -> io::Result<()> {
             "durable upgrade record directory sync is unsupported on this platform; \
              apply must be refused before replacing binaries",
         ))
+    }
+}
+
+/// Open a file or directory for a `sync_all` barrier. Unix opens it
+/// read-only. Windows `FlushFileBuffers` needs write access, and a directory
+/// handle needs `FILE_FLAG_BACKUP_SEMANTICS`; NTFS then flushes the directory
+/// entries, the Windows equivalent of a Unix directory fsync (#1588). A file
+/// system that refuses the flush fails the barrier, and the caller refuses.
+pub(crate) fn open_for_sync(path: &Path, directory: bool) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if directory {
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        options.open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = directory;
+        File::open(path)
     }
 }
 
@@ -872,7 +896,7 @@ fn replace_record_bytes(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     check_record_barrier_support(parent)?;
-    let directory = File::open(parent)?;
+    let directory = open_for_sync(parent, true)?;
     let (temporary_path, mut temporary) = create_replacement(parent)?;
     let result = (|| {
         before(BarrierStep::Write)?;
