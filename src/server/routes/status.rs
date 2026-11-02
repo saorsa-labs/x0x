@@ -296,7 +296,7 @@ fn one_sided_reason(count: usize) -> String {
     };
     format!(
         "{count} connected {noun} one-sided (one direction idle > {}s while the other direction still has traffic, \
-         or both directions idle > {}s while other peers have traffic and the liveness probe failed)",
+         or both directions idle > {}s and the liveness probe failed)",
         crate::network::ONE_SIDED_STALE.as_secs(),
         crate::network::ONE_SIDED_STALE.as_secs()
     )

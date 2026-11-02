@@ -150,17 +150,18 @@ async fn one_sided_torn_loopback_link_probe_receipt() {
         ),
         Err(error) => {
             // The receipt the PR body cites: the holding end sees an
-            // error naming the link. A propagated close can also drop the
-            // peer from the table, which is PeerNotFound.
+            // error that names the link. Only a timeout or a closed
+            // connection names it: x0x's probe classifier treats every
+            // other class, including PeerNotFound, as inconclusive, so
+            // no other class can confirm a both-stale link.
             let names_link = matches!(
                 error,
                 ant_quic::EndpointError::ProbeTimeout
                     | ant_quic::EndpointError::ConnectionClosed { .. }
-                    | ant_quic::EndpointError::PeerNotFound(_)
             );
             assert!(
                 names_link,
-                "receipt: unexpected probe error class on a torn real link: {error:?}"
+                "receipt: probe error class that does not name the link on a torn real link: {error:?}"
             );
         }
     }

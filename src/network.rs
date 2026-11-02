@@ -437,9 +437,10 @@ pub(crate) fn one_sided_peer_ids_from(samples: &[LinkAgeSample]) -> Vec<AntPeerI
 /// [`NetworkNode::resolve_one_sided_peers`], not one-sided by their ages
 /// alone: a quiet link and a broken link share this shape. A node whose
 /// every peer is quiet selects nobody, so its quiet peers stay up. A peer
-/// in `probe_fresh`, one this node probed successfully inside
-/// [`ONE_SIDED_FLOWING`], does not count as the flowing peer, so probing
-/// cannot bootstrap probing on a quiet node.
+/// in `probe_fresh`, one this node probed inside the probe-fresh window
+/// without a live broken-link verdict — successful or inconclusive — does
+/// not count as the flowing peer, so probing cannot bootstrap probing on a
+/// quiet node.
 pub(crate) fn both_stale_candidate_indexes(
     samples: &[LinkAgeSample],
     probe_fresh: &std::collections::HashSet<AntPeerId>,
@@ -576,6 +577,17 @@ struct OneSidedRepair {
     scheduler_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
+/// A both-stale confirmation counts only inside its window (#1419). The
+/// verdict expires with [`ONE_SIDED_REDIAL_BACKOFF`], so a stale flag an
+/// inconclusive probe left in place never lists, degrades or re-dials a
+/// peer on its own.
+fn confirmed_inside_window(entry: &OneSidedRepair, now: Instant) -> bool {
+    entry.both_stale_confirmed
+        && entry
+            .both_stale_confirmed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF)
+}
+
 /// Keep backoff and the warning unless the peer's own link has recovered.
 ///
 /// A sample that omits the peer is not recovery. The timestamp stays through
@@ -611,12 +623,6 @@ fn plan_one_sided_repairs(
             }
         }
     }
-    let confirmed_inside_window = |entry: &OneSidedRepair| {
-        entry.both_stale_confirmed
-            && entry
-                .both_stale_confirmed_at
-                .is_some_and(|at| now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF)
-    };
     map.retain(|peer, entry| {
         let in_backoff = entry
             .last_attempt
@@ -624,7 +630,7 @@ fn plan_one_sided_repairs(
         let still_one_sided = samples
             .iter()
             .any(|sample| sample.peer == *peer && sample.age.one_sided());
-        let still_confirmed = confirmed_inside_window(entry)
+        let still_confirmed = confirmed_inside_window(entry, now)
             && samples
                 .iter()
                 .any(|sample| sample.peer == *peer && sample.age.both_directions_stale());
@@ -639,7 +645,7 @@ fn plan_one_sided_repairs(
             return None;
         }
         let entry = map.get(&sample.peer)?;
-        confirmed_inside_window(entry).then_some(sample.peer)
+        confirmed_inside_window(entry, now).then_some(sample.peer)
     }));
     peers.sort_unstable();
     peers.dedup();
@@ -3786,9 +3792,10 @@ impl NetworkNode {
                 Ok(map) => map,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            // A peer this node probed successfully just now is fresh only
-            // because of that probe. It must not qualify another quiet
-            // peer for probing.
+            // A peer this node probed just now, with no live broken-link
+            // verdict, is fresh only because of that probe. A successful
+            // probe and an inconclusive one count the same. Such a peer
+            // must not qualify another quiet peer for probing.
             // The window covers the reply too: ant-quic stamps the
             // receive activity when the ack arrives, up to one probe
             // budget after the tick began.
@@ -3815,21 +3822,18 @@ impl NetworkNode {
                     continue;
                 }
                 let peer = sample.peer;
-                let (probed_inside_window, confirmed_before, confirmed_inside_window) =
-                    match map.get(&peer) {
-                        Some(entry) => (
-                            entry.both_stale_probe_at.is_some_and(|at| {
-                                now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF
-                            }),
-                            entry.both_stale_confirmed,
-                            entry.both_stale_confirmed
-                                && entry.both_stale_confirmed_at.is_some_and(|at| {
-                                    now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF
-                                }),
-                        ),
-                        None => (false, false, false),
-                    };
-                if confirmed_inside_window {
+                let (probed_inside_window, confirmed_before, confirmed_live) = match map.get(&peer)
+                {
+                    Some(entry) => (
+                        entry.both_stale_probe_at.is_some_and(|at| {
+                            now.saturating_duration_since(at) < ONE_SIDED_REDIAL_BACKOFF
+                        }),
+                        entry.both_stale_confirmed,
+                        confirmed_inside_window(entry, now),
+                    ),
+                    None => (false, false, false),
+                };
+                if confirmed_live {
                     degraded.push(peer);
                 }
                 if probed_inside_window {
@@ -3927,7 +3931,10 @@ impl NetworkNode {
                     continue;
                 }
                 apply_one_sided_probe(entry, now, &result);
-                if entry.both_stale_confirmed {
+                // The window check, not the flag alone: an inconclusive
+                // probe leaves an expired verdict in place, and that stale
+                // flag must not degrade the peer for one tick.
+                if confirmed_inside_window(entry, now) {
                     degraded.push(*peer);
                 }
             }
@@ -3964,14 +3971,15 @@ impl NetworkNode {
         };
         for peer in peers {
             let suppressed = self.is_reconnect_suppressed(peer.0);
+            let now = Instant::now();
             let both_stale = match self.one_sided_repairs.lock() {
                 Ok(map) => map
                     .get(&peer)
-                    .is_some_and(|entry| entry.both_stale_confirmed),
+                    .is_some_and(|entry| confirmed_inside_window(entry, now)),
                 Err(poisoned) => poisoned
                     .into_inner()
                     .get(&peer)
-                    .is_some_and(|entry| entry.both_stale_confirmed),
+                    .is_some_and(|entry| confirmed_inside_window(entry, now)),
             };
             if self.mark_one_sided_warned(&peer) {
                 #[cfg(test)]
@@ -3982,7 +3990,7 @@ impl NetworkNode {
                     suppressed,
                     "one-sided peer link: {}",
                     if both_stale {
-                        "both directions are idle while other peers have traffic and the liveness probe failed"
+                        "both directions are idle and the liveness probe failed"
                     } else {
                         "one direction is idle while the other direction still has traffic"
                     }
@@ -11857,6 +11865,95 @@ mod tests {
         a.try_shutdown().await.unwrap();
         b.try_shutdown().await.unwrap();
         c.try_shutdown().await.unwrap();
+    }
+
+    /// #1419: a confirmation that expired, then an inconclusive re-probe,
+    /// must not put the peer back on the degraded list. The probe leaves
+    /// the expired verdict's flag in place; only a probe that names the
+    /// link broken inside the window degrades.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_inconclusive_probe_does_not_redegrade_an_expired_confirmation() {
+        let plane = "issue1419-inconclusive-reprobe";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let node = NetworkNode::new(
+            NetworkConfig {
+                bind_addr: Some(SocketAddr::from(([198, 18, 0, 1], 5483))),
+                network_id: Some(plane.to_string()),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Absent from the fabric, so the sim probe answers with the
+        // not-connected error: inconclusive, not a link-naming failure.
+        let absent = test_ant_peer(9);
+        let expired = Instant::now() - ONE_SIDED_REDIAL_BACKOFF - Duration::from_secs(1);
+        {
+            let mut repairs = node.one_sided_repairs.lock().unwrap();
+            repairs.insert(
+                absent,
+                OneSidedRepair {
+                    both_stale_probe_at: Some(expired),
+                    both_stale_confirmed: true,
+                    both_stale_confirmed_at: Some(expired),
+                    ..OneSidedRepair::default()
+                },
+            );
+        }
+        let samples = [
+            LinkAgeSample {
+                peer: absent,
+                age: LinkTrafficAge {
+                    sent_ago: Some(Duration::from_secs(90)),
+                    received_ago: Some(Duration::from_secs(90)),
+                },
+            },
+            LinkAgeSample {
+                peer: test_ant_peer(8),
+                age: LinkTrafficAge {
+                    sent_ago: Some(Duration::from_secs(1)),
+                    received_ago: Some(Duration::from_secs(1)),
+                },
+            },
+        ];
+        let before = node.one_sided_probes.load(Ordering::Relaxed);
+        let degraded = node.resolve_one_sided_peers(&samples).await;
+        assert!(
+            degraded.is_empty(),
+            "an expired confirmation plus an inconclusive probe does not degrade: {degraded:?}"
+        );
+        assert_eq!(
+            node.one_sided_probes.load(Ordering::Relaxed),
+            before + 1,
+            "the expired verdict earns one re-probe"
+        );
+        // The inconclusive probe keeps its cooldown entry: a second pass
+        // neither probes again nor degrades.
+        let degraded = node.resolve_one_sided_peers(&samples).await;
+        assert!(
+            degraded.is_empty(),
+            "the cooldown pass after an inconclusive probe does not degrade: {degraded:?}"
+        );
+        assert_eq!(
+            node.one_sided_probes.load(Ordering::Relaxed),
+            before + 1,
+            "a peer probed inside the window is not probed again"
+        );
+        {
+            let repairs = node.one_sided_repairs.lock().unwrap();
+            let entry = repairs.get(&absent).unwrap();
+            assert!(
+                entry.both_stale_probe_at.is_some_and(|at| at > expired),
+                "the inconclusive probe moved the probe timestamp"
+            );
+        }
+        node.try_shutdown().await.unwrap();
     }
 
     /// #1419: one health tick probes at most two both-stale candidates,
