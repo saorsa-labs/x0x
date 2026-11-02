@@ -114,6 +114,19 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let head = view(sim, "A", &group).await?;
     all_reach(sim, &["O", "A"], &group, &head.state_hash).await?;
     let b_hex = sim.agent_hex("B")?;
+    // A must hold B's KeyPackage by the ban route's own lookup before it
+    // bans B. Otherwise the ban answers `424 member_key_package_pending`
+    // (retry: true) and the row stops as INFRA. A miss here is INFRA.
+    sim.until("A holds B's KeyPackage", SETUP, async |s: &Sim| {
+        let Ok(state) = s.state("A") else {
+            return false;
+        };
+        crate::server::routes::named_groups::holds_member_key_package_for_removal(
+            &state, &group, &b_hex,
+        )
+        .await
+    })
+    .await?;
     let path = format!("/groups/{group}/ban/{b_hex}");
     let (code, body) = sim.api("A", Method::POST, &path, None).await?;
     ensure!(code.is_success(), "A bans B: {code} {body}");
