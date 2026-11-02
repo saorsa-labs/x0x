@@ -35,7 +35,7 @@ use ant_quic::crypto::raw_public_keys::pqc::{
 use ant_quic::MlDsaPublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::groups::crypto_exclusion::CommitHeaderV1;
+use crate::groups::crypto_exclusion::{committed_secret_epoch, CommitHeaderV1};
 use crate::groups::member::{GroupMemberState, GroupRole};
 use crate::groups::policy::GroupConfidentiality;
 use crate::groups::GroupInfo;
@@ -639,7 +639,11 @@ pub fn validate_mandate(
 
 /// The receiver's L4 checks for an `OwnerRecoveryV1` commit against its
 /// current verified parent state. `current_epoch` is this node's TreeKEM
-/// epoch (ignored for other planes).
+/// epoch (ignored for other planes). The GSS transition starts at the
+/// parent's [`committed_secret_epoch`], not the local `secret_epoch`:
+/// a sealed share can raise the local epoch before the commit of that
+/// epoch arrives, the same baseline as `CryptoExclusionV1`
+/// (#1597 item 1).
 ///
 /// The caller holds the group's membership lock and calls this
 /// immediately before it applies the commit. The embedded commit must
@@ -719,7 +723,7 @@ pub fn validate_against_parent(
                     == Some(treekem_binding(*next_epoch, commits).as_str())
         }
         (OwnerRecoveryCryptoV1::Gss { next_secret_epoch }, RecoveryCryptoKind::Gss) => {
-            *next_secret_epoch == parent.secret_epoch.saturating_add(1)
+            *next_secret_epoch == committed_secret_epoch(parent).saturating_add(1)
                 && body.commit.security_binding.as_deref()
                     == Some(gss_binding(*next_secret_epoch).as_str())
         }
@@ -1152,7 +1156,7 @@ mod tests {
                 };
             }
             RecoveryCryptoKind::Gss => {
-                let next_secret_epoch = f.info.secret_epoch + 1;
+                let next_secret_epoch = committed_secret_epoch(&f.info).saturating_add(1);
                 next.secret_epoch = next_secret_epoch;
                 next.security_binding = Some(gss_binding(next_secret_epoch));
                 body.crypto = OwnerRecoveryCryptoV1::Gss { next_secret_epoch };
@@ -1215,6 +1219,49 @@ mod tests {
             verify_commit_signatures(&frame).expect("signatures");
             validate_against_parent(&frame.body, &f.info, 3, &f.revocations, NOW).expect("valid");
         }
+    }
+
+    /// #1597 item 1: a sealed share raised the local `secret_epoch`
+    /// before the commit of that epoch arrived. A recovery that starts
+    /// at the committed epoch is valid; the local epoch is not the
+    /// baseline.
+    #[test]
+    fn gss_recovery_starts_at_the_committed_epoch() {
+        let mut f = fixture(
+            GroupConfidentiality::MlsEncrypted,
+            crate::mls::SecureGroupPlane::Gss,
+        );
+        f.info.security_binding = Some(gss_binding(f.info.secret_epoch));
+        f.info
+            .seal_commit_evicting(&f.admin, 700)
+            .expect("seal head");
+        // The early share: the local epoch, secret and live binding are
+        // one ahead of the head the commit log retains.
+        f.info.secret_epoch += 1;
+        f.info.shared_secret = Some(vec![9u8; 32]);
+        f.info.security_binding = Some(gss_binding(f.info.secret_epoch));
+        assert_eq!(committed_secret_epoch(&f.info), 4);
+        let mandate = mandate_for(&f);
+        let frame = sign_commit(commit_for(&f, mandate, 0), &f.promoted).expect("sign");
+        assert!(matches!(
+            frame.body.crypto,
+            OwnerRecoveryCryptoV1::Gss {
+                next_secret_epoch: 5
+            }
+        ));
+        validate_against_parent(&frame.body, &f.info, 0, &f.revocations, NOW)
+            .expect("the committed baseline is valid");
+        // The local baseline (local + 1) skips the committed epoch, so
+        // the receiver refuses that commit.
+        let mut local = frame.body.clone();
+        if let OwnerRecoveryCryptoV1::Gss { next_secret_epoch } = &mut local.crypto {
+            *next_secret_epoch += 1;
+            local.commit.security_binding = Some(gss_binding(*next_secret_epoch));
+        }
+        assert_eq!(
+            validate_against_parent(&local, &f.info, 0, &f.revocations, NOW),
+            Err(OwnerRecoveryRefusal::RecoveryProofInvalid)
+        );
     }
 
     #[test]
