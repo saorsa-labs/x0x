@@ -715,9 +715,9 @@ pub(crate) fn write_record(path: &Path, record: &impl Serialize) -> io::Result<(
 /// A passing preflight cannot predict later I/O failure, so the writer still
 /// checks every barrier and never acknowledges a failed operation.
 pub(crate) fn check_record_barrier_support(data_dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        let directory = File::open(data_dir).map_err(|error| {
+        let directory = open_for_sync(data_dir, true).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("cannot open upgrade record directory: {error}"),
@@ -736,7 +736,7 @@ pub(crate) fn check_record_barrier_support(data_dir: &Path) -> io::Result<()> {
             )
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = data_dir;
         Err(io::Error::new(
@@ -744,6 +744,30 @@ pub(crate) fn check_record_barrier_support(data_dir: &Path) -> io::Result<()> {
             "durable upgrade record directory sync is unsupported on this platform; \
              apply must be refused before replacing binaries",
         ))
+    }
+}
+
+/// Open a file or directory for a `sync_all` barrier. Unix opens it
+/// read-only. Windows `FlushFileBuffers` needs write access, and a directory
+/// handle needs `FILE_FLAG_BACKUP_SEMANTICS`; NTFS then flushes the directory
+/// entries, the Windows equivalent of a Unix directory fsync (#1588). A file
+/// system that refuses the flush fails the barrier, and the caller refuses.
+pub(crate) fn open_for_sync(path: &Path, directory: bool) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if directory {
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        options.open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = directory;
+        File::open(path)
     }
 }
 
@@ -872,7 +896,7 @@ fn replace_record_bytes(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     check_record_barrier_support(parent)?;
-    let directory = File::open(parent)?;
+    let directory = open_for_sync(parent, true)?;
     let (temporary_path, mut temporary) = create_replacement(parent)?;
     let result = (|| {
         before(BarrierStep::Write)?;
@@ -1152,5 +1176,61 @@ mod refusal_diagnostics_tests {
             .unwrap()
             .contains("M2 recovery is not active"));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+}
+
+/// #1588: the Windows record barrier opens files and directories for
+/// `FlushFileBuffers`. These run the real calls on a Windows host.
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_exec_regressions {
+    use super::*;
+
+    fn boot_record(generation: u64) -> Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "record_kind": "boot",
+            "transaction_id": "transaction-a",
+            "generation": generation,
+            "instance_id": "alice",
+            "attempt": 1,
+            "pid": 5678,
+            "process_start": 200,
+            "boot_id": "boot-a",
+            "started_at_ns": 300,
+            "deadline_ns": 600
+        })
+    }
+
+    #[test]
+    fn windows_open_for_sync_flushes_a_file_and_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("record.json");
+        std::fs::write(&file_path, b"{}").unwrap();
+        let file = open_for_sync(&file_path, false).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let directory = open_for_sync(dir.path(), true).unwrap();
+        assert!(directory.metadata().unwrap().is_dir());
+        directory.sync_all().unwrap();
+    }
+
+    #[test]
+    fn windows_record_barrier_support_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        check_record_barrier_support(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn windows_write_record_writes_and_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(BOOT_FILE_NAME);
+        for generation in [3, 4] {
+            write_record(&path, &boot_record(generation)).unwrap();
+            let bytes = read_bytes(&path).unwrap();
+            let stored: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(stored, boot_record(generation));
+            assert!(matches!(read_record(&path, "boot"), RecordRead::Boot(_)));
+        }
     }
 }

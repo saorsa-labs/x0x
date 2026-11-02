@@ -340,7 +340,9 @@ fn legacy_handoff_referencing_a_cleanup_pattern_keeps_its_recovery_bytes() {
     }
 }
 
-#[cfg(not(unix))]
+// Platforms with no record barrier. Windows has one since #1588; see
+// `windows_m2_record_barriers_write_and_replace`.
+#[cfg(not(any(unix, windows)))]
 #[test]
 fn unsupported_m2_record_barriers_refuse_before_mutation() {
     let dir = TempDir::new().unwrap();
@@ -385,6 +387,60 @@ fn unsupported_m2_record_barriers_refuse_before_mutation() {
         assert_eq!(std::fs::read(&target).unwrap(), b"configured binary");
         assert_eq!(std::fs::read(&backup).unwrap(), b"rollback binary");
     }
+}
+
+// #1588: Windows flushes the record and its directory with
+// `FlushFileBuffers`, so typed M2 records now write and replace there.
+#[cfg(windows)]
+#[test]
+fn windows_m2_record_barriers_write_and_replace() {
+    let dir = TempDir::new().unwrap();
+    journal::check_record_barrier_support(dir.path()).unwrap();
+    let path = dir.path().join(journal::BOOT_FILE_NAME);
+    let record = |generation: u64| {
+        serde_json::json!({
+            "schema_version": 1,
+            "record_kind": "boot",
+            "transaction_id": "transaction-a",
+            "generation": generation,
+            "instance_id": "alice",
+            "attempt": 1,
+            "pid": 5678,
+            "process_start": 200,
+            "boot_id": "boot-a",
+            "started_at_ns": 300,
+            "deadline_ns": 600
+        })
+    };
+    let target = dir.path().join("x0xd.exe");
+    let backup = dir.path().join("x0xd.backup");
+    std::fs::write(&target, b"configured binary").unwrap();
+    std::fs::write(&backup, b"rollback binary").unwrap();
+    for preexisting in [false, true] {
+        if preexisting {
+            std::fs::write(&path, serde_json::to_vec(&record(3)).unwrap()).unwrap();
+        } else {
+            assert!(!path.exists());
+        }
+        journal::write_record(&path, &record(4)).unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored, record(4));
+        assert!(matches!(
+            journal::read_boot_records(dir.path()).boot,
+            journal::RecordRead::Boot(_)
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"configured binary");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"rollback binary");
+        std::fs::remove_file(&path).unwrap();
+    }
+    // No replacement file is left behind beside the record.
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".x0x-upgrade-record-"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover replacements: {leftovers:?}");
 }
 
 #[cfg(windows)]
