@@ -4517,12 +4517,15 @@ async fn durable_send_1455(
 /// the durable send pays the 250 ms legacy bus fallback (measured ~45% of
 /// sends on main). The send path now records the recipient machine as the
 /// inbox owner, so the recipient holds the eager seat for its own inbox
-/// topic on the sender. The asserted invariant is that seat; the fallback
-/// count per send is reported as evidence. Fails on main whenever the
-/// hash-order eager pick misses the recipient (the common draw on a
-/// seven-peer plane). The simulated-fabric twin
-/// `leaf_dm_inbox_owner_is_promoted_eager_over_bystanders` is the
-/// deterministic guard.
+/// topic on the sender. Asserted: that seat, typed delivery and receipt;
+/// the per-send `legacy_bus_fallback_publish` count (and whether local
+/// saturation shed a frame) is reported evidence — under this fixture the
+/// ACK leg alone can exceed the 250 ms window, so a wall-clock assert
+/// would flake for reasons the eager target does not control. On main
+/// the seat is a per-process-random hash-order draw that missed the
+/// recipient in 5/5 measured runs. The simulated-fabric twin
+/// `leaf_dm_inbox_owner_is_promoted_eager_over_bystanders` sweeps five
+/// owner draws, so a dropped pin escapes it only ~(2/7)^5 of the time.
 #[tokio::test]
 async fn dm_1455_bystander_plane_durable_send_stays_on_inbox_eager() {
     let dir = tempfile::tempdir().expect("fixture directory");
@@ -4557,14 +4560,16 @@ async fn dm_1455_bystander_plane_durable_send_stays_on_inbox_eager() {
         for label in ["send-1", "send-2", "send-3"] {
             let id = dm_send::fresh_request_id();
             let payload = marked(label);
+            let budget_before = pubsub(alice).stage_stats().outbound_budget_exhausted
+                + pubsub(bob).stage_stats().outbound_budget_exhausted;
             let fallbacks = durable_send_1455(alice, bob, &keys[1], id, payload.clone()).await;
             // The #1455 invariant, asserted where the defect lives: the
             // recipient's own machine must hold an eager seat in the
             // sender's bounded EAGER set for THEIR inbox topic. On main the
-            // seat is a tied-score hash-order draw over the whole plane, so
-            // bystanders take it whenever the draw misses the recipient —
-            // the single EAGER frame then strands and the send pays the
-            // 250 ms dm_bus fallback (the reported count below).
+            // seat is a tied-score hash-order draw over the whole plane
+            // (per-process random), so bystanders take it on most draws —
+            // the measured failure was 5/5 runs — and the single EAGER
+            // frame then strands.
             let snap = pubsub(alice).stage_stats();
             let role = snap
                 .peer_scores_by_topic
@@ -4589,13 +4594,20 @@ async fn dm_1455_bystander_plane_durable_send_stays_on_inbox_eager() {
             assert_eq!(actual.sender, alice.agent_id());
             assert_eq!(actual.payload, payload);
             assert!(actual.verified);
-            // The fallback count is reported evidence, not the assertion:
-            // under this fixture's capability-advert load sg's per-peer
-            // in-flight data permit can still shed a DM EAGER frame (local
-            // saturation, unrelated to target selection), which fires the
-            // fallback even though the recipient holds the eager seat.
+            // The user-visible symptom is reported, not asserted: under
+            // this fixture the ACK leg alone can exceed the 250 ms window
+            // (ack-job startup, first-publish topic joins, direct-hedge
+            // setup, or an sg local-saturation shed — `shed` below covers
+            // the byte-budget and per-peer-permit paths on both ends), so a
+            // wall-clock assert here would flake for reasons the eager
+            // target does not control. The causal chain is guarded instead:
+            // the seat assert above plus the simulated-fabric unit test's
+            // EAGER-frame-to-owner assertion.
+            let shed = snap.outbound_budget_exhausted
+                + pubsub(bob).stage_stats().outbound_budget_exhausted
+                > budget_before;
             eprintln!(
-                "ISSUE1455 checkpoint={label} fallback_events={fallbacks} request={}",
+                "ISSUE1455 checkpoint={label} fallback_events={fallbacks} shed={shed} request={}",
                 hex::encode(id)
             );
             // Drain per-peer in-flight permits so one send's frames cannot
@@ -4605,6 +4617,11 @@ async fn dm_1455_bystander_plane_durable_send_stays_on_inbox_eager() {
     })
     .catch_unwind()
     .await;
+    // Orderly teardown for success AND assertion panic, matching the #501
+    // cases: no spawned fixture task is left detached for nextest to flag.
+    for agent in &agents {
+        agent.shutdown().await;
+    }
     drop(agents);
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
