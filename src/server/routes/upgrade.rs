@@ -1105,14 +1105,16 @@ fn verify_gossip_release_with_key(payload: &[u8], trusted_key: &[u8]) -> Option<
 }
 
 /// #1169: a node that first observes a new release must not stay silent
-/// until each peer's fallback poll fires. Every observation point — the
-/// startup check, the post-restart broadcast, the fallback poll, gossip
-/// relay, the `/upgrade` check and a manual `/upgrade/apply` — announces
-/// the signed manifest on `RELEASE_TOPIC`. The GitHub poll cadence stays
-/// at its documented fallback (A14 / ADR 0045); gossip is the fast path.
-/// Best effort and bounded: a stuck mesh must never block the observer,
-/// and peer rebroadcast limiting plus the apply owner's dedup handle
-/// repeats.
+/// until each peer's fallback poll fires. Every live observation point —
+/// the every-launch manifest broadcast, the fallback poll, gossip relay,
+/// the `/upgrade` check and a manual `/upgrade/apply` — announces the
+/// signed manifest on `RELEASE_TOPIC`. (The startup check also has a
+/// publish site, but the daemon currently runs it with no agent, so boot
+/// coverage comes from the manifest broadcast.) The GitHub poll cadence
+/// stays at its documented fallback (A14 / ADR 0045); gossip is the fast
+/// path. Best effort and bounded: a stuck mesh must never block the
+/// observer, and peer rebroadcast limiting plus the apply owner's dedup
+/// handle repeats.
 async fn announce_observed_release<Publish, PublishFuture>(
     release: &VerifiedRelease,
     publish: Publish,
@@ -1665,7 +1667,9 @@ pub(in crate::server) async fn check_upgrade(State(state): State<Arc<AppState>>)
             // learn about the release; announce it before the (cached)
             // response keeps every later check silent for the cache TTL.
             // Gated like the apply paths: an embedder with self-update off
-            // must not gain a new updater side-effect.
+            // gains no announce. With self-update on, note that gossip
+            // self-delivery can feed this node's own apply owner — the same
+            // fully gated pipeline any peer's announcement would enter.
             if state.self_update_enabled {
                 let agent = Arc::clone(&state.agent);
                 announce_observed_release(&release, move |payload| async move {
@@ -1839,20 +1843,6 @@ pub(in crate::server) async fn apply_upgrade(
         }
     };
 
-    // #1169: announce before the apply work — the receipt, staging and
-    // rollout waits below can take minutes, and peers must not wait for
-    // their own fallback poll while this node already saw the release.
-    {
-        let agent = Arc::clone(&state.agent);
-        announce_observed_release(&release, move |payload| async move {
-            agent
-                .publish(RELEASE_TOPIC, payload)
-                .await
-                .map_err(|error| error.to_string())
-        })
-        .await;
-    }
-
     let restart_context = RestartContext {
         data_dir: Some(state.data_dir.clone()),
         api_addr: Some(state.api_address),
@@ -1864,6 +1854,23 @@ pub(in crate::server) async fn apply_upgrade(
     // Discovery retains the existing conflict behavior. The potentially long
     // receipt/probe wait must release the shared replacement lock.
     drop(upgrade_guard);
+
+    // #1169: announce before the apply work — the receipt, staging and
+    // rollout waits below can take minutes, and peers must not wait for
+    // their own fallback poll while this node already saw the release.
+    // After the lock drop: a bounded-but-slow publish must not hold the
+    // shared replacement lock away from background and startup applies.
+    {
+        let agent = Arc::clone(&state.agent);
+        announce_observed_release(&release, move |payload| async move {
+            agent
+                .publish(RELEASE_TOPIC, payload)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await;
+    }
+
     let runtime = HttpUpgradeRuntime {
         config: state.update_config.clone(),
         restart_context,
@@ -2421,12 +2428,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn release_propagation_reaches_a_subscribed_peer_within_two_heartbeats() {
+    async fn announced_release_propagates_to_a_subscribed_peer_immediately() {
         // #1169 acceptance shape, honestly signed: a node observes a
         // release and announces the real signed payload; a subscribed peer
         // verifies it, rebroadcasts it and queues it with its background
-        // apply owner — within two heartbeats of the observation. The two
-        // sides are wired by a channel; no network, no testnet.
+        // apply owner. Propagation is immediate — the peer reacts in the
+        // same scheduling round, not at a heartbeat or poll boundary, which
+        // is what keeps the fleet inside the issue's 2 x heartbeat bar.
+        // The two sides are wired by a channel; no network, no testnet.
         use x0x::upgrade::signature::sign_with_context;
         let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
             .generate_keypair()
@@ -2497,10 +2506,10 @@ mod tests {
         .await;
 
         let peer_reacted_at = relayed_rx.recv().await.expect("peer reacted");
-        assert!(
-            peer_reacted_at.duration_since(start)
-                < 2 * Duration::from_secs(x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS),
-            "a subscribed peer reacted within two heartbeat cycles"
+        assert_eq!(
+            peer_reacted_at.duration_since(start),
+            Duration::ZERO,
+            "the peer reacts in the same scheduling round as the observation"
         );
         assert_eq!(
             queued.lock().unwrap().as_slice(),

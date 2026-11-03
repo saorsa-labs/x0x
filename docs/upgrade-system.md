@@ -941,13 +941,14 @@ no gossip, binds nothing, and takes no instance lock.
 2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
 4. **Announce on first observation** (#1169): every point that first observes
-   a release — the startup check, the startup manifest broadcast
-   (`broadcast_current_manifest`, on every launch), the fallback poll, gossip
-   relay, the `/upgrade` check and a manual `/upgrade/apply` — announces the
-   signed manifest on the release topic, so subscribed peers start their
-   update check from the announcement instead of their own fallback poll.
-   The GitHub poll cadence does not change (A14 / ADR 0045): gossip is the
-   fast path. The `/upgrade` and `/upgrade/apply` announcements are bounded
+   a release — the startup manifest broadcast (`broadcast_current_manifest`,
+   on every launch; the startup check's own publish site is dormant because
+   the daemon runs it with no agent), the fallback poll, gossip relay, the
+   `/upgrade` check and a manual `/upgrade/apply` — announces the signed
+   manifest on the release topic, so subscribed peers start their update
+   check from the announcement instead of their own fallback poll. The
+   GitHub poll cadence does not change (A14 / ADR 0045): gossip is the fast
+   path. The `/upgrade` and `/upgrade/apply` announcements are bounded
    (10 s) and best effort; peer rebroadcast limiting and the apply owner's
    dedup handle repeats.
 5. **Authenticated HTTP apply**: Verify the release and wait for staging, then
