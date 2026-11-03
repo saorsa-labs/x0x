@@ -9174,16 +9174,16 @@ mod daemon_tests {
         Ok(())
     }
 
-    /// #1775 item 2 (claude review round 2): the held-rotation exit is
-    /// the walk's own step author's key, not any admin's. B's later
-    /// rotation waits held while another admin's share of that epoch is
-    /// installed: the frame keeps waiting, because the record does not
-    /// name B. This and the positive test vary exactly the quantity the
-    /// guard checks — the rotation's author — so their held shapes
-    /// differ: the rotation's author must stay seated at the walk's
-    /// cursor, which one extra seat cannot give both variants.
+    /// #1775 item 2 (rounds 2-6): the held exit belongs to the author
+    /// of the step that RAISED the epoch, not to the last step's author
+    /// and not to any admin. The held chain raises with B's rotation and
+    /// then rides the author's rename; the record names B — the raising
+    /// author — so the exit fires. A last-step rule would hand it to the
+    /// renaming author and strand the frame. An author-named record
+    /// cannot probe the negative side: the author is the frame's actor,
+    /// so its share applies through the actor rule.
     #[tokio::test]
-    async fn another_admins_installed_secret_takes_no_held_exit() -> Result<()> {
+    async fn the_held_exit_belongs_to_the_raising_step_author() -> Result<()> {
         use anyhow::Context as _;
         let mut fx = None;
         let mut b_kp = None;
@@ -9285,37 +9285,71 @@ mod daemon_tests {
             },
         )
         .context("the frame's keyless result")?;
-        let author_kp = fx.state.agent.identity().agent_keypair();
-        let mut held_next = f_result.clone();
-        held_next.roster_revision = held_next.roster_revision.saturating_add(1);
-        held_next.remove_member(&survivor_hex, Some(admin_hex.clone()));
-        held_next.secret_epoch = next_secret_epoch + 1;
-        held_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
-        let held_commit = held_next
-            .seal_commit(author_kp, 0)
-            .context("seal the author's removal")?;
-        let held_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+        // The held chain has two steps (round 6, finding 2): B's
+        // rotation raises the epoch past the frame's, and the author's
+        // role update rides on it without raising further — so the LAST
+        // step's author is the author, whose key the record names, while
+        // the RAISING step's author is B. The exit belongs to B's key
+        // only; under a last-step rule the author's installed key would
+        // wrongly take it.
+        let mut b_rotation = f_result.clone();
+        b_rotation.roster_revision = b_rotation.roster_revision.saturating_add(1);
+        b_rotation.remove_member(&survivor_hex, Some(b_hex.clone()));
+        b_rotation.secret_epoch = next_secret_epoch + 1;
+        b_rotation.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let b_commit = b_rotation
+            .seal_commit(&b_kp, 0)
+            .context("seal B's removal")?;
+        let b_rotation_head = b_commit.state_hash.clone();
+        let b_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
             group_id: fx.group_id.clone(),
-            revision: held_next.roster_revision,
-            actor: admin_hex.clone(),
+            revision: b_rotation.roster_revision,
+            actor: b_hex.clone(),
             agent_id: survivor_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
             secret_epoch: Some(next_secret_epoch + 1),
-            commit: Some(held_commit),
+            commit: Some(b_commit),
         };
         super::super::owner_recovery::seed_held_event_for_test(
             &fx.replica,
             &fx.stable,
-            held_removal,
-            admin,
+            b_removal,
+            b,
             Some(f_result.state_hash.clone()),
         )
         .await;
+        let author_kp = fx.state.agent.identity().agent_keypair();
+        let mut rename = b_rotation.clone();
+        rename.state_hash = b_rotation_head.clone();
+        rename.roster_revision = rename.roster_revision.saturating_add(1);
+        rename.name = "renamed".to_string();
+        let rename_commit = rename
+            .seal_commit(author_kp, 0)
+            .context("seal the author's rename")?;
+        let held_rename = ng::NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: fx.group_id.clone(),
+            revision: rename.roster_revision,
+            actor: admin_hex.clone(),
+            name: Some("renamed".to_string()),
+            description: None,
+            commit: Some(rename_commit),
+        };
+        super::super::owner_recovery::seed_held_event_for_test(
+            &fx.replica,
+            &fx.stable,
+            held_rename,
+            admin,
+            Some(b_rotation_head),
+        )
+        .await;
+        // The record names B, the RAISING step's author, so the exit
+        // fires; under a last-step rule (the author's rename) it would
+        // not, and the frame would keep waiting.
         assert_eq!(
             receive(&fx.replica, admin, &frame).await,
-            ReceiveOutcome::WaitingForShare,
-            "another admin's installed secret takes no held exit: the frame keeps waiting"
+            ReceiveOutcome::Applied,
+            "the held exit belongs to the raising step's author, not the last step's"
         );
         Ok(())
     }

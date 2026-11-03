@@ -380,47 +380,53 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
             })
 }
 
-/// #1775 rounds 3-5: whether `mark_head` is `info`'s head or one of
-/// its retained ancestors, in one reverse pass over the retained log.
-/// A retained ancestor that commits an epoch below `mark_epoch` is the
-/// floor of the mark's epoch: the chain dipped below it without passing
-/// through the mark's head, so a sibling commit of the epoch voids the
-/// mark however deep the chain runs. A head the log does not retain, or
-/// a log truncated above its genesis, cannot disprove the mark, so it
-/// stays (fail closed); a genesis reached without the mark does not.
+/// #1775 rounds 3-6: whether `mark_head` is `info`'s head or one of
+/// its retained ancestors, following the head's own `prev_state_hash`
+/// links entry by entry — the log also holds adopted chains that fork
+/// from earlier ancestors, so a positional pass proves nothing. An
+/// entry on the head's chain that commits an epoch below `mark_epoch`
+/// is the floor of the mark's epoch: the chain dipped below it without
+/// passing through the mark's head, so a sibling commit of the epoch
+/// voids the mark however deep the chain runs. A link the log does not
+/// retain cannot disprove the mark, so it stays (fail closed); a
+/// genesis reached without the mark does not.
 fn head_reaches(info: &x0x::groups::GroupInfo, mark_epoch: u64, mark_head: &str) -> bool {
-    if mark_head == info.state_hash {
-        return true;
-    }
     let epoch_of = |binding: Option<&str>| {
         binding?
             .strip_prefix("gss:epoch=")
             .and_then(|epoch| epoch.parse::<u64>().ok())
     };
-    let mut seen_head = false;
-    for retained in info.commit_log.iter().rev() {
-        let commit = &retained.commit;
-        if !seen_head {
-            seen_head = commit.state_hash == info.state_hash;
-            continue;
-        }
-        if commit.state_hash == mark_head {
+    // Follow the head's own prev links entry by entry: the retained log
+    // also holds adopted chains that fork from earlier ancestors, so a
+    // positional pass proves nothing.
+    let mut cursor = info.state_hash.clone();
+    for _ in 0..=info.commit_log.len() {
+        if cursor == mark_head {
             return true;
         }
-        if epoch_of(commit.security_binding.as_deref()).is_some_and(|epoch| epoch < mark_epoch) {
+        let Some(retained) = info
+            .commit_log
+            .iter()
+            .rev()
+            .find(|retained| retained.commit.state_hash == cursor)
+        else {
+            // The chain left the retained log: the mark stays (fail
+            // closed), as the committed epoch itself falls back.
+            return true;
+        };
+        if epoch_of(retained.commit.security_binding.as_deref())
+            .is_some_and(|epoch| epoch < mark_epoch)
+        {
+            // The floor of the mark's epoch, on the head's own chain:
+            // the mark's head is not an ancestor.
             return false;
         }
+        match retained.commit.prev_state_hash.as_deref() {
+            Some(prev) => cursor = prev.to_string(),
+            None => return false,
+        }
     }
-    if !seen_head {
-        // The head is not retained: the mark stays, as the committed
-        // epoch itself falls back to the local one.
-        return true;
-    }
-    // The oldest retained ancestor: a genesis ends the chain without
-    // the mark; a truncation cannot disprove it.
-    info.commit_log
-        .first()
-        .is_none_or(|oldest| oldest.commit.prev_state_hash.is_some())
+    true
 }
 
 /// #1775 item 4: whether the secret of its local epoch that `info` holds
@@ -1775,6 +1781,93 @@ mod tests {
         assert!(
             !replaces_uncommitted_secret(&state, &group_key, &raised, &actor, 2),
             "the stale sibling mark authorises no replace of an unpinned secret"
+        );
+
+        // A non-linear retained log (round 6): the keyless head sits in
+        // the log beside the sibling chain, and an adopted fork hangs
+        // below the mark's epoch — position proves nothing, only the
+        // head's own prev links do.
+        let mut forked = gss_info_at_head(1, None);
+        let parent_hash = forked.state_hash.clone();
+        let keyless_in_log = format!("keyless-in-log-{parent_hash}");
+        let sibling_head = format!("sibling-head-{parent_hash}");
+        let adopted = format!("adopted-fork-{parent_hash}");
+        let commit_at = |revision, prev: Option<String>, binding, hash: String| {
+            x0x::groups::state_commit::RetainedCommit {
+                commit: x0x::groups::state_commit::GroupStateCommit {
+                    group_id: "g".to_string(),
+                    revision,
+                    prev_state_hash: prev,
+                    roster_root: String::new(),
+                    policy_hash: String::new(),
+                    public_meta_hash: String::new(),
+                    security_binding: binding,
+                    state_hash: hash,
+                    withdrawn: false,
+                    committed_by: String::new(),
+                    committed_at: 0,
+                    signer_public_key: String::new(),
+                    signature: String::new(),
+                },
+                roster: std::collections::BTreeMap::new(),
+                meta: None,
+            }
+        };
+        forked.commit_log.push(commit_at(
+            2,
+            Some(parent_hash.clone()),
+            Some("gss:epoch=2".to_string()),
+            keyless_in_log.clone(),
+        ));
+        forked.commit_log.push(commit_at(
+            2,
+            Some(parent_hash.clone()),
+            Some("gss:epoch=2".to_string()),
+            sibling_head.clone(),
+        ));
+        forked.commit_log.push(commit_at(
+            9,
+            Some(adopted.clone()),
+            None,
+            format!("unrelated-{parent_hash}"),
+        ));
+        forked.secret_epoch = 2;
+        forked.shared_secret = Some(foreign.to_vec());
+        forked.state_hash = sibling_head.clone();
+        note_keyless_commit(&state, &group_key, 2, &actor, &keyless_in_log).await;
+        assert!(
+            !withholds(&state, &group_key, &forked),
+            "a keyless head sitting in the log beside the sibling chain voids nothing"
+        );
+        // The reverse error: a rename on the true keyless head keeps the
+        // mark though the log holds an unrelated fork below the epoch.
+        let mut chained = gss_info_at_head(1, None);
+        chained.secret_epoch = 2;
+        chained.shared_secret = Some(foreign.to_vec());
+        let chain_parent = chained.state_hash.clone();
+        chained.commit_log.push(commit_at(
+            2,
+            Some(chain_parent.clone()),
+            Some("gss:epoch=2".to_string()),
+            keyless_in_log.clone(),
+        ));
+        chained.commit_log.push(commit_at(
+            9,
+            Some("elsewhere".to_string()),
+            None,
+            format!("unrelated2-{chain_parent}"),
+        ));
+        let rename_head = format!("rename-on-{keyless_in_log}");
+        chained.commit_log.push(commit_at(
+            3,
+            Some(keyless_in_log.clone()),
+            Some("gss:epoch=2".to_string()),
+            rename_head.clone(),
+        ));
+        chained.state_hash = rename_head;
+        assert!(
+            withholds(&state, &group_key, &chained),
+            "a rename on the true keyless head keeps the mark past an unrelated fork"
         );
     }
 

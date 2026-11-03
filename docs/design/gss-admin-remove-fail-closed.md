@@ -355,7 +355,7 @@ except citations explicitly marked as resolving at
   info.shared_secret.is_some())` (statement `:5831-5835`; the conjunct is `:5832`), whose
   own doc comment (`:5827-5830`) states the intent. #1766/#1771 added a third conjunct —
   the equal-epoch arm refuses only when the share may not replace the installed
-  uncommitted secret (`!gss_share_hold::replaces_uncommitted_secret`) — and #1775 widened
+  secret that no commit pins (`!gss_share_hold::replaces_uncommitted_secret`) — and #1775 widened
   that replace to a secret no verified commit pins and a keyless commit's mark. (The
   parked-removal replace half that #1775 also added stays dormant until a fenced
   `gss_removal_waits_for_share` change lands, per that PR.) The strict `<` clear and

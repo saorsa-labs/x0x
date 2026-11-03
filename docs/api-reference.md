@@ -1910,32 +1910,36 @@ re-joins. The window between the
 keyed seat and the installed share is the same superseded-intermediate
 shape the 02:09 ruling keeps as main's answer, bounded by the share
 delivery the S4 row owes. Until one of the two keys the seat again, the
-hold lasts: an installed share of the held epoch, or a later one whose
-epoch a head commit pins (#1775: a sealed share that raised the local
-epoch past what the head commits completed no verified transition), or
-the #1663 republication (while the node holds no secret), ends it. The
-exclusion installing with its own key ends every older hold too. A
-share of the held epoch ends the hold only when its sender is a
-recorded actor of that hold and the share's secret is the one recorded
+hold lasts until one of these ends it:
+- An installed share of the held epoch, or of a later epoch that a head
+  commit pins. A sealed share that raised the local epoch past what the
+  head commits completed no verified transition (#1775).
+- The #1663 republication, while the node holds no secret.
+- The exclusion installing with its own key. This ends every older hold.
+
+A share of the held epoch ends the hold only when its sender is a
+recorded actor of that hold, and the share's secret is the one recorded
 for that sender (#1766). A share of the same epoch from a different
-admin installs, but the hold stays. The actor's share of that epoch
-then replaces the other admin's uncommitted secret. After a #1578
-keyless install the head already commits the epoch, but it binds the
-epoch, not the secret value (#1775): the durable keyless mark keeps
-that epoch's first installed secret replaceable — and the group's new
-ciphertext held, also past the #1663 republication — until the
-exclusion's own actor seals a share of it. Until then, any secret whose
-sender the record does not name stays replaceable. The mark claims
-exactly its own epoch, and the head that its keyless commit moved or a
-commit chained on it: a sibling commit of the epoch ends the mark, and
-so does a head that commits a later epoch. A share of a later unpinned
-epoch is not the mark's actor key. A hold also ends when one of its
-recorded actors seals a later epoch's unpinned secret. A known-empty
-evicted-removal hold ends at any secret of its epoch, committed or not.
-A hold whose actor list is unknown (a pre-#1771 exclusion file) is
-ended by no secret that a commit does not pin; one that carries removed
-members is an evicted removal's containment, which ends at any secret
-of its epoch.
+admin installs, but the hold stays. The actor's share of that epoch then
+replaces the other admin's secret that no commit pins.
+
+After a #1578 keyless install, the head already commits the epoch, but
+it binds the epoch, not the secret value (#1775). The durable keyless
+mark keeps that epoch's first installed secret replaceable, and the
+group's new ciphertext held, until the exclusion's own actor seals a
+share of it. This also holds past the #1663 republication. Until then,
+any secret whose sender the record does not name stays replaceable.
+The mark claims exactly its own epoch, and the head that its keyless
+commit moved, or a commit chained on that head. A sibling commit of the
+epoch ends the mark. So does a head that commits a later epoch. A share
+of a later unpinned epoch is not the mark's actor key.
+
+A hold also ends when one of its recorded actors seals a later epoch's
+unpinned secret. A known-empty evicted-removal hold ends at any secret
+of its epoch, committed or not. A hold whose actor list is unknown (a
+pre-#1771 exclusion file) is ended by no secret that a commit does not
+pin. One that carries removed members is an evicted removal's
+containment, which ends at any secret of its epoch.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
