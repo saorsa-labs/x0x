@@ -643,6 +643,18 @@ impl SubjectState {
         self.pending = None;
         self.cooled = None;
     }
+
+    /// Whether a later wait or refusal leaves the view in place. A sticky
+    /// state waits for its own exit (§8). A verified `catching_up` holds
+    /// while this node still makes progress, so a refusal or a silent round
+    /// does not replace it with `awaiting_attestation` (#1661). After
+    /// [`s3::GATE_STALL`] without progress the wait that names the stall
+    /// replaces it.
+    fn holds_view(&self, now: Instant) -> bool {
+        self.view.sticky()
+            || matches!(self.view, SubjectView::CatchingUp { verified: true, .. })
+                && now.saturating_duration_since(self.progress_at) < s3::GATE_STALL
+    }
 }
 
 /// The §8 states this node holds for itself.
@@ -3866,7 +3878,7 @@ pub(super) async fn retire_converged(state: &Arc<AppState>, group_id: &str) {
             .subjects
             .entry(stable.clone())
             .or_insert_with(|| SubjectState::new(now, info.state_revision));
-        if !subject.view.sticky() {
+        if !subject.holds_view(now) {
             subject.view = SubjectView::Awaiting {
                 reason: "segment_exhausted".to_string(),
             };
@@ -4303,7 +4315,7 @@ async fn next_target(
     };
     if exhausted {
         // §2 "Segments": the next segment is due now, not after a stall.
-        if !subject.view.sticky() {
+        if !subject.holds_view(now) {
             subject.view = SubjectView::Awaiting {
                 reason: "segment_exhausted".to_string(),
             };
@@ -4326,7 +4338,7 @@ async fn next_target(
         subject.pending = None;
         subject.next_target = subject.next_target.saturating_add(1);
         if subject.next_target >= targets.len() {
-            if !subject.view.sticky() {
+            if !subject.holds_view(now) {
                 subject.view = SubjectView::Awaiting {
                     reason: "no_reply".to_string(),
                 };
@@ -4344,7 +4356,7 @@ async fn next_target(
         return None;
     }
     if targets.is_empty() {
-        if !subject.view.sticky() {
+        if !subject.holds_view(now) {
             subject.view = SubjectView::Awaiting {
                 reason: "no_capable_peer".to_string(),
             };
@@ -4598,7 +4610,7 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
                     advance_round(subject, now, from_pending);
                 }
                 other => {
-                    if !subject.view.sticky() {
+                    if !subject.holds_view(now) {
                         subject.view = SubjectView::Awaiting {
                             reason: other.as_str().to_string(),
                         };
@@ -4918,7 +4930,7 @@ async fn arm_from_response(
                 .entry(stable.clone())
                 .or_insert_with(|| SubjectState::new(now, info.state_revision));
             subject.provisional = Some((ata, info.state_revision));
-            if !subject.view.sticky() {
+            if !subject.holds_view(now) {
                 subject.view = SubjectView::CatchingUp {
                     attested_by: attested_by.clone(),
                     verified: false,
@@ -5025,7 +5037,7 @@ async fn provisional_tick(state: &Arc<AppState>, group_key: &str, info: &GroupIn
             clear_provisional(state, &stable).await;
             let mut inner = state.group_recovery.inner.lock().await;
             if let Some(subject) = inner.subjects.get_mut(&stable) {
-                if !subject.view.sticky() {
+                if !subject.holds_view(Instant::now()) {
                     subject.view = SubjectView::Awaiting {
                         reason: "provisional_unverified".to_string(),
                     };
@@ -8849,6 +8861,64 @@ mod tests {
             segment_terminal: 1
         }
         .sticky());
+    }
+
+    /// #1661: a verified `catching_up` holds against a `rate_limited`
+    /// refusal while the node still makes progress, so `recovery.state`
+    /// does not flip to `awaiting_attestation` and back. After
+    /// `GATE_STALL` without progress the refusal replaces it, so a stalled
+    /// catch-up still shows its wait. Red without `holds_view`: the first
+    /// refusal shows `awaiting_attestation {rate_limited}`.
+    #[tokio::test]
+    async fn catching_up_holds_against_a_refusal_until_it_stalls() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let target = *admin.agent_id().as_bytes();
+        let held = SubjectView::CatchingUp {
+            attested_by: ata.fields.attested_by.clone(),
+            verified: true,
+            segment_terminal: ata.fields.segment_terminal_revision,
+        };
+        let refuse = |progress_at: Instant| {
+            let state = &state;
+            let stable = stable.clone();
+            let held = held.clone();
+            let info = &info;
+            let admin = &admin;
+            async move {
+                let now = Instant::now();
+                let mut subject = SubjectState::new(now, info.state_revision);
+                subject.view = held;
+                subject.progress_at = progress_at;
+                subject.pending = Some((target, now, info.state_hash.clone()));
+                state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .subjects
+                    .insert(stable.clone(), subject);
+                handle_response(
+                    state,
+                    admin.agent_id(),
+                    GroupAttestResponseV1 {
+                        group: stable.clone(),
+                        subject: *state.agent.agent_id().as_bytes(),
+                        for_head_state_hash: info.state_hash.clone(),
+                        answer: AttestAnswer::Refused(AttestRefusalReason::RateLimited),
+                    },
+                )
+                .await;
+                view_of(state, &stable).await
+            }
+        };
+        assert_eq!(refuse(Instant::now()).await, Some(held.clone()));
+        let stalled = Instant::now()
+            .checked_sub(s3::GATE_STALL)
+            .ok_or_else(|| anyhow::anyhow!("clock too early for GATE_STALL"))?;
+        assert_eq!(refuse(stalled).await, awaiting("rate_limited"));
+        Ok(())
     }
 
     #[test]
