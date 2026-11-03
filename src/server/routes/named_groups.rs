@@ -18967,6 +18967,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &info,
                 secret_epoch,
                 &sender_hex,
+                &secret,
             )
             .await;
             *replay_group_id = Some(resolved_group_key.clone());

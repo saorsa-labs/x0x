@@ -2914,18 +2914,15 @@ async fn install_gss(
     // #1766: a secret of the frame's epoch is uncommitted (the frame binds
     // the parent's committed epoch + 1). It is the frame's key only when
     // the frame's actor sealed its share. A secret from another sender,
-    // or from a sender this process does not know (a restart), is not
-    // kept: the frame waits for its actor's share, which may replace it
-    // ([`ng::gss_share_hold::replaces_uncommitted_secret`]).
+    // or with no sender record for that exact secret (another install
+    // path, or a crash between the key write and the record write), is
+    // not kept: the frame waits for its actor's share, which may replace
+    // it ([`ng::gss_share_hold::replaces_uncommitted_secret`]).
     ng::gss_share_hold::ensure_loaded(state).await;
+    let actor_hex = hex::encode(body.actor);
     let foreign_secret = info.secret_epoch == next_secret_epoch
         && info.shared_secret.is_some()
-        && !ng::gss_share_hold::share_sent_by(
-            state,
-            group_key,
-            next_secret_epoch,
-            &hex::encode(body.actor),
-        );
+        && !ng::gss_share_hold::share_sent_by(state, group_key, info, &actor_hex);
     let waiting =
         info.secret_epoch < next_secret_epoch || info.shared_secret.is_none() || foreign_secret;
     let roster_revision = body.roster_revision;
@@ -2985,16 +2982,28 @@ async fn install_gss(
         // excluded member holds: make no ciphertext until the share
         // installs. The hold is durable and has no time limit (#1508/#1533
         // rc13).
-        ng::gss_share_hold::hold_exclusion(state, group_key, &info.state_hash, next_secret_epoch)
-            .await;
+        ng::gss_share_hold::hold_exclusion(
+            state,
+            group_key,
+            &info.state_hash,
+            next_secret_epoch,
+            &actor_hex,
+        )
+        .await;
         return ReceiveOutcome::WaitingForShare;
     }
     if awaiting_share {
         // The keyless install holds through the same durable hold: it is
         // written before the state change, so a crash between the two
         // leaves the hold and a retry that installs again.
-        ng::gss_share_hold::hold_exclusion(state, group_key, &info.state_hash, next_secret_epoch)
-            .await;
+        ng::gss_share_hold::hold_exclusion(
+            state,
+            group_key,
+            &info.state_hash,
+            next_secret_epoch,
+            &actor_hex,
+        )
+        .await;
     }
     let next = match ng::apply_stateful_event_with_evidence(
         state,
@@ -8623,7 +8632,7 @@ mod daemon_tests {
         .map_err(|_| anyhow::anyhow!("seal B's share"))?;
         let took = ng::apply_named_group_metadata_event(
             &fx.replica,
-            foreign_share,
+            foreign_share.clone(),
             other_admin,
             true,
             None,
@@ -8643,11 +8652,50 @@ mod daemon_tests {
             "no result head over B's secret"
         );
 
+        // #1771 review P1: B's duplicate share is refused, and its replay
+        // must not end the frame's hold: B's secret is not the frame's key.
+        let again = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            foreign_share,
+            other_admin,
+            true,
+            None,
+        )
+        .await;
+        assert!(!again.accepted, "B's duplicate share: {again:?}");
+
         // The actor's share replaces B's uncommitted secret; the kept
         // frame then installs with the actor's key.
         let share = shares_for(&fx.state, &survivor_hex)
             .pop()
             .context("the actor sealed a share to the survivor")?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, share.clone(), admin, true, None)
+                .await;
+        assert!(took.accepted, "the actor's share replaces B's: {took:?}");
+
+        // #1771 review P1: the sender record names its secret. A crash
+        // after a key write and before its record write leaves B's key
+        // with the actor's record; after the restart the frame still
+        // waits, and the actor's share installs again.
+        let mut crashed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        crashed.shared_secret = Some(foreign.to_vec());
+        ng::persist_named_group_info(&fx.replica, &fx.group_id, crashed)
+            .await
+            .map_err(|error| anyhow::anyhow!("write B's key: {error}"))?;
+        ng::gss_share_hold::test_seam::simulate_restart(&fx.replica).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "the actor's record does not name B's key"
+        );
         let took =
             ng::apply_named_group_metadata_event(&fx.replica, share, admin, true, None).await;
         assert!(took.accepted, "the actor's share replaces B's: {took:?}");
@@ -10005,6 +10053,7 @@ mod daemon_tests {
             parent,
             parent.secret_epoch,
             &author_hex,
+            parent.shared_secret.as_deref().unwrap_or_default(),
         )
         .await;
         assert_eq!(

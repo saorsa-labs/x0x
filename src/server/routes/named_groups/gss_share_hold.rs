@@ -18,6 +18,11 @@
 //! or decoded holds its group, and a directory that cannot be read holds
 //! every GSS group, until a load succeeds (fail closed).
 //!
+//! #1766: the file also keeps the sender of an installed share whose epoch
+//! no head commits yet, bound to that secret. A file can hold only that
+//! record; it holds no ciphertext. A crypto-only exclusion's hold ends at
+//! such a secret only when the exclusion's actor sealed it.
+//!
 //! Only transitions whose signed commit the apply verified are written, so
 //! a forged removal holds nothing. The file is local state only: it is not
 //! a wire format and not an API. It carries `version`
@@ -80,6 +85,11 @@ struct ExclusionHold {
     /// ([`removes_share_actor`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     removed: Vec<String>,
+    /// #1766: the lower-case hex actors of the crypto-only exclusions that
+    /// wait on this hold. An uncommitted secret of its epoch ends the hold
+    /// only when one of them sealed it ([`hold_live`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    actors: Vec<String>,
 }
 
 /// #1766: the sender of an installed share whose epoch no head commits yet.
@@ -88,6 +98,16 @@ struct ShareSender {
     secret_epoch: u64,
     /// The lower-case hex agent id of the sender.
     sender: String,
+    /// [`secret_tag`] of the secret that the sender sealed. The key and
+    /// this record are two writes, so the record names the key it is for.
+    #[serde(default)]
+    secret: String,
+}
+
+/// #1766: binds a [`ShareSender`] to one secret. The secret itself is in
+/// the group state on the same disk, so the tag reveals nothing new.
+fn secret_tag(secret: &[u8]) -> String {
+    hex::encode(blake3::derive_key("x0x gss share sender v1", secret))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +286,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
             list.iter()
                 .any(|entry| holds(info, removal_epoch(&entry.event)))
         });
+    let sent = installed_share_sender(state, group_key, info);
     removal
         || state
             .gss_share_holds
@@ -273,7 +294,23 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group_key)
-            .is_some_and(|list| list.iter().any(|hold| holds(info, Some(hold.secret_epoch))))
+            .is_some_and(|list| {
+                list.iter()
+                    .any(|hold| hold_live(info, hold, sent.as_deref()))
+            })
+}
+
+/// #1766: whether `hold` still holds `info`, when `sent` sealed the
+/// installed secret ([`installed_share_sender`]). As [`holds`], except
+/// that a secret of the hold's epoch that no head commits yet ends a
+/// crypto-only exclusion's hold only when one of its actors sealed it.
+/// Another admin's secret of that epoch is not the exclusion's key.
+fn hold_live(info: &x0x::groups::GroupInfo, hold: &ExclusionHold, sent: Option<&str>) -> bool {
+    holds(info, Some(hold.secret_epoch))
+        || (!hold.actors.is_empty()
+            && hold.secret_epoch == info.secret_epoch
+            && hold.secret_epoch > x0x::groups::crypto_exclusion::committed_secret_epoch(info)
+            && !sent.is_some_and(|sent| hold.actors.iter().any(|actor| actor == sent)))
 }
 
 /// Load the durable holds once per process, before the first ciphertext
@@ -556,13 +593,19 @@ fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> boo
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let list = lot.entry(group_key.to_string()).or_default();
-    // One hold per parent and epoch; a second one adds its removed members.
+    // One hold per parent and epoch; a second one adds its removed members
+    // and actors.
     if let Some(kept) = list.iter_mut().find(|kept| {
         kept.parent_state_hash == hold.parent_state_hash && kept.secret_epoch == hold.secret_epoch
     }) {
-        let before = kept.removed.len();
+        let before = kept.removed.len() + kept.actors.len();
         merge_removed(kept, hold.removed);
-        return kept.removed.len() != before;
+        for actor in hold.actors {
+            if !kept.actors.contains(&actor) {
+                kept.actors.push(actor);
+            }
+        }
+        return kept.removed.len() + kept.actors.len() != before;
     }
     list.push(hold);
     while list.len() > super::PARKED_ROLE_UPDATE_CAP {
@@ -618,18 +661,21 @@ pub(super) fn keep_evicted_removal(
                     .map(str::to_string)
                     .into_iter()
                     .collect(),
+                actors: Vec::new(),
             },
         );
     }
 }
 
-/// A verified GSS crypto-only exclusion from `parent_state_hash` waits
-/// for the share of `secret_epoch`: hold new ciphertext until it installs.
+/// A verified GSS crypto-only exclusion by `actor_hex` from
+/// `parent_state_hash` waits for the share of `secret_epoch`: hold new
+/// ciphertext until it installs.
 pub(super) async fn hold_exclusion(
     state: &AppState,
     group_key: &str,
     parent_state_hash: &str,
     secret_epoch: u64,
+    actor_hex: &str,
 ) {
     ensure_loaded(state).await;
     // #1508 rc17 (#1533 rc16): added under the GSS publication gate held
@@ -642,6 +688,7 @@ pub(super) async fn hold_exclusion(
             parent_state_hash: parent_state_hash.to_string(),
             secret_epoch,
             removed: Vec::new(),
+            actors: vec![actor_hex.to_ascii_lowercase()],
         },
     );
     drop(gss_gate);
@@ -655,14 +702,16 @@ pub(super) async fn hold_exclusion(
 /// Drop the group's exclusion holds that no longer hold `info` (a secret of
 /// their epoch or a later one is installed), such as an evicted removal's
 /// hold after its key installed, or #1578's keyless install hold after the
-/// share it awaits installed. #1766: a share sender whose epoch the head
-/// now commits goes too. Returns whether anything was dropped. The caller
-/// writes the file.
+/// share it awaits installed. #1766: a crypto-only exclusion's hold stays
+/// while another sender's secret of its epoch is installed
+/// ([`hold_live`]), and a share sender whose epoch the head now commits
+/// goes. Returns whether anything was dropped. The caller writes the file.
 pub(super) fn prune_exclusions(
     state: &AppState,
     group_key: &str,
     info: &x0x::groups::GroupInfo,
 ) -> bool {
+    let sent = installed_share_sender(state, group_key, info);
     let mut lot = state
         .gss_share_holds
         .exclusions
@@ -670,7 +719,7 @@ pub(super) fn prune_exclusions(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dropped = lot.get_mut(group_key).is_some_and(|list| {
         let before = list.len();
-        list.retain(|hold| holds(info, Some(hold.secret_epoch)));
+        list.retain(|hold| hold_live(info, hold, sent.as_deref()));
         list.len() != before
     });
     if lot.get(group_key).is_some_and(Vec::is_empty) {
@@ -692,16 +741,18 @@ pub(super) fn holds_exclusions(state: &AppState, group_key: &str) -> bool {
         .contains_key(group_key)
 }
 
-/// #1766: `sender_hex` sealed the share of `secret_epoch` that just
-/// installed in `info`. The sender is kept, durably, only while no head
-/// commits that epoch: a crypto-only exclusion of that epoch keeps the
-/// secret only from its own actor ([`share_sent_by`]).
+/// #1766: `sender_hex` sealed `secret`, the share of `secret_epoch` that
+/// just installed over `info`. The sender is kept, durably and bound to
+/// `secret`, only while no head commits that epoch: a crypto-only
+/// exclusion of that epoch keeps the secret only from its own actor
+/// ([`share_sent_by`]).
 pub(super) async fn note_share_sender(
     state: &AppState,
     group_key: &str,
     info: &x0x::groups::GroupInfo,
     secret_epoch: u64,
     sender_hex: &str,
+    secret: &[u8],
 ) {
     ensure_loaded(state).await;
     let changed = {
@@ -714,6 +765,7 @@ pub(super) async fn note_share_sender(
             let sender = ShareSender {
                 secret_epoch,
                 sender: sender_hex.to_ascii_lowercase(),
+                secret: secret_tag(secret),
             };
             lot.insert(group_key.to_string(), sender.clone()) != Some(sender)
         } else {
@@ -757,33 +809,48 @@ pub(super) async fn forget_committed_share_sender(
     }
 }
 
-/// #1766: whether the group's installed secret of `secret_epoch` came from
-/// a share that `sender_hex` sealed. An unknown sender (another install
-/// path) is not `sender_hex`. Call [`ensure_loaded`] first.
-pub(super) fn share_sent_by(
+/// #1766: the lower-case hex sender of the secret that `info` holds,
+/// when the kept record names that exact secret and its epoch. A record
+/// left by a crash between a replacing key write and its record write
+/// names another secret, so the sender is unknown. Call [`ensure_loaded`]
+/// first.
+fn installed_share_sender(
     state: &AppState,
     group_key: &str,
-    secret_epoch: u64,
-    sender_hex: &str,
-) -> bool {
+    info: &x0x::groups::GroupInfo,
+) -> Option<String> {
+    let tag = secret_tag(info.shared_secret.as_deref()?);
     state
         .gss_share_holds
         .share_senders
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(group_key)
-        .is_some_and(|kept| {
-            kept.secret_epoch == secret_epoch && kept.sender.eq_ignore_ascii_case(sender_hex)
-        })
+        .filter(|kept| kept.secret_epoch == info.secret_epoch && kept.secret == tag)
+        .map(|kept| kept.sender.clone())
+}
+
+/// #1766: whether `sender_hex` sealed the secret that `info` holds. An
+/// unknown sender (another install path, or a record that names another
+/// secret) is not `sender_hex`. Call [`ensure_loaded`] first.
+pub(super) fn share_sent_by(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    sender_hex: &str,
+) -> bool {
+    installed_share_sender(state, group_key, info)
+        .is_some_and(|sent| sent.eq_ignore_ascii_case(sender_hex))
 }
 
 /// #1766: whether a share of `secret_epoch` from `sender_hex` may replace
 /// the secret of the same epoch that `info` holds. Only an uncommitted
 /// secret can go (no head binds its epoch yet), only while a verified
-/// transition of that epoch waits for its share ([`hold_exclusion`]), and
-/// only for a different sender. The waiting crypto-only exclusion keeps a
-/// secret only from its own actor, so without this its actor's share
-/// could never install. Call [`ensure_loaded`] first.
+/// crypto-only exclusion of that epoch still waits for its actor's share
+/// ([`hold_live`]), and only for a different sender. The waiting
+/// exclusion keeps a secret only from its own actor, so without this its
+/// actor's share could never install. Once the actor's secret is in, no
+/// other share replaces it. Call [`ensure_loaded`] first.
 pub(super) fn replaces_uncommitted_secret(
     state: &AppState,
     group_key: &str,
@@ -791,16 +858,22 @@ pub(super) fn replaces_uncommitted_secret(
     sender_hex: &str,
     secret_epoch: u64,
 ) -> bool {
+    let sent = installed_share_sender(state, group_key, info);
     secret_epoch == info.secret_epoch
-        && secret_epoch > x0x::groups::crypto_exclusion::committed_secret_epoch(info)
-        && !share_sent_by(state, group_key, secret_epoch, sender_hex)
+        && !sent
+            .as_deref()
+            .is_some_and(|sent| sent.eq_ignore_ascii_case(sender_hex))
         && state
             .gss_share_holds
             .exclusions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group_key)
-            .is_some_and(|list| list.iter().any(|hold| hold.secret_epoch == secret_epoch))
+            .is_some_and(|list| {
+                list.iter().any(|hold| {
+                    hold.secret_epoch == secret_epoch && hold_live(info, hold, sent.as_deref())
+                })
+            })
 }
 
 /// The exclusion installed with its secret at `secret_epoch`: its hold,
@@ -1018,6 +1091,7 @@ mod tests {
             parent_state_hash: "parent".to_string(),
             secret_epoch: 2,
             removed: Vec::new(),
+            actors: Vec::new(),
         };
         assert!(
             republish_releases(&keyless, &live),
