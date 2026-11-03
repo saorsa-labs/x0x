@@ -7,9 +7,11 @@
 //! `reseat_required` with no re-seat journal and an unchanged live record,
 //! and not re-seat in the hour after.
 //!
-//! J's writes to A and O are held from the removal until the expired one
-//! is refused, so no answer to J's own requests changes `last_refusal`
-//! (§8: the newest refusal) between an injection and its read.
+//! Every write from J is held from the removal until the expired one is
+//! refused. J's requests then reach no node (A, O or member M1), so no
+//! answer to them changes `last_refusal` (§8: the newest refusal) between
+//! an injection and its read. The row checks this: no write from J is
+//! delivered from the first injection to the last read.
 
 use super::*;
 use crate::groups::recovery::{
@@ -106,6 +108,37 @@ async fn inject(sim: &Sim, group: &str, base: &View, injection: &Injection) -> R
         refusal,
         contained,
     })
+}
+
+/// Writes delivered after trace position `after` whose origin is J, per
+/// receiver. The origin is the one the prefix hold uses: the first sender
+/// of a pubsub message ID, else the sender. So J's relays of other nodes'
+/// gossip do not count; J's own requests do.
+fn originated_by_j_after(sim: &Sim, after: usize) -> Result<Vec<(&'static str, usize)>> {
+    use crate::network::sim::{Fate, LaneClass};
+    let j = sim.peer("J")?.0;
+    let mut origins = std::collections::HashMap::new();
+    let mut counts = Vec::new();
+    for peer in ["O", "A", "X", "M1"] {
+        counts.push((peer, sim.peer(peer)?.0, 0));
+    }
+    for (position, write, fate) in sim.fabric().writes_with_positions() {
+        let msg = (write.lane.class == LaneClass::PubSub)
+            .then(|| pubsub_header(&write.bytes))
+            .flatten()
+            .map(|(_, id)| id);
+        let origin = match msg {
+            Some(id) => *origins.entry(id).or_insert(write.lane.src),
+            None => write.lane.src,
+        };
+        let delivered = matches!(fate, Some(Fate::Delivered { .. }));
+        if position > after && delivered && origin == j {
+            if let Some(count) = counts.iter_mut().find(|c| c.1 == write.lane.dst) {
+                count.2 += 1;
+            }
+        }
+    }
+    Ok(counts.into_iter().map(|(peer, _, n)| (peer, n)).collect())
 }
 
 /// Whether `label` holds a re-seat journal or a staging record.
@@ -304,10 +337,9 @@ pub(super) async fn authorisation_refusals(sim: &mut Sim, receipt: &mut Receipt)
         return Ok(());
     };
 
-    // From here no answer to J's own requests reaches J.
+    // From here J's requests reach no node, so no answer to them reaches J.
     p.j_out_held.store(true, Ordering::SeqCst);
-    sim.fabric()
-        .mark("fault: every write from J to A and O held");
+    sim.fabric().mark("fault: every write from J held");
     let path = format!("/groups/{group}/members/{j_hex}");
     let (code, body) = sim.api("A", Method::DELETE, &path, None).await?;
     ensure!(code.is_success(), "A removes J: {code} {body}");
@@ -335,6 +367,9 @@ pub(super) async fn authorisation_refusals(sim: &mut Sim, receipt: &mut Receipt)
     ];
     checks.push(("o_stores_the_authorisation", issued.is_some()));
     let Some(issued) = issued.filter(|_| reseat_code.is_success()) else {
+        // The cause names the 404 (pre-S3 `main`), but no request has
+        // reached J yet (no `request_delivered` stage), so the receipt
+        // classifies INFRA, not RED.
         let red = reseat_code == StatusCode::NOT_FOUND;
         let failing: Vec<&str> = checks.iter().filter(|c| !c.1).map(|c| c.0).collect();
         let observed = format!("failing {failing:?}; reseat {reseat_code} {answer}");
@@ -355,7 +390,9 @@ pub(super) async fn authorisation_refusals(sim: &mut Sim, receipt: &mut Receipt)
     })
     .await?;
     p.o_to_j_held.store(false, Ordering::SeqCst);
-    sim.fabric().mark("fault: O's direct writes pass to J");
+    let injecting = sim
+        .fabric()
+        .mark_indexed("fault: O's direct writes pass to J");
     let base = view(sim, "J", &group).await?;
 
     let mut answers = Vec::new();
@@ -380,10 +417,19 @@ pub(super) async fn authorisation_refusals(sim: &mut Sim, receipt: &mut Receipt)
     };
     answers.push(inject(sim, &group, &base, &expired_one).await?);
     injections.push(expired_one);
+    // The module doc's premise: no answer to a request of J's could land
+    // between an injection and its read.
+    let from_j = originated_by_j_after(sim, injecting)?;
+    receipt.evidence(
+        "no_write_from_j_delivered_during_the_injections",
+        from_j.iter().all(|(_, n)| *n == 0),
+        format!("frames that J originated, delivered per node {from_j:?}"),
+        at(sim),
+    );
 
     // "Advance 1 h with no further route call": J asks A and O again.
     p.j_out_held.store(false, Ordering::SeqCst);
-    sim.fabric().mark("fault: J's writes to A and O released");
+    sim.fabric().mark("fault: J's writes released");
     let mut states = Vec::new();
     let mut seen = Observations::default();
     let waited = sim
@@ -415,7 +461,7 @@ pub(super) async fn authorisation_refusals(sim: &mut Sim, receipt: &mut Receipt)
         && adds == 0
         && same_record(Some(&j_end), Some(&base));
 
-    let mut red = reseat_code == StatusCode::NOT_FOUND || !quiet;
+    let mut red = !quiet;
     for (injection, answer) in injections.iter().zip(&answers) {
         receipt.evidence(
             "o_injection_delivered_to_j",

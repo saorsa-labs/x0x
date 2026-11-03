@@ -4240,8 +4240,8 @@ async fn next_target(
     // per-requester interval (§11) has passed since that request, so the
     // new head's request is normally not refused `rate_limited` (#1726).
     // The responder times the interval from arrival, not from our send, so
-    // with delivery jitter it can still refuse; that refusal only advances
-    // the round.
+    // with delivery jitter it can still refuse; that refusal costs one
+    // cooldown retry to the same target, then the round advances.
     if let Some((_, asked_at)) = subject
         .asked_from
         .take_if(|(head, _)| *head != info.state_hash)

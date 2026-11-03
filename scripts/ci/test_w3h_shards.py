@@ -87,6 +87,8 @@ class ShardPlanTest(unittest.TestCase):
         self.assertEqual(SHARDS.stress_count('rest'), 20)
         with self.assertRaises(SystemExit):
             SHARDS.stress_count('s3.1')
+        with self.assertRaises(SystemExit):
+            SHARDS.stress_count('no-such-group')
 
     def test_matrix_lists_a_split_group_as_its_parts(self):
         groups = SHARDS.matrix(

@@ -813,6 +813,9 @@ jobs:
             python3 -B scripts/ci/w3h-shards.py --tag-traces "${{ matrix.group }}" target/w3h/traces
           fi
 
+      # Each part also writes pid-less `<case>.first-digest` and
+      # `.divergent-digest` markers; the merge below keeps one. Nothing
+      # reads them after the run (see `tag_traces` in w3h-shards.py).
       - name: Upload W3-H shard traces
         if: always()
         uses: actions/upload-artifact@v5

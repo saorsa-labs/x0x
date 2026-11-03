@@ -355,8 +355,8 @@ struct Prefix {
     joined_at: usize,
     /// While set, every write that O originates is held from J (H-S3-c).
     o_to_j_held: Arc<std::sync::atomic::AtomicBool>,
-    /// While set, every write that J originates is held from A and O
-    /// (H-S3-d8). Unset after the prefix.
+    /// While set, every write that J originates is held (H-S3-d8, H-S3-d3).
+    /// Unset after the prefix.
     j_out_held: Arc<std::sync::atomic::AtomicBool>,
     /// O's held r+1 gossip writes to J after r+1′.
     held_to_j: Arc<std::sync::atomic::AtomicUsize>,
@@ -446,7 +446,6 @@ async fn fork_prefix(
     let minted = view(sim, "O", &group).await?;
     let link = invite(sim, "O", &group).await?;
     let (o, x, j) = (sim.peer("O")?.0, sim.peer("X")?.0, sim.peer("J")?.0);
-    let a = sim.peer("A")?.0;
 
     // X is cut from O and A; O's r+1 publish (and its relays) is captured
     // and held from J.
@@ -664,9 +663,9 @@ async fn fork_prefix(
             let from_o =
                 origin == o && dst == j && o_held.load(std::sync::atomic::Ordering::SeqCst);
             let seal_to_j = dst == j && is_held(&seal_ids, msg);
-            let from_j = origin == j
-                && (dst == a || dst == o)
-                && j_held.load(std::sync::atomic::Ordering::SeqCst);
+            // While set, J's writes to every node are held (X is cut
+            // anyway); with M1 seated, M1 also answers J's requests (#1736).
+            let from_j = origin == j && j_held.load(std::sync::atomic::Ordering::SeqCst);
             origin == x || dst == x || from_j || (!both && (to_j || from_o || seal_to_j))
         });
     }

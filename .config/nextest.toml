@@ -45,7 +45,8 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 
 # H-S3-d3 runs about 2 h 15 min of virtual time (the authorisation's
 # 1 h lifetime, then the row's 1 h quiet advance): 520 s of wall time on
-# a 12-CPU Linux VM, so it gets 45 minutes.
+# a 12-CPU Linux VM and 940-1000 s on the 4-vCPU CI runner, so it gets
+# 45 minutes.
 [[profile.w3h.overrides]]
 filter = 'test(/(^|::)w3h_1356_control_s3_d3_authorisation_refusals_typed$/)'
 slow-timeout = { period = "60s", terminate-after = 45 }

@@ -66,7 +66,9 @@ def split_part(entry):
 
 def stress_count(entry):
     """Reruns for one matrix entry. The parts of a group add up to RUNS."""
-    _group, part, parts = split_part(entry)
+    group, part, parts = split_part(entry)
+    if group != 'rest' and group not in dict(GROUPS):
+        raise SystemExit(f'unknown W3-H shard {group!r}')
     return RUNS // parts + (1 if part <= RUNS % parts else 0)
 
 
@@ -75,7 +77,13 @@ def tag_traces(entry, directory):
     so traces of the same case from parallel parts cannot share a name
     when the summary job merges them (a runner can reuse a pid). The
     trace check reads the case as the text before the last `-`. Returns
-    the number of files renamed; a group with no parts renames none."""
+    the number of files renamed; a group with no parts renames none.
+
+    The pid-less dump markers `<case>.first-digest` and
+    `<case>.divergent-digest` are not renamed: each part writes its own,
+    and the merge keeps one of them. Only the run that writes them reads
+    them (to choose which runs dump payloads), so the merged copy is not
+    used."""
     _group, part, parts = split_part(entry)
     if parts == 1:
         return 0
