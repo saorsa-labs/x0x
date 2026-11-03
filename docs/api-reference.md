@@ -28,10 +28,14 @@ bounded liveness probe fails (issue #1419). Those ages are
 application-data ages. A quiet peer, with both directions idle, answers
 the probe and is not degraded. A probe the endpoint could not run, for a
 busy endpoint or a peer without probe support, is not a failure. A peer
-is probed only while another peer has traffic, a peer already confirmed
-broken is probed again after its window, and a confirmed peer stays
-`degraded` until its link carries traffic again or the verdict window
-ends. A successful re-dial removes the peer from the set at once. `GET /status` uses the same stored set and the same rule.
+is first probed only while another peer has traffic; a peer already
+confirmed broken is probed again after its 60 s window even when nothing
+else flows, and it stays `degraded` until its link carries traffic again
+or that window ends. A successful re-dial removes the peer from the set
+at once. Two limits, stated plainly: a silent connected peer that
+ignores probes can hold `degraded` for one 60 s window per handshake,
+and while a probe is due the refresher tick can spend up to 4 s on it,
+so the stored set can be a few seconds old. `GET /status` uses the same stored set and the same rule.
 `GET /peers` sets `link` to `degraded` for each peer in that set. Fleet
 deployments under a supervisor can additionally set `zero_peer_restart_secs = <secs>` in the
 daemon TOML to make the process exit (for `Restart=always` self-heal) after

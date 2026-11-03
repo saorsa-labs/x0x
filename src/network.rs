@@ -357,8 +357,10 @@ const ONE_SIDED_PROBE_OUTER_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How many both-stale liveness probes one health tick may start (#1419).
 /// Two, inside ant-quic's endpoint-wide budget of four probe slots, so
-/// other probe callers keep headroom. Candidates beyond the cap keep
-/// their turn on the next tick.
+/// other probe callers keep headroom. The budget counts flights still
+/// running from earlier ticks, so a stalled probe reduces the next
+/// tick's new probes until it ends. Candidates beyond the cap keep their
+/// turn on the next tick.
 const ONE_SIDED_PROBES_PER_TICK: usize = 2;
 
 /// Send and receive ages for one connected peer (#1419).
@@ -470,6 +472,13 @@ pub(crate) fn both_stale_candidate_indexes(
 /// peer traffic, so the immediate rule must not act on it: an
 /// inconclusive probe must not degrade or re-dial through the back door,
 /// and a confirming probe keeps its own verdict window.
+/// Whether a sample's one-sided shape was made by this node's own probe
+/// send (#1419): the probe ran inside the redial window, the send
+/// direction is fresh and the receive direction is stale.
+///
+/// Accepted limit: after an inconclusive probe, that send stamp can hide
+/// a real one-sided shape for up to the rest of the 60 s window, because
+/// the shape is read as the probe's, not the link's.
 fn probe_made_one_sided(sample: &LinkAgeSample, entry: &OneSidedRepair, now: Instant) -> bool {
     entry
         .both_stale_probe_at
@@ -516,8 +525,10 @@ fn order_one_sided_probes(to_probe: &mut [AntPeerId], probe_ats: &HashMap<AntPee
 /// broken (#1419).
 ///
 /// Only outcomes that name the link count: the probe timed out with no
-/// answer, or the connection was closed, including a superseded
-/// connection. A generic send error is not counted, because ant-quic
+/// answer, or the connection closed because the transport superseded it
+/// or cleaned up its lifecycle. A clean close by the peer — a restart or
+/// a deliberate drop — does not confirm, so it neither degrades nor
+/// re-dials. A generic send error is not counted, because ant-quic
 /// also uses it for local failures. A busy endpoint (`ProbeOverBudget`),
 /// a shutdown, a peer that left the table, and a peer without probe
 /// support are inconclusive. An inconclusive peer is neither degraded
@@ -528,7 +539,10 @@ fn one_sided_probe_confirms_broken(error: &ant_quic::NodeError) -> bool {
         error,
         ant_quic::NodeError::Endpoint(
             ant_quic::EndpointError::ProbeTimeout
-                | ant_quic::EndpointError::ConnectionClosed { .. },
+                | ant_quic::EndpointError::ConnectionClosed {
+                    reason: ant_quic::ConnectionCloseReason::Superseded
+                        | ant_quic::ConnectionCloseReason::LifecycleCleanup
+                },
         )
     )
 }
@@ -3873,7 +3887,13 @@ impl NetworkNode {
         // set cannot starve its tail and cannot spend the whole tick on
         // probes.
         order_one_sided_probes(&mut to_probe, &probe_ats);
-        to_probe.truncate(ONE_SIDED_PROBES_PER_TICK);
+        // The budget counts flights still running from earlier ticks: a
+        // stalled probe keeps one of ant-quic's four endpoint probe slots
+        // past the outer bound, so new probes must not stack behind it
+        // and squeeze other probe callers out of the budget (#1419).
+        let probe_budget =
+            ONE_SIDED_PROBES_PER_TICK.saturating_sub(self.live_one_sided_probe_flights());
+        to_probe.truncate(probe_budget);
         if !to_probe.is_empty() {
             // ant-quic's own probe bound starts at the reply wait. The
             // send before it can park on stream credit until the QUIC
@@ -4100,6 +4120,20 @@ impl NetworkNode {
         }
         flights.retain(|flight| !flight.is_finished());
         flights.push(flight);
+    }
+
+    /// How many detached probe flights are still running (#1419).
+    ///
+    /// Finished flights are pruned, the same as on insert, so a stalled
+    /// flight from an earlier tick counts against the next tick's probe
+    /// budget until it ends.
+    fn live_one_sided_probe_flights(&self) -> usize {
+        let mut flights = match self.one_sided_probe_flights.lock() {
+            Ok(flights) => flights,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        flights.retain(|flight| !flight.is_finished());
+        flights.len()
     }
 
     fn mark_one_sided_warned(&self, peer: &AntPeerId) -> bool {
@@ -4768,6 +4802,21 @@ impl NetworkNode {
                     return Ok(());
                 }
                 Some(Err(e)) => {
+                    if matches!(
+                        e,
+                        ant_quic::NodeError::Endpoint(ant_quic::EndpointError::ProbeOverBudget)
+                    ) {
+                        // A busy endpoint is no evidence the link is dead
+                        // (31 Oct ruling: `ProbeOverBudget` is no
+                        // evidence). The send itself decides.
+                        tracing::debug!(
+                            target: "x0x::connect",
+                            peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                            "pre-send liveness probe inconclusive: endpoint probe budget full"
+                        );
+                        self.remember_peer_send_ready(*peer_id)?;
+                        return Ok(());
+                    }
                     self.refresh_peer_connection(
                         peer_id,
                         fallback_addr,
@@ -11232,6 +11281,22 @@ mod tests {
             "a generic send error can be a local failure"
         );
         assert!(
+            !confirms(ant_quic::NodeError::Endpoint(
+                EndpointError::ConnectionClosed {
+                    reason: ant_quic::ConnectionCloseReason::PeerShutdown
+                }
+            )),
+            "a clean close by the peer does not confirm"
+        );
+        assert!(
+            !confirms(ant_quic::NodeError::Endpoint(
+                EndpointError::ConnectionClosed {
+                    reason: ant_quic::ConnectionCloseReason::ApplicationClosed
+                }
+            )),
+            "an application close does not confirm"
+        );
+        assert!(
             !confirms(ant_quic::NodeError::Connection(
                 "a generic connection error".to_string()
             )),
@@ -11910,7 +11975,9 @@ mod tests {
         // Absent from the fabric, so the sim probe answers with the
         // not-connected error: inconclusive, not a link-naming failure.
         let absent = test_ant_peer(9);
-        let expired = Instant::now() - ONE_SIDED_REDIAL_BACKOFF - Duration::from_secs(1);
+        let expired = Instant::now()
+            .checked_sub(ONE_SIDED_REDIAL_BACKOFF + Duration::from_secs(1))
+            .expect("the host clock covers the 61 s window");
         {
             let mut repairs = node.one_sided_repairs.lock().unwrap();
             repairs.insert(
@@ -12100,6 +12167,50 @@ mod tests {
         c.try_shutdown().await.unwrap();
     }
 
+    /// #1419: a probe flight that arrives after teardown emptied the
+    /// flight list is aborted at once. The abort is observable: the task
+    /// itself never finishes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_late_probe_flight_is_aborted_not_tracked() {
+        let plane = "issue1419-late-flight";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let node = NetworkNode::new(
+            NetworkConfig {
+                bind_addr: Some(SocketAddr::from(([198, 18, 0, 1], 5483))),
+                network_id: Some(plane.to_string()),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        node.shutdown_state.started.store(true, Ordering::Release);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+        let flight = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        node.remember_one_sided_probe_flight(flight);
+        assert!(
+            node.one_sided_probe_flights.lock().unwrap().is_empty(),
+            "a flight that arrives after teardown is not tracked"
+        );
+        // Past the flight's own sleep: an un-aborted task would have
+        // finished and set the flag. The teardown gate is already closed,
+        // so try_shutdown is not called again here.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(
+            !finished.load(Ordering::Relaxed),
+            "the late flight was aborted before it could finish"
+        );
+    }
+
     /// #1419: one health tick probes at most two both-stale candidates,
     /// inside ant-quic's four-slot endpoint probe budget. The rest keep
     /// their turn on the next tick, and a peer probed inside the window
@@ -12265,7 +12376,16 @@ mod tests {
             "the detached flight that outlived its outer bound is tracked"
         );
 
+        // Abort, not just join: the flight's probe is paused for one
+        // second past the outer bound, so a shutdown that only waited it
+        // out would advance the paused clock by that much.
+        let shutdown_started = tokio::time::Instant::now();
         a.try_shutdown().await.unwrap();
+        let shutdown_elapsed = tokio::time::Instant::now() - shutdown_started;
+        assert!(
+            shutdown_elapsed < Duration::from_secs(1),
+            "shutdown aborts the stalled flight instead of waiting it out ({shutdown_elapsed:?})"
+        );
         assert!(
             a.one_sided_probe_flights.lock().unwrap().is_empty(),
             "shutdown aborts and joins the detached probe flight"
