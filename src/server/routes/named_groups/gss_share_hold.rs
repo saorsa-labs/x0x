@@ -582,7 +582,15 @@ fn absorb(state: &AppState, file: HoldFile) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let list = lot.entry(file.group_key).or_default();
-        for hold in file.exclusions {
+        for mut hold in file.exclusions {
+            // #1775 item 3: a hold with removed members is an evicted
+            // removal's containment — actorless by design, not unknown —
+            // so it keeps the old rule; a crypto-only exclusion's hold
+            // from a pre-#1771 file has no removed members and unknown
+            // actors.
+            if hold.actors.is_none() && !hold.removed.is_empty() {
+                hold.actors = Some(Vec::new());
+            }
             match list.iter_mut().find(|kept| {
                 kept.parent_state_hash == hold.parent_state_hash
                     && kept.secret_epoch == hold.secret_epoch
@@ -733,12 +741,19 @@ fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> boo
     }) {
         let before = kept.removed.len() + kept.actors.as_ref().map_or(0, Vec::len);
         merge_removed(kept, hold.removed);
-        // #1775 item 3: a live re-park knows its actor, so it replaces an
-        // unknown list loaded from a pre-#1771 file; two known lists
-        // union.
+        // #1775 item 3: a live re-park knows its actor, so a non-empty
+        // list replaces an unknown one loaded from a pre-#1771 file (an
+        // empty list — an evicted removal — would turn "unknown" into
+        // "known none" and fail open); two known lists union.
         let mut actors = std::mem::take(&mut kept.actors);
         if actors.is_none() {
-            actors = hold.actors;
+            if hold
+                .actors
+                .as_ref()
+                .is_some_and(|actors| !actors.is_empty())
+            {
+                actors = hold.actors;
+            }
         } else {
             merge_actors(&mut actors, hold.actors);
         }
@@ -1125,8 +1140,15 @@ pub(super) fn replaces_uncommitted_secret(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(group_key)
                 .is_some_and(|list| {
-                    list.iter()
-                        .any(|entry| removal_epoch(&entry.event) == Some(secret_epoch))
+                    list.iter().any(|entry| {
+                        removal_epoch(&entry.event) == Some(secret_epoch)
+                            // The removal's own sender's secret is in: no
+                            // other share replaces it, exactly as for a
+                            // hold's actor.
+                            && !sent.as_deref().is_some_and(|sent| {
+                                sent.eq_ignore_ascii_case(&hex::encode(entry.sender.0))
+                            })
+                    })
                 })
             || state
                 .gss_share_holds
@@ -1460,11 +1482,12 @@ mod tests {
             withholds(&state, &group_key, &info),
             "the mark survives the restart"
         );
-        // The actor's share installs: the mark settles, and the epoch is
-        // pinned again.
+        // The actor's share installs — sealed by a sender whose hex the
+        // record compares case-insensitively — the mark settles, and the
+        // epoch is pinned again.
         let own = [0x07u8; 32];
         info.shared_secret = Some(own.to_vec());
-        note_share_sender(&state, &group_key, &keyless, 2, &actor, &own).await;
+        note_share_sender(&state, &group_key, &keyless, 2, &actor.to_uppercase(), &own).await;
         assert!(
             !withholds(&state, &group_key, &info),
             "the actor's own key ends the wait"
@@ -1472,6 +1495,20 @@ mod tests {
         assert!(
             !replaces_uncommitted_secret(&state, &group_key, &info, &other, 2),
             "the settled epoch is pinned: no later share replaces it"
+        );
+        // A head that commits a later epoch ends the mark of this one
+        // (and writes the file away).
+        note_keyless_commit(&state, &group_key, 2, &actor).await;
+        let later = gss_info_at_head(3, Some(foreign));
+        assert!(
+            !withholds(&state, &group_key, &later),
+            "the mark holds only its own epoch"
+        );
+        assert!(prune_exclusions(&state, &group_key, &later));
+        persist(&state, &group_key).await.expect("write the holds");
+        assert!(
+            !super::test_seam::hold_file_exists(&state, &group_key),
+            "a head that commits a later epoch prunes the stale mark"
         );
     }
 
@@ -1521,6 +1558,10 @@ mod tests {
             !withholds(&state, &group_key, &own_info),
             "the removal's own sender's secret ends the wait"
         );
+        assert!(
+            !replaces_uncommitted_secret(&state, &group_key, &own_info, &other, 2),
+            "once the removal's sender's secret is in, no other share replaces it"
+        );
     }
 
     /// #1775 item 3: a hold file that pre-#1771 code wrote carries no
@@ -1568,6 +1609,37 @@ mod tests {
         );
     }
 
+    /// #1775 item 3 (claude review round 1): a pre-#1771 evicted-removal
+    /// hold carries removed members and no actor list, and #1771 wrote
+    /// known-empty actor lists the same way. Such a hold is actorless by
+    /// design, not unknown: it keeps the old rule, so it does not wait
+    /// for a frame retry that an evicted removal no longer has.
+    #[tokio::test]
+    async fn a_pre_upgrade_evicted_removal_hold_keeps_the_old_rule() {
+        let (state, _dir) = test_state().await;
+        let group_key = "g".to_string();
+        let other = "bb".repeat(32);
+        let file = "{\"version\":1,\"group_key\":\"g\",\"exclusions\":\
+             [{\"parent_state_hash\":\"p\",\"secret_epoch\":2,\
+             \"removed\":[\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"]}]}"
+            .to_string();
+        let path = super::test_seam::hold_path_for(&state, &group_key);
+        std::fs::create_dir_all(path.parent().expect("the hold dir has a parent"))
+            .expect("make the hold dir");
+        std::fs::write(&path, file).expect("write the pre-#1771 evicted-removal hold file");
+        let parent = gss_info_at_head(1, None);
+        let foreign = [0xB5u8; 32];
+        let mut info = parent.clone();
+        info.secret_epoch = 2;
+        info.shared_secret = Some(foreign.to_vec());
+        note_share_sender(&state, &group_key, &parent, 2, &other, &foreign).await;
+        let settled = gss_info_at_head(2, Some(foreign));
+        assert!(
+            !withholds(&state, &group_key, &settled),
+            "an evicted removal's hold ends at a committed secret of its epoch"
+        );
+    }
+
     /// #1775, the load-side merge: a hold file that two exclusions of one
     /// parent and epoch wrote keeps both actors across a restart. On main
     /// the second entry's actor was dropped, so that actor's own
@@ -1603,6 +1675,9 @@ mod tests {
     /// actors to a later epoch's hold — an actor of the dropped epoch may
     /// not end a later epoch's wait (that would fail open). Its exclusion
     /// frame retries and re-parks its hold, so its actor check returns.
+    /// The probe reads the surviving epoch-2 hold directly: the holds
+    /// above the probe epoch would keep `withholds` true whatever the
+    /// merge did.
     #[tokio::test]
     async fn the_cap_eviction_moves_no_actor_to_a_later_epoch() {
         let (state, _dir) = test_state().await;
@@ -1619,8 +1694,20 @@ mod tests {
         info.secret_epoch = 2;
         info.shared_secret = Some(first_secret.to_vec());
         note_share_sender(&state, &group_key, &parent, 2, &first, &first_secret).await;
+        let held = state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&group_key)
+            .cloned()
+            .expect("the group's holds");
+        let at_two = held
+            .iter()
+            .find(|hold| hold.secret_epoch == 2)
+            .expect("the epoch-2 hold survived the cap");
         assert!(
-            withholds(&state, &group_key, &info),
+            hold_live(&state, &group_key, &info, at_two, Some(&first)),
             "the dropped epoch's actor does not end the later epoch's wait"
         );
     }

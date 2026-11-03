@@ -2255,6 +2255,10 @@ pub(in crate::server) enum LaterAdminKey {
 /// epoch. Catch-up seals the current secret only, so after such a rotation
 /// no holder seals `epoch`'s secret any more. A share of the later epoch
 /// from an admin of that later roster gives [`LaterAdminKey::Superseded`].
+/// #1775 item 2: so does the later rotation's own share that installed
+/// directly while its event waits held — the installed secret's record
+/// must name the held step's author — so an unpinned later secret from
+/// its own author strands no wait.
 pub(in crate::server) async fn promoted_admin_secret(
     state: &AppState,
     result: &GroupInfo,
@@ -2287,9 +2291,9 @@ pub(in crate::server) async fn promoted_admin_secret(
                 .collect(),
         )
     };
-    if parked.is_empty() {
-        return None;
-    }
+    // #1775 item 2: no parked share is needed when the walk's own step
+    // author sealed the installed later secret, so the walk runs with an
+    // empty park too.
     // A revoked agent signs no step and sends no trusted share, as in the
     // ordinary apply's revocation gate. A revoked agent is not added either
     // (the OwnerCertified add check).
@@ -2329,6 +2333,15 @@ pub(in crate::server) async fn promoted_admin_secret(
                 _ => None,
             })
     };
+    // #1775 item 2 (claude review round 1): the later rotation's share can
+    // install directly while its event waits held on this transition's
+    // result, so no parked share exists to find. The installed secret
+    // takes the superseded exit when the walk's own step author sealed
+    // it: the held chain replays and commits the later epoch, so an
+    // unpinned later secret from its own author strands no wait — and a
+    // secret from any other sender still does not end one.
+    let installed = group_by_stable(state, &stable_group_id).await;
+    let mut step_author: Option<String> = None;
     let mut cursor = result.clone();
     // Each step moves the revision up, so the walk ends; the bound keeps it
     // to the held set.
@@ -2340,8 +2353,31 @@ pub(in crate::server) async fn promoted_admin_secret(
                 LaterAdminKey::Superseded
             });
         }
-        match held.iter().find_map(|held| next_held_state(&cursor, held)) {
-            Some(next) => cursor = next,
+        if let (Some(author), Some((_, installed))) = (&step_author, &installed) {
+            if cursor.secret_epoch > epoch
+                && installed.secret_epoch == cursor.secret_epoch
+                && installed.shared_secret.is_some()
+                && cursor
+                    .caller_role(author)
+                    .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+                && super::super::gss_share_hold::share_sent_by(
+                    state,
+                    &stable_group_id,
+                    installed,
+                    author,
+                )
+            {
+                return Some(LaterAdminKey::Superseded);
+            }
+        }
+        match held
+            .iter()
+            .find_map(|held| next_held_state(&cursor, held).map(|next| (held, next)))
+        {
+            Some((held, next)) => {
+                step_author = Some(hex::encode(held.author.as_bytes()));
+                cursor = next;
+            }
             None => return None,
         }
     }
@@ -2362,6 +2398,26 @@ pub(in crate::server) async fn promoted_admin_secret(
 /// admin's removal or ban with or without a rotation, a member's own
 /// leave, and the request-based admission steps (a request, its approval,
 /// rejection or cancellation).
+/// Test builds only: park a held event for [`promoted_admin_secret`]'s
+/// walk (#1775 item 2).
+#[cfg(test)]
+pub(super) async fn seed_held_event_for_test(
+    state: &AppState,
+    stable_group_id: &str,
+    event: super::super::NamedGroupMetadataEvent,
+    author: AgentId,
+    prev_state_hash: Option<String>,
+) {
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    inner.orc.held_events.push(HeldEvent {
+        stable_group_id: stable_group_id.to_string(),
+        event,
+        author,
+        prev_state_hash,
+        at: Instant::now(),
+    });
+}
+
 fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
     use super::super::NamedGroupMetadataEvent as Event;
     let commit = super::super::named_group_metadata_event_commit(&held.event)?;

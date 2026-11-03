@@ -1913,7 +1913,8 @@ delivery the S4 row owes. Until one of the two keys the seat again, the
 hold lasts: an installed share of the held epoch, or a later one whose
 epoch a head commit pins (#1775: a sealed share that raised the local
 epoch past what the head commits completed no verified transition), or
-the #1663 republication (while the node holds no secret), ends it. A
+the #1663 republication (while the node holds no secret), ends it. The
+exclusion installing with its own key ends every older hold too. A
 share of the held epoch ends the hold only when its sender is a
 recorded actor of that hold and the share's secret is the one recorded
 for that sender (#1766). A share of the same epoch from a different
@@ -1923,7 +1924,8 @@ keyless install the head already commits the epoch, but it binds the
 epoch, not the secret value (#1775): the durable keyless mark keeps
 that epoch's first installed secret replaceable — and the group's new
 ciphertext held, also past the #1663 republication — until the
-exclusion's own actor seals a share of it.
+exclusion's own actor seals a share of it. A head that commits a later
+epoch ends the mark of an earlier one.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`

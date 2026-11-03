@@ -363,12 +363,12 @@ except citations explicitly marked as resolving at
   `MemberBanned` commit*, because remove had no GSS rotation to produce the same ordering
   when it was written. Tightening that predicate to
   `secret_epoch <= info.secret_epoch` would silently strand every survivor on the
-  commit-first ordering whose secret a head commit already pins: cleared by the commit,
-  then refusing its own replacement — the #1766/#1775 replace path saves only the
-  uncommitted window — in
+  commit-first ordering: cleared by the commit, then refusing its own replacement, in
   consensus with a matching `state_hash` and decrypting nothing. That is the F1 failure
   re-created by a one-token edit, which is why Validation item 3 must be written to fail
   when the conjunct is deleted rather than merely to exercise both orderings.
+  #1766/#1775 narrow that damage, they do not remove it: the replace path saves a
+  survivor only while no verified commit pins the secret's value.
 - **The preflight bounds construction, not delivery, and this ADR claims nothing beyond
   that.** `publish_named_group_metadata_event` (`:1797-1833`) returns `()` and folds both a
   publish error and a timeout into `tracing::warn!`; the direct path's own doc comment
