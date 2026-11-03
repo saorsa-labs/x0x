@@ -618,15 +618,13 @@ struct SubjectState {
     /// its promotion path through the ordinary path, with the head at which
     /// it last asked the signer for a catch-up page.
     provisional: Option<(AdminTerminalAttestation, u64)>,
-    /// When this record began. A pre-Welcome joiner's own seal, and so the
-    /// staged Welcome for it, is older (#1661).
-    created_at: Instant,
     /// §3 "Beyond retention": this node entered `readmission_required
     /// {base_beyond_retention}` while this record lived.
     readmitted: bool,
-    /// This pre-Welcome joiner's own seal did not apply because its staged
-    /// Welcome could not be fetched (#1661).
-    welcome_unfetched: bool,
+    /// When this pre-Welcome joiner's own seal first did not apply because
+    /// its staged Welcome could not be fetched (#1661). The seal, and so
+    /// the staged Welcome for it, is older.
+    welcome_unfetched_at: Option<Instant>,
     /// §2 "Join attempt (D64)" (#1661): after readmission the sealer's
     /// staged Welcome is gone, so the attempt has ended with ADR 0107's
     /// typed outcome (see [`end_on_welcome_loss`]).
@@ -651,9 +649,8 @@ impl SubjectState {
             progress_at: now,
             armed_at: now,
             provisional: None,
-            created_at: now,
             readmitted: false,
-            welcome_unfetched: false,
+            welcome_unfetched_at: None,
             welcome_lost: false,
         }
     }
@@ -3798,7 +3795,9 @@ async fn apply_kept_chain(
             .subjects
             .get_mut(info.stable_group_id())
         {
-            subject.welcome_unfetched = true;
+            subject
+                .welcome_unfetched_at
+                .get_or_insert_with(Instant::now);
         }
     }
     retire_converged(state, group_key).await;
@@ -3809,7 +3808,7 @@ async fn apply_kept_chain(
 /// pre-Welcome joiner's own seal did not apply because its staged Welcome
 /// could not be fetched. Only the sealer holds that Welcome, in memory,
 /// for `PENDING_WELCOME_TTL` from the seal, and a sealer restart loses it
-/// sooner. When that lifetime has passed since this record began (the
+/// sooner. When that lifetime has passed since the first failed fetch (the
 /// seal is older), no retry can bring the keys. The tick checks this, as
 /// the seal is not replayed again once the gate is armed. The attempt then ends with
 /// ADR 0107's typed outcome, `timed_out {rearm_original_result_unavailable}`,
@@ -3832,12 +3831,18 @@ async fn end_on_welcome_loss(
             return false;
         };
         if subject.welcome_lost {
+            // A tick that deferred the record (for example
+            // `home_gate_closed`) may have replaced the view.
+            subject.view = SubjectView::Readmission {
+                cause: "base_beyond_retention",
+            };
             return true;
         }
-        if !subject.readmitted
-            || !subject.welcome_unfetched
-            || now.saturating_duration_since(subject.created_at) < super::PENDING_WELCOME_TTL
-        {
+        let expired = subject.readmitted
+            && subject
+                .welcome_unfetched_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= super::PENDING_WELCOME_TTL);
+        if !expired {
             return false;
         }
         subject.welcome_lost = true;
@@ -10311,7 +10316,7 @@ mod tests {
             .insert(stable.clone(), subject);
         let later = now + super::super::PENDING_WELCOME_TTL;
 
-        let set = |readmitted: bool, unfetched: bool| {
+        let set = |readmitted: bool, unfetched: Option<Instant>| {
             let state = &state;
             let stable = stable.clone();
             async move {
@@ -10324,29 +10329,43 @@ mod tests {
                     .get_mut(&stable)
                 {
                     subject.readmitted = readmitted;
-                    subject.welcome_unfetched = unfetched;
+                    subject.welcome_unfetched_at = unfetched;
                 }
             }
         };
         // Never readmitted: not this path.
-        set(false, true).await;
+        set(false, Some(now)).await;
         assert!(!end_on_welcome_loss(&state, &key, &stable, later).await);
         // No failed fetch: the seal may still apply.
-        set(true, false).await;
+        set(true, None).await;
         assert!(!end_on_welcome_loss(&state, &key, &stable, later).await);
-        set(true, true).await;
+        // A recent failed fetch (a later re-invite's seal) in an older
+        // record: its Welcome may still be served.
+        set(true, Some(later)).await;
+        assert!(!end_on_welcome_loss(&state, &key, &stable, later).await);
+        set(true, Some(now)).await;
         // Inside the lifetime the Welcome may still be served.
         assert!(!end_on_welcome_loss(&state, &key, &stable, now).await);
         assert!(!welcome_lost(&state, &stable).await);
 
         assert!(end_on_welcome_loss(&state, &key, &stable, later).await);
         assert!(welcome_lost(&state, &stable).await);
-        assert_eq!(
-            view_of(&state, &stable).await,
-            Some(SubjectView::Readmission {
-                cause: "base_beyond_retention"
-            })
-        );
+        let readmission = Some(SubjectView::Readmission {
+            cause: "base_beyond_retention",
+        });
+        assert_eq!(view_of(&state, &stable).await, readmission);
+        // A deferring tick replaces the view; the ended attempt restores it.
+        set_view(
+            &state,
+            &stable,
+            info.state_revision,
+            SubjectView::Deferred {
+                cause: "home_gate_closed",
+            },
+        )
+        .await;
+        assert!(end_on_welcome_loss(&state, &key, &stable, later).await);
+        assert_eq!(view_of(&state, &stable).await, readmission);
         let outcome = state
             .last_join_outcomes
             .lock()
