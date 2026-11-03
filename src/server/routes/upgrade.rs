@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -36,27 +36,6 @@ const UPGRADE_CHECK_ERROR_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const RELEASE_REBROADCAST_INTERVAL: Duration = Duration::from_secs(300);
 
 const SELF_PUBLISHED_RELEASE_TTL: Duration = Duration::from_secs(30 * 60);
-
-/// #1169: a long-running node re-checks the release feed on the identity
-/// heartbeat cadence, so a newly published release is announced on
-/// `RELEASE_TOPIC` within one heartbeat cycle instead of waiting for the
-/// fallback poll or a restart. Anchored to the default heartbeat constant —
-/// not the per-daemon configured heartbeat — so a mesh-tuned slower
-/// heartbeat cannot stretch the release-observation deadline.
-const RELEASE_ANNOUNCE_INTERVAL: Duration =
-    Duration::from_secs(x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS);
-
-/// A version whose announcement keeps failing is left to the fallback poll
-/// and the next restart instead of being re-sent every heartbeat: a publish
-/// that timed out after the bytes went out must not re-announce the same
-/// manifest with a fresh gossip message ID forever.
-const MAX_RELEASE_PUBLISH_ATTEMPTS: u8 = 3;
-
-/// Upper bound on the exponential check backoff, in heartbeat ticks
-/// (6 x 600 s = one hour). During a sustained feed outage — including a 403
-/// from a shared unauthenticated GitHub rate limit — the observer settles at
-/// one check per hour per node instead of six.
-const MAX_RELEASE_CHECK_BACKOFF_TICKS: u32 = 6;
 
 #[derive(Debug, Default)]
 pub(in crate::server) struct SelfPublishedReleaseManifests {
@@ -1125,6 +1104,37 @@ fn verify_gossip_release_with_key(payload: &[u8], trusted_key: &[u8]) -> Option<
     })
 }
 
+/// #1169: a node that first observes a new release must not stay silent
+/// until each peer's fallback poll fires. Every observation point — the
+/// startup check, the post-restart broadcast, the fallback poll, gossip
+/// relay, the `/upgrade` check and a manual `/upgrade/apply` — announces
+/// the signed manifest on `RELEASE_TOPIC`. The GitHub poll cadence stays
+/// at its documented fallback (A14 / ADR 0045); gossip is the fast path.
+/// Best effort and bounded: a stuck mesh must never block the observer,
+/// and peer rebroadcast limiting plus the apply owner's dedup handle
+/// repeats.
+async fn announce_observed_release<Publish, PublishFuture>(
+    release: &VerifiedRelease,
+    publish: Publish,
+) where
+    Publish: FnOnce(Vec<u8>) -> PublishFuture,
+    PublishFuture: Future<Output = Result<(), String>>,
+{
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        publish(release.gossip_payload.clone()),
+    )
+    .await
+    {
+        Ok(Ok(())) => tracing::info!(
+            version = %release.manifest.version,
+            "Observed release announced on the release topic"
+        ),
+        Ok(Err(error)) => tracing::debug!(%error, "Observed release announcement failed"),
+        Err(_) => tracing::debug!("Observed release announcement timed out"),
+    }
+}
+
 /// Production loop after the real signature verifier. Tests replace only
 /// release input and network publication, leaving dedup and submission intact.
 async fn run_gossip_update_driver<S, Publish, PublishFuture>(
@@ -1186,18 +1196,6 @@ async fn run_gossip_update_driver<S, Publish, PublishFuture>(
     }
 }
 
-/// Shared release-feed check for the fallback poll and the heartbeat
-/// observer: one construction site, so repo, binary name and prerelease
-/// policy cannot drift between the two cadences.
-async fn check_release_feed(
-    config: &DaemonUpdateConfig,
-) -> Result<Option<VerifiedRelease>, x0x::upgrade::UpgradeError> {
-    let monitor = UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION)
-        .map_err(x0x::upgrade::UpgradeError::Other)?
-        .with_include_prereleases(config.include_prereleases);
-    monitor.check_for_updates().await
-}
-
 pub(in crate::server) async fn run_fallback_github_poll(
     agent: Arc<Agent>,
     config: DaemonUpdateConfig,
@@ -1213,48 +1211,37 @@ pub(in crate::server) async fn run_fallback_github_poll(
         tracing::warn!("Fallback check interval exceeds the monotonic timer range");
         return;
     }
-    // #1169: the fallback cadence alone can leave a fresh release unannounced
-    // for most of a day. A heartbeat-cadence observer shares this task and
-    // its handles and announces each new version the first time this process
-    // observes it. It lives here rather than as a spawn in
-    // `serve_with_options` because `src/server/mod.rs` is held by #1774;
-    // lift the spawn out when that lands.
-    let announce = run_release_announce_poll(
-        Arc::clone(&agent),
-        config.clone(),
-        submit.clone(),
-        Arc::clone(&self_published),
-        shutdown.clone(),
-    );
-    let fallback = async {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await; // startup already owns the immediate check
-        let ticks = futures::stream::unfold(ticker, |mut ticker| async move {
-            ticker.tick().await;
-            Some(((), ticker))
-        });
-        run_fallback_update_driver(
-            ticks,
-            move || {
-                let config = config.clone();
-                async move { check_release_feed(&config).await }
-            },
-            submit,
-            self_published,
-            move |payload| {
-                let agent = Arc::clone(&agent);
-                async move {
-                    agent
-                        .publish(RELEASE_TOPIC, payload)
-                        .await
-                        .map_err(|error| error.to_string())
-                }
-            },
-            shutdown,
-        )
-        .await;
-    };
-    tokio::join!(announce, fallback);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.tick().await; // startup already owns the immediate check
+    let ticks = futures::stream::unfold(ticker, |mut ticker| async move {
+        ticker.tick().await;
+        Some(((), ticker))
+    });
+    run_fallback_update_driver(
+        ticks,
+        move || {
+            let config = config.clone();
+            async move {
+                let monitor = UpgradeMonitor::new(&config.repo, "x0xd", x0x::VERSION)
+                    .map_err(x0x::upgrade::UpgradeError::Other)?
+                    .with_include_prereleases(config.include_prereleases);
+                monitor.check_for_updates().await
+            }
+        },
+        submit,
+        self_published,
+        move |payload| {
+            let agent = Arc::clone(&agent);
+            async move {
+                agent
+                    .publish(RELEASE_TOPIC, payload)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        },
+        shutdown,
+    )
+    .await;
 }
 
 /// Production ticker/check loop. Tests supply inert ticks and already-verified
@@ -1319,197 +1306,6 @@ async fn run_fallback_update_driver<S, Check, CheckFuture, Publish, PublishFutur
         }
         if let Some(Err(error)) = submit.as_ref().map(|submit| submit.submit(verified)) {
             tracing::warn!(%error, "Fallback release was not queued");
-        }
-    }
-}
-
-/// #1169: heartbeat-cadence release observer. The startup paths announce
-/// only at boot and the fallback poll defaults to every two days, so a
-/// long-running node would otherwise stay silent until its own poll fired
-/// hours after a publish. Every identity heartbeat this observer re-checks
-/// the release feed and announces each newer signed manifest on
-/// `RELEASE_TOPIC` the first time this process observes it; subscribed peers
-/// then run their update check from the announcement instead of the poll.
-async fn run_release_announce_poll(
-    agent: Arc<Agent>,
-    config: DaemonUpdateConfig,
-    submit: Option<BackgroundSubmit>,
-    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    // De-phase nodes before the first check: nodes behind one IP share
-    // GitHub's unauthenticated rate limit, so a synchronized fleet-wide
-    // tick would spend it in bursts. Stable per machine, bounded by one
-    // heartbeat; the announcement still leaves within two heartbeats.
-    let jitter = {
-        let digest = Sha256::digest(agent.machine_id().as_bytes());
-        let nanos = u64::from_be_bytes(digest[..8].try_into().expect("digest prefix"))
-            % RELEASE_ANNOUNCE_INTERVAL.as_nanos() as u64;
-        Duration::from_nanos(nanos)
-    };
-    tokio::select! {
-        _ = tokio::time::sleep(jitter) => {}
-        _ = shutdown.changed() => return,
-    }
-    let mut ticker = tokio::time::interval(RELEASE_ANNOUNCE_INTERVAL);
-    // A stalled runtime must not fire a burst of catch-up release checks.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await; // the startup check and post-restart broadcast own the immediate look
-    let ticks = futures::stream::unfold(ticker, |mut ticker| async move {
-        ticker.tick().await;
-        Some(((), ticker))
-    });
-    run_release_announce_driver(
-        ticks,
-        move || {
-            let config = config.clone();
-            async move { check_release_feed(&config).await }
-        },
-        submit,
-        self_published,
-        move |payload| {
-            let agent = Arc::clone(&agent);
-            async move {
-                agent
-                    .publish(RELEASE_TOPIC, payload)
-                    .await
-                    .map_err(|error| error.to_string())
-            }
-        },
-        shutdown,
-    )
-    .await;
-}
-
-/// Production ticker/check loop. Tests supply inert ticks and already-verified
-/// monitor results, not a replacement scheduling implementation.
-async fn run_release_announce_driver<S, Check, CheckFuture, Publish, PublishFuture>(
-    ticks: S,
-    mut check: Check,
-    submit: impl Into<Option<BackgroundSubmit>>,
-    self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
-    mut publish: Publish,
-    mut shutdown: watch::Receiver<bool>,
-) where
-    S: Stream<Item = ()>,
-    Check: FnMut() -> CheckFuture,
-    CheckFuture: Future<Output = Result<Option<VerifiedRelease>, x0x::upgrade::UpgradeError>>,
-    Publish: FnMut(Vec<u8>) -> PublishFuture,
-    PublishFuture: Future<Output = Result<(), String>>,
-{
-    let submit = submit.into();
-    // One announcement per version per process: gossip relay, the fallback
-    // poll and the next restart carry repeats, so a heartbeat-cadence loop
-    // must not re-flood the topic with the same manifest.
-    let mut announced: HashSet<String> = HashSet::new();
-    let mut publish_attempts: HashMap<String, u8> = HashMap::new();
-    // Consecutive feed errors skip 1, 2, 4 ... ticks (capped at one hour):
-    // a sustained outage must not keep the loop checking at heartbeat cadence.
-    let mut consecutive_errors: u32 = 0;
-    let mut ticks_to_skip: u32 = 0;
-    futures::pin_mut!(ticks);
-    loop {
-        if *shutdown.borrow() || shutdown.has_changed().is_err() {
-            return;
-        }
-        tokio::select! {
-            tick = ticks.next() => if tick.is_none() { return; },
-            _ = shutdown.changed() => return,
-        }
-        if ticks_to_skip > 0 {
-            ticks_to_skip -= 1;
-            continue;
-        }
-        let checked = tokio::select! {
-            result = check() => result,
-            _ = shutdown.changed() => return,
-        };
-        let verified = match checked {
-            Ok(Some(verified)) => verified,
-            Ok(None) => {
-                consecutive_errors = 0;
-                continue;
-            }
-            Err(error) => {
-                // debug, not warn: at heartbeat cadence a GitHub outage would
-                // flood warnings; the fallback poll keeps the warn-level
-                // signal. The backoff below also covers a 403 from a shared
-                // unauthenticated GitHub rate limit.
-                tracing::debug!(%error, "Heartbeat release check failed");
-                consecutive_errors = consecutive_errors.saturating_add(1);
-                ticks_to_skip =
-                    (1_u32 << (consecutive_errors - 1).min(3)).min(MAX_RELEASE_CHECK_BACKOFF_TICKS);
-                continue;
-            }
-        };
-        consecutive_errors = 0;
-        if x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest).is_err() {
-            continue;
-        }
-        if announced.contains(&verified.manifest.version) {
-            continue;
-        }
-        let already_published_here = {
-            let mut published = self_published.lock().await;
-            published.contains_recent_digest(
-                &release_manifest_payload_digest(&verified.gossip_payload),
-                Instant::now(),
-            )
-        };
-        if already_published_here {
-            // The post-restart broadcast, the fallback poll or this loop
-            // already announced this exact payload in this process. The
-            // startup check does not record its publication, so its
-            // announcement can repeat once here; peers dedup by version.
-            announced.insert(verified.manifest.version.clone());
-            continue;
-        }
-        if let Some(submit) = submit
-            .as_ref()
-            .filter(|submit| submit.in_retry_backoff(&verified))
-        {
-            if let Err(error) = submit.submit(verified) {
-                tracing::warn!(%error, "Announced release backoff could not be observed");
-            }
-            continue;
-        }
-        // Record the version only after the announcement went out, so a
-        // failed publication retries on the next heartbeat. Retries are
-        // capped: a publish that timed out after the bytes went out must
-        // not re-announce the same manifest with a fresh gossip message ID
-        // every heartbeat. The fallback poll and the next restart carry it.
-        let attempts = {
-            let attempts = publish_attempts
-                .entry(verified.manifest.version.clone())
-                .or_insert(0);
-            *attempts += 1;
-            *attempts
-        };
-        tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(10), publish(verified.gossip_payload.clone())) => {
-                if matches!(result, Ok(Ok(()))) {
-                    self_published
-                        .lock()
-                        .await
-                        .record_payload(&verified.gossip_payload, Instant::now());
-                    announced.insert(verified.manifest.version.clone());
-                    publish_attempts.remove(&verified.manifest.version);
-                } else if attempts >= MAX_RELEASE_PUBLISH_ATTEMPTS {
-                    tracing::warn!(
-                        version = %verified.manifest.version,
-                        attempts,
-                        "Release announcement kept failing; leaving it to the fallback poll"
-                    );
-                    announced.insert(verified.manifest.version.clone());
-                    publish_attempts.remove(&verified.manifest.version);
-                } else {
-                    tracing::debug!("Release announcement did not complete; retrying next heartbeat");
-                }
-            }
-            _ = shutdown.changed() => return,
-        }
-        if let Some(Err(error)) = submit.as_ref().map(|submit| submit.submit(verified)) {
-            tracing::warn!(%error, "Announced release was not queued");
         }
     }
 }
@@ -1865,6 +1661,21 @@ pub(in crate::server) async fn check_upgrade(State(state): State<Arc<AppState>>)
 
     match monitor.check_for_updates().await {
         Ok(Some(release)) => {
+            // #1169: this fresh observation is the fleet's fastest chance to
+            // learn about the release; announce it before the (cached)
+            // response keeps every later check silent for the cache TTL.
+            // Gated like the apply paths: an embedder with self-update off
+            // must not gain a new updater side-effect.
+            if state.self_update_enabled {
+                let agent = Arc::clone(&state.agent);
+                announce_observed_release(&release, move |payload| async move {
+                    agent
+                        .publish(RELEASE_TOPIC, payload)
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+                .await;
+            }
             store_upgrade_response(
                 state.as_ref(),
                 StatusCode::OK,
@@ -2027,6 +1838,20 @@ pub(in crate::server) async fn apply_upgrade(
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "upgrade check failed");
         }
     };
+
+    // #1169: announce before the apply work — the receipt, staging and
+    // rollout waits below can take minutes, and peers must not wait for
+    // their own fallback poll while this node already saw the release.
+    {
+        let agent = Arc::clone(&state.agent);
+        announce_observed_release(&release, move |payload| async move {
+            agent
+                .publish(RELEASE_TOPIC, payload)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await;
+    }
 
     let restart_context = RestartContext {
         data_dir: Some(state.data_dir.clone()),
@@ -2534,8 +2359,9 @@ mod tests {
         assert_eq!(decision_after_ttl, ReleaseRebroadcastDecision::Rebroadcast);
     }
 
-    // #1169: a release must reach RELEASE_TOPIC within one heartbeat cycle of
-    // a long-running node first observing it, not at the next fallback poll.
+    // #1169: every observation point must announce a newly observed release
+    // on RELEASE_TOPIC, so subscribed peers never wait for their own
+    // fallback poll.
 
     fn verified_release_with_version(version: &str) -> VerifiedRelease {
         let manifest = manifest_with_version(version);
@@ -2549,287 +2375,108 @@ mod tests {
         }
     }
 
-    fn verified_release_for_current_platform(version: &str) -> VerifiedRelease {
-        let mut verified = verified_release_with_version(version);
-        let Some(target) = x0x::upgrade::manifest::current_platform_target() else {
-            return verified;
-        };
-        if verified
-            .manifest
-            .assets
-            .iter()
-            .any(|asset| asset.target == target)
-        {
-            return verified;
-        }
-        verified.manifest.assets.push(PlatformAsset {
-            target: target.to_string(),
-            archive_url: "https://example.com/x0x-current-platform.tar.gz".to_string(),
-            archive_sha256: [0xCC; 32],
-            signature_url: "https://example.com/x0x-current-platform.tar.gz.sig".to_string(),
-        });
-        let manifest_json =
-            serde_json::to_vec(&verified.manifest).expect("serialize manifest fixture");
-        verified.gossip_payload =
-            x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"announce");
-        verified.manifest_json = manifest_json;
-        verified
-    }
-
-    #[test]
-    fn release_announce_interval_matches_the_identity_heartbeat() {
-        assert_eq!(
-            RELEASE_ANNOUNCE_INTERVAL,
-            Duration::from_secs(x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS),
-            "#1169: the announce cadence is one identity heartbeat cycle"
-        );
-    }
-
     #[tokio::test]
-    async fn release_announce_driver_announces_first_observation_once() {
+    async fn observed_release_announcement_publishes_the_signed_payload() {
         let verified = verified_release_with_version(&version_newer_than_current());
-        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = Arc::clone(&payloads);
-        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
-        let observed = Arc::clone(&self_published);
-        let expected_payload = verified.gossip_payload.clone();
-        let count = Arc::clone(&published);
-        let (_keep_running, shutdown) = watch::channel(false);
-        run_release_announce_driver(
-            futures::stream::iter([(), (), ()]),
-            move || {
-                let verified = verified.clone();
-                async { Ok(Some(verified)) }
-            },
-            None,
-            self_published,
-            move |payload| {
-                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                record.lock().unwrap().push(payload);
-                async { Ok(()) }
-            },
-            shutdown,
-        )
-        .await;
-        assert_eq!(
-            published.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "one announcement per version per process"
-        );
-        {
-            let payloads = payloads.lock().unwrap();
-            assert_eq!(payloads.len(), 1);
-            assert_eq!(payloads[0], expected_payload);
-        }
-        assert!(
-            observed.lock().await.contains_recent_digest(
-                &release_manifest_payload_digest(&expected_payload),
-                Instant::now()
-            ),
-            "the announcement is recorded as self-published"
-        );
-    }
-
-    #[tokio::test]
-    async fn release_announce_driver_announces_each_newer_version() {
-        let first = verified_release_with_version(&version_newer_than_current());
-        let mut later = semver::Version::parse(&first.manifest.version).unwrap();
-        later.patch += 1;
-        let later = verified_release_with_version(&later.to_string());
-        let first_payload = first.gossip_payload.clone();
-        let later_payload = later.gossip_payload.clone();
+        let expected = verified.gossip_payload.clone();
         let published = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = Arc::clone(&published);
-        let tick_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (_keep_running, shutdown) = watch::channel(false);
-        run_release_announce_driver(
-            // The release feed has nothing newer at first; version one
-            // appears mid-life, then version two supersedes it.
-            futures::stream::iter([(), (), (), ()]),
-            move || {
-                let first = first.clone();
-                let later = later.clone();
-                let tick = tick_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async move {
-                    let release = match tick {
-                        1 | 2 => Some(first),
-                        3 => Some(later),
-                        _ => None,
-                    };
-                    Ok(release)
-                }
-            },
-            None,
-            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
-            move |payload| {
-                record.lock().unwrap().push(payload);
-                async { Ok(()) }
-            },
-            shutdown,
-        )
+        announce_observed_release(&verified, move |payload| {
+            record.lock().unwrap().push(payload);
+            async { Ok(()) }
+        })
         .await;
-        let published = published.lock().unwrap();
         assert_eq!(
-            published.len(),
-            2,
-            "no announcement before the first observation, then one per version"
+            published.lock().unwrap().as_slice(),
+            &[expected],
+            "the observation publishes the exact signed gossip payload"
         );
-        assert_eq!(published[0], first_payload);
-        assert_eq!(published[1], later_payload);
     }
 
-    #[tokio::test]
-    async fn release_announce_driver_skips_payload_this_process_already_published() {
+    #[tokio::test(start_paused = true)]
+    async fn observed_release_announcement_is_bounded_on_a_stuck_mesh() {
         let verified = verified_release_with_version(&version_newer_than_current());
-        let self_published = Arc::new(Mutex::new(SelfPublishedReleaseManifests::default()));
-        self_published
-            .lock()
-            .await
-            .record_payload(&verified.gossip_payload, Instant::now());
-        let published = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count = Arc::clone(&published);
-        let (_keep_running, shutdown) = watch::channel(false);
-        run_release_announce_driver(
-            futures::stream::iter([(), (), ()]),
-            move || {
-                let verified = verified.clone();
-                async { Ok(Some(verified)) }
-            },
-            None,
-            self_published,
-            move |_| {
-                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async { Ok(()) }
-            },
-            shutdown,
-        )
-        .await;
+        let start = tokio::time::Instant::now();
+        announce_observed_release(&verified, |_| std::future::pending()).await;
         assert_eq!(
-            published.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the startup broadcast, fallback poll or an earlier heartbeat already announced it"
+            tokio::time::Instant::now().duration_since(start),
+            Duration::from_secs(10),
+            "a publication that never completes is abandoned after ten seconds"
         );
     }
 
     #[tokio::test]
-    async fn release_announce_driver_retries_failed_publication_next_heartbeat() {
+    async fn observed_release_announcement_survives_publish_errors() {
         let verified = verified_release_with_version(&version_newer_than_current());
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counting = Arc::clone(&attempts);
-        let (_keep_running, shutdown) = watch::channel(false);
-        run_release_announce_driver(
-            futures::stream::iter([(), (), ()]),
-            move || {
-                let verified = verified.clone();
-                async { Ok(Some(verified)) }
-            },
-            None,
-            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
-            move |_| {
-                let attempt = counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async move {
-                    if attempt == 0 {
-                        Err("gossip unreachable".to_string())
-                    } else {
-                        Ok(())
-                    }
-                }
-            },
-            shutdown,
-        )
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&reached);
+        announce_observed_release(&verified, |_| async {
+            Err("gossip unreachable".to_string())
+        })
         .await;
-        assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "a failed announcement is retried once and not re-sent after success"
-        );
-    }
-
-    #[tokio::test]
-    async fn release_announce_driver_gives_up_after_bounded_publish_attempts() {
-        let verified = verified_release_with_version(&version_newer_than_current());
-        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counting = Arc::clone(&attempts);
-        let (_keep_running, shutdown) = watch::channel(false);
-        run_release_announce_driver(
-            futures::stream::iter([(), (), (), (), (), ()]),
-            move || {
-                let verified = verified.clone();
-                async { Ok(Some(verified)) }
-            },
-            None,
-            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
-            move |_| {
-                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async { Err("gossip unreachable".to_string()) }
-            },
-            shutdown,
-        )
-        .await;
-        assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
-            usize::from(MAX_RELEASE_PUBLISH_ATTEMPTS),
-            "a version that cannot be published is left to the fallback poll, not re-sent forever"
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            "a failed publication is logged and abandoned, never propagated"
         );
     }
 
     #[tokio::test(start_paused = true)]
     async fn release_propagation_reaches_a_subscribed_peer_within_two_heartbeats() {
-        // #1169 acceptance shape: an observer announces a fresh release on
-        // the release topic within one heartbeat, and a subscribed peer's
-        // gossip driver reacts within two heartbeats of publication.
-        // Simulated network only: the two drivers are wired by a channel.
-        let verified = verified_release_for_current_platform(&version_newer_than_current());
-        let expected_version = verified.manifest.version.clone();
-        let queued = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // #1169 acceptance shape, honestly signed: a node observes a
+        // release and announces the real signed payload; a subscribed peer
+        // verifies it, rebroadcasts it and queues it with its background
+        // apply owner — within two heartbeats of the observation. The two
+        // sides are wired by a channel; no network, no testnet.
+        use x0x::upgrade::signature::sign_with_context;
+        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .unwrap();
+        let mut manifest = manifest_with_version(&version_newer_than_current());
+        if let Some(target) = x0x::upgrade::manifest::current_platform_target() {
+            if !manifest.assets.iter().any(|asset| asset.target == target) {
+                manifest.assets.push(PlatformAsset {
+                    target: target.to_string(),
+                    archive_url: "https://example.com/x0x-current-platform.tar.gz".to_string(),
+                    archive_sha256: [0xCC; 32],
+                    signature_url: "https://example.com/x0x-current-platform.tar.gz.sig"
+                        .to_string(),
+                });
+            }
+        }
+        let expected_version = manifest.version.clone();
+        let manifest_json = serde_json::to_vec(&manifest).unwrap();
+        let signature = sign_with_context(&sk.to_bytes(), &manifest_json).unwrap();
+        let payload = x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, &signature);
+        let verified = VerifiedRelease {
+            manifest,
+            manifest_json,
+            signature,
+            gossip_payload: payload.clone(),
+        };
+
         let start = tokio::time::Instant::now();
         let (announce_tx, announce_rx) = mpsc::channel::<Vec<u8>>(8);
         let (relayed_tx, mut relayed_rx) = mpsc::channel::<tokio::time::Instant>(1);
-        let published_at = Arc::new(std::sync::Mutex::new(None::<tokio::time::Instant>));
-        let sent_at = Arc::clone(&published_at);
+        let queued = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        // Node A: the ticker the announce poll runs; the first tick is
-        // skipped because the startup paths own the immediate look.
-        let mut ticker = tokio::time::interval(RELEASE_ANNOUNCE_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await;
-        let ticks = futures::stream::unfold(ticker, |mut ticker| async move {
-            ticker.tick().await;
-            Some(((), ticker))
+        // The observing node: announce the verified payload on the topic.
+        announce_observed_release(&verified, move |observed| {
+            let announce_tx = announce_tx.clone();
+            async move { announce_tx.send(observed).await.map_err(|e| e.to_string()) }
         })
-        .take(2);
-        let feed = verified.clone();
-        let (_keep_running, announcer_shutdown) = watch::channel(false);
-        let announcer = run_release_announce_driver(
-            ticks,
-            move || {
-                let feed = feed.clone();
-                async { Ok(Some(feed)) }
-            },
-            None,
-            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
-            move |payload| {
-                let announce_tx = announce_tx.clone();
-                let sent_at = Arc::clone(&sent_at);
-                async move {
-                    *sent_at.lock().unwrap() = Some(tokio::time::Instant::now());
-                    announce_tx.send(payload).await.map_err(|e| e.to_string())
-                }
-            },
-            announcer_shutdown,
-        );
+        .await;
 
-        // Peer B: the gossip driver a subscribed peer runs; it reacts the
-        // moment the announcement arrives.
+        // The subscribed peer: verify the payload like the gossip listener
+        // does, then run the gossip driver with a background apply owner.
         let releases = futures::stream::unfold(announce_rx, move |mut announce_rx| {
-            let verified = verified.clone();
+            let pk = pk.clone();
             async move {
-                let _payload = announce_rx.recv().await?;
-                Some((verified, announce_rx))
+                let payload = announce_rx.recv().await?;
+                verify_gossip_release_with_key(&payload, &pk.to_bytes())
+                    .map(|verified| (verified, announce_rx))
             }
         });
-        let (_keep_running, relayer_shutdown) = watch::channel(false);
         let record = Arc::clone(&queued);
         let relayer_submit = BackgroundSubmit {
             processed: Some(Arc::new(move |version, outcome| {
@@ -2837,7 +2484,8 @@ mod tests {
             })),
             ..Default::default()
         };
-        let relayer = run_gossip_update_driver(
+        let (_keep_running, relayer_shutdown) = watch::channel(false);
+        run_gossip_update_driver(
             releases,
             Some(relayer_submit),
             Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
@@ -2846,87 +2494,19 @@ mod tests {
                 async { Ok(()) }
             },
             relayer_shutdown,
-        );
+        )
+        .await;
 
-        tokio::join!(announcer, relayer);
-        let announced_at = published_at.lock().unwrap().expect("announcement went out");
         let peer_reacted_at = relayed_rx.recv().await.expect("peer reacted");
         assert!(
-            announced_at.duration_since(start) <= RELEASE_ANNOUNCE_INTERVAL,
-            "the announcement left within one heartbeat cycle"
-        );
-        assert!(
-            peer_reacted_at.duration_since(start) < 2 * RELEASE_ANNOUNCE_INTERVAL,
+            peer_reacted_at.duration_since(start)
+                < 2 * Duration::from_secs(x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS),
             "a subscribed peer reacted within two heartbeat cycles"
         );
         assert_eq!(
             queued.lock().unwrap().as_slice(),
             &[(expected_version, SubmitOutcome::Accepted)],
             "the subscribed peer started its own update check from the announcement"
-        );
-    }
-
-    #[tokio::test]
-    async fn release_announce_driver_backs_off_check_errors_exponentially() {
-        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counting = Arc::clone(&checks);
-        let (_keep_running, shutdown) = watch::channel(false);
-        run_release_announce_driver(
-            futures::stream::iter([(), (), (), (), (), (), (), (), (), ()]),
-            move || {
-                let call = counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                async move {
-                    if call < 2 {
-                        Err(x0x::upgrade::UpgradeError::Other("rate limited".into()))
-                    } else {
-                        Ok(None)
-                    }
-                }
-            },
-            None,
-            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
-            |_| async { Ok(()) },
-            shutdown,
-        )
-        .await;
-        // Call 1 fails: skip 1 tick. Call 2 fails: skip 2 ticks. Then the
-        // feed is quiet again, so every remaining tick checks.
-        assert_eq!(
-            checks.load(std::sync::atomic::Ordering::SeqCst),
-            7,
-            "10 ticks, 3 skipped by the 1-then-2 backoff"
-        );
-    }
-
-    #[tokio::test]
-    async fn release_announce_driver_queues_the_release_with_the_shared_owner() {
-        let verified = verified_release_for_current_platform(&version_newer_than_current());
-        let queued = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = Arc::clone(&queued);
-        let submit = BackgroundSubmit {
-            processed: Some(Arc::new(move |version, outcome| {
-                record.lock().unwrap().push((version, outcome))
-            })),
-            ..Default::default()
-        };
-        let (_keep_running, shutdown) = watch::channel(false);
-        run_release_announce_driver(
-            futures::stream::iter([(), ()]),
-            move || {
-                let verified = verified.clone();
-                async { Ok(Some(verified)) }
-            },
-            Some(submit),
-            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
-            |_| async { Ok(()) },
-            shutdown,
-        )
-        .await;
-        let queued = queued.lock().unwrap();
-        assert_eq!(
-            queued.as_slice(),
-            &[(version_newer_than_current(), SubmitOutcome::Accepted)],
-            "the observer starts its own update check from the announcement"
         );
     }
 
