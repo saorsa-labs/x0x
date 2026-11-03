@@ -661,8 +661,9 @@ jobs:
     # those cases extend that shard only. The H-S3-c/c2/c3/d8/d3 rows each have
     # their own S3 group (`s3-c`, `s3-c2`, `s3-c3`, `s3-d8`, `s3-d3`). H-S3-d3
     # runs as four parallel parts (`s3-d3.1` to `s3-d3.4`, 5 reruns each;
-    # `PARTS` in w3h-shards.py). A group is omitted when the tree has no
-    # matching test.
+    # `PARTS` in w3h-shards.py). The #1661 welcome-lost row has its own
+    # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each). A group is
+    # omitted when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
