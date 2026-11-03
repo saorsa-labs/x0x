@@ -1737,8 +1737,12 @@ every wait. A wait always names its cause; it does not stop silently.
 ```
 
 - `phase` — `pending`, `prepared`, `committed_delivery_pending`, `complete`
-  or `terminated`. `termination_cause` is `group_deleted` or
-  `certificate_valid` for a `terminated` row.
+  or `terminated`. `termination_cause` is `group_deleted`,
+  `certificate_valid` or `creator_seat_exempt` for a `terminated` row.
+  `creator_seat_exempt` ends an expiry row that names the group's creator
+  (#1023). The row was opened by an earlier build; no new creator row can
+  open, because the creator's own expired certificate does not make it
+  eviction-eligible.
 - `waiting.cause` — one of:
   - `waiting_for_designated_admin` — another admin is designated. `detail`
     is `rank` (this node waits for its fallback time, `remaining_ms`) or
@@ -2433,10 +2437,22 @@ commits — paired with the roster projection it effected:
   limit, count, has_more, next_from_revision, commits }`, where each
   `commits[]` entry is `{ commit, roster, roster_root_verified }`.
   `roster` is the `{ agent_id: { role, state } }` projection of `Active` +
-  `Banned` members; `roster_root_verified` recomputes the root over that
-  projection and compares it to the commit's signed `roster_root`, so any
-  at-rest corruption surfaces rather than serving silently-wrong history.
-  `limit` is capped at 500.
+  `Banned` members. Entries may additionally carry `treekem_key_package_hash`
+  and `certificate_digest`. Since #1023, an entry may also carry an optional
+  `certificate` (base64(bincode) `AgentCertificate`). Only the newest 2
+  retained commits keep the bytes (`RETAINED_CERT_CARRY_LINKS = 2`, the
+  terminal link included); older entries are digest-only. This local
+  endpoint applies no message budget. The 48 KiB direct-message budget
+  governs the `JoinResult` carrier between peers; that carrier drops the
+  chain bytes first when its payload would exceed the budget.
+  `roster_root_verified` recomputes the root over that projection and
+  compares it to the commit's signed `roster_root`. At-rest corruption
+  therefore surfaces instead of serving silently-wrong history. While the
+  group is live, the endpoint is members-only. These owner certificates
+  therefore go only to a local caller whose agent holds an active seat.
+  After the group is withdrawn, the local tombstone's history is
+  `PublicRead` to the local API caller. The newest retained commits still
+  carry their certificate bytes. `limit` is capped at 500.
 
 Scope and honest limits: retention is **not retroactive** — history begins
 at the first release that retains it, and each daemon holds only the suffix

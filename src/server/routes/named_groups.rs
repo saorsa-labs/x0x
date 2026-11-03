@@ -4607,7 +4607,16 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
         member.treekem_key_package_b64 = None;
         member.treekem_key_package_hash = None;
     }
-    let head = group.commit_log.last()?.clone();
+    let mut head = group.commit_log.last()?.clone();
+    // Review finding 10 (#1023 round): the receiver verifies certificates
+    // from `members_v2` and the roster root from the snapshots' DIGESTS, so
+    // the head link's certificate bytes carry nothing it needs — while
+    // doubling every certified seat's payload against the 48 KiB
+    // direct-message budget, past which the bootstrap never delivers. Serve
+    // the head link digest-only, like the KEM strip above.
+    for snapshot in head.roster.values_mut() {
+        snapshot.certificate = None;
+    }
     group.commit_log.clear();
     group.commit_log.push(head);
     Some(group)
@@ -5025,6 +5034,8 @@ pub(in crate::server) fn apply_signed_public_revision_catchup(
             let overflow = next.commit_log.len() - x0x::groups::COMMIT_LOG_CAP;
             next.commit_log.drain(0..overflow);
         }
+        // #1023: every append site ages the certificate carry.
+        next.age_certificate_carry();
     }
     Some(next)
 }
@@ -30825,8 +30836,10 @@ async fn owner_certified_seal_with_eviction(
         info.owner_cert_verdict(&evidence)
     };
     // The members that remain seated once the Failed set is gone: Clean ∪
-    // InGrace, per the operation's single verdict.
-    let in_grace_initially = !verdict.in_grace().is_empty();
+    // InGrace ∪ DigestPending, per the operation's single verdict. A
+    // digest-pending seat (a digest-only seat, or a held creator, #1023)
+    // is not Clean, so it keeps the restore quarantine set like InGrace.
+    let pending_initially = !verdict.in_grace().is_empty() || !verdict.digest_pending().is_empty();
     // Work queue: EXACTLY the operation-verdict's Failed set, evicted one
     // member per sealed transition. The verdict is frozen for this
     // operation — no re-evaluation, so mid-operation grace expiry cannot
@@ -30844,12 +30857,14 @@ async fn owner_certified_seal_with_eviction(
                 //
                 // Round-5 quarantine rule (documented): the operation ends
                 // with every remaining member Clean IN THE OPERATION'S
-                // VERDICT iff no member was InGrace initially — the Failed
-                // set is fully evicted and the rest were Clean at
-                // evaluation. Exactly then the restore quarantine lifts,
-                // here, explicitly (no clean seal is minted to do it).
-                // Otherwise it stays set until a later all-clean seal.
-                if !in_grace_initially {
+                // VERDICT iff no member was InGrace or DigestPending
+                // initially (#1023: a held creator is DigestPending) —
+                // the Failed set is fully evicted and the rest were
+                // Clean at evaluation. Exactly then the restore
+                // quarantine lifts, here, explicitly (no clean seal is
+                // minted to do it). Otherwise it stays set until a
+                // later all-clean seal.
+                if !pending_initially {
                     // ADR-0064 slice 4 r2 (review item 3): the flag AND
                     // the eviction-arm marker clear happen ONLY inside
                     // the persist transaction — no pre-transaction
@@ -30914,28 +30929,37 @@ async fn owner_certified_seal_with_eviction(
                     }
                     return Some(Ok((commit, evicted_total.clone(), fork_marker_cleared)));
                 }
-                // InGrace members remain (they were NOT evicted — not in
-                // this operation's Failed set): typed, retryable refusal;
-                // the evicted transitions are already committed/published.
+                // InGrace or DigestPending members remain (they were NOT
+                // evicted — not in this operation's Failed set): typed,
+                // retryable refusal; the evicted transitions are already
+                // committed/published. The pending list names BOTH classes
+                // — a held creator (#1023, 02:36 ruling) is a pending
+                // creator the operator must renew, never an empty list.
+                let mut still_pending = verdict.in_grace();
+                still_pending.extend(verdict.digest_pending());
                 return Some(Err(api_error(
                     StatusCode::CONFLICT,
                     format!(
                         "owner-certified group has members pending certificate resolution: {:?}; \
                          evictions committed, retry the seal once evidence converges",
-                        verdict.in_grace()
+                        still_pending
                     ),
                 )));
             }
             if !verdict.is_all_clean() {
-                // No Failed members but some are InGrace — no clean seal
-                // may mint on a non-clean verdict, and the restore
-                // quarantine must stay set. Typed, retryable.
+                // No Failed members but some are InGrace or DigestPending —
+                // no clean seal may mint on a non-clean verdict, and the
+                // restore quarantine must stay set. Typed, retryable; the
+                // list names BOTH classes (the R17 log's empty `[]` was this
+                // line reporting only in_grace).
+                let mut still_pending = verdict.in_grace();
+                still_pending.extend(verdict.digest_pending());
                 return Some(Err(api_error(
                     StatusCode::CONFLICT,
                     format!(
                         "owner-certified group has members pending certificate resolution: {:?}; \
                          retry the seal once evidence converges",
-                        verdict.in_grace()
+                        still_pending
                     ),
                 )));
             }
@@ -32147,9 +32171,10 @@ pub(in crate::server) async fn hydrate_digest_only_seats_at_seat_time(
                 .map(|cert| (member.clone(), cert))
         })
         .collect();
-    if pairs.is_empty() {
-        return 0;
-    }
+    // #1023 (Engineer ruling 31 Oct 2026 20:40 GMT): call through with no
+    // cached pairs too — `hydrate_member_certificates` then falls back to
+    // the group's own retained-commit snapshots, so a node holding the
+    // chain hydrates with every holder offline and nothing cached.
     let hydrated = info.hydrate_member_certificates(&pairs);
     if hydrated > 0 {
         tracing::info!(
@@ -32322,14 +32347,34 @@ async fn seal_owner_certified_unbounded(
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {
         let group_id = info.stable_group_id().to_string();
+        // The hold is re-checked at the verdict's own evidence time.
+        let now_unix = evidence.now_unix();
+        let in_grace = verdict.in_grace();
+        let digest_pending = verdict.digest_pending();
+        // ADR 0110 §1a: an admin whose own certificate is expired may not
+        // seal. A held creator is DigestPending, not Failed, so the S4
+        // passes below must refuse it as the signer themselves.
+        let signer_is_held_creator = info.creator_expired_certificate_hold(
+            &hex::encode(signing_kp.agent_id().as_bytes()),
+            now_unix,
+        );
         let failed = verdict.failed();
         if !failed.is_empty() {
             let members: Vec<String> = failed.iter().map(|(hex, _)| hex.clone()).collect();
+            // #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): a HELD
+            // creator — its own expired certificate, reported
+            // `DigestPending` — blocks nothing: the S4 eviction seal must
+            // still evict a revoked member while the creator's renewal is
+            // outstanding. Every OTHER pending seat keeps the gate.
+            let pending_blocks_seal = digest_pending
+                .iter()
+                .any(|hex| !info.creator_expired_certificate_hold(hex, now_unix));
             // ADR 0110 §3: an S4 removal of one revoked or expired seat may
             // seal while the group's other open S4 targets still fail; each
             // gets its own transition (ADR-0038 B3, no prune).
-            if verdict.in_grace().is_empty()
-                && verdict.digest_pending().is_empty()
+            if in_grace.is_empty()
+                && !signer_is_held_creator
+                && !pending_blocks_seal
                 && revocation_eviction::s4_eviction_seal_tolerates(info, &members)
             {
                 return info.seal_commit_evicting(signing_kp, now_ms);
@@ -32345,8 +32390,21 @@ async fn seal_owner_certified_unbounded(
         // digest-pending — so the operator sees exactly who is pending
         // (the R17 log's empty `[]` was this line reporting only
         // in_grace).
-        let mut pending = verdict.in_grace();
-        pending.extend(verdict.digest_pending());
+        // #1023 (02:36 ruling): inside an S4 removal or ban, a held
+        // creator does not block the removal's seal (see
+        // `s4_eviction_seal_passes_a_held_creator`).
+        if in_grace.is_empty()
+            && !signer_is_held_creator
+            && revocation_eviction::s4_eviction_seal_passes_a_held_creator(
+                info,
+                &digest_pending,
+                now_unix,
+            )
+        {
+            return info.seal_commit_evicting(signing_kp, now_ms);
+        }
+        let mut pending = in_grace;
+        pending.extend(digest_pending);
         return Err(
             x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
                 group_id,
@@ -46945,7 +47003,37 @@ pub(in crate::server) async fn join_result_payload_with_roster_certificates(
             roster_certificates_b64.clear();
         }
     }
-    let bare = serde_json::to_vec(&response)?;
+    let mut bare = serde_json::to_vec(&response)?;
+    let mut stripped_chain_bytes = false;
+    if bare.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        // #1023 (Engineer rulings 31 Oct 2026 20:40 + 23:44 GMT, kept under
+        // the 2 Nov 14:27 GMT carry): a served chain that FITS the budget
+        // keeps its certificate bytes — they are the carrier the kept-chain
+        // (S3) path seats. Past the budget they are discretionary size —
+        // strip them until the WHOLE payload fits, so certificate carry
+        // never pushes a joiner onto the blob path. The strip also bounds
+        // ANY peer that carries bytes beyond its newest links (a mixed
+        // fleet, a future carrier): what arrives over budget never rides a
+        // result.
+        if let JoinResultMessage::Result { chain, .. } = &mut response {
+            for link in chain {
+                for snapshot in link.roster.values_mut() {
+                    snapshot.certificate = None;
+                }
+            }
+            stripped_chain_bytes = true;
+        }
+        // Take the stripped form unconditionally: if it now fits, the
+        // sidecar loop below trims against the DM budget, so certificate
+        // carry is never the reason a result goes oversized.
+        bare = serde_json::to_vec(&response)?;
+    }
+    if stripped_chain_bytes {
+        tracing::debug!(
+            group_id = %LogHexId::group(group_id),
+            "join result: stripped chain-link certificate bytes to stay under the DM budget"
+        );
+    }
     let mut sidecar =
         seat_cert_fetch::roster_certificate_sidecar(state, group_id, member_agent_id).await;
     let budget = if bare.len() <= x0x::dm::MAX_PAYLOAD_BYTES {
@@ -56871,6 +56959,60 @@ pub(in crate::server) mod tests {
             &tampered,
             &authority_hex,
             &recipient_hex
+        ));
+        Ok(())
+    }
+
+    /// Review finding 10 (#1023 round): the served bootstrap's head link
+    /// carries no certificate BYTES. The receiver verifies certificates
+    /// from `members_v2` and the roster root from the snapshots' digests,
+    /// so the bytes only doubled every certified seat against the 48 KiB
+    /// direct-message budget. The seats keep their bytes, and the stripped
+    /// snapshot still validates.
+    #[test]
+    fn bootstrap_head_link_serves_digest_only_snapshots() -> Result<()> {
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let owner = x0x::identity::UserKeypair::generate()?;
+        let authority_hex = hex::encode(authority.agent_id().as_bytes());
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Carry".to_string(),
+            String::new(),
+            authority.agent_id(),
+            "ac".repeat(32),
+            x0x::groups::policy::GroupPolicy {
+                admission: x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id()),
+                confidentiality: x0x::groups::GroupConfidentiality::SignedPublic,
+                ..Default::default()
+            },
+        );
+        let authority_cert = x0x::identity::AgentCertificate::issue(&owner, &authority)?;
+        group
+            .set_member_certificate(&authority_hex, authority_cert)
+            .expect("the authority's seat binds its certificate");
+        let now_ms = now_millis_u64();
+        let verdict = group.owner_cert_verdict(&x0x::groups::owner_cert::OwnerCertEvidence::new(
+            now_ms / 1000,
+        ));
+        group
+            .seal_commit_with_owner_certs(&authority, now_ms, &verdict)
+            .map(|(commit, _)| commit)?;
+
+        let snapshot = signed_public_bootstrap_snapshot(group).context("public snapshot")?;
+        assert!(
+            snapshot.commit_log[0]
+                .roster
+                .values()
+                .all(|snap| snap.certificate.is_none()),
+            "the served head link is digest-only"
+        );
+        assert!(
+            snapshot.members_v2[&authority_hex].certificate.is_some(),
+            "the seats keep their certificate bytes"
+        );
+        assert!(validate_public_group_bootstrap(
+            &snapshot,
+            &authority_hex,
+            &authority_hex
         ));
         Ok(())
     }
