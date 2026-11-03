@@ -618,6 +618,19 @@ struct SubjectState {
     /// its promotion path through the ordinary path, with the head at which
     /// it last asked the signer for a catch-up page.
     provisional: Option<(AdminTerminalAttestation, u64)>,
+    /// When this record began. A pre-Welcome joiner's own seal, and so the
+    /// staged Welcome for it, is older (#1661).
+    created_at: Instant,
+    /// §3 "Beyond retention": this node entered `readmission_required
+    /// {base_beyond_retention}` while this record lived.
+    readmitted: bool,
+    /// This pre-Welcome joiner's own seal did not apply because its staged
+    /// Welcome could not be fetched (#1661).
+    welcome_unfetched: bool,
+    /// §2 "Join attempt (D64)" (#1661): after readmission the sealer's
+    /// staged Welcome is gone, so the attempt has ended with ADR 0107's
+    /// typed outcome (see [`end_on_welcome_loss`]).
+    welcome_lost: bool,
 }
 
 impl SubjectState {
@@ -638,6 +651,10 @@ impl SubjectState {
             progress_at: now,
             armed_at: now,
             provisional: None,
+            created_at: now,
+            readmitted: false,
+            welcome_unfetched: false,
+            welcome_lost: false,
         }
     }
 
@@ -3754,6 +3771,15 @@ async fn apply_kept_chain(
     {
         return false;
     }
+    let fetches_welcome = matches!(
+        &event,
+        super::NamedGroupMetadataEvent::MemberAdded {
+            agent_id,
+            treekem_welcome_b64: None,
+            welcome_ref: Some(_),
+            ..
+        } if *agent_id == local_hex(state)
+    );
     let accepted = Box::pin(super::apply_named_group_metadata_event(
         state,
         event,
@@ -3763,8 +3789,111 @@ async fn apply_kept_chain(
     ))
     .await
     .accepted;
+    if !accepted && fetches_welcome {
+        if let Some(subject) = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get_mut(info.stable_group_id())
+        {
+            subject.welcome_unfetched = true;
+        }
+    }
     retire_converged(state, group_key).await;
     accepted
+}
+
+/// §2 "Join attempt (D64)" on the readmission path (#1661). A readmitted
+/// pre-Welcome joiner's own seal did not apply because its staged Welcome
+/// could not be fetched. Only the sealer holds that Welcome, in memory,
+/// for `PENDING_WELCOME_TTL` from the seal, and a sealer restart loses it
+/// sooner. When that lifetime has passed since this record began (the
+/// seal is older), no retry can bring the keys. The tick checks this, as
+/// the seal is not replayed again once the gate is armed. The attempt then ends with
+/// ADR 0107's typed outcome, `timed_out {rearm_original_result_unavailable}`,
+/// and the node shows `readmission_required {base_beyond_retention}` again,
+/// with D43's manual remove and re-invite as the exit. The attempt's
+/// bookkeeping (polls, inviter pin, registry entry) is retired, so that
+/// exit's new invite is not refused `join_already_pending`; the stub and
+/// its row stay, as the armed record owns them. It sends no further
+/// request and applies no ATA. Authority re-Welcome is S8 (b) (ADR 0114).
+/// Returns whether the attempt ended. The caller holds no membership lock.
+async fn end_on_welcome_loss(
+    state: &AppState,
+    group_key: &str,
+    stable: &str,
+    now: Instant,
+) -> bool {
+    {
+        let mut inner = state.group_recovery.inner.lock().await;
+        let Some(subject) = inner.subjects.get_mut(stable) else {
+            return false;
+        };
+        if subject.welcome_lost {
+            return true;
+        }
+        if !subject.readmitted
+            || !subject.welcome_unfetched
+            || now.saturating_duration_since(subject.created_at) < super::PENDING_WELCOME_TTL
+        {
+            return false;
+        }
+        subject.welcome_lost = true;
+        subject.pending = None;
+        subject.view = SubjectView::Readmission {
+            cause: "base_beyond_retention",
+        };
+    }
+    let mls_group_id = state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .map(|info| info.mls_group_id.clone())
+        .unwrap_or_default();
+    {
+        let lock = super::group_membership_lock(state, group_key).await;
+        let _membership_guard = lock.lock().await;
+        // Its `Seated` finalize retires bookkeeping only; the outcome is
+        // written below.
+        super::retire_join_attempts_after_self_removal(
+            state,
+            group_key,
+            stable,
+            &mls_group_id,
+            &local_hex(state),
+        )
+        .await;
+    }
+    state
+        .last_join_outcomes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            group_key.to_string(),
+            super::LastJoinOutcome {
+                outcome: "timed_out",
+                reason: Some(super::JOIN_REARM_TIMEOUT_REASON),
+                finished_at_ms: now_ms(),
+            },
+        );
+    tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the sealer's staged Welcome is gone after readmission; the join attempt ends timed_out (rearm_original_result_unavailable), readmission_required (base_beyond_retention)");
+    true
+}
+
+/// Whether the attempt for `stable` ended on a lost Welcome
+/// ([`end_on_welcome_loss`]).
+async fn welcome_lost(state: &AppState, stable: &str) -> bool {
+    state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .subjects
+        .get(stable)
+        .is_some_and(|subject| subject.welcome_lost)
 }
 
 /// §2 "Segments": the admin-armed ATA's segment is exhausted (the head is
@@ -4156,7 +4285,9 @@ async fn subject_tick(state: &Arc<AppState>) {
         if defer_for_host_commit(state, &stable, info.state_revision).await {
             continue;
         }
-        if local_state_lost(state, &key, &info, now).await {
+        if local_state_lost(state, &key, &info, now).await
+            || end_on_welcome_loss(state, &key, &stable, now).await
+        {
             continue;
         }
         provisional_tick(state, &key, &info).await;
@@ -4630,6 +4761,7 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
                         subject.view = SubjectView::Readmission {
                             cause: "base_beyond_retention",
                         };
+                        subject.readmitted = true;
                     }
                     advance_round(subject, now, from_pending);
                 }
@@ -4921,6 +5053,9 @@ async fn arm_from_response(
     // A pre-Welcome joiner that kept its served chain applies it now.
     let pre_welcome = !info.has_active_member(&local)
         && !state.treekem_groups.read().await.contains_key(group_key);
+    if pre_welcome && welcome_lost(state, &stable).await {
+        return;
+    }
     if pre_welcome && apply_kept_chain(state, group_key, info, &ata).await {
         return;
     }
@@ -10144,6 +10279,93 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("recovery object"))?;
         assert_eq!(recovery["state"], "readmission_required");
         assert_eq!(recovery["cause"], "local_state_lost");
+        assert_eq!(recovery["exit"], "manual_remove_and_reinvite");
+        Ok(())
+    }
+
+    /// #1661, §2 "Join attempt (D64)": a readmitted pre-Welcome joiner whose
+    /// own seal could not fetch its staged Welcome ends the attempt with ADR
+    /// 0107's typed outcome once the Welcome's lifetime has passed. It shows
+    /// `readmission_required {base_beyond_retention}` with D43's exit and
+    /// asks no target again. Controls: a node that never entered
+    /// readmission, and one still inside the lifetime, keep trying. Inert.
+    #[tokio::test]
+    async fn a_lost_welcome_after_readmission_ends_the_attempt_typed() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let now = Instant::now();
+        let mut subject = SubjectState::new(now, info.state_revision);
+        subject.view = SubjectView::CatchingUp {
+            attested_by: ata.fields.attested_by.clone(),
+            verified: true,
+            segment_terminal: ata.fields.segment_terminal_revision,
+        };
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .insert(stable.clone(), subject);
+        let later = now + super::super::PENDING_WELCOME_TTL;
+
+        let set = |readmitted: bool, unfetched: bool| {
+            let state = &state;
+            let stable = stable.clone();
+            async move {
+                if let Some(subject) = state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .subjects
+                    .get_mut(&stable)
+                {
+                    subject.readmitted = readmitted;
+                    subject.welcome_unfetched = unfetched;
+                }
+            }
+        };
+        // Never readmitted: not this path.
+        set(false, true).await;
+        assert!(!end_on_welcome_loss(&state, &key, &stable, later).await);
+        // No failed fetch: the seal may still apply.
+        set(true, false).await;
+        assert!(!end_on_welcome_loss(&state, &key, &stable, later).await);
+        set(true, true).await;
+        // Inside the lifetime the Welcome may still be served.
+        assert!(!end_on_welcome_loss(&state, &key, &stable, now).await);
+        assert!(!welcome_lost(&state, &stable).await);
+
+        assert!(end_on_welcome_loss(&state, &key, &stable, later).await);
+        assert!(welcome_lost(&state, &stable).await);
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(SubjectView::Readmission {
+                cause: "base_beyond_retention"
+            })
+        );
+        let outcome = state
+            .last_join_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("join outcome"))?;
+        assert_eq!(outcome.outcome, "timed_out");
+        assert_eq!(
+            outcome.reason,
+            Some(super::super::JOIN_REARM_TIMEOUT_REASON)
+        );
+        let mut pre_welcome = info.clone();
+        pre_welcome.remove_member(&local, None);
+        let recovery = recovery_json(&state, &pre_welcome)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("recovery object"))?;
+        assert_eq!(recovery["state"], "readmission_required");
+        assert_eq!(recovery["cause"], "base_beyond_retention");
         assert_eq!(recovery["exit"], "manual_remove_and_reinvite");
         Ok(())
     }
