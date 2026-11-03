@@ -1933,7 +1933,9 @@ epoch is not the mark's actor key. A hold also ends when one of its
 recorded actors seals a later epoch's unpinned secret. A known-empty
 evicted-removal hold ends at any secret of its epoch, committed or not.
 A hold whose actor list is unknown (a pre-#1771 exclusion file) is
-ended by no secret that a commit does not pin.
+ended by no secret that a commit does not pin; one that carries removed
+members is an evicted removal's containment, which ends at any secret
+of its epoch.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`

@@ -2361,7 +2361,9 @@ pub(in crate::server) async fn promoted_admin_secret(
     // unpinned later secret from its own author strands no wait — and a
     // secret from any other sender still does not end one.
     let installed = group_by_stable(state, &stable_group_id).await;
-    let mut step_author: Option<String> = None;
+    // #1775 round 5: the author of the FIRST step that raised the epoch
+    // past the waiting one — not the last step's — owns the later key.
+    let mut raise_author: Option<String> = None;
     let mut cursor = result.clone();
     // Each step moves the revision up, so the walk ends; the bound keeps it
     // to the held set.
@@ -2373,7 +2375,7 @@ pub(in crate::server) async fn promoted_admin_secret(
                 LaterAdminKey::Superseded
             });
         }
-        if let (Some(author), Some((key, installed))) = (&step_author, &installed) {
+        if let (Some(author), Some((key, installed))) = (&raise_author, &installed) {
             if cursor.secret_epoch > epoch
                 && installed.secret_epoch == cursor.secret_epoch
                 && installed.shared_secret.is_some()
@@ -2390,7 +2392,9 @@ pub(in crate::server) async fn promoted_admin_secret(
             .find_map(|held| next_held_state(&cursor, held).map(|next| (held, next)))
         {
             Some((held, next)) => {
-                step_author = Some(hex::encode(held.author.as_bytes()));
+                if next.secret_epoch > epoch && raise_author.is_none() {
+                    raise_author = Some(hex::encode(held.author.as_bytes()));
+                }
                 cursor = next;
             }
             None => return None,

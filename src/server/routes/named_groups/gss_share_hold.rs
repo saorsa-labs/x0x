@@ -360,7 +360,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
         .get(group_key)
         .is_some_and(|mark| {
             info.secret_epoch == mark.secret_epoch
-                && head_reaches(info, &mark.head)
+                && head_reaches(info, mark.secret_epoch, &mark.head)
                 && info.shared_secret.is_some()
                 && !sent
                     .as_deref()
@@ -380,31 +380,47 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
             })
 }
 
-/// #1775 rounds 3 and 4: whether `mark_head` is `info`'s head or one of
-/// its retained ancestors, walked through the `prev_state_hash` links.
-/// A chain that leaves the retained log cannot disprove the mark, so it
-/// keeps it (fail closed); a chain past the mark to a genesis that never
-/// passed through it does not.
-fn head_reaches(info: &x0x::groups::GroupInfo, mark_head: &str) -> bool {
-    let mut cursor = info.state_hash.clone();
-    for _ in 0..=info.commit_log.len() {
-        if cursor == mark_head {
+/// #1775 rounds 3-5: whether `mark_head` is `info`'s head or one of
+/// its retained ancestors, in one reverse pass over the retained log.
+/// A retained ancestor that commits an epoch below `mark_epoch` is the
+/// floor of the mark's epoch: the chain dipped below it without passing
+/// through the mark's head, so a sibling commit of the epoch voids the
+/// mark however deep the chain runs. A head the log does not retain, or
+/// a log truncated above its genesis, cannot disprove the mark, so it
+/// stays (fail closed); a genesis reached without the mark does not.
+fn head_reaches(info: &x0x::groups::GroupInfo, mark_epoch: u64, mark_head: &str) -> bool {
+    if mark_head == info.state_hash {
+        return true;
+    }
+    let epoch_of = |binding: Option<&str>| {
+        binding?
+            .strip_prefix("gss:epoch=")
+            .and_then(|epoch| epoch.parse::<u64>().ok())
+    };
+    let mut seen_head = false;
+    for retained in info.commit_log.iter().rev() {
+        let commit = &retained.commit;
+        if !seen_head {
+            seen_head = commit.state_hash == info.state_hash;
+            continue;
+        }
+        if commit.state_hash == mark_head {
             return true;
         }
-        let Some(retained) = info
-            .commit_log
-            .iter()
-            .rev()
-            .find(|retained| retained.commit.state_hash == cursor)
-        else {
-            return true;
-        };
-        match retained.commit.prev_state_hash.as_deref() {
-            Some(prev) => cursor = prev.to_string(),
-            None => return false,
+        if epoch_of(commit.security_binding.as_deref()).is_some_and(|epoch| epoch < mark_epoch) {
+            return false;
         }
     }
-    true
+    if !seen_head {
+        // The head is not retained: the mark stays, as the committed
+        // epoch itself falls back to the local one.
+        return true;
+    }
+    // The oldest retained ancestor: a genesis ends the chain without
+    // the mark; a truncation cannot disprove it.
+    info.commit_log
+        .first()
+        .is_none_or(|oldest| oldest.commit.prev_state_hash.is_some())
 }
 
 /// #1775 item 4: whether the secret of its local epoch that `info` holds
@@ -427,7 +443,8 @@ pub(super) fn secret_unpinned(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group_key)
             .is_some_and(|mark| {
-                mark.secret_epoch == info.secret_epoch && head_reaches(info, &mark.head)
+                mark.secret_epoch == info.secret_epoch
+                    && head_reaches(info, mark.secret_epoch, &mark.head)
             })
 }
 
@@ -450,7 +467,7 @@ fn hold_live(
         return true;
     }
     // A secret of the hold's epoch or a later one is installed. It ends
-    // the hold only when a commit pins it and a recorded actor sealed it.
+    // the hold when a commit pins it, or when a recorded actor sealed it.
     info.shared_secret.is_some()
         && secret_unpinned(state, group_key, info)
         && match &hold.actors {
@@ -1016,13 +1033,16 @@ pub(super) async fn note_share_sender(
             senders.remove(group_key).is_some()
         };
         if settled {
-            changed |= state
+            // Under the same one-lock rule as the prune: the settle
+            // takes exactly its own mark.
+            let mut marks = state
                 .gss_share_holds
                 .keyless
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(group_key)
-                .is_some();
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            changed |= marks.get(group_key).is_some_and(|mark| {
+                mark.secret_epoch == secret_epoch && mark.actor.eq_ignore_ascii_case(sender_hex)
+            }) && marks.remove(group_key).is_some();
         }
         changed
     };
@@ -1095,40 +1115,39 @@ pub(super) async fn forget_keyless_commit(
 /// dropped; the caller writes the file.
 fn prune_share_sender(state: &AppState, group_key: &str, info: &x0x::groups::GroupInfo) -> bool {
     let committed = x0x::groups::crypto_exclusion::committed_secret_epoch(info);
-    let marked = state
-        .gss_share_holds
-        .keyless
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(group_key)
-        .map(|mark| mark.secret_epoch);
     let mut changed = false;
-    if marked.is_some_and(|epoch| epoch < committed)
-        || state
-            .gss_share_holds
-            .keyless
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(group_key)
-            .is_some_and(|mark| mark.secret_epoch <= committed && !head_reaches(info, &mark.head))
     {
-        changed |= state
+        // #1775 round 5: the test and the removal run under one lock, so
+        // a concurrent keyless commit of a later epoch cannot lose its
+        // mark in the gap.
+        let mut marks = state
             .gss_share_holds
             .keyless
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(group_key)
-            .is_some();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if marks.get(group_key).is_some_and(|mark| {
+            mark.secret_epoch < committed
+                || (mark.secret_epoch <= committed
+                    && !head_reaches(info, mark.secret_epoch, &mark.head))
+        }) {
+            changed |= marks.remove(group_key).is_some();
+        }
     }
     let mut lot = state
         .gss_share_holds
         .share_senders
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if lot
-        .get(group_key)
-        .is_some_and(|kept| kept.secret_epoch <= committed && marked != Some(kept.secret_epoch))
-    {
+    if lot.get(group_key).is_some_and(|kept| {
+        kept.secret_epoch <= committed
+            && state
+                .gss_share_holds
+                .keyless
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(group_key)
+                .is_none_or(|mark| mark.secret_epoch != kept.secret_epoch)
+    }) {
         lot.remove(group_key);
         return true;
     }
@@ -1239,7 +1258,8 @@ pub(super) fn replaces_uncommitted_secret(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(group_key)
                 .is_some_and(|mark| {
-                    mark.secret_epoch == secret_epoch && head_reaches(info, &mark.head)
+                    mark.secret_epoch == secret_epoch
+                        && head_reaches(info, mark.secret_epoch, &mark.head)
                 }))
 }
 
@@ -1628,8 +1648,8 @@ mod tests {
             2
         ));
         // The rollback helper takes exactly its own mark (round 4,
-        // finding 3: an epoch-and-head match, so a refused frame of
-        // another epoch never eats a live one), and a sibling head's
+        // finding 3: an epoch-and-head match — a refused frame's commit
+        // hash is the head it would have moved), and a sibling head's
         // commit prunes the stale one.
         forget_keyless_commit(&state, &group_key, 2, &keyless.state_hash).await;
         assert!(
@@ -1680,6 +1700,81 @@ mod tests {
         assert!(
             withholds(&state, &group_key, &renamed),
             "a commit on the keyless head keeps the mark: the foreign secret still withholds"
+        );
+        // The pruning half of the same rule (round 5, finding 2): the
+        // mark survives the prune, the replace stays open to the actor,
+        // and a reverted exact-hash match would drop it.
+        assert!(!prune_exclusions(&state, &group_key, &renamed));
+        assert!(
+            super::test_seam::keyless_mark_present(&state, &group_key),
+            "the chained commit prunes no mark"
+        );
+        assert!(
+            replaces_uncommitted_secret(&state, &group_key, &renamed, &actor, 2),
+            "the actor's share still replaces the foreign secret under the chained head"
+        );
+
+        // A sibling head whose chain dips below the mark's epoch voids
+        // the mark even when its log is a suffix that never saw genesis
+        // (round 5, finding 1).
+        let mut suffix = gss_info_at_head(1, None);
+        let parent_hash = suffix.state_hash.clone();
+        let sibling_hash = format!("sibling-{parent_hash}");
+        suffix.secret_epoch = 2;
+        suffix.shared_secret = Some(foreign.to_vec());
+        suffix
+            .commit_log
+            .push(x0x::groups::state_commit::RetainedCommit {
+                commit: x0x::groups::state_commit::GroupStateCommit {
+                    group_id: suffix.stable_group_id().to_string(),
+                    revision: 2,
+                    prev_state_hash: Some(parent_hash),
+                    roster_root: String::new(),
+                    policy_hash: String::new(),
+                    public_meta_hash: String::new(),
+                    security_binding: Some("gss:epoch=2".to_string()),
+                    state_hash: sibling_hash.clone(),
+                    withdrawn: false,
+                    committed_by: String::new(),
+                    committed_at: 0,
+                    signer_public_key: String::new(),
+                    signature: String::new(),
+                },
+                roster: std::collections::BTreeMap::new(),
+                meta: None,
+            });
+        suffix.state_hash = sibling_hash;
+        // The oldest retained entry (the parent, binding epoch 1) has a
+        // prev, so the log is a suffix; its epoch floors the mark's.
+        suffix.commit_log[0].commit.prev_state_hash = Some("truncated-below".to_string());
+        note_keyless_commit(
+            &state,
+            &group_key,
+            2,
+            &actor,
+            "a-keyless-head-not-on-this-chain",
+        )
+        .await;
+        assert!(
+            !withholds(&state, &group_key, &suffix),
+            "a sibling head's committed epoch is pinned however deep the chain"
+        );
+        assert!(!replaces_uncommitted_secret(
+            &state, &group_key, &suffix, &actor, 2
+        ));
+
+        // The replace disjunct's ancestry check in isolation (round 5):
+        // the epoch is unpinned — the head still binds the earlier
+        // epoch — yet the stale sibling mark authorises no replace.
+        let mut raised = gss_info_at_head(1, Some(foreign));
+        raised.secret_epoch = 2;
+        assert!(
+            secret_unpinned(&state, &group_key, &raised) || withholds(&state, &group_key, &raised),
+            "control: the raised epoch is not pinned by the head"
+        );
+        assert!(
+            !replaces_uncommitted_secret(&state, &group_key, &raised, &actor, 2),
+            "the stale sibling mark authorises no replace of an unpinned secret"
         );
     }
 
