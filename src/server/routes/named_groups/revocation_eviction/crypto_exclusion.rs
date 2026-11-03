@@ -8651,6 +8651,11 @@ mod daemon_tests {
             parent,
             "no result head over B's secret"
         );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "B's secret does not end the hold: no group ciphertext under it"
+        );
 
         // #1771 review P1: B's duplicate share is refused, and its replay
         // must not end the frame's hold: B's secret is not the frame's key.

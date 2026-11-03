@@ -1911,7 +1911,12 @@ keyed seat and the installed share is the same superseded-intermediate
 shape the 02:09 ruling keeps as main's answer, bounded by the share
 delivery the S4 row owes. Until one of the two keys the seat again, the
 hold lasts: an installed share of the held epoch, or a later one, or
-the #1663 republication (while the node holds no secret), ends it.
+the #1663 republication (while the node holds no secret), ends it. A
+share of the held epoch ends the hold only when its sender is a
+recorded actor of that hold and the share's secret is the one recorded
+for that sender (#1766). A share of the same epoch from a different
+admin installs, but the hold stays. The actor's share of that epoch
+then replaces the other admin's uncommitted secret.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
