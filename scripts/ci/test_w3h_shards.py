@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -53,13 +54,14 @@ class ShardPlanTest(unittest.TestCase):
             self.assertEqual(matched, cases, expr)
 
     def test_each_owner_axis_row_has_its_own_shard(self):
-        # One rerun of each H-S3-c/c2/c3/d8 row is the longest S3 case, so
-        # each row runs its 20 reruns on its own runner.
+        # One rerun of each H-S3-c/c2/c3/d8/d3 row is the longest S3 case,
+        # so each row runs its 20 reruns on its own runner(s).
         rows = {
             's3-c': 'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node',
             's3-c2': 'w3h_1356_red_s3_c2_reseat_retires_marker_and_gap',
             's3-c3': 'w3h_1356_control_s3_c3_owner_reseats_owner_axis_node',
             's3-d8': 'w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node',
+            's3-d3': 'w3h_1356_control_s3_d3_authorisation_refusals_typed',
         }
         assigned = SHARDS.assign(self.names)
         for group, name in rows.items():
@@ -67,6 +69,49 @@ class ShardPlanTest(unittest.TestCase):
         self.assertEqual(SHARDS.group_of(
             'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node_more'), 's3')
         self.assertFalse(set(rows.values()) & set(assigned.get('s3', [])))
+
+    def test_split_parts_run_the_full_rerun_count_together(self):
+        # D196: the gate counts exactly RUNS receipts per case, so the
+        # parts of a split group add up to RUNS and run the same filter.
+        self.assertEqual(SHARDS.RUNS, 20)
+        for group, parts in SHARDS.PARTS.items():
+            entries = [f'{group}.{k}' for k in range(1, parts + 1)]
+            self.assertEqual(sum(SHARDS.stress_count(e) for e in entries), SHARDS.RUNS)
+            for entry in entries:
+                self.assertEqual(SHARDS.filter_expr(entry), SHARDS.filter_expr(group))
+            with self.assertRaises(SystemExit):
+                SHARDS.stress_count(group)
+            with self.assertRaises(SystemExit):
+                SHARDS.stress_count(f'{group}.{parts + 1}')
+        self.assertEqual(SHARDS.stress_count('s3'), 20)
+        self.assertEqual(SHARDS.stress_count('rest'), 20)
+        with self.assertRaises(SystemExit):
+            SHARDS.stress_count('s3.1')
+        with self.assertRaises(SystemExit):
+            SHARDS.stress_count('no-such-group')
+
+    def test_matrix_lists_a_split_group_as_its_parts(self):
+        groups = SHARDS.matrix(
+            ['w3h_1356_control_s3_d3_authorisation_refusals_typed', 'w3h_other'])['group']
+        self.assertEqual(groups, ['s3-d3.1', 's3-d3.2', 's3-d3.3', 's3-d3.4', 'rest'])
+
+    def test_tag_traces_keeps_the_case_and_makes_parts_distinct(self):
+        case = 'w3h_1356_control_s3_d3_authorisation_refusals_typed'
+        files = [f'{case}-4242.trace', f'{case}-4242.receipt.json',
+                 f'{case}-4242.kv', 'notes.txt']
+        with tempfile.TemporaryDirectory() as directory:
+            for name in files:
+                (Path(directory) / name).write_text('x')
+            self.assertEqual(SHARDS.tag_traces('s3-d3.2', directory), 3)
+            names = sorted(path.name for path in Path(directory).iterdir())
+            self.assertEqual(names, sorted([
+                f'{case}-p2_4242.trace', f'{case}-p2_4242.receipt.json',
+                f'{case}-p2_4242.kv', 'notes.txt']))
+            for name in (n for n in names if n != 'notes.txt'):
+                stem = name[:-len('.receipt.json')] if name.endswith('.receipt.json') \
+                    else name.rpartition('.')[0]
+                self.assertEqual(stem.rpartition('-')[0], case)
+            self.assertEqual(SHARDS.tag_traces('s3', directory), 0)
 
     def test_s3_and_s4_prefixes_do_not_fall_through_to_rest(self):
         self.assertEqual(SHARDS.group_of('w3h_1356_future_case'), 's3')

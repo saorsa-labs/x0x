@@ -22,8 +22,8 @@
 //! chain-durable trigger, the arm fails with
 //! [`CAUSE_DURABLE_WAIT_SHOWN`]. Line 451's "a new trigger whose
 //! evidence is not yet in the revocation store" is a revocation whose
-//! revocation-store write has not succeeded: the #1765 unit test
-//! `a_memory_only_seal_waits_for_the_revocation_store_write` holds it.
+//! revocation-store write has not succeeded: `case_1765` drives it
+//! (#1765).
 //!
 //! Harness honesty:
 //!
@@ -50,7 +50,7 @@
 //!   candidates). Recorded by name below.
 //!
 //! Not covered, by name: line 451's new trigger whose evidence is not
-//! yet in the revocation store (see #1765); the
+//! yet in the revocation store (driven by `case_1765`); the
 //! rebuilt row's fresh T_obs (the budget restart at re-derivation —
 //! the case proves the one-rotation completion but not the reset
 //! timing); the

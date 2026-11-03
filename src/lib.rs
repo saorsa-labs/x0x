@@ -3991,7 +3991,12 @@ async fn apply_legacy_revocation_records(
             }
         }
     }
-    persist_completed_revocation_rebuild(revocation_set, identity_dir.as_deref()).await;
+    persist_completed_revocation_rebuild_for_s4(
+        revocation_set,
+        Some(s4_intake),
+        identity_dir.as_deref(),
+    )
+    .await;
 }
 
 /// Apply one v2 revocation batch after subject certificates are known.
@@ -4073,7 +4078,12 @@ async fn apply_v2_revocation_records(
             identity_dir.clone(),
         );
     }
-    persist_completed_revocation_rebuild(revocation_set, identity_dir.as_deref()).await;
+    persist_completed_revocation_rebuild_for_s4(
+        revocation_set,
+        Some(s4_intake),
+        identity_dir.as_deref(),
+    )
+    .await;
 }
 
 struct LegacyCertRecovery {
@@ -6902,7 +6912,8 @@ async fn s4_store_write_pending(
 /// the row shows `waiting_for_durable_intake` until a write succeeds. A
 /// blocked store logs through its own rate limit and is not retried here.
 /// One task per node retries; a second failed write leaves its records to
-/// that task, which reads the pending hashes again on each attempt.
+/// that task, which reads the pending hashes again on each attempt. Agent
+/// shutdown stops the retries; a write in progress finishes.
 fn spawn_persist_s4_revocations(
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
     s4_intake: groups::eviction::RevocationIntake,
@@ -6917,12 +6928,18 @@ fn spawn_persist_s4_revocations(
                 "failed to persist revocation set (S4 waiting_for_durable_intake): {e}"
             ),
         }
-        if !s4_intake.claim_persist_retry() {
+        if s4_intake.persist_stop().is_cancelled() || !s4_intake.claim_persist_retry() {
             return;
         }
         let mut delay = S4_PERSIST_RETRY_MIN;
         loop {
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = s4_intake.persist_stop().cancelled() => {
+                    s4_intake.release_persist_retry();
+                    return;
+                }
+            }
             delay = (delay * 2).min(S4_PERSIST_RETRY_MAX);
             match persist_s4_revocations(&revocation_set, &s4_intake, dir).await {
                 Ok(()) => {}
@@ -6950,6 +6967,15 @@ fn spawn_persist_s4_revocations(
     });
 }
 
+/// [`persist_completed_revocation_rebuild_for_s4`] without an S4 intake.
+#[cfg(test)]
+pub(crate) async fn persist_completed_revocation_rebuild(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<&std::path::Path>,
+) {
+    persist_completed_revocation_rebuild_for_s4(revocation_set, None, identity_dir).await;
+}
+
 /// After a trusted authority opens a carrier, write that live file (#1116).
 ///
 /// The quarantine sibling is left in place. A hold that is still open is
@@ -6962,8 +6988,15 @@ fn spawn_persist_s4_revocations(
 /// the write is still in progress. A fresh snapshot cannot clear that hold.
 /// A recovered revocation is installed into the live set before admission
 /// opens. An ordinary save cannot replace that file with an older snapshot.
-pub(crate) async fn persist_completed_revocation_rebuild(
+///
+/// A successful `revocations.bin` write also tells `s4_intake` which
+/// live-route records are durable now, by the rule of
+/// [`persist_s4_revocations`] (#1765). Without this, a row whose own write
+/// met a blocked store would keep `waiting_for_durable_intake` after the
+/// rebuild wrote its record.
+async fn persist_completed_revocation_rebuild_for_s4(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    s4_intake: Option<&groups::eviction::RevocationIntake>,
     identity_dir: Option<&std::path::Path>,
 ) {
     let pending = revocation_set.write().await.take_rebuild_pending();
@@ -6980,13 +7013,15 @@ pub(crate) async fn persist_completed_revocation_rebuild(
             .requeue_rebuild_pending(pending);
         return;
     };
-    let encoded = {
+    let (s4_written, encoded) = {
         let set = revocation_set.read().await;
-        [
+        let s4_written = s4_intake.map(|intake| s4_pending_in_set(&set, intake));
+        let encoded = [
             (revocation::REVOCATION_CARRIER_V1, set.to_bytes()),
             (revocation::REVOCATION_CARRIER_V2, set.to_bytes_v2()),
             (revocation::REVOCATION_CARRIER_V3, set.to_bytes_v3()),
-        ]
+        ];
+        (s4_written, encoded)
     };
     let mut retry = 0u8;
     for (carrier, bytes) in encoded {
@@ -7013,6 +7048,12 @@ pub(crate) async fn persist_completed_revocation_rebuild(
         let write = storage::rebuild_carrier_preserving_durable(&path, store, bytes, true).await;
         match write {
             Ok(preserved) => {
+                // The written file is a union that holds this snapshot.
+                if carrier == revocation::REVOCATION_CARRIER_V1 {
+                    if let (Some(intake), Some(written)) = (s4_intake, &s4_written) {
+                        intake.note_durable(written);
+                    }
+                }
                 let mut set = revocation_set.write().await;
                 set.hold_carrier_until_reconciled(carrier);
                 match storage::install_preserved_revocations(&mut set, store, &preserved.bytes) {
@@ -7063,13 +7104,27 @@ pub(crate) async fn persist_completed_revocation_rebuild(
     }
 }
 
-/// Apply a `x0x.revocation.v3` batch (ADR-0070): verify each share-grant
-/// record's owner-key authority, insert, and persist `revocations-v3.bin`
-/// when anything was new. Records of any other subject are ignored here —
-/// they have their own carriers.
+/// [`ingest_share_grant_revocations_for_s4`] without an S4 intake.
+#[cfg(test)]
 pub(crate) async fn ingest_share_grant_revocations(
     owner_trust: &owner_trust::OwnerTrust,
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<std::path::PathBuf>,
+    payload: &[u8],
+) -> bool {
+    ingest_share_grant_revocations_for_s4(owner_trust, revocation_set, None, identity_dir, payload)
+        .await
+}
+
+/// Apply a `x0x.revocation.v3` batch (ADR-0070): verify each share-grant
+/// record's owner-key authority, insert, and persist `revocations-v3.bin`
+/// when anything was new. Records of any other subject are ignored here —
+/// they have their own carriers. The carrier rebuild tells `s4_intake`
+/// about a durable `revocations.bin` write (#1765).
+async fn ingest_share_grant_revocations_for_s4(
+    owner_trust: &owner_trust::OwnerTrust,
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    s4_intake: Option<&groups::eviction::RevocationIntake>,
     identity_dir: Option<std::path::PathBuf>,
     payload: &[u8],
 ) -> bool {
@@ -7105,7 +7160,8 @@ pub(crate) async fn ingest_share_grant_revocations(
     if inserted {
         persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
     }
-    persist_completed_revocation_rebuild(revocation_set, identity_dir.as_deref()).await;
+    persist_completed_revocation_rebuild_for_s4(revocation_set, s4_intake, identity_dir.as_deref())
+        .await;
     inserted
 }
 
@@ -9893,6 +9949,8 @@ impl Agent {
         // 1. Signal every token-aware loop to break. Inert until now, so this
         //    is the first thing that changes steady-state behavior.
         self.shutdown_token.cancel();
+        // #1765: a failed S4 revocation-store write is not retried again.
+        self.s4_revocation_intake.stop_persist_retries();
         // Bound the evidence drain without discarding unfinished workers.
         let evidence_workers_unfinished = self.peer_evidence().shutdown_workers().await;
         self.capability_refreshes.shutdown_workers().await;
@@ -15213,9 +15271,10 @@ impl Agent {
                     }
                     // ADR-0070: share-grant revocations on the v3 carrier.
                     DiscoveryMessage::RevocationV3(msg) => {
-                        ingest_share_grant_revocations(
+                        ingest_share_grant_revocations_for_s4(
                             &owner_trust_for_listener,
                             &revocation_set,
+                            Some(&s4_intake_for_listener),
                             identity_dir_for_listener.clone(),
                             &msg.payload,
                         )
@@ -17647,8 +17706,12 @@ impl Agent {
                 }
             }
         }
-        persist_completed_revocation_rebuild(&self.revocation_set, self.identity_dir.as_deref())
-            .await;
+        persist_completed_revocation_rebuild_for_s4(
+            &self.revocation_set,
+            Some(&self.s4_revocation_intake),
+            self.identity_dir.as_deref(),
+        )
+        .await;
 
         // 2. Return only the subject's own store result. V1 does not
         //    change for binding/share-grant subjects; its unreadability
@@ -38129,6 +38192,88 @@ mod tests {
         let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
         assert!(on_disk.contains_hash(&first.record_hash()));
         assert!(on_disk.contains_hash(&second.record_hash()));
+    }
+
+    /// #1765 review P1: a v1 carrier rebuild writes a live record that a
+    /// blocked store kept from its own write. S4 then reads it as durable.
+    #[tokio::test]
+    async fn a_v1_carrier_rebuild_makes_pending_s4_records_durable() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let intake = groups::eviction::RevocationIntake::new();
+        let record = s4_self_revocation(Agent::unix_timestamp_secs());
+        let hashes = std::collections::BTreeSet::from([record.record_hash()]);
+        {
+            let mut guard = set.write().await;
+            assert!(guard
+                .verify_and_insert(record.clone(), None)
+                .expect("insert"));
+            intake.note_verified(&record);
+            guard.requeue_rebuild_pending(revocation::REVOCATION_CARRIER_V1);
+        }
+        assert!(!intake.all_durable(&hashes));
+        persist_completed_revocation_rebuild_for_s4(&set, Some(&intake), Some(dir.path())).await;
+        let written = std::fs::read(dir.path().join("revocations.bin")).expect("v1 store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(on_disk.contains_hash(&record.record_hash()));
+        assert!(
+            intake.all_durable(&hashes),
+            "the rebuild wrote the record, so the memory-only seal may go"
+        );
+    }
+
+    /// #1765 review P2: Agent shutdown stops the retry task of a lasting
+    /// store-write failure. No retry writes after that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_stops_the_s4_store_write_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let id_dir = dir.path().join("identity");
+        std::fs::create_dir(&id_dir).expect("identity dir");
+        std::fs::set_permissions(&id_dir, std::fs::Permissions::from_mode(0o500)).expect("0500");
+        if std::fs::write(id_dir.join("probe"), b"x").is_ok() {
+            // Root ignores the mode: this host cannot make the fault.
+            return;
+        }
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new()));
+        let intake = groups::eviction::RevocationIntake::new();
+        let record = s4_self_revocation(Agent::unix_timestamp_secs());
+        assert!(set
+            .write()
+            .await
+            .verify_and_insert(record.clone(), None)
+            .expect("insert"));
+        intake.note_verified(&record);
+        spawn_persist_s4_revocations(
+            std::sync::Arc::clone(&set),
+            intake.clone(),
+            Some(id_dir.clone()),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !intake.persist_retrying_for_testing() {
+            assert!(std::time::Instant::now() < deadline, "no retry task");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        intake.stop_persist_retries();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while intake.persist_retrying_for_testing() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry task did not stop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        std::fs::set_permissions(&id_dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        // The fault clears, but no retry runs to write the record.
+        tokio::time::sleep(S4_PERSIST_RETRY_MIN * 4).await;
+        assert!(!intake.persist_retrying_for_testing());
+        assert!(
+            !id_dir.join("revocations.bin").exists(),
+            "a retry wrote after shutdown"
+        );
+        let hashes = std::collections::BTreeSet::from([record.record_hash()]);
+        assert!(!intake.all_durable(&hashes));
     }
 
     /// #1116: a known issuer certificate and a pending fetch for another
