@@ -134,8 +134,9 @@ struct MachineBudget {
 }
 impl MachineBudget {
     fn hello_attempted(&self, generation: u64) -> bool {
-        // The floor only ever holds evicted real generations (allocated
-        // from 1), so the unattributed slot 0 is never floor-covered.
+        // Fail closed: a floor past 1 covers the unattributed generation 0
+        // with everything else, and eviction below never forgets a Some(0)
+        // slot, so its try cannot re-arm through either path.
         (self.hello_floor > 0 && generation <= self.hello_floor)
             || self
                 .hello_attempts
@@ -150,7 +151,15 @@ impl MachineBudget {
             // Bounded memory: forget the smallest attempted generation by
             // raising the floor above it, so nothing at or below it re-arms.
             // Every slot is Some here, so the minimum is a stored generation.
-            if let Some(smallest) = self.hello_attempts.iter().filter_map(|s| *s).min() {
+            // The unattributed 0 can never raise the floor, so a positive
+            // generation is the one forgotten; Some(0) keeps its slot.
+            if let Some(smallest) = self
+                .hello_attempts
+                .iter()
+                .filter_map(|s| *s)
+                .filter(|g| *g > 0)
+                .min()
+            {
                 self.hello_floor = self.hello_floor.max(smallest);
                 if let Some(slot) = self
                     .hello_attempts

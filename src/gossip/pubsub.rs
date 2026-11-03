@@ -10198,13 +10198,15 @@ mod tests {
     /// or lazy advertisement. A later IWANT must not retrieve the rejected ID.
     /// Signed V2/V3 controls prove the same subscribed/unsubscribed paths work.
     ///
-    /// #1346 hold: the refusal ships in saorsa-gossip 0.5.89. While ant-quic
-    /// is =0.27.62 the family stays at 0.5.88 (0.5.89 pins ant-quic =0.27.60,
-    /// 0.5.90 pins =0.27.61), and a pubsub that old cannot refuse an unsigned
-    /// inner V1 at all, so the test reports and stands down instead of
-    /// asserting behaviour the pinned dependency does not carry. The first
-    /// family release that accepts ant-quic 0.27.62 re-arms it with no edit.
-    fn pinned_pubsub_refuses_unsigned_inner_v1() -> bool {
+    /// #1346 hold: 0.5.88 refuses a fresh unsigned inner V1 at the
+    /// validator, but only 0.5.89 carries that refusal across payload
+    /// replays (saorsa-gossip #116), which this test's rewrapped-ID and
+    /// IWANT assertions need. While ant-quic is =0.27.62 the family stays
+    /// at 0.5.88 (0.5.89 pins ant-quic =0.27.60, 0.5.90 pins =0.27.61),
+    /// so the test reports and stands down instead of asserting behaviour
+    /// the pinned dependency does not carry. The first family release
+    /// that accepts ant-quic 0.27.62 re-arms it with no edit.
+    fn pinned_pubsub_carries_refusal_replays() -> bool {
         let lock: toml::Value =
             toml::from_str(include_str!("../../Cargo.lock")).expect("workspace lock parses");
         lock["package"]
@@ -10222,10 +10224,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue1226_unsigned_inner_v1_is_not_forwarded_or_served() {
-        if !pinned_pubsub_refuses_unsigned_inner_v1() {
+        if !pinned_pubsub_carries_refusal_replays() {
             eprintln!(
                 "issue1226 guard stood down: pinned saorsa-gossip-pubsub predates \
-                 the 0.5.89 refusal (ant-quic =0.27.62 hold, #1346)"
+                 the 0.5.89 replay-refusal carry-over (ant-quic =0.27.62 hold, #1346)"
             );
             return;
         }
