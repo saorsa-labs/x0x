@@ -3972,6 +3972,20 @@ impl InboxPipeline {
                     &sender_agent,
                 )
                 .await;
+                // #1455: pin the sender's machine as the owner of THEIR
+                // inbox topic, so this receiver's bounded EAGER set for the
+                // ACK publish carries the frame to the sender itself instead
+                // of a bystander that refuses unsubscribed pass-through (the
+                // send path records the same ownership from the resolved
+                // recipient machine). Origin-gated like the connected-map
+                // registration below (#927): an unattested machine claim
+                // must not steer eager selection.
+                if origin_authenticated {
+                    self.pubsub.note_dm_inbox_owner(
+                        crate::dm::dm_inbox_topic(&sender_agent),
+                        sender_machine_id,
+                    );
+                }
             }
 
             // #380 leaf-reverse-ACK fix (b): register the sender's

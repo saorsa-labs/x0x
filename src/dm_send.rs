@@ -238,6 +238,15 @@ pub(crate) async fn send_via_gossip_with_provenance(
     let wire = envelope.to_wire_bytes().map_err(map_identity_err)?;
     let topic = DmInboxService::inbox_topic_name(&recipient_agent_id);
     let topic_id = dm_inbox_topic(&recipient_agent_id);
+    // #1455: record the resolved recipient machine as this inbox's owner
+    // before the first publish. A Leaf's bounded EAGER set is chosen without
+    // a subscription signal, so on a plane with bystanders the only EAGER
+    // inbox frame can go to a peer that refuses unsubscribed pass-through;
+    // the owner pin keeps the actual subscriber inside that set. A `None`
+    // here (machine unresolved) keeps the stock eager choice.
+    if let Some(owner) = recipient_machine_id {
+        pubsub.note_dm_inbox_owner(topic_id, owner);
+    }
 
     tracing::debug!(
         target: "dm.trace",
