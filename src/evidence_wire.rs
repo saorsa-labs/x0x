@@ -129,14 +129,21 @@ struct MachineBudget {
     /// forgotten as attempted when its slot was reused). Fail closed.
     hello_floor: u64,
     hello_generation: Option<u64>,
+    /// Highest generation ever observed from this machine, as the live
+    /// winner or as an accepted stream's provenance. The certificate fence
+    /// compares against this, not against the marker: the marker follows
+    /// the live winner in both directions, so only a connection newer than
+    /// every observed one is a replacement (#1772 review).
+    hello_ceiling: Option<u64>,
     touched: Option<Instant>,
     certificate: Option<(AgentId, [u8; 32], Instant)>,
 }
 impl MachineBudget {
     fn hello_attempted(&self, generation: u64) -> bool {
-        // Fail closed: a floor past 1 covers the unattributed generation 0
-        // with everything else, and eviction below never forgets a Some(0)
-        // slot, so its try cannot re-arm through either path.
+        // Fail closed: any floor at or above 1 covers the unattributed
+        // generation 0 with everything else, and a stored Some(0) slot is
+        // never an eviction candidate, so its try cannot re-arm through
+        // either path.
         (self.hello_floor > 0 && generation <= self.hello_floor)
             || self
                 .hello_attempts
@@ -148,26 +155,34 @@ impl MachineBudget {
             return;
         }
         let Some(slot) = self.hello_attempts.iter_mut().find(|s| s.is_none()) else {
-            // Bounded memory: forget the smallest attempted generation by
-            // raising the floor above it, so nothing at or below it re-arms.
-            // Every slot is Some here, so the minimum is a stored generation.
-            // The unattributed 0 can never raise the floor, so a positive
-            // generation is the one forgotten; Some(0) keeps its slot.
-            if let Some(smallest) = self
+            // Bounded memory: reuse the slot of the smallest attempted
+            // positive generation. Some(0) is never a candidate. Only an
+            // arrival above that smallest stored slot raises the floor: the
+            // stored history then reaches down to it, so nothing at or below
+            // the floor re-arms. An out-of-order arrival sits below every
+            // stored slot, so a floor raise there would block generations
+            // between it and the smallest slot that never tried (#1772
+            // review). The floor stays put instead; the forgotten
+            // generation can re-arm under five-generation churn, still
+            // bounded by the shared 60-second machine gate.
+            let Some(smallest) = self
                 .hello_attempts
                 .iter()
                 .filter_map(|s| *s)
                 .filter(|g| *g > 0)
                 .min()
-            {
+            else {
+                return;
+            };
+            if generation > smallest {
                 self.hello_floor = self.hello_floor.max(smallest);
-                if let Some(slot) = self
-                    .hello_attempts
-                    .iter_mut()
-                    .find(|s| **s == Some(smallest))
-                {
-                    *slot = Some(generation);
-                }
+            }
+            if let Some(slot) = self
+                .hello_attempts
+                .iter_mut()
+                .find(|s| **s == Some(smallest))
+            {
+                *slot = Some(generation);
             }
             return;
         };
@@ -179,12 +194,24 @@ impl MachineBudget {
     // still owns its single Hello try, while a generation that attempted
     // stays consumed however the winner moves. The marker follows the live
     // winner in both directions. This reports whether an attempt may begin
-    // on `generation`; the u64::MAX sentinel never owns an attempt.
+    // on `generation`; the u64::MAX sentinel never owns an attempt. The
+    // readiness pass owns this method: the begin path below never calls it,
+    // so a reply cannot move the marker (#1772 review).
+    //
+    // The certificate fence keys on the observed ceiling, not on the
+    // marker. A stale-generation reply or a 5→3→5 winner flip moves the
+    // marker backward and forward without any new connection, so the fence
+    // drops the pending certificate only when a generation strictly newer
+    // than every observed one takes over.
     fn observe_hello_generation(&mut self, generation: u64) -> bool {
         if generation == u64::MAX {
             return false;
         }
         self.hello_generation = Some(generation);
+        if self.hello_ceiling.is_none_or(|high| high < generation) {
+            self.hello_ceiling = Some(generation);
+            self.certificate = None;
+        }
         !self.hello_attempted(generation)
     }
 }
@@ -472,7 +499,20 @@ impl Limits {
         // the machine's current marker, or the unattributed slot when no
         // connection was ever observed.
         let id = generation.unwrap_or(m.hello_generation.unwrap_or(UNATTRIBUTED_GENERATION));
-        if !m.observe_hello_generation(id) {
+        if id == u64::MAX {
+            return false;
+        }
+        // #1772 review: the begin path never moves the marker, so a
+        // stale-generation reply cannot unset the live winner or make the
+        // next readiness pass look like a replacement. It only records the
+        // observation: the ceiling rises before the rate gate, because a
+        // rate-refused reply on a fresh generation still proves that
+        // connection exists, and the readiness fence below is the only
+        // reader of the ceiling.
+        if id > 0 && m.hello_ceiling.is_none_or(|high| high < id) {
+            m.hello_ceiling = Some(id);
+        }
+        if m.hello_attempted(id) {
             return false;
         }
         if m.hello_out
@@ -482,8 +522,13 @@ impl Limits {
         }
         // The attempt is recorded before the first byte. A reset or refusal
         // never schedules a retry. Reconnect churn meets only the rate gate:
-        // each connection generation owns exactly one try (#1346).
+        // each connection generation owns exactly one try (#1346). The
+        // marker moves forward only here, after the rate gate; the
+        // readiness pass owns every other move.
         m.record_hello_attempt(id);
+        if m.hello_generation.is_none_or(|old| old < id) {
+            m.hello_generation = Some(id);
+        }
         m.hello_out = Some(now);
         true
     }
@@ -494,13 +539,11 @@ impl Limits {
                 m.touched = Some(Instant::now());
                 // The marker follows the live winner in both directions: a
                 // follow can restore an older generation (#1346). The
-                // certificate fence still drops only when a strictly newer
-                // connection replaces the marker.
-                let replaced = m.hello_generation.is_none_or(|old| old < generation);
+                // certificate fence inside drops only when a connection
+                // newer than every observed generation takes over, so a
+                // 5→3→5 winner flip keeps a pending certificate (#1772
+                // review).
                 m.observe_hello_generation(generation);
-                if replaced {
-                    m.certificate = None;
-                }
             }
         }
     }

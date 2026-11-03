@@ -10203,9 +10203,10 @@ mod tests {
     /// replays (saorsa-gossip #116), which this test's rewrapped-ID and
     /// IWANT assertions need. While ant-quic is =0.27.62 the family stays
     /// at 0.5.88 (0.5.89 pins ant-quic =0.27.60, 0.5.90 pins =0.27.61),
-    /// so the test reports and stands down instead of asserting behaviour
-    /// the pinned dependency does not carry. The first family release
-    /// that accepts ant-quic 0.27.62 re-arms it with no edit.
+    /// so the test fails with the reason below instead of asserting
+    /// behaviour the pinned dependency does not carry — the failure is the
+    /// visible record of the gap. The first family release that accepts
+    /// ant-quic 0.27.62 re-arms the assertions with no edit.
     fn pinned_pubsub_carries_refusal_replays() -> bool {
         let lock: toml::Value =
             toml::from_str(include_str!("../../Cargo.lock")).expect("workspace lock parses");
@@ -10225,11 +10226,13 @@ mod tests {
     #[tokio::test]
     async fn issue1226_unsigned_inner_v1_is_not_forwarded_or_served() {
         if !pinned_pubsub_carries_refusal_replays() {
-            eprintln!(
-                "issue1226 guard stood down: pinned saorsa-gossip-pubsub predates \
-                 the 0.5.89 replay-refusal carry-over (ant-quic =0.27.62 hold, #1346)"
+            panic!(
+                "issue1226 stands down: pinned saorsa-gossip-pubsub lacks the \
+                 0.5.89 replay-refusal carry-over (saorsa-gossip #116; \
+                 ant-quic =0.27.62 hold, #1346). The pin choice is with \
+                 David and PR #1772 must not merge while it stands — this \
+                 failure keeps that gap visible instead of passing silently."
             );
-            return;
         }
         // Match SG's existing anti-entropy wire enum. A digest may contain
         // retained dedupe IDs; it must never cause refused bytes to be served.

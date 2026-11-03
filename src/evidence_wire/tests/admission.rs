@@ -1682,11 +1682,14 @@ async fn issue1346_reply_after_follow_to_older_generation_carries_hello() {
         1,
         "the reply on the followed lower-generation connection must carry our Hello"
     );
-    // The followed connection's single try is spent.
+    // The followed connection's single try is spent. The reply charges the
+    // stream's generation without moving the marker (#1772 review): the
+    // readiness pass owns the marker, so it still shows g2 until a pass
+    // observes the followed winner.
     {
         let state = f.context.runtime.wire_limits.state.lock().unwrap();
         let budget = &state.machines[&machine];
-        assert_eq!(budget.hello_generation, Some(g1));
+        assert_eq!(budget.hello_generation, Some(g2));
         assert!(budget.hello_attempted(g1));
         assert!(!budget.hello_attempted(g2), "marker 2 consumed nothing");
     }
@@ -1829,6 +1832,202 @@ fn issue1346_attempt_record_is_bounded_and_forgotten_generations_fail_closed() {
         assert_eq!(budget.hello_floor, 2);
         assert!(!budget.hello_attempted(7));
     }
+}
+
+// #1772 review: a Hello on a stale-generation stream must not be able to
+// drop a pending certificate. The reply used to move the marker backward
+// to the stream's generation, so the next readiness pass for the still-live
+// generation looked like a replacement and cleared the certificate the peer
+// was about to redeem.
+#[test]
+fn issue1346_stale_generation_reply_keeps_pending_certificate() {
+    let limits = Limits::default();
+    let machine = MachineId([25; 32]);
+    let agent = AgentId([26; 32]);
+    let age_gate = |limits: &Limits| {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&machine)
+            .unwrap()
+            .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    };
+    // Generation 5 is the live winner; the Hello try on it is spent.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    // The peer's Hello on a stale generation-3 stream solicits its
+    // certificate; the reply charges generation 3.
+    limits.need_certificate(machine, agent, [7; 32]);
+    age_gate(&limits);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+    // The readiness pass still sees generation 5 as the live winner.
+    limits.hello_connection(machine, 5);
+    assert!(
+        limits.take_certificate(machine, agent, [7; 32]),
+        "a stale-generation Hello cannot make the live generation look like a replacement"
+    );
+}
+
+// #1772 review: a winner that flips 5→3→5 moves the marker backward and
+// forward without any new connection. The certificate fence keys on the
+// highest generation ever observed, so only a genuinely new generation
+// (the control below) drops the pending certificate.
+#[test]
+fn issue1346_winner_flip_keeps_certificate_until_a_new_generation() {
+    let limits = Limits::default();
+    let machine = MachineId([27; 32]);
+    let agent = AgentId([28; 32]);
+    // Generation 5 is the live winner before the certificate is solicited.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    limits.need_certificate(machine, agent, [7; 32]);
+    limits.hello_connection(machine, 3);
+    limits.hello_connection(machine, 5);
+    assert!(
+        limits.take_certificate(machine, agent, [7; 32]),
+        "a 5->3->5 winner flip must not drop the pending certificate"
+    );
+    limits.need_certificate(machine, agent, [7; 32]);
+    limits.hello_connection(machine, 6);
+    assert!(
+        !limits.take_certificate(machine, agent, [7; 32]),
+        "a connection newer than every observed generation still drops the fence"
+    );
+}
+
+// #1772 review: a begin that the machine rate gate refuses must move no
+// marker. The old code moved the marker before the gate, so a refused
+// begin spoke for a generation that never attempted.
+#[test]
+fn issue1346_rate_refused_begin_moves_no_marker() {
+    let limits = Limits::default();
+    let machine = MachineId([29; 32]);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(6)));
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(7)));
+    let state = limits.state.lock().unwrap();
+    let budget = &state.machines[&machine];
+    assert_eq!(budget.hello_generation, Some(6));
+    assert!(!budget.hello_attempted(7));
+}
+
+// #1772 review: out-of-order eviction must not block a generation that
+// never tried. With the slots {5,6,7,8} full, an attempt on generation 3
+// used to raise the floor to 5, blocking never-tried generation 4.
+#[test]
+fn issue1346_out_of_order_eviction_does_not_block_untried_generation() {
+    let limits = Limits::default();
+    let machine = MachineId([30; 32]);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    for generation in [6, 7, 8] {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&machine)
+            .unwrap()
+            .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+        assert!(limits.begin_hello_on_connection(machine, true, Some(generation)));
+    }
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(
+            budget.hello_floor, 0,
+            "an arrival below every stored slot raises no floor"
+        );
+        assert!(!budget.hello_attempted(4), "generation 4 never tried");
+        // The forgotten generation 5 is the trade: under five-generation
+        // churn it can re-arm, still bounded by the machine rate gate.
+        assert!(!budget.hello_attempted(5));
+    }
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    assert!(
+        limits.begin_hello_on_connection(machine, true, Some(4)),
+        "the never-tried generation still owns its try"
+    );
+}
+
+// #1772 review: the unattributed Some(0) slot is never an eviction
+// candidate, in-order or out-of-order.
+#[test]
+fn issue1346_unattributed_slot_survives_eviction() {
+    let limits = Limits::default();
+    let aged = Instant::now() - HELLO_INTERVAL;
+    // In-order pressure: {0,5,6,7} then 8 evicts the smallest positive slot.
+    let orderly = MachineId([31; 32]);
+    assert!(limits.begin_hello_on_connection(orderly, true, None));
+    for generation in [5, 6, 7, 8] {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&orderly)
+            .unwrap()
+            .hello_out = Some(aged);
+        assert!(limits.begin_hello_on_connection(orderly, true, Some(generation)));
+    }
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&orderly];
+        assert_eq!(budget.hello_floor, 5);
+        assert!(
+            budget.hello_attempted(0),
+            "the unattributed slot keeps its try"
+        );
+        assert!(budget.hello_attempts.contains(&Some(0)));
+    }
+    // Out-of-order pressure: {0,6,7,8} then 4 arrives below every stored
+    // positive slot; generation 5 never tried and must stay free.
+    let unordered = MachineId([32; 32]);
+    assert!(limits.begin_hello_on_connection(unordered, true, None));
+    for generation in [6, 7, 8, 4] {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&unordered)
+            .unwrap()
+            .hello_out = Some(aged);
+        assert!(limits.begin_hello_on_connection(unordered, true, Some(generation)));
+    }
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&unordered];
+        assert_eq!(budget.hello_floor, 0);
+        assert!(budget.hello_attempts.contains(&Some(0)));
+        assert!(!budget.hello_attempted(5), "generation 5 never tried");
+    }
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&unordered)
+        .unwrap()
+        .hello_out = Some(aged);
+    assert!(
+        limits.begin_hello_on_connection(unordered, true, Some(5)),
+        "the never-tried generation still owns its try"
+    );
 }
 
 #[test]
