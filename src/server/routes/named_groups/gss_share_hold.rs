@@ -58,6 +58,11 @@ pub(in crate::server) struct GssShareHolds {
     /// `true` while the hold directory, or a file in it, cannot be read:
     /// every GSS group is held until a load succeeds.
     unreadable: std::sync::atomic::AtomicBool,
+    /// #1766: per group, the sender of the installed share of an epoch
+    /// that no head commits yet ([`share_sent_by`]). Durable in the hold
+    /// file, so a restart between the share and its crypto-only exclusion
+    /// keeps it.
+    share_senders: StdMutex<HashMap<String, ShareSender>>,
     /// The groups whose last write failed. A later park or hold of the
     /// group, a resend included, writes again ([`retry_unsaved`]).
     unsaved: StdMutex<HashSet<String>>,
@@ -75,6 +80,14 @@ struct ExclusionHold {
     /// ([`removes_share_actor`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     removed: Vec<String>,
+}
+
+/// #1766: the sender of an installed share whose epoch no head commits yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ShareSender {
+    secret_epoch: u64,
+    /// The lower-case hex agent id of the sender.
+    sender: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +108,9 @@ struct HoldFile {
     removals: Vec<HeldRemoval>,
     #[serde(default)]
     exclusions: Vec<ExclusionHold>,
+    /// #1766: holds nothing; an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    share_sender: Option<ShareSender>,
 }
 
 fn hold_dir(state: &AppState) -> PathBuf {
@@ -365,6 +381,14 @@ fn decode_hold_file(bytes: &[u8]) -> Result<HoldFile, String> {
 }
 
 fn absorb(state: &AppState, file: HoldFile) {
+    if let Some(sender) = file.share_sender {
+        state
+            .gss_share_holds
+            .share_senders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(file.group_key.clone(), sender);
+    }
     if !file.removals.is_empty() {
         let mut lot = state
             .parked_gss_removals
@@ -440,6 +464,13 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
         .get(group_key)
         .cloned()
         .unwrap_or_default();
+    let share_sender = state
+        .gss_share_holds
+        .share_senders
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(group_key)
+        .cloned();
     let path = hold_path(state, group_key);
     if state
         .gss_share_holds
@@ -452,7 +483,7 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
             "an undecodable hold file is kept, not replaced",
         ));
     }
-    if removals.is_empty() && exclusions.is_empty() {
+    if removals.is_empty() && exclusions.is_empty() && share_sender.is_none() {
         return match crate::w3h_inline::fs::remove_file(&path).await {
             Ok(()) => super::sync_parent_dir_for_path(&path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -464,6 +495,7 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
         group_key: group_key.to_string(),
         removals,
         exclusions,
+        share_sender,
     };
     let bytes = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
     if let Some(parent) = path.parent() {
@@ -623,8 +655,9 @@ pub(super) async fn hold_exclusion(
 /// Drop the group's exclusion holds that no longer hold `info` (a secret of
 /// their epoch or a later one is installed), such as an evicted removal's
 /// hold after its key installed, or #1578's keyless install hold after the
-/// share it awaits installed. Returns whether a hold was dropped. The
-/// caller writes the file.
+/// share it awaits installed. #1766: a share sender whose epoch the head
+/// now commits goes too. Returns whether anything was dropped. The caller
+/// writes the file.
 pub(super) fn prune_exclusions(
     state: &AppState,
     group_key: &str,
@@ -635,16 +668,16 @@ pub(super) fn prune_exclusions(
         .exclusions
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(list) = lot.get_mut(group_key) else {
-        return false;
-    };
-    let before = list.len();
-    list.retain(|hold| holds(info, Some(hold.secret_epoch)));
-    let dropped = list.len() != before;
-    if list.is_empty() {
+    let dropped = lot.get_mut(group_key).is_some_and(|list| {
+        let before = list.len();
+        list.retain(|hold| holds(info, Some(hold.secret_epoch)));
+        list.len() != before
+    });
+    if lot.get(group_key).is_some_and(Vec::is_empty) {
         lot.remove(group_key);
     }
-    dropped
+    drop(lot);
+    prune_share_sender(state, group_key, info) || dropped
 }
 
 /// Whether the group has an exclusion hold in memory. A share that installs
@@ -657,6 +690,117 @@ pub(super) fn holds_exclusions(state: &AppState, group_key: &str) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .contains_key(group_key)
+}
+
+/// #1766: `sender_hex` sealed the share of `secret_epoch` that just
+/// installed in `info`. The sender is kept, durably, only while no head
+/// commits that epoch: a crypto-only exclusion of that epoch keeps the
+/// secret only from its own actor ([`share_sent_by`]).
+pub(super) async fn note_share_sender(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    secret_epoch: u64,
+    sender_hex: &str,
+) {
+    ensure_loaded(state).await;
+    let changed = {
+        let mut lot = state
+            .gss_share_holds
+            .share_senders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if secret_epoch > x0x::groups::crypto_exclusion::committed_secret_epoch(info) {
+            let sender = ShareSender {
+                secret_epoch,
+                sender: sender_hex.to_ascii_lowercase(),
+            };
+            lot.insert(group_key.to_string(), sender.clone()) != Some(sender)
+        } else {
+            lot.remove(group_key).is_some()
+        }
+    };
+    if changed {
+        persist_logged(state, group_key).await;
+    }
+}
+
+/// #1766: drop the group's share sender once `info`'s head commits its
+/// epoch (or a later one). Returns whether it was dropped; the caller
+/// writes the file.
+fn prune_share_sender(state: &AppState, group_key: &str, info: &x0x::groups::GroupInfo) -> bool {
+    let committed = x0x::groups::crypto_exclusion::committed_secret_epoch(info);
+    let mut lot = state
+        .gss_share_holds
+        .share_senders
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if lot
+        .get(group_key)
+        .is_some_and(|kept| kept.secret_epoch <= committed)
+    {
+        lot.remove(group_key);
+        return true;
+    }
+    false
+}
+
+/// #1766: [`prune_share_sender`], and write the file when it changed.
+pub(super) async fn forget_committed_share_sender(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+) {
+    ensure_loaded(state).await;
+    if prune_share_sender(state, group_key, info) {
+        persist_logged(state, group_key).await;
+    }
+}
+
+/// #1766: whether the group's installed secret of `secret_epoch` came from
+/// a share that `sender_hex` sealed. An unknown sender (another install
+/// path) is not `sender_hex`. Call [`ensure_loaded`] first.
+pub(super) fn share_sent_by(
+    state: &AppState,
+    group_key: &str,
+    secret_epoch: u64,
+    sender_hex: &str,
+) -> bool {
+    state
+        .gss_share_holds
+        .share_senders
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(group_key)
+        .is_some_and(|kept| {
+            kept.secret_epoch == secret_epoch && kept.sender.eq_ignore_ascii_case(sender_hex)
+        })
+}
+
+/// #1766: whether a share of `secret_epoch` from `sender_hex` may replace
+/// the secret of the same epoch that `info` holds. Only an uncommitted
+/// secret can go (no head binds its epoch yet), only while a verified
+/// transition of that epoch waits for its share ([`hold_exclusion`]), and
+/// only for a different sender. The waiting crypto-only exclusion keeps a
+/// secret only from its own actor, so without this its actor's share
+/// could never install. Call [`ensure_loaded`] first.
+pub(super) fn replaces_uncommitted_secret(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    sender_hex: &str,
+    secret_epoch: u64,
+) -> bool {
+    secret_epoch == info.secret_epoch
+        && secret_epoch > x0x::groups::crypto_exclusion::committed_secret_epoch(info)
+        && !share_sent_by(state, group_key, secret_epoch, sender_hex)
+        && state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_key)
+            .is_some_and(|list| list.iter().any(|hold| hold.secret_epoch == secret_epoch))
 }
 
 /// The exclusion installed with its secret at `secret_epoch`: its hold,
@@ -751,6 +895,16 @@ pub(super) async fn forget_group<'a>(
     }
     {
         let mut lot = state
+            .gss_share_holds
+            .share_senders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for alias in aliases.clone() {
+            lot.remove(alias);
+        }
+    }
+    {
+        let mut lot = state
             .parked_gss_removals
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -770,11 +924,17 @@ pub(super) async fn forget_group<'a>(
 pub(in crate::server) mod test_seam {
     use super::*;
 
-    /// A restart: memory loses every parked removal and held exclusion,
-    /// and the next check loads the files again.
+    /// A restart: memory loses every parked removal, held exclusion and
+    /// share sender (#1766), and the next check loads the files again.
     pub(in crate::server) async fn simulate_restart(state: &AppState) {
         state
             .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        state
+            .gss_share_holds
+            .share_senders
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();

@@ -18887,9 +18887,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // Ignore stale envelopes. Equal-epoch delivery is still accepted
             // if we only know the epoch/security_binding from a prior
             // MemberBanned commit but have not yet received the actual shared
-            // secret material.
+            // secret material. #1766: a waiting transition's share may
+            // replace an uncommitted secret of its epoch from another sender.
             if secret_epoch < info.secret_epoch
-                || (secret_epoch == info.secret_epoch && info.shared_secret.is_some())
+                || (secret_epoch == info.secret_epoch
+                    && info.shared_secret.is_some()
+                    && !gss_share_hold::replaces_uncommitted_secret(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &sender_hex,
+                        secret_epoch,
+                    ))
             {
                 return ApplyMetadataResult::REJECTED;
             }
@@ -18950,6 +18959,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) {
                 return ApplyMetadataResult::REJECTED;
             }
+            // #1766: a GSS crypto-only exclusion keeps this secret only when
+            // its own actor sealed it.
+            gss_share_hold::note_share_sender(
+                state,
+                &resolved_group_key,
+                &info,
+                secret_epoch,
+                &sender_hex,
+            )
+            .await;
             *replay_group_id = Some(resolved_group_key.clone());
             tracing::info!(
                 group_id = %ev_group_id,

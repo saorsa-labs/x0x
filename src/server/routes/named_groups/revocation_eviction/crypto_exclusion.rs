@@ -2911,7 +2911,23 @@ async fn install_gss(
     frame_bytes: Arc<Vec<u8>>,
 ) -> ReceiveOutcome {
     use super::super as ng;
-    let waiting = info.secret_epoch < next_secret_epoch || info.shared_secret.is_none();
+    // #1766: a secret of the frame's epoch is uncommitted (the frame binds
+    // the parent's committed epoch + 1). It is the frame's key only when
+    // the frame's actor sealed its share. A secret from another sender,
+    // or from a sender this process does not know (a restart), is not
+    // kept: the frame waits for its actor's share, which may replace it
+    // ([`ng::gss_share_hold::replaces_uncommitted_secret`]).
+    ng::gss_share_hold::ensure_loaded(state).await;
+    let foreign_secret = info.secret_epoch == next_secret_epoch
+        && info.shared_secret.is_some()
+        && !ng::gss_share_hold::share_sent_by(
+            state,
+            group_key,
+            next_secret_epoch,
+            &hex::encode(body.actor),
+        );
+    let waiting =
+        info.secret_epoch < next_secret_epoch || info.shared_secret.is_none() || foreign_secret;
     let roster_revision = body.roster_revision;
     // The frame's verified result without its key: the roster that a later
     // admin's promotion chains on.
@@ -2962,6 +2978,7 @@ async fn install_gss(
         tracing::info!(
             group_id = %LogHexId::group(group_key),
             secret_epoch = next_secret_epoch,
+            foreign_secret,
             "ADR 0110 S4: GSS crypto-only exclusion waits for its sealed share"
         );
         // The frame verified, and this node keeps the old secret, which the
@@ -3051,6 +3068,9 @@ async fn install_gss(
     if !superseded && !awaiting_share {
         ng::gss_share_hold::release_exclusions(state, group_key, next_secret_epoch).await;
     }
+    // #1766: the head now commits the epoch; its share sender is no longer
+    // needed.
+    ng::gss_share_hold::forget_committed_share_sender(state, group_key, &next).await;
     // #1663: this node just learned its own seat can not take a share.
     // Republish the daemon's live KEM key on the seat so the next delivery
     // round can seal the share. Detached: the republish takes the group's
@@ -4905,6 +4925,16 @@ mod daemon_tests {
         committer_seats_kem: bool,
         replica_seats_kem: bool,
     ) -> Result<GssLeave> {
+        let extra = extra.map(|extra| (extra, x0x::groups::GroupRole::Member));
+        gss_leave_fixture_seated(extra, committer_seats_kem, replica_seats_kem).await
+    }
+
+    /// [`gss_leave_fixture_views`], with the extra agent seated in `role`.
+    async fn gss_leave_fixture_seated(
+        extra: Option<(AgentId, x0x::groups::GroupRole)>,
+        committer_seats_kem: bool,
+        replica_seats_kem: bool,
+    ) -> Result<GssLeave> {
         let (mut state, dir) = ng::tests::secure_endpoint_test_state().await?;
         // Only the per-group head round holds a seal, not the boot wait.
         anyhow::Context::context(
@@ -4944,10 +4974,10 @@ mod daemon_tests {
             None,
             committer_seats_kem.then(|| survivor_kem_b64.clone()),
         );
-        if let Some(extra) = extra {
+        if let Some((extra, role)) = extra {
             info.add_member(
                 hex::encode(extra.as_bytes()),
-                x0x::groups::GroupRole::Member,
+                role,
                 Some(admin_hex.clone()),
                 None,
             );
@@ -5001,7 +5031,7 @@ mod daemon_tests {
             leaver_kp,
             leave,
             old_secret,
-            extra,
+            extra: extra.map(|(extra, _)| extra),
         })
     }
 
@@ -8519,6 +8549,131 @@ mod daemon_tests {
         Ok(())
     }
 
+    /// #1766: the survivor keeps an uncommitted secret of the frame's
+    /// epoch only when the frame's actor sealed it. Another Active admin
+    /// `B` seals its own secret of that epoch to the survivor first; the
+    /// share installs (B is an admin on the parent). The frame must not
+    /// install over B's secret: the group would split, and B chose the
+    /// key. The frame waits, the actor's own share replaces B's secret,
+    /// and the frame then installs with the actor's key.
+    #[tokio::test]
+    async fn a_gss_exclusion_keeps_no_same_epoch_secret_that_another_admin_sealed() -> Result<()> {
+        use anyhow::Context as _;
+        // The highest raw ID, so the fixture's admin stays designated.
+        let other_admin = AgentId([0xff; 32]);
+        let other_admin_hex = hex::encode(other_admin.as_bytes());
+        let fx = gss_leave_fixture_seated(
+            Some((other_admin, x0x::groups::GroupRole::Admin)),
+            true,
+            true,
+        )
+        .await?;
+        let admin = fx.state.agent.agent_id();
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let frame = latest_frame_for_test(&fx.state, &fx.stable)
+            .await
+            .context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let next_secret_epoch = match body.crypto {
+            ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } => next_secret_epoch,
+            _ => anyhow::bail!("the fixture commits the GSS form"),
+        };
+        let actor_secret = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .and_then(|info| info.shared_secret.clone())
+            .context("the actor's new secret")?;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's share of the frame's epoch installs first.
+        let foreign = [0xB5u8; 32];
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let foreign_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &other_admin_hex,
+            &foreign,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's share"))?;
+        let took = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            foreign_share,
+            other_admin,
+            true,
+            None,
+        )
+        .await;
+        assert!(took.accepted, "B is an admin on the parent: {took:?}");
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "B's secret is not the frame's key: the frame waits for its actor's share"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no result head over B's secret"
+        );
+
+        // The actor's share replaces B's uncommitted secret; the kept
+        // frame then installs with the actor's key.
+        let share = shares_for(&fx.state, &survivor_hex)
+            .pop()
+            .context("the actor sealed a share to the survivor")?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, share, admin, true, None).await;
+        assert!(took.accepted, "the actor's share replaces B's: {took:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the frame installs with its actor's key"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(installed.state_hash, body.commit.state_hash);
+        assert_eq!(installed.secret_epoch, next_secret_epoch);
+        assert_eq!(
+            installed.shared_secret,
+            Some(actor_secret),
+            "the survivor holds the actor's key, not B's"
+        );
+        Ok(())
+    }
+
     /// #1578 review: the other direction of the divergent seat view. The
     /// author's view of the survivor's seat holds no KEM key (for
     /// example after an outbound snapshot that strips KEM keys) while
@@ -9841,6 +9996,17 @@ mod daemon_tests {
             .write()
             .await
             .insert(fx.group_id.clone(), parent.clone());
+        // `parent` holds the author's early share; `B` took it from the
+        // author too (#1766).
+        let author_hex = hex::encode(fx.state.agent.agent_id().as_bytes());
+        ng::gss_share_hold::note_share_sender(
+            &lagging,
+            &fx.group_id,
+            parent,
+            parent.secret_epoch,
+            &author_hex,
+        )
+        .await;
         assert_eq!(
             receive(&lagging, relay, frame).await,
             ReceiveOutcome::Applied,
