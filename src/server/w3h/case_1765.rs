@@ -612,18 +612,30 @@ async fn body(
         .await;
     let completed_after = sim.fabric().now().saturating_sub(restored_at);
     let store_after = read_optional(&store)?;
+    // The bytes must hold B's revocation, not only differ: a written store
+    // without B's record would not carry the exclusion's evidence.
+    let b_id = crate::identity::AgentId(
+        <[u8; 32]>::try_from(hex::decode(b_hex).context("B's agent id hex")?.as_slice())
+            .context("B's agent id length")?,
+    );
+    let store_holds_b = store_after.as_deref().is_some_and(|bytes| {
+        crate::revocation::RevocationSet::from_bytes(bytes)
+            .is_ok_and(|set| set.is_agent_revoked(&b_id))
+    });
     passed &= record_check(
         receipt,
         "the_retried_write_puts_the_revocation_in_the_store",
-        store_after.is_some() && store_after != store_before,
+        store_holds_b && store_after != store_before,
         CAUSE_STORE_NOT_WRITTEN,
         Some(format!(
-            "revocations.bin: {:?} bytes before, {:?} after the restore",
+            "revocations.bin: {:?} bytes before, {:?} after the restore; holds B's revocation: \
+             {store_holds_b}",
             store_before.as_ref().map(Vec::len),
             store_after.as_ref().map(Vec::len)
         )),
         format!(
-            "revocations.bin: {:?} bytes before the fault, {:?} after the restore",
+            "revocations.bin: {:?} bytes before the fault, {:?} after the restore; holds B's \
+             revocation: {store_holds_b}",
             store_before.as_ref().map(Vec::len),
             store_after.as_ref().map(Vec::len)
         ),

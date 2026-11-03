@@ -1274,6 +1274,9 @@ struct IntakeInner {
 pub struct RevocationIntake {
     inner: std::sync::Arc<std::sync::Mutex<IntakeInner>>,
     notify: std::sync::Arc<tokio::sync::Notify>,
+    /// Cancelled when the owning Agent shuts down: no S4 store-write
+    /// retry starts again after that (#1765).
+    persist_stop: tokio_util::sync::CancellationToken,
 }
 
 impl RevocationIntake {
@@ -1381,6 +1384,17 @@ impl RevocationIntake {
     /// The retry task stops. A write that fails after this starts a new one.
     pub(crate) fn release_persist_retry(&self) {
         self.lock().persist_retrying = false;
+    }
+
+    /// The owning Agent shuts down. A retry task stops before its next
+    /// attempt; a write in progress finishes.
+    pub(crate) fn stop_persist_retries(&self) {
+        self.persist_stop.cancel();
+    }
+
+    /// The signal of [`Self::stop_persist_retries`].
+    pub(crate) fn persist_stop(&self) -> &tokio_util::sync::CancellationToken {
+        &self.persist_stop
     }
 
     /// Whether a retry task holds the claim.
