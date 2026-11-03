@@ -2031,7 +2031,7 @@ the fields shown:
 
 | `state` | Fields | Meaning |
 |---|---|---|
-| `catching_up` | `attested_by`, `verified`, `cursor`, `segment_terminal` | An admin's attestation (ATA) covers this node's gap. The node applies the attested links. While a verified catch-up makes progress, a refusal or a silent round does not change the state. After 10 minutes without progress, the wait replaces it. |
+| `catching_up` | `attested_by`, `verified`, `cursor`, `segment_terminal` | An admin's attestation (ATA) covers this node's gap. The node applies the attested links. While a verified catch-up makes progress, a soft refusal (for example `rate_limited`) or a silent round does not change the state. A new verified attestation counts as progress. After 10 minutes without progress, the next refusal or silent round replaces it with `awaiting_attestation`; the timeout alone does not change the state. An armed attestation with no progress asks for renewal (`renewal_due`) after 30 minutes. A hard refusal, for example `not_a_member`, replaces it at once. |
 | `awaiting_attestation` | `reason`, `asked`, `next_retry_at_ms` | The node asks capable admins, then members. `reason` is `no_capable_peer`, `no_reply`, `segment_exhausted`, `renewal_due`, `provisional_unverified`, or the last refusal reason. |
 | `readmission_required` | `cause`, `asked`, `exit` | `cause` is `base_beyond_retention` or `local_state_lost`. `exit` is `manual_remove_and_reinvite` until ADR 0114's repair is in effect. |
 | `manual_clear_required` | `ref` | The head is on the admin's chain, but the marker names a sibling. Use `POST /groups/:id/quarantine/clear`. |
