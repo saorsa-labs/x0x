@@ -50565,12 +50565,26 @@ async fn send_welcome_fetch_request(
         detached_send_test_seam::park(&detached_send_test_seam::welcome_fetch_key(welcome_id))
             .await;
     }
-    state
+    let error = match state
         .agent
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request))
         .await
-        .map(|_| ())
-        .map_err(classify_welcome_fetch_send_error)
+    {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    // #1776: an undiscovered recipient is not only a transient gap — for a
+    // fresh joiner it is structural. It joined the mesh after the staging
+    // authority's last advert beat, and neither the advert cadence (600 s)
+    // nor the identity heartbeat replays onto meshes joined later, so no
+    // retry inside the fetch window can succeed unaided. The membership
+    // event itself reached this node over the gossip mesh, so ask the
+    // authority for a fresh advert over the mesh's targeted control topics;
+    // the retry schedule above re-sends once the binding lands.
+    if matches!(error, x0x::dm::DmError::RecipientUndiscovered(_)) {
+        state.agent.refresh_dm_capability_binding(*agent_id).await;
+    }
+    Err(classify_welcome_fetch_send_error(error))
 }
 
 async fn notify_welcome_waiters(

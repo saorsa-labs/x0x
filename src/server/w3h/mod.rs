@@ -80,6 +80,7 @@ mod case_1581f;
 mod case_1581g;
 mod case_1581h;
 mod case_1765;
+mod case_1776;
 mod case_811;
 mod case_818;
 mod case_969;
