@@ -49374,8 +49374,11 @@ async fn handle_join_result_message_bound(
                     _ => Vec::new(),
                 };
             // ADR 0109 §2: the join-carry ATA for a capable stale joiner
-            // when no owner v2 attestation is served.
-            let admin_attestation = {
+            // when no owner v2 attestation is served. #1651 r3: gated on
+            // `carry_allowed` (verified included) — an unverified spoofed
+            // fetch must burn neither the member's carry slot nor a §11
+            // signature; it still gets its staged result, without the ATA.
+            let admin_attestation = if carry_allowed {
                 let owner_terminal_served = head_attestation
                     .as_ref()
                     .is_some_and(|attestation| attestation.terminal_signature_b64.is_some());
@@ -49397,6 +49400,8 @@ async fn handle_join_result_message_bound(
                 )
                 .await
                 .map(Box::new)
+            } else {
+                None
             };
             let response = JoinResultMessage::Result {
                 event: Box::new(event),

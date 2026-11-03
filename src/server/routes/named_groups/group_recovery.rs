@@ -492,6 +492,12 @@ struct ResponderBudget {
     signatures: u32,
     bytes: usize,
     building: usize,
+    /// Members with a join-carry signature this interval (#1651): the
+    /// carry's §11 per-requester rate, tracked separately from
+    /// `per_requester` — the same rate the request path gets, counted
+    /// apart, so one member can hold both one request-path response and
+    /// one carry signature in the same interval.
+    carry_per_member: HashMap<[u8; 32], Instant>,
 }
 
 impl ResponderBudget {
@@ -505,6 +511,9 @@ impl ResponderBudget {
             self.bytes = 0;
         }
         self.per_requester.retain(|_, at| {
+            now.saturating_duration_since(*at) < s3::RESPONDER_PER_REQUESTER_INTERVAL
+        });
+        self.carry_per_member.retain(|_, at| {
             now.saturating_duration_since(*at) < s3::RESPONDER_PER_REQUESTER_INTERVAL
         });
     }
@@ -536,6 +545,27 @@ impl ResponderBudget {
             return false;
         }
         self.signatures += 1;
+        true
+    }
+
+    /// #1651: the join carry signs under the same §11 budget and the
+    /// same per-requester rate as the request path — one signature per
+    /// member per interval, whatever `attempt_id`s the fetch presents,
+    /// because the joiner picks the id and could otherwise mint a fresh
+    /// one per fetch to spend the shared budget. The rate is the
+    /// request path's, tracked separately from `per_requester`. The
+    /// per-member check runs before `may_sign`, so an over-rate member
+    /// burns no global slot; a failed `sign` still spends both, as on
+    /// the request path.
+    fn may_sign_carry(&mut self, member: [u8; 32], now: Instant) -> bool {
+        self.roll(now);
+        if self.carry_per_member.contains_key(&member) {
+            return false;
+        }
+        if !self.may_sign() {
+            return false;
+        }
+        self.carry_per_member.insert(member, now);
         true
     }
 
@@ -3118,7 +3148,15 @@ async fn record_recovery_list(
 /// owner v2 attestation served, the joiner's current verified advert sets
 /// the §5 bit, this node an uncontained active admin, and the group not
 /// Home-policy (Home activation is off). One signature per
-/// `(attempt_id, from_revision)`.
+/// `(attempt_id, from_revision)`, drawn from the §11 responder signature
+/// budget like a request-path signature, at that path's per-requester
+/// rate — one signature per member per interval, the same rate tracked
+/// separately from the request path's `per_requester` map, whatever
+/// `attempt_id`s the fetch presents (#1651). An over-budget or
+/// over-rate join gets no carry ATA — the result is still sent without
+/// one, and the joiner falls back to the §2 stale-base pending path
+/// and `awaiting_attestation`. A cached `(attempt_id, from_revision)`
+/// serves again without a new signature.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn join_carry_attestation(
     state: &Arc<AppState>,
@@ -3178,16 +3216,20 @@ pub(super) async fn join_carry_attestation(
         return None;
     }
     let cache_key = (attempt_id.to_string(), from_revision);
-    if let Some(cached) = state
-        .group_recovery
-        .inner
-        .lock()
-        .await
-        .join_carry
-        .get(&cache_key)
-        .cloned()
     {
-        return Some(cached);
+        let mut inner = state.group_recovery.inner.lock().await;
+        if let Some(cached) = inner.join_carry.get(&cache_key).cloned() {
+            return Some(cached);
+        }
+        // #1651: the carry is a responder signature from the same §11
+        // budget as the request path, at that path's per-requester
+        // rate — the same rate tracked separately from the request
+        // path's `per_requester` map. A join result passes no `admit`,
+        // which rolls the window there, so the rate check rolls it
+        // here.
+        if !inner.responder.may_sign_carry(member.0, Instant::now()) {
+            return None;
+        }
     }
     let mut sequence: Vec<String> = chain
         .iter()
@@ -8095,6 +8137,59 @@ mod tests {
         assert!(budget.per_requester.is_empty());
     }
 
+    /// #1651: the carry's per-member rate — one signature per member per
+    /// interval, the same rate the request path gets, tracked separately —
+    /// and `roll()` prunes `carry_per_member` with the window, so a member
+    /// is never locked out past the interval and the map cannot grow
+    /// without bound.
+    #[test]
+    fn responder_budget_carry_rate_prunes_with_the_window() {
+        let now = Instant::now();
+        let mut budget = ResponderBudget::default();
+        // Tracked separately: a request-path response in the same interval
+        // does not consume the member's carry slot.
+        assert_eq!(budget.admit([1; 32], now), Admission::Build);
+        assert!(
+            budget.may_sign_carry([1; 32], now),
+            "the request path and the carry track the member separately"
+        );
+        assert!(
+            !budget.may_sign_carry([1; 32], now),
+            "one carry signature per member per interval"
+        );
+        assert_eq!(
+            budget.signatures, 1,
+            "the refused retry spends no global signature"
+        );
+        // An exhausted shared budget refuses without holding the member's
+        // carry slot: the member can sign in the next interval.
+        while budget.signatures < s3::RESPONDER_SIGNATURES_PER_MINUTE {
+            assert!(budget.may_sign());
+        }
+        assert!(
+            !budget.may_sign_carry([3; 32], now),
+            "the shared signature budget is spent"
+        );
+        assert!(
+            !budget.carry_per_member.contains_key(&[3; 32]),
+            "a budget refusal holds no carry slot"
+        );
+        let later = now + Duration::from_secs(61);
+        budget.roll(later);
+        assert!(
+            budget.carry_per_member.is_empty(),
+            "roll() prunes the carry map with the window"
+        );
+        assert!(
+            budget.may_sign_carry([1; 32], later),
+            "a fresh interval signs for the member again"
+        );
+        assert!(
+            budget.may_sign_carry([3; 32], later),
+            "the budget-refused member signs in the fresh interval"
+        );
+    }
+
     /// Codex P2 (#1533 r10), ADR 0109 §11: a `rate_limited` refusal takes
     /// a build slot and counts against the byte budget, so a request flood
     /// from one capable peer stops at the concurrent-build and byte limits.
@@ -8135,6 +8230,445 @@ mod tests {
             budget.finish(0);
         }
         assert_eq!(budget.admit([1; 32], later), Admission::Build);
+    }
+
+    /// #1651: the group an over-base join fetches a carry from — a
+    /// creator-admin group with two sealed links past the joiner's base,
+    /// sealed at +1 revisions so the retained log is CONSECUTIVE and the
+    /// production `intervening_chain_from` finds a complete chain. The
+    /// TempDir is returned so the data dir outlives the test body.
+    async fn carry_fixture(
+        name: &str,
+    ) -> anyhow::Result<(
+        Arc<AppState>,
+        tempfile::TempDir,
+        String,
+        GroupInfo,
+        Vec<RetainedCommit>,
+        GroupStateCommit,
+    )> {
+        let (state, dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let admin = state.agent.identity().agent_keypair();
+        let mut base = GroupInfo::new(
+            name.to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "1651".repeat(16),
+        );
+        base.seal_commit(admin, 1_000)?;
+        let key = base.mls_group_id.clone();
+        let mut ahead = base.clone();
+        ahead.name = "renamed".to_string();
+        ahead.seal_commit(admin, 1_001)?;
+        let mut head = ahead.clone();
+        head.name = "renamed again".to_string();
+        head.seal_commit(admin, 1_002)?;
+        let links: Vec<RetainedCommit> = head
+            .commit_log
+            .iter()
+            .filter(|entry| entry.commit.revision > base.state_revision)
+            .cloned()
+            .collect();
+        let terminal = head
+            .commit_log
+            .last()
+            .map(|entry| entry.commit.clone())
+            .expect("three sealed links");
+        state.named_groups.write().await.insert(key.clone(), head);
+        Ok((state, dir, key, base, links, terminal))
+    }
+
+    /// A joiner whose verified, machine-bound advert sets the §5 bit.
+    fn carry_joiner(state: &Arc<AppState>) -> anyhow::Result<x0x::identity::AgentKeypair> {
+        let joiner = x0x::identity::AgentKeypair::generate()?;
+        let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(vec![9; 16]);
+        caps.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: x0x::dm::CapabilityRegistry::GROUP_TERMINAL_ATTEST_V1,
+        };
+        assert!(
+            state.agent.capability_store().insert(
+                joiner.agent_id(),
+                x0x::identity::MachineId([4; 32]),
+                caps,
+                x0x::dm_capability::now_unix_ms(),
+            ),
+            "the joiner's verified advert sets the §5 bit"
+        );
+        Ok(joiner)
+    }
+
+    /// One join-carry fetch for `joiner_hex` under `attempt_id`.
+    async fn carry(
+        state: &Arc<AppState>,
+        key: &str,
+        joiner_hex: &str,
+        base: &GroupInfo,
+        links: &[RetainedCommit],
+        terminal: &GroupStateCommit,
+        attempt_id: &str,
+    ) -> Option<AdminTerminalAttestation> {
+        join_carry_attestation(
+            state,
+            key,
+            joiner_hex,
+            Some(base.state_revision),
+            Some(&base.state_hash),
+            links,
+            Some(terminal),
+            None,
+            Some(attempt_id),
+            false,
+        )
+        .await
+    }
+
+    /// #1651, ADR 0109 §11: a join-carry ATA is a responder signature
+    /// from the same per-minute budget as a request-path signature.
+    /// Before the fix each distinct join attempt forced an uncapped
+    /// ML-DSA signature; only the ADR 0107 serving guard bounded it
+    /// indirectly. A flood of distinct joiners now stops at
+    /// `RESPONDER_SIGNATURES_PER_MINUTE`, a served attempt still serves
+    /// from the cache without a new signature, and the next minute
+    /// starts again.
+    #[tokio::test]
+    async fn join_carry_signatures_draw_from_the_responder_budget() -> anyhow::Result<()> {
+        let (state, _dir, key, base, links, terminal) =
+            carry_fixture("issue1651-carry-budget").await?;
+        let local = local_hex(&state);
+        let mut zeroth_joiner_hex = None;
+        let mut zeroth = None;
+        let mut signatures = HashSet::new();
+        for attempt in 0..s3::RESPONDER_SIGNATURES_PER_MINUTE {
+            let joiner_hex = hex::encode(carry_joiner(&state)?.agent_id().as_bytes());
+            let ata = carry(
+                &state,
+                &key,
+                &joiner_hex,
+                &base,
+                &links,
+                &terminal,
+                &format!("attempt-{attempt}"),
+            )
+            .await
+            .expect("signs inside the per-minute budget");
+            assert_eq!(ata.fields.attested_by, local);
+            assert_eq!(ata.fields.subject, joiner_hex);
+            assert!(ata.verify_signature().is_ok());
+            signatures.insert(ata.signature.clone());
+            if attempt == 0 {
+                zeroth_joiner_hex = Some(joiner_hex);
+                zeroth = Some(ata);
+            }
+        }
+        assert_eq!(
+            signatures.len(),
+            s3::RESPONDER_SIGNATURES_PER_MINUTE as usize,
+            "each distinct joiner is a fresh signature"
+        );
+        // The next distinct joiner in the same minute gets no carry ATA;
+        // the joiner falls back to the §2 request path.
+        let late_hex = hex::encode(carry_joiner(&state)?.agent_id().as_bytes());
+        assert!(
+            carry(
+                &state,
+                &key,
+                &late_hex,
+                &base,
+                &links,
+                &terminal,
+                "attempt-late"
+            )
+            .await
+            .is_none(),
+            "the budget stops the next join-carry signature"
+        );
+        // A served attempt is a cache hit: it serves again without a
+        // new signature.
+        let cached = carry(
+            &state,
+            &key,
+            &zeroth_joiner_hex.expect("first joiner"),
+            &base,
+            &links,
+            &terminal,
+            "attempt-0",
+        )
+        .await
+        .expect("a cached attempt still serves");
+        assert_eq!(cached.signature, zeroth.expect("served").signature);
+        // The next minute the budget starts again.
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .responder
+            .window_start = None;
+        let fresh_hex = hex::encode(carry_joiner(&state)?.agent_id().as_bytes());
+        assert!(
+            carry(
+                &state,
+                &key,
+                &fresh_hex,
+                &base,
+                &links,
+                &terminal,
+                "attempt-next-minute"
+            )
+            .await
+            .is_some(),
+            "a fresh minute signs again"
+        );
+        Ok(())
+    }
+
+    /// #1651 (review r2): the §11 signature budget is shared, and the
+    /// joiner picks `attempt_id`. One member — or a spoofer using its
+    /// id — minting a fresh id per fetch must not spend that shared
+    /// budget: the carry is capped at one signature per member per
+    /// interval, the per-requester rate the request path already has.
+    /// Before the cap this test fails: the second fresh attempt signs.
+    #[tokio::test]
+    async fn join_carry_signatures_are_capped_per_member() -> anyhow::Result<()> {
+        let (state, _dir, key, base, links, terminal) =
+            carry_fixture("issue1651-carry-per-member").await?;
+        let joiner_hex = hex::encode(carry_joiner(&state)?.agent_id().as_bytes());
+        let first = carry(
+            &state,
+            &key,
+            &joiner_hex,
+            &base,
+            &links,
+            &terminal,
+            "attempt-1",
+        )
+        .await
+        .expect("a member's first join attempt signs");
+        // A fresh attempt_id from the same member in the same interval
+        // is a cache miss that must not sign.
+        assert!(
+            carry(
+                &state,
+                &key,
+                &joiner_hex,
+                &base,
+                &links,
+                &terminal,
+                "attempt-2"
+            )
+            .await
+            .is_none(),
+            "a second join attempt in the same interval gets no carry"
+        );
+        // The refused attempt is observable in the budget, not just in
+        // another member's success: no global §11 signature was spent.
+        {
+            let inner = state.group_recovery.inner.lock().await;
+            assert_eq!(
+                inner.responder.signatures, 1,
+                "the over-rate member's refused attempt spends no global signature slot"
+            );
+            assert_eq!(
+                inner.responder.carry_per_member.len(),
+                1,
+                "only the member's own carry slot is held"
+            );
+        }
+        // The over-rate member blocks only itself: another member still
+        // signs.
+        let other_hex = hex::encode(carry_joiner(&state)?.agent_id().as_bytes());
+        assert!(
+            carry(
+                &state,
+                &key,
+                &other_hex,
+                &base,
+                &links,
+                &terminal,
+                "attempt-other"
+            )
+            .await
+            .is_some(),
+            "an over-rate member burns no global signature slot"
+        );
+        // The served attempt still serves from the cache.
+        let cached = carry(
+            &state,
+            &key,
+            &joiner_hex,
+            &base,
+            &links,
+            &terminal,
+            "attempt-1",
+        )
+        .await
+        .expect("a cached attempt still serves");
+        assert_eq!(cached.signature, first.signature);
+        // The next interval the member signs again.
+        {
+            let mut inner = state.group_recovery.inner.lock().await;
+            inner.responder.window_start = None;
+            inner.responder.carry_per_member.clear();
+        }
+        assert!(
+            carry(
+                &state,
+                &key,
+                &joiner_hex,
+                &base,
+                &links,
+                &terminal,
+                "attempt-3"
+            )
+            .await
+            .is_some(),
+            "a fresh interval signs for the member again"
+        );
+        Ok(())
+    }
+
+    /// #1651 (review r3): a spoofed fetch over an UNVERIFIED direct
+    /// message self-asserts the sender id, so it reaches the staged-result
+    /// serve wearing the joiner's own id. The carry is gated on
+    /// `carry_allowed` (verified included) at the call site: the spoofed
+    /// fetch is served its staged result but signs nothing — neither the
+    /// member's carry slot nor a §11 global signature is spent — and the
+    /// member's real VERIFIED fetch still carries its ATA.
+    #[tokio::test]
+    async fn unverified_spoofed_fetch_burns_no_carry_slot_or_signature() -> anyhow::Result<()> {
+        let (state, _dir, key, base, _links, terminal) =
+            carry_fixture("issue1651-carry-verified-gate").await?;
+        let joiner = carry_joiner(&state)?;
+        let joiner_hex = hex::encode(joiner.agent_id().as_bytes());
+        // ADR 0107: the staged result serves only to a member eligible on
+        // the current roster, so the joiner holds an active seat.
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&key)
+            .expect("fixture group")
+            .add_member(
+                joiner_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(local_hex(&state)),
+                None,
+            );
+        state.pending_join_results.write().await.insert(
+            super::super::join_result_key(&key, &joiner_hex),
+            super::super::PendingJoinResult {
+                event: super::super::NamedGroupMetadataEvent::MemberAdded {
+                    group_id: key.clone(),
+                    revision: terminal.revision,
+                    actor: local_hex(&state),
+                    agent_id: joiner_hex.clone(),
+                    display_name: None,
+                    treekem_commit_b64: None,
+                    treekem_welcome_b64: None,
+                    welcome_ref: None,
+                    treekem_epoch: Some(7),
+                    treekem_key_package_hash: None,
+                    member_joined_recovery: None,
+                    member_recovery_history: Vec::new(),
+                    certificate_b64: None,
+                    owner_mandate: None,
+                    reseat_mandate: None,
+                    roster_certificates_b64: Vec::new(),
+                    commit: Some(terminal.clone()),
+                },
+                head_attestation: None,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        let fetch = |attempt_id: &str| super::super::JoinResultMessage::FetchRequest {
+            group_id: key.clone(),
+            member_agent_id: joiner_hex.clone(),
+            from_revision: Some(base.state_revision),
+            base_state_hash: Some(base.state_hash.clone()),
+            accepts_refusal: true,
+            accepts_control_blob_ref: true,
+            attempt_id: Some(attempt_id.to_string()),
+            accepts_pending_notice: false,
+            held_notice_hash: None,
+            notice_only: false,
+            attempt_evidence: None,
+        };
+        let served = |count: usize| {
+            let recorded = state
+                .named_group_test_recorders
+                .join_result_serves
+                .lock()
+                .expect("serve witness");
+            assert_eq!(recorded.len(), count, "the staged result itself is served");
+            serde_json::from_slice::<super::super::JoinResultMessage>(&recorded[count - 1].2)
+                .expect("the served payload decodes")
+        };
+        // The spoof: an unverified DM self-asserting the joiner's id.
+        super::super::handle_join_result_message(
+            &state,
+            &joiner.agent_id(),
+            false,
+            fetch("spoof-attempt"),
+        )
+        .await;
+        {
+            let inner = state.group_recovery.inner.lock().await;
+            assert_eq!(
+                inner.responder.signatures, 0,
+                "an unverified spoofed fetch spends no §11 signature"
+            );
+            assert!(
+                inner.responder.carry_per_member.is_empty(),
+                "and burns no member carry slot"
+            );
+            assert!(
+                inner.join_carry.is_empty(),
+                "nothing is cached for the spoofed attempt"
+            );
+        }
+        let super::super::JoinResultMessage::Result {
+            admin_attestation, ..
+        } = served(1)
+        else {
+            panic!("the fetch must be answered with a Result");
+        };
+        assert!(
+            admin_attestation.is_none(),
+            "the spoofed fetch's result carries no ATA"
+        );
+        // The member's real, verified fetch still gets its carry.
+        super::super::handle_join_result_message(
+            &state,
+            &joiner.agent_id(),
+            true,
+            fetch("real-attempt"),
+        )
+        .await;
+        {
+            let inner = state.group_recovery.inner.lock().await;
+            assert_eq!(
+                inner.responder.signatures, 1,
+                "the member's verified fetch signs exactly once"
+            );
+            assert!(
+                inner
+                    .join_carry
+                    .contains_key(&("real-attempt".to_string(), base.state_revision)),
+                "the carry ATA is cached for the real attempt"
+            );
+        }
+        let super::super::JoinResultMessage::Result {
+            admin_attestation, ..
+        } = served(2)
+        else {
+            panic!("the verified fetch must be answered with a Result");
+        };
+        assert!(
+            admin_attestation.is_some(),
+            "the member's verified fetch carries its ATA"
+        );
+        Ok(())
     }
 
     /// Codex P1 (#1533 r10), ADR 0109 §3 step 2: while a re-seat join is
