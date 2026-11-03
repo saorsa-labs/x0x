@@ -5407,6 +5407,35 @@ mod tests {
     }
 
     #[test]
+    fn from_plan_with_backup_carries_the_fresh_backup_or_falls_back() {
+        let plan = RestartPlan {
+            mode: RestartMode::TransactionalHandoff,
+            supervised_exit_code: None,
+            supervision_signal: None,
+            executable: PathBuf::from("/opt/x0x/bin/x0xd"),
+            argv: vec!["x0xd".into()],
+            cwd: PathBuf::from("/opt/x0x"),
+            data_root: PathBuf::from("/var/lib/x0x"),
+            api_addr: "127.0.0.1:12700".parse().unwrap(),
+            launchd_verified: None,
+            systemd_verified: None,
+        };
+        // A real swap (#1106): the record must name this transaction's own
+        // per-swap file so a concurrent swapper on the same executable can
+        // never orphan the helper's rollback bytes.
+        let fresh = Path::new("/opt/x0x/bin/x0xd.backup-1.2.3-4212-99887766554433221100");
+        let handoff = UpgradeHandoff::from_plan_with_backup(&plan, "1.3.0", Some(fresh));
+        assert_eq!(handoff.backup_path, fresh);
+        assert_eq!(handoff.target_path, plan.executable);
+
+        // No swap this transaction (equal-bytes skip): canonical fallback.
+        assert_eq!(
+            UpgradeHandoff::from_plan_with_backup(&plan, "1.3.0", None).backup_path,
+            UpgradeHandoff::backup_path_for(&plan.executable)
+        );
+    }
+
+    #[test]
     fn resolve_health_addr_prefers_recorded_port() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(dir.path().join("api.port"), "127.0.0.1:9999\n").unwrap();

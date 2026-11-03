@@ -1698,12 +1698,10 @@ impl AutoApplyUpgrader {
         // Issue #1106: name this transaction's per-swap backup in the handoff
         // so the helper restores only bytes this transaction preserved. The
         // canonical fallback covers transactions that swapped nothing.
-        let fresh_backup = self.swapped_artifacts.as_deref().and_then(|swapped| {
-            swapped
-                .iter()
-                .find(|(target, _)| target == &plan.executable)
-                .map(|(_, backup)| backup.as_path())
-        });
+        let fresh_backup = fresh_backup_for(
+            self.swapped_artifacts.as_deref().unwrap_or(&[]),
+            &plan.executable,
+        );
         let handoff =
             restart::UpgradeHandoff::from_plan_with_backup(plan, target_version, fresh_backup);
         let handoff_path = plan.handoff_path();
@@ -1871,6 +1869,19 @@ impl AutoApplyUpgrader {
             ),
         }
     }
+}
+
+/// The fresh per-swap backup this transaction's own swap created for
+/// `executable`, if any (#1106). The handoff record must restore only bytes
+/// this transaction preserved: a derived shared name can hold a later
+/// swapper's bytes, and consuming it by rename would take another live
+/// transaction's rollback copy. `None` (an equal-bytes skip swapped nothing)
+/// falls back to the canonical derived name.
+fn fresh_backup_for<'a>(swapped: &'a [(PathBuf, PathBuf)], executable: &Path) -> Option<&'a Path> {
+    swapped
+        .iter()
+        .find(|(target, _)| target == executable)
+        .map(|(_, backup)| backup.as_path())
 }
 
 /// The flush already succeeded, so the daemon is stopped behind the hook.
@@ -2394,6 +2405,29 @@ mod tests {
     #[cfg(unix)]
     background_permit_regression_tests!();
     use super::*;
+
+    /// #1106: the handoff names this transaction's own per-swap backup for
+    /// the daemon target, never the companion CLI's, and a transaction that
+    /// swapped nothing falls back to the canonical derived name.
+    #[test]
+    fn fresh_backup_for_selects_the_plan_executable_or_none() {
+        let daemon = PathBuf::from("/opt/x0x/bin/x0xd");
+        let cli = PathBuf::from("/opt/x0x/bin/x0x");
+        let daemon_backup = PathBuf::from("/opt/x0x/bin/x0xd.backup-1.0.0-7-998877");
+        let cli_backup = PathBuf::from("/opt/x0x/bin/x0x.backup-1.0.0-7-998877");
+        let swapped = vec![(daemon.clone(), daemon_backup.clone()), (cli, cli_backup)];
+
+        assert_eq!(
+            fresh_backup_for(&swapped, &daemon),
+            Some(daemon_backup.as_path()),
+            "the handoff must carry the daemon target's own backup"
+        );
+        assert_eq!(
+            fresh_backup_for(&[], &daemon),
+            None,
+            "no swap this transaction: from_plan_with_backup falls back to the canonical name"
+        );
+    }
     use std::io::Write;
     use tempfile::TempDir;
 

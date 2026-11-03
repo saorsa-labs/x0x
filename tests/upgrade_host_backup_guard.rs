@@ -542,6 +542,88 @@ fn two_processes_different_releases_keep_both_rollback_copies() {
     );
 }
 
+/// #1106, concurrent form of the test above: both workers are alive at the
+/// barrier, so the host lock serialises the two critical sections in either
+/// order. Whichever transaction wins, the first transaction's v1 rollback
+/// copy must survive the other release's swap — on the single fixed
+/// `<target>.backup` name the loser's copy destroyed it.
+#[test]
+fn concurrent_processes_different_releases_keep_a_v1_rollback_copy() {
+    if std::env::var_os(DIFFERENT_RELEASE_WORKER_ENV).is_some() {
+        return;
+    }
+    const V3: &[u8] = b"candidate-binary-bytes-v3";
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let target = root.join("target");
+    write_bytes(&target, ORIGINAL);
+    write_bytes(&root.join("incoming_v2"), CANDIDATE);
+    write_bytes(&root.join("incoming_v3"), V3);
+
+    let mut reaper_v2 = ChildReaper::new();
+    let idx_v2 = reaper_v2.push(spawn_different_release_worker(
+        root,
+        "incoming_v2",
+        "ready_v2",
+        "result_v2",
+        FROM,
+        TO,
+    ));
+    let mut reaper_v3 = ChildReaper::new();
+    let idx_v3 = reaper_v3.push(spawn_different_release_worker(
+        root,
+        "incoming_v3",
+        "ready_v3",
+        "result_v3",
+        FROM,
+        "3.0.0",
+    ));
+    wait_until_exists(
+        &root.join("ready_v2"),
+        &mut reaper_v2,
+        "concurrent ready_v2",
+    );
+    wait_until_exists(
+        &root.join("ready_v3"),
+        &mut reaper_v3,
+        "concurrent ready_v3",
+    );
+    fs::write(root.join("barrier_go"), b"go").unwrap();
+    let kind_v2 = wait_for_result(
+        &root.join("result_v2"),
+        &mut reaper_v2,
+        "concurrent result_v2",
+    );
+    let kind_v3 = wait_for_result(
+        &root.join("result_v3"),
+        &mut reaper_v3,
+        "concurrent result_v3",
+    );
+    reap_success(&mut reaper_v2, idx_v2, "concurrent v2");
+    reap_success(&mut reaper_v3, idx_v3, "concurrent v3");
+
+    // Neither worker can hit the equal-bytes skip: whichever wins the host
+    // lock first, the other sees the winner's bytes on disk, not its own.
+    assert_eq!(kind_v2, "replaced");
+    assert_eq!(kind_v3, "replaced");
+
+    let final_bytes = fs::read(&target).unwrap();
+    assert!(
+        final_bytes == CANDIDATE || final_bytes == V3,
+        "target must hold whichever release won the lock, got {final_bytes:?}"
+    );
+    let preserved: Vec<Vec<u8>> = fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .map(|entry| fs::read(entry.path()).unwrap_or_default())
+        .collect();
+    assert!(
+        preserved.iter().any(|bytes| bytes == ORIGINAL),
+        "the first transaction's v1 rollback copy must survive the concurrent second release's swap"
+    );
+}
+
 /// Parent holds the real host lock: a ready worker must not replace until unlock.
 #[test]
 fn held_host_lock_excludes_ready_worker_until_released() {

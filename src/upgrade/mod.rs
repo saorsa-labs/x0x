@@ -111,10 +111,14 @@ impl Upgrader {
     /// transaction now restores only the file its own swap created, so
     /// concurrent transactions on one executable never collide.
     ///
-    /// The canonical `<file>.backup` name is refreshed as a hard link to the
-    /// per-swap file so path-deriving consumers (an equal-bytes-skip restart,
+    /// The canonical `<file>.backup` name is refreshed to the same bytes as a
+    /// separate copy so path-deriving consumers (an equal-bytes-skip restart,
     /// which has no fresh backup of its own, and operators) keep seeing the
-    /// latest preserved bytes under the documented name.
+    /// latest preserved bytes under the documented name. Never an alias: a
+    /// hard link to the per-swap file would let a post-restore state share
+    /// one inode between the canonical name and the target, so a pre-#1106
+    /// swapper's copy onto the canonical name would truncate the running
+    /// binary (review finding on the first draft).
     pub fn create_backup(&self) -> Result<PathBuf, UpgradeError> {
         let backup_path = per_swap_backup_path(&self.target_path, &self.current_version);
         debug!(backup_path = %backup_path.display(), "Creating backup at: {}", backup_path.display());
@@ -122,6 +126,7 @@ impl Upgrader {
             path: backup_path.clone(),
             source: e,
         })?;
+        refresh_mtime(&backup_path);
         refresh_canonical_backup(&self.target_path, &backup_path);
         Ok(backup_path)
     }
@@ -352,28 +357,41 @@ fn per_swap_backup_path(target: &Path, running_version: &Version) -> PathBuf {
     }
 }
 
-/// Point the canonical `<file>.backup` name at this transaction's per-swap
-/// backup via a hard link (same inode, so a later rename of the per-swap path
-/// onto the target never leaves the canonical name dangling with split
-/// content). Best-effort: the per-swap file is the rollback token; the
-/// canonical name only serves path-deriving consumers. Called under the host
-/// lock, so remove+link cannot interleave with another swapper.
+/// Refresh the canonical `<file>.backup` name to hold this transaction's
+/// preserved bytes as a separate copy. A separate inode is required: an
+/// alias of the per-swap file would let a post-restore rename leave the
+/// canonical name and the target sharing one inode, and `fs::copy` onto the
+/// canonical name (a pre-#1106 swapper, or this fallback) truncates its
+/// destination before writing — emptying the running binary. A separate
+/// copy also survives the per-swap file being renamed onto the target by a
+/// restore. Best-effort: the per-swap file is the rollback token; the
+/// canonical name only serves path-deriving consumers. Called under the
+/// host lock, so remove+copy cannot interleave with another swapper.
 fn refresh_canonical_backup(target: &Path, per_swap: &Path) {
     let canonical = target.with_extension("backup");
     if canonical.exists() || std::fs::symlink_metadata(&canonical).is_ok() {
         let _ = std::fs::remove_file(&canonical);
     }
-    if std::fs::hard_link(per_swap, &canonical).is_err() {
-        // Filesystems without hard links (or cross-device oddities) fall back
-        // to a copy; the canonical name is compatibility, never the rollback
-        // token, so failure is only logged.
-        if let Err(error) = std::fs::copy(per_swap, &canonical) {
+    match std::fs::copy(per_swap, &canonical) {
+        Ok(_) => refresh_mtime(&canonical),
+        Err(error) => {
             warn!(
                 canonical = %canonical.display(),
                 error = %error,
                 "cannot refresh the canonical backup name; the per-swap backup is unaffected"
             );
         }
+    }
+}
+
+/// Reset a freshly written backup's mtime to now. `fs::copy` may preserve
+/// the source's timestamps (macOS `fcopyfile`, Windows `CopyFileExW`), and
+/// the bytes being preserved usually carry an install-date mtime; without
+/// this reset the startup sweep's age gate could reclaim a live
+/// transaction's backup the moment it is written (#1106 review finding).
+fn refresh_mtime(path: &Path) {
+    if let Ok(file) = File::options().write(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
     }
 }
 
@@ -840,12 +858,36 @@ mod tests {
         );
 
         // A restore that consumes the per-swap file by rename leaves the
-        // canonical name holding the same preserved bytes (hard link, same
-        // inode), never dangling and never split from what was restored.
+        // canonical name holding the same preserved bytes: it is an
+        // independent copy, never an alias of the per-swap or target inode,
+        // so it is neither emptied by the restore nor able to alias the
+        // running binary.
         fs::write(&binary_path, b"new content").unwrap();
         upgrader.restore_from_backup(&backup_path).unwrap();
         assert_eq!(fs::read(&binary_path).unwrap(), b"original content");
         assert_eq!(fs::read(&canonical).unwrap(), b"original content");
+    }
+
+    /// #1106 review finding: `fs::copy` may preserve the source binary's
+    /// install-date mtime (macOS `fcopyfile`, Windows `CopyFileExW`), so a
+    /// freshly written backup must have its mtime reset or the startup
+    /// sweep's age gate can reclaim a live transaction's backup immediately.
+    #[test]
+    fn create_backup_resets_mtime_so_a_fresh_backup_is_never_swept() {
+        let dir = TempDir::new().unwrap();
+        let binary_path = create_test_binary(&dir, "test-binary", b"original content");
+        age_file(&binary_path, std::time::Duration::from_secs(7200));
+        let upgrader = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+
+        let backup_path = upgrader.create_backup().unwrap();
+        let canonical = binary_path.with_extension("backup");
+
+        // The production startup sweep's one-hour gate must spare both names.
+        let removed =
+            sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(3600));
+        assert_eq!(removed, 0, "a just-written backup must not look aged");
+        assert!(backup_path.is_file(), "the per-swap backup must survive");
+        assert!(canonical.is_file(), "the canonical backup must survive");
     }
 
     /// #1106 regression: two transactions on one shared executable applying
