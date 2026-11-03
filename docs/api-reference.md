@@ -1924,14 +1924,16 @@ keyless install the head already commits the epoch, but it binds the
 epoch, not the secret value (#1775): the durable keyless mark keeps
 that epoch's first installed secret replaceable — and the group's new
 ciphertext held, also past the #1663 republication — until the
-exclusion's own actor seals a share of it — any secret whose sender
-the record does not name stays replaceable until then. The mark claims
-exactly its own epoch and the head its keyless commit moved; a share of
-a later unpinned epoch is not its actor's key, and a different commit of
-its epoch ends it. A head that commits a later epoch ends the mark of an
-earlier one. A hold also ends when one of its recorded actors seals a
-later epoch's unpinned secret, and a known-empty evicted-removal hold
-ends at any secret of its epoch, committed or not.
+exclusion's own actor seals a share of it. Until then, any secret whose
+sender the record does not name stays replaceable. The mark claims
+exactly its own epoch, and the head that its keyless commit moved or a
+commit chained on it: a sibling commit of the epoch ends the mark, and
+so does a head that commits a later epoch. A share of a later unpinned
+epoch is not the mark's actor key. A hold also ends when one of its
+recorded actors seals a later epoch's unpinned secret. A known-empty
+evicted-removal hold ends at any secret of its epoch, committed or not.
+A hold whose actor list is unknown (a pre-#1771 exclusion file) is
+ended by no secret that a commit does not pin.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`

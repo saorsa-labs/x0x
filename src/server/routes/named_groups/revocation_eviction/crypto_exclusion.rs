@@ -3063,8 +3063,13 @@ async fn install_gss(
             // the keyless mark written ahead of the commit goes — kept,
             // it would keep a committed epoch of this number replaceable.
             if awaiting_share {
-                ng::gss_share_hold::forget_keyless_commit(state, group_key, next_secret_epoch)
-                    .await;
+                ng::gss_share_hold::forget_keyless_commit(
+                    state,
+                    group_key,
+                    next_secret_epoch,
+                    &commit.state_hash,
+                )
+                .await;
             }
             return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::BadSignature);
         }
@@ -3082,7 +3087,13 @@ async fn install_gss(
         // #1775 (claude review round 2): nothing was staged, so the
         // keyless mark goes with it.
         if awaiting_share {
-            ng::gss_share_hold::forget_keyless_commit(state, group_key, next_secret_epoch).await;
+            ng::gss_share_hold::forget_keyless_commit(
+                state,
+                group_key,
+                next_secret_epoch,
+                &commit.state_hash,
+            )
+            .await;
         }
         return ReceiveOutcome::LocalFailure;
     }
@@ -9069,7 +9080,6 @@ mod daemon_tests {
         // waiting for a share that the stale-envelope guard refuses. B's
         // share then reinstalls over the intermediate head, and the held
         // chain replays onto it.
-        let author_hex = hex::encode(admin.as_bytes());
         let parent_info = fx
             .replica
             .named_groups
@@ -9091,6 +9101,7 @@ mod daemon_tests {
             },
         )
         .context("the frame's keyless result")?;
+        let author_hex = hex::encode(admin.as_bytes());
         let mut b_next = f_result.clone();
         b_next.roster_revision = b_next.roster_revision.saturating_add(1);
         b_next.remove_member(&author_hex, Some(b_hex.clone()));
@@ -9167,7 +9178,10 @@ mod daemon_tests {
     /// the walk's own step author's key, not any admin's. B's later
     /// rotation waits held while another admin's share of that epoch is
     /// installed: the frame keeps waiting, because the record does not
-    /// name B.
+    /// name B. This and the positive test vary exactly the quantity the
+    /// guard checks — the rotation's author — so their held shapes
+    /// differ: the rotation's author must stay seated at the walk's
+    /// cursor, which one extra seat cannot give both variants.
     #[tokio::test]
     async fn another_admins_installed_secret_takes_no_held_exit() -> Result<()> {
         use anyhow::Context as _;

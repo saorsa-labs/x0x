@@ -142,11 +142,12 @@ struct KeylessMark {
     secret_epoch: u64,
     /// The lower-case hex actor of the exclusion that installed keyless.
     actor: String,
-    /// The state hash of the head the keyless commit moved. A different
-    /// commit of the same epoch is not this mark's keyless head (claude
-    /// review round 3): the mark counts only while this head is the
-    /// group's, so a crash-stale mark cannot keep another transition's
-    /// committed epoch replaceable for ever.
+    /// The state hash of the head the keyless commit moved. The mark
+    /// counts while that head is the group's, or a retained ancestor of
+    /// it (claude review rounds 3 and 4): a commit chained on the keyless
+    /// head — a rename, a role change, which still commits the epoch —
+    /// keeps the mark, while a sibling commit of the epoch, the shape a
+    /// crash between the durable mark and its head leaves, does not.
     head: String,
 }
 
@@ -359,7 +360,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
         .get(group_key)
         .is_some_and(|mark| {
             info.secret_epoch == mark.secret_epoch
-                && mark.head == info.state_hash
+                && head_reaches(info, &mark.head)
                 && info.shared_secret.is_some()
                 && !sent
                     .as_deref()
@@ -377,6 +378,33 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
                 list.iter()
                     .any(|hold| hold_live(state, group_key, info, hold, sent.as_deref()))
             })
+}
+
+/// #1775 rounds 3 and 4: whether `mark_head` is `info`'s head or one of
+/// its retained ancestors, walked through the `prev_state_hash` links.
+/// A chain that leaves the retained log cannot disprove the mark, so it
+/// keeps it (fail closed); a chain past the mark to a genesis that never
+/// passed through it does not.
+fn head_reaches(info: &x0x::groups::GroupInfo, mark_head: &str) -> bool {
+    let mut cursor = info.state_hash.clone();
+    for _ in 0..=info.commit_log.len() {
+        if cursor == mark_head {
+            return true;
+        }
+        let Some(retained) = info
+            .commit_log
+            .iter()
+            .rev()
+            .find(|retained| retained.commit.state_hash == cursor)
+        else {
+            return true;
+        };
+        match retained.commit.prev_state_hash.as_deref() {
+            Some(prev) => cursor = prev.to_string(),
+            None => return false,
+        }
+    }
+    true
 }
 
 /// #1775 item 4: whether the secret of its local epoch that `info` holds
@@ -399,7 +427,7 @@ pub(super) fn secret_unpinned(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group_key)
             .is_some_and(|mark| {
-                mark.secret_epoch == info.secret_epoch && mark.head == info.state_hash
+                mark.secret_epoch == info.secret_epoch && head_reaches(info, &mark.head)
             })
 }
 
@@ -1038,7 +1066,12 @@ pub(super) async fn note_keyless_commit(
 /// happen after all — its apply refused, or nothing was staged — so the
 /// mark written ahead of it goes. A staged-but-undurable install keeps
 /// it: that head moved in memory.
-pub(super) async fn forget_keyless_commit(state: &AppState, group_key: &str, secret_epoch: u64) {
+pub(super) async fn forget_keyless_commit(
+    state: &AppState,
+    group_key: &str,
+    secret_epoch: u64,
+    head: &str,
+) {
     ensure_loaded(state).await;
     let removed = {
         let mut lot = state
@@ -1047,7 +1080,7 @@ pub(super) async fn forget_keyless_commit(state: &AppState, group_key: &str, sec
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         lot.get(group_key)
-            .is_some_and(|mark| mark.secret_epoch == secret_epoch)
+            .is_some_and(|mark| mark.secret_epoch == secret_epoch && mark.head == head)
             && lot.remove(group_key).is_some()
     };
     if removed {
@@ -1077,7 +1110,7 @@ fn prune_share_sender(state: &AppState, group_key: &str, info: &x0x::groups::Gro
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group_key)
-            .is_some_and(|mark| mark.secret_epoch <= committed && mark.head != info.state_hash)
+            .is_some_and(|mark| mark.secret_epoch <= committed && !head_reaches(info, &mark.head))
     {
         changed |= state
             .gss_share_holds
@@ -1205,7 +1238,9 @@ pub(super) fn replaces_uncommitted_secret(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(group_key)
-                .is_some_and(|mark| mark.secret_epoch == secret_epoch))
+                .is_some_and(|mark| {
+                    mark.secret_epoch == secret_epoch && head_reaches(info, &mark.head)
+                }))
 }
 
 /// The exclusion installed with its secret at `secret_epoch`: its hold,
@@ -1592,18 +1627,59 @@ mod tests {
             &other,
             2
         ));
-        assert!(prune_exclusions(&state, &group_key, &other_head));
-        forget_keyless_commit(&state, &group_key, 2).await;
+        // The rollback helper takes exactly its own mark (round 4,
+        // finding 3: an epoch-and-head match, so a refused frame of
+        // another epoch never eats a live one), and a sibling head's
+        // commit prunes the stale one.
+        forget_keyless_commit(&state, &group_key, 2, &keyless.state_hash).await;
         assert!(
             !super::test_seam::keyless_mark_present(&state, &group_key),
             "the rollback helper takes the mark away"
         );
         note_keyless_commit(&state, &group_key, 2, &actor, &keyless.state_hash).await;
-        assert!(super::test_seam::keyless_mark_present(&state, &group_key));
-        forget_keyless_commit(&state, &group_key, 2).await;
+        forget_keyless_commit(&state, &group_key, 2, "a-refused-frames-head").await;
+        assert!(
+            super::test_seam::keyless_mark_present(&state, &group_key),
+            "a refused frame's rollback touches only its own head's mark"
+        );
+        assert!(prune_exclusions(&state, &group_key, &other_head));
         assert!(
             !super::test_seam::keyless_mark_present(&state, &group_key),
-            "and again"
+            "a sibling head's commit prunes the stale mark"
+        );
+
+        // #1775 round 4: a commit chained on the keyless head — a rename,
+        // which still commits the epoch — keeps the mark: the withholding
+        // under the foreign secret must not lapse.
+        note_keyless_commit(&state, &group_key, 2, &actor, &keyless.state_hash).await;
+        let mut renamed = keyless.clone();
+        renamed.shared_secret = Some(foreign.to_vec());
+        let renamed_hash = format!("renamed-{}", keyless.state_hash);
+        renamed
+            .commit_log
+            .push(x0x::groups::state_commit::RetainedCommit {
+                commit: x0x::groups::state_commit::GroupStateCommit {
+                    group_id: renamed.stable_group_id().to_string(),
+                    revision: 2,
+                    prev_state_hash: Some(keyless.state_hash.clone()),
+                    roster_root: String::new(),
+                    policy_hash: String::new(),
+                    public_meta_hash: String::new(),
+                    security_binding: Some("gss:epoch=2".to_string()),
+                    state_hash: renamed_hash.clone(),
+                    withdrawn: false,
+                    committed_by: String::new(),
+                    committed_at: 0,
+                    signer_public_key: String::new(),
+                    signature: String::new(),
+                },
+                roster: std::collections::BTreeMap::new(),
+                meta: None,
+            });
+        renamed.state_hash = renamed_hash;
+        assert!(
+            withholds(&state, &group_key, &renamed),
+            "a commit on the keyless head keeps the mark: the foreign secret still withholds"
         );
     }
 
@@ -1737,6 +1813,11 @@ mod tests {
             !withholds(&state, &group_key, &settled),
             "an evicted removal's hold ends at a committed secret of its epoch"
         );
+        assert_eq!(
+            super::test_seam::held_exclusions(&state, &group_key),
+            1,
+            "the file loaded its hold"
+        );
     }
 
     /// #1775, the load-side merge: a hold file that two exclusions of one
@@ -1767,6 +1848,11 @@ mod tests {
         assert!(
             !withholds(&state, &group_key, &info),
             "the second actor's own uncommitted key ends its merged wait"
+        );
+        assert_eq!(
+            super::test_seam::held_exclusions(&state, &group_key),
+            1,
+            "the file loaded and merged to one hold"
         );
     }
 
