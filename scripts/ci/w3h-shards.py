@@ -5,9 +5,12 @@ Each shard runs its cases with the same `--stress-count 20` gate profile.
 The summary job merges the trace directories and runs `w3h-trace-check.py`.
 A case name matches exactly one shard. A new `w3h_1356_` or `w3h_1357_`
 case joins the S3 or S4 shard. Any other new `w3h_` case joins `rest`.
-The four ADR 0109 owner-axis rows (H-S3-c, H-S3-c2, H-S3-c3, H-S3-d8)
-each have their own shard: one rerun of each row is the longest S3 case,
-and 20 reruns of them in one job do not fit the S3 test deadline.
+The five ADR 0109 owner-axis rows (H-S3-c, H-S3-c2, H-S3-c3, H-S3-d8,
+H-S3-d3) each have their own shard: one rerun of each row is the longest
+S3 case, and 20 reruns of them in one job do not fit the S3 test deadline.
+One rerun of H-S3-d3 takes about 16 min on a runner, so its 20 reruns
+are split across parallel parts (`PARTS`): matrix entries `s3-d3.1` to
+`s3-d3.4`, 5 reruns each. The summary job still counts 20 receipts.
 
 The S3 shard is omitted when the tree has no `w3h_1356_` test, so `main`
 does not spend a runner on an empty filter. Adding those tests makes the
@@ -31,10 +34,60 @@ GROUPS = (
     ('s3-c2', 'w3h_1356_red_s3_c2_reseat_retires_marker_and_gap$'),
     ('s3-c3', 'w3h_1356_control_s3_c3_owner_reseats_owner_axis_node$'),
     ('s3-d8', 'w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node$'),
+    ('s3-d3', 'w3h_1356_control_s3_d3_authorisation_refusals_typed$'),
     ('s3', 'w3h_1356_'),
 )
 
+# The gate's reruns per case (D196). A group in `PARTS` runs them as that
+# many parallel matrix entries `<group>.<k>`, each with its share of RUNS.
+RUNS = 20
+# H-S3-d3 (#1572): one rerun is 940-1000 s on a 4-vCPU runner (job
+# 125609571831), so 20 reruns (about 320 min) do not fit the 155-min S3
+# test deadline or the 360-min hosted job limit. 4 parts of 5 reruns take
+# about 85 min each.
+PARTS = {'s3-d3': 4}
+
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def split_part(entry):
+    """`(group, part, parts)` for a matrix entry: `s3-d3.2` is part 2 of
+    `PARTS['s3-d3']`; a group with no parts is part 1 of 1."""
+    group, dot, part = entry.partition('.')
+    parts = PARTS.get(group, 1)
+    if not dot:
+        if parts != 1:
+            raise SystemExit(f'W3-H shard {group!r} runs as parts {group}.1..{parts}')
+        return group, 1, 1
+    if not part.isdigit() or not 1 <= int(part) <= parts or parts == 1:
+        raise SystemExit(f'unknown W3-H shard part {entry!r}')
+    return group, int(part), parts
+
+
+def stress_count(entry):
+    """Reruns for one matrix entry. The parts of a group add up to RUNS."""
+    _group, part, parts = split_part(entry)
+    return RUNS // parts + (1 if part <= RUNS % parts else 0)
+
+
+def tag_traces(entry, directory):
+    """Rename `<case>-<pid>.<ext>` to `<case>-p<k>_<pid>.<ext>` for part k,
+    so traces of the same case from parallel parts cannot share a name
+    when the summary job merges them (a runner can reuse a pid). The
+    trace check reads the case as the text before the last `-`. Returns
+    the number of files renamed; a group with no parts renames none."""
+    _group, part, parts = split_part(entry)
+    if parts == 1:
+        return 0
+    renamed = 0
+    for path in sorted(Path(directory).iterdir()):
+        stem, dot, ext = path.name.partition('.')
+        case, dash, pid = stem.rpartition('-')
+        if not (path.is_file() and dot and dash and case and pid.isdigit()):
+            continue
+        path.rename(path.with_name(f'{case}-p{part}_{pid}.{ext}'))
+        renamed += 1
+    return renamed
 
 
 def group_of(name):
@@ -52,6 +105,8 @@ def filter_expr(group):
     `test(/(^|::)w3h_/)`. A group excludes the patterns of the groups
     before it, and `rest` excludes all of them, so a case cannot run twice.
     """
+    if '.' in group:
+        group = split_part(group)[0]
     names = [name for name, _pattern in GROUPS]
     if group == 'rest':
         earlier = GROUPS
@@ -105,12 +160,17 @@ def assign(names):
 
 
 def matrix(names):
-    """GitHub Actions matrix. Group order follows GROUPS, then `rest`."""
+    """GitHub Actions matrix. Group order follows GROUPS, then `rest`; a
+    group in PARTS is listed as its parts."""
     assigned = assign(names)
     order = [group for group, _pattern in GROUPS if group in assigned]
     if 'rest' in assigned:
         order.append('rest')
-    return {'group': order}
+    entries = []
+    for group in order:
+        parts = PARTS.get(group, 1)
+        entries += [group] if parts == 1 else [f'{group}.{k}' for k in range(1, parts + 1)]
+    return {'group': entries}
 
 
 def main(argv=None):
@@ -121,12 +181,23 @@ def main(argv=None):
                         help='print the nextest filterset for GROUP')
     parser.add_argument('--list', metavar='GROUP',
                         help='print case names for GROUP, one per line')
+    parser.add_argument('--stress', metavar='GROUP',
+                        help='print the --stress-count for GROUP (a matrix entry)')
+    parser.add_argument('--tag-traces', nargs=2, metavar=('GROUP', 'DIR'),
+                        help='rename the trace files in DIR for part GROUP')
     parser.add_argument('--root', type=Path, default=ROOT,
                         help='repository root (default: this repo)')
     args = parser.parse_args(argv)
     names = discover(args.root)
     if args.matrix:
         print(json.dumps(matrix(names), separators=(',', ':')))
+        return 0
+    if args.stress:
+        print(stress_count(args.stress))
+        return 0
+    if args.tag_traces:
+        entry, directory = args.tag_traces
+        print(f'W3-H shard {entry}: renamed {tag_traces(entry, directory)} trace files')
         return 0
     if args.filter:
         # Validate the group exists in this tree when it is a named shard
@@ -135,12 +206,13 @@ def main(argv=None):
         print(filter_expr(args.filter))
         return 0
     if args.list:
-        cases = assign(names).get(args.list, [])
+        group = split_part(args.list)[0] if '.' in args.list else args.list
+        cases = assign(names).get(group, [])
         if not cases:
             raise SystemExit(f'W3-H shard {args.list!r} has no cases')
         print('\n'.join(cases))
         return 0
-    parser.error('pass --matrix, --filter GROUP, or --list GROUP')
+    parser.error('pass --matrix, --filter, --list, --stress or --tag-traces')
     return 2
 
 
