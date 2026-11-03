@@ -356,9 +356,10 @@ except citations explicitly marked as resolving at
   own doc comment (`:5827-5830`) states the intent. #1766/#1771 added a third conjunct —
   the equal-epoch arm refuses only when the share may not replace the installed
   uncommitted secret (`!gss_share_hold::replaces_uncommitted_secret`) — and #1775 widened
-  that replace to a secret no verified commit pins, a waiting parked removal, and a
-  keyless commit's mark. The strict `<` clear and the equal-epoch refuse survive both
-  changes. F1 does not change the guard — it is cited at the baseline, and its comment
+  that replace to a secret no verified commit pins and a keyless commit's mark. (The
+  parked-removal replace half that #1775 also added stays dormant until a fenced
+  `gss_removal_waits_for_share` change lands, per that PR.) The strict `<` clear and
+  the equal-epoch refuse survive both changes. F1 does not change the guard — it is cited at the baseline, and its comment
   names only a *prior
   `MemberBanned` commit*, because remove had no GSS rotation to produce the same ordering
   when it was written. Tightening that predicate to

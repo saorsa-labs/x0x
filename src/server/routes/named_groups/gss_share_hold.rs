@@ -131,7 +131,9 @@ fn secret_tag(secret: &[u8]) -> String {
 /// keeps that epoch's installed secret replaceable — and its group's new
 /// ciphertext held — until the exclusion's own actor seals a share of it
 /// ([`note_share_sender`]), or a head commits a later epoch
-/// ([`prune_share_sender`]). It is durable, and the #1663 key
+/// ([`prune_share_sender`]). The mark claims exactly its own epoch: a
+/// share of a later unpinned epoch is not its waiting actor's key, and
+/// no hold of the later epoch exists to claim it. It is durable, and the #1663 key
 /// republication keeps it: that release ends the hold of a secretless
 /// survivor, but the first admin's share that reaches its re-keyed seat
 /// is still not the actor's key.
@@ -587,7 +589,10 @@ fn absorb(state: &AppState, file: HoldFile) {
             // removal's containment — actorless by design, not unknown —
             // so it keeps the old rule; a crypto-only exclusion's hold
             // from a pre-#1771 file has no removed members and unknown
-            // actors.
+            // actors. #1775 review round 2: a pre-#1771 file that merged
+            // an evicted removal into an exclusion hold of the same
+            // parent and epoch reads the same way — the `removed` gate
+            // bounds that exposure to that one shape.
             if hold.actors.is_none() && !hold.removed.is_empty() {
                 hold.actors = Some(Vec::new());
             }
@@ -790,7 +795,11 @@ fn push_exclusion(state: &AppState, group_key: &str, hold: ExclusionHold) -> boo
 /// Add `members` to `hold`'s removed members, once each.
 fn merge_removed(hold: &mut ExclusionHold, members: Vec<String>) {
     for member in members {
-        if !hold.removed.contains(&member) {
+        if !hold
+            .removed
+            .iter()
+            .any(|kept| kept.eq_ignore_ascii_case(&member))
+        {
             hold.removed.push(member);
         }
     }
@@ -1010,6 +1019,27 @@ pub(super) async fn note_keyless_commit(
         lot.insert(group_key.to_string(), mark.clone()) != Some(mark)
     };
     if changed {
+        persist_logged(state, group_key).await;
+    }
+}
+
+/// #1775 item 4 (claude review round 2): the keyless commit did not
+/// happen after all — its apply refused, or nothing was staged — so the
+/// mark written ahead of it goes. A staged-but-undurable install keeps
+/// it: that head moved in memory.
+pub(super) async fn forget_keyless_commit(state: &AppState, group_key: &str, secret_epoch: u64) {
+    ensure_loaded(state).await;
+    let removed = {
+        let mut lot = state
+            .gss_share_holds
+            .keyless
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lot.get(group_key)
+            .is_some_and(|mark| mark.secret_epoch == secret_epoch)
+            && lot.remove(group_key).is_some()
+    };
+    if removed {
         persist_logged(state, group_key).await;
     }
 }
@@ -1633,6 +1663,10 @@ mod tests {
         info.secret_epoch = 2;
         info.shared_secret = Some(foreign.to_vec());
         note_share_sender(&state, &group_key, &parent, 2, &other, &foreign).await;
+        assert!(
+            !withholds(&state, &group_key, &info),
+            "the old rule: an actorless containment ends at any secret of its epoch, committed or not"
+        );
         let settled = gss_info_at_head(2, Some(foreign));
         assert!(
             !withholds(&state, &group_key, &settled),

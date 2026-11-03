@@ -1924,8 +1924,11 @@ keyless install the head already commits the epoch, but it binds the
 epoch, not the secret value (#1775): the durable keyless mark keeps
 that epoch's first installed secret replaceable — and the group's new
 ciphertext held, also past the #1663 republication — until the
-exclusion's own actor seals a share of it. A head that commits a later
-epoch ends the mark of an earlier one.
+exclusion's own actor seals a share of it — any secret whose sender
+the record does not name stays replaceable until then. The mark claims
+exactly its own epoch; a share of a later unpinned epoch is not its
+actor's key. A head that commits a later epoch ends the mark of an
+earlier one.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`

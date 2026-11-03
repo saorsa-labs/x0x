@@ -2210,6 +2210,26 @@ fn open_parked_share(state: &AppState, share: &ParkedShare) -> Option<(u64, [u8;
     Some((*secret_epoch, secret))
 }
 
+/// Test builds only: park a held event for [`promoted_admin_secret`]'s
+/// walk (#1775 item 2).
+#[cfg(test)]
+pub(super) async fn seed_held_event_for_test(
+    state: &AppState,
+    stable_group_id: &str,
+    event: super::super::NamedGroupMetadataEvent,
+    author: AgentId,
+    prev_state_hash: Option<String>,
+) {
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    inner.orc.held_events.push(HeldEvent {
+        stable_group_id: stable_group_id.to_string(),
+        event,
+        author,
+        prev_state_hash,
+        at: Instant::now(),
+    });
+}
+
 /// What [`promoted_admin_secret`] found for a waiting GSS transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum LaterAdminKey {
@@ -2398,26 +2418,6 @@ pub(in crate::server) async fn promoted_admin_secret(
 /// admin's removal or ban with or without a rotation, a member's own
 /// leave, and the request-based admission steps (a request, its approval,
 /// rejection or cancellation).
-/// Test builds only: park a held event for [`promoted_admin_secret`]'s
-/// walk (#1775 item 2).
-#[cfg(test)]
-pub(super) async fn seed_held_event_for_test(
-    state: &AppState,
-    stable_group_id: &str,
-    event: super::super::NamedGroupMetadataEvent,
-    author: AgentId,
-    prev_state_hash: Option<String>,
-) {
-    let mut inner = state.revocation_evictions.inner.lock().await;
-    inner.orc.held_events.push(HeldEvent {
-        stable_group_id: stable_group_id.to_string(),
-        event,
-        author,
-        prev_state_hash,
-        at: Instant::now(),
-    });
-}
-
 fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
     use super::super::NamedGroupMetadataEvent as Event;
     let commit = super::super::named_group_metadata_event_commit(&held.event)?;
