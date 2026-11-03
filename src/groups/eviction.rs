@@ -1261,6 +1261,8 @@ struct IntakeInner {
     /// Record hashes from a live route whose revocation-store write has
     /// not succeeded yet (#1765). A startup-loaded record is never here.
     not_durable: BTreeSet<[u8; 32]>,
+    /// A task retries a failed revocation-store write for S4 (#1765).
+    persist_retrying: bool,
 }
 
 /// The queue between the revocation choke point in `lib.rs` and the S4
@@ -1339,13 +1341,13 @@ impl RevocationIntake {
     /// succeeded yet. Take this before the store snapshot is encoded:
     /// every hash in it is then in the snapshot (#1765).
     #[must_use]
-    pub fn not_durable_hashes(&self) -> BTreeSet<[u8; 32]> {
+    pub(crate) fn not_durable_hashes(&self) -> BTreeSet<[u8; 32]> {
         self.lock().not_durable.clone()
     }
 
     /// The revocation-store write that held `hashes` succeeded: they are
     /// durable now. The worker wakes, so a row held for them re-evaluates.
-    pub fn note_durable(&self, hashes: &BTreeSet<[u8; 32]>) {
+    pub(crate) fn note_durable(&self, hashes: &BTreeSet<[u8; 32]>) {
         if hashes.is_empty() {
             return;
         }
@@ -1359,14 +1361,32 @@ impl RevocationIntake {
     /// (ADR 0110 "Memory-only durability"). A record that a live route
     /// verified stays not durable until its store write succeeds.
     #[must_use]
-    pub fn all_durable(&self, hashes: &BTreeSet<[u8; 32]>) -> bool {
+    pub(crate) fn all_durable(&self, hashes: &BTreeSet<[u8; 32]>) -> bool {
         self.lock().not_durable.is_disjoint(hashes)
     }
 
-    /// Whether any live-route record still waits for its store write.
+    /// Become the one task that retries a failed revocation-store write.
+    /// `false` when a task already retries: it reads the pending hashes
+    /// again on each attempt, so it also writes the caller's records.
     #[must_use]
-    pub fn has_not_durable(&self) -> bool {
-        !self.lock().not_durable.is_empty()
+    pub(crate) fn claim_persist_retry(&self) -> bool {
+        let mut inner = self.lock();
+        if inner.persist_retrying {
+            return false;
+        }
+        inner.persist_retrying = true;
+        true
+    }
+
+    /// The retry task stops. A write that fails after this starts a new one.
+    pub(crate) fn release_persist_retry(&self) {
+        self.lock().persist_retrying = false;
+    }
+
+    /// Whether a retry task holds the claim.
+    #[cfg(test)]
+    pub(crate) fn persist_retrying_for_testing(&self) -> bool {
+        self.lock().persist_retrying
     }
 
     /// Take every queued item and the reconcile flag.

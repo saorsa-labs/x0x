@@ -6848,48 +6848,96 @@ const S4_PERSIST_RETRY_MIN: std::time::Duration = std::time::Duration::from_mill
 /// Largest delay between those retries.
 const S4_PERSIST_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The live-route record hashes that a snapshot of `set` holds. Each
+/// live route notes a record under the set's write guard, after the
+/// insert. A pending hash that is not in the set has left it (the TTL
+/// sweep) before any write held it, so its evidence is not on disk.
+fn s4_pending_in_set(
+    set: &revocation::RevocationSet,
+    s4_intake: &groups::eviction::RevocationIntake,
+) -> std::collections::BTreeSet<[u8; 32]> {
+    let mut pending = s4_intake.not_durable_hashes();
+    pending.retain(|hash| set.contains_hash(hash));
+    pending
+}
+
 /// Write the v1 revocation store, which holds every Agent subject, and
 /// tell S4 which live-route records are durable now (ADR 0110 §5,
-/// "Memory-only durability"; #1765). The pending hashes are read before
-/// the snapshot, so each of them is in the bytes written.
+/// "Memory-only durability"; #1765). The pending hashes and the bytes
+/// come from one read of the set, and only a hash in those bytes becomes
+/// durable. A record that left the set before a write held it stays not
+/// durable, and its row keeps `waiting_for_durable_intake`.
 async fn persist_s4_revocations(
     revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
     s4_intake: &groups::eviction::RevocationIntake,
     identity_dir: Option<&std::path::Path>,
 ) -> error::Result<()> {
-    let pending = s4_intake.not_durable_hashes();
-    let bytes = revocation_set.read().await.to_bytes()?;
+    let (written, bytes) = {
+        let set = revocation_set.read().await;
+        (s4_pending_in_set(&set, s4_intake), set.to_bytes()?)
+    };
     storage::save_revocation_set_bytes(bytes, identity_dir).await?;
-    s4_intake.note_durable(&pending);
+    s4_intake.note_durable(&written);
     Ok(())
+}
+
+/// Whether a record that a store write can still make durable waits for it.
+async fn s4_store_write_pending(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    s4_intake: &groups::eviction::RevocationIntake,
+) -> bool {
+    !s4_pending_in_set(&*revocation_set.read().await, s4_intake).is_empty()
 }
 
 /// [`persist_s4_revocations`] off the receive path. A failed write is
 /// logged and retried with backoff while S4 still waits for a record, so
 /// the row shows `waiting_for_durable_intake` until a write succeeds. A
 /// blocked store logs through its own rate limit and is not retried here.
+/// One task per node retries; a second failed write leaves its records to
+/// that task, which reads the pending hashes again on each attempt.
 fn spawn_persist_s4_revocations(
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
     s4_intake: groups::eviction::RevocationIntake,
     identity_dir: Option<std::path::PathBuf>,
 ) {
     tokio::spawn(async move {
+        let dir = identity_dir.as_deref();
+        match persist_s4_revocations(&revocation_set, &s4_intake, dir).await {
+            Ok(()) => return,
+            Err(e) if storage::revocation_persistence_is_blocked(&e) => return,
+            Err(e) => tracing::warn!(
+                "failed to persist revocation set (S4 waiting_for_durable_intake): {e}"
+            ),
+        }
+        if !s4_intake.claim_persist_retry() {
+            return;
+        }
         let mut delay = S4_PERSIST_RETRY_MIN;
         loop {
-            match persist_s4_revocations(&revocation_set, &s4_intake, identity_dir.as_deref()).await
-            {
-                Ok(()) => return,
-                Err(e) if storage::revocation_persistence_is_blocked(&e) => return,
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(S4_PERSIST_RETRY_MAX);
+            match persist_s4_revocations(&revocation_set, &s4_intake, dir).await {
+                Ok(()) => {}
+                Err(e) if storage::revocation_persistence_is_blocked(&e) => {
+                    s4_intake.release_persist_retry();
+                    return;
+                }
                 Err(e) => tracing::warn!(
                     retry = ?delay,
                     "failed to persist revocation set (S4 waiting_for_durable_intake): {e}"
                 ),
             }
-            if !s4_intake.has_not_durable() {
+            if s4_store_write_pending(&revocation_set, &s4_intake).await {
+                continue;
+            }
+            s4_intake.release_persist_retry();
+            // A write that failed before the release left its records to
+            // this task: take them back unless a new task has them.
+            if !s4_store_write_pending(&revocation_set, &s4_intake).await
+                || !s4_intake.claim_persist_retry()
+            {
                 return;
             }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(S4_PERSIST_RETRY_MAX);
         }
     });
 }
@@ -37531,6 +37579,150 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// A self-revocation of a fresh agent, `revoked_at` seconds after 1970.
+    fn s4_self_revocation(revoked_at: u64) -> revocation::RevocationRecord {
+        let kp = identity::AgentKeypair::generate().expect("keypair");
+        revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Agent(kp.agent_id()),
+            kp.public_key(),
+            kp.secret_key(),
+            revoked_at,
+            None,
+        )
+        .expect("sign")
+    }
+
+    /// #1765 review finding 1: a live record that the TTL sweep takes from
+    /// the set before any write held it is not in the bytes of a later
+    /// write. It stays not durable, and no retry waits for it.
+    #[tokio::test]
+    async fn a_swept_revocation_is_not_durable_after_a_later_store_write() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let intake = groups::eviction::RevocationIntake::new();
+        let record = s4_self_revocation(1);
+        {
+            let mut guard = set.write().await;
+            assert!(guard
+                .verify_and_insert(record.clone(), None)
+                .expect("insert"));
+            intake.note_verified(&record);
+            let swept =
+                guard.expire_records_older_than(90 * 24 * 3600, Agent::unix_timestamp_secs());
+            assert_eq!(swept, 1);
+        }
+        persist_s4_revocations(&set, &intake, Some(dir.path()))
+            .await
+            .expect("store write");
+        let written = std::fs::read(dir.path().join("revocations.bin")).expect("store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(!on_disk.contains_hash(&record.record_hash()));
+        let hashes = std::collections::BTreeSet::from([record.record_hash()]);
+        assert!(
+            !intake.all_durable(&hashes),
+            "a record that no write held must not release a memory-only seal"
+        );
+        assert!(!s4_store_write_pending(&set, &intake).await);
+    }
+
+    /// #1765 review finding 4: the v2 route writes an Agent subject to the
+    /// v1 store, and S4 then reads the record as durable.
+    #[tokio::test]
+    async fn a_v2_agent_revocation_writes_the_v1_store_for_s4() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new()));
+        let intake = groups::eviction::RevocationIntake::new();
+        let owner_trust = owner_trust::OwnerTrust::new(
+            None,
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                dm_inbox::AuthenticatedMachineBindingCache::default(),
+            )),
+        );
+        let record = s4_self_revocation(Agent::unix_timestamp_secs());
+        let hashes = std::collections::BTreeSet::from([record.record_hash()]);
+        apply_v2_revocation_records(
+            vec![record.clone()],
+            std::collections::HashMap::new(),
+            &set,
+            &intake,
+            Some(dir.path().to_path_buf()),
+            &owner_trust,
+        )
+        .await;
+        assert!(set.read().await.contains_hash(&record.record_hash()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !intake.all_durable(&hashes) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the v1 store write did not happen"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let written = std::fs::read(dir.path().join("revocations.bin")).expect("v1 store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(on_disk.contains_hash(&record.record_hash()));
+    }
+
+    /// #1765 review findings 3 and 4: two failed writes start one retry
+    /// task. It writes after the fault clears, then stops.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_task_retries_a_failed_s4_store_write_until_it_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let id_dir = dir.path().join("identity");
+        std::fs::create_dir(&id_dir).expect("identity dir");
+        std::fs::set_permissions(&id_dir, std::fs::Permissions::from_mode(0o500)).expect("0500");
+        if std::fs::write(id_dir.join("probe"), b"x").is_ok() {
+            // Root ignores the mode: this host cannot make the fault.
+            return;
+        }
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new()));
+        let intake = groups::eviction::RevocationIntake::new();
+        let (first, second) = (
+            s4_self_revocation(Agent::unix_timestamp_secs()),
+            s4_self_revocation(Agent::unix_timestamp_secs()),
+        );
+        for record in [&first, &second] {
+            assert!(set
+                .write()
+                .await
+                .verify_and_insert(record.clone(), None)
+                .expect("insert"));
+            intake.note_verified(record);
+            spawn_persist_s4_revocations(
+                std::sync::Arc::clone(&set),
+                intake.clone(),
+                Some(id_dir.clone()),
+            );
+        }
+        let hashes = std::collections::BTreeSet::from([first.record_hash(), second.record_hash()]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !intake.persist_retrying_for_testing() {
+            assert!(std::time::Instant::now() < deadline, "no retry task");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!intake.all_durable(&hashes));
+        assert!(
+            !intake.claim_persist_retry(),
+            "the second failed write leaves its records to the first task"
+        );
+        std::fs::set_permissions(&id_dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !intake.all_durable(&hashes) || intake.persist_retrying_for_testing() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry task did not write and stop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let written = std::fs::read(id_dir.join("revocations.bin")).expect("v1 store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(on_disk.contains_hash(&first.record_hash()));
+        assert!(on_disk.contains_hash(&second.record_hash()));
     }
 
     /// #1116: a known issuer certificate and a pending fetch for another
