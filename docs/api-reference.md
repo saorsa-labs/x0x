@@ -22,9 +22,20 @@ for its whole uptime past a 120 s bootstrap grace (issue #262 — the wedged
 transport signal; `ok` stays `true` because the process itself is alive). A
 degraded response carries a `degraded_reason` string. A connected peer is
 also `degraded` when one direction on that same peer is at least 60 s old
-and the other direction is at most 10 s old (issue #1419). Those ages are
-application-data ages. A quiet peer, with both directions idle, is not
-degraded. `GET /status` uses the same stored set and the same rule.
+and the other direction is at most 10 s old, or when both directions on
+that peer are at least 60 s old while another peer still has traffic and a
+bounded liveness probe fails (issue #1419). Those ages are
+application-data ages. A quiet peer, with both directions idle, answers
+the probe and is not degraded. A probe the endpoint could not run, for a
+busy endpoint or a peer without probe support, is not a failure. A peer
+is first probed only while another peer has traffic; a peer already
+confirmed broken is probed again after its 60 s window even when nothing
+else flows, and it stays `degraded` until its link carries traffic again
+or that window ends. A successful re-dial removes the peer from the set
+at once. Two limits, stated plainly: a silent connected peer that
+ignores probes can hold `degraded` for one 60 s window per handshake,
+and while a probe is due the refresher tick can spend up to 4 s on it,
+so the stored set can be a few seconds old. `GET /status` uses the same stored set and the same rule.
 `GET /peers` sets `link` to `degraded` for each peer in that set. Fleet
 deployments under a supervisor can additionally set `zero_peer_restart_secs = <secs>` in the
 daemon TOML to make the process exit (for `Restart=always` self-heal) after
@@ -307,7 +318,8 @@ version bump.
   (`network_id = ""` in the TOML) degrades: plane isolation is off.
 - `peers` — the #262/#1419 classification behind `status`: zero peers past
   the 120 s grace, send-ready-less outer peers, or a one-sided link
-  degrade.
+  degrade. The both-directions-idle rule also needs a failed liveness
+  probe while another peer has traffic.
 - `seed_reachable` — `connected` of `configured` bootstrap seeds,
   measured from the connections the node actually holds (x0x joins via
   `connect_addr`, so ant-quic's own bootstrap counter never sees the join).
@@ -430,8 +442,12 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 `status` is `connected` when a send-ready peer exists. It is `degraded` when
 `GET /health` would be degraded. That includes a one-sided link: one
 direction on that peer is at least 60 s old and the other direction is at
-most 10 s old. The reason is appended to `warnings`. A quiet peer, with both
-directions idle, is not degraded. `GET /health`, `GET /status`, and
+most 10 s old, or both directions are at least 60 s old while another peer
+has traffic and the liveness probe fails. The reason is appended to
+`warnings`. A quiet peer, with both directions idle, answers the probe and
+is not degraded. A confirmed peer stays `degraded` until its link carries
+traffic again or the verdict window ends; a successful re-dial removes
+the peer from the set at once. `GET /health`, `GET /status`, and
 `GET /peers` read the one-sided set the health refresher stored.
 
 `revocation_resync_required` is false on a healthy node. It is true when a
@@ -1177,7 +1193,7 @@ or an illegal placement; `501` ceremony disabled.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/peers` | `x0x peers` | Connected gossip peers. Each peer has `id` and `link` (`healthy`, or `degraded` when that peer is in the health refresher's stored one-sided set, #1419). One direction on that peer is at least 60 s old and the other is at most 10 s old. A quiet peer stays `healthy`. |
+| GET | `/peers` | `x0x peers` | Connected gossip peers. Each peer has `id` and `link` (`healthy`, or `degraded` when that peer is in the health refresher's stored one-sided set, #1419). One direction on that peer is at least 60 s old and the other is at most 10 s old, or both directions are at least 60 s old while another peer has traffic and the liveness probe fails. A quiet peer answers the probe and stays `healthy`; a confirmed peer stays `degraded` until it recovers. |
 | GET | `/presence` | `x0x presence` | Presence view of online agents |
 | GET | `/presence/online` | `x0x presence online` | Online agents (network-view trust filter) |
 | GET | `/presence/foaf` | `x0x presence foaf` | Friends-of-friends discovery walk (`?ttl=<hops>`, default 3; social-view trust filter) |
@@ -1818,7 +1834,7 @@ every wait. A wait always names its cause; it does not stop silently.
 | Group sends, invites, member adds, seals, `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "waiting_for_eligible_admin_revocation", "reason": ..., "state", "revoked_admins", "exit": "owner_recovery" \| "group_admin_revoked", "group_id"}`. No eligible admin remains, so no new message, admission or key can reach a revoked admin key. |
 | Same routes | `410 Gone` | `{"ok": false, "error": "group_admin_revoked", "reason": ..., "state", "revoked_admins", "exit", "recreate_offer", "group_id"}`. A group without `OwnerCertified` admission whose admins are all revoked. This is final for the group. |
 | `POST /groups/:id/secure/encrypt` (GSS plane) | `424 Failed Dependency` | `{"ok": false, "error": "no shared secret available — await welcome or ask admin to re-share"}`. The caller is an active member that holds no group secret and no verified-removal hold: an encrypted-group joiner still waiting for its welcome share. The keyless survivor of the 409 row below is not this state — its hold is what separates the two answers.
-| `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold lasts until the seat is keyed again — a sealed share of the held epoch (or a later one) installs, or the key republication of #1663 seats the seat's KEM key again. It has no timer of its own. |
+| `POST /groups/:id/secure/encrypt` | `409 Conflict` | `{"ok": false, "error": "a verified removal waits for its new group secret; ciphertext is withheld"}`. The local node verified a GSS removal or exclusion, but it holds no secret of the rotated epoch: it still waits for its sealed share (#1508), or it installed the exclusion keyless (#1578, below). The hold lasts until the seat is keyed again — a sealed share of the held epoch (or a later one) installs, or the key republication of #1663 seats the seat's KEM key again while the node holds no secret. It has no timer of its own. Between that republication and the share install the endpoint answers the no-secret `424` of the row above: the node still holds no secret to encrypt under. |
 
 The same hold refuses group ciphertext on the paths that make no HTTP
 response of their own, and each refusal carries the same reason text: a
@@ -1844,21 +1860,63 @@ superseded intermediate head included — serves the field exactly as
 before); and the author's removal obligation stays open — a keyless
 install never proves delivery. The state ends when the seat is keyed
 again. One exit: the seat leaves and re-joins with a verified KEM
-binding — no wire event today seats a KEM key on an already-Active
-seat — and a holder then seals the current secret to it and the sealed
-share installs; the S4 delivery's own re-seal (its author resends each
-round until the seat can take the share) or the next rotation do this
-on their own, and `POST /groups/:id/secure/reseal` only builds the
+binding — and a holder then seals the current secret to it and the
+sealed share installs; the S4 delivery's own re-seal (its author resends
+each round until the seat can take the share) or the next rotation do
+this on their own, and `POST /groups/:id/secure/reseal` only builds the
 envelope, which must still be delivered and installed. The second exit
-is the key republication planned in #1663 (David's 28 Oct 02:25 GMT
-ruling): it seats the seat's KEM key again without a leave and
-re-join, and the re-sealed share then ends the hold. Until one of the
-two keys the seat again, the hold lasts: an installed share of the
-held epoch, or a later one, or the #1663 republication, ends it.
+is the key republication of #1663 (David's 28 Oct 02:25 GMT ruling):
+the member signs its live ML-KEM-768 public key — the key its daemon
+can open sealed shares under — in the domain
+`x0x.member-key-republish.v1` and sends the typed `X0XKR1` frame to
+its group peers; each peer that verifies the signature, the signer's
+Active seat, the encrypted GSS plane and the frame's per-seat position
+(`state_revision`, `key_sequence`) seats the key on the member's row
+(replays, stale keys, frames signed before the seat's current
+admission, and unsigned or wrong-signer frames are refused; see the
+`X0XKR1` entry below). The republication is
+automatic: the keyless install itself sends it, and a node that boots
+into the keyless state — or into the keyed state whose share never
+installed — sends it at startup. A send the carrier does not accept is
+not done: a recipient whose verified advert is missing or expired, or
+whose send failed, keeps the frame owed, and the daemon retries it
+until the advert sets the bit or rules the frame out. A send the carrier
+accepts is not proof that the peer seated the key, so the daemon sends
+the frame again to each owed Active recipient, up to 6 carrier-accepted
+sends. The sweep interval starts at 5 s and doubles to a maximum of
+80 s. A newer republication for the same group resets the count. A
+recipient that leaves the group's Active roster, or is revoked, is no
+longer owed. The receiver refuses a repeat of a seated key as
+`stale_key`, so a repeat does no harm. The startup pass keeps the seat
+selected until the share installs, so a restart sends it again. Once
+the seat is keyed — on the survivor's own copy and on the authors' copies — the next S4
+delivery round seals the current secret to it and the share installs
+through the existing path, which ends the hold and returns the served
+head. Share completion stays distinct from that head: a catch-up answer
+from a seat an author's roster leaves keyless is not share-possession
+evidence (such a seat cannot hold the epoch secret), and the frame's
+ingest owes the republisher its sealed share on the author's open S4
+rows. That debt — not the roster key — holds the row open whatever a
+restored head already reported: it ends only when the carrier accepts a
+sealed share for the member, and a share batch whose bounded retries
+fail leaves the obligation in place, re-sealed each delivery round. If
+the member republishes while the author's GSS delivery is open, the
+author resets the member's earlier convergence: the member converges
+again only after the new-key share is accepted and the member reports
+its head. A peer whose verified advert lacks
+`key_republish_v1` (bit 12) keeps the pre-#1663 behavior, so the seat
+stays keyless in that peer's view until it upgrades or the member
+re-joins. The window between the
+keyed seat and the installed share is the same superseded-intermediate
+shape the 02:09 ruling keeps as main's answer, bounded by the share
+delivery the S4 row owes. Until one of the two keys the seat again, the
+hold lasts: an installed share of the held epoch, or a later one, or
+the #1663 republication (while the node holds no secret), ends it.
 
-**Wire and capabilities.** The daemon advertises three more ADR 0093
+**Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
-(bit 5) and `owner_recovery_v1` (bit 7). The new frames ride the
+(bit 5), `owner_recovery_v1` (bit 7) and `key_republish_v1` (bit 12,
+the #1663 republication). The new frames ride the
 direct-message carrier only. They are
 not on the metadata topic and not in a legacy-decoded container:
 
@@ -1871,6 +1929,77 @@ not on the metadata topic and not in a legacy-decoded container:
   current verified advert sets bit 5, and it checks the recipient's agent,
   machine and binding revocations just before each send. A capable member
   that asks for TreeKEM catch-up gets held frames on this same carrier.
+
+- `X0XKR1` — `MemberKeyRepublishV1` (#1663, bit 12 `key_republish_v1`).
+  An Active member of an encrypted GSS group republishes its ML-KEM-768
+  public key on its own seat — the recovery of the keyless survivor state
+  above, without a leave and re-join. The frame is a
+  `SignedMemberKeyRepublishV1`: a `MemberKeyRepublishBodyV1` and an
+  ML-DSA-65 signature over it in domain `x0x.member-key-republish.v1`. The
+  body fields, in postcard order, are:
+  - `stable_group_id` — the group's stable ID.
+  - `actor` — the republishing member's raw agent ID. The key seats on
+    this member's own row only.
+  - `agent_public_key_b64` — the actor's ML-DSA-65 agent public key
+    (base64). It verifies the
+    signature and must derive `actor`.
+  - `kem_public_key_b64` — the ML-KEM-768 public key (base64) to seat.
+    It must parse as an
+    ML-KEM-768 public key; a correct length alone is not sufficient.
+  - `state_revision` — the group state revision (the signed state-commit
+    chain) that the actor held when it signed. This is the admission
+    binding (David's 2 Nov 2026 ruling).
+  - `key_sequence` — the republication counter within the admission. `0`
+    is refused.
+
+  It rides the direct-message carrier only. A daemon sends it only to a
+  member whose current verified advert sets bit 12. Receivers verify the
+  signature, the signer's Active seat, the encrypted GSS plane and the
+  frame's position. Each seat has a local position
+  `(kem_key_revision, kem_key_sequence)` (absent parts read as `0`). The
+  frame's `(state_revision, key_sequence)` must order strictly after it,
+  compared first by revision; if it does not, the frame is refused as
+  `stale_key`. A seated frame moves the position to its own.
+
+  **Re-admission.** A row that becomes Active from absent, `Removed` or
+  `Banned` (by an add, an unban, or a catch-up apply) is a re-admission.
+  The receiver clears the counter and sets the floor `kem_key_revision` to
+  the state revision it held at that time. The removal commit advanced the
+  chain, so a frame that the actor signed in an earlier admission carries
+  a lower revision. If any peer relays that old frame, receivers refuse
+  it as `stale_key`. Limits that remain:
+  - A receiver that first learns the seat from a catch-up snapshot, with
+    no earlier local row, uses its own revision before the apply as the
+    floor. It can not tell an older admission apart from the current one
+    for frames signed at or after that floor. A relay is then possible
+    only for a frame signed at a revision at or above that floor.
+  - If the actor's own state revision is lower than a receiver's floor,
+    that receiver refuses the actor's frame as `stale_key`. The actor must
+    republish at a later revision.
+  - The actor can sign any revision. The binding stops relays of the
+    actor's old frames; it does not defend against the actor itself.
+
+  Typed refusals (`MemberKeyRepublishRefusal`):
+  - `wrong_prefix` — the payload is not an `X0XKR1` payload.
+  - `malformed` — the body does not decode, is not consumed exactly, has
+    `key_sequence` `0`, or its KEM key is not an ML-KEM-768 public key.
+  - `bad_signature` — the signature does not verify, or the embedded agent
+    public key does not derive `actor`.
+  - `group_mismatch` — the group ID is not this group's ID.
+  - `group_contained` — the group is withdrawn or holds a fork-quarantine
+    marker.
+  - `actor_ineligible` — the signer is not an Active member on the named
+    seat. An absent row and the join's key-only marker row (Pending) are
+    not seated.
+  - `crypto_plane_unsupported` — the group is not a GSS `MlsEncrypted`
+    group.
+  - `stale_key` — the position does not order after the seat's position:
+    a replay, a stale key, or a frame signed before the seat's current
+    admission.
+
+  Two receiver outcomes are local and are not refusals: the group is not
+  known on this node (nothing to seat), or the frame is sound but a local
+  fault stopped the save.
 
 - `X0XORC1` — owner recovery (ADR 0110 §4b(1), bit 7
   `owner_recovery_v1`). One postcard frame type with two variants: the

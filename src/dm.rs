@@ -113,6 +113,10 @@ impl CapabilityRegistry {
     /// join-result poll (David's 25 Oct 2026 05:14 GMT ruling). Bit 11,
     /// the next free bit at acceptance order.
     pub const JOIN_PENDING_NOTICE_V1: u64 = 1 << 11;
+    /// #1663: verifies and seats signed `MemberKeyRepublishV1` (`X0XKR1`)
+    /// — a member's republication of a fresh KEM key on its own
+    /// already-Active seat. Bit 12.
+    pub const KEY_REPUBLISH_V1: u64 = 1 << 12;
     /// #1657 (ADR 0110 §3; David's approval, 28 Oct 2026 02:08 GMT):
     /// sends and understands the typed `treekem_catchup_refusal` that
     /// answers a TreeKEM catch-up request from a machine-revoked or
@@ -141,6 +145,7 @@ impl CapabilityRegistry {
                 | Self::OWNER_RECOVERY_V1
                 | Self::GUI_SHOW_V1
                 | Self::JOIN_PENDING_NOTICE_V1
+                | Self::KEY_REPUBLISH_V1
                 | Self::TREEKEM_CATCHUP_REFUSAL_V1,
         }
     }
@@ -175,6 +180,8 @@ impl CapabilityRegistry {
             || payload.starts_with(crate::gui::remote::ACTIVITY_PREFIX)
         {
             Some((Self::GUI_SHOW_V1, "gui_show_v1"))
+        } else if payload.starts_with(crate::groups::key_republish::KEY_REPUBLISH_PREFIX) {
+            Some((Self::KEY_REPUBLISH_V1, "key_republish_v1"))
         } else {
             None
         }

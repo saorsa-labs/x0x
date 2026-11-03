@@ -2215,6 +2215,39 @@ impl SimLink {
     }
 
     pub(crate) fn probe_peer(&self, peer_id: &PeerId) -> Result<Duration, NodeError> {
+        // The probe envelope is a send from this end, so the end whose
+        // winner moved (#1419, ant-quic#332) cannot probe. Its probe fails
+        // the same way a data send on the superseded connection is
+        // refused, while the other end still answers. The refusal uses
+        // the endpoint's link-naming error so the x0x probe classifier
+        // sees the same cause as on QUIC.
+        //
+        // The envelope is itself a send: ant-quic records the Sent stamp
+        // even when no reply comes, so a probe that failed leaves the
+        // prober's direction looking fresh for one flowing window. The
+        // sim records the same stamp on the failure path only: a
+        // successful probe keeps its answer as the traffic evidence, and
+        // the quiet-peer pins keep the sender's direction stale after a
+        // successful probe.
+        let winner_moved = self
+            .fabric
+            .lock()
+            .links
+            .get(&pair(self.me.0, peer_id.0))
+            .is_some_and(|link| link.one_sided.is_some_and(|(who, _)| who == self.me.0));
+        if winner_moved {
+            let probe_send_at = self.fabric.now();
+            let mut state = self.fabric.lock();
+            let key = pair(self.me.0, peer_id.0);
+            let send_idx = usize::from(self.me.0 != key.0);
+            if let Some(link) = state.links.get_mut(&key) {
+                link.sent_at[send_idx] = Some(probe_send_at);
+            }
+            drop(state);
+            return Err(NodeError::Endpoint(EndpointError::ConnectionClosed {
+                reason: ConnectionCloseReason::Superseded,
+            }));
+        }
         if self.is_connected(peer_id) {
             Ok(self.fabric.base_latency * 2)
         } else {

@@ -189,6 +189,15 @@ pub(in crate::server) async fn run_direct_metadata_listener(
             );
             continue;
         }
+        // #1663: a signed `MemberKeyRepublishV1` rides the same direct
+        // carrier, never the metadata topic; it is verified off this loop.
+        if msg
+            .payload
+            .starts_with(x0x::groups::key_republish::KEY_REPUBLISH_PREFIX)
+        {
+            super::key_republish::spawn_receipt(&state, msg.sender, msg.verified, msg.payload);
+            continue;
+        }
         let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else {
             continue; // not a named-group metadata event
         };
