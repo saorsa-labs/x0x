@@ -9174,14 +9174,14 @@ mod daemon_tests {
         Ok(())
     }
 
-    /// #1775 item 2 (rounds 2-6): the held exit belongs to the author
-    /// of the step that RAISED the epoch, not to the last step's author
-    /// and not to any admin. The held chain raises with B's rotation and
-    /// then rides the author's rename; the record names B — the raising
-    /// author — so the exit fires. A last-step rule would hand it to the
-    /// renaming author and strand the frame. An author-named record
-    /// cannot probe the negative side: the author is the frame's actor,
-    /// so its share applies through the actor rule.
+    /// #1775 item 2 (rounds 2-8): the held chain raises with B's
+    /// rotation and rides the author's rename after it; the record names
+    /// B, the raising author, and the exit fires at the raising cursor.
+    /// This shape proves the walk continues past a non-raising step; it
+    /// cannot alone discriminate a last-step rule, because the exit
+    /// fires at the raising cursor under either. The sibling negative
+    /// test carries the `share_sent_by` guard's negative side, and the
+    /// fully discriminating E+2 shape needs a second phantom seat.
     #[tokio::test]
     async fn the_held_exit_belongs_to_the_raising_step_author() -> Result<()> {
         use anyhow::Context as _;
@@ -9285,16 +9285,12 @@ mod daemon_tests {
             },
         )
         .context("the frame's keyless result")?;
-        // The held chain has two steps (rounds 6-7): B's rotation
-        // raises the epoch past the frame's, and the author's rename
-        // rides on it without raising further. The record names B — the
-        // raising author — so the exit fires at the raising cursor; the
-        // rename only proves the walk continues past it. (This shape
-        // cannot alone discriminate a last-step rule, because the exit
-        // fires at the raising cursor under either; the restored
-        // sibling test below carries the guard's negative side, and the
-        // fully discriminating E+2 shape needs a second phantom seat
-        // this fixture does not have.)
+        // The held chain has two steps: B's rotation raises the epoch
+        // past the frame's, and the author's rename rides on it without
+        // raising further. The record names B — the raising author — so
+        // the exit fires at the raising cursor; the rename proves the
+        // walk continues past a non-raising step.
+
         let mut b_rotation = f_result.clone();
         b_rotation.roster_revision = b_rotation.roster_revision.saturating_add(1);
         b_rotation.remove_member(&survivor_hex, Some(b_hex.clone()));
@@ -9346,13 +9342,12 @@ mod daemon_tests {
             Some(b_rotation_head),
         )
         .await;
-        // The record names B, the RAISING step's author, so the exit
-        // fires; under a last-step rule (the author's rename) it would
-        // not, and the frame would keep waiting.
+        // The record names B, the raising author, so the exit fires at
+        // the raising cursor — the rename after it changes nothing.
         assert_eq!(
             receive(&fx.replica, admin, &frame).await,
             ReceiveOutcome::Applied,
-            "the held exit belongs to the raising step's author, not the last step's"
+            "the raising author's recorded key takes the exit past a later non-raising step"
         );
         Ok(())
     }

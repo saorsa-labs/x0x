@@ -397,6 +397,9 @@ fn head_reaches(
     mark_head: &str,
     missing_keeps: bool,
 ) -> bool {
+    if info.state_hash == mark_head {
+        return true;
+    }
     // One index of the retained entries, then the head's own prev links
     // entry by entry: the log also holds adopted chains that fork from
     // earlier ancestors, so a positional pass proves nothing, and a
@@ -433,7 +436,7 @@ fn head_reaches(
             None => return false,
         }
     }
-    true
+    missing_keeps
 }
 
 /// #1775 item 4: whether the secret of its local epoch that `info` holds
@@ -1846,6 +1849,44 @@ mod tests {
             !withholds(&state, &group_key, &forked),
             "a keyless head sitting in the log beside the sibling chain voids nothing"
         );
+        // The replace path's strict branch (round 7): a chain that runs
+        // off the retained log cannot prove the mark, so withholding
+        // keeps it and the replace path treats the unknown as pinned.
+        let mut offlog = gss_info_at_head(1, None);
+        offlog.secret_epoch = 2;
+        offlog.shared_secret = Some(foreign.to_vec());
+        let offlog_parent = offlog.state_hash.clone();
+        let offlog_head = format!("offlog-{offlog_parent}");
+        offlog.commit_log[0].commit.prev_state_hash = Some("beneath-the-log".to_string());
+        // The whole retained suffix sits inside the mark's epoch, so the
+        // walk leaves the log before any epoch floor fires.
+        offlog.commit_log[0].commit.security_binding = Some("gss:epoch=2".to_string());
+        offlog.commit_log.push({
+            let mut c = offlog.commit_log[0].commit.clone();
+            c.revision = 2;
+            c.prev_state_hash = Some(offlog_parent);
+            c.security_binding = Some("gss:epoch=2".to_string());
+            c.state_hash = offlog_head.clone();
+            x0x::groups::state_commit::RetainedCommit {
+                commit: c,
+                roster: std::collections::BTreeMap::new(),
+                meta: None,
+            }
+        });
+        offlog.state_hash = offlog_head;
+        // Earlier steps left a live exclusion hold of this epoch; drop
+        // it so only the mark decides here.
+        release_exclusions(&state, &group_key, 3).await;
+        note_keyless_commit(&state, &group_key, 2, &actor, "an-offlog-keyless-head").await;
+        assert!(
+            withholds(&state, &group_key, &offlog),
+            "a chain off the retained log keeps the mark for withholding"
+        );
+        assert!(
+            !replaces_uncommitted_secret(&state, &group_key, &offlog, &actor, 2),
+            "the replace path treats the unprovable mark as pinned"
+        );
+
         // The reverse error: a rename on the true keyless head keeps the
         // mark though the log holds an unrelated fork below the epoch.
         let mut chained = gss_info_at_head(1, None);
@@ -1876,6 +1917,7 @@ mod tests {
             rename_head.clone(),
         ));
         chained.state_hash = rename_head;
+        note_keyless_commit(&state, &group_key, 2, &actor, &keyless_in_log).await;
         assert!(
             withholds(&state, &group_key, &chained),
             "a rename on the true keyless head keeps the mark past an unrelated fork"

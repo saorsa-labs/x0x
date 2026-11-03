@@ -1935,8 +1935,8 @@ commit moved, or a commit chained on that head. A sibling commit of the
 epoch ends the mark. So does a head that commits a later epoch. A share
 of a later unpinned epoch is not the mark's actor key.
 
-A known-empty evicted-removal hold ends at any secret
-of its epoch, committed or not. A hold whose actor list is unknown (a
+A known-empty evicted-removal hold ends at a secret of
+its epoch or a later one, committed or not. A hold whose actor list is unknown (a
 pre-#1771 exclusion file) is ended by no secret that a commit does not
 pin. One that carries removed members is an evicted removal's
 containment, which ends at any secret of its epoch.
