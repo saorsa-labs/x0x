@@ -349,15 +349,23 @@ except citations explicitly marked as resolving at
 - **What makes both publish orderings work is one conjunct, and it is load-bearing.** The
   clear is gated on *strict* `<` (D7), so an envelope that installed first survives the
   later commit. The reverse ordering — commit first, envelope second at equal epoch —
-  works only because the stale-envelope guard is
+  works only because the stale-envelope guard keeps its strict/equal split. At the F1
+  baseline it was
   `if secret_epoch < info.secret_epoch || (secret_epoch == info.secret_epoch &&
   info.shared_secret.is_some())` (statement `:5831-5835`; the conjunct is `:5832`), whose
-  own doc comment (`:5827-5830`) states the intent. That guard is pre-existing and F1 does
-  not change it — it is cited at the baseline, and its comment names only a *prior
+  own doc comment (`:5827-5830`) states the intent. #1766/#1771 added a third conjunct —
+  the equal-epoch arm refuses only when the share may not replace the installed
+  uncommitted secret (`!gss_share_hold::replaces_uncommitted_secret`) — and #1775 widened
+  that replace to a secret no verified commit pins, a waiting parked removal, and a
+  keyless commit's mark. The strict `<` clear and the equal-epoch refuse survive both
+  changes. F1 does not change the guard — it is cited at the baseline, and its comment
+  names only a *prior
   `MemberBanned` commit*, because remove had no GSS rotation to produce the same ordering
   when it was written. Tightening that predicate to
   `secret_epoch <= info.secret_epoch` would silently strand every survivor on the
-  commit-first ordering: cleared by the commit, then refusing its own replacement, in
+  commit-first ordering whose secret a head commit already pins: cleared by the commit,
+  then refusing its own replacement — the #1766/#1775 replace path saves only the
+  uncommitted window — in
   consensus with a matching `state_hash` and decrypting nothing. That is the F1 failure
   re-created by a one-token edit, which is why Validation item 3 must be written to fail
   when the conjunct is deleted rather than merely to exercise both orderings.
