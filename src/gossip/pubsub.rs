@@ -10208,19 +10208,83 @@ mod tests {
     /// visible record of the gap. The first family release that accepts
     /// ant-quic 0.27.62 re-arms the assertions with no edit.
     fn pinned_pubsub_carries_refusal_replays() -> bool {
-        let lock: toml::Value =
-            toml::from_str(include_str!("../../Cargo.lock")).expect("workspace lock parses");
-        lock["package"]
-            .as_array()
-            .expect("lock packages")
-            .iter()
-            .filter(|p| p["name"].as_str() == Some("saorsa-gossip-pubsub"))
-            .all(|p| {
-                p["version"]
-                    .as_str()
-                    .and_then(|v| semver::Version::parse(v).ok())
-                    .is_some_and(|v| v >= semver::Version::new(0, 5, 89))
-            })
+        lock_carries_pubsub_refusal_replays(include_str!("../../Cargo.lock"))
+    }
+
+    /// The guard body, over raw lock text so a synthetic lock can exercise
+    /// it. Returns false when the lock holds no `saorsa-gossip-pubsub`
+    /// entry: zero matching entries once passed `.all()` vacuously, so a
+    /// dropped pin would quietly disarm the guard (#1772 review). A
+    /// matching entry whose version is missing or unparsable also fails.
+    fn lock_carries_pubsub_refusal_replays(lock: &str) -> bool {
+        let parsed: toml::Value = match toml::from_str(lock) {
+            Ok(parsed) => parsed,
+            Err(_) => return false,
+        };
+        let mut saw_pubsub = false;
+        for package in parsed
+            .get("package")
+            .and_then(|packages| packages.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let name = package.get("name").and_then(|name| name.as_str());
+            if name != Some("saorsa-gossip-pubsub") {
+                continue;
+            }
+            saw_pubsub = true;
+            // A missing or unparsable version must fail, not pass.
+            let carries = package
+                .get("version")
+                .and_then(|version| version.as_str())
+                .and_then(|version| semver::Version::parse(version).ok())
+                .is_some_and(|version| version >= semver::Version::new(0, 5, 89));
+            if !carries {
+                return false;
+            }
+        }
+        saw_pubsub
+    }
+
+    /// A minimal Cargo.lock-shaped TOML pinning the pubsub crate at
+    /// `version` (#1772 review fixtures).
+    fn lock_with_pubsub_pin(version: &str) -> String {
+        format!(
+            "[[package]]\nname = \"unrelated-crate\"\nversion = \"1.0.0\"\n\n\
+             [[package]]\nname = \"saorsa-gossip-pubsub\"\nversion = \"{version}\"\n"
+        )
+    }
+
+    /// Zero matching entries passed vacuously before; a lock without the
+    /// pubsub pin must fail the guard (#1772 review).
+    #[test]
+    fn lock_carries_refusal_replays_fails_without_pubsub_entry() {
+        let lock = "[[package]]\nname = \"unrelated-crate\"\nversion = \"1.0.0\"\n";
+        assert!(!lock_carries_pubsub_refusal_replays(lock));
+    }
+
+    /// The real pin: 0.5.88, which the #1346 hold keeps in force.
+    #[test]
+    fn lock_carries_refusal_replays_fails_at_0_5_88() {
+        assert!(!lock_carries_pubsub_refusal_replays(&lock_with_pubsub_pin(
+            "0.5.88"
+        )));
+    }
+
+    /// 0.5.89 carries the refusal replay (saorsa-gossip #116).
+    #[test]
+    fn lock_carries_refusal_replays_passes_at_0_5_89() {
+        assert!(lock_carries_pubsub_refusal_replays(&lock_with_pubsub_pin(
+            "0.5.89"
+        )));
+    }
+
+    /// A matching name whose version does not parse must fail the guard.
+    #[test]
+    fn lock_carries_refusal_replays_fails_on_unparsable_version() {
+        assert!(!lock_carries_pubsub_refusal_replays(&lock_with_pubsub_pin(
+            "not-a-semver"
+        )));
     }
 
     #[tokio::test]

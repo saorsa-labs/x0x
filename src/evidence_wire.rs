@@ -156,15 +156,15 @@ impl MachineBudget {
         }
         let Some(slot) = self.hello_attempts.iter_mut().find(|s| s.is_none()) else {
             // Bounded memory: reuse the slot of the smallest attempted
-            // positive generation. Some(0) is never a candidate. Only an
-            // arrival above that smallest stored slot raises the floor: the
-            // stored history then reaches down to it, so nothing at or below
-            // the floor re-arms. An out-of-order arrival sits below every
-            // stored slot, so a floor raise there would block generations
-            // between it and the smallest slot that never tried (#1772
-            // review). The floor stays put instead; the forgotten
-            // generation can re-arm under five-generation churn, still
-            // bounded by the shared 60-second machine gate.
+            // positive generation. Some(0) is never a candidate. The floor
+            // may rise to that smallest only when no untried generation
+            // sits between the arrival and it: an in-order arrival, or an
+            // out-of-order arrival immediately below the smallest (#1772
+            // review, round 3). A gapped out-of-order arrival raises
+            // nothing — the generations between it and the smallest slot
+            // never tried and must stay free — so that forgotten smallest
+            // can re-arm under churn, still bounded by the shared
+            // 60-second machine gate.
             let Some(smallest) = self
                 .hello_attempts
                 .iter()
@@ -174,7 +174,7 @@ impl MachineBudget {
             else {
                 return;
             };
-            if generation > smallest {
+            if generation >= smallest - 1 {
                 self.hello_floor = self.hello_floor.max(smallest);
             }
             if let Some(slot) = self
@@ -507,10 +507,14 @@ impl Limits {
         // next readiness pass look like a replacement. It only records the
         // observation: the ceiling rises before the rate gate, because a
         // rate-refused reply on a fresh generation still proves that
-        // connection exists, and the readiness fence below is the only
-        // reader of the ceiling.
+        // connection exists. The certificate fence fires on this raise
+        // itself: the readiness pass would only find the ceiling already
+        // at the new generation, so a genuinely new connection retiring the
+        // certificate's premise must be recognized here (#1772 review,
+        // round 3).
         if id > 0 && m.hello_ceiling.is_none_or(|high| high < id) {
             m.hello_ceiling = Some(id);
+            m.certificate = None;
         }
         if m.hello_attempted(id) {
             return false;
@@ -1262,6 +1266,23 @@ impl Context {
             #[cfg(test)]
             if kind == HELLO {
                 self.pause_hello_open(true).await;
+            }
+            // #1772 review, round 3: the samples around the open can agree
+            // on a generation the stream does not carry. An A→B→A winner
+            // flip across open_bi stamps the stream with B while the
+            // post-open sample reads A again, so B's Hello would be charged
+            // to A. The stream's own stamp owns the attempt: refuse when it
+            // disagrees with the sampled generation or is unstamped.
+            if let Some(generation) = generation {
+                let stamped = send.connection_generation();
+                if stamped == u64::MAX || stamped != generation {
+                    tracing::debug!(
+                        %machine,
+                        outcome = "hello_stream_generation_mismatch",
+                        "evidence Hello stream generation check failed"
+                    );
+                    return Err(invalid("Hello stream generation mismatch"));
+                }
             }
             if let Some(generation) = generation.filter(|_| policy.is_some()) {
                 // Open may yield. A busy Hello defers to the next pass. Its
