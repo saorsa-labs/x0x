@@ -328,6 +328,8 @@ pub(crate) fn read_boot_records(data_dir: &Path) -> BootRecords {
 /// Ordinary released legacy intent permits unrelated debris cleanup. If its
 /// recorded target or backup can match the sweep patterns, preserve candidates
 /// conservatively instead. No path taken from a record is followed.
+/// Per-swap backup names (`.backup-<version>-<pid>-<nanos>`, #1106) are sweep
+/// candidates too, so a legacy record naming one holds the sweep back.
 pub(crate) fn sweep_if_no_pending_records(data_dir: &Path, sweep: impl FnOnce() -> usize) -> usize {
     let records = read_boot_records(data_dir);
     let legacy_references_candidates = match &records.handoff {
@@ -335,7 +337,9 @@ pub(crate) fn sweep_if_no_pending_records(data_dir: &Path, sweep: impl FnOnce() 
             value.get(name).and_then(Value::as_str).is_none_or(|path| {
                 Path::new(path).components().any(|component| {
                     let name = component.as_os_str().to_string_lossy();
-                    name.starts_with(".x0x-upgrade-") || name.contains(".x0xold-")
+                    name.starts_with(".x0x-upgrade-")
+                        || name.contains(".x0xold-")
+                        || name.contains(".backup-")
                 })
             })
         }),

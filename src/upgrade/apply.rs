@@ -1695,7 +1695,17 @@ impl AutoApplyUpgrader {
         target_version: &str,
         mut exit: impl FnMut(i32),
     ) -> Result<(), UpgradeError> {
-        let handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
+        // Issue #1106: name this transaction's per-swap backup in the handoff
+        // so the helper restores only bytes this transaction preserved. The
+        // canonical fallback covers transactions that swapped nothing.
+        let fresh_backup = self.swapped_artifacts.as_deref().and_then(|swapped| {
+            swapped
+                .iter()
+                .find(|(target, _)| target == &plan.executable)
+                .map(|(_, backup)| backup.as_path())
+        });
+        let handoff =
+            restart::UpgradeHandoff::from_plan_with_backup(plan, target_version, fresh_backup);
         let handoff_path = plan.handoff_path();
 
         match plan.mode {

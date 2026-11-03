@@ -101,13 +101,28 @@ impl Upgrader {
     }
 
     /// Create a backup of the current binary.
+    ///
+    /// The backup file is per-swap: `<file>.backup-<running-version>-<pid>-<nanos>`
+    /// (issue #1106 M2, "a per-instance `<exe>.backup-<ver>`"). One fixed name
+    /// let a second daemon sharing this executable destroy or consume the
+    /// first one's rollback copy — its swap overwrote the shared file, and a
+    /// late restore (HTTP deferred-restart owner, transactional-handoff
+    /// helper) renamed away a backup another live transaction owned. Each
+    /// transaction now restores only the file its own swap created, so
+    /// concurrent transactions on one executable never collide.
+    ///
+    /// The canonical `<file>.backup` name is refreshed as a hard link to the
+    /// per-swap file so path-deriving consumers (an equal-bytes-skip restart,
+    /// which has no fresh backup of its own, and operators) keep seeing the
+    /// latest preserved bytes under the documented name.
     pub fn create_backup(&self) -> Result<PathBuf, UpgradeError> {
-        let backup_path = self.target_path.with_extension("backup");
+        let backup_path = per_swap_backup_path(&self.target_path, &self.current_version);
         debug!(backup_path = %backup_path.display(), "Creating backup at: {}", backup_path.display());
         std::fs::copy(&self.target_path, &backup_path).map_err(|e| UpgradeError::BackupFailed {
             path: backup_path.clone(),
             source: e,
         })?;
+        refresh_canonical_backup(&self.target_path, &backup_path);
         Ok(backup_path)
     }
 
@@ -301,6 +316,91 @@ fn host_upgrade_lock_path(target: &Path) -> PathBuf {
         .unwrap_or_default();
     name.push(".upgrade.lock");
     target.with_file_name(name)
+}
+
+/// Per-swap backup path for `target`: `<file>.backup-<version>-<pid>-<nanos>`.
+///
+/// The version label is the swapper's running version — a diagnostic label,
+/// not a claim about the bytes on disk (a second daemon still running v1 can
+/// preserve v2 bytes a first swapper already installed, #1106). The
+/// pid-nanos pair (the [`Upgrader::create_temp_dir`] idiom) makes the name
+/// unique per transaction, which is what concurrent swappers on one shared
+/// executable actually need — two same-version daemons applying different
+/// releases would otherwise collide on a version-only name.
+fn per_swap_backup_path(target: &Path, running_version: &Version) -> PathBuf {
+    let mut unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    loop {
+        let mut name = target
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(format!(
+            ".backup-{running_version}-{}-{unique}",
+            std::process::id()
+        ));
+        let path = target.with_file_name(name);
+        // `fs::copy` onto an existing name would silently destroy another
+        // transaction's rollback bytes — the exact #1106 bug class — so a
+        // collision (coarse clock tick, backward NTP step) re-derives instead.
+        if !path.exists() {
+            return path;
+        }
+        unique += 1;
+    }
+}
+
+/// Point the canonical `<file>.backup` name at this transaction's per-swap
+/// backup via a hard link (same inode, so a later rename of the per-swap path
+/// onto the target never leaves the canonical name dangling with split
+/// content). Best-effort: the per-swap file is the rollback token; the
+/// canonical name only serves path-deriving consumers. Called under the host
+/// lock, so remove+link cannot interleave with another swapper.
+fn refresh_canonical_backup(target: &Path, per_swap: &Path) {
+    let canonical = target.with_extension("backup");
+    if canonical.exists() || std::fs::symlink_metadata(&canonical).is_ok() {
+        let _ = std::fs::remove_file(&canonical);
+    }
+    if std::fs::hard_link(per_swap, &canonical).is_err() {
+        // Filesystems without hard links (or cross-device oddities) fall back
+        // to a copy; the canonical name is compatibility, never the rollback
+        // token, so failure is only logged.
+        if let Err(error) = std::fs::copy(per_swap, &canonical) {
+            warn!(
+                canonical = %canonical.display(),
+                error = %error,
+                "cannot refresh the canonical backup name; the per-swap backup is unaffected"
+            );
+        }
+    }
+}
+
+/// True for per-swap backup files this module creates:
+/// `<file>.backup-<version>-<pid>-<nanos>`.
+///
+/// Deliberately narrower than a bare `.backup-` substring so the dormant pair
+/// engine's `.backup-<version>-<transaction>` names (uuid transaction ids,
+/// not pid-nanos pairs) are never matched. Residual false positive: a uuid
+/// whose last two dash groups are all digits (~0.05% per artifact) would
+/// match; the cost is only a skipped cleanup of that dormant artifact.
+fn is_per_swap_backup_name(name: &str) -> bool {
+    let Some((_, rest)) = name.split_once(".backup-") else {
+        return false;
+    };
+    // `<version>-<pid>-<nanos>`: the two trailing dash segments are all
+    // digits and a nonempty version label precedes them. A version may carry
+    // dashes (prerelease), so only the tail is parsed.
+    let mut tail = rest.rsplitn(3, '-');
+    let nanos = tail.next().unwrap_or_default();
+    let pid = tail.next().unwrap_or_default();
+    let version = tail.next().unwrap_or_default();
+    !nanos.is_empty()
+        && !pid.is_empty()
+        && !version.is_empty()
+        && nanos.bytes().all(|b| b.is_ascii_digit())
+        && pid.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Exclusive OS lock (`std::fs::File::lock`: flock/fcntl on Unix, LockFileEx
@@ -547,6 +647,9 @@ pub(crate) fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std:
 /// disturbed. Sidelined binaries are age-gated the same way (issue #261 I4b):
 /// a handoff still in flight — including a manual relaunch of a crashing new
 /// binary — must not lose its rollback bytes to the startup sweep.
+/// Per-swap backups (`<file>.backup-<version>-<pid>-<nanos>`, issue #1106)
+/// are age-gated identically for the same reason: a live handoff helper
+/// may still need its transaction's rollback bytes.
 ///
 /// Returns the number of entries removed. All removal is best-effort.
 pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duration) -> usize {
@@ -582,6 +685,12 @@ pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duratio
             && std::fs::remove_file(&path).is_ok()
         {
             info!(path = %path.display(), "Removed sidelined binary from prior upgrade");
+            removed += 1;
+        } else if is_per_swap_backup_name(&name)
+            && entry_is_aged(&entry)
+            && std::fs::remove_file(&path).is_ok()
+        {
+            info!(path = %path.display(), "Removed per-swap backup from a completed upgrade");
             removed += 1;
         }
     }
@@ -705,6 +814,107 @@ mod tests {
         // Restore
         upgrader.restore_from_backup(&backup_path).unwrap();
         assert_eq!(fs::read(&binary_path).unwrap(), b"original content");
+    }
+
+    /// #1106: each swap writes its own per-swap backup file, and the canonical
+    /// `<target>.backup` name keeps pointing at the latest preserved bytes.
+    #[test]
+    fn create_backup_writes_per_swap_file_and_refreshes_canonical() {
+        let dir = TempDir::new().unwrap();
+        let binary_path = create_test_binary(&dir, "test-binary", b"original content");
+        let canonical = binary_path.with_extension("backup");
+        fs::write(&canonical, b"stale prior backup").unwrap();
+        let upgrader = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+
+        let backup_path = upgrader.create_backup().unwrap();
+
+        assert_ne!(
+            backup_path, canonical,
+            "the rollback token must be a per-swap file, not the shared canonical name"
+        );
+        assert_eq!(fs::read(&backup_path).unwrap(), b"original content");
+        assert_eq!(
+            fs::read(&canonical).unwrap(),
+            b"original content",
+            "the canonical name must be refreshed to this swap's preserved bytes"
+        );
+
+        // A restore that consumes the per-swap file by rename leaves the
+        // canonical name holding the same preserved bytes (hard link, same
+        // inode), never dangling and never split from what was restored.
+        fs::write(&binary_path, b"new content").unwrap();
+        upgrader.restore_from_backup(&backup_path).unwrap();
+        assert_eq!(fs::read(&binary_path).unwrap(), b"original content");
+        assert_eq!(fs::read(&canonical).unwrap(), b"original content");
+    }
+
+    /// #1106 regression: two transactions on one shared executable applying
+    /// different releases must each keep their own rollback copy, and a late
+    /// restore of the first transaction must not consume the second's backup.
+    /// On a single fixed `.backup` name the second swap overwrote the first
+    /// rollback copy and the late restore renamed the second's backup away.
+    #[test]
+    fn second_release_keeps_first_transactions_rollback_copy() {
+        let dir = TempDir::new().unwrap();
+        let binary_path = create_test_binary(&dir, "test-binary", b"v1-original");
+        let candidate_v2 = create_test_binary(&dir, "new-v2", b"v2-bytes");
+        let candidate_v3 = create_test_binary(&dir, "new-v3", b"v3-bytes");
+
+        // Transaction 1: a daemon running v1 applies v2.
+        let first = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+        let lock1 = acquire_host_upgrade_lock(&binary_path).unwrap();
+        let (result1, backup1) = first
+            .finish_upgrade_under_host_lock(&candidate_v2, &Version::new(2, 0, 0))
+            .unwrap();
+        drop(lock1);
+        assert!(matches!(result1, UpgradeResult::Success { .. }));
+        let backup1 = backup1.expect("a real swap reports its fresh backup");
+
+        // Transaction 2: a second daemon still running v1 from the same
+        // shared executable applies a different release; disk now holds v2.
+        let second = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+        let lock2 = acquire_host_upgrade_lock(&binary_path).unwrap();
+        let (result2, backup2) = second
+            .finish_upgrade_under_host_lock(&candidate_v3, &Version::new(3, 0, 0))
+            .unwrap();
+        drop(lock2);
+        assert!(matches!(result2, UpgradeResult::Success { .. }));
+        let backup2 = backup2.expect("a real swap reports its fresh backup");
+
+        assert_ne!(backup1, backup2, "each swap owns its own backup file");
+        assert_eq!(
+            fs::read(&backup1).unwrap(),
+            b"v1-original",
+            "the second transaction must not destroy the first rollback copy"
+        );
+        assert_eq!(fs::read(&backup2).unwrap(), b"v2-bytes");
+
+        // A late restore of transaction 1 (handoff helper, deferred restart
+        // owner) restores exactly its own bytes and leaves transaction 2's
+        // backup untouched.
+        restore_swapped_binaries(&[(binary_path.clone(), backup1.clone())]).unwrap();
+        assert_eq!(fs::read(&binary_path).unwrap(), b"v1-original");
+        assert!(
+            backup2.is_file(),
+            "a late restore must not consume another transaction's backup"
+        );
+    }
+
+    /// The sweep's per-swap matcher: this module's pid-nanos names match; the
+    /// canonical name and the dormant pair engine's uuid-transaction names do
+    /// not.
+    #[test]
+    fn per_swap_backup_name_matcher_is_precise() {
+        assert!(is_per_swap_backup_name(
+            "x0xd.backup-1.2.3-4212-99887766554433221100"
+        ));
+        assert!(is_per_swap_backup_name("x0xd.backup-1.0.0-rc.1-42-7"));
+        assert!(!is_per_swap_backup_name("x0xd.backup"));
+        assert!(!is_per_swap_backup_name("x0xd.backup-1.0.0"));
+        assert!(!is_per_swap_backup_name(
+            "x0xd.backup-1.0.0-3f2a8c1e-9d4b-4c6e-8a2f-1b0d5e7a9c31"
+        ));
+        assert!(!is_per_swap_backup_name("x0xd.exe.x0xold-17"));
     }
 
     #[test]
@@ -1015,6 +1225,48 @@ mod tests {
             "in-flight handoff sideline must survive the age gate"
         );
         assert!(backup.exists(), "unrelated .backup file must be left alone");
+    }
+
+    /// Per-swap backups (#1106) are reclaimed by the startup sweep only past
+    /// the age gate, so a live handoff keeps its rollback bytes while
+    /// completed upgrades do not accumulate one ≤200 MiB file per swap.
+    #[test]
+    fn sweep_reclaims_aged_per_swap_backups_but_spares_live_ones() {
+        let dir = TempDir::new().unwrap();
+        let aged = dir.path().join("x0xd.backup-1.0.0-123-456");
+        fs::write(&aged, b"old").unwrap();
+        let fresh = dir.path().join("x0xd.backup-2.0.0-789-101");
+        fs::write(&fresh, b"fresh").unwrap();
+        let canonical = dir.path().join("x0xd.backup");
+        fs::write(&canonical, b"canonical").unwrap();
+        // A dormant pair-engine artifact (uuid transaction id) is not this
+        // module's debris and must survive the sweep.
+        let pair_artifact = dir
+            .path()
+            .join("x0xd.backup-1.0.0-3f2a8c1e-9d4b-4c6e-8a2f-1b0d5e7a9c31");
+        fs::write(&pair_artifact, b"pair").unwrap();
+        age_file(&aged, std::time::Duration::from_secs(7200));
+
+        let removed =
+            sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(3600));
+
+        assert_eq!(
+            removed, 1,
+            "only the aged per-swap backup should be removed"
+        );
+        assert!(!aged.exists(), "aged per-swap backup must be reclaimed");
+        assert!(
+            fresh.exists(),
+            "a live transaction's per-swap backup must survive the age gate"
+        );
+        assert!(
+            canonical.exists(),
+            "the canonical backup name is never swept"
+        );
+        assert!(
+            pair_artifact.exists(),
+            "pair-engine artifact names are not this module's debris"
+        );
     }
 
     /// Backdate a file's mtime so the sweep's age gate sees it as old.

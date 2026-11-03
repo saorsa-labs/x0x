@@ -307,16 +307,36 @@ fn legacy_only_handoff_allows_unrelated_cleanup_and_preserves_its_files() {
 
 #[test]
 fn legacy_handoff_referencing_a_cleanup_pattern_keeps_its_recovery_bytes() {
-    for reference_staged_directory in [false, true] {
+    /// Each variant points one handoff path at debris the sweep would claim.
+    enum Reference {
+        StagedDirectory,
+        SidelinedBinary,
+        /// A per-swap backup (`<file>.backup-<ver>-<pid>-<nanos>`, #1106) the
+        /// live helper still needs; the sweep reclaims these when aged.
+        PerSwapBackup,
+    }
+    for reference in [
+        Reference::StagedDirectory,
+        Reference::SidelinedBinary,
+        Reference::PerSwapBackup,
+    ] {
         let install = TempDir::new().unwrap();
         let data = TempDir::new().unwrap();
         let mut handoff = legacy_handoff(install.path(), "0.48.2");
-        if reference_staged_directory {
-            let staged = install.path().join(".x0x-upgrade-referenced");
-            std::fs::create_dir(&staged).unwrap();
-            handoff.target_path = staged.join("x0xd");
-        } else {
-            handoff.backup_path = install.path().join("x0xd.x0xold-referenced");
+        match reference {
+            Reference::StagedDirectory => {
+                let staged = install.path().join(".x0x-upgrade-referenced");
+                std::fs::create_dir(&staged).unwrap();
+                handoff.target_path = staged.join("x0xd");
+            }
+            Reference::SidelinedBinary => {
+                handoff.backup_path = install.path().join("x0xd.x0xold-referenced");
+            }
+            Reference::PerSwapBackup => {
+                handoff.backup_path = install
+                    .path()
+                    .join("x0xd.backup-1.2.3-4212-99887766554433221100");
+            }
         }
         std::fs::write(&handoff.target_path, b"configured binary").unwrap();
         std::fs::write(&handoff.backup_path, b"referenced rollback").unwrap();
