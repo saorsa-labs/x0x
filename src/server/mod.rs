@@ -2493,8 +2493,14 @@ pub async fn serve_with_options(
                 ) else {
                     continue;
                 };
-                handle_control_blob_message(&control_state, &msg.sender, msg.verified, control_msg)
-                    .await;
+                handle_control_blob_message(
+                    &control_state,
+                    &msg.sender,
+                    &msg.machine_id,
+                    msg.verified,
+                    control_msg,
+                )
+                .await;
             }
         }));
     }
