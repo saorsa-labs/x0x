@@ -1433,6 +1433,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         });
         group_synced.insert(stable.clone(), synced);
     }
+    let intake = state.agent.s4_revocation_intake();
     for key in open {
         let Some((group_key, info)) = by_stable.get(key.stable_group_id.as_str()) else {
             continue;
@@ -1447,11 +1448,12 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         let active_admins = active_admins_of(info);
         let target_hex = hex::encode(key.target);
         let target_seated = seat_target(info, &target_hex);
-        // §5 memory-only durability: every trigger S4 derives today is
-        // durable elsewhere (the revocation store, the verified chain or a
-        // committed certificate), so a memory-only sidecar does not hold
-        // the seal. A failed write of a writable sidecar does.
-        let durable = memory_only || !inner.not_durable.contains_key(&key);
+        // §5 memory-only durability: a memory-only sidecar seals only a
+        // trigger that is durable elsewhere. A self-leave (the verified
+        // chain) and an expiry (a committed certificate) are; a revocation
+        // is durable only once its revocation-store write succeeded
+        // (#1765). A failed write of a writable sidecar holds the seal.
+        let durable = row_durable(&inner, &row, &intake, memory_only);
         let head_synced = group_synced
             .get(&key.stable_group_id)
             .copied()
@@ -2353,6 +2355,23 @@ async fn manual_request_gate(
     ))
 }
 
+/// Whether `row`'s latest material change is durable (ADR 0110 §5).
+/// A writable sidecar answers for its own rows. A memory-only sidecar
+/// answers only for evidence that is durable elsewhere: a revocation
+/// counts once its revocation-store write succeeded (#1765).
+fn row_durable(
+    inner: &S4Inner,
+    row: &ObligationRow,
+    intake: &s4::RevocationIntake,
+    memory_only: bool,
+) -> bool {
+    if memory_only {
+        intake.all_durable(&row.revocation_hashes)
+    } else {
+        !inner.not_durable.contains_key(&row.key())
+    }
+}
+
 /// The §2 seal decision for one S4 target, read now: `None` when this node
 /// may seal, otherwise the cause it waits for and the `waiting` JSON. It
 /// reads the last evaluation (designation and rank), the stored blocking
@@ -2381,7 +2400,9 @@ async fn seal_wait(
             .filter(|cause| blocks_manual_request(*cause))
             // Durability is read live, as the evaluation computes it.
             .or_else(|| {
-                (inner.sidecar.state.writable() && inner.not_durable.contains_key(key))
+                let intake = state.agent.s4_revocation_intake();
+                let memory_only = !inner.sidecar.state.writable();
+                row.is_some_and(|row| !row_durable(&inner, row, &intake, memory_only))
                     .then_some(WaitingCause::WaitingForDurableIntake)
             });
         match permission {
@@ -7271,6 +7292,74 @@ pub(super) mod tests {
                 .queued_bans
                 .contains_key(&key),
             "the accepted ban is queued"
+        );
+        Ok(())
+    }
+
+    /// #1765 (ADR 0110 §5 "Memory-only durability"): under a memory-only
+    /// sidecar a designated admin's seal waits with
+    /// `waiting_for_durable_intake` until the revocation-store write for
+    /// the row's record succeeds, then no longer waits for it.
+    #[tokio::test]
+    async fn a_memory_only_seal_waits_for_the_revocation_store_write() -> anyhow::Result<()> {
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let target_kp = x0x::identity::AgentKeypair::generate()?;
+        let target = target_kp.agent_id();
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(target),
+            target_kp.public_key(),
+            target_kp.secret_key(),
+            1,
+            None,
+        )?;
+        let group_id = "e6".repeat(16);
+        let mut info = group_with(*state.agent.agent_id().as_bytes(), *target.as_bytes());
+        info.mls_group_id = group_id.clone();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        let key = EvictionKey::new(stable, *target.as_bytes());
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.sidecar.state = SidecarState::SidecarNewerFormat;
+            inner.store.intake(
+                &key,
+                EvictionTrigger::AgentRevocation {
+                    record_hash: record.record_hash(),
+                    record_bytes: vec![1],
+                },
+                None,
+                0,
+                [0; 16],
+            );
+            inner.evaluations.insert(
+                key.clone(),
+                StoredEvaluation {
+                    permission: Some(CommitPermission::Designated),
+                    cause: None,
+                    action: RowAction::None,
+                    stable_group_key: group_id.clone(),
+                },
+            );
+        }
+        let intake = state.agent.s4_revocation_intake();
+        intake.note_verified(&record);
+        let wait = seal_wait(&state, &group_id, &key, SealMode::Manual).await;
+        assert_eq!(
+            wait.map(|(cause, _)| cause),
+            Some(WaitingCause::WaitingForDurableIntake),
+            "a record not yet in the revocation store holds the seal"
+        );
+        intake.note_durable(&intake.not_durable_hashes());
+        let wait = seal_wait(&state, &group_id, &key, SealMode::Manual).await;
+        assert_ne!(
+            wait.map(|(cause, _)| cause),
+            Some(WaitingCause::WaitingForDurableIntake),
+            "the written record no longer holds the seal"
         );
         Ok(())
     }

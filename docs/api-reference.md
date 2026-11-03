@@ -1749,7 +1749,8 @@ every wait. A wait always names its cause; it does not stop silently.
   - `local_committer_ineligible` — this admin may not seal (demoted,
     removed, revoked, left, or its own certificate expired).
   - `waiting_for_durable_intake` — the obligation is not on disk yet; the
-    daemon retries.
+    daemon retries. When the obligation file runs memory-only, a
+    revocation waits here until the revocation store holds it on disk.
   - `waiting_for_head_sync` — a catch-up round must finish first (for
     example after a restart).
   - `waiting_for_member_key_package` — the TreeKEM removal needs the

@@ -3034,10 +3034,9 @@ fn resolve_restart_identity(
         .filter(|dir| dir.is_dir())
         .ok_or_else(|| RestartOwnershipError::Unresolved {
             what: "install directory",
-            detail: format!(
-                "{} has no existing parent directory to hold the backup",
-                executable.display()
-            ),
+            detail: "the executable has no existing parent directory to hold the backup \
+                     (command values redacted)"
+                .to_string(),
         })?;
 
     let argv = current_argv();
@@ -3059,7 +3058,8 @@ fn resolve_restart_identity(
     if !data_root.is_dir() {
         return Err(RestartOwnershipError::Unresolved {
             what: "data root",
-            detail: format!("{} is not an existing directory", data_root.display()),
+            detail: "the data root is not an existing directory (command values redacted)"
+                .to_string(),
         });
     }
 
@@ -4047,6 +4047,58 @@ mod tests {
             ),
             SystemdPolicyReadback::Verified(_)
         ));
+    }
+
+    #[test]
+    fn restart_diagnostics_install_directory_refusal_redacts_the_executable() {
+        // The executable path is argv[0]-class command evidence: the apply-path
+        // refusal must name the unresolved contract, never the path (#1106).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("install-secret").join("x0xd");
+        let err = resolve_restart_plan(
+            true,
+            &shell_parent_signals(),
+            &binary,
+            None,
+            None,
+            &readback_na(),
+            &SystemdPolicyReadback::NotApplicable,
+        )
+        .expect_err("a missing install directory must not resolve");
+        assert_restart_error_redacted(&err, &["install-secret"]);
+        let message = err.to_string();
+        assert!(
+            message.contains("install directory"),
+            "the refusal must still name the contract: {message}"
+        );
+        assert!(
+            message.contains("No binaries were replaced"),
+            "the refusal must state that nothing was mutated: {message}"
+        );
+    }
+
+    #[test]
+    fn restart_diagnostics_data_root_refusal_redacts_the_resolved_root() {
+        // The data root is resolved from argv/config evidence: the same
+        // command-evidence redaction class as the executable above (#1106).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_root = dir.path().join("root-secret");
+        let err = resolve_restart_plan(
+            true,
+            &shell_parent_signals(),
+            &installed_binary(dir.path()),
+            Some(&data_root),
+            None,
+            &readback_na(),
+            &SystemdPolicyReadback::NotApplicable,
+        )
+        .expect_err("a non-directory data root must not resolve");
+        assert_restart_error_redacted(&err, &["root-secret"]);
+        assert!(
+            err.to_string().contains("data root"),
+            "the refusal must still name the contract: {}",
+            err
+        );
     }
 
     fn shell_parent_signals() -> SupervisionSignals {
