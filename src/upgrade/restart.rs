@@ -3229,7 +3229,8 @@ impl UpgradeHandoff {
 
     /// Canonical backup name for `target` (`x0xd.backup`) — the fallback when
     /// no fresh per-swap backup exists. The swap itself writes
-    /// `<target>.backup-<ver>-<pid>-<nanos>` and links this name to it.
+    /// `<target>.backup-<ver>-<pid>-<nanos>` and refreshes this name to a
+    /// separate copy of those bytes.
     pub fn backup_path_for(target_path: &Path) -> PathBuf {
         target_path.with_extension("backup")
     }

@@ -108,8 +108,13 @@ impl Upgrader {
     /// first one's rollback copy — its swap overwrote the shared file, and a
     /// late restore (HTTP deferred-restart owner, transactional-handoff
     /// helper) renamed away a backup another live transaction owned. Each
-    /// transaction now restores only the file its own swap created, so
-    /// concurrent transactions on one executable never collide.
+    /// transaction now restores only the file its own swap created, so a
+    /// concurrent transaction never destroys or consumes another
+    /// transaction's rollback copy. The *installed bytes* are still
+    /// unserialised across processes: restores rename without the host lock
+    /// (as on main), so a late restore can overwrite a later transaction's
+    /// installed release — #1106's lock-or-handoff question for restores,
+    /// flagged in the PR body.
     ///
     /// The canonical `<file>.backup` name is refreshed to the same bytes as a
     /// separate copy so path-deriving consumers (an equal-bytes-skip restart,
@@ -364,24 +369,37 @@ fn per_swap_backup_path(target: &Path, running_version: &Version) -> PathBuf {
 /// canonical name (a pre-#1106 swapper, or this fallback) truncates its
 /// destination before writing — emptying the running binary. A separate
 /// copy also survives the per-swap file being renamed onto the target by a
-/// restore. Best-effort: the per-swap file is the rollback token; the
-/// canonical name only serves path-deriving consumers. Called under the
-/// host lock, so remove+copy cannot interleave with another swapper.
+/// restore. The copy stages under a `.backup-partial-` name and renames, so
+/// a mid-copy failure (full disk) never leaves a truncated canonical file
+/// for a later skip-restart fallback to restore. Best-effort: the per-swap
+/// file is the rollback token; the canonical name only serves
+/// path-deriving consumers. Called under the host lock, so the swap cannot
+/// interleave with another swapper.
 fn refresh_canonical_backup(target: &Path, per_swap: &Path) {
     let canonical = target.with_extension("backup");
-    if canonical.exists() || std::fs::symlink_metadata(&canonical).is_ok() {
-        let _ = std::fs::remove_file(&canonical);
+    let staging = target.with_file_name(format!(
+        "{}.backup-partial-{}",
+        target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    if let Err(error) = std::fs::copy(per_swap, &staging).and_then(|_| {
+        std::fs::rename(&staging, &canonical).inspect_err(|_| {
+            // The staged copy is complete; only the atomic swap failed.
+            let _ = std::fs::remove_file(&staging);
+        })
+    }) {
+        let _ = std::fs::remove_file(&staging);
+        warn!(
+            canonical = %canonical.display(),
+            error = %error,
+            "cannot refresh the canonical backup name; the per-swap backup is unaffected"
+        );
+        return;
     }
-    match std::fs::copy(per_swap, &canonical) {
-        Ok(_) => refresh_mtime(&canonical),
-        Err(error) => {
-            warn!(
-                canonical = %canonical.display(),
-                error = %error,
-                "cannot refresh the canonical backup name; the per-swap backup is unaffected"
-            );
-        }
-    }
+    refresh_mtime(&canonical);
 }
 
 /// Reset a freshly written backup's mtime to now. `fs::copy` may preserve
@@ -389,18 +407,29 @@ fn refresh_canonical_backup(target: &Path, per_swap: &Path) {
 /// the bytes being preserved usually carry an install-date mtime; without
 /// this reset the startup sweep's age gate could reclaim a live
 /// transaction's backup the moment it is written (#1106 review finding).
+/// The backup file is created by this process, so it owns it and the reset
+/// cannot fail on permissions unless something changed the file in between.
 fn refresh_mtime(path: &Path) {
     if let Ok(file) = File::options().write(true).open(path) {
-        let _ = file.set_modified(std::time::SystemTime::now());
+        if let Err(error) = file.set_modified(std::time::SystemTime::now()) {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "cannot reset the backup mtime; the sweep's age gate may see it as old"
+            );
+        }
     }
 }
 
 /// True for per-swap backup files this module creates:
 /// `<file>.backup-<version>-<pid>-<nanos>`.
 ///
-/// Deliberately narrower than a bare `.backup-` substring so the dormant pair
-/// engine's `.backup-<version>-<transaction>` names (uuid transaction ids,
-/// not pid-nanos pairs) are never matched. Residual false positive: a uuid
+/// The version must parse as semver and the two trailing groups must be all
+/// digits, which keeps date-like operator files (`notes.backup-2026-01-15`,
+/// read as version `2026`) out of the sweep. Still deliberately narrower
+/// than a bare `.backup-` substring so the dormant pair engine's
+/// `.backup-<version>-<transaction>` names (uuid transaction ids, not
+/// pid-nanos pairs) are never matched. Residual false positive: a uuid
 /// whose last two dash groups are all digits (~0.05% per artifact) would
 /// match; the cost is only a skipped cleanup of that dormant artifact.
 fn is_per_swap_backup_name(name: &str) -> bool {
@@ -408,8 +437,8 @@ fn is_per_swap_backup_name(name: &str) -> bool {
         return false;
     };
     // `<version>-<pid>-<nanos>`: the two trailing dash segments are all
-    // digits and a nonempty version label precedes them. A version may carry
-    // dashes (prerelease), so only the tail is parsed.
+    // digits and a valid semver label precedes them. A version may carry
+    // dashes (prerelease), so only the tail is split off first.
     let mut tail = rest.rsplitn(3, '-');
     let nanos = tail.next().unwrap_or_default();
     let pid = tail.next().unwrap_or_default();
@@ -419,6 +448,7 @@ fn is_per_swap_backup_name(name: &str) -> bool {
         && !version.is_empty()
         && nanos.bytes().all(|b| b.is_ascii_digit())
         && pid.bytes().all(|b| b.is_ascii_digit())
+        && Version::parse(version).is_ok()
 }
 
 /// Exclusive OS lock (`std::fs::File::lock`: flock/fcntl on Unix, LockFileEx
@@ -666,8 +696,9 @@ pub(crate) fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std:
 /// a handoff still in flight — including a manual relaunch of a crashing new
 /// binary — must not lose its rollback bytes to the startup sweep.
 /// Per-swap backups (`<file>.backup-<version>-<pid>-<nanos>`, issue #1106)
-/// are age-gated identically for the same reason: a live handoff helper
-/// may still need its transaction's rollback bytes.
+/// and interrupted canonical refreshes (`<file>.backup-partial-<pid>`) are
+/// age-gated identically for the same reason: a live handoff helper may
+/// still need its transaction's rollback bytes.
 ///
 /// Returns the number of entries removed. All removal is best-effort.
 pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duration) -> usize {
@@ -704,7 +735,7 @@ pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duratio
         {
             info!(path = %path.display(), "Removed sidelined binary from prior upgrade");
             removed += 1;
-        } else if is_per_swap_backup_name(&name)
+        } else if (is_per_swap_backup_name(&name) || name.contains(".backup-partial-"))
             && entry_is_aged(&entry)
             && std::fs::remove_file(&path).is_ok()
         {
@@ -866,6 +897,15 @@ mod tests {
         upgrader.restore_from_backup(&backup_path).unwrap();
         assert_eq!(fs::read(&binary_path).unwrap(), b"original content");
         assert_eq!(fs::read(&canonical).unwrap(), b"original content");
+        // The staged refresh name is consumed by the rename, never left
+        // behind for a later restore to mistake for complete bytes.
+        assert!(
+            !dir.path().read_dir().unwrap().flatten().any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".backup-partial-")),
+            "no partial-refresh staging file may survive a successful backup"
+        );
     }
 
     /// #1106 review finding: `fs::copy` may preserve the source binary's
@@ -943,8 +983,8 @@ mod tests {
     }
 
     /// The sweep's per-swap matcher: this module's pid-nanos names match; the
-    /// canonical name and the dormant pair engine's uuid-transaction names do
-    /// not.
+    /// canonical name, the dormant pair engine's uuid-transaction names, and
+    /// date-like operator files do not.
     #[test]
     fn per_swap_backup_name_matcher_is_precise() {
         assert!(is_per_swap_backup_name(
@@ -957,6 +997,12 @@ mod tests {
             "x0xd.backup-1.0.0-3f2a8c1e-9d4b-4c6e-8a2f-1b0d5e7a9c31"
         ));
         assert!(!is_per_swap_backup_name("x0xd.exe.x0xold-17"));
+        // Date-like operator files in the install directory must never be
+        // swept as upgrade debris (review round-2 finding: `2026` etc. parse
+        // as pid/nanos groups but not as a semver version label).
+        assert!(!is_per_swap_backup_name("notes.backup-2026-01-15"));
+        assert!(!is_per_swap_backup_name("x0xd.backup-2024-01-15"));
+        assert!(!is_per_swap_backup_name("x0xd.backup-partial-123"));
     }
 
     #[test]
@@ -1272,6 +1318,8 @@ mod tests {
     /// Per-swap backups (#1106) are reclaimed by the startup sweep only past
     /// the age gate, so a live handoff keeps its rollback bytes while
     /// completed upgrades do not accumulate one ≤200 MiB file per swap.
+    /// Interrupted canonical refreshes (`*.backup-partial-*`) are reclaimed
+    /// the same way, and date-like operator files are never touched.
     #[test]
     fn sweep_reclaims_aged_per_swap_backups_but_spares_live_ones() {
         let dir = TempDir::new().unwrap();
@@ -1287,14 +1335,23 @@ mod tests {
             .path()
             .join("x0xd.backup-1.0.0-3f2a8c1e-9d4b-4c6e-8a2f-1b0d5e7a9c31");
         fs::write(&pair_artifact, b"pair").unwrap();
+        // An operator's date-named backup beside the binary is not upgrade
+        // debris and must survive the sweep (review round-2 finding).
+        let operator_file = dir.path().join("notes.backup-2026-01-15");
+        fs::write(&operator_file, b"operator notes").unwrap();
+        // A canonical refresh interrupted mid-copy stages under this name;
+        // an aged leftover is debris, a live one is an in-flight refresh.
+        let aged_partial = dir.path().join("x0xd.backup-partial-321");
+        fs::write(&aged_partial, b"partial").unwrap();
         age_file(&aged, std::time::Duration::from_secs(7200));
+        age_file(&aged_partial, std::time::Duration::from_secs(7200));
 
         let removed =
             sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(3600));
 
         assert_eq!(
-            removed, 1,
-            "only the aged per-swap backup should be removed"
+            removed, 2,
+            "only the aged per-swap backup and aged partial staging should be removed"
         );
         assert!(!aged.exists(), "aged per-swap backup must be reclaimed");
         assert!(
@@ -1309,6 +1366,11 @@ mod tests {
             pair_artifact.exists(),
             "pair-engine artifact names are not this module's debris"
         );
+        assert!(
+            operator_file.exists(),
+            "date-like operator files are not this module's debris"
+        );
+        assert!(!aged_partial.exists(), "aged partial staging is debris");
     }
 
     /// Backdate a file's mtime so the sweep's age gate sees it as old.
