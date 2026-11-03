@@ -1725,8 +1725,9 @@ async fn issue1346_winner_flip_across_open_charges_no_generation() {
     let mut job = tokio::spawn(Arc::clone(&f.context).connect(machine, None, None));
     // The unfixed code writes the Hello on the older link and charges the
     // sampled generation; drain and refuse it so its exchange settles
-    // inside the lease deadline. The fixed code sends nothing, so the
-    // settled job ends the wait instead of the drain's own timeout.
+    // inside the lease deadline. The fixed code opens, refuses the stamp
+    // mismatch and drops the stream; the drain disposes of that reset
+    // open, so neither path waits out the drain's 2 s bound.
     let drain = async {
         let _ = tokio::time::timeout(Duration::from_secs(2), async {
             let (_peer, mut send, mut recv) =
@@ -1753,7 +1754,13 @@ async fn issue1346_winner_flip_across_open_charges_no_generation() {
     tokio::pin!(drain);
     let settled = tokio::time::timeout(DEADLINE, async {
         tokio::select! {
-            settled = &mut job => settled,
+            settled = &mut job => {
+                // The refused open still queued a stream on the peer. Let
+                // the drain dispose of it (bounded by its own inner 2 s)
+                // instead of leaving it for the control's accept.
+                let _ = (&mut drain).await;
+                settled
+            }
             // The drained refusal only unblocks the job; keep waiting for it.
             _ = &mut drain => tokio::time::timeout(DEADLINE, &mut job)
                 .await
@@ -2298,7 +2305,9 @@ fn issue1346_gapped_in_order_eviction_does_not_block_older_follow() {
             .unwrap()
             .hello_out = Some(Instant::now() - HELLO_INTERVAL);
     };
-    for generation in [5, 6, 7, 8, 9] {
+    // The first attempt creates the budget the age gate writes to.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    for generation in [6, 7, 8, 9] {
         age_gate(&limits);
         assert!(limits.begin_hello_on_connection(machine, true, Some(generation)));
     }
