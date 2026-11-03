@@ -52579,6 +52579,16 @@ pub(in crate::server) mod tests {
         data_dir: &FsPath,
         agent: Arc<Agent>,
     ) -> Result<Arc<AppState>> {
+        secure_endpoint_test_state_at_with_self_update(data_dir, agent, false).await
+    }
+
+    /// #1169 fix round: upgrade-route tests need the self-update arm
+    /// switched on without touching the shared fixture default.
+    pub(in crate::server) async fn secure_endpoint_test_state_at_with_self_update(
+        data_dir: &FsPath,
+        agent: Arc<Agent>,
+        self_update_enabled: bool,
+    ) -> Result<Arc<AppState>> {
         let treekem_dir = data_dir.join("treekem");
         tokio::fs::create_dir_all(&treekem_dir).await?;
         let named_groups_path = data_dir.join("named_groups.json");
@@ -52774,7 +52784,7 @@ pub(in crate::server) mod tests {
             shutdown_tx,
             shutdown_notify,
             update_config: DaemonUpdateConfig::default(),
-            self_update_enabled: false,
+            self_update_enabled,
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             http_upgrade_wait_lock: Arc::new(Mutex::new(())),

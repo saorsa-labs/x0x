@@ -1105,16 +1105,18 @@ fn verify_gossip_release_with_key(payload: &[u8], trusted_key: &[u8]) -> Option<
 }
 
 /// #1169: a node that first observes a new release must not stay silent
-/// until each peer's fallback poll fires. Every live observation point —
-/// the every-launch manifest broadcast, the fallback poll, gossip relay,
-/// the `/upgrade` check and a manual `/upgrade/apply` — announces the
-/// signed manifest on `RELEASE_TOPIC`. (The startup check also has a
-/// publish site, but the daemon currently runs it with no agent, so boot
-/// coverage comes from the manifest broadcast.) The GitHub poll cadence
-/// stays at its documented fallback (A14 / ADR 0045); gossip is the fast
-/// path. Best effort and bounded: a stuck mesh must never block the
-/// observer, and peer rebroadcast limiting plus the apply owner's dedup
-/// handle repeats.
+/// until each peer's fallback poll fires. The announcing observation
+/// points — the every-launch manifest broadcast, the fallback poll, gossip
+/// relay and a manual `/upgrade/apply` — publish the signed manifest on
+/// `RELEASE_TOPIC`. The read-only `/upgrade` check announces nothing
+/// (Engineer ruling 3 Nov 2026 17:40 GMT): gossip self-delivery would feed
+/// this node's own apply owner, i.e. a background install triggered by a
+/// read. (The startup check also has a publish site, but the daemon
+/// currently runs it with no agent, so boot coverage comes from the
+/// manifest broadcast.) The GitHub poll cadence stays at its documented
+/// fallback (A14 / ADR 0045); gossip is the fast path. Best effort and
+/// bounded: a stuck mesh must never block the observer, and peer
+/// rebroadcast limiting plus the apply owner's dedup handle repeats.
 async fn announce_observed_release<Publish, PublishFuture>(
     release: &VerifiedRelease,
     publish: Publish,
@@ -1628,6 +1630,76 @@ async fn update_skill_inner(
 // Route handlers
 // ---------------------------------------------------------------------------
 
+/// #1169 fix-round test seam (cfg(test) only; no env vars, no cargo
+/// features): lets an in-process test inject the monitor answer that
+/// [`check_upgrade`] and [`apply_upgrade`] would have fetched and
+/// signature-verified, so the routes run for real without GitHub (the
+/// release private key is deliberately not in the repo, so no test can
+/// mint a signature the monitor would accept). Compiled out entirely in
+/// non-test builds; an uninstalled injection leaves the production fetch
+/// untouched.
+#[cfg(test)]
+mod upgrade_check_feed_seam {
+    use crate::upgrade::monitor::VerifiedRelease;
+    use std::cell::RefCell;
+
+    /// The injected monitor answer: `Some(release)` = a newer verified
+    /// release was found, `None` = already up to date.
+    type Answer = Option<VerifiedRelease>;
+
+    // Thread-local, like `skill_download_seam`: the route tests below call
+    // the handlers directly on the test's current-thread runtime, so a
+    // process-wide static could let sibling tests on other threads steal
+    // the answer and fall through to a real fetch.
+    thread_local! {
+        static INJECTED: RefCell<Option<Answer>> = const { RefCell::new(None) };
+    }
+
+    /// Uninstalls the injection on drop, so a test cannot leak its answer
+    /// into sibling tests on the same thread.
+    pub(super) struct Guard {
+        _private: (),
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            INJECTED.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    /// Inject the monitor's next answer for the guard's lifetime.
+    pub(super) fn install(answer: Answer) -> Guard {
+        INJECTED.with(|slot| *slot.borrow_mut() = Some(answer));
+        Guard { _private: () }
+    }
+
+    /// Take the injected answer, or `None` when nothing is installed
+    /// (fall through to the real monitor fetch).
+    pub(super) fn take() -> Option<Answer> {
+        INJECTED.with(|slot| slot.borrow_mut().take())
+    }
+}
+
+/// The update-monitor answer for a route: the injected test answer when
+/// installed, else the real fetch. Test builds only see the seam; the
+/// production body is the verbatim `check_for_updates` call.
+#[cfg(test)]
+async fn monitor_check(
+    monitor: &UpgradeMonitor,
+) -> Result<Option<crate::upgrade::monitor::VerifiedRelease>, x0x::upgrade::UpgradeError> {
+    match upgrade_check_feed_seam::take() {
+        Some(injected) => Ok(injected),
+        None => monitor.check_for_updates().await,
+    }
+}
+
+#[cfg(not(test))]
+async fn monitor_check(
+    monitor: &UpgradeMonitor,
+) -> Result<Option<crate::upgrade::monitor::VerifiedRelease>, x0x::upgrade::UpgradeError> {
+    monitor.check_for_updates().await
+}
+
 /// GET /upgrade — check for available updates.
 pub(in crate::server) async fn check_upgrade(State(state): State<Arc<AppState>>) -> Response {
     if !state.update_config.enabled {
@@ -1661,25 +1733,14 @@ pub(in crate::server) async fn check_upgrade(State(state): State<Arc<AppState>>)
             }
         };
 
-    match monitor.check_for_updates().await {
+    // Engineer ruling 3 Nov 2026 17:40 GMT: the /upgrade check is
+    // read-only and must never publish the release it observes — gossip
+    // self-delivery would feed the announcing node's own apply owner, a
+    // background install from a read. It answers and caches only; peers
+    // learn the release from an applying node, the fallback poll or
+    // relay. `monitor_check` carries the cfg(test) feed seam.
+    match monitor_check(&monitor).await {
         Ok(Some(release)) => {
-            // #1169: this fresh observation is the fleet's fastest chance to
-            // learn about the release; announce it before the (cached)
-            // response keeps every later check silent for the cache TTL.
-            // Gated like the apply paths: an embedder with self-update off
-            // gains no announce. With self-update on, note that gossip
-            // self-delivery can feed this node's own apply owner — the same
-            // fully gated pipeline any peer's announcement would enter.
-            if state.self_update_enabled {
-                let agent = Arc::clone(&state.agent);
-                announce_observed_release(&release, move |payload| async move {
-                    agent
-                        .publish(RELEASE_TOPIC, payload)
-                        .await
-                        .map_err(|error| error.to_string())
-                })
-                .await;
-            }
             store_upgrade_response(
                 state.as_ref(),
                 StatusCode::OK,
@@ -1824,7 +1885,7 @@ pub(in crate::server) async fn apply_upgrade(
             }
         };
 
-    let release = match monitor.check_for_updates().await {
+    let release = match monitor_check(&monitor).await {
         Ok(Some(r)) => r,
         Ok(None) => {
             return (
@@ -1860,6 +1921,15 @@ pub(in crate::server) async fn apply_upgrade(
     // their own fallback poll while this node already saw the release.
     // After the lock drop: a bounded-but-slow publish must not hold the
     // shared replacement lock away from background and startup applies.
+    // The only announcing route: an explicit owner action on a release
+    // this node is already installing. Self-delivery does return the
+    // announcement to this node's own gossip listener, so with gossip
+    // updates on the same version also enters the background apply owner
+    // — a duplicate attempt of an operator-requested release, serialized
+    // by the shared apply lock and version dedup, not a new install
+    // decision. Recording the payload as self-published (so the driver
+    // skips the rebroadcast and the submit) needs the shared tracker on
+    // AppState (src/server/mod.rs, held by #1774).
     {
         let agent = Arc::clone(&state.agent);
         announce_observed_release(&release, move |payload| async move {
@@ -2366,9 +2436,11 @@ mod tests {
         assert_eq!(decision_after_ttl, ReleaseRebroadcastDecision::Rebroadcast);
     }
 
-    // #1169: every observation point must announce a newly observed release
-    // on RELEASE_TOPIC, so subscribed peers never wait for their own
-    // fallback poll.
+    // #1169: an applying node must announce a newly observed release on
+    // RELEASE_TOPIC, so subscribed peers never wait for their own fallback
+    // poll. The read-only /upgrade check announces nothing (Engineer ruling
+    // 3 Nov 2026 17:40 GMT): a check-path announce self-delivers and feeds
+    // this node's own apply owner — a background install from a read.
 
     fn verified_release_with_version(version: &str) -> VerifiedRelease {
         let manifest = manifest_with_version(version);
@@ -2515,6 +2587,206 @@ mod tests {
             queued.lock().unwrap().as_slice(),
             &[(expected_version, SubmitOutcome::Accepted)],
             "the subscribed peer started its own update check from the announcement"
+        );
+    }
+
+    // Route-level coverage for the 17:40 GMT ruling and the call sites
+    // Claude's a8cf431f review asked about (round 5, finding 2): a real
+    // AppState through the shared fixture and a loopback-only gossip
+    // runtime, so any publish attempt is observable.
+
+    /// A gossip agent bound to loopback only (no bootstrap nodes, no
+    /// mDNS, no port mapping): its pubsub works in-process, so tests
+    /// observe publishes — including self-delivery — with no real network.
+    async fn loopback_gossip_agent(data_dir: &std::path::Path) -> Arc<Agent> {
+        Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().expect("agent key"))
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_network_config(crate::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
+                    bootstrap_nodes: Vec::new(),
+                    port_mapping_enabled: false,
+                    mdns_enabled: false,
+                    ..crate::network::NetworkConfig::default()
+                })
+                .build()
+                .await
+                .expect("loopback gossip agent"),
+        )
+    }
+
+    async fn upgrade_route_state(agent: Arc<Agent>, data_dir: &std::path::Path) -> Arc<AppState> {
+        super::super::named_groups::tests::secure_endpoint_test_state_at_with_self_update(
+            data_dir, agent, true,
+        )
+        .await
+        .expect("upgrade route state")
+    }
+
+    async fn route_response_json(
+        response: axum::response::Response,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("response body");
+        (
+            parts.status,
+            serde_json::from_slice(&bytes).expect("response json"),
+        )
+    }
+
+    /// Engineer ruling 3 Nov 2026 17:40 GMT: GET /upgrade is a read-only
+    /// check and must never publish the release it observes — gossip
+    /// self-delivery would feed this node's own apply owner, a background
+    /// install from a read. The self-update flag is on (it armed the
+    /// removed announce), and a publish attempt would show in both the
+    /// pubsub publish counter and on the topic itself. Fails when the
+    /// removed announce block is present; passes when the check answers
+    /// and caches only.
+    #[tokio::test]
+    async fn upgrade_check_finding_a_release_publishes_nothing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let mut release_topic = agent
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("release topic subscription");
+        let pubsub = agent
+            .gossip_runtime
+            .as_ref()
+            .expect("loopback gossip runtime")
+            .pubsub();
+        let publishes_before = pubsub.stats().publish_total;
+
+        let expected = version_newer_than_current();
+        let _feed =
+            upgrade_check_feed_seam::install(Some(verified_release_with_version(&expected)));
+        let (status, body) =
+            route_response_json(check_upgrade(State(Arc::clone(&state))).await).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["update_available"], serde_json::json!(true));
+        assert_eq!(body["version"], serde_json::json!(expected));
+        assert!(
+            state.upgrade_check_cache.lock().await.is_some(),
+            "the check still answers and caches normally: {body}"
+        );
+        assert_eq!(
+            pubsub.stats().publish_total,
+            publishes_before,
+            "the read-only check must not publish the release it observes"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), release_topic.recv())
+                .await
+                .is_err(),
+            "nothing may self-deliver on the release topic from a check"
+        );
+    }
+
+    /// The apply path is the one announcing route: an explicit owner
+    /// action announces before its apply work (the 17:40 GMT ruling keeps
+    /// it; the read-only check lost its announce). The apply itself
+    /// refuses fast here — the test state carries no staging identity —
+    /// which also keeps the test hermetic: no archive download, and the
+    /// probe retry never starts because the install path is pointed at
+    /// nothing. The self-delivery consequence of the same announcement is
+    /// covered by the publishing-node test above. Unix-gated like the
+    /// staging apply suites it leans on (`current_binary_path_seam` and
+    /// the staging refusal are unix-only test surface).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_upgrade_announces_the_release_it_applies() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let state = upgrade_route_state(Arc::clone(&agent), dir.path()).await;
+        let mut release_topic = agent
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("release topic subscription");
+        let pubsub = agent
+            .gossip_runtime
+            .as_ref()
+            .expect("loopback gossip runtime")
+            .pubsub();
+        let publishes_before = pubsub.stats().publish_total;
+        let _no_install =
+            crate::upgrade::apply::current_binary_path_seam::install(dir.path().join("no-binary"));
+
+        let verified = verified_release_with_version(&version_newer_than_current());
+        let expected_payload = verified.gossip_payload.clone();
+        let _feed = upgrade_check_feed_seam::install(Some(verified));
+        let (status, body) = route_response_json(
+            apply_upgrade(State(Arc::clone(&state)), Query(Default::default()))
+                .await
+                .into_response(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["applied"], serde_json::json!(false));
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("staging")),
+            "the refusal is the fast staging-unavailable one: {body}"
+        );
+        assert_eq!(
+            pubsub.stats().publish_total,
+            publishes_before + 1,
+            "the announcing route publishes exactly once before its apply work"
+        );
+        let received = tokio::time::timeout(Duration::from_secs(5), release_topic.recv())
+            .await
+            .expect("the announcement self-delivers within the timeout")
+            .expect("subscription still live");
+        assert_eq!(
+            &received.payload[..],
+            expected_payload.as_slice(),
+            "the announced payload is the verified gossip payload"
+        );
+    }
+
+    /// The mechanism behind the ruling: a node that publishes an
+    /// announcement on the release topic receives its own publication back
+    /// (gossip self-delivery), and its listener would feed that payload to
+    /// the node's own apply owner — why the read-only /upgrade check must
+    /// not announce. The publish below is the announce helper's, through a
+    /// real loopback gossip runtime; no peers, no testnet.
+    #[tokio::test]
+    async fn observed_release_announcement_self_delivers_to_the_publishing_node() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = loopback_gossip_agent(dir.path()).await;
+        let mut release_topic = agent
+            .subscribe(RELEASE_TOPIC)
+            .await
+            .expect("release topic subscription");
+
+        let verified = verified_release_with_version(&version_newer_than_current());
+        let expected_payload = verified.gossip_payload.clone();
+        let publishing_agent = Arc::clone(&agent);
+        announce_observed_release(&verified, move |payload| async move {
+            publishing_agent
+                .publish(RELEASE_TOPIC, payload)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await;
+
+        let received = tokio::time::timeout(Duration::from_secs(5), release_topic.recv())
+            .await
+            .expect("self-delivery within the timeout")
+            .expect("subscription still live");
+        assert_eq!(
+            &received.payload[..],
+            expected_payload.as_slice(),
+            "the publishing node receives its own announcement back"
         );
     }
 
