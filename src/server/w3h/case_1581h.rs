@@ -21,11 +21,9 @@
 //! guards the other side of line 378: if the wait ever appears for a
 //! chain-durable trigger, the arm fails with
 //! [`CAUSE_DURABLE_WAIT_SHOWN`]. Line 451's "a new trigger whose
-//! evidence is not yet in the revocation store" names the other kind —
-//! a trigger with no durable record anywhere — and S4 derives no such
-//! trigger today, so that variant is not drivable and is recorded by
-//! name below (the FOR ENGINEER question on the PR body asks David to
-//! confirm this reading of line 451 against line 378).
+//! evidence is not yet in the revocation store" is a revocation whose
+//! revocation-store write has not succeeded: the #1765 unit test
+//! `a_memory_only_seal_waits_for_the_revocation_store_write` holds it.
 //!
 //! Harness honesty:
 //!
@@ -51,10 +49,8 @@
 //!   can never reach the restarted A (left members are not catch-up
 //!   candidates). Recorded by name below.
 //!
-//! Not covered, by name: line 451's new trigger with no durable record
-//! anywhere (S4 derives no such trigger today — every kind is durable
-//! in the revocation store, on the verified chain or as a committed
-//! certificate, per the §5 comment in `revocation_eviction.rs`); the
+//! Not covered, by name: line 451's new trigger whose evidence is not
+//! yet in the revocation store (see #1765); the
 //! rebuilt row's fresh T_obs (the budget restart at re-derivation —
 //! the case proves the one-rotation completion but not the reset
 //! timing); the
