@@ -491,6 +491,68 @@ jobs:
             ${{ runner.temp }}/x0x-isolation-*/
           if-no-files-found: error
 
+  # ADR 0109 H-S3-home released-binary gate (#1571). It runs the published
+  # v0.45.0 and v0.46.1 daemons against the real Home placeholder rule.
+  # The run has about 30 minutes of real-time waits, so it is its own job
+  # and the Test Suite shards do not carry it. It is not a required check.
+  # nextest-isolated.sh fetches the pinned binaries before the loopback-only
+  # namespace (scripts/ci/prepare-released-h-s3-home.sh).
+  h-s3-home-released:
+    name: H-S3-home released binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache cargo registry and sources
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-rust-1.95.0-h-s3-home-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Resolve test dependency graph
+        run: cargo metadata --locked --format-version 1 >/dev/null
+
+      - name: Cache released-binary target
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-rust-1.95.0-h-s3-home-target-${{ hashFiles('Cargo.lock', '**/Cargo.toml', 'scripts/ci/prepare-released-h-s3-home.sh') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.144
+
+      - name: Run H-S3-home against v0.45.0 and v0.46.1
+        env:
+          X0X_ISOLATION_ROLE: h-s3-home-released
+          X0X_RUNTIME_TIMEOUT_SECONDS: 3000
+        run: >-
+          bash scripts/ci/nextest-isolated.sh --locked --test h_s3_home_released --
+          --run-ignored ignored-only --no-tests=fail
+
+      - name: Upload H-S3-home custody
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: h-s3-home-released
+          # The reports and the released daemon logs only; the run data
+          # directories hold identity keys and the API token.
+          path: |
+            ${{ runner.temp }}/x0x-metadata-*/
+            ${{ runner.temp }}/x0x-isolation-*/
+            target/h-s3-home/*-report.json
+            target/h-s3-home/*/*/std*-*.log
+          if-no-files-found: warn
+
   linux-systemd-policy:
     name: Linux systemd policy acceptance
     runs-on: ubuntu-latest
@@ -596,9 +658,9 @@ jobs:
   w3h-plan:
     # Names the case groups for the matrix. A case is in exactly one group.
     # S3 (`w3h_1356_`) and S4 (`w3h_1357_`) each have a group, so more of
-    # those cases extend that shard only. The H-S3-c/c2/c3/d8/d3 rows each
-    # have their own S3 group (`s3-c`, `s3-c2`, `s3-c3`, `s3-d8`, `s3-d3`).
-    # A group is omitted when the tree has no matching test.
+    # those cases extend that shard only. The H-S3-c/c2/c3/d8 rows each have
+    # their own S3 group (`s3-c`, `s3-c2`, `s3-c3`, `s3-d8`). A group is omitted
+    # when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -625,8 +687,8 @@ jobs:
     name: W3-H shard (${{ matrix.group }})
     needs: w3h-plan
     runs-on: ubuntu-latest
-    # Every S3 group (`s3`, and `s3-c`, `s3-c2`, `s3-c3`, `s3-d8`, `s3-d3`
-    # for the H-S3-c/c2/c3/d8/d3 owner-axis rows) gets 185 min (Engineer ruling, 30 Oct, 165 min;
+    # Every S3 group (`s3`, and `s3-c`, `s3-c2`, `s3-c3`, `s3-d8` for the
+    # H-S3-c/c2/c3/d8 owner-axis rows) gets 185 min (Engineer ruling, 30 Oct, 165 min;
     # raised by option (b) of the 31 Oct ruling, #1727). Every other group
     # keeps 120 min. The isolated test phase has its own deadline
     # (`X0X_RUNTIME_TIMEOUT_SECONDS` below), which must also fit inside this
@@ -910,6 +972,8 @@ jobs:
           --expect w3h_1356_red_s3_t_deferred_until_host_commit=GREEN
           --require w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear
           --expect w3h_1356_red_s3_d5_sibling_marker_needs_manual_clear=GREEN
+          --require w3h_1356_control_s3_d4_reseat_route_refusals
+          --expect w3h_1356_control_s3_d4_reseat_route_refusals=GREEN
           --require w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node
           --expect w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node=GREEN
           --require w3h_1356_red_s3_c2_reseat_retires_marker_and_gap
@@ -938,6 +1002,14 @@ jobs:
           --expect w3h_1581e_red_crash_commit_fork_contained=RED
           --require w3h_1581e_control_crash_commit_same_chain_resume
           --expect w3h_1581e_control_crash_commit_same_chain_resume=GREEN
+          --require w3h_1581f_control_local_authority_exit_revoked_committer
+          --expect w3h_1581f_control_local_authority_exit_revoked_committer=GREEN
+          --require w3h_1581f_red_local_authority_exit_demoted_form
+          --expect w3h_1581f_red_local_authority_exit_demoted_form=RED
+          --require w3h_1581g_control_sidecar_lifecycle_evs_damage_rebuilds
+          --expect w3h_1581g_control_sidecar_lifecycle_evs_damage_rebuilds=GREEN
+          --require w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume
+          --expect w3h_1581g_red_sidecar_lifecycle_journal_and_pending_resume=GREEN
           --require w3h_1581d_control_evidence_holder_resume_after_holder_returns
           --expect w3h_1581d_control_evidence_holder_resume_after_holder_returns=GREEN
           --require w3h_1581d_red_evidence_holder_all_holders_offline
@@ -946,6 +1018,10 @@ jobs:
           --expect w3h_1581d_control_unrelated_decrypt_error_is_not_exclusion=INFRA
           --require w3h_1581d_control_completion_past_the_budget_is_red
           --expect w3h_1581d_control_completion_past_the_budget_is_red=RED
+          --require w3h_1581h_control_sidecar_rebuild_body_damage_rederives
+          --expect w3h_1581h_control_sidecar_rebuild_body_damage_rederives=GREEN
+          --require w3h_1581h_control_sidecar_rebuild_newer_file_memory_only
+          --expect w3h_1581h_control_sidecar_rebuild_newer_file_memory_only=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable
@@ -1025,6 +1101,16 @@ jobs:
 
       - name: Run the instance-lock suite
         run: cargo test --lib instance_lock
+
+      # #1588: the Windows flush owner (named pipe, boot clock, record
+      # directory barrier) and the `x0x start --foreground` exit propagation
+      # were compile-only. These selectors are inert: temp dirs, local pipes
+      # and child `cmd` processes only, no daemon and no network.
+      - name: Run the Windows flush-owner suite
+        run: cargo test --lib windows_exec_regressions
+
+      - name: Run the upgrade journal integration tests
+        run: cargo test --test upgrade_journal
 
   coverage:
     name: Coverage Gate

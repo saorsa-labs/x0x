@@ -941,6 +941,14 @@ pub struct Agent {
     /// [`Agent::send_treekem_refusal_reply`] — so one pair is answered
     /// once per window across paths. See `direct::TreeKemRefusalReplies`.
     treekem_refusal_replies: std::sync::Arc<direct::TreeKemRefusalReplies>,
+    /// #1664: the test egress recorder for machine-addressed DATA replies
+    /// (a TreeKEM catch-up page, a control-blob chunk) — every
+    /// `(MachineId, payload)` this node addresses to a requesting machine
+    /// on the raw-QUIC DM lane, so a test can assert WHERE an answer went
+    /// (offline agents have no transport, so the addressing decision is
+    /// the observable). Test builds only.
+    #[cfg(test)]
+    machine_reply_egress: std::sync::Mutex<Vec<(identity::MachineId, Vec<u8>)>>,
     /// ADR-0043 review-r5: ceremony gate mirrored on the agent so the
     /// LIBRARY API (`move_authorize`/`move_export`/`move_import`/
     /// `move_activate`/`move_abort`/`move_retire`) is unreachable when
@@ -3937,22 +3945,11 @@ async fn apply_legacy_revocation_records(
         persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
     }
     if !newly_inserted.is_empty() {
-        let persisted_bytes = revocation_set.read().await.to_bytes();
-        let id_dir = identity_dir.clone();
-        tokio::spawn(async move {
-            match persisted_bytes {
-                Ok(bytes) => {
-                    if let Err(e) =
-                        storage::save_revocation_set_bytes(bytes, id_dir.as_deref()).await
-                    {
-                        if !storage::revocation_persistence_is_blocked(&e) {
-                            tracing::warn!("failed to persist revocation set: {e}");
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("failed to encode revocation set for persistence: {e}"),
-            }
-        });
+        spawn_persist_s4_revocations(
+            std::sync::Arc::clone(revocation_set),
+            s4_intake.clone(),
+            identity_dir.clone(),
+        );
         for record in newly_inserted {
             match &record.subject {
                 revocation::RevokedSubject::Agent(agent_id) => {
@@ -4008,6 +4005,7 @@ async fn apply_v2_revocation_records(
 ) {
     let mut inserted = false;
     let mut share_grant_inserted = false;
+    let mut v1_inserted = false;
     {
         let _share_grant_barrier = owner_trust
             .share_grant_revocation_barrier(&records, revocation_set)
@@ -4032,6 +4030,11 @@ async fn apply_v2_revocation_records(
                     s4_intake.note_verified(&hook_record);
                     inserted = true;
                     share_grant_inserted |= is_share_grant;
+                    v1_inserted |= matches!(
+                        hook_record.subject,
+                        revocation::RevokedSubject::Agent(_)
+                            | revocation::RevokedSubject::Machine(_)
+                    );
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -4047,13 +4050,28 @@ async fn apply_v2_revocation_records(
         let persisted = revocation_set.read().await.to_bytes_v2();
         let id_dir = identity_dir.clone();
         tokio::spawn(async move {
-            if let Ok(bytes) = persisted {
-                if let Some(dir) = id_dir {
-                    let _ = storage::save_private_bytes_to(&dir.join("revocations-v2.bin"), bytes)
-                        .await;
+            let saved = match (persisted, id_dir) {
+                (Ok(bytes), Some(dir)) => {
+                    storage::save_private_bytes_to(&dir.join("revocations-v2.bin"), bytes).await
+                }
+                (Ok(_), None) => Ok(()),
+                (Err(e), _) => Err(e),
+            };
+            if let Err(e) = saved {
+                if !storage::revocation_persistence_is_blocked(&e) {
+                    tracing::warn!("failed to persist v2 revocation set: {e}");
                 }
             }
         });
+    }
+    // An Agent or Machine subject lives in the v1 store, never in
+    // `revocations-v2.bin`; S4 waits for that write (#1765).
+    if v1_inserted {
+        spawn_persist_s4_revocations(
+            std::sync::Arc::clone(revocation_set),
+            s4_intake.clone(),
+            identity_dir.clone(),
+        );
     }
     persist_completed_revocation_rebuild(revocation_set, identity_dir.as_deref()).await;
 }
@@ -6831,6 +6849,106 @@ fn raw_dm_history_record(
 
 /// File (in the identity dir) holding ADR-0070 share-grant revocations.
 pub(crate) const SHARE_GRANT_REVOCATIONS_FILE: &str = "revocations-v3.bin";
+
+/// First delay before a failed revocation-store write that S4 waits for
+/// is retried (#1765). Each retry doubles it up to [`S4_PERSIST_RETRY_MAX`].
+const S4_PERSIST_RETRY_MIN: std::time::Duration = std::time::Duration::from_millis(250);
+/// Largest delay between those retries.
+const S4_PERSIST_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The live-route record hashes that a snapshot of `set` holds. Each
+/// live route notes a record under the set's write guard, after the
+/// insert. A pending hash that is not in the set has left it (the TTL
+/// sweep) before any write held it, so its evidence is not on disk.
+fn s4_pending_in_set(
+    set: &revocation::RevocationSet,
+    s4_intake: &groups::eviction::RevocationIntake,
+) -> std::collections::BTreeSet<[u8; 32]> {
+    let mut pending = s4_intake.not_durable_hashes();
+    pending.retain(|hash| set.contains_hash(hash));
+    pending
+}
+
+/// Write the v1 revocation store, which holds every Agent subject, and
+/// tell S4 which live-route records are durable now (ADR 0110 §5,
+/// "Memory-only durability"; #1765). The pending hashes and the bytes
+/// come from one read of the set, and only a hash in those bytes becomes
+/// durable. A record that left the set before a write held it stays not
+/// durable, and its row keeps `waiting_for_durable_intake`.
+async fn persist_s4_revocations(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    s4_intake: &groups::eviction::RevocationIntake,
+    identity_dir: Option<&std::path::Path>,
+) -> error::Result<()> {
+    let (written, bytes) = {
+        let set = revocation_set.read().await;
+        (s4_pending_in_set(&set, s4_intake), set.to_bytes()?)
+    };
+    storage::save_revocation_set_bytes(bytes, identity_dir).await?;
+    s4_intake.note_durable(&written);
+    Ok(())
+}
+
+/// Whether a record that a store write can still make durable waits for it.
+async fn s4_store_write_pending(
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    s4_intake: &groups::eviction::RevocationIntake,
+) -> bool {
+    !s4_pending_in_set(&*revocation_set.read().await, s4_intake).is_empty()
+}
+
+/// [`persist_s4_revocations`] off the receive path. A failed write is
+/// logged and retried with backoff while S4 still waits for a record, so
+/// the row shows `waiting_for_durable_intake` until a write succeeds. A
+/// blocked store logs through its own rate limit and is not retried here.
+/// One task per node retries; a second failed write leaves its records to
+/// that task, which reads the pending hashes again on each attempt.
+fn spawn_persist_s4_revocations(
+    revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    s4_intake: groups::eviction::RevocationIntake,
+    identity_dir: Option<std::path::PathBuf>,
+) {
+    tokio::spawn(async move {
+        let dir = identity_dir.as_deref();
+        match persist_s4_revocations(&revocation_set, &s4_intake, dir).await {
+            Ok(()) => return,
+            Err(e) if storage::revocation_persistence_is_blocked(&e) => return,
+            Err(e) => tracing::warn!(
+                "failed to persist revocation set (S4 waiting_for_durable_intake): {e}"
+            ),
+        }
+        if !s4_intake.claim_persist_retry() {
+            return;
+        }
+        let mut delay = S4_PERSIST_RETRY_MIN;
+        loop {
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(S4_PERSIST_RETRY_MAX);
+            match persist_s4_revocations(&revocation_set, &s4_intake, dir).await {
+                Ok(()) => {}
+                Err(e) if storage::revocation_persistence_is_blocked(&e) => {
+                    s4_intake.release_persist_retry();
+                    return;
+                }
+                Err(e) => tracing::warn!(
+                    retry = ?delay,
+                    "failed to persist revocation set (S4 waiting_for_durable_intake): {e}"
+                ),
+            }
+            if s4_store_write_pending(&revocation_set, &s4_intake).await {
+                continue;
+            }
+            s4_intake.release_persist_retry();
+            // A write that failed before the release left its records to
+            // this task: take them back unless a new task has them.
+            if !s4_store_write_pending(&revocation_set, &s4_intake).await
+                || !s4_intake.claim_persist_retry()
+            {
+                return;
+            }
+        }
+    });
+}
 
 /// After a trusted authority opens a carrier, write that live file (#1116).
 ///
@@ -10366,6 +10484,394 @@ impl Agent {
         .await;
     }
 
+    /// #1664: send one DATA reply machine-addressed on the raw-QUIC DM
+    /// lane — to the machine whose authenticated request this node is
+    /// answering, never "whichever device currently resolves for the
+    /// agent". A revoked device that still holds the portable agent key
+    /// can be exactly that resolution (discovery cache, capability
+    /// binding, newest connection), so an ordinary agent-addressed send
+    /// ([`Self::send_direct_with_config`]) can hand it a page or a chunk
+    /// meant for the clean device that asked.
+    ///
+    /// Gates: the ADR-0043 signing gate (the same egress refusal as every
+    /// DM path), the raw payload bound, and — review rounds 1 and 2 — the
+    /// full revocation ladder (agent, machine, binding/placement, resync)
+    /// re-read HERE at the send: a chunk serve can park and read the blob
+    /// after the handler's ladder decision, so a revocation landing in
+    /// that window still finds this send closed under its own sentence. A
+    /// reply addressed to this daemon's own (agent, machine) pair is
+    /// delivered through the same loopback path an ordinary self-addressed
+    /// DM takes.
+    ///
+    /// #1664: send one machine-addressed DATA answer (a TreeKEM catch-up
+    /// page, a control-blob chunk) to `machine_id` — the machine the
+    /// answered request authenticated (QUIC on a direct DM; the
+    /// machine-key attestation or a stored binding when the DM arrived
+    /// over gossip). The
+    /// answer rides the SAME pinned exchange a join-result chunk uses
+    /// ([`Self::send_direct_pinned_admitted_machine_inner`]): the connect
+    /// ladder (repair, then the pinned redial of exactly the asking
+    /// machine), then one `send_direct_pinned` write, with this agent's
+    /// revocation sentences and the ADR-0043 B/P pairing re-checked at
+    /// the stream seam, AFTER the dial (Engineer ruling, 31 Oct 2026
+    /// 09:00 GMT). A lost exchange is the requester's own re-ask (the
+    /// backstop), never a gossip fallback: a fallback can reach the wrong
+    /// device. The entry re-reads below are the fast-fail half; the seam
+    /// re-reads them at the write.
+    pub(crate) async fn send_machine_addressed_dm(
+        &self,
+        requester: &identity::AgentId,
+        machine_id: identity::MachineId,
+        payload: &[u8],
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*requester);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
+            self.direct_messaging.record_outgoing_failed(*requester);
+            return Err(dm::DmError::PayloadTooLarge {
+                len: payload.len(),
+                max: direct::MAX_DIRECT_PAYLOAD_SIZE,
+            });
+        }
+        if *requester == self.identity.agent_id() {
+            if machine_id != self.identity.machine_id() {
+                self.direct_messaging.record_outgoing_failed(*requester);
+                return Err(dm::DmError::NoConnectivity(
+                    "a machine-addressed reply names another machine of this agent".to_string(),
+                ));
+            }
+            #[cfg(test)]
+            if let Ok(mut egress) = self.machine_reply_egress.lock() {
+                egress.push((machine_id, payload.to_vec()));
+            }
+            self.direct_messaging
+                .record_outgoing_started(*requester, None);
+            let delivered = self
+                .direct_messaging
+                .handle_loopback(
+                    self.identity.machine_id(),
+                    self.identity.agent_id(),
+                    payload.to_vec(),
+                )
+                .await;
+            let receipt = dm_send::loopback_receipt();
+            self.direct_messaging
+                .record_outgoing_succeeded(*requester, receipt.path);
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "machine_reply",
+                outcome = "loopback",
+                delivered_subscribers = delivered,
+                "machine-addressed data reply delivered on the loopback path"
+            );
+            return Ok(receipt);
+        }
+        // Review round 2, finding 1: re-read EVERY revocation sentence for
+        // the exact (requester, machine) pair at the send — the caller's
+        // ladder decision can predate the chunk read that followed it.
+        // `recipient_pairing_denied` below covers the binding and placement
+        // only; the agent, machine and resync sentences are read here.
+        // r4: this is now the fast-fail half only — the pinned exchange's
+        // seam re-reads the same sentences at the stream write, AFTER the
+        // dial, so a revocation landing during the connect still refuses.
+        {
+            let revocation_set = self.revocation_set.read().await;
+            if revocation_set.is_agent_revoked(requester)
+                || revocation_set.is_machine_revoked(&machine_id)
+                || revocation_set.revocation_resync_required()
+            {
+                drop(revocation_set);
+                self.direct_messaging.record_outgoing_failed(*requester);
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "machine_reply",
+                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                    outcome = "machine_reply_revoked_at_send",
+                    "machine-addressed data reply withheld: a revocation for this (agent, machine) pair landed before the write"
+                );
+                return Err(dm::DmError::EnvelopeConstruction(
+                    "recipient revoked at the send (agent, machine or resync)".to_string(),
+                ));
+            }
+        }
+        if let Some(denial) = self.recipient_pairing_denied(requester, &machine_id).await {
+            self.direct_messaging.record_outgoing_failed(*requester);
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "machine_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "machine_reply_pairing_denied",
+                denial = ?denial,
+                "machine-addressed data reply withheld: the pairing was denied at the send"
+            );
+            return Err(dm::DmError::EnvelopeConstruction(format!(
+                "recipient pairing denied (ADR-0043 B/P): {denial:?}"
+            )));
+        }
+        // #1664 r4 (Engineer ruling, 31 Oct 2026 09:00 GMT): the answer
+        // rides the SAME pinned exchange a join-result chunk uses — the
+        // connect ladder (repair, then the pinned redial of exactly the
+        // asking machine), then one `send_direct_pinned` write, with this
+        // agent's revocation sentences and the ADR-0043 B/P pairing
+        // re-checked at the stream seam, AFTER the dial. A lost exchange
+        // is the requester's own re-ask (the backstop), never a gossip
+        // fallback: a fallback can reach the wrong device.
+        self.direct_messaging
+            .record_outgoing_started(*requester, None);
+        let admission: dm::ArtifactAdmission = std::sync::Arc::new(|| {
+            Box::pin(async { Some(Box::new(|| true) as dm::SeamAdmission) })
+        });
+        let exchange = self
+            .send_direct_pinned_admitted_machine_inner(requester, machine_id, payload, &admission);
+        match tokio::time::timeout(direct::MACHINE_ADDRESSED_EXCHANGE_TIMEOUT, exchange).await {
+            Ok(Ok(receipt)) => {
+                self.direct_messaging
+                    .record_outgoing_succeeded(*requester, receipt.path);
+                Ok(receipt)
+            }
+            Ok(Err(error)) => {
+                self.direct_messaging.record_outgoing_failed(*requester);
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "machine_reply",
+                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                    error = %error,
+                    outcome = "machine_reply_send_failed",
+                    "failed to send the machine-addressed data reply to the requesting machine"
+                );
+                Err(error)
+            }
+            Err(_) => {
+                self.direct_messaging.record_outgoing_failed(*requester);
+                tracing::debug!(
+                    target: "x0x::direct",
+                    stage = "machine_reply",
+                    machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                    outcome = "machine_reply_send_timeout",
+                    "timed out sending the machine-addressed data reply to the requesting machine"
+                );
+                Err(dm::DmError::NoConnectivity(
+                    "machine-addressed data reply exchange timed out".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// #1664: [`Self::send_direct_pinned_admitted`] with the target FIXED
+    /// to the machine the answered request authenticated (QUIC on a
+    /// direct DM; attestation or stored binding over gossip),
+    /// instead of the recipient's (moveable) binding resolution. Used by
+    /// the join-artifact exchange for a chunk that ANSWERS a control-blob
+    /// fetch: the admission seam still re-checks this agent's revocation
+    /// state and the ADR-0043 B/P pairing for the exact (agent, machine)
+    /// pair at the stream seam, but `check_binding` is false — the
+    /// requester's own binding may legitimately name a different machine
+    /// (a revoked device that still holds the agent key can hold the
+    /// newest advert), and the fetch DM authenticated this machine
+    /// directly. Callers bound the exchange with their own deadline.
+    pub(crate) async fn send_direct_pinned_admitted_machine(
+        &self,
+        to: &identity::AgentId,
+        machine_id: identity::MachineId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        // ADR-0043 signing gate: the same egress refusal the general path
+        // applies before any envelope or transport work.
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        if *to == self.identity.agent_id() {
+            return Err(dm::DmError::NoConnectivity(
+                "a pinned recovery-response send is never self-addressed".to_string(),
+            ));
+        }
+        // G14: a logical DM send like any other. No phi "likely offline"
+        // short-circuit: these sends answer the recipient's own fetch, and a
+        // stale suspicion must not suppress the recovery.
+        self.direct_messaging.record_outgoing_started(*to, None);
+        let result = self
+            .send_direct_pinned_admitted_machine_inner(to, machine_id, payload, admission)
+            .await;
+        match &result {
+            Ok(_) => self
+                .direct_messaging
+                .record_outgoing_succeeded(*to, dm::DmPath::RawQuic),
+            Err(_) => self.direct_messaging.record_outgoing_failed(*to),
+        }
+        result
+    }
+
+    /// #1664 r4: the connect ladder of a machine-pinned exchange — is the
+    /// asking machine connected, then the send-readiness repair, then the
+    /// pinned redial of exactly that machine (never the general connector,
+    /// whose reconciliation can land on a different machine of the agent).
+    /// Shared by the network path and the offline test stand-in, so the
+    /// rotated-connection case runs the same code either way. The caller's
+    /// exchange deadline bounds the whole future this runs inside.
+    async fn pinned_machine_connect_ladder(
+        &self,
+        transport: &RawQuicTransport<'_>,
+        to: &identity::AgentId,
+        machine_id: identity::MachineId,
+    ) -> bool {
+        let ant_peer_id = ant_quic::PeerId(machine_id.0);
+        let mut connected = transport.is_connected(&ant_peer_id).await;
+        if !connected {
+            const MACHINE_REPLY_REPAIR_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(3);
+            let _ = tokio::time::timeout(
+                MACHINE_REPLY_REPAIR_TIMEOUT,
+                transport.ensure_peer_send_ready(&ant_peer_id),
+            )
+            .await;
+            connected = transport.is_connected(&ant_peer_id).await;
+            if !connected && transport.pinned_redial(self, to, machine_id).await {
+                connected = true;
+            }
+        }
+        connected
+    }
+
+    /// #1664 r4: shared core of the machine-pinned exchange for the
+    /// network path and the offline test stand-in. The two arms agree on
+    /// the ladder and the seam but diverge AFTER a ladder that finds no
+    /// connection: the stand-in returns `Err` at once, while the network
+    /// path logs and still runs the admission seam and
+    /// `send_direct_pinned`, which fails on its own (no live generation
+    /// to write). Either way no frame is written, and a revocation
+    /// landing before that point is still refused under its own
+    /// sentence — only the reported error differs.
+    async fn send_direct_pinned_admitted_machine_inner(
+        &self,
+        to: &identity::AgentId,
+        machine_id: identity::MachineId,
+        payload: &[u8],
+        admission: &dm::ArtifactAdmission,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        #[cfg(test)]
+        if self.network.is_none() {
+            let refused = || {
+                Err(dm::DmError::NoConnectivity(
+                    dm::PINNED_ADMISSION_REFUSED.to_string(),
+                ))
+            };
+            // r4: the connect ladder runs here too, over the scripted
+            // transport, so a rotated connection (the repair misses, the
+            // pinned redial of exactly the asking machine reconnects) runs
+            // the SAME ladder code offline, not a second copy.
+            let transport =
+                RawQuicTransport::Scripted(pinned_standin_transport(&self.identity.agent_id()));
+            let connected = self
+                .pinned_machine_connect_ladder(&transport, to, machine_id)
+                .await;
+            if !connected {
+                return Err(dm::DmError::NoConnectivity(
+                    "machine-pinned exchange found no live connection after repair; the fetcher's retry re-asks"
+                        .to_string(),
+                ));
+            }
+            let Some(seam) = admission().await else {
+                return refused();
+            };
+            let admitted = self.pinned_admission_seam(*to, machine_id, false, seam)();
+            if admitted {
+                // The addressing decision the exchange admitted — recorded
+                // only after the admission, exactly where the transport
+                // would write (a withheld send is no egress).
+                if let Ok(mut egress) = self.machine_reply_egress.lock() {
+                    egress.push((machine_id, payload.to_vec()));
+                }
+                return Err(dm::DmError::NoConnectivity(
+                    dm::PINNED_STANDIN_ADMITTED.to_string(),
+                ));
+            }
+            return refused();
+        }
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| dm::DmError::NoConnectivity("network not initialized".to_string()))?;
+        // Review round 2, finding 2: a fetch can arrive with no live
+        // connection to the asking machine (fetch frames go gossip-first),
+        // and the connection can be replaced between the fetch and this
+        // detached serve. `send_direct_pinned` needs a live generation, so
+        // run the resolver's connect ladder first — repair, then the
+        // pinned redial — bounded by the repair budget the resolver uses;
+        // the CALLER's exchange deadline bounds this whole inner future.
+        let transport = RawQuicTransport::Network(network);
+        let connected = self
+            .pinned_machine_connect_ladder(&transport, to, machine_id)
+            .await;
+        if !connected {
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "machine_reply",
+                machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                outcome = "machine_reply_pinned_no_connection",
+                "machine-pinned exchange found no live connection after repair; the fetcher's retry re-asks"
+            );
+        }
+        let Some(seam) = admission().await else {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        };
+        // A refusal AT THE SEAM is reported as an admission refusal (a
+        // retryable withhold for the caller), not as a transport failure.
+        let refused_at_seam = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seam = {
+            let refused_at_seam = std::sync::Arc::clone(&refused_at_seam);
+            let checks = self.pinned_admission_seam(*to, machine_id, false, seam);
+            move || {
+                let admitted = checks();
+                if !admitted {
+                    refused_at_seam.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                admitted
+            }
+        };
+        let sent = network
+            .send_direct_pinned(
+                &ant_quic::PeerId(machine_id.0),
+                &self.identity.agent_id().0,
+                payload,
+                seam,
+            )
+            .await;
+        if refused_at_seam.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(dm::DmError::NoConnectivity(
+                dm::PINNED_ADMISSION_REFUSED.to_string(),
+            ));
+        }
+        sent.map_err(Self::map_raw_quic_dm_error)?;
+        // The addressing decision the transport wrote — recorded only after
+        // the admitted write (a withheld or failed send is no egress).
+        #[cfg(test)]
+        if let Ok(mut egress) = self.machine_reply_egress.lock() {
+            egress.push((machine_id, payload.to_vec()));
+        }
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "pinned_exchange_written",
+            recipient = %hex::encode(to.as_bytes()),
+            machine_prefix = %crate::logging::LogHexId::new("machine", &network::hex_prefix(&machine_id.0, 4)),
+            resolution = "requester_machine",
+            bytes = payload.len(),
+            "machine-pinned exchange written"
+        );
+        Ok(dm_send::raw_quic_receipt_for_path(dm::DmPath::RawQuic))
+    }
+
     /// #461: provenance variant for the direct-send HTTP route — identical
     /// behavior to the public method INCLUDING the ADR-0023 §4 outbound
     /// history wiring (this is the single common path; the public method
@@ -11580,7 +12086,8 @@ impl Agent {
     }
 
     /// The seam check for a pinned send to `(agent, machine)`: this agent's
-    /// own revocation (agent AND resolved machine) and ADR-0043 B/P pairing
+    /// own revocation (agent AND resolved machine AND a pending revocation
+    /// resync, #1664 review round 3) and ADR-0043 B/P pairing
     /// checks, then (with `check_binding`, r7b) that the recipient's verified
     /// binding still names `machine`, then the caller's. Synchronous;
     /// contention refuses.
@@ -11599,7 +12106,14 @@ impl Agent {
                 let Ok(revoked) = revocation.try_read() else {
                     return false;
                 };
-                if revoked.is_agent_revoked(&agent) || revoked.is_machine_revoked(&machine) {
+                // #1664 review round 3, finding 5: a pending revocation
+                // resync keeps every other lane silent (the control-blob
+                // entry ladder and the machine-addressed reply seam both
+                // check it), so the pinned seam refuses for it too.
+                if revoked.is_agent_revoked(&agent)
+                    || revoked.is_machine_revoked(&machine)
+                    || revoked.revocation_resync_required()
+                {
                     return false;
                 }
                 let Ok(placements) = moves.try_read() else {
@@ -17157,11 +17671,22 @@ impl Agent {
                 }
             }
             _ => {
-                storage::save_revocation_set(
-                    &*self.revocation_set.read().await,
+                let saved = persist_s4_revocations(
+                    &self.revocation_set,
+                    &self.s4_revocation_intake,
                     self.identity_dir.as_deref(),
                 )
-                .await
+                .await;
+                if saved.is_err() {
+                    // #1765: S4 holds this record's row until a retry
+                    // writes it; the caller still sees the error.
+                    spawn_persist_s4_revocations(
+                        std::sync::Arc::clone(&self.revocation_set),
+                        self.s4_revocation_intake.clone(),
+                        self.identity_dir.clone(),
+                    );
+                }
+                saved
             }
         };
         if matches!(
@@ -23650,6 +24175,8 @@ impl AgentBuilder {
             move_state,
             move_state_load_failed,
             treekem_refusal_replies: std::sync::Arc::new(direct::TreeKemRefusalReplies::default()),
+            #[cfg(test)]
+            machine_reply_egress: std::sync::Mutex::default(),
             move_ceremony_enabled: self.move_ceremony_enabled,
             stream_reauth,
             history_service: tokio::sync::Mutex::new(history_service),
@@ -37458,6 +37985,150 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// A self-revocation of a fresh agent, `revoked_at` seconds after 1970.
+    fn s4_self_revocation(revoked_at: u64) -> revocation::RevocationRecord {
+        let kp = identity::AgentKeypair::generate().expect("keypair");
+        revocation::RevocationRecord::sign(
+            revocation::RevokedSubject::Agent(kp.agent_id()),
+            kp.public_key(),
+            kp.secret_key(),
+            revoked_at,
+            None,
+        )
+        .expect("sign")
+    }
+
+    /// #1765 review finding 1: a live record that the TTL sweep takes from
+    /// the set before any write held it is not in the bytes of a later
+    /// write. It stays not durable, and no retry waits for it.
+    #[tokio::test]
+    async fn a_swept_revocation_is_not_durable_after_a_later_store_write() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = tokio::sync::RwLock::new(revocation::RevocationSet::new());
+        let intake = groups::eviction::RevocationIntake::new();
+        let record = s4_self_revocation(1);
+        {
+            let mut guard = set.write().await;
+            assert!(guard
+                .verify_and_insert(record.clone(), None)
+                .expect("insert"));
+            intake.note_verified(&record);
+            let swept =
+                guard.expire_records_older_than(90 * 24 * 3600, Agent::unix_timestamp_secs());
+            assert_eq!(swept, 1);
+        }
+        persist_s4_revocations(&set, &intake, Some(dir.path()))
+            .await
+            .expect("store write");
+        let written = std::fs::read(dir.path().join("revocations.bin")).expect("store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(!on_disk.contains_hash(&record.record_hash()));
+        let hashes = std::collections::BTreeSet::from([record.record_hash()]);
+        assert!(
+            !intake.all_durable(&hashes),
+            "a record that no write held must not release a memory-only seal"
+        );
+        assert!(!s4_store_write_pending(&set, &intake).await);
+    }
+
+    /// #1765 review finding 4: the v2 route writes an Agent subject to the
+    /// v1 store, and S4 then reads the record as durable.
+    #[tokio::test]
+    async fn a_v2_agent_revocation_writes_the_v1_store_for_s4() {
+        let dir = tempfile::tempdir().expect("dir");
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new()));
+        let intake = groups::eviction::RevocationIntake::new();
+        let owner_trust = owner_trust::OwnerTrust::new(
+            None,
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                dm_inbox::AuthenticatedMachineBindingCache::default(),
+            )),
+        );
+        let record = s4_self_revocation(Agent::unix_timestamp_secs());
+        let hashes = std::collections::BTreeSet::from([record.record_hash()]);
+        apply_v2_revocation_records(
+            vec![record.clone()],
+            std::collections::HashMap::new(),
+            &set,
+            &intake,
+            Some(dir.path().to_path_buf()),
+            &owner_trust,
+        )
+        .await;
+        assert!(set.read().await.contains_hash(&record.record_hash()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !intake.all_durable(&hashes) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the v1 store write did not happen"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let written = std::fs::read(dir.path().join("revocations.bin")).expect("v1 store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(on_disk.contains_hash(&record.record_hash()));
+    }
+
+    /// #1765 review findings 3 and 4: two failed writes start one retry
+    /// task. It writes after the fault clears, then stops.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_task_retries_a_failed_s4_store_write_until_it_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let id_dir = dir.path().join("identity");
+        std::fs::create_dir(&id_dir).expect("identity dir");
+        std::fs::set_permissions(&id_dir, std::fs::Permissions::from_mode(0o500)).expect("0500");
+        if std::fs::write(id_dir.join("probe"), b"x").is_ok() {
+            // Root ignores the mode: this host cannot make the fault.
+            return;
+        }
+        let set = std::sync::Arc::new(tokio::sync::RwLock::new(revocation::RevocationSet::new()));
+        let intake = groups::eviction::RevocationIntake::new();
+        let (first, second) = (
+            s4_self_revocation(Agent::unix_timestamp_secs()),
+            s4_self_revocation(Agent::unix_timestamp_secs()),
+        );
+        for record in [&first, &second] {
+            assert!(set
+                .write()
+                .await
+                .verify_and_insert(record.clone(), None)
+                .expect("insert"));
+            intake.note_verified(record);
+            spawn_persist_s4_revocations(
+                std::sync::Arc::clone(&set),
+                intake.clone(),
+                Some(id_dir.clone()),
+            );
+        }
+        let hashes = std::collections::BTreeSet::from([first.record_hash(), second.record_hash()]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !intake.persist_retrying_for_testing() {
+            assert!(std::time::Instant::now() < deadline, "no retry task");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!intake.all_durable(&hashes));
+        assert!(
+            !intake.claim_persist_retry(),
+            "the second failed write leaves its records to the first task"
+        );
+        std::fs::set_permissions(&id_dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !intake.all_durable(&hashes) || intake.persist_retrying_for_testing() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry task did not write and stop"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let written = std::fs::read(id_dir.join("revocations.bin")).expect("v1 store");
+        let on_disk = revocation::RevocationSet::from_bytes(&written).expect("decode");
+        assert!(on_disk.contains_hash(&first.record_hash()));
+        assert!(on_disk.contains_hash(&second.record_hash()));
     }
 
     /// #1116: a known issuer certificate and a pending fetch for another

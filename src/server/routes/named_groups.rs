@@ -5783,7 +5783,7 @@ async fn install_fork_evidence(
         Ok(AtomicWriteOutcome::NotReplaced | AtomicWriteOutcome::PreflightRefusedAfterRename) => {
             tracing::debug!(
                 group_id = %LogHexId::group(group_key),
-                "#468: fork evidence install was a no-op (lineage gone or already carries evidence)"
+                "#468: fork evidence install replaced nothing (no-op: lineage gone or already carries evidence; or the durability preflight refused)"
             );
             false
         }
@@ -7002,7 +7002,28 @@ where
             Ok(AtomicWriteOutcome::Durable) => state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release),
-            outcome => return outcome,
+            // #1574: a refusal here reports the confirming re-save of the
+            // EARLIER unconfirmed replacement, not this caller's write.
+            // The clear below never ran; nothing of its candidate is
+            // staged. Sent on as `ReplacedNotDurable` (the behaviour
+            // before this fix), it claimed the #759 shape — "the clear's
+            // replacement is visible, only its directory fsync is
+            // unconfirmed" — for a clear that did not occur. Report the
+            // refusal as `NotReplaced`. The flag stays set (the re-save's
+            // own handling keeps it), so the next save retries this
+            // preflight; a hard error stays an error.
+            // #1729 (merged at cf707096) gave the after-rename refusal
+            // its own outcome. No producer feeds that variant to this
+            // whole-map re-save, and no caller of this entry point does
+            // outcome-keyed S3 arming, so it folds into the refusal
+            // arm: like every refusal shape, this clear replaced
+            // nothing.
+            Ok(
+                AtomicWriteOutcome::NotReplaced
+                | AtomicWriteOutcome::ReplacedNotDurable
+                | AtomicWriteOutcome::PreflightRefusedAfterRename,
+            ) => return Ok(AtomicWriteOutcome::NotReplaced),
+            Err(error) => return Err(error),
         }
     }
     persist_named_groups_quarantine_clear_gated_unlocked(
@@ -7215,7 +7236,29 @@ where
             Ok(AtomicWriteOutcome::Durable) => state
                 .named_groups_requires_durability_confirmation
                 .store(false, Ordering::Release),
-            outcome => return outcome,
+            // #1574: a refusal here reports the confirming re-save of the
+            // EARLIER unconfirmed replacement, not this caller's write.
+            // The mutation below never ran; nothing of its candidate is
+            // staged. Sent on as `ReplacedNotDurable` (the behaviour
+            // before this fix), it claimed the #759 shape — "the
+            // mutation's replacement is visible, only its directory
+            // fsync is unconfirmed" — the arm a caller uses to keep its
+            // candidate and proceed, for a mutation that did not occur.
+            // Report the refusal as `NotReplaced`. The flag stays set
+            // (the re-save's own handling keeps it), so the next save
+            // retries this preflight; a hard error stays an error.
+            // #1729 (merged at cf707096) gave the after-rename refusal
+            // its own outcome. No producer feeds that variant to this
+            // whole-map re-save, and no caller of this entry point does
+            // outcome-keyed S3 arming, so it folds into the refusal
+            // arm: like every refusal shape, this mutation replaced
+            // nothing.
+            Ok(
+                AtomicWriteOutcome::NotReplaced
+                | AtomicWriteOutcome::ReplacedNotDurable
+                | AtomicWriteOutcome::PreflightRefusedAfterRename,
+            ) => return Ok(AtomicWriteOutcome::NotReplaced),
+            Err(error) => return Err(error),
         }
     }
     let (before, after) = {
@@ -7561,10 +7604,9 @@ async fn compare_and_restore_named_groups(
 /// #470 test fault cell for the roster save itself (same idiom as
 /// [`DeleteFault`]): forces `save_named_groups_checked_unlocked` to return
 /// a chosen outcome so the compare-and-restore rollback matrix can be
-/// exercised through the PRODUCTION persist path. The check is compiled
-/// into production code but constant-false there (`cfg!(test)`); only the
-/// setter is test-gated, and the RAII guard clears the cell on drop so a
-/// failing test cannot leak it.
+/// exercised through the PRODUCTION persist path. Every read of the cell
+/// is `#[cfg(test)]`, so a release build never consults it; the RAII
+/// guard clears the cell on drop so a failing test cannot leak it.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -7601,6 +7643,13 @@ pub(in crate::server) enum SaveFault {
     /// sidecar journal is written, then the legacy journal write (the
     /// commit point) fails: no live file changes.
     JournalWriteFails = 8,
+    /// #1574 (the #1729 fold): `Ok(AtomicWriteOutcome::
+    /// PreflightRefusedAfterRename)` — the after-rename refusal shape,
+    /// so a test can drive the folded refusal arm of the two whole-map
+    /// persist preflights. No production save yields the variant before
+    /// them; the folded arm states their contract: every refusal shape
+    /// reports `NotReplaced`.
+    PreflightRefusedAfterRename = 9,
 }
 
 // #470 — per-instance fault helpers; all `#[cfg(test)]` so no trace in
@@ -7616,6 +7665,7 @@ fn save_fault_short_circuit(state: &AppState) -> Option<AtomicWriteOutcome> {
     {
         1 => Some(AtomicWriteOutcome::NotReplaced),
         3 => Some(AtomicWriteOutcome::ReplacedNotDurable),
+        9 => Some(AtomicWriteOutcome::PreflightRefusedAfterRename),
         _ => None,
     }
 }
@@ -12406,7 +12456,8 @@ pub(in crate::server) async fn dispatch_treekem_catchup_message(
         };
         let serve_state = Arc::clone(state);
         let requester = *sender;
-        // #1616: the QUIC-authenticated sender machine of the DM, so the
+        // #1616: the authenticated sender machine of the DM (QUIC on a
+        // direct DM; attestation or a stored binding over gossip), so the
         // serve can refuse a revoked device (ADR 0110 D70).
         let sender_machine = *machine_id;
         let _admitted = state.spawn_detached(async move {
@@ -12623,12 +12674,12 @@ async fn send_treekem_catchup_refusal(
     state: &Arc<AppState>,
     sender: &AgentId,
     machine_id: &MachineId,
-    request: &TreeKemCatchupRequest,
+    group_id: &str,
     reason: TreeKemCatchupRefusalReason,
 ) {
     #[cfg(test)]
     if let Ok(payload) = serde_json::to_vec(&TreeKemCatchupRefusal::new(
-        request.group_id.clone(),
+        group_id.to_string(),
         hex::encode(sender.as_bytes()),
         reason,
     )) {
@@ -12638,7 +12689,7 @@ async fn send_treekem_catchup_refusal(
     }
     state
         .agent
-        .send_treekem_refusal_reply(sender, *machine_id, &request.group_id, reason)
+        .send_treekem_refusal_reply(sender, *machine_id, group_id, reason)
         .await;
 }
 
@@ -12659,7 +12710,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // check below alone cannot refuse it.
     // #1616 (ADR 0110 D70): a machine revocation denies that device only;
     // the portable agent keeps its Active seat, so the same roster check
-    // cannot refuse the device either — the DM's QUIC-authenticated
+    // cannot refuse the device either — the DM's authenticated
     // sender machine refuses it, under its own operator sentence.
     // #1622 (ADR 0110 D70): a binding revocation retires the pairing
     // only — the agent keeps its seat and the device stays clean — so
@@ -12717,7 +12768,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         return;
     }
     if let Some(reason) = typed_refusal {
-        send_treekem_catchup_refusal(state, sender, machine_id, &request, reason).await;
+        send_treekem_catchup_refusal(state, sender, machine_id, &request.group_id, reason).await;
         return;
     }
     let (authorized, log_keys, held_group) = {
@@ -12849,12 +12900,17 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 return;
             }
         };
+        // #1664: the page answers the machine whose DM this node served
+        // (the authenticated requester machine), never "whichever device
+        // currently resolves for the agent" — a revoked device holding
+        // the portable agent key must not read a page meant for the
+        // clean device that asked.
         if let Err(e) = state
             .agent
-            .send_direct_with_config(sender, payload, direct_message_send_config())
+            .send_machine_addressed_dm(sender, *machine_id, &payload)
             .await
         {
-            tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send member-keyed TreeKEM catch-up response: {e}");
+            tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send member-keyed TreeKEM catch-up response to the requesting machine: {e}");
         }
         return;
     }
@@ -12899,12 +12955,18 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     }
     #[cfg(test)]
     detached_send_test_seam::park(&format!("treekem-catchup-serve:{sender_hex}")).await;
+    // #1664: the page is machine-addressed to the authenticated
+    // requester machine — the same revocation-clean (agent, machine) pair the
+    // #1657 ladder above cleared — so a revoked device that still holds
+    // the portable agent key cannot be handed this answer by an
+    // agent-level resolution (discovery cache, capability binding or
+    // newest connection can each name the revoked device).
     if let Err(e) = state
         .agent
-        .send_direct_with_config(sender, payload, direct_message_send_config())
+        .send_machine_addressed_dm(sender, *machine_id, &payload)
         .await
     {
-        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response: {e}");
+        tracing::warn!(group_id = %LogHexId::group(&request.group_id), requester = %sender_hex, "failed to send TreeKEM catch-up response to the requesting machine: {e}");
     }
 }
 
@@ -13435,7 +13497,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
                 // would re-fetch the identical page; only a moved cursor
                 // can falsify it, so a replay that moves the cursor asks
                 // this peer again (round 5: from a detached task). The
-                // row records the QUIC-authenticated machine this page
+                // row records the authenticated machine this page
                 // came from, so the re-arm pre-check can run the same
                 // machine-aware revocation gate a page from this peer
                 // must pass.
@@ -13629,7 +13691,7 @@ const TREEKEM_PAGE_STOPPED_PEERS_CAP: usize = 1024;
 
 /// #1685 round 6 (CI clippy, `clippy::type_complexity`): the value of
 /// [`TREEKEM_PAGE_STOPPED_PEERS`] — per group, each stopped peer's
-/// armed row: the QUIC-authenticated machine its stopped page came
+/// armed row: the authenticated machine its stopped page came
 /// from and the stop instant. A named alias, not a new type; the
 /// map's shape is unchanged.
 type TreekemPageStoppedPeersByGroup = std::collections::HashMap<
@@ -13640,7 +13702,7 @@ type TreekemPageStoppedPeersByGroup = std::collections::HashMap<
 /// #1685 round 3 (review 5712505625): peers whose truncated-page loop
 /// stopped with [`TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS`], per group,
 /// keyed by the same page-fence aliases the peer fence uses. The row
-/// also records the QUIC-authenticated machine the stopped page came
+/// also records the authenticated machine the stopped page came
 /// from (round 5), so the re-arm pre-check can run the same
 /// machine-aware revocation gate a page from this peer must pass. This
 /// map is liveness bookkeeping, not safety state: the peer fence itself
@@ -16046,6 +16108,38 @@ fn role_update_target(event: &NamedGroupMetadataEvent) -> Option<&str> {
     }
 }
 
+/// §3a check 8, the carried-record group half (#1680, Engineer ruling
+/// 31 Oct 2026): a re-seat that binds a KeyPackage carries the
+/// subject's signed `MemberJoined` as the package's evidence, and that
+/// record must name the parent group (the predicate lives in
+/// `x0x::groups::recovery`). The clause runs after the §3a rule, so
+/// every earlier cause still refuses first, and refuses here with
+/// check 8's typed `binding_mismatch` cause. A packageless re-seat
+/// binds no package, so a carried record is not §3a evidence for it; a
+/// re-seat that carries no record already fails the rule's own
+/// evidence check.
+fn carried_member_joined_recovery_binds_parent_group(
+    mandate: &x0x::groups::recovery::ReseatMandateV1,
+    parent: &x0x::groups::GroupInfo,
+    member_joined_recovery: Option<&NamedGroupMetadataEvent>,
+) -> bool {
+    if mandate.fields.key_package_hash.is_empty() {
+        return true;
+    }
+    match member_joined_recovery {
+        Some(NamedGroupMetadataEvent::MemberJoined {
+            group_id,
+            stable_group_id,
+            ..
+        }) => x0x::groups::recovery::carried_member_joined_binds_parent_group(
+            group_id,
+            stable_group_id.as_deref(),
+            parent,
+        ),
+        _ => true,
+    }
+}
+
 async fn apply_named_group_metadata_event_inner(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
@@ -16796,7 +16890,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // Check 8 reads the subject-signed `MemberJoined` the event
             // carries in `member_joined_recovery` (Engineer ruling
             // 30 Oct 2026) and binds the TreeKEM commit's added leaf to
-            // the mandate's bound hash.
+            // the mandate's bound hash. The carried record must also
+            // name the parent group (ruling 31 Oct 2026), refused with
+            // the same typed cause, not the attestation gate's plain
+            // rejection.
             let reseat_accepted = match (
                 info.policy.admission.owner_certified_user_id(),
                 owner_mandate.as_ref(),
@@ -16818,7 +16915,26 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     )
                     .await
                     {
-                        Ok(()) => true,
+                        Ok(())
+                            if carried_member_joined_recovery_binds_parent_group(
+                                mandate,
+                                &info,
+                                member_joined_recovery.as_deref(),
+                            ) =>
+                        {
+                            true
+                        }
+                        Ok(()) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&agent_id),
+                                cause =
+                                    x0x::groups::recovery::ReseatMandateCause::BindingMismatch
+                                        .as_str(),
+                                "MemberAdded: reseat_mandate_invalid; rejecting with state byte-identical (ADR 0109 §3a)"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
                         Err(cause) => {
                             tracing::warn!(
                                 group_id = %LogHexId::group(&resolved_group_key),
@@ -48310,6 +48426,53 @@ pub(super) async fn send_join_artifact(
     admission: x0x::dm::ArtifactAdmission,
     deadline: Instant,
 ) -> std::result::Result<(), String> {
+    send_join_artifact_exchange(
+        state, recipient, None, payload, group_id, kind, admission, deadline,
+    )
+    .await
+}
+
+/// #1664: the machine-pinned variant for a chunk that ANSWERS a
+/// control-blob fetch. The exchange targets `machine_id` — the
+/// machine the fetch DM authenticated — instead of the
+/// recipient's binding resolution, which a revoked device still holding
+/// the agent key can hold the newest advert for. The admission seam and
+/// every lifecycle recorder stay exactly the exchange's.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_join_artifact_to_machine(
+    state: &AppState,
+    recipient: &AgentId,
+    machine_id: MachineId,
+    payload: &[u8],
+    group_id: &str,
+    kind: &'static str,
+    admission: x0x::dm::ArtifactAdmission,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
+    send_join_artifact_exchange(
+        state,
+        recipient,
+        Some(machine_id),
+        payload,
+        group_id,
+        kind,
+        admission,
+        deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_join_artifact_exchange(
+    state: &AppState,
+    recipient: &AgentId,
+    pinned_machine: Option<MachineId>,
+    payload: &[u8],
+    group_id: &str,
+    kind: &'static str,
+    admission: x0x::dm::ArtifactAdmission,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
     let exchange_deadline =
         std::cmp::min(Instant::now() + JOIN_ARTIFACT_EXCHANGE_TIMEOUT, deadline);
     #[cfg(test)]
@@ -48327,14 +48490,21 @@ pub(super) async fn send_join_artifact(
                 transports.push((recipient_hex.clone(), kind, "pinned_single_exchange"));
             }
         }
-        let resolve_within = std::cmp::min(
-            x0x::dm::PINNED_RESOLUTION_WAIT,
-            exchange_deadline.saturating_duration_since(Instant::now()) / 2,
-        );
-        state
-            .agent
-            .send_direct_pinned_admitted(recipient, payload, &admission, resolve_within)
-            .await
+        if let Some(machine_id) = pinned_machine {
+            state
+                .agent
+                .send_direct_pinned_admitted_machine(recipient, machine_id, payload, &admission)
+                .await
+        } else {
+            let resolve_within = std::cmp::min(
+                x0x::dm::PINNED_RESOLUTION_WAIT,
+                exchange_deadline.saturating_duration_since(Instant::now()) / 2,
+            );
+            state
+                .agent
+                .send_direct_pinned_admitted(recipient, payload, &admission, resolve_within)
+                .await
+        }
     };
     let outcome = match tokio::time::timeout_at(tokio_deadline(exchange_deadline), exchange).await {
         Ok(Ok(_)) => Ok(()),
@@ -51476,11 +51646,13 @@ pub(in crate::server) mod tests {
     mod issue1570_held_back_cards;
     mod issue1570_held_back_rebind;
     mod issue1570_held_back_tombstone;
+    mod issue1574_persist_preflight_refusal;
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
     mod issue1649_reseat_mandate_receive;
     mod issue1657_typed_refusal_catchup;
+    mod issue1664_machine_addressed_replies;
     mod issue1685_catchup_page_no_progress;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
@@ -51504,7 +51676,7 @@ pub(in crate::server) mod tests {
     mod wp_c;
 
     /// #1616: the transport machine of a simulated DM whose sender device
-    /// is clean. The catch-up handlers thread the QUIC-authenticated sender
+    /// is clean. The catch-up handlers thread the authenticated sender
     /// machine of the direct message; tests that do not exercise a machine
     /// revocation pass this id, which no test revokes.
     fn clean_sender_machine() -> MachineId {
@@ -59058,6 +59230,7 @@ pub(in crate::server) mod tests {
                         handle_control_blob_message(
                             &dispatch_state,
                             &msg.sender,
+                            &msg.machine_id,
                             msg.verified,
                             message,
                         )
@@ -59082,6 +59255,7 @@ pub(in crate::server) mod tests {
         handle_control_blob_message(
             &state,
             &local,
+            &state.agent.machine_id(),
             true,
             ControlBlobMessage::Reference {
                 reference: reference.clone(),

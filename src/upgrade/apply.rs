@@ -1294,7 +1294,7 @@ impl AutoApplyUpgrader {
         // operator removes the hold file. Without this, a deterministic flush
         // failure turns every restart into the same failed apply (an endless
         // exit loop ADR 0094 §4 forbids).
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(held) =
             super::shutdown_flush::release_is_held(&restart_plan.data_root, &target_version)
                 .map_err(|error| {
@@ -1317,13 +1317,14 @@ impl AutoApplyUpgrader {
         }
         #[cfg(unix)]
         let probe_launch = super::probe::ProbeLaunch::capture(&restart_plan.cwd);
-        // Refuse a failed Unix record barrier before download or replacement.
-        // Unmanaged Windows keeps the released legacy helper path; managed
-        // Windows is refused by the restart planner and has no M2 barrier.
-        #[cfg(unix)]
-        super::journal::check_record_barrier_support(&restart_plan.data_root).map_err(|error| {
-            UpgradeError::Other(format!("upgrade record barrier unavailable: {error}"))
-        })?;
+        // Refuse a failed record barrier before download or replacement.
+        // Unmanaged Windows keeps the released legacy helper path. Supervised
+        // Windows writes its flush records through the same barrier (#1588).
+        if cfg!(unix) || restart_plan.mode == restart::RestartMode::SupervisedExit {
+            super::journal::check_record_barrier_support(&restart_plan.data_root).map_err(
+                |error| UpgradeError::Other(format!("upgrade record barrier unavailable: {error}")),
+            )?;
+        }
         #[cfg(unix)]
         if let Some(gate) = &self.staging {
             super::monitor::validate_manifest_timestamp(manifest)?;

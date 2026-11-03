@@ -55,7 +55,7 @@ pub(crate) const MAX_LIMIT: Duration = Duration::from_secs(3600);
 /// ordinary refusals (engineer ruling, 23 Oct 2026).
 type Hook = Arc<dyn Fn(Deadline, &AtomicBool) -> io::Result<()> + Send + Sync>;
 
-/// Metadata preflight the flush owner registers with the roots its hook
+/// Admission preflight the flush owner registers with the roots its hook
 /// walks: it names the first path the flush would refuse, so upgrade
 /// admission can surface it before any byte changes (issue #1595).
 pub(crate) type Preflight = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
@@ -151,10 +151,12 @@ impl Deadline {
         })
     }
 
-    /// Ceiling for the metadata-only admission preflight (issue #1595): no
-    /// fsync runs under it, so the generous bound only stops a walk that is
-    /// not making progress. Built on the same suspend-inclusive clock the
-    /// flush itself checks.
+    /// Ceiling for the admission preflight walk (issue #1595). The walk
+    /// writes no bytes and runs no fsync. On Windows it opens each file and
+    /// directory with write access, to prove the later flush can open them
+    /// (#1588). The generous bound only stops a walk that is not making
+    /// progress. Built on the same suspend-inclusive clock the flush itself
+    /// checks.
     pub(crate) fn preflight() -> io::Result<Self> {
         let limit = LIMIT.saturating_mul(4);
         let (boot_id, now) = clock()?;
@@ -241,7 +243,7 @@ pub(crate) fn register(root: PathBuf, hook: Hook) -> io::Result<Registration> {
     register_inner(root, hook, LIMIT, None)
 }
 
-/// Register with the metadata preflight that admission runs before any
+/// Register with the admission preflight that runs before any
 /// upgrade byte changes (issue #1595). The daemon's flush owner uses this
 /// to refuse early — naming the offending path — on state its hook could
 /// never walk.
@@ -801,13 +803,100 @@ fn clock() -> io::Result<(String, u64)> {
         let clock = super::probe::ProbeClock::now()?;
         Ok((clock.boot_id, clock.monotonic_ms))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        Ok((windows_clock::boot_id()?, windows_clock::monotonic_ms()))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "acknowledged upgrade flush needs a suspend-inclusive clock",
         ))
     }
+}
+
+/// The Windows twin of `CLOCK_BOOTTIME` / `mach_continuous_time` (#1588).
+/// `GetTickCount64` counts milliseconds since boot, includes time spent in
+/// sleep and hibernation, and does not follow wall-clock changes. The kernel
+/// `BootId` counter names the boot that count started at. A missing or
+/// unreadable `BootId` is an error, so the flush refuses before stop.
+#[cfg(windows)]
+mod windows_clock {
+    use std::{ffi::c_void, io, os::windows::ffi::OsStrExt};
+
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
+    const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+    const BOOT_KEY: &str =
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters";
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetTickCount64() -> u64;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegGetValueW(
+            key: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
+    }
+
+    pub(super) fn monotonic_ms() -> u64 {
+        // SAFETY: no arguments; the call only reads the kernel tick count.
+        unsafe { GetTickCount64() }
+    }
+
+    pub(super) fn boot_id() -> io::Result<String> {
+        let key = wide(BOOT_KEY);
+        let value = wide("BootId");
+        let mut boot: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        // SAFETY: both names are nul-terminated UTF-16 buffers that outlive
+        // the call. RRF_RT_REG_DWORD limits the write to the owned u32, whose
+        // size is passed in `size`. A null type pointer is permitted.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut boot as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        Ok(super::windows_boot_identity(boot))
+    }
+}
+
+/// Boot identity string for a Windows kernel `BootId`. It is never empty,
+/// so a Windows record passes the same `validate` rule as a Unix record.
+#[cfg(any(windows, test))]
+fn windows_boot_identity(boot: u32) -> String {
+    format!("windows-boot-{boot}")
+}
+
+/// The boot the suspend-inclusive clock counts from. Unix reports the
+/// probe clock's boot ID; Windows reports the kernel `BootId`.
+pub(crate) fn boot_identity() -> io::Result<String> {
+    clock().map(|(boot, _)| boot)
 }
 
 fn check_deadline(record: &Record, deadline: Instant) -> io::Result<()> {
@@ -1504,5 +1593,84 @@ mod reservation_release_regressions {
             elapsed < WORKER_JOIN_BOUND,
             "a finished worker must not delay the exit: {elapsed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod windows_clock_regressions {
+    use super::*;
+
+    #[test]
+    fn windows_boot_identity_is_never_empty_and_names_the_boot() {
+        for boot in [0, 1, u32::MAX] {
+            let identity = windows_boot_identity(boot);
+            assert!(!identity.is_empty());
+            assert_eq!(identity, format!("windows-boot-{boot}"));
+        }
+        assert_ne!(windows_boot_identity(7), windows_boot_identity(8));
+    }
+
+    /// The live clock pair must read on every supported platform, never go
+    /// backwards, and keep its boot identity (#1588: before it, Windows had
+    /// no clock and every supervised apply refused).
+    #[test]
+    fn suspend_inclusive_clock_reads_and_is_monotonic() {
+        let (boot, first) = clock().expect("suspend-inclusive clock");
+        let (again, second) = clock().expect("suspend-inclusive clock");
+        assert!(!boot.is_empty());
+        assert_eq!(boot, again);
+        assert!(second >= first);
+        let deadline = Deadline::for_test(Duration::from_secs(5)).expect("deadline");
+        deadline.check().expect("a fresh deadline has not expired");
+        #[cfg(windows)]
+        assert!(boot.starts_with("windows-boot-"));
+    }
+}
+
+/// Windows-only: these run on the windows-latest CI runner (#1588). They
+/// read the kernel tick count and the `BootId` registry value only.
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_exec_regressions {
+    use super::*;
+
+    #[test]
+    fn windows_boot_id_names_the_kernel_boot_and_is_stable() {
+        let boot = windows_clock::boot_id().expect("kernel BootId");
+        let number = boot
+            .strip_prefix("windows-boot-")
+            .expect("windows-boot-<n> form");
+        number.parse::<u32>().expect("BootId is a DWORD");
+        assert_eq!(boot, windows_clock::boot_id().expect("kernel BootId"));
+        assert_eq!(boot, boot_identity().expect("boot identity"));
+    }
+
+    #[test]
+    fn windows_tick_clock_is_nonzero_and_non_decreasing() {
+        let first = windows_clock::monotonic_ms();
+        assert!(first > 0);
+        std::thread::sleep(Duration::from_millis(20));
+        let second = windows_clock::monotonic_ms();
+        assert!(second >= first);
+        let (boot, now) = clock().expect("suspend-inclusive clock");
+        assert!(now >= second);
+        assert_eq!(boot, windows_clock::boot_id().expect("kernel BootId"));
+    }
+
+    /// The deadlines the flush and the admission preflight check read the
+    /// same Windows clock; a different boot refuses as an overrun.
+    #[test]
+    fn windows_deadlines_use_the_live_clock_and_boot() {
+        let deadline = Deadline::for_test(Duration::from_secs(5)).expect("deadline");
+        deadline.check().expect("a fresh deadline has not expired");
+        let preflight = Deadline::preflight().expect("preflight deadline");
+        preflight
+            .check()
+            .expect("a fresh preflight has not expired");
+        assert_eq!(deadline.boot_id, preflight.boot_id);
+        let other_boot = format!("{}-other", deadline.boot_id);
+        let refused = check_clock(&other_boot, deadline.deadline_ms, deadline.instant)
+            .expect_err("a different boot must refuse");
+        assert_eq!(refused.kind(), io::ErrorKind::TimedOut);
     }
 }

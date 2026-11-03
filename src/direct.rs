@@ -253,6 +253,17 @@ pub(crate) fn treekem_catchup_refusal_probe(payload: &[u8], requester: &AgentId)
 pub(crate) const TREEKEM_REFUSAL_SEND_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 
+/// #1664: the bound on one machine-addressed DATA exchange (a TreeKEM
+/// catch-up page, a control-blob chunk). The same budget class as the
+/// join-artifact exchange: the connect ladder (the send-readiness repair,
+/// then the pinned redial of exactly the asking machine) plus one
+/// admitted stream write, no application-ACK wait — the requester's own
+/// retry cadence re-asks if the exchange is lost, and a slow requester
+/// cannot hold a serve slot beyond this (Engineer ruling, 31 Oct 2026
+/// 09:00 GMT: the re-ask is the backstop, never a gossip fallback).
+pub(crate) const MACHINE_ADDRESSED_EXCHANGE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// How long one (machine, group) refusal answer stands before the
 /// same requester may be answered again (per-(machine, group) dedupe,
 /// Engineer ruling, 29 Oct 2026 22:14 GMT). A revocation does not
