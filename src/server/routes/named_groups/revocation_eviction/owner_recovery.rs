@@ -2373,19 +2373,14 @@ pub(in crate::server) async fn promoted_admin_secret(
                 LaterAdminKey::Superseded
             });
         }
-        if let (Some(author), Some((_, installed))) = (&step_author, &installed) {
+        if let (Some(author), Some((key, installed))) = (&step_author, &installed) {
             if cursor.secret_epoch > epoch
                 && installed.secret_epoch == cursor.secret_epoch
                 && installed.shared_secret.is_some()
                 && cursor
                     .caller_role(author)
                     .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
-                && super::super::gss_share_hold::share_sent_by(
-                    state,
-                    &stable_group_id,
-                    installed,
-                    author,
-                )
+                && super::super::gss_share_hold::share_sent_by(state, key, installed, author)
             {
                 return Some(LaterAdminKey::Superseded);
             }

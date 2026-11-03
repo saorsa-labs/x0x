@@ -1926,9 +1926,12 @@ that epoch's first installed secret replaceable — and the group's new
 ciphertext held, also past the #1663 republication — until the
 exclusion's own actor seals a share of it — any secret whose sender
 the record does not name stays replaceable until then. The mark claims
-exactly its own epoch; a share of a later unpinned epoch is not its
-actor's key. A head that commits a later epoch ends the mark of an
-earlier one.
+exactly its own epoch and the head its keyless commit moved; a share of
+a later unpinned epoch is not its actor's key, and a different commit of
+its epoch ends it. A head that commits a later epoch ends the mark of an
+earlier one. A hold also ends when one of its recorded actors seals a
+later epoch's unpinned secret, and a known-empty evicted-removal hold
+ends at any secret of its epoch, committed or not.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`

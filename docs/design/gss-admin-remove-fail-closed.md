@@ -360,9 +360,8 @@ except citations explicitly marked as resolving at
   parked-removal replace half that #1775 also added stays dormant until a fenced
   `gss_removal_waits_for_share` change lands, per that PR.) The strict `<` clear and
   the equal-epoch refuse survive both changes. F1 does not change the guard — it is cited at the baseline, and its comment
-  names only a *prior
-  `MemberBanned` commit*, because remove had no GSS rotation to produce the same ordering
-  when it was written. Tightening that predicate to
+  names only a *prior `MemberBanned` commit*, because remove had no GSS rotation to
+  produce the same ordering when it was written. Tightening that predicate to
   `secret_epoch <= info.secret_epoch` would silently strand every survivor on the
   commit-first ordering: cleared by the commit, then refusing its own replacement, in
   consensus with a matching `state_hash` and decrypting nothing. That is the F1 failure

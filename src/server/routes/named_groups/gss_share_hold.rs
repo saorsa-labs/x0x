@@ -142,6 +142,12 @@ struct KeylessMark {
     secret_epoch: u64,
     /// The lower-case hex actor of the exclusion that installed keyless.
     actor: String,
+    /// The state hash of the head the keyless commit moved. A different
+    /// commit of the same epoch is not this mark's keyless head (claude
+    /// review round 3): the mark counts only while this head is the
+    /// group's, so a crash-stale mark cannot keep another transition's
+    /// committed epoch replaceable for ever.
+    head: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,6 +359,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
         .get(group_key)
         .is_some_and(|mark| {
             info.secret_epoch == mark.secret_epoch
+                && mark.head == info.state_hash
                 && info.shared_secret.is_some()
                 && !sent
                     .as_deref()
@@ -391,7 +398,9 @@ pub(super) fn secret_unpinned(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(group_key)
-            .is_some_and(|mark| mark.secret_epoch == info.secret_epoch)
+            .is_some_and(|mark| {
+                mark.secret_epoch == info.secret_epoch && mark.head == info.state_hash
+            })
 }
 
 /// #1766/#1775: whether `hold` still holds `info`, when `sent` sealed the
@@ -1004,6 +1013,7 @@ pub(super) async fn note_keyless_commit(
     group_key: &str,
     secret_epoch: u64,
     actor_hex: &str,
+    head: &str,
 ) {
     ensure_loaded(state).await;
     let changed = {
@@ -1015,6 +1025,7 @@ pub(super) async fn note_keyless_commit(
         let mark = KeylessMark {
             secret_epoch,
             actor: actor_hex.to_ascii_lowercase(),
+            head: head.to_string(),
         };
         lot.insert(group_key.to_string(), mark.clone()) != Some(mark)
     };
@@ -1059,7 +1070,15 @@ fn prune_share_sender(state: &AppState, group_key: &str, info: &x0x::groups::Gro
         .get(group_key)
         .map(|mark| mark.secret_epoch);
     let mut changed = false;
-    if marked.is_some_and(|epoch| epoch < committed) {
+    if marked.is_some_and(|epoch| epoch < committed)
+        || state
+            .gss_share_holds
+            .keyless
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(group_key)
+            .is_some_and(|mark| mark.secret_epoch <= committed && mark.head != info.state_hash)
+    {
         changed |= state
             .gss_share_holds
             .keyless
@@ -1407,6 +1426,16 @@ pub(in crate::server) mod test_seam {
     pub(in crate::server) fn hold_file_exists(state: &AppState, group_key: &str) -> bool {
         hold_path(state, group_key).exists()
     }
+
+    /// Whether the group's hold file carries a keyless mark.
+    pub(in crate::server) fn keyless_mark_present(state: &AppState, group_key: &str) -> bool {
+        state
+            .gss_share_holds
+            .keyless
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(group_key)
+    }
 }
 
 #[cfg(test)]
@@ -1489,7 +1518,7 @@ mod tests {
         let actor = "aa".repeat(32);
         let other = "bb".repeat(32);
         let keyless = gss_info_at_head(2, None);
-        note_keyless_commit(&state, &group_key, 2, &actor).await;
+        note_keyless_commit(&state, &group_key, 2, &actor, &keyless.state_hash).await;
         // The frame's retry re-parks its hold on the keyless commit too;
         // the mark keeps that hold live under a foreign secret as well.
         hold_exclusion(&state, &group_key, "p", 2, &actor).await;
@@ -1528,7 +1557,7 @@ mod tests {
         );
         // A head that commits a later epoch ends the mark of this one
         // (and writes the file away).
-        note_keyless_commit(&state, &group_key, 2, &actor).await;
+        note_keyless_commit(&state, &group_key, 2, &actor, &keyless.state_hash).await;
         let later = gss_info_at_head(3, Some(foreign));
         assert!(
             !withholds(&state, &group_key, &later),
@@ -1539,6 +1568,42 @@ mod tests {
         assert!(
             !super::test_seam::hold_file_exists(&state, &group_key),
             "a head that commits a later epoch prunes the stale mark"
+        );
+
+        // #1775 (claude review round 3): a different commit of the mark's
+        // own epoch is not the keyless head. A crash-stale mark (its
+        // commit never landed, another transition committed the epoch)
+        // keeps no committed secret replaceable, and the rollback helper
+        // takes a mark that never became a head away.
+        let mut other_head = gss_info_at_head(2, Some(foreign));
+        let other_hash = format!("other-{}", keyless.state_hash);
+        other_head.commit_log[0].commit.state_hash = other_hash.clone();
+        other_head.state_hash = other_hash;
+        assert_ne!(other_head.state_hash, keyless.state_hash);
+        note_keyless_commit(&state, &group_key, 2, &actor, &keyless.state_hash).await;
+        assert!(
+            !withholds(&state, &group_key, &other_head),
+            "a different head's committed epoch is pinned: the stale mark withholds nothing"
+        );
+        assert!(!replaces_uncommitted_secret(
+            &state,
+            &group_key,
+            &other_head,
+            &other,
+            2
+        ));
+        assert!(prune_exclusions(&state, &group_key, &other_head));
+        forget_keyless_commit(&state, &group_key, 2).await;
+        assert!(
+            !super::test_seam::keyless_mark_present(&state, &group_key),
+            "the rollback helper takes the mark away"
+        );
+        note_keyless_commit(&state, &group_key, 2, &actor, &keyless.state_hash).await;
+        assert!(super::test_seam::keyless_mark_present(&state, &group_key));
+        forget_keyless_commit(&state, &group_key, 2).await;
+        assert!(
+            !super::test_seam::keyless_mark_present(&state, &group_key),
+            "and again"
         );
     }
 
@@ -1762,6 +1827,18 @@ mod tests {
         assert_eq!(known.as_ref().map(Vec::len), Some(2));
         merge_actors(&mut known, None);
         assert!(known.is_none(), "an unknown list dominates a merge on load");
+        let mut hold = ExclusionHold {
+            parent_state_hash: "p".to_string(),
+            secret_epoch: 2,
+            removed: vec!["aa".repeat(32)],
+            actors: None,
+        };
+        merge_removed(&mut hold, vec!["AA".repeat(32)]);
+        assert_eq!(
+            hold.removed.len(),
+            1,
+            "the removed merge is case-insensitive"
+        );
     }
 
     /// #1663: the key republication ends exactly the keyless survivor's

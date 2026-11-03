@@ -3012,8 +3012,14 @@ async fn install_gss(
             &actor_hex,
         )
         .await;
-        ng::gss_share_hold::note_keyless_commit(state, group_key, next_secret_epoch, &actor_hex)
-            .await;
+        ng::gss_share_hold::note_keyless_commit(
+            state,
+            group_key,
+            next_secret_epoch,
+            &actor_hex,
+            &commit.state_hash,
+        )
+        .await;
     }
     let next = match ng::apply_stateful_event_with_evidence(
         state,
@@ -6919,6 +6925,10 @@ mod daemon_tests {
             ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
             "the released hold leaves only the keyless mark in the file"
         );
+        assert!(
+            ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the mark itself survived the release"
+        );
         let served = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
         assert_eq!(
             served.as_deref(),
@@ -7082,6 +7092,10 @@ mod daemon_tests {
         assert!(
             !ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
             "#1775: the actor's share settles the keyless mark and writes the file away"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the mark is settled"
         );
         // #1663 review P1 (Codex controller, 30 Oct): the carrier's
         // acceptance of the sealed share — the spawned egress's admitted
@@ -9260,7 +9274,7 @@ mod daemon_tests {
         let author_kp = fx.state.agent.identity().agent_keypair();
         let mut held_next = f_result.clone();
         held_next.roster_revision = held_next.roster_revision.saturating_add(1);
-        held_next.remove_member(&b_hex, Some(admin_hex.clone()));
+        held_next.remove_member(&survivor_hex, Some(admin_hex.clone()));
         held_next.secret_epoch = next_secret_epoch + 1;
         held_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
         let held_commit = held_next
@@ -9270,7 +9284,7 @@ mod daemon_tests {
             group_id: fx.group_id.clone(),
             revision: held_next.roster_revision,
             actor: admin_hex.clone(),
-            agent_id: b_hex.clone(),
+            agent_id: survivor_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
             secret_epoch: Some(next_secret_epoch + 1),
