@@ -658,9 +658,11 @@ jobs:
   w3h-plan:
     # Names the case groups for the matrix. A case is in exactly one group.
     # S3 (`w3h_1356_`) and S4 (`w3h_1357_`) each have a group, so more of
-    # those cases extend that shard only. The H-S3-c/c2/c3/d8 rows each have
-    # their own S3 group (`s3-c`, `s3-c2`, `s3-c3`, `s3-d8`). A group is omitted
-    # when the tree has no matching test.
+    # those cases extend that shard only. The H-S3-c/c2/c3/d8/d3 rows each have
+    # their own S3 group (`s3-c`, `s3-c2`, `s3-c3`, `s3-d8`, `s3-d3`). H-S3-d3
+    # runs as four parallel parts (`s3-d3.1` to `s3-d3.4`, 5 reruns each;
+    # `PARTS` in w3h-shards.py). A group is omitted when the tree has no
+    # matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -682,8 +684,10 @@ jobs:
           echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
 
   w3h-shard:
-    # One group, still `--stress-count 20`. The summary job below is the
-    # D196 gate. `fail-fast: false` so one bad group still uploads traces.
+    # One group, still `--stress-count 20`, or one part of a split group
+    # with its share of the 20 (`w3h-shards.py --stress`). The summary job
+    # below is the D196 gate and counts 20 receipts per case.
+    # `fail-fast: false` so one bad group still uploads traces.
     name: W3-H shard (${{ matrix.group }})
     needs: w3h-plan
     runs-on: ubuntu-latest
@@ -697,7 +701,9 @@ jobs:
     # parallel jobs in job 124477009427), so 165 min no longer held setup,
     # build, the 155-min test deadline and upload. The 31 Oct ruling on
     # #1733 keeps this budget: when an S3 group no longer fits, split it.
-    # Do not raise the budget.
+    # Do not raise the budget. One H-S3-d3 rerun alone is 940-1000 s
+    # (job 125609571831: 9 of 20 in the 9300 s deadline), so its 20
+    # reruns are split into parts inside this budget (#1736).
     timeout-minutes: ${{ startsWith(matrix.group, 's3') && 185 || 120 }}
     strategy:
       fail-fast: false
@@ -790,12 +796,26 @@ jobs:
             export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable"
           fi
           filter="$(python3 -B scripts/ci/w3h-shards.py --filter "${{ matrix.group }}")"
-          echo "W3H-SHARD-START group=${{ matrix.group }} filter=${filter}"
+          stress="$(python3 -B scripts/ci/w3h-shards.py --stress "${{ matrix.group }}")"
+          echo "W3H-SHARD-START group=${{ matrix.group }} stress-count=${stress} filter=${filter}"
           python3 -B scripts/ci/w3h-shards.py --list "${{ matrix.group }}"
           bash scripts/ci/nextest-isolated.sh --all-features --build-jobs 1 --lib -- \
-            --profile w3h-gate --run-ignored all --stress-count 20 -E "$filter"
+            --profile w3h-gate --run-ignored all --stress-count "$stress" -E "$filter"
           echo "W3H-SHARD-END group=${{ matrix.group }}"
 
+      # Parts of a split group run the same case on different runners, and
+      # a runner can reuse a pid, so their `<case>-<pid>` names could
+      # collide in the merge. Tag them with the part first.
+      - name: Tag split-part traces
+        if: always() && contains(matrix.group, '.')
+        run: |
+          if [ -d target/w3h/traces ]; then
+            python3 -B scripts/ci/w3h-shards.py --tag-traces "${{ matrix.group }}" target/w3h/traces
+          fi
+
+      # Each part also writes pid-less `<case>.first-digest` and
+      # `.divergent-digest` markers; the merge below keeps one. Nothing
+      # reads them after the run (see `tag_traces` in w3h-shards.py).
       - name: Upload W3-H shard traces
         if: always()
         uses: actions/upload-artifact@v5
@@ -982,6 +1002,8 @@ jobs:
           --expect w3h_1356_control_s3_c3_owner_reseats_owner_axis_node=GREEN
           --require w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node
           --expect w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node=GREEN
+          --require w3h_1356_control_s3_d3_authorisation_refusals_typed
+          --expect w3h_1356_control_s3_d3_authorisation_refusals_typed=GREEN
           --require w3h_1666_control_certificate_only_admin_seals
           --expect w3h_1666_control_certificate_only_admin_seals=GREEN
           --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless

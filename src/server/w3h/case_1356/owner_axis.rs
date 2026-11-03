@@ -1,5 +1,5 @@
 //! OwnerCertified harness support (#1666) and the ADR 0109 §10 rows
-//! H-S3-c, H-S3-c2, H-S3-c3 and H-S3-d8 (#871, D78, D79, D121, D156, #1572). O is the only
+//! H-S3-c, H-S3-c2, H-S3-c3, H-S3-d3 and H-S3-d8 (#871, D78, D79, D121, D156, #1572). O is the only
 //! install with the owner's USER key; A, X and J hold owner-issued agent
 //! certificates only (test builds load `agent.cert` without a user key).
 //!
@@ -16,6 +16,8 @@
 //! (`CAUSE_C`); a missing prerequisite or any other failure is INFRA.
 
 use super::*;
+
+mod refusals;
 
 const LABELS: &[&str] = &["O", "A"];
 const FINAL: &str = "certificate_only_admin_seals_an_owner_certified_group";
@@ -209,6 +211,8 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
 // ─── H-S3-c and H-S3-c2 ───────────────────────────────────────────────────
 
 const C_LABELS: &[&str] = &["O", "A", "X", "J"];
+/// H-S3-d3: H-S3-c's nodes plus member M1, seated before invite I.
+const D3_LABELS: &[&str] = &["O", "A", "X", "J", "M1"];
 const FINAL_C: &str = "j_reseat_required_then_promoted_admin_reseats_it_with_the_owner_offline";
 const CAUSE_C: &str = "the row's main observation: after the advance J stays on X's fork r+1′ \
                        with its gap gate armed and no typed re-seat state (H-S3-c: no marker); \
@@ -341,6 +345,8 @@ struct Prefix {
     j_hex: String,
     /// O's head when invite I was minted (r).
     minted: View,
+    /// O's head after it sealed J (r+2).
+    sealed: View,
     /// The owner's (O's) ML-DSA-65 USER public key bytes.
     owner_key: Vec<u8>,
     /// X's r+1′ head, which J holds.
@@ -349,8 +355,8 @@ struct Prefix {
     joined_at: usize,
     /// While set, every write that O originates is held from J (H-S3-c).
     o_to_j_held: Arc<std::sync::atomic::AtomicBool>,
-    /// While set, every write that J originates is held from A and O
-    /// (H-S3-d8). Unset after the prefix.
+    /// While set, every write that J originates is held (H-S3-d8, H-S3-d3).
+    /// Unset after the prefix.
     j_out_held: Arc<std::sync::atomic::AtomicBool>,
     /// O's held r+1 gossip writes to J after r+1′.
     held_to_j: Arc<std::sync::atomic::AtomicUsize>,
@@ -360,20 +366,23 @@ struct Prefix {
 
 /// The H-S3-c setup up to J on X's fork r+1′ (ADR 0109 §10), shared by the
 /// owner-axis rows; with `both`, H-S3-c2's canonical r+1 also reaches J.
-/// `None` when a prerequisite is missing: the receipt is then finished
-/// under the row's final step `last`.
+/// With `m1` (H-S3-d3), member M1 is seated with A and X, and is cut from
+/// X as O and A are. `None` when a prerequisite is missing: the receipt is
+/// then finished under the row's final step `last`.
 async fn fork_prefix(
     sim: &mut Sim,
     receipt: &mut Receipt,
     both: bool,
+    m1: bool,
     last: &str,
 ) -> Result<Option<Prefix>> {
+    let labels = if m1 { D3_LABELS } else { C_LABELS };
     let owner = crate::identity::UserKeypair::from_seed(&[0x13; 32])?;
     start_certified(sim, "O", &owner, true).await?;
-    for label in ["A", "X", "J"] {
+    for label in labels.iter().filter(|l| **l != "O") {
         start_certified(sim, label, &owner, false).await?;
     }
-    mesh(sim, C_LABELS).await?;
+    mesh(sim, labels).await?;
     // O is an owned install: let its deferred Home provisioning finish
     // before the announces, so it runs outside the row.
     sim.until("O provisions its Home", SETUP, async |s: &Sim| {
@@ -381,13 +390,13 @@ async fn fork_prefix(
         home.is_ok_and(|(code, body)| code.is_success() && body["state"] != "provisioning_pending")
     })
     .await?;
-    announce_all(sim, C_LABELS).await?;
+    announce_all(sim, labels).await?;
     // A pinned send with no binding runs a blocking Lookup that stalls
     // paused virtual time (see `case_1357`).
     sim.until("every node pins every peer", SETUP, async |s: &Sim| {
-        for (from, to) in C_LABELS
+        for (from, to) in labels
             .iter()
-            .flat_map(|f| C_LABELS.iter().map(move |t| (f, t)))
+            .flat_map(|f| labels.iter().map(move |t| (f, t)))
         {
             let (Ok(state), Ok((id, _))) = (s.state(from), s.ids(to)) else {
                 return false;
@@ -400,7 +409,8 @@ async fn fork_prefix(
     })
     .await?;
     let group = create_group(sim, &owner).await?;
-    for member in ["A", "X"] {
+    let seated: &[&str] = if m1 { &["A", "X", "M1"] } else { &["A", "X"] };
+    for member in seated {
         join_owner(sim, member, &group, &owner).await?;
     }
     for admin in ["A", "X"] {
@@ -431,12 +441,11 @@ async fn fork_prefix(
         ensure!(code.is_success(), "policy {read_access}: {code} {answer}");
     }
     let head = view(sim, "O", &group).await?;
-    all_reach(sim, &["A", "X"], &group, &head.state_hash).await?;
+    all_reach(sim, seated, &group, &head.state_hash).await?;
     // Invite I at r; J redeems it only after O removes X.
     let minted = view(sim, "O", &group).await?;
     let link = invite(sim, "O", &group).await?;
     let (o, x, j) = (sim.peer("O")?.0, sim.peer("X")?.0, sim.peer("J")?.0);
-    let a = sim.peer("A")?.0;
 
     // X is cut from O and A; O's r+1 publish (and its relays) is captured
     // and held from J.
@@ -481,11 +490,12 @@ async fn fork_prefix(
             },
         );
     }
-    for other in ["O", "A"] {
+    for other in labels.iter().filter(|l| !["X", "J"].contains(l)) {
         sim.fabric()
             .set_partitioned(&sim.peer("X")?, &sim.peer(other)?, true);
     }
-    sim.fabric().mark("fault: X~O and X~A partitioned");
+    sim.fabric()
+        .mark("fault: X partitioned from every node but J");
     let x_hex = sim.agent_hex("X")?;
     let recorded_from = sim
         .state("O")?
@@ -653,9 +663,9 @@ async fn fork_prefix(
             let from_o =
                 origin == o && dst == j && o_held.load(std::sync::atomic::Ordering::SeqCst);
             let seal_to_j = dst == j && is_held(&seal_ids, msg);
-            let from_j = origin == j
-                && (dst == a || dst == o)
-                && j_held.load(std::sync::atomic::Ordering::SeqCst);
+            // While set, J's writes to every node are held (X is cut
+            // anyway); with M1 seated, M1 also answers J's requests (#1736).
+            let from_j = origin == j && j_held.load(std::sync::atomic::Ordering::SeqCst);
             origin == x || dst == x || from_j || (!both && (to_j || from_o || seal_to_j))
         });
     }
@@ -739,6 +749,7 @@ async fn fork_prefix(
         group,
         j_hex,
         minted,
+        sealed,
         owner_key: owner.public_key().as_bytes().to_vec(),
         fork,
         joined_at,
@@ -1013,7 +1024,7 @@ async fn reseat_and_swap(
 /// H-S3-c, or with `both` H-S3-c2 (ADR 0109 §10). Each candidate step is a
 /// named sub-check; a red run lists the ones that fail.
 async fn owner_reseat(sim: &mut Sim, receipt: &mut Receipt, both: bool) -> Result<()> {
-    let Some(p) = fork_prefix(sim, receipt, both, FINAL_C).await? else {
+    let Some(p) = fork_prefix(sim, receipt, both, false, FINAL_C).await? else {
         return Ok(());
     };
     let Some(adv) = advance(
@@ -1193,7 +1204,7 @@ const CAUSE_C3: &str = "the row's main observation: O's re-seat route returns 40
 /// H-S3-c3 (owner path): H-S3-c with O online throughout. O removes J
 /// (r+3) and calls reseat with basis `Removal(r+3)`.
 async fn owner_path_reseat(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
-    let Some(p) = fork_prefix(sim, receipt, false, FINAL_C3).await? else {
+    let Some(p) = fork_prefix(sim, receipt, false, false, FINAL_C3).await? else {
         return Ok(());
     };
     let Some(adv) = advance(
@@ -1279,7 +1290,7 @@ const REQUEST_INTERVAL: Duration = Duration::from_secs(70);
 /// re-seat with basis `Removal(r+3)` swaps J in at r+4.
 async fn removal_basis_reseat(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     use std::sync::atomic::Ordering;
-    let Some(p) = fork_prefix(sim, receipt, false, FINAL_D8).await? else {
+    let Some(p) = fork_prefix(sim, receipt, false, false, FINAL_D8).await? else {
         return Ok(());
     };
     let (group, j_hex) = (&p.group, &p.j_hex);
@@ -1363,16 +1374,42 @@ fn owner_countersignature(
         .map_err(|refusal| format!("{refusal:?}"))
 }
 
-/// The newest re-seat invite `issuer` issued for `subject`, read from the
-/// S3 sidecar files under its data directory. The read is passive, so it
-/// runs while `issuer` is up (`Sim::data_dir` is for stopped nodes).
+/// The newest re-seat invite `issuer` issued for `subject` (see
+/// [`issued_reseat`]).
 fn issued_invite(
     sim: &Sim,
     issuer: &str,
     subject: &str,
 ) -> Result<Option<crate::groups::invite::SignedInvite>> {
+    let Some(issued) = issued_reseat(sim, issuer, subject)? else {
+        return Ok(None);
+    };
+    crate::groups::invite::SignedInvite::from_link(&issued.invite)
+        .map(Some)
+        .map_err(|e| anyhow!("{issuer}'s re-seat invite: {e}"))
+}
+
+/// The newest re-seat authorisation `issuer` issued for `subject`, with its
+/// invite, read from the S3 sidecar files under its data directory.
+fn issued_reseat(
+    sim: &Sim,
+    issuer: &str,
+    subject: &str,
+) -> Result<Option<crate::groups::recovery::IssuedReseatV1>> {
+    Ok(sidecars(sim, issuer)?.into_iter().find_map(|body| {
+        body.issued_reseats
+            .into_iter()
+            .rev()
+            .find(|i| i.authorisation.fields.subject.eq_ignore_ascii_case(subject))
+    }))
+}
+
+/// Every S3 sidecar under `label`'s data directory. The read is passive,
+/// so it runs while `label` is up (`Sim::data_dir` is for stopped nodes).
+fn sidecars(sim: &Sim, label: &str) -> Result<Vec<crate::groups::recovery::GroupRecoveryV1>> {
     use crate::groups::recovery::{decode_sidecar, GROUP_RECOVERY_EXTENSION};
-    let mut dirs = vec![sim.root.path().join(issuer).join("data")];
+    let mut dirs = vec![sim.root.path().join(label).join("data")];
+    let mut bodies = Vec::new();
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let path = entry?.path();
@@ -1386,22 +1423,12 @@ fn issued_invite(
             {
                 continue;
             }
-            let Ok(body) = decode_sidecar(&std::fs::read(&path)?) else {
-                continue;
-            };
-            let issued = body
-                .issued_reseats
-                .iter()
-                .rev()
-                .find(|i| i.authorisation.fields.subject.eq_ignore_ascii_case(subject));
-            if let Some(issued) = issued {
-                return crate::groups::invite::SignedInvite::from_link(&issued.invite)
-                    .map(Some)
-                    .map_err(|e| anyhow!("{issuer}'s re-seat invite: {e}"));
+            if let Ok(body) = decode_sidecar(&std::fs::read(&path)?) {
+                bodies.push(body);
             }
         }
     }
-    Ok(None)
+    Ok(bodies)
 }
 
 /// `label`'s `membership_state` for `group` (the label `GET /groups/:id`
@@ -1510,6 +1537,7 @@ enum Row {
     C,
     C2,
     C3,
+    D3,
     D8,
 }
 
@@ -1519,6 +1547,7 @@ async fn run(case: &str, seed: u64, row: Row) -> Receipt {
         Row::Control => (LABELS, FINAL),
         Row::C | Row::C2 => (C_LABELS, FINAL_C),
         Row::C3 => (C_LABELS, FINAL_C3),
+        Row::D3 => (D3_LABELS, refusals::FINAL_D3),
         Row::D8 => (C_LABELS, FINAL_D8),
     };
     receipt.note(match row {
@@ -1526,6 +1555,7 @@ async fn run(case: &str, seed: u64, row: Row) -> Receipt {
         Row::C => "ADR 0109 S3 (#1356, #1572) H-S3-c; O alone holds the USER key".to_string(),
         Row::C2 => "ADR 0109 S3 (#1356, #1572) H-S3-c2; O alone holds the USER key".to_string(),
         Row::C3 => "ADR 0109 S3 (#1356, #1572) H-S3-c3; O online throughout".to_string(),
+        Row::D3 => "ADR 0109 S3 (#1356, #1572) H-S3-d3; J refuses bad authorisations".to_string(),
         Row::D8 => "ADR 0109 S3 (#1356, #1572) H-S3-d8; A removes J, O re-seats".to_string(),
     });
     match Sim::empty(case, seed, labels) {
@@ -1535,6 +1565,7 @@ async fn run(case: &str, seed: u64, row: Row) -> Receipt {
                 Row::C => owner_reseat(&mut sim, &mut receipt, false).await,
                 Row::C2 => owner_reseat(&mut sim, &mut receipt, true).await,
                 Row::C3 => owner_path_reseat(&mut sim, &mut receipt).await,
+                Row::D3 => refusals::authorisation_refusals(&mut sim, &mut receipt).await,
                 Row::D8 => removal_basis_reseat(&mut sim, &mut receipt).await,
             };
             if let Err(error) = ran {
@@ -1607,6 +1638,18 @@ fn w3h_1356_red_s3_c2_reseat_retires_marker_and_gap() -> Result<()> {
 fn w3h_1356_control_s3_c3_owner_reseats_owner_axis_node() -> Result<()> {
     let case = "w3h_1356_control_s3_c3_owner_reseats_owner_axis_node";
     super::super::block_on_paused(expect(case, 0x1356_0109, Row::C3))
+}
+
+/// H-S3-d3 (authorisation refusals): a control; on `main` before S3 the
+/// route returned 404. Step (6) waits for the authorisation's expiry,
+/// which follows the daemons' wall clock, so the row needs the shim (wall
+/// clock = base + virtual time). Without it J never sees the expiry and
+/// re-seats. It runs in the W3-H gate only (`--run-ignored all`).
+#[test]
+#[ignore = "needs the W3-H LD_PRELOAD shim: the W3-H gate runs it with --run-ignored all"]
+fn w3h_1356_control_s3_d3_authorisation_refusals_typed() -> Result<()> {
+    let case = "w3h_1356_control_s3_d3_authorisation_refusals_typed";
+    super::super::block_on_paused(expect(case, 0x1356_0111, Row::D3))
 }
 
 /// H-S3-d8 (`Removal` basis): a control; on `main` before S3, J stayed at
