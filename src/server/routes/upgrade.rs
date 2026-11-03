@@ -46,6 +46,12 @@ const SELF_PUBLISHED_RELEASE_TTL: Duration = Duration::from_secs(30 * 60);
 const RELEASE_ANNOUNCE_INTERVAL: Duration =
     Duration::from_secs(x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS);
 
+/// A version whose announcement keeps failing is left to the fallback poll
+/// and the next restart instead of being re-sent every heartbeat: a publish
+/// that timed out after the bytes went out must not re-announce the same
+/// manifest with a fresh gossip message ID forever.
+const MAX_RELEASE_PUBLISH_ATTEMPTS: u8 = 3;
+
 #[derive(Debug, Default)]
 pub(in crate::server) struct SelfPublishedReleaseManifests {
     published_at: HashMap<[u8; 32], Instant>,
@@ -1376,6 +1382,7 @@ async fn run_release_announce_driver<S, Check, CheckFuture, Publish, PublishFutu
     // poll and the next restart carry repeats, so a heartbeat-cadence loop
     // must not re-flood the topic with the same manifest.
     let mut announced: HashSet<String> = HashSet::new();
+    let mut publish_attempts: HashMap<String, u8> = HashMap::new();
     futures::pin_mut!(ticks);
     loop {
         if *shutdown.borrow() || shutdown.has_changed().is_err() {
@@ -1430,8 +1437,17 @@ async fn run_release_announce_driver<S, Check, CheckFuture, Publish, PublishFutu
             continue;
         }
         // Record the version only after the announcement went out, so a
-        // failed publication retries on the next heartbeat instead of being
-        // silenced forever.
+        // failed publication retries on the next heartbeat. Retries are
+        // capped: a publish that timed out after the bytes went out must
+        // not re-announce the same manifest with a fresh gossip message ID
+        // every heartbeat. The fallback poll and the next restart carry it.
+        let attempts = {
+            let attempts = publish_attempts
+                .entry(verified.manifest.version.clone())
+                .or_insert(0);
+            *attempts += 1;
+            *attempts
+        };
         tokio::select! {
             result = tokio::time::timeout(Duration::from_secs(10), publish(verified.gossip_payload.clone())) => {
                 if matches!(result, Ok(Ok(()))) {
@@ -1440,6 +1456,15 @@ async fn run_release_announce_driver<S, Check, CheckFuture, Publish, PublishFutu
                         .await
                         .record_payload(&verified.gossip_payload, Instant::now());
                     announced.insert(verified.manifest.version.clone());
+                    publish_attempts.remove(&verified.manifest.version);
+                } else if attempts >= MAX_RELEASE_PUBLISH_ATTEMPTS {
+                    tracing::warn!(
+                        version = %verified.manifest.version,
+                        attempts,
+                        "Release announcement kept failing; leaving it to the fallback poll"
+                    );
+                    announced.insert(verified.manifest.version.clone());
+                    publish_attempts.remove(&verified.manifest.version);
                 } else {
                     tracing::debug!("Release announcement did not complete; retrying next heartbeat");
                 }
@@ -2681,6 +2706,112 @@ mod tests {
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "a failed announcement is retried once and not re-sent after success"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_announce_driver_gives_up_after_bounded_publish_attempts() {
+        let verified = verified_release_with_version(&version_newer_than_current());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::clone(&attempts);
+        let (_keep_running, shutdown) = watch::channel(false);
+        run_release_announce_driver(
+            futures::stream::iter([(), (), (), (), (), ()]),
+            move || {
+                let verified = verified.clone();
+                async { Ok(Some(verified)) }
+            },
+            None,
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            move |_| {
+                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err("gossip unreachable".to_string()) }
+            },
+            shutdown,
+        )
+        .await;
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(MAX_RELEASE_PUBLISH_ATTEMPTS),
+            "a version that cannot be published is left to the fallback poll, not re-sent forever"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_propagation_reaches_a_subscribed_peer_within_two_heartbeats() {
+        // #1169 acceptance shape: an observer announces a fresh release on
+        // the release topic within one heartbeat, and a subscribed peer's
+        // gossip driver reacts within two heartbeats of publication.
+        // Simulated network only: the two drivers are wired by a channel.
+        let verified = verified_release_with_version(&version_newer_than_current());
+        let start = tokio::time::Instant::now();
+        let (announce_tx, announce_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (relayed_tx, mut relayed_rx) = mpsc::channel::<tokio::time::Instant>(1);
+        let published_at = Arc::new(std::sync::Mutex::new(None::<tokio::time::Instant>));
+        let sent_at = Arc::clone(&published_at);
+
+        // Node A: the ticker the announce poll runs; the first tick is
+        // skipped because the startup paths own the immediate look.
+        let mut ticker = tokio::time::interval(RELEASE_ANNOUNCE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        let ticks = futures::stream::unfold(ticker, |mut ticker| async move {
+            ticker.tick().await;
+            Some(((), ticker))
+        })
+        .take(2);
+        let feed = verified.clone();
+        let (_keep_running, announcer_shutdown) = watch::channel(false);
+        let announcer = run_release_announce_driver(
+            ticks,
+            move || {
+                let feed = feed.clone();
+                async { Ok(Some(feed)) }
+            },
+            None,
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            move |payload| {
+                let announce_tx = announce_tx.clone();
+                let sent_at = Arc::clone(&sent_at);
+                async move {
+                    *sent_at.lock().unwrap() = Some(tokio::time::Instant::now());
+                    announce_tx.send(payload).await.map_err(|e| e.to_string())
+                }
+            },
+            announcer_shutdown,
+        );
+
+        // Peer B: the gossip driver a subscribed peer runs; it reacts the
+        // moment the announcement arrives.
+        let releases = futures::stream::unfold(announce_rx, move |mut announce_rx| {
+            let verified = verified.clone();
+            async move {
+                let _payload = announce_rx.recv().await?;
+                Some((verified, announce_rx))
+            }
+        });
+        let (_keep_running, relayer_shutdown) = watch::channel(false);
+        let relayer = run_gossip_update_driver(
+            releases,
+            None,
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            move |_| {
+                let _ = relayed_tx.try_send(tokio::time::Instant::now());
+                async { Ok(()) }
+            },
+            relayer_shutdown,
+        );
+
+        tokio::join!(announcer, relayer);
+        let announced_at = published_at.lock().unwrap().expect("announcement went out");
+        let peer_reacted_at = relayed_rx.recv().await.expect("peer reacted");
+        assert!(
+            announced_at.duration_since(start) <= RELEASE_ANNOUNCE_INTERVAL,
+            "the announcement left within one heartbeat cycle"
+        );
+        assert!(
+            peer_reacted_at.duration_since(start) < 2 * RELEASE_ANNOUNCE_INTERVAL,
+            "a subscribed peer reacted within two heartbeat cycles"
         );
     }
 
