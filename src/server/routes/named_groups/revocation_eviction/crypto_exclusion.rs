@@ -9285,13 +9285,16 @@ mod daemon_tests {
             },
         )
         .context("the frame's keyless result")?;
-        // The held chain has two steps (round 6, finding 2): B's
-        // rotation raises the epoch past the frame's, and the author's
-        // role update rides on it without raising further — so the LAST
-        // step's author is the author, whose key the record names, while
-        // the RAISING step's author is B. The exit belongs to B's key
-        // only; under a last-step rule the author's installed key would
-        // wrongly take it.
+        // The held chain has two steps (rounds 6-7): B's rotation
+        // raises the epoch past the frame's, and the author's rename
+        // rides on it without raising further. The record names B — the
+        // raising author — so the exit fires at the raising cursor; the
+        // rename only proves the walk continues past it. (This shape
+        // cannot alone discriminate a last-step rule, because the exit
+        // fires at the raising cursor under either; the restored
+        // sibling test below carries the guard's negative side, and the
+        // fully discriminating E+2 shape needs a second phantom seat
+        // this fixture does not have.)
         let mut b_rotation = f_result.clone();
         b_rotation.roster_revision = b_rotation.roster_revision.saturating_add(1);
         b_rotation.remove_member(&survivor_hex, Some(b_hex.clone()));
@@ -9350,6 +9353,148 @@ mod daemon_tests {
             receive(&fx.replica, admin, &frame).await,
             ReceiveOutcome::Applied,
             "the held exit belongs to the raising step's author, not the last step's"
+        );
+        Ok(())
+    }
+
+    /// #1775 item 2 (rounds 2-7, restored): the held exit is the
+    /// raising author's recorded key, not any admin's. B's share of the
+    /// later epoch is installed while the AUTHOR's rotation of that
+    /// epoch waits held: the record names B, not the rotation's author,
+    /// so no exit — the frame keeps waiting. Deleting the
+    /// `share_sent_by` guard would let any admin's key take the exit.
+    #[tokio::test]
+    async fn another_admins_installed_secret_takes_no_held_exit() -> Result<()> {
+        use anyhow::Context as _;
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's share of the later epoch installs, and the AUTHOR's
+        // rotation of that epoch waits held on the frame's result.
+        let foreign = [0xB6u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+        let parent_info = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("the survivor's group")?;
+        let frame_commit = body.commit.to_commit();
+        let f_result = ng::apply_stateful_event_to_group(
+            &parent_info,
+            &frame_commit,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.roster_revision =
+                    ng::adopt_roster_revision(next.roster_revision, body.next_revision);
+                next.secret_epoch = next_secret_epoch;
+                next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+            },
+        )
+        .context("the frame's keyless result")?;
+        let author_kp = fx.state.agent.identity().agent_keypair();
+        let mut held_next = f_result.clone();
+        held_next.roster_revision = held_next.roster_revision.saturating_add(1);
+        held_next.remove_member(&survivor_hex, Some(admin_hex.clone()));
+        held_next.secret_epoch = next_secret_epoch + 1;
+        held_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let held_commit = held_next
+            .seal_commit(author_kp, 0)
+            .context("seal the author's removal")?;
+        let held_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: fx.group_id.clone(),
+            revision: held_next.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: survivor_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(next_secret_epoch + 1),
+            commit: Some(held_commit),
+        };
+        super::super::owner_recovery::seed_held_event_for_test(
+            &fx.replica,
+            &fx.stable,
+            held_removal,
+            admin,
+            Some(f_result.state_hash.clone()),
+        )
+        .await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "another admin's installed secret takes no held exit: the frame keeps waiting"
         );
         Ok(())
     }

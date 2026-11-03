@@ -1914,6 +1914,7 @@ hold lasts until one of these ends it:
 - An installed share of the held epoch, or of a later epoch that a head
   commit pins. A sealed share that raised the local epoch past what the
   head commits completed no verified transition (#1775).
+- A recorded actor of the hold sealing a later epoch's unpinned secret.
 - The #1663 republication, while the node holds no secret.
 - The exclusion installing with its own key. This ends every older hold.
 
@@ -1934,8 +1935,7 @@ commit moved, or a commit chained on that head. A sibling commit of the
 epoch ends the mark. So does a head that commits a later epoch. A share
 of a later unpinned epoch is not the mark's actor key.
 
-A hold also ends when one of its recorded actors seals a later epoch's
-unpinned secret. A known-empty evicted-removal hold ends at any secret
+A known-empty evicted-removal hold ends at any secret
 of its epoch, committed or not. A hold whose actor list is unknown (a
 pre-#1771 exclusion file) is ended by no secret that a commit does not
 pin. One that carries removed members is an evicted removal's

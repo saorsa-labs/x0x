@@ -360,7 +360,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
         .get(group_key)
         .is_some_and(|mark| {
             info.secret_epoch == mark.secret_epoch
-                && head_reaches(info, mark.secret_epoch, &mark.head)
+                && head_reaches(info, mark.secret_epoch, &mark.head, true)
                 && info.shared_secret.is_some()
                 && !sent
                     .as_deref()
@@ -380,7 +380,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
             })
 }
 
-/// #1775 rounds 3-6: whether `mark_head` is `info`'s head or one of
+/// #1775 rounds 3-7: whether `mark_head` is `info`'s head or one of
 /// its retained ancestors, following the head's own `prev_state_hash`
 /// links entry by entry — the log also holds adopted chains that fork
 /// from earlier ancestors, so a positional pass proves nothing. An
@@ -388,41 +388,48 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
 /// is the floor of the mark's epoch: the chain dipped below it without
 /// passing through the mark's head, so a sibling commit of the epoch
 /// voids the mark however deep the chain runs. A link the log does not
-/// retain cannot disprove the mark, so it stays (fail closed); a
-/// genesis reached without the mark does not.
-fn head_reaches(info: &x0x::groups::GroupInfo, mark_epoch: u64, mark_head: &str) -> bool {
-    let epoch_of = |binding: Option<&str>| {
-        binding?
-            .strip_prefix("gss:epoch=")
-            .and_then(|epoch| epoch.parse::<u64>().ok())
-    };
-    // Follow the head's own prev links entry by entry: the retained log
-    // also holds adopted chains that fork from earlier ancestors, so a
-    // positional pass proves nothing.
-    let mut cursor = info.state_hash.clone();
+/// retain cannot disprove the mark: withholding keeps it (fail closed),
+/// the replace path treats the unknown as pinned. A genesis reached
+/// without the mark does not keep it.
+fn head_reaches(
+    info: &x0x::groups::GroupInfo,
+    mark_epoch: u64,
+    mark_head: &str,
+    missing_keeps: bool,
+) -> bool {
+    // One index of the retained entries, then the head's own prev links
+    // entry by entry: the log also holds adopted chains that fork from
+    // earlier ancestors, so a positional pass proves nothing, and a
+    // linear scan per step costs too much on the send path.
+    let by_hash: std::collections::HashMap<&str, &x0x::groups::state_commit::GroupStateCommit> =
+        info.commit_log
+            .iter()
+            .map(|retained| (retained.commit.state_hash.as_str(), &retained.commit))
+            .collect();
+    let mut cursor = info.state_hash.as_str();
     for _ in 0..=info.commit_log.len() {
         if cursor == mark_head {
             return true;
         }
-        let Some(retained) = info
-            .commit_log
-            .iter()
-            .rev()
-            .find(|retained| retained.commit.state_hash == cursor)
-        else {
-            // The chain left the retained log: the mark stays (fail
-            // closed), as the committed epoch itself falls back.
-            return true;
+        let Some(commit) = by_hash.get(cursor) else {
+            // The chain left the retained log. Withholding keeps the
+            // mark (fail closed, as the committed epoch itself falls
+            // back); the replace path treats the unknown as pinned.
+            return missing_keeps;
         };
-        if epoch_of(retained.commit.security_binding.as_deref())
+        if commit
+            .security_binding
+            .as_deref()
+            .and_then(|binding| binding.strip_prefix("gss:epoch="))
+            .and_then(|epoch| epoch.parse::<u64>().ok())
             .is_some_and(|epoch| epoch < mark_epoch)
         {
             // The floor of the mark's epoch, on the head's own chain:
             // the mark's head is not an ancestor.
             return false;
         }
-        match retained.commit.prev_state_hash.as_deref() {
-            Some(prev) => cursor = prev.to_string(),
+        match commit.prev_state_hash.as_deref() {
+            Some(prev) => cursor = prev,
             None => return false,
         }
     }
@@ -450,7 +457,7 @@ pub(super) fn secret_unpinned(
             .get(group_key)
             .is_some_and(|mark| {
                 mark.secret_epoch == info.secret_epoch
-                    && head_reaches(info, mark.secret_epoch, &mark.head)
+                    && head_reaches(info, mark.secret_epoch, &mark.head, true)
             })
 }
 
@@ -1134,7 +1141,7 @@ fn prune_share_sender(state: &AppState, group_key: &str, info: &x0x::groups::Gro
         if marks.get(group_key).is_some_and(|mark| {
             mark.secret_epoch < committed
                 || (mark.secret_epoch <= committed
-                    && !head_reaches(info, mark.secret_epoch, &mark.head))
+                    && !head_reaches(info, mark.secret_epoch, &mark.head, true))
         }) {
             changed |= marks.remove(group_key).is_some();
         }
@@ -1265,7 +1272,7 @@ pub(super) fn replaces_uncommitted_secret(
                 .get(group_key)
                 .is_some_and(|mark| {
                     mark.secret_epoch == secret_epoch
-                        && head_reaches(info, mark.secret_epoch, &mark.head)
+                        && head_reaches(info, mark.secret_epoch, &mark.head, false)
                 }))
 }
 
@@ -1851,11 +1858,15 @@ mod tests {
             Some("gss:epoch=2".to_string()),
             keyless_in_log.clone(),
         ));
+        // The fork binds an epoch below the mark's and sits between the
+        // rename head and the mark in log order, where a positional pass
+        // would meet it first and wrongly void the mark.
+        let unrelated_hash = format!("unrelated2-{chain_parent}");
         chained.commit_log.push(commit_at(
             9,
             Some("elsewhere".to_string()),
-            None,
-            format!("unrelated2-{chain_parent}"),
+            Some("gss:epoch=1".to_string()),
+            unrelated_hash.clone(),
         ));
         let rename_head = format!("rename-on-{keyless_in_log}");
         chained.commit_log.push(commit_at(

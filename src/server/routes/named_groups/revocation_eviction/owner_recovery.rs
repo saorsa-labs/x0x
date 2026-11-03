@@ -2361,9 +2361,10 @@ pub(in crate::server) async fn promoted_admin_secret(
     // unpinned later secret from its own author strands no wait — and a
     // secret from any other sender still does not end one.
     let installed = group_by_stable(state, &stable_group_id).await;
-    // #1775 round 5: the author of the FIRST step that raised the epoch
-    // past the waiting one — not the last step's — owns the later key.
-    let mut raise_author: Option<String> = None;
+    // #1775 rounds 5 and 7: the author of the step that raised the
+    // epoch to each height owns that height's key — a later step's
+    // author, raising further, owns only its own.
+    let mut raises: Vec<(u64, String)> = Vec::new();
     let mut cursor = result.clone();
     // Each step moves the revision up, so the walk ends; the bound keeps it
     // to the held set.
@@ -2375,6 +2376,13 @@ pub(in crate::server) async fn promoted_admin_secret(
                 LaterAdminKey::Superseded
             });
         }
+        let raise_author = installed.as_ref().and_then(|(_, installed)| {
+            raises
+                .iter()
+                .rev()
+                .find(|(epoch, _)| *epoch == installed.secret_epoch)
+                .map(|(_, author)| author.clone())
+        });
         if let (Some(author), Some((key, installed))) = (&raise_author, &installed) {
             if cursor.secret_epoch > epoch
                 && installed.secret_epoch == cursor.secret_epoch
@@ -2392,8 +2400,8 @@ pub(in crate::server) async fn promoted_admin_secret(
             .find_map(|held| next_held_state(&cursor, held).map(|next| (held, next)))
         {
             Some((held, next)) => {
-                if next.secret_epoch > epoch && raise_author.is_none() {
-                    raise_author = Some(hex::encode(held.author.as_bytes()));
+                if next.secret_epoch > cursor.secret_epoch {
+                    raises.push((next.secret_epoch, hex::encode(held.author.as_bytes())));
                 }
                 cursor = next;
             }
