@@ -4583,6 +4583,23 @@ async fn dm_1455_bystander_plane_durable_send_stays_on_inbox_eager() {
                 Some("eager"),
                 "#1455: the recipient's machine must be eager for its own inbox topic on the sender"
             );
+            // The ACK leg's seat: the receiver records the origin-attested
+            // sender as the owner of the SENDER's inbox topic, so the
+            // durable ACK publish also carries to the sender itself rather
+            // than a bystander.
+            let ack_role = pubsub(bob)
+                .stage_stats()
+                .peer_scores_by_topic
+                .get(&dm::dm_inbox_topic(&alice.agent_id()).to_string())
+                .and_then(|by_peer| {
+                    by_peer.get(&saorsa_gossip_types::PeerId::new(alice.machine_id().0).to_string())
+                })
+                .map(|row| row.role.clone());
+            assert_eq!(
+                ack_role.as_deref(),
+                Some("eager"),
+                "#1455: the sender's machine must be eager for its own inbox topic on the receiver"
+            );
             let actual = bounded(
                 "receiver typed decrypt delivery",
                 DELIVERY,
