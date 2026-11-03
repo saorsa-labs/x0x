@@ -425,6 +425,10 @@ pub(in crate::server) async fn receive(
         .await;
         return RepublishOutcome::LocalFailure;
     }
+    // #1663 F1: the key is seated, so a later roster key that differs
+    // from the armed key is a change by another path, which ends the debt.
+    super::revocation_eviction::crypto_exclusion::seat_gss_shares_after_republish(state, armed)
+        .await;
     ng::refresh_group_card_cache_from_info(state, &group_key, &next).await;
     // The seated key may key a survivor this node's delivery rounds could
     // not seal to: the next round must seal the current secret to that
