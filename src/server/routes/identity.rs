@@ -538,7 +538,10 @@ pub(in crate::server) fn populate_invite_base_state_v4(
     // and the size budget holds at a roster cap instead of the 3rd member
     // (issue #188/#205). The legacy fat `base_members_v2` is never set on
     // v4 invites — the E1 view constructor refuses it.
-    invite.base_roster = Some(x0x::groups::state_commit::roster_projection(
+    // #1023: the digest-only projection — the invite link is DM-budgeted
+    // and is not a certificate carrier; the bytes travel with the
+    // retained-commit chain instead.
+    invite.base_roster = Some(x0x::groups::state_commit::roster_projection_digest_only(
         &info.members_v2,
     ));
     invite.base_members_v2 = None;

@@ -203,6 +203,7 @@ fn forgeries(
             state: crate::groups::GroupMemberState::Active,
             treekem_key_package_hash: None,
             certificate_digest: None,
+            certificate: None,
         },
     );
     let owner = crate::identity::UserKeypair::from_seed(&[0x13; 32])?;

@@ -1610,6 +1610,38 @@ impl GroupInfo {
             .collect()
     }
 
+    /// #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): whether `agent_hex`
+    /// is this group's CREATOR whose own EMBEDDED certificate is expired —
+    /// the seat every eviction path must spare. The hold keys on the
+    /// COMMITTED (embedded) certificate's failure, never an announced
+    /// one, so a creator whose committed certificate fails for any other
+    /// reason (wrong owner, wrong agent, a bad signature) is NOT held,
+    /// and a creator without bytes is not "its own expired certificate".
+    /// `owner_cert_verdict` holds such a seat at `DigestPending`; the S4
+    /// eviction paths use this same predicate to treat the held creator
+    /// as non-blocking, so revocation evictions of other members still
+    /// seal.
+    #[must_use]
+    pub fn creator_expired_certificate_hold(&self, agent_hex: &str, now_unix: u64) -> bool {
+        if agent_hex != hex::encode(self.creator.as_bytes()) {
+            return false;
+        }
+        let Some(cert) = self
+            .members_v2
+            .get(agent_hex)
+            .and_then(|member| member.certificate.as_ref())
+        else {
+            return false;
+        };
+        let Some(owner) = self.policy.admission.owner_certified_user_id() else {
+            return false;
+        };
+        matches!(
+            owner_cert::verify_cert_against_owner(owner, agent_hex, cert, false, now_unix),
+            Err(owner_cert::OwnerCertFailure::Expired)
+        )
+    }
+
     /// Round-4 prescriptive: THE single grace-aware, digestpending-fetch
     /// aware evaluation of an OwnerCertified roster. Called ONCE per
     /// operation; every seal path consumes the returned
@@ -1625,7 +1657,11 @@ impl GroupInfo {
     /// including an expired/stale embedded cert mid-rotation) or totally
     /// missing → `InGrace` (first observation stamps
     /// `certificate_missing_since_ms`); any other present-but-failing
-    /// certificate → `Failed` (definitive, no grace).
+    /// certificate → `Failed` (definitive, no grace) — EXCEPT the
+    /// creator's own EXPIRED certificate, which holds at `DigestPending`
+    /// ([`Self::creator_expired_certificate_hold`], Engineer ruling 1 Nov
+    /// 2026 02:36 GMT: never eviction-eligible from that alone, never
+    /// `Clean` until a renewal lands).
     ///
     /// ADR 0108 §4 (the Home verdict rule, #1143): in a committed Home
     /// scope ([`Self::is_home_scope`]) the canonical anonymous announced
@@ -1748,6 +1784,16 @@ impl GroupInfo {
                         );
                     }
                     None => {
+                        // #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): an
+                        // unfetchable renewal must not make the creator's
+                        // own expired certificate eviction-eligible through
+                        // the grace window either — the hold applies past
+                        // the window too.
+                        if self.creator_expired_certificate_hold(&agent_hex, now) {
+                            per_member
+                                .insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
+                            continue;
+                        }
                         per_member.insert(
                             agent_hex,
                             owner_cert::MemberCertStatus::Failed {
@@ -1766,6 +1812,26 @@ impl GroupInfo {
                     .and_then(|cert| check(cert).err())
                     .or_else(|| embedded.as_ref().and_then(|cert| check(cert).err()))
                     .unwrap_or(owner_cert::OwnerCertFailure::NoCertificate);
+                // Engineer ruling 1 Nov 2026 02:36 GMT: the creator seat
+                // never becomes eviction-eligible from its own EXPIRED
+                // certificate alone. The hold keys on the COMMITTED
+                // (embedded) certificate's failure — never an announced
+                // one — and an expired committed certificate on the
+                // creator holds like a digest-only seat: `DigestPending`
+                // is never in `OwnerCertVerdict::failed()`, so no
+                // ordinary-seal eviction set names the creator seat while
+                // its renewal is outstanding, while every operation that
+                // needs valid creator bytes still fails closed
+                // (`is_all_clean` stays false). The S4 eviction paths
+                // treat a held creator as non-blocking
+                // (`creator_expired_certificate_hold`), so revocation
+                // evictions of other members still seal. Any other
+                // failure (revocation is checked above; wrong owner or
+                // agent, a bad signature) stays `Failed`.
+                if self.creator_expired_certificate_hold(&agent_hex, now) {
+                    per_member.insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
+                    continue;
+                }
                 per_member.insert(agent_hex, owner_cert::MemberCertStatus::Failed { reason });
                 continue;
             }
@@ -1890,15 +1956,47 @@ impl GroupInfo {
     /// installed via [`Self::set_member_certificate`] (which re-checks the
     /// digest and stamps both fields). A provided certificate that matches
     /// no committed digest (or belongs to a byte-bearing member) is ignored
-    /// and logged — hydration never rewrites committed state. Returns the
-    /// number of members hydrated; the server broadcast bridge is the
-    /// intended caller.
+    /// and logged — hydration never rewrites committed state. #1023: seats
+    /// no provided certificate covers fall back to the group's OWN
+    /// retained-commit snapshots (`commit_log`), newest first, under the
+    /// same digest-anchored rule — the retained chain is a certificate
+    /// carrier, so a node holding it can hydrate with every other holder
+    /// offline. Returns the number of members hydrated; the server
+    /// broadcast bridge is the intended caller.
     pub fn hydrate_member_certificates(
         &mut self,
         certificates: &[(String, crate::identity::AgentCertificate)],
     ) -> usize {
+        // #1023: collect the commit-log fallback before any mutation (the
+        // scan borrows `self` immutably). A seat the caller covers is left
+        // to the caller's entry — the shared loop below skips byte-bearing
+        // seats, so an overlap cannot double-install.
+        let mut from_commit_log: Vec<(String, crate::identity::AgentCertificate)> = Vec::new();
+        for (agent_hex, member) in &self.members_v2 {
+            if member.certificate.is_some() {
+                continue;
+            }
+            let Some(committed) = member.certificate_digest.as_deref() else {
+                continue;
+            };
+            for retained in self.commit_log.iter().rev() {
+                let Some(snapshot) = retained.roster.get(agent_hex) else {
+                    continue;
+                };
+                let Some(cert) = snapshot.certificate.as_ref() else {
+                    continue;
+                };
+                if owner_cert::certificate_digest_hex(cert) == committed {
+                    from_commit_log.push((agent_hex.clone(), cert.clone()));
+                    break;
+                }
+                // A byte-bearing snapshot for a DIFFERENT admission is not
+                // a verdict on this seat: keep looking — a record
+                // installed whole can hold byte-bearing older links.
+            }
+        }
         let mut hydrated = 0usize;
-        for (agent_hex, cert) in certificates {
+        for (agent_hex, cert) in certificates.iter().chain(from_commit_log.iter()) {
             let Some(member) = self.members_v2.get(agent_hex) else {
                 continue;
             };
@@ -1972,6 +2070,10 @@ impl GroupInfo {
                 repaired += 1;
             }
         }
+        // #1023: age the certificate carry at load too — a record
+        // installed whole (a backup restore, a peer-built file) keeps old
+        // byte-bearing links until its next commit otherwise.
+        self.age_certificate_carry();
         repaired
     }
 
@@ -2007,6 +2109,27 @@ impl GroupInfo {
                 cap = COMMIT_LOG_CAP,
                 "commit_log exceeded cap; dropped oldest retained commits",
             );
+        }
+        self.age_certificate_carry();
+    }
+
+    /// #1023: strip snapshot certificate bytes from every retained link
+    /// older than [`state_commit::RETAINED_CERT_CARRY_LINKS`] (Engineer
+    /// rulings 31 Oct 2026 20:40 + 2 Nov 14:27 GMT: certificate bytes ride
+    /// the TERMINAL LINK PLUS ONE, so the chain a JoinResult serves still
+    /// holds bytes on its newest link while persisted growth stays small
+    /// and fixed). A node that adopted or hydrated while a link carried
+    /// bytes keeps what it seated. Every commit-log append site calls
+    /// this.
+    pub fn age_certificate_carry(&mut self) {
+        let carry_from = self
+            .commit_log
+            .len()
+            .saturating_sub(state_commit::RETAINED_CERT_CARRY_LINKS);
+        for retained in &mut self.commit_log[..carry_from] {
+            for snapshot in retained.roster.values_mut() {
+                snapshot.certificate = None;
+            }
         }
     }
 
@@ -2195,7 +2318,10 @@ impl GroupInfo {
     /// `certificate_digest` — a mismatching local cert drops its bytes but
     /// keeps the committed digest, so projection members without local
     /// bytes seat digest-only (`MemberCertStatus::DigestPending`) instead
-    /// of losing their committed evidence.
+    /// of losing their committed evidence. #1023: an entry whose snapshot
+    /// carries certificate bytes that hash to its committed digest seats
+    /// the BYTES at adoption, so a chain served while the certificate
+    /// holders were online keeps the group sealable after they go offline.
     pub fn apply_reconstructed_roster(
         &mut self,
         projection: &BTreeMap<String, state_commit::RosterMemberSnapshot>,
@@ -2211,6 +2337,24 @@ impl GroupInfo {
             self.members_v2.remove(&id);
         }
         for (id, snap) in projection {
+            // #1023: snapshot-carried certificate bytes install on
+            // adoption ONLY when they hash to the entry's committed
+            // `certificate_digest` — the same digest-anchored rule as
+            // [`Self::hydrate_member_certificates`]. Bytes without a
+            // committed digest, or hashing to a different one, are not
+            // evidence for this admission: the seat stays digest-only
+            // (`MemberCertStatus::DigestPending`). A byte-bearing seat
+            // hashes identically to its digest-only form, so the adopted
+            // root never moves.
+            let snapshot_certificate = snap
+                .certificate
+                .as_ref()
+                .filter(|cert| {
+                    snap.certificate_digest.as_deref().is_some_and(|committed| {
+                        owner_cert::certificate_digest_hex(cert) == committed
+                    })
+                })
+                .cloned();
             match self.members_v2.get_mut(id) {
                 Some(member) => {
                     member.role = snap.role;
@@ -2234,6 +2378,9 @@ impl GroupInfo {
                     // remains digest-committed
                     // (`MemberCertStatus::DigestPending`).
                     member.certificate_digest = snap.certificate_digest.clone();
+                    if member.certificate.is_none() {
+                        member.certificate = snapshot_certificate;
+                    }
                 }
                 None => {
                     let mut member =
@@ -2241,6 +2388,7 @@ impl GroupInfo {
                     member.role = snap.role;
                     member.state = snap.state;
                     member.certificate_digest = snap.certificate_digest.clone();
+                    member.certificate = snapshot_certificate;
                     self.members_v2.insert(id.clone(), member);
                 }
             }
@@ -3727,6 +3875,189 @@ mod tests {
     }
 
     #[test]
+    fn creator_seat_expired_certificate_never_becomes_eviction_eligible() {
+        // WHY (#1023, Engineer ruling 1 Nov 2026 02:36 GMT): with bytes
+        // arriving by chain, an expired committed certificate on the
+        // CREATOR seat would move it DigestPending → Failed(Expired) —
+        // eviction-eligible, so the ladder could remove the group's founder
+        // from its own expired certificate alone. The guard holds the
+        // creator seat at DigestPending: never in `failed()`, so no
+        // eviction path targets it, and never clean, so every operation
+        // needing valid creator bytes still fails closed until a renewal
+        // lands. An ordinary member's expired certificate stays Failed —
+        // still the eviction set — and a creator certificate failing for
+        // any other reason stays Failed too.
+        //
+        // Claude review (2 Nov 2026, finding 8): the expired bytes ARRIVE
+        // BY CHAIN — a byte-bearing projection folds through
+        // `apply_reconstructed_roster`, which installs them digest-anchored
+        // without an expiry check (the install is evidence-matching, the
+        // verdict is the check), and the verdict then really checks them.
+        let (user, creator_kp, _cert) = certified_fixture();
+        let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
+        let expired_creator =
+            crate::identity::AgentCertificate::issue_with_expiry(&user, &creator_kp, Some(1))
+                .expect("expired creator cert");
+        let member_kp = crate::identity::AgentKeypair::generate().unwrap();
+        let member_hex = hex::encode(member_kp.agent_id().as_bytes());
+        let expired_member =
+            crate::identity::AgentCertificate::issue_with_expiry(&user, &member_kp, Some(1))
+                .expect("expired member cert");
+
+        // The chain-carried projection: both seats byte-bearing with
+        // expired certificates.
+        let mut source = GroupInfo::new(
+            "S".into(),
+            String::new(),
+            creator_kp.agent_id(),
+            "aabb".repeat(8),
+        );
+        source
+            .set_member_certificate(&creator_hex, expired_creator.clone())
+            .expect("the source seat binds its certificate");
+        source.add_member(member_hex.clone(), GroupRole::Member, None, None);
+        source
+            .set_member_certificate(&member_hex, expired_member.clone())
+            .expect("the source seat binds its certificate");
+        let projection = state_commit::roster_projection(&source.members_v2);
+        assert!(
+            projection
+                .get(&creator_hex)
+                .and_then(|snap| snap.certificate.as_ref())
+                .is_some_and(|cert| *cert == expired_creator)
+                && projection
+                    .get(&member_hex)
+                    .and_then(|snap| snap.certificate.as_ref())
+                    .is_some_and(|cert| *cert == expired_member),
+            "the carried snapshots hold the expired bytes"
+        );
+
+        let mut policy = GroupPolicyPreset::PublicRequestSecure.to_policy();
+        policy.admission = GroupAdmission::OwnerCertified(user.user_id());
+        let mut info = GroupInfo::with_policy(
+            "T".into(),
+            String::new(),
+            creator_kp.agent_id(),
+            "aabb".repeat(8),
+            policy.clone(),
+        );
+        // Digest-only local seats (the adopter's shape before the fold).
+        info.members_v2
+            .get_mut(&creator_hex)
+            .unwrap()
+            .certificate_digest = Some(owner_cert::certificate_digest_hex(&expired_creator));
+        info.add_member(member_hex.clone(), GroupRole::Member, None, None);
+        info.members_v2
+            .get_mut(&member_hex)
+            .unwrap()
+            .certificate_digest = Some(owner_cert::certificate_digest_hex(&expired_member));
+        info.apply_reconstructed_roster(&projection);
+        assert!(
+            info.members_v2[&creator_hex].certificate.is_some()
+                && info.members_v2[&member_hex].certificate.is_some(),
+            "the chain-carried expired bytes install digest-anchored"
+        );
+
+        let evidence = owner_cert::OwnerCertEvidence::new(10_000_000);
+        let verdict = info.owner_cert_verdict(&evidence);
+        assert_eq!(
+            verdict.per_member.get(&creator_hex),
+            Some(&owner_cert::MemberCertStatus::DigestPending),
+            "the creator's own expired certificate holds the seat pending"
+        );
+        assert!(
+            verdict.failed().iter().all(|(hex, _)| hex != &creator_hex),
+            "the creator seat never enters the eviction set"
+        );
+        assert_eq!(
+            verdict.per_member.get(&member_hex),
+            Some(&owner_cert::MemberCertStatus::Failed {
+                reason: owner_cert::OwnerCertFailure::Expired
+            }),
+            "an ordinary member's expired certificate stays the eviction set"
+        );
+        assert!(
+            !verdict.is_all_clean(),
+            "an expired creator certificate still fails clean-required operations closed"
+        );
+
+        // The enforcement path removes the failed member and keeps the
+        // creator seated.
+        let failures = info.enforce_owner_certified_admission("authority", &verdict);
+        assert!(
+            failures.iter().all(|(hex, _)| hex != &creator_hex),
+            "no enforced removal may name the creator"
+        );
+        assert!(
+            info.members_v2.contains_key(&creator_hex),
+            "the creator stays seated"
+        );
+        assert_eq!(
+            info.members_v2.get(&member_hex).map(|seat| seat.state),
+            Some(GroupMemberState::Removed),
+            "the ordinary member is removed"
+        );
+
+        // The guard is expiry-ONLY: a creator certificate failing for
+        // another reason (issued by the wrong owner) is still a definitive
+        // failure.
+        let other_user = crate::identity::UserKeypair::generate().unwrap();
+        let wrong_owner =
+            crate::identity::AgentCertificate::issue(&other_user, &creator_kp).unwrap();
+        let mut strict = GroupInfo::with_policy(
+            "T".into(),
+            String::new(),
+            creator_kp.agent_id(),
+            "aabb".repeat(8),
+            policy,
+        );
+        strict
+            .set_member_certificate(&creator_hex, wrong_owner)
+            .expect("seat binds the bytes; verification happens at the verdict");
+        let strict_verdict = strict.owner_cert_verdict(&evidence);
+        assert!(
+            matches!(
+                strict_verdict.per_member.get(&creator_hex),
+                Some(owner_cert::MemberCertStatus::Failed { .. })
+            ),
+            "a non-expiry creator failure is not held"
+        );
+
+        // Claude review (2 Nov 2026 16:49, finding 3): the hold keys on the
+        // COMMITTED certificate. An announced certificate that is merely
+        // expired does not hold a creator whose committed certificate fails
+        // for another reason (red before: the reason came from the
+        // announced certificate first).
+        let mut announced_expired = owner_cert::OwnerCertEvidence::new(10_000_000);
+        announced_expired.insert_cert(creator_hex.clone(), expired_creator.clone());
+        let announced_verdict = strict.owner_cert_verdict(&announced_expired);
+        assert!(
+            matches!(
+                announced_verdict.per_member.get(&creator_hex),
+                Some(owner_cert::MemberCertStatus::Failed { .. })
+            ),
+            "an expired ANNOUNCED certificate does not hold a creator whose committed one fails otherwise"
+        );
+
+        // Claude review (2 Nov 2026 16:49, finding 2): an announced renewal
+        // that cannot be fetched past the grace window does not make the
+        // held creator eviction-eligible (red before: `Failed {
+        // NoCertificate }`).
+        let mut unfetchable = owner_cert::OwnerCertEvidence::new(10_000_000);
+        unfetchable.observe_pending_digest(creator_hex.clone(), [9; 32]);
+        info.members_v2
+            .get_mut(&creator_hex)
+            .unwrap()
+            .certificate_missing_since_ms = Some(1);
+        let grace_verdict = info.owner_cert_verdict(&unfetchable);
+        assert_eq!(
+            grace_verdict.per_member.get(&creator_hex),
+            Some(&owner_cert::MemberCertStatus::DigestPending),
+            "past the grace window the creator's own expired certificate still holds"
+        );
+    }
+
+    #[test]
     fn apply_reconstructed_roster_copies_certificate_digest_across_gap() {
         // WHY (#458 ac-gap + #468/#469 design v5 D2): a joiner adopting
         // across a prev-hash gap materializes members from the VERIFIED
@@ -3765,14 +4096,29 @@ mod tests {
             signed_root,
             "materialized roster must re-derive the projection's signed root"
         );
-        for hex in [&creator_hex, &agent_hex] {
-            let m = adopted.members_v2.get(hex).unwrap();
-            assert!(
-                m.certificate.is_none(),
-                "projection materialization carries no bytes, only the digest"
-            );
-            assert_eq!(m.certificate_digest.as_deref(), Some(committed.as_str()));
-        }
+        // #1023: a BYTE-BEARING source seat now materializes with its
+        // bytes (the snapshot carries them), while a digest-only source
+        // seat still materializes digest-only. Both hold the committed
+        // digest, so both re-derive the same signed root either way.
+        let creator = adopted.members_v2.get(&creator_hex).unwrap();
+        assert_eq!(
+            creator.certificate.as_ref(),
+            Some(&cert),
+            "a byte-bearing source seat materializes with its bytes (#1023)"
+        );
+        assert_eq!(
+            creator.certificate_digest.as_deref(),
+            Some(committed.as_str())
+        );
+        let digest_only = adopted.members_v2.get(&agent_hex).unwrap();
+        assert!(
+            digest_only.certificate.is_none(),
+            "a digest-only source seat materializes with no bytes, only the digest"
+        );
+        assert_eq!(
+            digest_only.certificate_digest.as_deref(),
+            Some(committed.as_str())
+        );
     }
 
     #[test]
@@ -3821,6 +4167,242 @@ mod tests {
             state_commit::compute_roster_root(&adopted.members_v2),
             signed_root
         );
+    }
+
+    /// #1023: a chain whose snapshots carry certificate bytes seats the
+    /// bytes at adoption (the new-member arm is pinned by the updated
+    /// `apply_reconstructed_roster_copies_certificate_digest_across_gap`)
+    /// — but ONLY after the bytes hash to the entry's committed digest,
+    /// for a digest-only local seat as for a materialized one. Mismatched
+    /// snapshot bytes are not evidence for this admission: the seat stays
+    /// digest-only.
+    #[test]
+    fn apply_reconstructed_roster_seats_snapshot_bytes_after_digest_check() {
+        let (_user, _agent_kp, cert) = certified_fixture();
+        let committed = owner_cert::certificate_digest_hex(&cert);
+
+        // A sealing authority's roster: the creator seat byte-bearing at
+        // capture, so its retained snapshots carry the bytes.
+        let mut source = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        let creator_hex = hex::encode([1u8; 32]);
+        source
+            .set_member_certificate(&creator_hex, cert.clone())
+            .expect("creator cert installs");
+        let projection = state_commit::roster_projection(&source.members_v2);
+        assert!(
+            projection
+                .get(&creator_hex)
+                .is_some_and(|snap| snap.certificate.is_some()),
+            "post-#1023 capture carries the seat bytes"
+        );
+        let signed_root = state_commit::roster_root_of_projection(&projection);
+
+        // Digest-only local seat (existing-member arm): the bytes install.
+        let mut digest_only = GroupInfo::new("S".into(), String::new(), agent(8), "aabb".repeat(8));
+        digest_only.add_member(creator_hex.clone(), GroupRole::Member, None, None);
+        digest_only
+            .members_v2
+            .get_mut(&creator_hex)
+            .unwrap()
+            .certificate_digest = Some(committed.clone());
+        digest_only.apply_reconstructed_roster(&projection);
+        assert_eq!(
+            digest_only.members_v2[&creator_hex].certificate.as_ref(),
+            Some(&cert),
+            "matched snapshot bytes install on a digest-only seat"
+        );
+        assert_eq!(
+            state_commit::compute_roster_root(&digest_only.members_v2),
+            signed_root
+        );
+
+        // Snapshot bytes hashing to a DIFFERENT digest never install: the
+        // seat stays digest-only and the root still re-derives.
+        let (_user2, _agent2_kp, other_cert) = certified_fixture();
+        let mut mismatched = projection.clone();
+        mismatched.get_mut(&creator_hex).unwrap().certificate = Some(other_cert);
+        let mut strict = GroupInfo::new("S".into(), String::new(), agent(7), "aabb".repeat(8));
+        strict.add_member(creator_hex.clone(), GroupRole::Member, None, None);
+        strict
+            .members_v2
+            .get_mut(&creator_hex)
+            .unwrap()
+            .certificate_digest = Some(committed.clone());
+        strict.apply_reconstructed_roster(&mismatched);
+        assert!(
+            strict.members_v2[&creator_hex].certificate.is_none(),
+            "snapshot bytes for another admission must not install"
+        );
+        assert_eq!(
+            strict.members_v2[&creator_hex]
+                .certificate_digest
+                .as_deref(),
+            Some(committed.as_str())
+        );
+        assert_eq!(
+            state_commit::compute_roster_root(&strict.members_v2),
+            state_commit::roster_root_of_projection(&mismatched)
+        );
+    }
+
+    /// #1023 (review repro): a byte-bearing retained commit must round-trip
+    /// through the persisted JSON store form.
+    #[test]
+    fn groupinfo_json_round_trips_byte_bearing_retained_commit() {
+        let (_user, agent_kp, cert) = certified_fixture();
+        let creator_hex = hex::encode([1u8; 32]);
+        let mut info = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        info.set_member_certificate(&creator_hex, cert.clone())
+            .expect("creator cert installs");
+        let commit = state_commit::GroupStateCommit::sign(
+            "aabb".repeat(8),
+            1,
+            None,
+            state_commit::compute_roster_root(&info.members_v2),
+            "ph".to_string(),
+            "mh".to_string(),
+            None,
+            false,
+            0,
+            &agent_kp,
+        )
+        .expect("fixture commit signs");
+        info.retain_commit(&commit);
+        let json = serde_json::to_string(&info).expect("GroupInfo encodes");
+        let back: GroupInfo = serde_json::from_str(&json).expect("GroupInfo decodes");
+        assert_eq!(
+            back.commit_log[0].roster[&creator_hex].certificate.as_ref(),
+            Some(&cert),
+            "the retained snapshot certificate survives the store round-trip"
+        );
+    }
+
+    /// #1023: only the newest RETAINED_CERT_CARRY_LINKS retained commits
+    /// keep their snapshot bytes; older links age to digest-only at
+    /// retention, so the persisted and served log carries a bounded amount.
+    #[test]
+    fn retain_commit_ages_certificate_carry_to_newest_links() {
+        let (_user, agent_kp, cert) = certified_fixture();
+        let creator_hex = hex::encode([1u8; 32]);
+        let mut info = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        info.set_member_certificate(&creator_hex, cert.clone())
+            .expect("creator cert installs");
+        let total = state_commit::RETAINED_CERT_CARRY_LINKS + 2;
+        for revision in 1..=total as u64 {
+            let commit = state_commit::GroupStateCommit::sign(
+                "aabb".repeat(8),
+                revision,
+                None,
+                state_commit::compute_roster_root(&info.members_v2),
+                "ph".to_string(),
+                "mh".to_string(),
+                None,
+                false,
+                0,
+                &agent_kp,
+            )
+            .expect("fixture commit signs");
+            info.retain_commit(&commit);
+        }
+        assert_eq!(info.commit_log.len(), total);
+        let carry = state_commit::RETAINED_CERT_CARRY_LINKS;
+        let aged_out = total - carry;
+        for (index, retained) in info.commit_log.iter().enumerate() {
+            let snapshot = retained.roster[&creator_hex].certificate.as_ref();
+            if index < aged_out {
+                assert!(
+                    snapshot.is_none(),
+                    "link {index} older than the carry window must age to digest-only"
+                );
+            } else {
+                assert!(
+                    snapshot.is_some_and(|seated| seated == &cert),
+                    "link {index} inside the carry window keeps the bytes"
+                );
+            }
+        }
+    }
+
+    /// #1023: `hydrate_member_certificates` falls back to the group's OWN
+    /// retained-commit snapshots for still-digest-only seats — the retained
+    /// chain is a certificate carrier, so a node holding it hydrates with
+    /// every other holder offline. The fallback keeps the digest-anchored
+    /// rule: snapshot bytes for a different admission never install.
+    #[test]
+    fn hydrate_member_certificates_falls_back_to_commit_log_snapshots() {
+        let (_user, agent_kp, cert) = certified_fixture();
+        let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
+        let committed = owner_cert::certificate_digest_hex(&cert);
+
+        // The authority's captured link: the member byte-bearing at seal.
+        let mut authority = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        authority.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        authority
+            .set_member_certificate(&agent_hex, cert.clone())
+            .expect("cert installs");
+        let commit = state_commit::GroupStateCommit::sign(
+            "aabb".repeat(8),
+            1,
+            None,
+            state_commit::compute_roster_root(&authority.members_v2),
+            "ph".to_string(),
+            "mh".to_string(),
+            None,
+            false,
+            0,
+            &agent_kp,
+        )
+        .expect("fixture commit signs");
+        let retained = state_commit::RetainedCommit {
+            commit,
+            roster: state_commit::roster_projection(&authority.members_v2),
+            meta: Some(state_commit::GroupPublicMeta::default()),
+        };
+
+        // A holder whose seat is digest-only but which holds the retained
+        // link: the fallback hydrates with NO caller-supplied pairs.
+        let mut holder = GroupInfo::new("S".into(), String::new(), agent(2), "aabb".repeat(8));
+        holder.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        holder
+            .members_v2
+            .get_mut(&agent_hex)
+            .unwrap()
+            .certificate_digest = Some(committed.clone());
+        holder.commit_log.push(retained.clone());
+        assert_eq!(
+            holder.hydrate_member_certificates(&[]),
+            1,
+            "the retained snapshot must hydrate the digest-only seat"
+        );
+        assert_eq!(
+            holder.members_v2[&agent_hex].certificate.as_ref(),
+            Some(&cert)
+        );
+        assert_eq!(
+            holder.members_v2[&agent_hex].certificate_digest.as_deref(),
+            Some(committed.as_str())
+        );
+
+        // The owner re-keyed while this holder kept the old chain: the
+        // snapshot bytes hash to the OLD digest, so they are evidence for
+        // a different admission and nothing installs.
+        let (_user3, _agent3_kp, cert3) = certified_fixture();
+        let re_keyed = owner_cert::certificate_digest_hex(&cert3);
+        let mut stale_holder =
+            GroupInfo::new("S".into(), String::new(), agent(3), "aabb".repeat(8));
+        stale_holder.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        stale_holder
+            .members_v2
+            .get_mut(&agent_hex)
+            .unwrap()
+            .certificate_digest = Some(re_keyed);
+        stale_holder.commit_log.push(retained);
+        assert_eq!(
+            stale_holder.hydrate_member_certificates(&[]),
+            0,
+            "snapshot bytes for a different admission must not hydrate"
+        );
+        assert!(stale_holder.members_v2[&agent_hex].certificate.is_none());
     }
 
     #[test]
@@ -4263,8 +4845,22 @@ mod tests {
             serde_json::from_value::<crate::identity::AgentCertificate>(value)
                 .expect("tampered cert decodes")
         };
-        let cases: Vec<(&str, Option<crate::identity::AgentCertificate>, bool)> = vec![
-            ("invalid_signature", Some(tampered), false),
+        // Engineer ruling 1 Nov 2026 02:36 GMT: the creator's own EXPIRED
+        // certificate holds the seat at `DigestPending` (never
+        // eviction-eligible) instead of `Failed`. Every other invalid
+        // evidence — and revocation — still fails definitively, and no
+        // case is ever Clean.
+        enum Expect {
+            Failed,
+            Held,
+        }
+        let cases: Vec<(
+            &str,
+            Option<crate::identity::AgentCertificate>,
+            bool,
+            Expect,
+        )> = vec![
+            ("invalid_signature", Some(tampered), false, Expect::Failed),
             (
                 "wrong_owner",
                 Some(
@@ -4272,6 +4868,7 @@ mod tests {
                         .expect("cert"),
                 ),
                 false,
+                Expect::Failed,
             ),
             (
                 "wrong_agent",
@@ -4280,6 +4877,7 @@ mod tests {
                         .expect("cert"),
                 ),
                 false,
+                Expect::Failed,
             ),
             (
                 "expired",
@@ -4292,10 +4890,11 @@ mod tests {
                     .expect("cert"),
                 ),
                 false,
+                Expect::Held,
             ),
-            ("revoked", None, true),
+            ("revoked", None, true, Expect::Failed),
         ];
-        for (case, cert, revoked) in cases {
+        for (case, cert, revoked, expect) in cases {
             let mut info = base.info.clone();
             if let Some(cert) = cert {
                 seat_bytes(&mut info, &creator, cert);
@@ -4306,10 +4905,17 @@ mod tests {
                 evidence.mark_revoked(creator.clone());
             }
             let status = creator_status(&mut info, &creator, &evidence);
-            assert!(
-                matches!(status, owner_cert::MemberCertStatus::Failed { .. }),
-                "[{case}] must fail definitively, got {status:?}"
-            );
+            match expect {
+                Expect::Failed => assert!(
+                    matches!(status, owner_cert::MemberCertStatus::Failed { .. }),
+                    "[{case}] must fail definitively, got {status:?}"
+                ),
+                Expect::Held => assert_eq!(
+                    status,
+                    owner_cert::MemberCertStatus::DigestPending,
+                    "[{case}] the creator's expired certificate holds the seat"
+                ),
+            }
             assert_eq!(missing_since(&info, &creator), None, "[{case}] no grace");
         }
     }

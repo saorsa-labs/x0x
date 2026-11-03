@@ -239,6 +239,11 @@ pub enum TerminationCause {
     GroupDeleted,
     /// A verified `certificate_rebind_v1` renewed the seat (§4a).
     CertificateValid,
+    /// #1023 (Engineer ruling 1 Nov 2026 02:36 GMT): the creator seat
+    /// never becomes eviction-eligible from its own expired certificate
+    /// alone. An expiry row persisted by an earlier build that names the
+    /// creator ends with this cause; no new creator row can open.
+    CreatorSeatExempt,
 }
 
 impl TerminationCause {
@@ -248,6 +253,7 @@ impl TerminationCause {
         match self {
             Self::GroupDeleted => "group_deleted",
             Self::CertificateValid => "certificate_valid",
+            Self::CreatorSeatExempt => "creator_seat_exempt",
         }
     }
 }

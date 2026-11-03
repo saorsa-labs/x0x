@@ -1471,6 +1471,90 @@ async fn explicit_eviction_of_failed_member_clears_restore_quarantine() -> Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn explicit_eviction_keeps_restore_quarantine_while_a_seat_is_digest_pending() -> Result<()> {
+    // WHY (#1023, Claude review at 80bfb707): a digest-pending seat (a
+    // digest-only seat, or a creator held on its own expired certificate)
+    // is not Clean. Before the fix the explicit eviction counted only
+    // InGrace seats, so it lifted the restore quarantine while such a
+    // seat was still seated.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "83".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let bad = AgentKeypair::generate()?;
+    let bad_hex = hex::encode(bad.agent_id().as_bytes());
+    let foreign = UserKeypair::generate()?;
+    let foreign_cert = x0x::identity::AgentCertificate::issue(&foreign, &bad)?;
+    // A digest-only seat whose bytes no cache or link holds.
+    let pending = AgentKeypair::generate()?;
+    let pending_hex = hex::encode(pending.agent_id().as_bytes());
+    let pending_cert = x0x::identity::AgentCertificate::issue(&owner_kp, &pending)?;
+    // The survivor needs a roster KEM key, or the eviction's rotation
+    // aborts before the quarantine rule is reached.
+    let pending_kem = {
+        use base64::Engine as _;
+        BASE64.encode(x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes)
+    };
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.add_member(bad_hex.clone(), x0x::groups::GroupRole::Member, None, None);
+        live.set_member_certificate(&bad_hex, foreign_cert)
+            .expect("fresh seat: foreign cert must install (seeds the definitive failure)");
+        live.add_member_with_kem(
+            pending_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+            Some(pending_kem),
+        );
+        live.members_v2
+            .get_mut(&pending_hex)
+            .expect("pending seat")
+            .certificate_digest = Some(x0x::groups::owner_cert::certificate_digest_hex(
+            &pending_cert,
+        ));
+        live.shared_secret = Some(vec![4u8; 32]);
+        live.owner_cert_reverify_required = true;
+    }
+
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the eviction commits, then the pending seat refuses: {body}"
+    );
+    assert!(
+        body.to_string().contains(&pending_hex),
+        "the refusal names the digest-pending seat: {body}"
+    );
+    let groups = state.named_groups.read().await;
+    let live = groups.get(&group_id).expect("group");
+    assert_eq!(
+        live.members_v2[&bad_hex].state,
+        x0x::groups::GroupMemberState::Removed,
+        "the Failed member is evicted"
+    );
+    assert!(
+        live.owner_cert_reverify_required,
+        "the quarantine stays set while a seat is digest-pending"
+    );
+    Ok(())
+}
+
 /// ADR-0064 slice 1: the fork-quarantine gate shares the exact refusal
 /// SHAPE of the ADR-0038 restore gate above (typed 409 consulted by the
 /// same membership-gated surfaces) — and the same evidence-bearing seal

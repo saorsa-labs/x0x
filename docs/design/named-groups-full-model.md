@@ -1235,3 +1235,44 @@ We should commit to this product direction explicitly:
 > x0x will have one first-class named-group system that supports private secure spaces, public request-access secure spaces, open public communities, and announcement channels under one policy-driven architecture, with stable `group_id`s, authority-signed `state_hash` commits, and partition-tolerant gossip discovery instead of a DHT.
 
 That is the right long-term model, and it gives us a sane path from the current named-group + MLS split to a real product.
+
+## Certificate carriage with group state (#1023)
+
+A roster seat commits to its owner-issued certificate by BLAKE3 digest
+inside the signed roster root. The BYTES also travel with group state
+(#1023). The `RosterMemberSnapshot.certificate` field is optional. It
+holds base64(bincode) certificate bytes. The newest
+`RETAINED_CERT_CARRY_LINKS` retained commits keep the field. That window
+is 2 links: the terminal link plus one (Engineer ruling of 2 Nov 2026,
+over the 31 Oct head-link-only form). Older links age to digest-only.
+
+The second-newest link matters because a JoinResult serves only the
+links strictly before its terminal revision. With a one-link window
+those links were always digest-only, so no production path delivered
+the bytes to a gap joiner. With two links the newest SERVED link stays
+byte-bearing, and the terminal link still covers catch-up and
+`GET /groups/:id/state/commits` readers. A JoinResult that would exceed
+the direct-message budget drops the chain bytes first, so certificate
+carry never moves a joiner onto the blob path.
+
+A member that reads a byte-bearing link can seat the bytes when the
+creator and all other holders are offline. Install is digest-anchored at
+both sites (`apply_reconstructed_roster`, `hydrate_member_certificates`).
+Bytes that hash to a different digest never seat. Snapshot equality
+covers the committed fields only, so the bytes never change a
+comparison. The signed root does not move. Invite links stay
+digest-only, because of the direct message budget. A certificate that no
+link carried still blocks the seal with `OwnerCertMemberPending`. The one
+exception is the held creator in an S4 removal or ban (see below).
+
+The creator seat never becomes eviction-eligible from its own expired
+certificate alone (Engineer ruling of 1 Nov 2026). The verdict holds the
+seat at `DigestPending`, and the S4 expiry trigger skips it. An expiry
+row persisted by an earlier build ends with `creator_seat_exempt`. An
+ordinary member's expired certificate stays eviction-eligible as before.
+The held creator does not block an S4 removal or ban: when the working
+copy has excluded its target and every digest-pending seat is a held
+creator, that seal goes through. Ordinary seals still refuse with
+`OwnerCertMemberPending`, and the restore quarantine stays set while any
+seat is digest-pending. The `OwnerCertMemberPending` refusal lists both
+in-grace and digest-pending seats.

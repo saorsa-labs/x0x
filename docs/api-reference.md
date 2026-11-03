@@ -22,9 +22,20 @@ for its whole uptime past a 120 s bootstrap grace (issue #262 — the wedged
 transport signal; `ok` stays `true` because the process itself is alive). A
 degraded response carries a `degraded_reason` string. A connected peer is
 also `degraded` when one direction on that same peer is at least 60 s old
-and the other direction is at most 10 s old (issue #1419). Those ages are
-application-data ages. A quiet peer, with both directions idle, is not
-degraded. `GET /status` uses the same stored set and the same rule.
+and the other direction is at most 10 s old, or when both directions on
+that peer are at least 60 s old while another peer still has traffic and a
+bounded liveness probe fails (issue #1419). Those ages are
+application-data ages. A quiet peer, with both directions idle, answers
+the probe and is not degraded. A probe the endpoint could not run, for a
+busy endpoint or a peer without probe support, is not a failure. A peer
+is first probed only while another peer has traffic; a peer already
+confirmed broken is probed again after its 60 s window even when nothing
+else flows, and it stays `degraded` until its link carries traffic again
+or that window ends. A successful re-dial removes the peer from the set
+at once. Two limits, stated plainly: a silent connected peer that
+ignores probes can hold `degraded` for one 60 s window per handshake,
+and while a probe is due the refresher tick can spend up to 4 s on it,
+so the stored set can be a few seconds old. `GET /status` uses the same stored set and the same rule.
 `GET /peers` sets `link` to `degraded` for each peer in that set. Fleet
 deployments under a supervisor can additionally set `zero_peer_restart_secs = <secs>` in the
 daemon TOML to make the process exit (for `Restart=always` self-heal) after
@@ -307,7 +318,8 @@ version bump.
   (`network_id = ""` in the TOML) degrades: plane isolation is off.
 - `peers` — the #262/#1419 classification behind `status`: zero peers past
   the 120 s grace, send-ready-less outer peers, or a one-sided link
-  degrade.
+  degrade. The both-directions-idle rule also needs a failed liveness
+  probe while another peer has traffic.
 - `seed_reachable` — `connected` of `configured` bootstrap seeds,
   measured from the connections the node actually holds (x0x joins via
   `connect_addr`, so ant-quic's own bootstrap counter never sees the join).
@@ -430,8 +442,12 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 `status` is `connected` when a send-ready peer exists. It is `degraded` when
 `GET /health` would be degraded. That includes a one-sided link: one
 direction on that peer is at least 60 s old and the other direction is at
-most 10 s old. The reason is appended to `warnings`. A quiet peer, with both
-directions idle, is not degraded. `GET /health`, `GET /status`, and
+most 10 s old, or both directions are at least 60 s old while another peer
+has traffic and the liveness probe fails. The reason is appended to
+`warnings`. A quiet peer, with both directions idle, answers the probe and
+is not degraded. A confirmed peer stays `degraded` until its link carries
+traffic again or the verdict window ends; a successful re-dial removes
+the peer from the set at once. `GET /health`, `GET /status`, and
 `GET /peers` read the one-sided set the health refresher stored.
 
 `revocation_resync_required` is false on a healthy node. It is true when a
@@ -1177,7 +1193,7 @@ or an illegal placement; `501` ceremony disabled.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/peers` | `x0x peers` | Connected gossip peers. Each peer has `id` and `link` (`healthy`, or `degraded` when that peer is in the health refresher's stored one-sided set, #1419). One direction on that peer is at least 60 s old and the other is at most 10 s old. A quiet peer stays `healthy`. |
+| GET | `/peers` | `x0x peers` | Connected gossip peers. Each peer has `id` and `link` (`healthy`, or `degraded` when that peer is in the health refresher's stored one-sided set, #1419). One direction on that peer is at least 60 s old and the other is at most 10 s old, or both directions are at least 60 s old while another peer has traffic and the liveness probe fails. A quiet peer answers the probe and stays `healthy`; a confirmed peer stays `degraded` until it recovers. |
 | GET | `/presence` | `x0x presence` | Presence view of online agents |
 | GET | `/presence/online` | `x0x presence online` | Online agents (network-view trust filter) |
 | GET | `/presence/foaf` | `x0x presence foaf` | Friends-of-friends discovery walk (`?ttl=<hops>`, default 3; social-view trust filter) |
@@ -1737,8 +1753,12 @@ every wait. A wait always names its cause; it does not stop silently.
 ```
 
 - `phase` — `pending`, `prepared`, `committed_delivery_pending`, `complete`
-  or `terminated`. `termination_cause` is `group_deleted` or
-  `certificate_valid` for a `terminated` row.
+  or `terminated`. `termination_cause` is `group_deleted`,
+  `certificate_valid` or `creator_seat_exempt` for a `terminated` row.
+  `creator_seat_exempt` ends an expiry row that names the group's creator
+  (#1023). The row was opened by an earlier build; no new creator row can
+  open, because the creator's own expired certificate does not make it
+  eviction-eligible.
 - `waiting.cause` — one of:
   - `waiting_for_designated_admin` — another admin is designated. `detail`
     is `rank` (this node waits for its fallback time, `remaining_ms`) or
@@ -2433,10 +2453,22 @@ commits — paired with the roster projection it effected:
   limit, count, has_more, next_from_revision, commits }`, where each
   `commits[]` entry is `{ commit, roster, roster_root_verified }`.
   `roster` is the `{ agent_id: { role, state } }` projection of `Active` +
-  `Banned` members; `roster_root_verified` recomputes the root over that
-  projection and compares it to the commit's signed `roster_root`, so any
-  at-rest corruption surfaces rather than serving silently-wrong history.
-  `limit` is capped at 500.
+  `Banned` members. Entries may additionally carry `treekem_key_package_hash`
+  and `certificate_digest`. Since #1023, an entry may also carry an optional
+  `certificate` (base64(bincode) `AgentCertificate`). Only the newest 2
+  retained commits keep the bytes (`RETAINED_CERT_CARRY_LINKS = 2`, the
+  terminal link included); older entries are digest-only. This local
+  endpoint applies no message budget. The 48 KiB direct-message budget
+  governs the `JoinResult` carrier between peers; that carrier drops the
+  chain bytes first when its payload would exceed the budget.
+  `roster_root_verified` recomputes the root over that projection and
+  compares it to the commit's signed `roster_root`. At-rest corruption
+  therefore surfaces instead of serving silently-wrong history. While the
+  group is live, the endpoint is members-only. These owner certificates
+  therefore go only to a local caller whose agent holds an active seat.
+  After the group is withdrawn, the local tombstone's history is
+  `PublicRead` to the local API caller. The newest retained commits still
+  carry their certificate bytes. `limit` is capped at 500.
 
 Scope and honest limits: retention is **not retroactive** — history begins
 at the first release that retains it, and each daemon holds only the suffix
