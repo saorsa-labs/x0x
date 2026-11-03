@@ -745,8 +745,9 @@ async fn apply_replacements_with_permit(
                 ),
                 Err(error) => error!(
                     %error,
-                    "cannot restore the companion binaries this transaction \
-                     swapped; manual recovery applies"
+                    "companion restore failed, or the renames succeeded and only the \
+                     post-restore directory flush failed; verify the install directory \
+                     before manual recovery"
                 ),
             }
         };
@@ -1769,8 +1770,10 @@ impl AutoApplyUpgrader {
                                             .iter()
                                             .map(|(target, _)| target.display().to_string())
                                             .collect::<Vec<_>>(),
-                                        "cannot restore the swapped binaries; \
-                                         manual recovery applies"
+                                        "restore failed, or the renames succeeded and \
+                                         only the post-restore directory flush failed; \
+                                         verify the install directory before manual \
+                                         recovery"
                                     );
                                     false
                                 }
@@ -1820,8 +1823,10 @@ impl AutoApplyUpgrader {
                                             .iter()
                                             .map(|(target, _)| target.display().to_string())
                                             .collect::<Vec<_>>(),
-                                        "cannot restore the swapped binaries; the daemon \
-                                         keeps serving but the install needs manual recovery"
+                                        "restore failed, or the renames succeeded and \
+                                         only the post-restore directory flush failed; the \
+                                         daemon keeps serving but the install needs manual \
+                                         verification"
                                     );
                                     false
                                 }
