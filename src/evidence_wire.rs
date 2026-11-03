@@ -1384,12 +1384,14 @@ impl Context {
             } else if generation.is_some_and(|g| !self.same_connection(machine, g)) {
                 // Open may yield across a replacement. Drop the empty stream
                 // without consuming the marker or starting the rate window.
+                // A replacement under the open is this node's own timing, so
+                // the refusal charges no reset (#1772 review, round 5).
                 tracing::debug!(
                     %machine,
                     outcome = "hello_generation_changed_after_open",
                     "evidence Hello connection check failed"
                 );
-                return Err(invalid("Hello connection replaced"));
+                return Err(local_race("Hello connection replaced"));
             }
             if kind == HELLO
                 && !self
@@ -1397,7 +1399,10 @@ impl Context {
                     .wire_limits
                     .begin_hello_on_connection(machine, true, generation)
             {
-                return Err(invalid("Hello already attempted"));
+                // The reply gate can spend this generation's try while the
+                // open is in flight. That race is this node's own timing, so
+                // the refusal charges no reset (#1772 review, round 5).
+                return Err(local_race("Hello already attempted"));
             }
             send.write_u8(StreamProtocol::EvidenceV1.as_u8()).await?;
             // Preserve the default-off serialization point and deadline.

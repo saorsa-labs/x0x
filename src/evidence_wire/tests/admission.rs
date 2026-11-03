@@ -1830,6 +1830,128 @@ async fn issue1346_winner_flip_across_open_charges_no_generation() {
     f.shutdown().await;
 }
 
+// #1772 review, round 5: the two local races after the open — the winner
+// replaced under the parked open, and the reply gate spending the
+// generation's try while the open is in flight — are this node's own
+// timing, so the outgoing job must charge the peer no reset for either.
+#[tokio::test]
+async fn issue1772_post_open_local_races_charge_no_reset() {
+    // Race 1: the connection is replaced while the open is parked. The
+    // stream's stamp still matches the sample, so only the post-open
+    // connection check can refuse it.
+    let mut f = Fixture::new_with_transport(true, true, true, true).await;
+    f.publish_ready();
+    let machine = f.initiator.machine_id();
+    let old = f.s1b_generation();
+    let pause = Arc::new(HelloOpenPause {
+        after_open: true,
+        ..Default::default()
+    });
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_open_pause
+        .lock()
+        .unwrap() = Some(Arc::clone(&pause));
+    let job = tokio::spawn(Arc::clone(&f.context).connect(machine, None, None));
+    tokio::time::timeout(DEADLINE, pause.reached.notified())
+        .await
+        .expect("the job must reach the open boundary");
+    f.s1b_restart_remote().await;
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_open_pause
+        .lock()
+        .unwrap() = None;
+    pause.resume.notify_one();
+    tokio::time::timeout(DEADLINE, job).await.unwrap().unwrap();
+    assert_eq!(f.sent(), 0, "a replaced connection carries no Hello");
+    assert_ne!(f.s1b_generation(), old);
+    {
+        let state = f.context.runtime.wire_limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        // The stamp matched, so the mismatch back-off cannot explain the
+        // refusal: this is the post-open connection check.
+        assert!(budget.hello_mismatch.is_none());
+        assert!(
+            budget.hello_attempts.iter().all(|slot| slot.is_none()),
+            "the refused open spends no attempt"
+        );
+        assert!(
+            budget.hello_out.is_none(),
+            "the refused open starts no 60 s gate"
+        );
+        assert_eq!(
+            budget.bytes.total, 0,
+            "a replacement under the open is not the peer's reset"
+        );
+    }
+    // Control: the replacement generation still owns its one try.
+    let ((), ()) = tokio::join!(
+        Arc::clone(&f.context).connect(machine, None, None),
+        f.s1b_read_hello(S1bReply::Ack),
+    );
+    assert_eq!(f.sent(), 1);
+    f.shutdown().await;
+
+    // Race 2: the reply gate spends the generation's try while the same
+    // open is parked. The begin check must refuse without charging.
+    let f = Fixture::new_with_transport(true, true, true, true).await;
+    f.publish_ready();
+    let machine = f.initiator.machine_id();
+    let generation = f.s1b_generation();
+    let pause = Arc::new(HelloOpenPause {
+        after_open: true,
+        ..Default::default()
+    });
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_open_pause
+        .lock()
+        .unwrap() = Some(Arc::clone(&pause));
+    let job = tokio::spawn(Arc::clone(&f.context).connect(machine, None, None));
+    tokio::time::timeout(DEADLINE, pause.reached.notified())
+        .await
+        .expect("the job must reach the open boundary");
+    assert_eq!(
+        f.context
+            .begin_hello_current(machine, true, generation)
+            .expect("the reply gate spends the try first"),
+        generation
+    );
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_open_pause
+        .lock()
+        .unwrap() = None;
+    pause.resume.notify_one();
+    tokio::time::timeout(DEADLINE, job).await.unwrap().unwrap();
+    assert_eq!(f.sent(), 0, "the spent try carries no Hello");
+    {
+        let state = f.context.runtime.wire_limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert!(budget.hello_attempted(generation), "the reply owns the try");
+        assert!(budget.hello_out.is_some(), "the reply owns the rate window");
+        assert_eq!(
+            budget.bytes.total, 0,
+            "this node spending its own try is not the peer's reset"
+        );
+    }
+    // The refused open still queues a reset stream on the peer (it wrote
+    // nothing); drain and drop that carcass before proving no retry
+    // follows, as the winner-flip test does.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.initiator.network().unwrap().accept_bi(),
+    )
+    .await;
+    f.s1b_no_more_hellos().await;
+    f.shutdown().await;
+}
+
 // #1346: attempts are per connection generation, not a high-water mark. A
 // follow can make an older generation the Live winner again; that
 // connection still owns its single Hello try, and a generation that
