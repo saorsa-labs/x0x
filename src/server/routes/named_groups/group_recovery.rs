@@ -610,6 +610,10 @@ struct SubjectState {
     /// trigger waits [`s3::GATE_STALL`] without progress.
     progress_revision: u64,
     progress_at: Instant,
+    /// When this node last armed a verified `catching_up` view. A fresh
+    /// attestation counts as progress for [`Self::holds_view`] only, so it
+    /// does not move the gap and renewal timers (#1661).
+    armed_at: Instant,
     /// §2: a provisional ATA this node (not a joiner) verifies by applying
     /// its promotion path through the ordinary path, with the head at which
     /// it last asked the signer for a catch-up page.
@@ -632,6 +636,7 @@ impl SubjectState {
             last_refusal: None,
             progress_revision: revision,
             progress_at: now,
+            armed_at: now,
             provisional: None,
         }
     }
@@ -642,6 +647,30 @@ impl SubjectState {
         self.next_target = 0;
         self.pending = None;
         self.cooled = None;
+    }
+
+    /// Whether a later wait or refusal leaves the view in place. A sticky
+    /// state waits for its own exit (§8). A verified `catching_up` holds
+    /// while this node still makes progress, so a refusal or a silent round
+    /// does not replace it with `awaiting_attestation` (#1661). After
+    /// [`s3::GATE_STALL`] without progress the wait that names the stall
+    /// replaces it.
+    fn holds_view(&self, now: Instant) -> bool {
+        self.view.sticky()
+            || matches!(self.view, SubjectView::CatchingUp { verified: true, .. })
+                && now.saturating_duration_since(self.progress_at.max(self.armed_at))
+                    < s3::GATE_STALL
+    }
+
+    /// Records progress when the applied state revision moved since the
+    /// last check. Returns whether it moved.
+    fn note_progress(&mut self, revision: u64, now: Instant) -> bool {
+        if revision == self.progress_revision {
+            return false;
+        }
+        self.progress_revision = revision;
+        self.progress_at = now;
+        true
     }
 }
 
@@ -3866,7 +3895,11 @@ pub(super) async fn retire_converged(state: &Arc<AppState>, group_id: &str) {
             .subjects
             .entry(stable.clone())
             .or_insert_with(|| SubjectState::new(now, info.state_revision));
-        if !subject.view.sticky() {
+        // The links that reached this segment end are progress. Record
+        // them before the hold check, because `next_target` runs later in
+        // the tick (#1661).
+        subject.note_progress(info.state_revision, now);
+        if !subject.holds_view(now) {
             subject.view = SubjectView::Awaiting {
                 reason: "segment_exhausted".to_string(),
             };
@@ -3915,6 +3948,9 @@ async fn set_view(state: &AppState, stable_group_id: &str, revision: u64, view: 
         .subjects
         .entry(stable_group_id.to_string())
         .or_insert_with(|| SubjectState::new(now, revision));
+    if matches!(view, SubjectView::CatchingUp { verified: true, .. }) {
+        subject.armed_at = now;
+    }
     subject.view = view;
 }
 
@@ -4271,10 +4307,7 @@ async fn next_target(
         .subjects
         .entry(stable.clone())
         .or_insert_with(|| SubjectState::new(now, info.state_revision));
-    if info.state_revision != subject.progress_revision {
-        subject.progress_revision = info.state_revision;
-        subject.progress_at = now;
-    }
+    subject.note_progress(info.state_revision, now);
     // The node left the head its last request named. §2 drops an answer
     // for an old head, so a request still open is void, and the last
     // round's silence was for that head: its backoff does not hold here.
@@ -4306,7 +4339,7 @@ async fn next_target(
     };
     if exhausted {
         // §2 "Segments": the next segment is due now, not after a stall.
-        if !subject.view.sticky() {
+        if !subject.holds_view(now) {
             subject.view = SubjectView::Awaiting {
                 reason: "segment_exhausted".to_string(),
             };
@@ -4329,7 +4362,7 @@ async fn next_target(
         subject.pending = None;
         subject.next_target = subject.next_target.saturating_add(1);
         if subject.next_target >= targets.len() {
-            if !subject.view.sticky() {
+            if !subject.holds_view(now) {
                 subject.view = SubjectView::Awaiting {
                     reason: "no_reply".to_string(),
                 };
@@ -4347,7 +4380,7 @@ async fn next_target(
         return None;
     }
     if targets.is_empty() {
-        if !subject.view.sticky() {
+        if !subject.holds_view(now) {
             subject.view = SubjectView::Awaiting {
                 reason: "no_capable_peer".to_string(),
             };
@@ -4601,7 +4634,7 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
                     advance_round(subject, now, from_pending);
                 }
                 other => {
-                    if !subject.view.sticky() {
+                    if !subject.holds_view(now) {
                         subject.view = SubjectView::Awaiting {
                             reason: other.as_str().to_string(),
                         };
@@ -4921,7 +4954,7 @@ async fn arm_from_response(
                 .entry(stable.clone())
                 .or_insert_with(|| SubjectState::new(now, info.state_revision));
             subject.provisional = Some((ata, info.state_revision));
-            if !subject.view.sticky() {
+            if !subject.holds_view(now) {
                 subject.view = SubjectView::CatchingUp {
                     attested_by: attested_by.clone(),
                     verified: false,
@@ -5028,7 +5061,7 @@ async fn provisional_tick(state: &Arc<AppState>, group_key: &str, info: &GroupIn
             clear_provisional(state, &stable).await;
             let mut inner = state.group_recovery.inner.lock().await;
             if let Some(subject) = inner.subjects.get_mut(&stable) {
-                if !subject.view.sticky() {
+                if !subject.holds_view(Instant::now()) {
                     subject.view = SubjectView::Awaiting {
                         reason: "provisional_unverified".to_string(),
                     };
@@ -5128,9 +5161,7 @@ async fn local_state_lost(
     ) {
         return true;
     }
-    if info.state_revision != subject.progress_revision {
-        subject.progress_revision = info.state_revision;
-        subject.progress_at = now;
+    if subject.note_progress(info.state_revision, now) {
         return false;
     }
     if now.saturating_duration_since(subject.progress_at) < s3::GATE_STALL {
@@ -8854,6 +8885,271 @@ mod tests {
         .sticky());
     }
 
+    /// The admin refuses this node's open request `rate_limited`, through
+    /// the real response path. Returns the view after the refusal.
+    async fn rate_limited_refusal(
+        state: &Arc<AppState>,
+        info: &GroupInfo,
+        admin: &x0x::identity::AgentKeypair,
+    ) -> Option<SubjectView> {
+        refused_with(state, info, admin, AttestRefusalReason::RateLimited).await
+    }
+
+    /// The admin refuses this node's open request with `reason`, through
+    /// the real response path. Returns the view after the refusal.
+    async fn refused_with(
+        state: &Arc<AppState>,
+        info: &GroupInfo,
+        admin: &x0x::identity::AgentKeypair,
+        reason: AttestRefusalReason,
+    ) -> Option<SubjectView> {
+        let stable = info.stable_group_id().to_string();
+        let target = *admin.agent_id().as_bytes();
+        if let Some(subject) = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get_mut(&stable)
+        {
+            subject.pending = Some((target, Instant::now(), info.state_hash.clone()));
+        }
+        handle_response(
+            state,
+            admin.agent_id(),
+            GroupAttestResponseV1 {
+                group: stable.clone(),
+                subject: *state.agent.agent_id().as_bytes(),
+                for_head_state_hash: info.state_hash.clone(),
+                answer: AttestAnswer::Refused(reason),
+            },
+        )
+        .await;
+        view_of(state, &stable).await
+    }
+
+    /// A subject for `info`'s group that last made progress now, at
+    /// `revision`, and shows `view`.
+    async fn subject_showing(state: &AppState, info: &GroupInfo, revision: u64, view: SubjectView) {
+        let mut subject = SubjectState::new(Instant::now(), revision);
+        subject.view = view;
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .insert(info.stable_group_id().to_string(), subject);
+    }
+
+    fn catching_up(ata: &AdminTerminalAttestation, verified: bool) -> SubjectView {
+        SubjectView::CatchingUp {
+            attested_by: ata.fields.attested_by.clone(),
+            verified,
+            segment_terminal: ata.fields.segment_terminal_revision,
+        }
+    }
+
+    /// #1661: a verified `catching_up` holds against a `rate_limited`
+    /// refusal while the node still makes progress, so `recovery.state`
+    /// does not flip to `awaiting_attestation` and back. After
+    /// `GATE_STALL` without progress the refusal replaces it, so a stalled
+    /// catch-up still shows its wait. An unverified one never holds. Red
+    /// without `holds_view`: the first refusal shows `awaiting_attestation
+    /// {rate_limited}`. Inert: an offline agent, paused time.
+    #[tokio::test]
+    async fn catching_up_holds_against_a_refusal_until_it_stalls() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let held = catching_up(&ata, true);
+        subject_showing(&state, &info, info.state_revision, catching_up(&ata, false)).await;
+        assert_eq!(
+            rate_limited_refusal(&state, &info, &admin).await,
+            awaiting("rate_limited"),
+            "an unverified catch-up does not hold"
+        );
+        subject_showing(&state, &info, info.state_revision, held.clone()).await;
+        assert_eq!(
+            rate_limited_refusal(&state, &info, &admin).await,
+            Some(held)
+        );
+        tokio::time::pause();
+        tokio::time::advance(s3::GATE_STALL).await;
+        assert_eq!(
+            rate_limited_refusal(&state, &info, &admin).await,
+            awaiting("rate_limited")
+        );
+        Ok(())
+    }
+
+    /// #1661 (ZCode on 80e815cf): progress that `next_target` records keeps
+    /// a long catch-up holding. The node made no progress for `GATE_STALL`,
+    /// then its applied revision moved: the tick records it, and a later
+    /// refusal leaves the view. Control: with no revision move the refusal
+    /// replaces it. Inert: an offline agent, paused time.
+    #[tokio::test]
+    async fn a_revision_move_seen_by_the_tick_keeps_the_hold() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let local = local_hex(&state);
+        let refs = live_refs(&state, &info).await;
+        let held = catching_up(&ata, true);
+        tokio::time::pause();
+        for moved in [false, true] {
+            let revision = info.state_revision.wrapping_sub(u64::from(moved));
+            subject_showing(&state, &info, revision, held.clone()).await;
+            tokio::time::advance(s3::GATE_STALL).await;
+            let _ = next_target(&state, &key, &info, &local, &refs, Instant::now()).await;
+            let view = rate_limited_refusal(&state, &info, &admin).await;
+            assert_eq!(
+                view == Some(held.clone()),
+                moved,
+                "moved: {moved}, {view:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1661 (ZCode on 80e815cf): a verified arm is fresh progress for the
+    /// hold. The head sat still for `GATE_STALL`, then `arm_from_response`
+    /// arms a verified catch-up: a refusal in the next round leaves it.
+    /// Before the fix the hold was dead on arrival. Inert: an offline
+    /// agent, paused time.
+    #[tokio::test]
+    async fn a_verified_arm_after_a_still_head_holds() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let held = catching_up(&ata, true);
+        fresh_subject(&state, &info, Instant::now()).await;
+        tokio::time::pause();
+        tokio::time::advance(s3::GATE_STALL).await;
+        arm_from_response(&state, &key, &info, ata).await;
+        assert_eq!(view_of(&state, &stable).await, Some(held.clone()), "armed");
+        assert_eq!(
+            rate_limited_refusal(&state, &info, &admin).await,
+            Some(held)
+        );
+        Ok(())
+    }
+
+    /// A silent round against a verified catch-up that `arm_from_response`
+    /// armed after a still head: with `no_reply` an open request outlives
+    /// `ANSWER_WAIT`, otherwise this offline node has no capable peer
+    /// (`no_capable_peer`). The round holds the view, and after
+    /// `GATE_STALL` without progress the same round replaces it. The refs
+    /// are the ones before the arm, so the tick reaches the round (the
+    /// armed gap itself waits `ATA_ARMED_LIFETIME`).
+    async fn silent_round_against_a_held_catch_up(no_reply: bool) -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let local = local_hex(&state);
+        let stable = info.stable_group_id().to_string();
+        let refs = live_refs(&state, &info).await;
+        let held = catching_up(&ata, true);
+        fresh_subject(&state, &info, Instant::now()).await;
+        tokio::time::pause();
+        tokio::time::advance(s3::GATE_STALL).await;
+        arm_from_response(&state, &key, &info, ata).await;
+        assert_eq!(view_of(&state, &stable).await, Some(held.clone()), "armed");
+        for stalled in [false, true] {
+            if stalled {
+                tokio::time::advance(s3::GATE_STALL).await;
+            }
+            if no_reply {
+                if let Some(subject) = state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .subjects
+                    .get_mut(&stable)
+                {
+                    let target = *admin.agent_id().as_bytes();
+                    subject.pending = Some((target, Instant::now(), info.state_hash.clone()));
+                }
+                tokio::time::advance(ANSWER_WAIT).await;
+            }
+            assert_eq!(
+                next_target(&state, &key, &info, &local, &refs, Instant::now()).await,
+                None
+            );
+            let expected = match (stalled, no_reply) {
+                (false, _) => Some(held.clone()),
+                (true, true) => awaiting("no_reply"),
+                (true, false) => awaiting("no_capable_peer"),
+            };
+            assert_eq!(
+                view_of(&state, &stable).await,
+                expected,
+                "stalled: {stalled}"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1661 (ZCode on ef467536): an answer that never comes holds a
+    /// verified catch-up until it stalls. Red without `holds_view` in the
+    /// `no_reply` branch of `next_target`. Inert: an offline agent, paused
+    /// time.
+    #[tokio::test]
+    async fn a_no_reply_round_holds_a_catch_up_until_it_stalls() -> anyhow::Result<()> {
+        silent_round_against_a_held_catch_up(true).await
+    }
+
+    /// #1661 (ZCode on ef467536): a round with no capable peer holds a
+    /// verified catch-up until it stalls. Red without `holds_view` in the
+    /// `no_capable_peer` branch of `next_target`. Inert: an offline agent,
+    /// paused time.
+    #[tokio::test]
+    async fn a_no_capable_peer_round_holds_a_catch_up_until_it_stalls() -> anyhow::Result<()> {
+        silent_round_against_a_held_catch_up(false).await
+    }
+
+    /// #1661 (ZCode on ef467536): a hard refusal replaces a held verified
+    /// catch-up at once: `not_a_member` shows the re-seat and
+    /// `banned_or_revoked` the refusal. Control: the same fresh view holds
+    /// against `rate_limited`. Red if a hard refusal waits for the hold.
+    /// Inert: an offline agent.
+    #[tokio::test]
+    async fn a_hard_refusal_replaces_a_held_catch_up_at_once() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, ata, admin) = armed_fixture_with_signer(&state).await?;
+        let refs = live_refs(&state, &info).await;
+        let held = catching_up(&ata, true);
+        subject_showing(&state, &info, info.state_revision, held.clone()).await;
+        assert_eq!(
+            rate_limited_refusal(&state, &info, &admin).await,
+            Some(held.clone()),
+            "control"
+        );
+        for (reason, expected) in [
+            (
+                AttestRefusalReason::NotAMember,
+                SubjectView::Reseat {
+                    cause: "not_a_member",
+                    recovery_ref: refs.first().cloned(),
+                },
+            ),
+            (
+                AttestRefusalReason::BannedOrRevoked,
+                SubjectView::Refused {
+                    reason: "banned_or_revoked",
+                },
+            ),
+        ] {
+            subject_showing(&state, &info, info.state_revision, held.clone()).await;
+            assert_eq!(
+                refused_with(&state, &info, &admin, reason).await,
+                Some(expected),
+                "{}",
+                reason.as_str()
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn seating_commit_is_the_first_seat_before_the_removal() {
         let admin = x0x::identity::AgentKeypair::generate().expect("keypair");
@@ -12489,6 +12785,100 @@ mod tests {
             awaiting("no_capable_peer"),
             "asked"
         );
+        Ok(())
+    }
+
+    /// #1661 (Greptile P2 and ZCode on 80e815cf): a verified catch-up
+    /// that reaches a segment end after a long stall inside the segment
+    /// keeps its view. `retire_converged` runs before `next_target` in the
+    /// tick, so it records the links that reached the end itself. Before
+    /// the fix it read the stale clock and showed `awaiting_attestation
+    /// {segment_exhausted}` for one round. Control: with no revision move
+    /// the stall shows. Inert: an offline agent, paused time.
+    #[tokio::test]
+    async fn a_segment_end_after_a_stall_keeps_a_verified_catch_up() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (admin, base, mid, ahead, links) = segment_fixture(&state)?;
+        let ata = sign_ata(&admin, &local, &base, &links[..1])?;
+        let terminal = super::super::NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: ahead.stable_group_id().to_string(),
+            revision: links[1].commit.revision,
+            actor: hex::encode(admin.agent_id().as_bytes()),
+            agent_id: "44".repeat(32),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(links[1].commit.clone()),
+        };
+        let terminal_json = serde_json::to_vec(&terminal)?;
+        let stable = base.stable_group_id().to_string();
+        let held = catching_up(&ata, true);
+        assert!(
+            update_sidecar(&state, &stable, move |body| {
+                body.active_ata = Some(ata);
+                body.queued_terminal = Some(terminal_json);
+            })
+            .await
+        );
+        let key = base.mls_group_id.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), mid.clone());
+        assert!(exhausted_segment(&state, &mid).await.is_some());
+        tokio::time::pause();
+        for (from, moved) in [(&mid, false), (&base, true)] {
+            subject_showing(&state, &mid, from.state_revision, held.clone()).await;
+            tokio::time::advance(s3::GATE_STALL).await;
+            retire_converged(&state, &key).await;
+            let expected = if moved {
+                Some(held.clone())
+            } else {
+                awaiting("segment_exhausted")
+            };
+            assert_eq!(view_of(&state, &stable).await, expected, "moved: {moved}");
+        }
+        Ok(())
+    }
+
+    /// #1661: `renewal_due` replaces a held verified catch-up. An armed
+    /// gap-only ATA with no progress for `ATA_ARMED_LIFETIME` asks for its
+    /// renewal, even when a verified arm is recent enough to hold the view
+    /// against a refusal. The round's retry is not due yet, so the tick
+    /// stops after the renewal and the view shows `renewal_due` itself.
+    /// Inert: an offline agent, paused time.
+    #[tokio::test]
+    async fn renewal_due_replaces_a_held_catch_up() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (admin, base, _mid, _ahead, links) = segment_fixture(&state)?;
+        let ata = sign_ata(&admin, &local, &base, &links[..1])?;
+        let held = catching_up(&ata, true);
+        let stable = base.stable_group_id().to_string();
+        assert!(update_sidecar(&state, &stable, move |body| body.active_ata = Some(ata)).await);
+        assert!(armed_admin_ata(&state, &base).await.is_some());
+        let refs = live_refs(&state, &base).await;
+        let key = base.mls_group_id.clone();
+        fresh_subject(&state, &base, Instant::now()).await;
+        tokio::time::pause();
+        tokio::time::advance(s3::ATA_ARMED_LIFETIME).await;
+        set_view(&state, &stable, base.state_revision, held).await;
+        if let Some(subject) = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get_mut(&stable)
+        {
+            assert!(subject.holds_view(Instant::now()));
+            subject.next_retry_at = Instant::now() + s3::GATE_STALL;
+        }
+        assert_eq!(
+            next_target(&state, &key, &base, &local, &refs, Instant::now()).await,
+            None
+        );
+        assert_eq!(view_of(&state, &stable).await, awaiting("renewal_due"));
         Ok(())
     }
 
