@@ -752,6 +752,20 @@ pub(crate) fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std:
 ///
 /// Returns the number of entries removed. All removal is best-effort.
 pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duration) -> usize {
+    sweep_stale_upgrade_artifacts_excluding(dir, dir_min_age, &[])
+}
+
+/// [`sweep_stale_upgrade_artifacts`] with paths that are never removed,
+/// whatever pattern they match (#1106): a persistent handoff record names
+/// its own target and per-swap backup as the operator's recovery pointers,
+/// and the sweep must reclaim unrelated debris without eating them — a
+/// whole-sweep hold here would stop all cleanup on supervised hosts, whose
+/// supervised-exit records are only removed by a later transaction.
+pub fn sweep_stale_upgrade_artifacts_excluding(
+    dir: &Path,
+    dir_min_age: std::time::Duration,
+    exempt: &[PathBuf],
+) -> usize {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -773,6 +787,9 @@ pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duratio
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
         let path = entry.path();
+        if exempt.contains(&path) {
+            continue;
+        }
         if name.starts_with(".x0x-upgrade-") {
             // Age-gate temp dirs so an in-flight apply is never deleted.
             if entry_is_aged(&entry) && std::fs::remove_dir_all(&path).is_ok() {

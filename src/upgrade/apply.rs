@@ -2410,6 +2410,8 @@ mod tests {
     #[cfg(unix)]
     background_permit_regression_tests!();
     use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
 
     /// #1106: the handoff names this transaction's own per-swap backup for
     /// the daemon target, never the companion CLI's, and a transaction that
@@ -2433,8 +2435,6 @@ mod tests {
             "no swap this transaction: from_plan_with_backup falls back to the canonical name"
         );
     }
-    use std::io::Write;
-    use tempfile::TempDir;
 
     #[cfg(unix)]
     async fn check_supervised_unused_reservation_after_replacement(rollback: bool) {

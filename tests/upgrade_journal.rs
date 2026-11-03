@@ -212,8 +212,12 @@ fn recovery_records_preserve_real_cleanup_candidates() {
             br#"{"schema_version":"#.as_slice(),
         ] {
             std::fs::write(&record, bytes).unwrap();
-            let removed = journal::sweep_if_no_pending_records(data.path(), || {
-                x0x::upgrade::sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::ZERO)
+            let removed = journal::sweep_if_no_pending_records(data.path(), |exempt| {
+                x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+                    dir.path(),
+                    std::time::Duration::ZERO,
+                    exempt,
+                )
             });
             assert_eq!(removed, 0);
             assert_eq!(std::fs::read(&record).unwrap(), bytes);
@@ -240,8 +244,12 @@ fn recovery_records_preserve_real_cleanup_candidates() {
         journal::RecordRead::Handoff(_)
     ));
     assert_eq!(
-        journal::sweep_if_no_pending_records(data.path(), || {
-            x0x::upgrade::sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::ZERO)
+        journal::sweep_if_no_pending_records(data.path(), |exempt| {
+            x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+                dir.path(),
+                std::time::Duration::ZERO,
+                exempt,
+            )
         }),
         0
     );
@@ -253,8 +261,12 @@ fn recovery_records_preserve_real_cleanup_candidates() {
     assert_eq!(std::fs::read(&sidelined).unwrap(), b"rollback");
     std::fs::remove_file(&record).unwrap();
     assert_eq!(
-        journal::sweep_if_no_pending_records(data.path(), || {
-            x0x::upgrade::sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::ZERO)
+        journal::sweep_if_no_pending_records(data.path(), |exempt| {
+            x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+                dir.path(),
+                std::time::Duration::ZERO,
+                exempt,
+            )
         }),
         2
     );
@@ -283,8 +295,12 @@ fn legacy_only_handoff_allows_unrelated_cleanup_and_preserves_its_files() {
         std::fs::write(&record, &bytes).unwrap();
 
         // A zero minimum age makes the fixtures eligible without sleeps.
-        let removed = journal::sweep_if_no_pending_records(data.path(), || {
-            x0x::upgrade::sweep_stale_upgrade_artifacts(install.path(), std::time::Duration::ZERO)
+        let removed = journal::sweep_if_no_pending_records(data.path(), |exempt| {
+            x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+                install.path(),
+                std::time::Duration::ZERO,
+                exempt,
+            )
         });
 
         assert_eq!(
@@ -344,8 +360,12 @@ fn legacy_handoff_referencing_a_cleanup_pattern_keeps_its_recovery_bytes() {
         let record = data.path().join(journal::HANDOFF_FILE_NAME);
         std::fs::write(&record, &bytes).unwrap();
 
-        journal::sweep_if_no_pending_records(data.path(), || {
-            x0x::upgrade::sweep_stale_upgrade_artifacts(install.path(), std::time::Duration::ZERO)
+        journal::sweep_if_no_pending_records(data.path(), |exempt| {
+            x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+                install.path(),
+                std::time::Duration::ZERO,
+                exempt,
+            )
         });
 
         assert_eq!(std::fs::read(&record).unwrap(), bytes);
@@ -358,6 +378,57 @@ fn legacy_handoff_referencing_a_cleanup_pattern_keeps_its_recovery_bytes() {
             b"referenced rollback"
         );
     }
+}
+
+/// #1106 review round 5: a persistent supervised-exit record names a
+/// per-swap backup and is only replaced by a later transaction, so a
+/// whole-sweep hold for its `.backup-` reference stopped all cleanup on
+/// supervised hosts forever. The sweep must still reclaim unrelated debris
+/// while sparing the record's own target and backup paths.
+#[cfg(unix)]
+#[test]
+fn legacy_handoff_with_per_swap_backup_still_sweeps_unrelated_debris() {
+    let install = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let mut handoff = legacy_handoff(install.path(), "0.48.2");
+    handoff.backup_path = install
+        .path()
+        .join("x0xd.backup-1.2.3-4212-99887766554433221100");
+    std::fs::write(&handoff.target_path, b"configured binary").unwrap();
+    std::fs::write(&handoff.backup_path, b"referenced rollback").unwrap();
+    let staged = install.path().join(".x0x-upgrade-unrelated");
+    std::fs::create_dir(&staged).unwrap();
+    std::fs::write(staged.join("candidate"), b"unrelated stage").unwrap();
+    let stale_swap = install.path().join("x0xd.backup-9.9.9-1-2");
+    std::fs::write(&stale_swap, b"older transaction").unwrap();
+    let bytes = serde_json::to_vec(&handoff).unwrap();
+    let record = data.path().join(journal::HANDOFF_FILE_NAME);
+    std::fs::write(&record, &bytes).unwrap();
+
+    let removed = journal::sweep_if_no_pending_records(data.path(), |exempt| {
+        x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+            install.path(),
+            std::time::Duration::ZERO,
+            exempt,
+        )
+    });
+
+    assert_eq!(
+        removed, 2,
+        "the unrelated staged dir and the unreferenced per-swap backup must go"
+    );
+    assert!(!staged.exists());
+    assert!(!stale_swap.exists());
+    assert_eq!(std::fs::read(&record).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(&handoff.backup_path).unwrap(),
+        b"referenced rollback",
+        "the record's own per-swap backup is the operator's recovery pointer"
+    );
+    assert_eq!(
+        std::fs::read(&handoff.target_path).unwrap(),
+        b"configured binary"
+    );
 }
 
 // Platforms with no record barrier. Windows has one since #1588; see

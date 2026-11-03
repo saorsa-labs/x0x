@@ -328,27 +328,39 @@ pub(crate) fn read_boot_records(data_dir: &Path) -> BootRecords {
 /// Ordinary released legacy intent permits unrelated debris cleanup. If its
 /// recorded target or backup can match the sweep patterns, preserve candidates
 /// conservatively instead. No path taken from a record is followed.
-/// Per-swap backup names (`.backup-<version>-<pid>-<nanos>`, #1106) are sweep
-/// candidates too, so a legacy record naming one holds the sweep back.
-pub(crate) fn sweep_if_no_pending_records(data_dir: &Path, sweep: impl FnOnce() -> usize) -> usize {
+/// A record's per-swap backup reference (`<file>.backup-<version>-<pid>-<nanos>`,
+/// #1106) is different: supervised-exit records persist until a later
+/// transaction replaces them, so holding the whole sweep for one would stop
+/// all cleanup on supervised hosts forever. The sweep instead receives the
+/// record's own target and backup paths as exemptions and still runs.
+pub(crate) fn sweep_if_no_pending_records(
+    data_dir: &Path,
+    sweep: impl FnOnce(&[PathBuf]) -> usize,
+) -> usize {
     let records = read_boot_records(data_dir);
     let legacy_references_candidates = match &records.handoff {
         RecordRead::LegacyHandoff(value) => ["target_path", "backup_path"].iter().any(|name| {
             value.get(name).and_then(Value::as_str).is_none_or(|path| {
                 Path::new(path).components().any(|component| {
                     let name = component.as_os_str().to_string_lossy();
-                    name.starts_with(".x0x-upgrade-")
-                        || name.contains(".x0xold-")
-                        || name.contains(".backup-")
+                    name.starts_with(".x0x-upgrade-") || name.contains(".x0xold-")
                 })
             })
         }),
         _ => false,
     };
+    let referenced_paths = match &records.handoff {
+        RecordRead::LegacyHandoff(value) => ["target_path", "backup_path"]
+            .iter()
+            .filter_map(|name| value.get(name).and_then(Value::as_str))
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
     if records.blocks_apply() || legacy_references_candidates {
         0
     } else {
-        sweep()
+        sweep(&referenced_paths)
     }
 }
 
