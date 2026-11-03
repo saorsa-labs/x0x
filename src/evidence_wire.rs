@@ -106,6 +106,16 @@ impl Window {
         self.total += n;
     }
 }
+/// Distinct Hello-attempted generations kept per machine before the oldest
+/// is forgotten by raising the floor (#1346). Four covers a replacement and
+/// a follow-back plus churn; the 60-second machine rate gate bounds actual
+/// sends independently of this cap.
+const HELLO_ATTEMPT_SLOTS: usize = 4;
+/// Generations allocate from 1, so 0 names the unattributed attempt a
+/// `None`-generation begin makes before any connection was observed
+/// (test-only path). `u64::MAX` is ant-quic's unstamped sentinel and never
+/// owns an attempt.
+const UNATTRIBUTED_GENERATION: u64 = 0;
 #[derive(Default)]
 struct MachineBudget {
     open: usize,
@@ -114,25 +124,53 @@ struct MachineBudget {
     lookup: Option<Instant>,
     hello_in: Option<Instant>,
     hello_out: Option<Instant>,
-    attempted: bool,
+    hello_attempts: [Option<u64>; HELLO_ATTEMPT_SLOTS],
+    /// Every generation at or below the floor was attempted (or was
+    /// forgotten as attempted when its slot was reused). Fail closed.
+    hello_floor: u64,
     hello_generation: Option<u64>,
     touched: Option<Instant>,
     certificate: Option<(AgentId, [u8; 32], Instant)>,
 }
 impl MachineBudget {
-    // Generation IDs are allocated in increasing order, but ant-quic can
-    // promote an older superseded connection back to Live. Keep a high-water
-    // mark: that promotion fails closed for Hello until a newer generation
-    // arrives. A delayed job must not re-arm a previously used connection.
+    fn hello_attempted(&self, generation: u64) -> bool {
+        // The floor only ever holds evicted real generations (allocated
+        // from 1), so the unattributed slot 0 is never floor-covered.
+        (self.hello_floor > 0 && generation <= self.hello_floor)
+            || self
+                .hello_attempts
+                .iter()
+                .any(|slot| slot.is_some_and(|g| g == generation))
+    }
+    fn record_hello_attempt(&mut self, generation: u64) {
+        if self.hello_attempted(generation) {
+            return;
+        }
+        let Some(slot) = self.hello_attempts.iter_mut().find(|s| s.is_none()) else {
+            // Bounded memory: forget the smallest attempted generation by
+            // raising the floor above it, so nothing at or below it re-arms.
+            let floor = &mut self.hello_floor;
+            if let Some(slot) = self.hello_attempts.iter_mut().min_by_key(|s| s.unwrap()) {
+                *floor = (*floor).max(slot.unwrap());
+                *slot = Some(generation);
+            }
+            return;
+        };
+        *slot = Some(generation);
+    }
+    // #1346: attempts are tracked per connection generation, not with a
+    // high-water mark. ant-quic can promote an older superseded connection
+    // back to Live (a follow), so a lower generation that never attempted
+    // still owns its single Hello try, while a generation that attempted
+    // stays consumed however the winner moves. The marker follows the live
+    // winner in both directions. This reports whether an attempt may begin
+    // on `generation`; the u64::MAX sentinel never owns an attempt.
     fn observe_hello_generation(&mut self, generation: u64) -> bool {
-        if self.hello_generation.is_some_and(|old| old > generation) {
+        if generation == u64::MAX {
             return false;
         }
-        if self.hello_generation != Some(generation) {
-            self.attempted = false;
-            self.hello_generation = Some(generation);
-        }
-        true
+        self.hello_generation = Some(generation);
+        !self.hello_attempted(generation)
     }
 }
 #[derive(Default)]
@@ -375,7 +413,7 @@ impl Limits {
             return false;
         };
         state.machines.get(&machine).is_none_or(|m| {
-            !m.attempted
+            !m.hello_generation.is_some_and(|g| m.hello_attempted(g))
                 && m.hello_out
                     .is_none_or(|t| Instant::now().duration_since(t) >= HELLO_INTERVAL)
         })
@@ -387,8 +425,7 @@ impl Limits {
             return false;
         };
         state.machines.get(&machine).is_none_or(|m| {
-            m.hello_generation
-                .is_none_or(|old| old < generation || (old == generation && !m.attempted))
+            !m.hello_attempted(generation)
                 && m.hello_out
                     .is_none_or(|t| Instant::now().duration_since(t) >= HELLO_INTERVAL)
         })
@@ -413,21 +450,25 @@ impl Limits {
         let Some(m) = s.machine(machine, now) else {
             return false;
         };
-        // Requests and replies consume the same generation marker under the
-        // same lock as the machine rate gate. A remote close need not emit a
-        // local PeerDisconnected event. Keep hello_out across replacements.
-        if generation.is_some_and(|id| !m.observe_hello_generation(id)) {
+        // Requests and replies consume the same per-generation attempt under
+        // the same lock as the machine rate gate. A remote close need not
+        // emit a local PeerDisconnected event. Keep hello_out across
+        // replacements. A `None` generation (test-only legacy path) charges
+        // the machine's current marker, or the unattributed slot when no
+        // connection was ever observed.
+        let id = generation.unwrap_or(m.hello_generation.unwrap_or(UNATTRIBUTED_GENERATION));
+        if !m.observe_hello_generation(id) {
             return false;
         }
-        if m.attempted
-            || m.hello_out
-                .is_some_and(|t| now.duration_since(t) < HELLO_INTERVAL)
+        if m.hello_out
+            .is_some_and(|t| now.duration_since(t) < HELLO_INTERVAL)
         {
             return false;
         }
-        // Attempted is set before the first byte. A reset or refusal never
-        // schedules a retry. Reconnect clears only this connection marker.
-        m.attempted = true;
+        // The attempt is recorded before the first byte. A reset or refusal
+        // never schedules a retry. Reconnect churn meets only the rate gate:
+        // each connection generation owns exactly one try (#1346).
+        m.record_hello_attempt(id);
         m.hello_out = Some(now);
         true
     }
@@ -436,8 +477,13 @@ impl Limits {
             if let Some(m) = s.machines.get_mut(&machine) {
                 // Each readiness pass keeps tracked live markers out of idle eviction.
                 m.touched = Some(Instant::now());
+                // The marker follows the live winner in both directions: a
+                // follow can restore an older generation (#1346). The
+                // certificate fence still drops only when a strictly newer
+                // connection replaces the marker.
                 let replaced = m.hello_generation.is_none_or(|old| old < generation);
-                if m.observe_hello_generation(generation) && replaced {
+                m.observe_hello_generation(generation);
+                if replaced {
                     m.certificate = None;
                 }
             }
@@ -854,6 +900,10 @@ impl Context {
         };
         let lease = Arc::new(lease);
         let machine = stream.peer();
+        // #1346: the stream's own connection generation, not a sample of the
+        // current winner, is the provenance every reply-gate decision on this
+        // stream uses. Captured before the split; both halves carry it.
+        let stream_generation = stream.connection_generation();
         let (mut send, mut recv) = stream.into_split();
         let result = tokio::time::timeout_at(lease.deadline, async {
             let (kind, body) = read_message(&mut recv, &self.runtime.wire_limits).await?;
@@ -1002,7 +1052,11 @@ impl Context {
                     if !crate::dm_capability_service::advert_is_publishable(
                         &self.capabilities.borrow(),
                     ) || self
-                        .begin_hello_current(machine, self.related(machine).await)
+                        .begin_hello_current(
+                            machine,
+                            self.related(machine).await,
+                            stream_generation,
+                        )
                         .is_none()
                     {
                         let body = codec().serialize(&have_peer).map_err(io::Error::other)?;
@@ -1030,25 +1084,31 @@ impl Context {
             tracing::debug!(?machine, "evidence stream refused/reset");
         }
     }
-    fn begin_hello_current(&self, machine: MachineId, related: bool) -> Option<u64> {
-        let Ok(Some(generation)) = self
-            .network
-            .try_connection_generation(&ant_quic::PeerId(machine.0))
-        else {
-            // Busy or absent is not evidence of a replacement. Do not clear
-            // a consumed marker or start an attempt with unknown ownership.
+    fn begin_hello_current(
+        &self,
+        machine: MachineId,
+        related: bool,
+        stream_generation: u64,
+    ) -> Option<u64> {
+        // #1346: charge the reply to the connection that actually carried
+        // the Hello — the accepted stream's stamped generation
+        // (ant-quic#327) — never to a sample of the current winner, which a
+        // follow may have moved back to an older generation. An unstamped
+        // stream cannot prove ownership: reply ACK-only without spending
+        // anything (the sentinel never owns an attempt).
+        if stream_generation == u64::MAX {
             tracing::debug!(
                 %machine,
                 outcome = "hello_reply_gate_closed",
                 "evidence Hello reply skipped"
             );
             return None;
-        };
-        if !self
-            .runtime
-            .wire_limits
-            .begin_hello_on_connection(machine, related, Some(generation))
-        {
+        }
+        if !self.runtime.wire_limits.begin_hello_on_connection(
+            machine,
+            related,
+            Some(stream_generation),
+        ) {
             tracing::debug!(
                 %machine,
                 outcome = "hello_reply_attempt_unavailable",
@@ -1056,7 +1116,7 @@ impl Context {
             );
             return None;
         }
-        Some(generation)
+        Some(stream_generation)
     }
 
     #[cfg(test)]
@@ -1856,7 +1916,8 @@ mod tests {
         assert!(!connections.generations.contains_key(&overflow));
         connections.remove(overflow, &jobs, &limits);
         assert!(
-            limits.state.lock().unwrap().machines[&overflow].attempted,
+            limits.state.lock().unwrap().machines[&overflow]
+                .hello_attempted(UNATTRIBUTED_GENERATION),
             "generation-blind disconnect must retain an inbound attempt"
         );
     }
@@ -2202,7 +2263,10 @@ mod tests {
             .unwrap();
         assert!(result.unwrap_err().is_cancelled());
         assert!(!jobs.outgoing(machine));
-        assert!(context.runtime.wire_limits.state.lock().unwrap().machines[&machine].attempted);
+        assert!(
+            context.runtime.wire_limits.state.lock().unwrap().machines[&machine]
+                .hello_attempted(generation)
+        );
         context.network.disconnect(&peer).await.unwrap();
         // Keep the reply stream alive until after the cancellation assertion.
         let _ = &mut recv;

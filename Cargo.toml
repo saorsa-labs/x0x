@@ -19,7 +19,11 @@ exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 
 [dependencies]
 anyhow = "1.0"
-ant-quic = "=0.27.61"
+# #1346 dev pin: ant-quic PR #367 (issue #327) adds the additive
+# SendStream/RecvStream::connection_generation() the evidence Hello reply
+# gate needs. Replace with the released `=0.27.x` once it ships (the PR is
+# blocked on that release before merge).
+ant-quic = { git = "https://github.com/saorsa-labs/ant-quic.git", rev = "3b638c098551b4cedd9047f9eed0889faa53b65e" }
 # CI pin (2026-09-03): tinyvec 1.13.0 (published 2026-09-03) fails to compile on the
 # pinned rustc 1.95.0 ("cannot find macro `vec`"). Cargo.lock is now tracked, but
 # keep the bound so a `cargo update` or a downstream fresh resolve cannot pick it
@@ -45,17 +49,22 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = "=0.5.90"
-saorsa-gossip-crdt-sync = "=0.5.90"
-saorsa-gossip-groups = "=0.5.90"
-saorsa-gossip-identity = "=0.5.90"
-saorsa-gossip-membership = "=0.5.90"
-saorsa-gossip-presence = "=0.5.90"
-saorsa-gossip-pubsub = "=0.5.90"
-saorsa-gossip-rendezvous = "=0.5.90"
-saorsa-gossip-runtime = "=0.5.90"
-saorsa-gossip-transport = "=0.5.90"
-saorsa-gossip-types = "=0.5.90"
+# #1346 dev pin: 0.5.88 is the last saorsa-gossip release whose ant-quic
+# requirement (`^0.27.53`) accepts the git-pinned ant-quic PR branch
+# (0.27.53); 0.5.89+ pin `=0.27.60+` exactly. Temporary: restore =0.5.90
+# together with the released ant-quic pin. Two guard tests (#1226 refusal,
+# the controlled-load build-lock premise) are red under this dev pin only.
+saorsa-gossip-coordinator = "=0.5.88"
+saorsa-gossip-crdt-sync = "=0.5.88"
+saorsa-gossip-groups = "=0.5.88"
+saorsa-gossip-identity = "=0.5.88"
+saorsa-gossip-membership = "=0.5.88"
+saorsa-gossip-presence = "=0.5.88"
+saorsa-gossip-pubsub = "=0.5.88"
+saorsa-gossip-rendezvous = "=0.5.88"
+saorsa-gossip-runtime = "=0.5.88"
+saorsa-gossip-transport = "=0.5.88"
+saorsa-gossip-types = "=0.5.88"
 saorsa-pqc = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -199,6 +208,14 @@ members = [
     ".",
     "tests/harness",
 ]
+
+# #1346 dev pin (temporary): ant-quic PR #367 (issue #327) adds the additive
+# SendStream/RecvStream::connection_generation() the evidence Hello reply
+# gate keys on. Everything must resolve to that one revision, so patch the
+# registry source too. Drop this section and the git dependency above for
+# the released `=0.27.x` once it ships.
+[patch.crates-io]
+ant-quic = { git = "https://github.com/saorsa-labs/ant-quic.git", rev = "3b638c098551b4cedd9047f9eed0889faa53b65e" }
 
 
 # #703: the 100k signing-path test spends most CPU time in Keccak. Optimize

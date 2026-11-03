@@ -2339,6 +2339,13 @@ pub struct SimSend {
 }
 
 impl SimSend {
+    /// The link generation this stream was opened on. Mirrors ant-quic
+    /// `SendStream::connection_generation` (#1346: per-connection Hello
+    /// gating).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Gracefully end this direction (EOF for the reader). As with QUIC
     /// (`ClosedStream`, mapped to `NotConnected`), finishing twice fails.
     pub(crate) fn finish(&mut self) -> io::Result<()> {

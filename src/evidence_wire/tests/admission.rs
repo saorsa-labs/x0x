@@ -1562,7 +1562,10 @@ async fn issue1207_s1b_default_off_replacement_around_open_does_not_spend_unsent
         {
             let state = f.context.runtime.wire_limits.state.lock().unwrap();
             let budget = &state.machines[&machine];
-            assert!(!budget.attempted, "unsent g1 must not consume an attempt");
+            assert!(
+                budget.hello_attempts.iter().all(|slot| slot.is_none()),
+                "unsent g1 must not consume an attempt"
+            );
             assert!(
                 budget.hello_out.is_none(),
                 "unsent g1 must not start 60 s gate"
@@ -1603,10 +1606,102 @@ async fn issue1207_s1b_delayed_disconnect_cannot_rearm_live_generation() {
     f.shutdown().await;
 }
 
+// #1346: the reply gate must charge the accepted stream's own connection
+// generation, never a sample of the current winner. After a replacement to
+// generation 2 and a follow back to the older generation 1 (ADR-017 keeps
+// the followed connection open and reading), a Hello arriving on the
+// generation-1 stream must still be answered with our full Hello. The old
+// high-water rule sampled the current winner (1), compared it with the
+// stored marker (2) and refused (`hello_reply_attempt_unavailable`), so
+// the peer got a bare ACK and no evidence on a connection that had never
+// attempted.
+#[tokio::test]
+async fn issue1346_reply_after_follow_to_older_generation_carries_hello() {
+    let mut f = Fixture::new_with_transport(true, true, true, true).await;
+    let machine = f.initiator.machine_id();
+    let peer = ant_quic::PeerId(machine.0);
+    let responder = f.responder.network().unwrap().clone();
+    let fabric = f._fabric.as_ref().expect("simulated fixture").clone();
+    let g1 = f.s1b_generation();
+
+    // First Hello over generation 1 with no publishable advert: the reply
+    // is ACK-only, so nothing is attempted, but the machine's budget entry
+    // now exists (the inbound rate gate created it).
+    let hello = f.hello();
+    assert_eq!(
+        f.exchange(StreamProtocol::EvidenceV1, &hello).await,
+        Outcome::HelloVerified
+    );
+    assert_eq!(f.sent(), 0);
+    {
+        let state = f.context.runtime.wire_limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(budget.hello_generation, None);
+        assert!(budget.hello_attempts.iter().all(|slot| slot.is_none()));
+    }
+    // Age the inbound rate gate so the second Hello is not refused.
+    f.context
+        .runtime
+        .wire_limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_in = Some(Instant::now() - HELLO_INTERVAL);
+
+    // The pair replaces to generation 2; the responder's readiness pass
+    // observes the new marker without spending any attempt, then the
+    // winner follows back to the older generation 1.
+    let (old, g2) = fabric
+        .supersede_link_for_test(&responder.peer_id(), &peer, false)
+        .expect("the pair has a link");
+    assert_eq!(old, g1);
+    assert!(g2 > g1);
+    f.context.runtime.wire_limits.hello_connection(machine, g2);
+    assert!(
+        fabric.restore_link_generation_for_test(&responder.peer_id(), &peer, g1),
+        "follow back to the older generation"
+    );
+    assert_eq!(
+        f.s1b_generation(),
+        g1,
+        "the live winner is the older generation again"
+    );
+
+    // The initiator's Hello travels on the generation-1 link, so the
+    // accepted stream is stamped with it. The reply must carry our Hello.
+    f.publish_ready();
+    assert_eq!(
+        f.exchange(StreamProtocol::EvidenceV1, &hello).await,
+        Outcome::HelloVerified
+    );
+    assert_eq!(
+        f.sent(),
+        1,
+        "the reply on the followed lower-generation connection must carry our Hello"
+    );
+    // The followed connection's single try is spent.
+    {
+        let state = f.context.runtime.wire_limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(budget.hello_generation, Some(g1));
+        assert!(budget.hello_attempted(g1));
+        assert!(!budget.hello_attempted(g2), "marker 2 consumed nothing");
+    }
+    f.shutdown().await;
+}
+
+// #1346: attempts are per connection generation, not a high-water mark. A
+// follow can make an older generation the Live winner again; that
+// connection still owns its single Hello try, and a generation that
+// attempted stays consumed however the winner moves.
 #[test]
-fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget() {
+fn issue1346_followed_older_generation_owns_one_try_after_a_newer_attempt() {
     let limits = Limits::default();
     let machine = MachineId([19; 32]);
+    // Generation 2 is attempted: its single try is spent.
     assert!(limits.begin_hello_on_connection(machine, true, Some(2)));
     let aged = Instant::now() - HELLO_INTERVAL;
     limits
@@ -1617,17 +1712,123 @@ fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget(
         .get_mut(&machine)
         .unwrap()
         .hello_out = Some(aged);
+    // 2→1 follow: the live winner is generation 1 again while the machine
+    // has attempted on 2. The old high-water rule refused this (fail
+    // closed); the followed connection never attempted, so it owns one try.
     limits.hello_connection(machine, 1);
-    assert!(!limits.hello_candidate(machine, 1));
-    assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
+    assert!(limits.hello_candidate(machine, 1));
+    assert!(limits.begin_hello_on_connection(machine, true, Some(1)));
     {
         let state = limits.state.lock().unwrap();
         let budget = &state.machines[&machine];
-        assert_eq!(budget.hello_generation, Some(2));
-        assert!(budget.attempted);
-        assert_eq!(budget.hello_out, Some(aged));
+        assert_eq!(budget.hello_generation, Some(1));
+        assert!(budget.hello_attempted(1));
+        assert!(budget.hello_attempted(2));
     }
-    assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+    // One try per connection: after the shared 60 s machine gate clears,
+    // both attempted generations stay consumed.
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(aged);
+    assert!(
+        !limits.begin_hello_on_connection(machine, true, Some(1)),
+        "the followed generation's try is spent"
+    );
+    assert!(
+        !limits.begin_hello_on_connection(machine, true, Some(2)),
+        "the replaced generation's try stays spent"
+    );
+}
+
+// The u64::MAX unstamped sentinel never owns or blocks an attempt.
+#[test]
+fn issue1346_unstamped_stream_never_spends_or_blocks_an_attempt() {
+    let limits = Limits::default();
+    let machine = MachineId([21; 32]);
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(u64::MAX)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert!(budget.hello_attempts.iter().all(|slot| slot.is_none()));
+        assert!(budget.hello_out.is_none());
+    }
+    assert!(
+        limits.begin_hello_on_connection(machine, true, Some(1)),
+        "a later stamped stream must not inherit the sentinel's refusal"
+    );
+}
+
+// Bounded memory: once every slot holds a distinct attempted generation,
+// the smallest is forgotten by raising the floor, and everything at or
+// below the floor stays consumed (fail closed, never re-armed).
+#[test]
+fn issue1346_attempt_record_is_bounded_and_forgotten_generations_fail_closed() {
+    let limits = Limits::default();
+    let machine = MachineId([23; 32]);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(1)));
+    for generation in 2..=HELLO_ATTEMPT_SLOTS as u64 {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&machine)
+            .unwrap()
+            .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+        assert!(limits.begin_hello_on_connection(machine, true, Some(generation)));
+    }
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert!(budget.hello_attempted(1));
+        assert_eq!(budget.hello_floor, 0);
+        assert_eq!(
+            budget
+                .hello_attempts
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count(),
+            HELLO_ATTEMPT_SLOTS
+        );
+    }
+    // Slot pressure: generation 5 evicts the smallest (1) and raises the
+    // floor above it.
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(budget.hello_floor, 1);
+        assert!(budget.hello_attempted(1), "forgotten but still consumed");
+        assert!(!budget.hello_attempted(6));
+    }
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(6)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(budget.hello_floor, 2);
+        assert!(!budget.hello_attempted(7));
+    }
 }
 
 #[test]
@@ -1673,7 +1874,7 @@ fn issue1207_s1b_stale_attempts_allow_new_machine_without_evicting_active_budget
         assert_eq!(state.machines.len(), 8);
         for id in 0..7 {
             let budget = &state.machines[&machine(id)];
-            assert!(budget.attempted);
+            assert!(budget.hello_attempted(100));
             assert_eq!(budget.hello_generation, Some(100));
         }
         assert!(!state.machines.contains_key(&machine(7)));
