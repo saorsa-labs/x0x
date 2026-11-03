@@ -402,8 +402,10 @@ pub(crate) fn read_backup_ledger(data_dir: &Path) -> Vec<PathBuf> {
     }
 }
 
-/// Record a creation in the ledger (atomic tmp+rename; entries whose files
-/// are gone are pruned on the way).
+/// Record a creation in the ledger (atomic tmp+rename with the file and
+/// directory synced, so a power cut cannot leave a truncated ledger that
+/// reads as empty and silently unsweepable-forever; entries whose files are
+/// gone are pruned on the way).
 pub(crate) fn append_backup_ledger(data_dir: &Path, created: &Path) -> io::Result<()> {
     let canonical = std::fs::canonicalize(created).unwrap_or_else(|_| created.to_path_buf());
     let mut paths: Vec<String> = read_backup_ledger(data_dir)
@@ -418,7 +420,10 @@ pub(crate) fn append_backup_ledger(data_dir: &Path, created: &Path) -> io::Resul
     let path = backup_ledger_path(data_dir);
     let staging = data_dir.join("upgrade-backup-ledger.partial");
     fs::write(&staging, &bytes)?;
-    fs::rename(&staging, &path)
+    File::open(&staging)?.sync_all()?;
+    fs::rename(&staging, &path)?;
+    File::open(&path)?.sync_all()?;
+    open_for_sync(data_dir, true)?.sync_all()
 }
 
 fn read_record(path: &Path, expected: &str) -> RecordRead {

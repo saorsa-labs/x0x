@@ -167,6 +167,7 @@ impl Upgrader {
         record_backup_creation(self.backup_ledger_data_dir.as_deref(), &backup_path);
         refresh_mtime(&backup_path);
         sync_file_best_effort(&backup_path);
+        sync_dir_best_effort(&backup_path);
         refresh_canonical_backup(
             &self.target_path,
             &backup_path,
@@ -543,6 +544,26 @@ fn sync_file_best_effort(path: &Path) {
         Err(error) => {
             warn!(path = %path.display(), error = %error, "cannot open the backup file to sync it");
         }
+    }
+}
+
+/// Sync the directory holding `path` so a just-created file's directory
+/// entry survives a power cut even when a later step in the same backup
+/// fails (#1106 review round 7: the handoff record must never name a backup
+/// whose name never reached disk).
+fn sync_dir_best_effort(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if parent.as_os_str().is_empty() {
+        return;
+    }
+    if let Err(error) = journal::open_for_sync(parent, true).and_then(|dir| dir.sync_all()) {
+        warn!(
+            dir = %parent.display(),
+            error = %error,
+            "cannot sync the install directory after creating the backup"
+        );
     }
 }
 
@@ -1125,6 +1146,43 @@ mod tests {
         );
         assert_eq!(removed, 0, "a mode-inheriting backup must not look aged");
         assert!(backup_path.is_file(), "the per-swap backup must survive");
+    }
+
+    /// End-to-end ledger round trip (#1106, engineer ruling 3 Nov 12:48 GMT):
+    /// a ledgered creation is provable, so the sweep reclaims it once aged —
+    /// and an unledgered creation with the same shape is never touched.
+    #[test]
+    fn ledgered_backup_is_reclaimed_aged_but_unledgered_is_not() {
+        let install = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let binary_path = create_test_binary(&install, "test-binary", b"original");
+        let upgrader =
+            Upgrader::new(binary_path, Version::new(1, 0, 0)).with_backup_ledger_at(data.path());
+
+        let backup_path = upgrader.create_backup().unwrap();
+        let unledgered = install.path().join("test-binary.backup-9.9.9-1-2");
+        fs::write(&unledgered, b"another instance's").unwrap();
+        age_file(&backup_path, std::time::Duration::from_secs(7200));
+        age_file(&unledgered, std::time::Duration::from_secs(7200));
+
+        let ledger = journal::read_backup_ledger(data.path());
+        assert!(
+            ledger.contains(&backup_path.canonicalize().unwrap()),
+            "the creation must be recorded in the data-dir ledger"
+        );
+        let removed = sweep_stale_upgrade_artifacts_proven(
+            install.path(),
+            std::time::Duration::from_secs(3600),
+            &[],
+            &ledger,
+        );
+
+        assert_eq!(removed, 1, "only the ledgered backup is reclaimed");
+        assert!(!backup_path.exists(), "the ledgered, aged backup is debris");
+        assert!(
+            unledgered.exists(),
+            "the unledgered file is never provable and never deleted"
+        );
     }
 
     /// #1106 regression: two transactions on one shared executable applying

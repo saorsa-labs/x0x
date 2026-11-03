@@ -418,6 +418,10 @@ fn legacy_handoff_with_per_swap_backup_still_sweeps_but_never_unproven_files() {
     let sibling_swap = install.path().join("x0xd.backup-8.8.8-3-4");
     std::fs::write(&sibling_swap, b"another instance's rollback").unwrap();
     journal::append_backup_ledger(data.path(), &ledgered_swap).unwrap();
+    // The record's own backup is ledgered too: it is proven AND aged, so
+    // only the record exemption can save it — removing the exemption check
+    // must fail this test rather than pass silently.
+    journal::append_backup_ledger(data.path(), &handoff.backup_path).unwrap();
     assert!(
         journal::read_backup_ledger(data.path()).contains(&ledgered_swap.canonicalize().unwrap()),
         "ledger entries are stored canonicalised"
