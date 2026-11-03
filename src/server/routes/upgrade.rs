@@ -2405,19 +2405,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn observed_release_announcement_survives_publish_errors() {
         let verified = verified_release_with_version(&version_newer_than_current());
-        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = Arc::clone(&reached);
+        let start = tokio::time::Instant::now();
         announce_observed_release(&verified, |_| async {
             Err("gossip unreachable".to_string())
         })
         .await;
-        flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            reached.load(std::sync::atomic::Ordering::SeqCst),
-            "a failed publication is logged and abandoned, never propagated"
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(start),
+            Duration::ZERO,
+            "a failed publication is abandoned at once: no wait, no retry"
         );
     }
 

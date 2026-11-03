@@ -3306,8 +3306,8 @@ Run a command on **another** agent's machine. Disabled by default; every request
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback) |
-| POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart |
+| GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback). A fresh check that finds a newer release also announces it on `x0x/release` (#1169); through gossip self-delivery the node's own apply pipeline may pick it up |
+| POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart; the observed release is announced on `x0x/release` before the apply work (#1169) |
 | GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383; no update check runs, nothing is announced) |
 
 **Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the
