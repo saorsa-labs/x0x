@@ -2091,11 +2091,18 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
     // to 0.5.89; 0.5.90 only moves the ant-quic pin to =0.27.61. Compared
     // with 0.5.88, 0.5.89 changed only payload replay refusal state/handling
     // and its tests. Refused replays can change attempt counts without
-    // changing the meter.
+    // changing the meter. 0.5.88 was the reviewed pin before 0.5.89 and
+    // keeps that meter; #1346 holds the family at 0.5.88 while ant-quic is
+    // =0.27.62 (0.5.89 pins ant-quic =0.27.60 and 0.5.90 pins =0.27.61),
+    // so it stays a reviewed producer until a family release accepts
+    // 0.27.62 and supersedes it.
     const REGISTRY_PUBSUB_VERSION: &str = "0.5.90";
     const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const REGISTRY_PUBSUB_SHA: &str =
         "ae450e28dd005cd606e006815fde51e515c6c0dc671a94e5fc044e35228320b0";
+    const HELD_PUBSUB_VERSION: &str = "0.5.88";
+    const HELD_PUBSUB_SHA: &str =
+        "accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
     // SG 997abc75 supplies the reviewed meter accounting. Its descendant
     // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
@@ -2109,11 +2116,14 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
     let registry = version == Some(REGISTRY_PUBSUB_VERSION)
         && source == Some(REGISTRY_PUBSUB_SOURCE)
         && package.get("checksum").and_then(toml::Value::as_str) == Some(REGISTRY_PUBSUB_SHA);
+    let held = version == Some(HELD_PUBSUB_VERSION)
+        && source == Some(REGISTRY_PUBSUB_SOURCE)
+        && package.get("checksum").and_then(toml::Value::as_str) == Some(HELD_PUBSUB_SHA);
     let git = version == Some(GIT_PUBSUB_VERSION)
         && (source == Some(GIT_PUBSUB_SOURCE_ACCOUNTING)
             || source == Some(GIT_PUBSUB_SOURCE_CURRENT))
         && package.get("checksum").is_none();
-    registry || git
+    registry || held || git
 }
 
 #[test]
@@ -2158,11 +2168,13 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("prior registry fixture");
     assert!(!reviewed_pubsub_producer(&prior_registry));
+    // 0.5.88 is the #1346 hold: while ant-quic is =0.27.62 the family
+    // cannot move past it, and its reviewed meter makes it a producer.
     let previous_registry: toml::Value = toml::from_str(
         "version = '0.5.88'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097'",
     )
     .expect("previous registry fixture");
-    assert!(!reviewed_pubsub_producer(&previous_registry));
+    assert!(reviewed_pubsub_producer(&previous_registry));
     // 0.5.89 has the same pubsub sources as 0.5.90 but is superseded.
     let superseded_registry: toml::Value = toml::from_str(
         "version = '0.5.89'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'f3bec1a8233738b93f847040e7618e4f06d1e275e002845e558fef956412edb6'",

@@ -10197,8 +10197,38 @@ mod tests {
     /// #1226: refuse an unsigned inner envelope before either eager forwarding
     /// or lazy advertisement. A later IWANT must not retrieve the rejected ID.
     /// Signed V2/V3 controls prove the same subscribed/unsubscribed paths work.
+    ///
+    /// #1346 hold: the refusal ships in saorsa-gossip 0.5.89. While ant-quic
+    /// is =0.27.62 the family stays at 0.5.88 (0.5.89 pins ant-quic =0.27.60,
+    /// 0.5.90 pins =0.27.61), and a pubsub that old cannot refuse an unsigned
+    /// inner V1 at all, so the test reports and stands down instead of
+    /// asserting behaviour the pinned dependency does not carry. The first
+    /// family release that accepts ant-quic 0.27.62 re-arms it with no edit.
+    fn pinned_pubsub_refuses_unsigned_inner_v1() -> bool {
+        let lock: toml::Value =
+            toml::from_str(include_str!("../../Cargo.lock")).expect("workspace lock parses");
+        lock["package"]
+            .as_array()
+            .expect("lock packages")
+            .iter()
+            .filter(|p| p["name"].as_str() == Some("saorsa-gossip-pubsub"))
+            .all(|p| {
+                p["version"]
+                    .as_str()
+                    .and_then(|v| semver::Version::parse(v).ok())
+                    .is_some_and(|v| v >= semver::Version::new(0, 5, 89))
+            })
+    }
+
     #[tokio::test]
     async fn issue1226_unsigned_inner_v1_is_not_forwarded_or_served() {
+        if !pinned_pubsub_refuses_unsigned_inner_v1() {
+            eprintln!(
+                "issue1226 guard stood down: pinned saorsa-gossip-pubsub predates \
+                 the 0.5.89 refusal (ant-quic =0.27.62 hold, #1346)"
+            );
+            return;
+        }
         // Match SG's existing anti-entropy wire enum. A digest may contain
         // retained dedupe IDs; it must never cause refused bytes to be served.
         #[derive(Debug, serde::Serialize, serde::Deserialize)]

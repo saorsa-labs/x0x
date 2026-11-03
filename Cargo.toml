@@ -19,11 +19,10 @@ exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 
 [dependencies]
 anyhow = "1.0"
-# #1346 dev pin: ant-quic PR #367 (issue #327) adds the additive
-# SendStream/RecvStream::connection_generation() the evidence Hello reply
-# gate needs. Replace with the released `=0.27.x` once it ships (the PR is
-# blocked on that release before merge).
-ant-quic = { git = "https://github.com/saorsa-labs/ant-quic.git", rev = "3b638c098551b4cedd9047f9eed0889faa53b65e" }
+# #1346: 0.27.62 ships the additive
+# SendStream/RecvStream::connection_generation() the evidence Hello
+# reply gate keys on (ant-quic#327, David's 3 Nov 2026 go).
+ant-quic = "=0.27.62"
 # CI pin (2026-09-03): tinyvec 1.13.0 (published 2026-09-03) fails to compile on the
 # pinned rustc 1.95.0 ("cannot find macro `vec`"). Cargo.lock is now tracked, but
 # keep the bound so a `cargo update` or a downstream fresh resolve cannot pick it
@@ -49,11 +48,11 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-# #1346 dev pin: 0.5.88 is the last saorsa-gossip release whose ant-quic
-# requirement (`^0.27.53`) accepts the git-pinned ant-quic PR branch
-# (0.27.53); 0.5.89+ pin `=0.27.60+` exactly. Temporary: restore =0.5.90
-# together with the released ant-quic pin. Two guard tests (#1226 refusal,
-# the controlled-load build-lock premise) are red under this dev pin only.
+# #1346: the family stays at 0.5.88 while ant-quic is =0.27.62 — 0.5.89
+# pins ant-quic =0.27.60 and 0.5.90 pins =0.27.61 exactly, so neither
+# resolves against =0.27.62. Move the family to the first release that
+# accepts 0.27.62; that release re-arms the #1226 guard
+# (src/gossip/pubsub.rs) and re-supersedes this producer premise.
 saorsa-gossip-coordinator = "=0.5.88"
 saorsa-gossip-crdt-sync = "=0.5.88"
 saorsa-gossip-groups = "=0.5.88"
@@ -208,15 +207,6 @@ members = [
     ".",
     "tests/harness",
 ]
-
-# #1346 dev pin (temporary): ant-quic PR #367 (issue #327) adds the additive
-# SendStream/RecvStream::connection_generation() the evidence Hello reply
-# gate keys on. Everything must resolve to that one revision, so patch the
-# registry source too. Drop this section and the git dependency above for
-# the released `=0.27.x` once it ships.
-[patch.crates-io]
-ant-quic = { git = "https://github.com/saorsa-labs/ant-quic.git", rev = "3b638c098551b4cedd9047f9eed0889faa53b65e" }
-
 
 # #703: the 100k signing-path test spends most CPU time in Keccak. Optimize
 # only its concrete crypto path in `test`; dev and release stay unchanged.

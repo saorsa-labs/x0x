@@ -149,10 +149,16 @@ impl MachineBudget {
         let Some(slot) = self.hello_attempts.iter_mut().find(|s| s.is_none()) else {
             // Bounded memory: forget the smallest attempted generation by
             // raising the floor above it, so nothing at or below it re-arms.
-            let floor = &mut self.hello_floor;
-            if let Some(slot) = self.hello_attempts.iter_mut().min_by_key(|s| s.unwrap()) {
-                *floor = (*floor).max(slot.unwrap());
-                *slot = Some(generation);
+            // Every slot is Some here, so the minimum is a stored generation.
+            if let Some(smallest) = self.hello_attempts.iter().filter_map(|s| *s).min() {
+                self.hello_floor = self.hello_floor.max(smallest);
+                if let Some(slot) = self
+                    .hello_attempts
+                    .iter_mut()
+                    .find(|s| **s == Some(smallest))
+                {
+                    *slot = Some(generation);
+                }
             }
             return;
         };
