@@ -132,6 +132,7 @@ impl Upgrader {
             source: e,
         })?;
         refresh_mtime(&backup_path);
+        sync_file_best_effort(&backup_path);
         refresh_canonical_backup(&self.target_path, &backup_path);
         Ok(backup_path)
     }
@@ -386,6 +387,7 @@ fn refresh_canonical_backup(target: &Path, per_swap: &Path) {
         std::process::id()
     ));
     if let Err(error) = std::fs::copy(per_swap, &staging).and_then(|_| {
+        sync_file_best_effort(&staging);
         std::fs::rename(&staging, &canonical).inspect_err(|_| {
             // The staged copy is complete; only the atomic swap failed.
             let _ = std::fs::remove_file(&staging);
@@ -400,6 +402,15 @@ fn refresh_canonical_backup(target: &Path, per_swap: &Path) {
         return;
     }
     refresh_mtime(&canonical);
+    if let Some(parent) = canonical.parent() {
+        if let Err(error) = journal::open_for_sync(parent, true).and_then(|dir| dir.sync_all()) {
+            warn!(
+                dir = %parent.display(),
+                error = %error,
+                "cannot sync the install directory after the canonical backup rename"
+            );
+        }
+    }
 }
 
 /// Reset a freshly written backup's mtime to now. `fs::copy` may preserve
@@ -407,16 +418,55 @@ fn refresh_canonical_backup(target: &Path, per_swap: &Path) {
 /// the bytes being preserved usually carry an install-date mtime; without
 /// this reset the startup sweep's age gate could reclaim a live
 /// transaction's backup the moment it is written (#1106 review finding).
-/// The backup file is created by this process, so it owns it and the reset
-/// cannot fail on permissions unless something changed the file in between.
+/// `fs::copy` also copies the source's permission bits, so a `0o555`
+/// install cannot be opened for writing — but this process created the
+/// backup and owns it, and `futimens` with explicit times needs only
+/// ownership, so a read-only open is the fallback. Best-effort: a failure
+/// is logged because the sweep's age gate is then the only protection.
 fn refresh_mtime(path: &Path) {
-    if let Ok(file) = File::options().write(true).open(path) {
-        if let Err(error) = file.set_modified(std::time::SystemTime::now()) {
+    let file = File::options()
+        .write(true)
+        .open(path)
+        .or_else(|_| File::options().read(true).open(path));
+    match file {
+        Ok(file) => {
+            if let Err(error) = file.set_modified(std::time::SystemTime::now()) {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "cannot reset the backup mtime; the sweep's age gate may see it as old"
+                );
+            }
+        }
+        Err(error) => {
             warn!(
                 path = %path.display(),
                 error = %error,
-                "cannot reset the backup mtime; the sweep's age gate may see it as old"
+                "cannot open the backup to reset its mtime; the sweep's age gate may see it as old"
             );
+        }
+    }
+}
+
+/// Flush a freshly written backup file to storage, matching the durability
+/// the restore side already provides (#1595): a rollback token that a power
+/// cut can tear is no rollback token. Any fd syncs the file's data.
+/// Best-effort and logged — a sync error must not fail the upgrade that
+/// already holds the host lock, and the pre-#1106 `.backup` was never
+/// synced either.
+fn sync_file_best_effort(path: &Path) {
+    match File::options().read(true).open(path) {
+        Ok(file) => {
+            if let Err(error) = file.sync_all() {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "cannot sync the backup file; a power cut may tear it"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(path = %path.display(), error = %error, "cannot open the backup file to sync it");
         }
     }
 }
@@ -928,6 +978,32 @@ mod tests {
         assert_eq!(removed, 0, "a just-written backup must not look aged");
         assert!(backup_path.is_file(), "the per-swap backup must survive");
         assert!(canonical.is_file(), "the canonical backup must survive");
+    }
+
+    /// `fs::copy` also copies the source's permission bits (#1106 review
+    /// round 3): a `0o555` install produces a `0o555` backup, whose mtime
+    /// must still be resettable — this process owns the fresh file, so the
+    /// reset falls back to a read-only open.
+    #[test]
+    fn create_backup_resets_mtime_on_a_read_only_mode_backup() {
+        let dir = TempDir::new().unwrap();
+        let binary_path = create_test_binary(&dir, "test-binary", b"original content");
+        // Age first, while the mode still allows the write-open that
+        // backdates the mtime; then make the install read-only.
+        age_file(&binary_path, std::time::Duration::from_secs(7200));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let upgrader = Upgrader::new(binary_path.clone(), Version::new(1, 0, 0));
+
+        let backup_path = upgrader.create_backup().unwrap();
+
+        let removed =
+            sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(3600));
+        assert_eq!(removed, 0, "a mode-inheriting backup must not look aged");
+        assert!(backup_path.is_file(), "the per-swap backup must survive");
     }
 
     /// #1106 regression: two transactions on one shared executable applying
