@@ -1410,7 +1410,11 @@ impl AutoApplyUpgrader {
             None
         };
 
-        let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
+        // #1106: creations recorded in this instance's ledger so its own
+        // startup sweep can later prove it created them (engineer ruling,
+        // 3 Nov 12:48 GMT).
+        let upgrader = Upgrader::new(target_path.clone(), current_version.clone())
+            .with_backup_ledger_at(&restart_plan.data_root);
         let temp_dir = upgrader.create_temp_dir()?;
         // Guarantees temp-dir removal on every early-return error path below.
         let _temp_guard = TempDirGuard {
@@ -1506,7 +1510,8 @@ impl AutoApplyUpgrader {
                 #[cfg(unix)]
                 {
                     companion = Some((
-                        Upgrader::new(x0x_path, current_version.clone()),
+                        Upgrader::new(x0x_path, current_version.clone())
+                            .with_backup_ledger_at(&restart_plan.data_root),
                         probe_cli.clone(),
                     ));
                 }
@@ -1519,7 +1524,8 @@ impl AutoApplyUpgrader {
                         warn!("Failed to extract companion x0x binary: {e}");
                     } else {
                         companion = Some((
-                            Upgrader::new(x0x_path, current_version.clone()),
+                            Upgrader::new(x0x_path, current_version.clone())
+                                .with_backup_ledger_at(&restart_plan.data_root),
                             extracted_x0x,
                         ));
                     }

@@ -11,12 +11,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 
 pub(crate) const JOURNAL_FILE_NAME: &str = "upgrade-journal.json";
 pub(crate) const HANDOFF_FILE_NAME: &str = "upgrade-handoff.json";
@@ -332,10 +333,11 @@ pub(crate) fn read_boot_records(data_dir: &Path) -> BootRecords {
 /// #1106) is different: supervised-exit records persist until a later
 /// transaction replaces them, so holding the whole sweep for one would stop
 /// all cleanup on supervised hosts forever. The sweep instead receives the
-/// record's own target and backup paths as exemptions and still runs.
+/// record's own target and backup paths as exemptions, the instance's backup
+/// ledger as its proof of creation, and still runs.
 pub(crate) fn sweep_if_no_pending_records(
     data_dir: &Path,
-    sweep: impl FnOnce(&[PathBuf]) -> usize,
+    sweep: impl FnOnce(&[PathBuf], &[PathBuf]) -> usize,
 ) -> usize {
     let records = read_boot_records(data_dir);
     let legacy_references_candidates = match &records.handoff {
@@ -360,8 +362,63 @@ pub(crate) fn sweep_if_no_pending_records(
     if records.blocks_apply() || legacy_references_candidates {
         0
     } else {
-        sweep(&referenced_paths)
+        sweep(&referenced_paths, &read_backup_ledger(data_dir))
     }
+}
+
+/// The #1106 creation ledger: files this instance created in the shared
+/// install directory (per-swap backups, canonical-refresh staging). The
+/// startup sweep may reclaim only ledgered files — anything else may belong
+/// to a sibling instance's live transaction (engineer ruling, 3 Nov 12:48
+/// GMT: never delete a per-swap backup this instance cannot prove it
+/// created from its own data dir; hold back when unsure).
+pub(crate) fn backup_ledger_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("upgrade-backup-ledger.json")
+}
+
+/// Read the creation ledger. Missing, empty or unparsable reads as empty —
+/// the sweep then holds back, which is the safe direction.
+pub(crate) fn read_backup_ledger(data_dir: &Path) -> Vec<PathBuf> {
+    let bytes = match read_bytes(&backup_ledger_path(data_dir)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            warn!(error = %error, "cannot read the backup ledger; the sweep will hold back");
+            return Vec::new();
+        }
+    };
+    match serde_json::from_slice::<Vec<String>>(&bytes) {
+        // Entries whose files are gone are pruned so the ledger cannot grow
+        // without bound.
+        Ok(paths) => paths
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .collect(),
+        Err(error) => {
+            warn!(error = %error, "cannot parse the backup ledger; the sweep will hold back");
+            Vec::new()
+        }
+    }
+}
+
+/// Record a creation in the ledger (atomic tmp+rename; entries whose files
+/// are gone are pruned on the way).
+pub(crate) fn append_backup_ledger(data_dir: &Path, created: &Path) -> io::Result<()> {
+    let canonical = std::fs::canonicalize(created).unwrap_or_else(|_| created.to_path_buf());
+    let mut paths: Vec<String> = read_backup_ledger(data_dir)
+        .into_iter()
+        .filter_map(|path| path.into_os_string().into_string().ok())
+        .collect();
+    paths.push(canonical.to_string_lossy().into_owned());
+    let bytes = serde_json::to_vec_pretty(&paths).map_err(invalid)?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(invalid("backup ledger exceeds the size limit"));
+    }
+    let path = backup_ledger_path(data_dir);
+    let staging = data_dir.join("upgrade-backup-ledger.partial");
+    fs::write(&staging, &bytes)?;
+    fs::rename(&staging, &path)
 }
 
 fn read_record(path: &Path, expected: &str) -> RecordRead {

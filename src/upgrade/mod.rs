@@ -72,6 +72,12 @@ pub struct Upgrader {
     target_path: PathBuf,
     /// Current version of the binary.
     current_version: Version,
+    /// Data dir whose backup ledger proves this instance created a per-swap
+    /// backup (#1106, engineer ruling 3 Nov 12:48 GMT: the sweep may only
+    /// reclaim files this instance can prove it created from its own data
+    /// dir). `None` (public `perform_upgrade`, tests): creations are never
+    /// recorded and therefore never swept — the conservative direction.
+    backup_ledger_data_dir: Option<PathBuf>,
 }
 
 impl Upgrader {
@@ -79,7 +85,15 @@ impl Upgrader {
         Self {
             target_path,
             current_version,
+            backup_ledger_data_dir: None,
         }
+    }
+
+    /// Record per-swap backup creations in `data_dir`'s ledger so this
+    /// instance's startup sweep can later prove it created them (#1106).
+    pub(crate) fn with_backup_ledger_at(mut self, data_dir: &Path) -> Self {
+        self.backup_ledger_data_dir = Some(data_dir.to_path_buf());
+        self
     }
 
     /// Prevent downgrades — target must be strictly newer.
@@ -124,16 +138,40 @@ impl Upgrader {
     /// one inode between the canonical name and the target, so a pre-#1106
     /// swapper's copy onto the canonical name would truncate the running
     /// binary (review finding on the first draft).
+    /// The copy itself is exclusive (`O_EXCL`): a pre-placed name — a
+    /// symlink, or another transaction's file after a clock collision —
+    /// fails loudly with `AlreadyExists` and the name is re-derived, never
+    /// silently overwritten. Creation is recorded in the data-dir ledger so
+    /// this instance's sweep can later prove it created the file (engineer
+    /// ruling, 3 Nov 12:48 GMT).
     pub fn create_backup(&self) -> Result<PathBuf, UpgradeError> {
-        let backup_path = per_swap_backup_path(&self.target_path, &self.current_version);
-        debug!(backup_path = %backup_path.display(), "Creating backup at: {}", backup_path.display());
-        std::fs::copy(&self.target_path, &backup_path).map_err(|e| UpgradeError::BackupFailed {
-            path: backup_path.clone(),
-            source: e,
-        })?;
+        let mut unique = unique_nanos();
+        let backup_path = loop {
+            let candidate = per_swap_backup_path(&self.target_path, &self.current_version, unique);
+            debug!(backup_path = %candidate.display(), "Creating backup at: {}", candidate.display());
+            match copy_exclusive(&self.target_path, &candidate) {
+                Ok(()) => break candidate,
+                // Name collision (coarse clock, backward step): re-derive
+                // instead of destroying whatever holds the name.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    unique = unique.saturating_add(1);
+                }
+                Err(e) => {
+                    return Err(UpgradeError::BackupFailed {
+                        path: candidate,
+                        source: e,
+                    })
+                }
+            }
+        };
+        record_backup_creation(self.backup_ledger_data_dir.as_deref(), &backup_path);
         refresh_mtime(&backup_path);
         sync_file_best_effort(&backup_path);
-        refresh_canonical_backup(&self.target_path, &backup_path);
+        refresh_canonical_backup(
+            &self.target_path,
+            &backup_path,
+            self.backup_ledger_data_dir.as_deref(),
+        );
         Ok(backup_path)
     }
 
@@ -337,29 +375,59 @@ fn host_upgrade_lock_path(target: &Path) -> PathBuf {
 /// pid-nanos pair (the [`Upgrader::create_temp_dir`] idiom) makes the name
 /// unique per transaction, which is what concurrent swappers on one shared
 /// executable actually need — two same-version daemons applying different
-/// releases would otherwise collide on a version-only name.
-fn per_swap_backup_path(target: &Path, running_version: &Version) -> PathBuf {
-    let mut unique = std::time::SystemTime::now()
+/// releases would otherwise collide on a version-only name. Uniqueness is
+/// enforced by the caller's exclusive create, not by a check-then-copy race.
+fn per_swap_backup_path(target: &Path, running_version: &Version, unique: u128) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(
+        ".backup-{running_version}-{}-{unique}",
+        std::process::id()
+    ));
+    target.with_file_name(name)
+}
+
+/// Fresh uniqueness seed (nanoseconds since the epoch); the [`Upgrader::create_temp_dir`]
+/// idiom.
+fn unique_nanos() -> u128 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    loop {
-        let mut name = target
-            .file_name()
-            .map(|n| n.to_os_string())
-            .unwrap_or_default();
-        name.push(format!(
-            ".backup-{running_version}-{}-{unique}",
-            std::process::id()
-        ));
-        let path = target.with_file_name(name);
-        // `fs::copy` onto an existing name would silently destroy another
-        // transaction's rollback bytes — the exact #1106 bug class — so a
-        // collision (coarse clock tick, backward NTP step) re-derives instead.
-        if !path.exists() {
-            return path;
-        }
-        unique += 1;
+        .unwrap_or(0)
+}
+
+/// Copy `src` to a `dst` that must not exist (`O_EXCL`/`create_new`), then
+/// copy the permission bits as `fs::copy` would. Exclusive creation means a
+/// pre-placed name (symlink or another transaction's file) fails loudly
+/// instead of being silently truncated, and the fresh file carries a
+/// creation-time mtime on every platform.
+fn copy_exclusive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut reader = File::open(src)?;
+    let writer = File::options().write(true).create_new(true).open(dst)?;
+    let mut buffered = std::io::BufWriter::new(&writer);
+    std::io::copy(&mut reader, &mut buffered)?;
+    buffered.flush()?;
+    let permissions = reader.metadata()?.permissions();
+    writer.set_permissions(permissions)
+}
+
+/// Record a per-swap creation in this instance's data-dir ledger (#1106,
+/// engineer ruling 3 Nov 12:48 GMT: the sweep may only reclaim files this
+/// instance can prove it created). Best-effort: a failed write means the
+/// file is never swept — the conservative direction — and is only logged.
+fn record_backup_creation(data_dir: Option<&Path>, created: &Path) {
+    let Some(data_dir) = data_dir else {
+        return;
+    };
+    if let Err(error) = journal::append_backup_ledger(data_dir, created) {
+        warn!(
+            ledger = %journal::backup_ledger_path(data_dir).display(),
+            error = %error,
+            "cannot record the backup creation; the sweep will never reclaim this file"
+        );
     }
 }
 
@@ -376,7 +444,7 @@ fn per_swap_backup_path(target: &Path, running_version: &Version) -> PathBuf {
 /// file is the rollback token; the canonical name only serves
 /// path-deriving consumers. Called under the host lock, so the swap cannot
 /// interleave with another swapper.
-fn refresh_canonical_backup(target: &Path, per_swap: &Path) {
+fn refresh_canonical_backup(target: &Path, per_swap: &Path, ledger_data_dir: Option<&Path>) {
     let canonical = target.with_extension("backup");
     let staging = target.with_file_name(format!(
         "{}.backup-partial-{}",
@@ -386,7 +454,14 @@ fn refresh_canonical_backup(target: &Path, per_swap: &Path) {
             .unwrap_or_default(),
         std::process::id()
     ));
-    if let Err(error) = std::fs::copy(per_swap, &staging).and_then(|_| {
+    // A crash between the staged copy and the rename leaves an orphan; the
+    // pid-scoped name is provably this process's debris, so it is ledgered
+    // up front (the ledger prunes entries whose files are gone).
+    record_backup_creation(ledger_data_dir, &staging);
+    // Our own pid-scoped staging name: any leftover from an earlier call of
+    // this process is garbage by definition.
+    let _ = std::fs::remove_file(&staging);
+    if let Err(error) = copy_exclusive(per_swap, &staging).and_then(|()| {
         sync_file_best_effort(&staging);
         std::fs::rename(&staging, &canonical).inspect_err(|_| {
             // The staged copy is complete; only the atomic swap failed.
@@ -747,24 +822,37 @@ pub(crate) fn restore_swapped_binaries(artifacts: &[(PathBuf, PathBuf)]) -> std:
 /// binary — must not lose its rollback bytes to the startup sweep.
 /// Per-swap backups (`<file>.backup-<version>-<pid>-<nanos>`, issue #1106)
 /// and interrupted canonical refreshes (`<file>.backup-partial-<pid>`) are
-/// age-gated identically for the same reason: a live handoff helper may
-/// still need its transaction's rollback bytes.
+/// age-gated identically for the same reason — and, per the engineer ruling
+/// of 3 Nov 12:48 GMT, reclaimed only when the sweeping instance's own
+/// data-dir ledger proves it created them (see
+/// [`sweep_stale_upgrade_artifacts_proven`]).
 ///
 /// Returns the number of entries removed. All removal is best-effort.
 pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duration) -> usize {
-    sweep_stale_upgrade_artifacts_excluding(dir, dir_min_age, &[])
+    sweep_stale_upgrade_artifacts_proven(dir, dir_min_age, &[], &[])
 }
 
-/// [`sweep_stale_upgrade_artifacts`] with paths that are never removed,
-/// whatever pattern they match (#1106): a persistent handoff record names
-/// its own target and per-swap backup as the operator's recovery pointers,
-/// and the sweep must reclaim unrelated debris without eating them — a
-/// whole-sweep hold here would stop all cleanup on supervised hosts, whose
-/// supervised-exit records are only removed by a later transaction.
-pub fn sweep_stale_upgrade_artifacts_excluding(
+/// [`sweep_stale_upgrade_artifacts`] scoped by the two #1106 rules (engineer
+/// ruling, 3 Nov 12:48 GMT):
+///
+/// - `exempt` — paths named by this instance's boot records (its target and
+///   per-swap backup). Never removed, whatever pattern they match. Compared
+///   canonically, because the records hold canonicalised install paths while
+///   this sweep walks the directory as the current process resolves it.
+/// - `proven` — per-swap backups and `.backup-partial-` staging files this
+///   instance recorded in its own data-dir ledger at creation time. A
+///   per-swap file not in that set is never deleted: it may belong to a
+///   sibling instance's live transaction or handoff record, and the sweep
+///   holds back when it cannot prove otherwise.
+///
+/// An entry whose age cannot be established (missing metadata, unreadable
+/// mtime, an mtime in the future after a backward clock step) counts as not
+/// aged — never as old enough to delete.
+pub fn sweep_stale_upgrade_artifacts_proven(
     dir: &Path,
     dir_min_age: std::time::Duration,
     exempt: &[PathBuf],
+    proven: &[PathBuf],
 ) -> usize {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -773,6 +861,10 @@ pub fn sweep_stale_upgrade_artifacts_excluding(
             return 0;
         }
     };
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let exempt: Vec<PathBuf> = exempt.iter().map(|path| canonical(path)).collect();
+    let proven: Vec<PathBuf> = proven.iter().map(|path| canonical(path)).collect();
     let now = std::time::SystemTime::now();
     let entry_is_aged = |entry: &std::fs::DirEntry| {
         entry
@@ -780,14 +872,14 @@ pub fn sweep_stale_upgrade_artifacts_excluding(
             .and_then(|m| m.modified())
             .ok()
             .and_then(|modified| now.duration_since(modified).ok())
-            .is_none_or(|age| age >= dir_min_age)
+            .is_some_and(|age| age >= dir_min_age)
     };
     let mut removed = 0;
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
         let path = entry.path();
-        if exempt.contains(&path) {
+        if exempt.contains(&canonical(&path)) {
             continue;
         }
         if name.starts_with(".x0x-upgrade-") {
@@ -803,6 +895,7 @@ pub fn sweep_stale_upgrade_artifacts_excluding(
             info!(path = %path.display(), "Removed sidelined binary from prior upgrade");
             removed += 1;
         } else if (is_per_swap_backup_name(&name) || name.contains(".backup-partial-"))
+            && proven.contains(&canonical(&path))
             && entry_is_aged(&entry)
             && std::fs::remove_file(&path).is_ok()
         {
@@ -979,6 +1072,8 @@ mod tests {
     /// install-date mtime (macOS `fcopyfile`, Windows `CopyFileExW`), so a
     /// freshly written backup must have its mtime reset or the startup
     /// sweep's age gate can reclaim a live transaction's backup immediately.
+    /// The backup is passed as proven so the per-swap branch is armed and
+    /// only the mtime can save it.
     #[test]
     fn create_backup_resets_mtime_so_a_fresh_backup_is_never_swept() {
         let dir = TempDir::new().unwrap();
@@ -989,18 +1084,23 @@ mod tests {
         let backup_path = upgrader.create_backup().unwrap();
         let canonical = binary_path.with_extension("backup");
 
-        // The production startup sweep's one-hour gate must spare both names.
-        let removed =
-            sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(3600));
+        // The production startup sweep's one-hour gate must spare the file
+        // even though the sweeping instance can prove it created it.
+        let removed = sweep_stale_upgrade_artifacts_proven(
+            dir.path(),
+            std::time::Duration::from_secs(3600),
+            &[],
+            std::slice::from_ref(&backup_path),
+        );
         assert_eq!(removed, 0, "a just-written backup must not look aged");
         assert!(backup_path.is_file(), "the per-swap backup must survive");
         assert!(canonical.is_file(), "the canonical backup must survive");
     }
 
-    /// `fs::copy` also copies the source's permission bits (#1106 review
-    /// round 3): a `0o555` install produces a `0o555` backup, whose mtime
-    /// must still be resettable — this process owns the fresh file, so the
-    /// reset falls back to a read-only open.
+    /// The exclusive copy inherits the source's permission bits (#1106
+    /// review round 3): a `0o555` install produces a `0o555` backup, whose
+    /// mtime must still be resettable — this process owns the fresh file, so
+    /// the reset falls back to a read-only open.
     #[test]
     fn create_backup_resets_mtime_on_a_read_only_mode_backup() {
         let dir = TempDir::new().unwrap();
@@ -1017,8 +1117,12 @@ mod tests {
 
         let backup_path = upgrader.create_backup().unwrap();
 
-        let removed =
-            sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(3600));
+        let removed = sweep_stale_upgrade_artifacts_proven(
+            dir.path(),
+            std::time::Duration::from_secs(3600),
+            &[],
+            std::slice::from_ref(&backup_path),
+        );
         assert_eq!(removed, 0, "a mode-inheriting backup must not look aged");
         assert!(backup_path.is_file(), "the per-swap backup must survive");
     }
@@ -1408,18 +1512,20 @@ mod tests {
         assert!(backup.exists(), "unrelated .backup file must be left alone");
     }
 
-    /// Per-swap backups (#1106) are reclaimed by the startup sweep only past
-    /// the age gate, so a live handoff keeps its rollback bytes while
-    /// completed upgrades do not accumulate one ≤200 MiB file per swap.
-    /// Interrupted canonical refreshes (`*.backup-partial-*`) are reclaimed
-    /// the same way, and date-like operator files are never touched.
+    /// Per-swap backups (#1106) are reclaimed by the startup sweep only when
+    /// ALL of: the instance's ledger proves it created them (engineer
+    /// ruling, 3 Nov 12:48 GMT — a sibling instance's file is never provable
+    /// from this data dir, so it is never deleted), the known age is past
+    /// the gate, and no boot record names them. Interrupted canonical
+    /// refreshes (`*.backup-partial-*`) follow the same rules. Date-like
+    /// operator files and pair-engine artifacts are never touched.
     #[test]
-    fn sweep_reclaims_aged_per_swap_backups_but_spares_live_ones() {
+    fn sweep_reclaims_proven_aged_per_swap_backups_but_holds_back_when_unsure() {
         let dir = TempDir::new().unwrap();
-        let aged = dir.path().join("x0xd.backup-1.0.0-123-456");
-        fs::write(&aged, b"old").unwrap();
-        let fresh = dir.path().join("x0xd.backup-2.0.0-789-101");
-        fs::write(&fresh, b"fresh").unwrap();
+        let proven_aged = dir.path().join("x0xd.backup-1.0.0-123-456");
+        fs::write(&proven_aged, b"old and ledgered").unwrap();
+        let unproven_aged = dir.path().join("x0xd.backup-2.0.0-789-101");
+        fs::write(&unproven_aged, b"another instance's file").unwrap();
         let canonical = dir.path().join("x0xd.backup");
         fs::write(&canonical, b"canonical").unwrap();
         // A dormant pair-engine artifact (uuid transaction id) is not this
@@ -1432,24 +1538,37 @@ mod tests {
         // debris and must survive the sweep (review round-2 finding).
         let operator_file = dir.path().join("notes.backup-2026-01-15");
         fs::write(&operator_file, b"operator notes").unwrap();
-        // A canonical refresh interrupted mid-copy stages under this name;
-        // an aged leftover is debris, a live one is an in-flight refresh.
-        let aged_partial = dir.path().join("x0xd.backup-partial-321");
-        fs::write(&aged_partial, b"partial").unwrap();
-        age_file(&aged, std::time::Duration::from_secs(7200));
-        age_file(&aged_partial, std::time::Duration::from_secs(7200));
+        // A ledgered staging leftover from an interrupted canonical refresh.
+        let proven_partial = dir.path().join("x0xd.backup-partial-321");
+        fs::write(&proven_partial, b"partial").unwrap();
+        // Unknown age (mtime in the future after a backward clock step):
+        // hold back (engineer ruling, 3 Nov 12:48 GMT).
+        let future = dir.path().join("x0xd.backup-4.0.0-555-777");
+        fs::write(&future, b"future mtime").unwrap();
+        age_file(&proven_aged, std::time::Duration::from_secs(7200));
+        age_file(&unproven_aged, std::time::Duration::from_secs(7200));
+        age_file(&proven_partial, std::time::Duration::from_secs(7200));
+        set_mtime_in_future(&future, std::time::Duration::from_secs(7200));
+        let proven = vec![proven_aged.clone(), proven_partial.clone(), future.clone()];
 
-        let removed =
-            sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(3600));
+        let removed = sweep_stale_upgrade_artifacts_proven(
+            dir.path(),
+            std::time::Duration::from_secs(3600),
+            &[],
+            &proven,
+        );
 
         assert_eq!(
             removed, 2,
-            "only the aged per-swap backup and aged partial staging should be removed"
+            "only the proven-aged per-swap backup and partial staging are removed"
         );
-        assert!(!aged.exists(), "aged per-swap backup must be reclaimed");
         assert!(
-            fresh.exists(),
-            "a live transaction's per-swap backup must survive the age gate"
+            !proven_aged.exists(),
+            "a proven, aged per-swap backup is reclaimed"
+        );
+        assert!(
+            unproven_aged.exists(),
+            "a file the instance cannot prove it created is never deleted, however old"
         );
         assert!(
             canonical.exists(),
@@ -1463,7 +1582,14 @@ mod tests {
             operator_file.exists(),
             "date-like operator files are not this module's debris"
         );
-        assert!(!aged_partial.exists(), "aged partial staging is debris");
+        assert!(
+            !proven_partial.exists(),
+            "proven aged partial staging is debris"
+        );
+        assert!(
+            future.exists(),
+            "an unknown age (future mtime) means hold back, not delete"
+        );
     }
 
     /// Backdate a file's mtime so the sweep's age gate sees it as old.
@@ -1473,6 +1599,18 @@ mod tests {
             std::time::SystemTime::now()
                 .checked_sub(age)
                 .expect("age must not overflow the clock"),
+        )
+        .unwrap();
+    }
+
+    /// Move a file's mtime into the future, as a backward clock step leaves
+    /// behind: the sweep's age computation then fails and must hold back.
+    fn set_mtime_in_future(path: &Path, skew: std::time::Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(
+            std::time::SystemTime::now()
+                .checked_add(skew)
+                .expect("skew must not overflow the clock"),
         )
         .unwrap();
     }

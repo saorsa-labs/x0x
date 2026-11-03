@@ -212,11 +212,12 @@ fn recovery_records_preserve_real_cleanup_candidates() {
             br#"{"schema_version":"#.as_slice(),
         ] {
             std::fs::write(&record, bytes).unwrap();
-            let removed = journal::sweep_if_no_pending_records(data.path(), |exempt| {
-                x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+            let removed = journal::sweep_if_no_pending_records(data.path(), |exempt, proven| {
+                x0x::upgrade::sweep_stale_upgrade_artifacts_proven(
                     dir.path(),
                     std::time::Duration::ZERO,
                     exempt,
+                    proven,
                 )
             });
             assert_eq!(removed, 0);
@@ -244,11 +245,12 @@ fn recovery_records_preserve_real_cleanup_candidates() {
         journal::RecordRead::Handoff(_)
     ));
     assert_eq!(
-        journal::sweep_if_no_pending_records(data.path(), |exempt| {
-            x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+        journal::sweep_if_no_pending_records(data.path(), |exempt, proven| {
+            x0x::upgrade::sweep_stale_upgrade_artifacts_proven(
                 dir.path(),
                 std::time::Duration::ZERO,
                 exempt,
+                proven,
             )
         }),
         0
@@ -261,11 +263,12 @@ fn recovery_records_preserve_real_cleanup_candidates() {
     assert_eq!(std::fs::read(&sidelined).unwrap(), b"rollback");
     std::fs::remove_file(&record).unwrap();
     assert_eq!(
-        journal::sweep_if_no_pending_records(data.path(), |exempt| {
-            x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+        journal::sweep_if_no_pending_records(data.path(), |exempt, proven| {
+            x0x::upgrade::sweep_stale_upgrade_artifacts_proven(
                 dir.path(),
                 std::time::Duration::ZERO,
                 exempt,
+                proven,
             )
         }),
         2
@@ -295,11 +298,12 @@ fn legacy_only_handoff_allows_unrelated_cleanup_and_preserves_its_files() {
         std::fs::write(&record, &bytes).unwrap();
 
         // A zero minimum age makes the fixtures eligible without sleeps.
-        let removed = journal::sweep_if_no_pending_records(data.path(), |exempt| {
-            x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+        let removed = journal::sweep_if_no_pending_records(data.path(), |exempt, proven| {
+            x0x::upgrade::sweep_stale_upgrade_artifacts_proven(
                 install.path(),
                 std::time::Duration::ZERO,
                 exempt,
+                proven,
             )
         });
 
@@ -360,11 +364,12 @@ fn legacy_handoff_referencing_a_cleanup_pattern_keeps_its_recovery_bytes() {
         let record = data.path().join(journal::HANDOFF_FILE_NAME);
         std::fs::write(&record, &bytes).unwrap();
 
-        journal::sweep_if_no_pending_records(data.path(), |exempt| {
-            x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+        journal::sweep_if_no_pending_records(data.path(), |exempt, proven| {
+            x0x::upgrade::sweep_stale_upgrade_artifacts_proven(
                 install.path(),
                 std::time::Duration::ZERO,
                 exempt,
+                proven,
             )
         });
 
@@ -380,14 +385,20 @@ fn legacy_handoff_referencing_a_cleanup_pattern_keeps_its_recovery_bytes() {
     }
 }
 
-/// #1106 review round 5: a persistent supervised-exit record names a
-/// per-swap backup and is only replaced by a later transaction, so a
-/// whole-sweep hold for its `.backup-` reference stopped all cleanup on
-/// supervised hosts forever. The sweep must still reclaim unrelated debris
-/// while sparing the record's own target and backup paths.
+/// #1106, engineer ruling 3 Nov 12:48 GMT. Two properties at once:
+///
+/// 1. A persistent supervised-exit record names a per-swap backup and is
+///    only replaced by a later transaction, so a whole-sweep hold for its
+///    `.backup-` reference stopped all cleanup on supervised hosts forever
+///    (review round 5). The sweep must still reclaim unrelated debris while
+///    sparing the record's own target and backup paths.
+/// 2. A per-swap backup is reclaimed only when the instance's own data-dir
+///    ledger proves it created it — a sibling instance's aged backup in the
+///    shared install directory is never provable from here and is never
+///    deleted; hold back when unsure.
 #[cfg(unix)]
 #[test]
-fn legacy_handoff_with_per_swap_backup_still_sweeps_unrelated_debris() {
+fn legacy_handoff_with_per_swap_backup_still_sweeps_but_never_unproven_files() {
     let install = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();
     let mut handoff = legacy_handoff(install.path(), "0.48.2");
@@ -399,26 +410,41 @@ fn legacy_handoff_with_per_swap_backup_still_sweeps_unrelated_debris() {
     let staged = install.path().join(".x0x-upgrade-unrelated");
     std::fs::create_dir(&staged).unwrap();
     std::fs::write(staged.join("candidate"), b"unrelated stage").unwrap();
-    let stale_swap = install.path().join("x0xd.backup-9.9.9-1-2");
-    std::fs::write(&stale_swap, b"older transaction").unwrap();
+    // This instance created and ledgered this one in an earlier transaction.
+    let ledgered_swap = install.path().join("x0xd.backup-9.9.9-1-2");
+    std::fs::write(&ledgered_swap, b"my older transaction").unwrap();
+    // A sibling instance's backup: same directory, not in this data dir's
+    // ledger, however old it is.
+    let sibling_swap = install.path().join("x0xd.backup-8.8.8-3-4");
+    std::fs::write(&sibling_swap, b"another instance's rollback").unwrap();
+    journal::append_backup_ledger(data.path(), &ledgered_swap).unwrap();
+    assert!(
+        journal::read_backup_ledger(data.path()).contains(&ledgered_swap.canonicalize().unwrap()),
+        "ledger entries are stored canonicalised"
+    );
     let bytes = serde_json::to_vec(&handoff).unwrap();
     let record = data.path().join(journal::HANDOFF_FILE_NAME);
     std::fs::write(&record, &bytes).unwrap();
 
-    let removed = journal::sweep_if_no_pending_records(data.path(), |exempt| {
-        x0x::upgrade::sweep_stale_upgrade_artifacts_excluding(
+    let removed = journal::sweep_if_no_pending_records(data.path(), |exempt, proven| {
+        x0x::upgrade::sweep_stale_upgrade_artifacts_proven(
             install.path(),
             std::time::Duration::ZERO,
             exempt,
+            proven,
         )
     });
 
     assert_eq!(
         removed, 2,
-        "the unrelated staged dir and the unreferenced per-swap backup must go"
+        "the unrelated staged dir and the ledgered per-swap backup must go"
     );
     assert!(!staged.exists());
-    assert!(!stale_swap.exists());
+    assert!(!ledgered_swap.exists());
+    assert!(
+        sibling_swap.exists(),
+        "a file this instance cannot prove it created is never deleted, however old"
+    );
     assert_eq!(std::fs::read(&record).unwrap(), bytes);
     assert_eq!(
         std::fs::read(&handoff.backup_path).unwrap(),
