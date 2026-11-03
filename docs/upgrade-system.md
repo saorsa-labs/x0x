@@ -950,7 +950,10 @@ no gossip, binds nothing, and takes no instance lock.
    process. A failed publication retries on the next heartbeat. Payloads this
    process already published — post-restart broadcast, fallback poll or an
    earlier heartbeat — are skipped, and the release is queued through the
-   shared background apply owner. Without this observer, a long-running node
+   shared background apply owner. Checks start at a per-machine jitter and
+   back off exponentially (up to one hour) while the feed errors, so nodes
+   behind one IP do not spend GitHub's unauthenticated request limit in
+   bursts. Without this observer, a long-running node
    stays silent until its own poll fires, hours after a publish.
 5. **Authenticated HTTP apply**: Verify the release and wait for staging, then
    recheck admission under the install lock before replacement. The CLI

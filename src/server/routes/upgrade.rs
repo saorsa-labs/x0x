@@ -52,6 +52,12 @@ const RELEASE_ANNOUNCE_INTERVAL: Duration =
 /// manifest with a fresh gossip message ID forever.
 const MAX_RELEASE_PUBLISH_ATTEMPTS: u8 = 3;
 
+/// Upper bound on the exponential check backoff, in heartbeat ticks
+/// (6 x 600 s = one hour). During a sustained feed outage — including a 403
+/// from a shared unauthenticated GitHub rate limit — the observer settles at
+/// one check per hour per node instead of six.
+const MAX_RELEASE_CHECK_BACKOFF_TICKS: u32 = 6;
+
 #[derive(Debug, Default)]
 pub(in crate::server) struct SelfPublishedReleaseManifests {
     published_at: HashMap<[u8; 32], Instant>,
@@ -1329,8 +1335,22 @@ async fn run_release_announce_poll(
     config: DaemonUpdateConfig,
     submit: Option<BackgroundSubmit>,
     self_published: Arc<Mutex<SelfPublishedReleaseManifests>>,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
+    // De-phase nodes before the first check: nodes behind one IP share
+    // GitHub's unauthenticated rate limit, so a synchronized fleet-wide
+    // tick would spend it in bursts. Stable per machine, bounded by one
+    // heartbeat; the announcement still leaves within two heartbeats.
+    let jitter = {
+        let digest = Sha256::digest(agent.machine_id().as_bytes());
+        let nanos = u64::from_be_bytes(digest[..8].try_into().expect("digest prefix"))
+            % RELEASE_ANNOUNCE_INTERVAL.as_nanos() as u64;
+        Duration::from_nanos(nanos)
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(jitter) => {}
+        _ = shutdown.changed() => return,
+    }
     let mut ticker = tokio::time::interval(RELEASE_ANNOUNCE_INTERVAL);
     // A stalled runtime must not fire a burst of catch-up release checks.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1383,6 +1403,10 @@ async fn run_release_announce_driver<S, Check, CheckFuture, Publish, PublishFutu
     // must not re-flood the topic with the same manifest.
     let mut announced: HashSet<String> = HashSet::new();
     let mut publish_attempts: HashMap<String, u8> = HashMap::new();
+    // Consecutive feed errors skip 1, 2, 4 ... ticks (capped at one hour):
+    // a sustained outage must not keep the loop checking at heartbeat cadence.
+    let mut consecutive_errors: u32 = 0;
+    let mut ticks_to_skip: u32 = 0;
     futures::pin_mut!(ticks);
     loop {
         if *shutdown.borrow() || shutdown.has_changed().is_err() {
@@ -1392,20 +1416,33 @@ async fn run_release_announce_driver<S, Check, CheckFuture, Publish, PublishFutu
             tick = ticks.next() => if tick.is_none() { return; },
             _ = shutdown.changed() => return,
         }
+        if ticks_to_skip > 0 {
+            ticks_to_skip -= 1;
+            continue;
+        }
         let checked = tokio::select! {
             result = check() => result,
             _ = shutdown.changed() => return,
         };
         let verified = match checked {
             Ok(Some(verified)) => verified,
-            Ok(None) => continue,
+            Ok(None) => {
+                consecutive_errors = 0;
+                continue;
+            }
             Err(error) => {
                 // debug, not warn: at heartbeat cadence a GitHub outage would
-                // flood warnings; the fallback poll keeps the warn-level signal.
+                // flood warnings; the fallback poll keeps the warn-level
+                // signal. The backoff below also covers a 403 from a shared
+                // unauthenticated GitHub rate limit.
                 tracing::debug!(%error, "Heartbeat release check failed");
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                ticks_to_skip =
+                    (1_u32 << (consecutive_errors - 1).min(3)).min(MAX_RELEASE_CHECK_BACKOFF_TICKS);
                 continue;
             }
         };
+        consecutive_errors = 0;
         if x0x::upgrade::monitor::validate_manifest_timestamp(&verified.manifest).is_err() {
             continue;
         }
@@ -2743,7 +2780,9 @@ mod tests {
         // the release topic within one heartbeat, and a subscribed peer's
         // gossip driver reacts within two heartbeats of publication.
         // Simulated network only: the two drivers are wired by a channel.
-        let verified = verified_release_with_version(&version_newer_than_current());
+        let verified = verified_release_for_current_platform(&version_newer_than_current());
+        let expected_version = verified.manifest.version.clone();
+        let queued = Arc::new(std::sync::Mutex::new(Vec::new()));
         let start = tokio::time::Instant::now();
         let (announce_tx, announce_rx) = mpsc::channel::<Vec<u8>>(8);
         let (relayed_tx, mut relayed_rx) = mpsc::channel::<tokio::time::Instant>(1);
@@ -2791,9 +2830,16 @@ mod tests {
             }
         });
         let (_keep_running, relayer_shutdown) = watch::channel(false);
+        let record = Arc::clone(&queued);
+        let relayer_submit = BackgroundSubmit {
+            processed: Some(Arc::new(move |version, outcome| {
+                record.lock().unwrap().push((version, outcome))
+            })),
+            ..Default::default()
+        };
         let relayer = run_gossip_update_driver(
             releases,
-            None,
+            Some(relayer_submit),
             Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
             move |_| {
                 let _ = relayed_tx.try_send(tokio::time::Instant::now());
@@ -2812,6 +2858,43 @@ mod tests {
         assert!(
             peer_reacted_at.duration_since(start) < 2 * RELEASE_ANNOUNCE_INTERVAL,
             "a subscribed peer reacted within two heartbeat cycles"
+        );
+        assert_eq!(
+            queued.lock().unwrap().as_slice(),
+            &[(expected_version, SubmitOutcome::Accepted)],
+            "the subscribed peer started its own update check from the announcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_announce_driver_backs_off_check_errors_exponentially() {
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::clone(&checks);
+        let (_keep_running, shutdown) = watch::channel(false);
+        run_release_announce_driver(
+            futures::stream::iter([(), (), (), (), (), (), (), (), (), ()]),
+            move || {
+                let call = counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if call < 2 {
+                        Err(x0x::upgrade::UpgradeError::Other("rate limited".into()))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            },
+            None,
+            Arc::new(Mutex::new(SelfPublishedReleaseManifests::default())),
+            |_| async { Ok(()) },
+            shutdown,
+        )
+        .await;
+        // Call 1 fails: skip 1 tick. Call 2 fails: skip 2 ticks. Then the
+        // feed is quiet again, so every remaining tick checks.
+        assert_eq!(
+            checks.load(std::sync::atomic::Ordering::SeqCst),
+            7,
+            "10 ticks, 3 skipped by the 1-then-2 backoff"
         );
     }
 
