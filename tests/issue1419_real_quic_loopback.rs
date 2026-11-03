@@ -149,18 +149,23 @@ async fn one_sided_torn_loopback_link_probe_receipt() {
              without ant-quic#332"
         ),
         Err(error) => {
-            // The receipt the PR body cites: the holding end sees an
-            // error naming the link — a timeout or a closed connection,
-            // the two classes x0x's probe classifier confirms — or, once
-            // the CONNECTION_CLOSE is processed and the peer leaves the
-            // table, PeerNotFound, which the classifier treats as
-            // inconclusive. Which one arrives is a race on loopback, so
-            // the receipt pins the classifier's meaning for the class it
-            // saw, not the class itself.
+            // The receipt the PR body cites: the holding end sees one of
+            // three classes on a torn real link. x0x's classifier
+            // confirms only a `ProbeTimeout`, or a `ConnectionClosed`
+            // whose reason is `Superseded` or `LifecycleCleanup`; this
+            // file calls ant-quic directly, so the receipt records the
+            // class and its classifier meaning. Which class arrives is a
+            // race on loopback once the CONNECTION_CLOSE is processed,
+            // so the receipt pins the meaning, not the class.
             match error {
-                ant_quic::EndpointError::ProbeTimeout
-                | ant_quic::EndpointError::ConnectionClosed { .. } => {
-                    // Names the link: the classifier confirms it broken.
+                ant_quic::EndpointError::ProbeTimeout => {
+                    // Confirms: the classifier degrades the link.
+                }
+                ant_quic::EndpointError::ConnectionClosed { reason } => {
+                    // Confirms only when the transport superseded the
+                    // connection or cleaned up its lifecycle; a clean
+                    // close by the peer does not confirm.
+                    let _ = reason;
                 }
                 ant_quic::EndpointError::PeerNotFound(_) => {
                     // The close is processed and the peer left the table.

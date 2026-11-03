@@ -328,7 +328,7 @@ const PRE_SEND_RECONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// The peer is one-sided when this direction is stale and the other
 /// direction on that same peer is still within [`ONE_SIDED_FLOWING`].
-/// ant-quic 0.27.60 records application data only, so a quiet peer can
+/// ant-quic 0.27.61 records application data only, so a quiet peer can
 /// show a large age on both directions. Such a peer is a liveness-probe
 /// candidate in [`NetworkNode::resolve_one_sided_peers`] while other
 /// sampled peers have traffic; the probe, not the age, decides.
@@ -462,19 +462,16 @@ pub(crate) fn both_stale_candidate_indexes(
         .collect()
 }
 
-/// Whether a one-sided sample shape was made by this node's own probe
-/// (#1419).
-///
-/// ant-quic 0.27.61 records the probe envelope's send as peer activity.
-/// A probe on a both-directions-stale peer then leaves `sent` fresh and
-/// `received` stale, which is exactly the immediate rule's shape. While
-/// the probe cooldown is live, that shape is this node's own send, not
-/// peer traffic, so the immediate rule must not act on it: an
-/// inconclusive probe must not degrade or re-dial through the back door,
-/// and a confirming probe keeps its own verdict window.
 /// Whether a sample's one-sided shape was made by this node's own probe
 /// send (#1419): the probe ran inside the redial window, the send
 /// direction is fresh and the receive direction is stale.
+///
+/// ant-quic records the probe envelope's send as peer activity, which is
+/// exactly the immediate rule's shape. While the probe cooldown is live,
+/// that shape is this node's own send, not peer traffic, so the
+/// immediate rule must not act on it: an inconclusive probe must not
+/// degrade or re-dial through the back door, and a confirming probe
+/// keeps its own verdict window.
 ///
 /// Accepted limit: after an inconclusive probe, that send stamp can hide
 /// a real one-sided shape for up to the rest of the 60 s window, because
@@ -534,6 +531,17 @@ fn order_one_sided_probes(to_probe: &mut [AntPeerId], probe_ats: &HashMap<AntPee
 /// support are inconclusive. An inconclusive peer is neither degraded
 /// nor re-dialled on that evidence; the probe runs again after the
 /// window.
+/// A pre-send liveness probe error that is no evidence the link is dead
+/// (#1419). Such an outcome must not refresh the connection: the send
+/// itself decides. Only `ProbeOverBudget` qualifies — the 31 Oct ruling:
+/// a busy endpoint is no evidence.
+fn pre_send_probe_error_is_inconclusive(error: &ant_quic::NodeError) -> bool {
+    matches!(
+        error,
+        ant_quic::NodeError::Endpoint(ant_quic::EndpointError::ProbeOverBudget)
+    )
+}
+
 fn one_sided_probe_confirms_broken(error: &ant_quic::NodeError) -> bool {
     matches!(
         error,
@@ -660,7 +668,12 @@ fn plan_one_sided_repairs(
     });
     let mut peers = immediate_one_sided_peer_ids(samples, map, now);
     peers.extend(samples.iter().filter_map(|sample| {
-        if !sample.age.both_directions_stale() {
+        // A failed probe's own send stamp can mask the
+        // both-directions-stale shape for up to its window. The receive
+        // direction cannot be made fresh by this node's own probe, so a
+        // stale receive with a live confirmation keeps the peer planned
+        // (#1419).
+        if !sample.age.both_directions_stale() && !direction_stale(sample.age.received_ago) {
             return None;
         }
         let entry = map.get(&sample.peer)?;
@@ -3840,14 +3853,18 @@ impl NetworkNode {
             degraded = immediate_one_sided_peer_ids(samples, &map, now);
             for (index, sample) in samples.iter().enumerate() {
                 if !sample.age.both_directions_stale() {
-                    // A probe that timed out stamps its own send, so the
-                    // peer looks one-sided on the next tick. A live
-                    // confirmation still degrades it (#1419).
-                    let probe_masked = map.get(&sample.peer).is_some_and(|entry| {
-                        confirmed_inside_window(entry, now)
-                            && probe_made_one_sided(sample, entry, now)
-                    });
-                    if probe_masked {
+                    // A failed probe stamps its own send, so the peer
+                    // looks one-sided — and, as that stamp ages past the
+                    // flowing bound, like neither shape — until it goes
+                    // stale again. The receive direction cannot be made
+                    // fresh by this node's own probe, so a stale receive
+                    // with a live confirmation still degrades (#1419).
+                    let confirmation_behind_probe_send =
+                        map.get(&sample.peer).is_some_and(|entry| {
+                            confirmed_inside_window(entry, now)
+                                && direction_stale(sample.age.received_ago)
+                        });
+                    if confirmation_behind_probe_send {
                         degraded.push(sample.peer);
                     }
                     continue;
@@ -4802,10 +4819,7 @@ impl NetworkNode {
                     return Ok(());
                 }
                 Some(Err(e)) => {
-                    if matches!(
-                        e,
-                        ant_quic::NodeError::Endpoint(ant_quic::EndpointError::ProbeOverBudget)
-                    ) {
+                    if pre_send_probe_error_is_inconclusive(&e) {
                         // A busy endpoint is no evidence the link is dead
                         // (31 Oct ruling: `ProbeOverBudget` is no
                         // evidence). The send itself decides.
@@ -8837,7 +8851,7 @@ fn plane_note_closed_in(
 ///
 /// Residual (partial fix, David D281; finish in 0.49 with ant-quic#330):
 /// the drain fences a winner change only after ant-quic has queued its
-/// `Replaced`. In ant-quic 0.27.60, B can supersede A (A stays open as a
+/// `Replaced`. In ant-quic 0.27.61, B can supersede A (A stays open as a
 /// fallback), then B can close and ant-quic can restore A with the same
 /// generation, all before B's outer registration publishes `Replaced`.
 /// That registration waits for reader setup and for the connected-peer and
@@ -10500,7 +10514,7 @@ mod tests {
     /// Live-period epoch: this case FAILS with the current fix.
     ///
     /// A→B→restore A, but B's outer registration has not published
-    /// `Replaced` when the gate reads (ant-quic 0.27.60 does not bound that
+    /// `Replaced` when the gate reads (ant-quic 0.27.61 does not bound that
     /// wait). The gate has no event to drain, so a clock from A's earlier
     /// Live period admits the restored A. To enable: bind the grace to the
     /// ant-quic Live-period epoch, then remove `#[ignore]`.
@@ -11258,6 +11272,26 @@ mod tests {
     fn both_stale_probe_failure_is_classified_by_cause() {
         use ant_quic::EndpointError;
         let confirms = |error: ant_quic::NodeError| one_sided_probe_confirms_broken(&error);
+        let pre_send_inconclusive =
+            |error: ant_quic::NodeError| pre_send_probe_error_is_inconclusive(&error);
+        assert!(
+            pre_send_inconclusive(ant_quic::NodeError::Endpoint(
+                EndpointError::ProbeOverBudget
+            )),
+            "a busy endpoint must not refresh the connection"
+        );
+        assert!(
+            !pre_send_inconclusive(ant_quic::NodeError::Endpoint(EndpointError::ProbeTimeout)),
+            "a timeout still refreshes"
+        );
+        assert!(
+            !pre_send_inconclusive(ant_quic::NodeError::Endpoint(
+                EndpointError::ConnectionClosed {
+                    reason: ant_quic::ConnectionCloseReason::Superseded
+                }
+            )),
+            "a closed connection still refreshes"
+        );
         assert!(confirms(ant_quic::NodeError::Endpoint(
             EndpointError::ProbeTimeout
         )));
@@ -12129,19 +12163,45 @@ mod tests {
             probes_after_confirm,
             "the masked shape is not probed again inside the cooldown"
         );
+
+        // The probe send age between the flowing and stale bounds —
+        // neither one-sided nor both-directions-stale — must not open a
+        // gap either: a stale receive with a live confirmation still
+        // degrades.
+        let mid_age = [LinkAgeSample {
+            peer: peer_b,
+            age: LinkTrafficAge {
+                sent_ago: Some(Duration::from_secs(30)),
+                received_ago: Some(Duration::from_secs(90)),
+            },
+        }];
+        let still_mid = a.resolve_one_sided_peers(&mid_age).await;
+        assert_eq!(
+            still_mid,
+            vec![peer_b],
+            "a live confirmation stays degraded while the probe send ages between the bounds"
+        );
+
+        // The masked shape is planned, not just listed: the episode
+        // warns once and the re-dial spends the verdict.
         a.repair_one_sided_links(&masked).await;
+        assert_eq!(
+            a.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "the masked shape plans the re-dial"
+        );
+        assert_eq!(
+            a.one_sided_warnings.load(Ordering::Relaxed),
+            1,
+            "one WARN for the episode"
+        );
         {
             let repairs = a.one_sided_repairs.lock().unwrap();
             assert!(
-                repairs[&peer_b].both_stale_confirmed,
-                "a probe-made one-sided shape does not spend the verdict"
+                !repairs[&peer_b].both_stale_confirmed,
+                "the re-dial spends the verdict"
             );
         }
-
-        // A both-directions-stale sample inside the window — the probe
-        // send cannot keep its stamp fresh for long on the real clock —
-        // plans the kept verdict: one WARN, and the second pass stays
-        // silent.
         let both_stale = [LinkAgeSample {
             peer: peer_b,
             age: LinkTrafficAge {
@@ -12151,15 +12211,20 @@ mod tests {
         }];
         a.repair_one_sided_links(&both_stale).await;
         assert_eq!(
+            a.one_sided_redials.load(Ordering::Relaxed),
+            1,
+            "the spent verdict and the backoff hold further dials"
+        );
+        assert_eq!(
             a.one_sided_warnings.load(Ordering::Relaxed),
             1,
-            "one WARN when the kept verdict plans on a both-directions-stale sample"
+            "the spent verdict does not re-arm the WARN"
         );
         a.repair_one_sided_links(&both_stale).await;
         assert_eq!(
             a.one_sided_warnings.load(Ordering::Relaxed),
             1,
-            "the kept verdict does not re-arm the WARN"
+            "a second pass stays silent"
         );
 
         a.try_shutdown().await.unwrap();
@@ -12209,6 +12274,77 @@ mod tests {
             !finished.load(Ordering::Relaxed),
             "the late flight was aborted before it could finish"
         );
+    }
+
+    /// #1419: the per-tick probe budget counts flights still running
+    /// from earlier ticks. Two stalled flights leave no budget for new
+    /// probes, so a stalled probe cannot stack new probes behind it and
+    /// squeeze other probe callers out of ant-quic's endpoint budget.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn issue1419_stalled_flights_reduce_the_next_tick_budget() {
+        let plane = "issue1419-flight-budget";
+        let fabric = sim::SimFabric::new(1419);
+        sim::register(plane, &fabric);
+        let node = NetworkNode::new(
+            NetworkConfig {
+                bind_addr: Some(SocketAddr::from(([198, 18, 0, 1], 5483))),
+                network_id: Some(plane.to_string()),
+                bootstrap_nodes: Vec::new(),
+                mdns_enabled: false,
+                port_mapping_enabled: false,
+                ..NetworkConfig::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        node.pause_one_sided_probe_for_test(ONE_SIDED_PROBE_OUTER_TIMEOUT + Duration::from_secs(1));
+        let quiet = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(90)),
+            received_ago: Some(Duration::from_secs(90)),
+        };
+        let fresh = LinkTrafficAge {
+            sent_ago: Some(Duration::from_secs(1)),
+            received_ago: Some(Duration::from_secs(1)),
+        };
+        let samples = [
+            LinkAgeSample {
+                peer: test_ant_peer(8),
+                age: fresh,
+            },
+            LinkAgeSample {
+                peer: test_ant_peer(2),
+                age: quiet,
+            },
+            LinkAgeSample {
+                peer: test_ant_peer(3),
+                age: quiet,
+            },
+            LinkAgeSample {
+                peer: test_ant_peer(4),
+                age: quiet,
+            },
+        ];
+        let before = node.one_sided_probes.load(Ordering::Relaxed);
+        node.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            node.one_sided_probes.load(Ordering::Relaxed) - before,
+            ONE_SIDED_PROBES_PER_TICK as u32,
+            "the first tick starts its two probes"
+        );
+        assert_eq!(
+            node.live_one_sided_probe_flights(),
+            ONE_SIDED_PROBES_PER_TICK,
+            "both flights are still live past their outer bound"
+        );
+        node.resolve_one_sided_peers(&samples).await;
+        assert_eq!(
+            node.one_sided_probes.load(Ordering::Relaxed) - before,
+            ONE_SIDED_PROBES_PER_TICK as u32,
+            "stalled flights leave no probe budget for the next tick"
+        );
+        node.try_shutdown().await.unwrap();
     }
 
     /// #1419: one health tick probes at most two both-stale candidates,
