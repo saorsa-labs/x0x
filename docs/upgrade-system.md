@@ -940,7 +940,19 @@ no gossip, binds nothing, and takes no instance lock.
 1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
 2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
-4. **Authenticated HTTP apply**: Verify the release and wait for staging, then
+4. **Heartbeat release observer** (#1169): re-check the release feed on the
+   identity heartbeat cadence (`IDENTITY_HEARTBEAT_INTERVAL_SECS`, 600 s
+   default) and announce
+   each newer signed manifest on the release topic the first time this process
+   observes it. The observer shares the fallback poll task, so it is gated the
+   same way: self-update enabled, `[update]` enabled and
+   `fallback_check_interval_minutes > 0`. Each version is announced once per
+   process. A failed publication retries on the next heartbeat. Payloads this
+   process already published — post-restart broadcast, fallback poll or an
+   earlier heartbeat — are skipped, and the release is queued through the
+   shared background apply owner. Without this observer, a long-running node
+   stays silent until its own poll fires, hours after a publish.
+5. **Authenticated HTTP apply**: Verify the release and wait for staging, then
    recheck admission under the install lock before replacement. The CLI
    `upgrade --apply` uses this route; `--now` skips only the staging delay.
 
@@ -951,8 +963,9 @@ durable hold.
 
 `x0xd --skip-update-check` disables self-update for that process invocation. It
 suppresses the startup GitHub check, gossip-delivered apply, manifest broadcast,
-fallback polling, and manual `/upgrade/apply`. The setting is not persisted;
-launching the daemon normally later restores the configured updater behavior.
+fallback polling with its heartbeat release announcements, and manual
+`/upgrade/apply`. The setting is not persisted; launching the daemon normally
+later restores the configured updater behavior.
 
 All nodes verify and rebroadcast manifests (symmetric propagation — no privileged bootstrap role).
 
