@@ -207,6 +207,12 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     })
     .await?;
     receipt.evidence("a_seats_b_over_the_topic_mesh", true, b.clone(), at(sim));
+    receipt.request_delivered(
+        "b_join_volley_reaches_a_over_the_topic_mesh",
+        true,
+        "A seated B, so the join volley arrived although B holds no binding for A",
+        at(sim),
+    );
     sim.fabric().mark("checkpoint: A seated B");
 
     // The step that never completes on main: B's own seat installs only
@@ -215,10 +221,26 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     // only surfaces its recipient_undiscovered after the DM ladder's
     // internal retries (~100 s here), then the targeted refresh lands the
     // binding and the next retry delivers.
-    sim.until("B reports active membership", secs(180), async |s: &Sim| {
-        local_membership(s, "B", &group).await.as_deref() == Some("active")
-    })
-    .await?;
+    let b_active = sim
+        .until("B reports active membership", secs(180), async |s: &Sim| {
+            local_membership(s, "B", &group).await.as_deref() == Some("active")
+        })
+        .await
+        .is_ok();
+    if !b_active {
+        // The defect, observed: record it as the expected cause so the
+        // verdict is RED (bug reproduced), not INFRA (harness failure).
+        // No API read here: the apply that waits for the Welcome holds
+        // the group membership lock, so a GET would block on it.
+        receipt.cause(
+            "welcome_fetch_never_completes_for_the_fresh_joiner",
+            Some("B never reported active membership inside the 180 s budget".to_string()),
+            true,
+            at(sim),
+        );
+        receipt.finish(CASE, false, at(sim));
+        return Ok(());
+    }
     receipt.evidence(
         "b_fetches_the_welcome_and_activates",
         true,

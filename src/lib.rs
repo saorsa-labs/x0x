@@ -7786,9 +7786,17 @@ async fn run_strict_capability_refresh(
     let ready = || {
         let binding = capability_store.lookup_binding(&recipient);
         // #1776: a flight with neither a durable-ack nor an application-bit
-        // requirement still has one — the binding itself. Without this
-        // conjunct such a flight would return before publishing anything.
-        binding.is_some()
+        // requirement still has one — a binding the gossip-inbox DM leg can
+        // actually use. A weaker conjunct would let such a flight return
+        // before publishing anything, so a stale or partial binding (no
+        // gossip inbox, empty KEM key, zeroed machine) would satisfy it.
+        let binding_usable_for_gossip = binding.as_ref().is_some_and(|binding| {
+            binding.machine_id.0 != [0; 32]
+                && binding.capabilities.gossip_inbox
+                && !binding.capabilities.kem_public_key.is_empty()
+        });
+        (require_durable_ack || required_application.is_some() || binding_usable_for_gossip)
+            && binding.is_some()
             && (!require_durable_ack || capability_binding_supports_durable_ack(binding.as_ref()))
             && required_application.is_none_or(|bit| {
                 binding.as_ref().is_some_and(|binding| {
@@ -11957,8 +11965,10 @@ impl Agent {
     /// current advert lacks the payload's application bit (ADR 0093), and
     /// when a caller holds no binding for the recipient at all and only
     /// needs any binding to become addressable (#1776). The recipient gets
-    /// one chance to answer before the gate refuses. Concurrent sends to
-    /// the same recipient share a single flight.
+    /// one chance to answer before the caller proceeds unaided — the strict
+    /// gate's refusal (ADR 0030 §2), or the next blind retry of a send that
+    /// cannot address it (#1776). Concurrent sends to the same recipient
+    /// share a single flight.
     async fn refresh_strict_dm_capability(
         &self,
         recipient: identity::AgentId,
@@ -17531,15 +17541,16 @@ impl Agent {
     }
 
     /// #1776: ask `recipient` to republish its signed capability advert and
-    /// wait a bounded time for any binding at all — no application bit, no
-    /// durable-ACK support. A fresh joiner whose only path to an authority
-    /// runs over the gossip mesh joined after that authority's last advert
-    /// beat holds no binding for it (adverts ride a 600 s cadence and are
-    /// not replayed onto meshes joined later), so every direct send dies on
-    /// the raw-QUIC `AgentNotFound` path. The targeted request travels on
-    /// the same control topics the mesh already carries, giving the
-    /// gossip-inbox DM leg its KEM material. Concurrent callers share one
-    /// flight; the per-recipient cooldown bounds repeat requests.
+    /// wait a bounded time for a binding the gossip-inbox DM leg can use —
+    /// no application bit, no durable-ACK support. A fresh joiner whose
+    /// only path to an authority runs over the gossip mesh joined after
+    /// that authority's last advert beat holds no binding for it (adverts
+    /// ride a 600 s cadence and are not replayed onto meshes joined
+    /// later), so every direct send dies on the raw-QUIC `AgentNotFound`
+    /// path. The targeted request travels on the same control topics the
+    /// mesh already carries, giving the gossip-inbox DM leg its KEM
+    /// material. Concurrent callers share one flight; the per-recipient
+    /// cooldown bounds repeat requests.
     pub(crate) async fn refresh_dm_capability_binding(&self, recipient: identity::AgentId) {
         self.refresh_strict_dm_capability(recipient, None, false)
             .await;
