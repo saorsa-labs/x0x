@@ -1006,6 +1006,8 @@ jobs:
           --expect w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node=GREEN
           --require w3h_1356_control_s3_d3_authorisation_refusals_typed
           --expect w3h_1356_control_s3_d3_authorisation_refusals_typed=GREEN
+          --require w3h_1356_control_s3_d2_fork_exposure_contained
+          --expect w3h_1356_control_s3_d2_fork_exposure_contained=GREEN
           --require w3h_1666_control_certificate_only_admin_seals
           --expect w3h_1666_control_certificate_only_admin_seals=GREEN
           --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
