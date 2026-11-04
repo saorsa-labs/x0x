@@ -50348,9 +50348,15 @@ async fn poll_join_result_until_membership_confirmed(
             // advert whenever the poll cannot address it, and the next
             // fetch rides the gossip-inbox leg instead of grinding. The
             // flight registry and per-recipient cooldown bound repeat
-            // requests while the window lasts.
+            // requests while the window lasts. The request is detached, not
+            // awaited: its convergence wait (up to 3 s) must not stretch the
+            // poll past its own window, and the next fetch needs only the
+            // binding, not this caller's wait.
             if !state.agent.holds_gossip_usable_dm_binding(&inviter) {
-                state.agent.refresh_dm_capability_binding(inviter).await;
+                let agent = Arc::clone(&state.agent);
+                tokio::spawn(async move {
+                    agent.refresh_dm_capability_binding(inviter).await;
+                });
             }
             tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
             tracing::debug!(
@@ -50622,7 +50628,9 @@ async fn send_welcome_fetch_request(
     // #1776, reactive: the same structural gap can surface as either
     // variant — `RecipientUndiscovered` from the fast `AgentNotFound`
     // path, or `Timeout` after the send's absolute budget burned — and
-    // the repair must not depend on which one this interleaving produced.
+    // the repair must not depend on which one this interleaving produced,
+    // so it keys on the binding alone. A usable binding means the request
+    // would publish nothing, so it is not sent.
     // Whenever the failed send leaves the authority still unaddressable,
     // ask for its advert; the retry schedule above re-sends once the
     // binding lands. The request is detached, not awaited: the metadata
@@ -50631,9 +50639,7 @@ async fn send_welcome_fetch_request(
     // Only the proactive wait above stays on the lock (at most
     // `CAPABILITY_REFRESH_CONVERGENCE_WAIT` per attempt), because it
     // replaces a doomed send that would hold the lock far longer.
-    if matches!(error, x0x::dm::DmError::RecipientUndiscovered(_))
-        || !state.agent.holds_gossip_usable_dm_binding(agent_id)
-    {
+    if !state.agent.holds_gossip_usable_dm_binding(agent_id) {
         let agent = Arc::clone(&state.agent);
         let recipient = *agent_id;
         tokio::spawn(async move {

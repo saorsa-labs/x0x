@@ -7743,6 +7743,7 @@ impl CapabilityRefreshRegistry {
             registry: std::sync::Arc::clone(self),
             key,
             flight_id,
+            published: false,
         };
         let handle = tokio::spawn(worker(guard, completion_tx));
         if let Some(entry) = state.inflight.get_mut(&key) {
@@ -7775,7 +7776,7 @@ impl CapabilityRefreshRegistry {
         let _results = futures::future::join_all(handles).await;
     }
 
-    fn remove(&self, key: &CapabilityRefreshKey, flight_id: u64) {
+    fn remove(&self, key: &CapabilityRefreshKey, flight_id: u64, published: bool) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -7789,7 +7790,7 @@ impl CapabilityRefreshRegistry {
             // stamps that can never gate again (bounded memory on
             // long-lived daemons with churny recipient sets). Runs before
             // the insert below, so the fresh stamp is never a candidate.
-            if state.cooldown > std::time::Duration::ZERO {
+            if published && state.cooldown > std::time::Duration::ZERO {
                 let cooldown = state.cooldown;
                 state
                     .last_finished
@@ -7814,11 +7815,16 @@ struct CapabilityRefreshGuard {
     registry: std::sync::Arc<CapabilityRefreshRegistry>,
     key: CapabilityRefreshKey,
     flight_id: u64,
+    /// Set once the flight published its targeted request. Only such a
+    /// flight starts the cooldown (#1776): a flight that was ready at once
+    /// asked nothing, so it must not refuse a later caller its request.
+    published: bool,
 }
 
 impl Drop for CapabilityRefreshGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.key, self.flight_id);
+        self.registry
+            .remove(&self.key, self.flight_id, self.published);
     }
 }
 
@@ -7828,6 +7834,9 @@ impl Drop for CapabilityRefreshGuard {
 /// ADR 0030 §2 specifies "one forced targeted capability refresh" — a single
 /// publish, not a retry loop. Returning early on a cache hit keeps a strict
 /// send that raced an in-flight advert from paying the full window.
+///
+/// Returns whether the flight reached its publish step, which is what
+/// starts the requester-side cooldown.
 async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
     required_application: Option<u64>,
@@ -7836,7 +7845,7 @@ async fn run_strict_capability_refresh(
     shutdown_token: tokio_util::sync::CancellationToken,
     deadline: tokio::time::Instant,
     publish: impl std::future::Future<Output = error::NetworkResult<()>> + Send,
-) {
+) -> bool {
     let ready = || {
         let binding = capability_store.lookup_binding(&recipient);
         // #1776: a flight with neither a durable-ack nor an application-bit
@@ -7857,7 +7866,7 @@ async fn run_strict_capability_refresh(
             })
     };
     if ready() {
-        return;
+        return false;
     }
 
     let published = tokio::select! {
@@ -7866,7 +7875,7 @@ async fn run_strict_capability_refresh(
         () = shutdown_token.cancelled() => None,
     };
     let Some(published) = published else {
-        return;
+        return true;
     };
     if let Err(error) = published {
         tracing::warn!(
@@ -7879,15 +7888,15 @@ async fn run_strict_capability_refresh(
 
     loop {
         if ready() {
-            return;
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
-            return;
+            return true;
         }
         tokio::select! {
             _ = tokio::time::sleep(CAPABILITY_REFRESH_POLL_INTERVAL) => {}
-            () = tokio::time::sleep_until(deadline) => return,
-            () = shutdown_token.cancelled() => return,
+            () = tokio::time::sleep_until(deadline) => return true,
+            () = shutdown_token.cancelled() => return true,
         }
     }
 }
@@ -12051,8 +12060,8 @@ impl Agent {
         let mut completion = match self.capability_refreshes.register_or_start(
             recipient,
             purpose,
-            move |guard, completion_tx| async move {
-                run_strict_capability_refresh(
+            move |mut guard, completion_tx| async move {
+                guard.published = run_strict_capability_refresh(
                     recipient,
                     required_application,
                     require_durable_ack,
@@ -30049,8 +30058,9 @@ mod tests {
         let make_worker =
             |publishes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
              mut release: tokio::sync::watch::Receiver<bool>| {
-                move |guard: CapabilityRefreshGuard,
+                move |mut guard: CapabilityRefreshGuard,
                   completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = true;
                 publishes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 while !*release.borrow_and_update() {
                     if release.changed().await.is_err() {
@@ -30110,8 +30120,9 @@ mod tests {
     async fn capability_refresh_registry_cooldown_blocks_immediate_reflight() {
         let recipient = identity::AgentId([0x81_u8; 32]);
         let finish_now =
-            |guard: CapabilityRefreshGuard,
+            |mut guard: CapabilityRefreshGuard,
              completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = true;
                 completion_tx.send_replace(CapabilityRefreshState::Finished);
                 drop(guard);
             };
@@ -30196,8 +30207,9 @@ mod tests {
     async fn capability_refresh_addressability_flight_never_holds_back_a_strict_refresh() {
         let recipient = identity::AgentId([0x91_u8; 32]);
         let finish_now =
-            |guard: CapabilityRefreshGuard,
+            |mut guard: CapabilityRefreshGuard,
              completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = true;
                 completion_tx.send_replace(CapabilityRefreshState::Finished);
                 drop(guard);
             };
@@ -30251,8 +30263,9 @@ mod tests {
         // Single flight across purposes.
         let (release_tx, release_rx) = tokio::sync::watch::channel(false);
         let hold = |mut release: tokio::sync::watch::Receiver<bool>| {
-            move |guard: CapabilityRefreshGuard,
+            move |mut guard: CapabilityRefreshGuard,
                   completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = true;
                 while !*release.borrow_and_update() {
                     if release.changed().await.is_err() {
                         break;
@@ -30298,6 +30311,66 @@ mod tests {
         assert_eq!(fresh.len(), 2);
         release_tx.send_replace(true);
         drain(fresh).await;
+    }
+
+    /// #1776 review round 3: only a flight that published its request starts
+    /// the cooldown. A flight that was ready at once asked nothing, so a
+    /// later caller still gets its own request. A published flight's
+    /// cooldown runs on the tokio clock and expires with virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn capability_refresh_cooldown_needs_a_publish_and_expires_on_the_tokio_clock() {
+        let recipient = identity::AgentId([0x94_u8; 32]);
+        let finish = |published: bool| {
+            move |mut guard: CapabilityRefreshGuard,
+                  completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                guard.published = published;
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            }
+        };
+        let registry = std::sync::Arc::new(CapabilityRefreshRegistry::with_cooldown(
+            CAPABILITY_REFRESH_COOLDOWN,
+        ));
+        let drain = |registry: std::sync::Arc<CapabilityRefreshRegistry>| async move {
+            for _ in 0..200 {
+                if registry.len() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(registry.len(), 0, "flight drained");
+        };
+        let purpose = CapabilityRefreshPurpose::Addressability;
+
+        assert!(matches!(
+            registry.register_or_start(recipient, purpose, finish(false)),
+            CapabilityRefreshRegistration::Started(_)
+        ));
+        drain(std::sync::Arc::clone(&registry)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(recipient, purpose, finish(true)),
+                CapabilityRefreshRegistration::Started(_)
+            ),
+            "a flight that published nothing must not start the cooldown"
+        );
+        drain(std::sync::Arc::clone(&registry)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(recipient, purpose, finish(true)),
+                CapabilityRefreshRegistration::Unavailable
+            ),
+            "a published flight starts the cooldown"
+        );
+        tokio::time::advance(CAPABILITY_REFRESH_COOLDOWN + std::time::Duration::from_secs(1)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(recipient, purpose, finish(true)),
+                CapabilityRefreshRegistration::Started(_)
+            ),
+            "the cooldown expires with tokio (virtual) time"
+        );
+        drain(registry).await;
     }
 
     /// #1776 review round 2: the strict-send gate refreshes only for a real
