@@ -3784,6 +3784,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
 | GET | `/diagnostics/relay` | `x0x diagnostics relay` | ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence |
 | GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023), including the ADR-0068 D1 quarantine-pin pair |
+| GET | `/diagnostics/sidecar-quarantine` | `x0x diagnostics sidecar-quarantine` | Read-only list of the ADR 0108 §5a quarantined sidecar copies, with their sizes (D148); see [below](#get-diagnosticssidecar-quarantine) |
 
 The inner-envelope verification fields are independent lock-free samples.
 Derived failure ratios and mean durations are approximate, especially over
@@ -3929,6 +3930,50 @@ Connect-ACL policy summary and allow/deny counters. Counters read `0` until the 
 ```
 
 See `docs/connect-acl.md` for full documentation including the `denial_breakdown` key reference.
+
+### `GET /diagnostics/sidecar-quarantine`
+
+Read-only. The route lists each ADR 0108 §5a quarantined sidecar copy and
+its size (D148). It looks for copies of these sidecar files:
+
+- `revocation-evictions.evs`, `revocation-evictions.evh` and
+  `revocation-evictions.rdc` in the data directory.
+- `treekem/*.evjournal` and `treekem/*.orcpend`.
+- `group-recovery/*.grecov`.
+
+```json
+{
+  "copies": [
+    {
+      "sidecar": "g1.evjournal",
+      "file": "g1.evjournal.q-<txid>-<hash>.pending",
+      "path": "treekem/g1.evjournal.q-<txid>-<hash>.pending",
+      "txid": "00112233445566778899aabbccddeeff",
+      "state": "pending",
+      "size": 17
+    }
+  ],
+  "count": 1,
+  "total_bytes": 17,
+  "scan_errors": []
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `copies[].sidecar` | The live sidecar file that the copy was moved aside from. |
+| `copies[].file` | The file name of the copy. |
+| `copies[].path` | The path of the copy, relative to the data directory. |
+| `copies[].txid` | The §5a transaction ID, as 32 hexadecimal characters. |
+| `copies[].state` | `pending` (§5a step 1) or `history` (§5a step 5). |
+| `copies[].size` | The size in bytes. `null` when the file metadata cannot be read. |
+| `count` | The number of copies. |
+| `total_bytes` | The sum of the known copy sizes. |
+| `scan_errors[]` | Each directory that could not be listed: `dir` (`.` is the data directory) and `error`. Copies found before the error stay in `copies`. |
+
+The route does not follow symbolic links and does not list them. A missing
+directory is not an error; it has no copies. The daemon never deletes these
+copies automatically (D148).
 
 
 ## Tailnet port-forwarding (#132)

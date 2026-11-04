@@ -52,8 +52,9 @@ buckets), `/diagnostics/gossip` (drop detection and participation),
 metering), `/diagnostics/dm` (DM counters and per-peer state),
 `/diagnostics/groups` (ingest and drop buckets; ADR-0064 fork-quarantine and owner-mandate counters, plus per-agent `mandate_capability` rows — see the [fork quarantine runbook](https://github.com/saorsa-labs/x0x/blob/main/docs/runbooks/fork-quarantine.md)), `/diagnostics/history`
 (writer/reaper), `/diagnostics/connect` (ACL allow/deny),
-`/diagnostics/ws` (outbound-queue health), and `/diagnostics/exec` (counters
-and ACL summary).
+`/diagnostics/ws` (outbound-queue health), `/diagnostics/sidecar-quarantine`
+(each quarantined sidecar copy with its size; D148), and `/diagnostics/exec`
+(counters and ACL summary).
 
 The three routes detailed below are `GET` with no request body and require the
 normal local bearer token. They return snapshots, not SLAs or proof that a peer

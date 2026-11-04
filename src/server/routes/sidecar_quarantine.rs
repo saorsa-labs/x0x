@@ -6,15 +6,19 @@
 //! not change daemon state. Copies are never deleted automatically (D148),
 //! so this list tells an operator what is kept and how much disk it uses.
 //!
-//! The scanned sidecar families are the ones that run the §5a lifecycle
-//! today:
-//! - ADR 0110 S4: `<data_dir>/revocation-evictions.evs` and each
-//!   `<data_dir>/treekem/<stem>.evjournal`.
-//! - ADR 0109 S3: each `<data_dir>/group-recovery/<stem>.grecov`.
+//! The scanned files are every file that the §5a `quarantine_file` and
+//! `finalize_quarantine` helpers in `named_groups/revocation_eviction.rs`
+//! move aside:
+//! - ADR 0110 S4, in `<data_dir>`: `revocation-evictions.evs`,
+//!   `revocation-evictions.evh` (hand-off log) and
+//!   `revocation-evictions.rdc` (displaced certificates).
+//! - ADR 0110 S4, in `<data_dir>/treekem`: each `<stem>.evjournal` and each
+//!   `<stem>.orcpend` (pending owner-recovery mandates).
+//! - ADR 0109 S3, in `<data_dir>/group-recovery`: each `<stem>.grecov`.
 //!
 //! A copy is `<file>.q-<txid>-<h>.pending` (pending) or
 //! `<file>.q-<txid>-<h>` (history). Names that do not parse are not copies
-//! and are not listed.
+//! and are not listed. A symbolic link is not followed and is not listed.
 
 use super::super::state::AppState;
 use crate::groups::eviction as s4;
@@ -25,6 +29,14 @@ use axum::Json;
 use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
+
+/// `revocation_eviction/handoff_log.rs` `FILE_NAME` (private there; the
+/// drift test checks that both names stay equal).
+const EVH_FILE_NAME: &str = "revocation-evictions.evh";
+/// `revocation_eviction/displaced_certs.rs` `FILE_NAME` (private there).
+const RDC_FILE_NAME: &str = "revocation-evictions.rdc";
+/// `revocation_eviction/mandate_store.rs` `EXTENSION` (`pub(super)` there).
+const ORCPEND_EXTENSION: &str = "orcpend";
 
 /// One quarantined copy.
 #[derive(Debug, Serialize)]
@@ -84,7 +96,10 @@ async fn quarantined_sidecar_copies(
     let recovery_dir = data_dir.join(s3::GROUP_RECOVERY_DIR);
     let sources = [
         (data_dir, SidecarName::Fixed(s4::EVS_FILE_NAME)),
+        (data_dir, SidecarName::Fixed(EVH_FILE_NAME)),
+        (data_dir, SidecarName::Fixed(RDC_FILE_NAME)),
         (treekem_dir, SidecarName::Extension(s4::EVJOURNAL_EXTENSION)),
+        (treekem_dir, SidecarName::Extension(ORCPEND_EXTENSION)),
         (
             recovery_dir.as_path(),
             SidecarName::Extension(s3::GROUP_RECOVERY_EXTENSION),
@@ -134,7 +149,8 @@ async fn scan_dir(
             continue;
         };
         let path = entry.path();
-        let metadata = crate::w3h_inline::fs::metadata(&path).await.ok();
+        // `symlink_metadata` does not follow a link, so a link is skipped.
+        let metadata = tokio::fs::symlink_metadata(&path).await.ok();
         if metadata.as_ref().is_some_and(|meta| !meta.is_file()) {
             continue;
         }
@@ -173,11 +189,13 @@ fn parse_copy_name(name: &str, sidecar: SidecarName) -> Option<(String, [u8; 16]
     Some((live, txid, state))
 }
 
+/// `path` relative to `data_dir`; the data directory itself is `.`.
 fn display_path(data_dir: &Path, path: &Path) -> String {
-    path.strip_prefix(data_dir)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    match path.strip_prefix(data_dir) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".to_string(),
+        Ok(relative) => relative.to_string_lossy().into_owned(),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -268,14 +286,37 @@ mod tests {
         )
         .unwrap();
         std::fs::write(recovery_dir.join(&grecov_pending), b"12345678901").unwrap();
+        // #1804 review: the other files that `quarantine_file` moves aside.
+        let evh_pending = s4::quarantine_pending_name(EVH_FILE_NAME, &[5; 16], b"evh");
+        let rdc_history = s4::quarantine_history_name(&s4::quarantine_pending_name(
+            RDC_FILE_NAME,
+            &[6; 16],
+            b"rdc",
+        ))
+        .unwrap()
+        .to_string();
+        let orcpend = format!("g1.{ORCPEND_EXTENSION}");
+        let orcpend_pending = s4::quarantine_pending_name(&orcpend, &[7; 16], b"orc");
+        std::fs::write(data_dir.join(EVH_FILE_NAME), b"live").unwrap();
+        std::fs::write(data_dir.join(&evh_pending), b"12").unwrap();
+        std::fs::write(data_dir.join(&rdc_history), b"1234567890123").unwrap();
+        std::fs::write(treekem_dir.join(&orcpend), b"live").unwrap();
+        std::fs::write(treekem_dir.join(&orcpend_pending), b"12345678901234567").unwrap();
+        // A link with a copy name is not followed and is not listed.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            data_dir.join(&evs_pending),
+            data_dir.join(s4::quarantine_pending_name(evs, &[8; 16], b"link")),
+        )
+        .unwrap();
 
         let before = names_in(data_dir);
         let report = quarantined_sidecar_copies(data_dir, &treekem_dir).await;
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(names_in(data_dir), before, "the listing changes no file");
 
-        assert_eq!(json["count"], 4, "{json}");
-        assert_eq!(json["total_bytes"], 5 + 7 + 3 + 11, "{json}");
+        assert_eq!(json["count"], 7, "{json}");
+        assert_eq!(json["total_bytes"], 5 + 7 + 3 + 11 + 2 + 13 + 17, "{json}");
         assert_eq!(json["scan_errors"], serde_json::json!([]));
         let rows: Vec<(String, String, String, String, u64)> = json["copies"]
             .as_array()
@@ -326,9 +367,69 @@ mod tests {
                 "history".to_string(),
                 3,
             ),
+            (
+                evh_pending.clone(),
+                EVH_FILE_NAME.to_string(),
+                "05".repeat(16),
+                "pending".to_string(),
+                2,
+            ),
+            (
+                rdc_history.clone(),
+                RDC_FILE_NAME.to_string(),
+                "06".repeat(16),
+                "history".to_string(),
+                13,
+            ),
+            (
+                Path::new("treekem")
+                    .join(&orcpend_pending)
+                    .display()
+                    .to_string(),
+                orcpend.clone(),
+                "07".repeat(16),
+                "pending".to_string(),
+                17,
+            ),
         ];
         expected.sort();
         assert_eq!(rows, expected);
+    }
+
+    /// The mirrored names must equal the private constants of the files
+    /// that own them (#1804 review). If one of these files renames its
+    /// constant, this test fails until the mirror here is updated.
+    #[test]
+    fn mirrored_sidecar_names_match_their_source_files() {
+        let sources = [
+            (
+                include_str!("named_groups/revocation_eviction/handoff_log.rs"),
+                format!("const FILE_NAME: &str = \"{EVH_FILE_NAME}\";"),
+            ),
+            (
+                include_str!("named_groups/revocation_eviction/displaced_certs.rs"),
+                format!("const FILE_NAME: &str = \"{RDC_FILE_NAME}\";"),
+            ),
+            (
+                include_str!("named_groups/revocation_eviction/mandate_store.rs"),
+                format!("pub(super) const EXTENSION: &str = \"{ORCPEND_EXTENSION}\";"),
+            ),
+        ];
+        for (source, line) in sources {
+            assert!(source.contains(&line), "missing `{line}`");
+        }
+    }
+
+    /// The data directory itself is reported as `.`, never as "".
+    #[test]
+    fn the_data_directory_is_displayed_as_dot() {
+        let data_dir = Path::new("/var/x0x");
+        assert_eq!(display_path(data_dir, data_dir), ".");
+        assert_eq!(display_path(data_dir, &data_dir.join("treekem")), "treekem");
+        assert_eq!(
+            display_path(data_dir, Path::new("/elsewhere")),
+            "/elsewhere"
+        );
     }
 
     /// A data directory with no sidecar directories has no copies and no
