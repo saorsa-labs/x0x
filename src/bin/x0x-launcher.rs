@@ -8,9 +8,11 @@
 mod launcher;
 
 /// 64 is `EX_USAGE`: the unit supplied no daemon to run.
+#[cfg(unix)]
 const EXIT_USAGE: u8 = 64;
 /// 75 is `EX_TEMPFAIL`: the manager restarts the job, as it does for a
 /// direct unit whose daemon cannot exec.
+#[cfg(unix)]
 const EXIT_TEMPFAIL: u8 = 75;
 /// 69 is `EX_UNAVAILABLE`: this host cannot run process custody.
 #[cfg(not(unix))]
