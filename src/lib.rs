@@ -7815,9 +7815,10 @@ struct CapabilityRefreshGuard {
     registry: std::sync::Arc<CapabilityRefreshRegistry>,
     key: CapabilityRefreshKey,
     flight_id: u64,
-    /// Set once the flight published its targeted request. Only such a
-    /// flight starts the cooldown (#1776): a flight that was ready at once
-    /// asked nothing, so it must not refuse a later caller its request.
+    /// Set once the flight published its targeted request successfully.
+    /// Only such a flight starts the cooldown (#1776): a flight that was
+    /// ready at once, or whose publish failed, asked nothing, so it must
+    /// not refuse a later caller its request.
     published: bool,
 }
 
@@ -7835,8 +7836,10 @@ impl Drop for CapabilityRefreshGuard {
 /// publish, not a retry loop. Returning early on a cache hit keeps a strict
 /// send that raced an in-flight advert from paying the full window.
 ///
-/// Returns whether the flight reached its publish step, which is what
-/// starts the requester-side cooldown.
+/// Returns whether the targeted request was published successfully, which
+/// is what starts the requester-side cooldown. A failed publish, or a
+/// deadline or shutdown before the publish completes, returns `false` at
+/// once.
 async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
     required_application: Option<u64>,
@@ -7874,8 +7877,10 @@ async fn run_strict_capability_refresh(
         () = tokio::time::sleep_until(deadline) => None,
         () = shutdown_token.cancelled() => None,
     };
+    // A request that never left this node starts no cooldown and earns no
+    // convergence wait: nothing can answer it (#1776 review).
     let Some(published) = published else {
-        return true;
+        return false;
     };
     if let Err(error) = published {
         tracing::warn!(
@@ -7884,6 +7889,7 @@ async fn run_strict_capability_refresh(
             %error,
             "targeted capability refresh publish failed"
         );
+        return false;
     }
 
     loop {
@@ -30429,6 +30435,26 @@ mod tests {
             run(stale).await,
             1,
             "a binding without gossip inbox or KEM key is not usable"
+        );
+
+        // A failed publish asked nothing: it returns `false` at once (no
+        // cooldown, no convergence wait).
+        let started = tokio::time::Instant::now();
+        let published = run_strict_capability_refresh(
+            recipient,
+            None,
+            false,
+            std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            tokio_util::sync::CancellationToken::new(),
+            started + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            async { Err(error::NetworkError::BroadcastError("test".into())) },
+        )
+        .await;
+        assert!(!published, "a failed publish must not start the cooldown");
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "a failed publish must not wait for an answer"
         );
 
         let usable = std::sync::Arc::new(dm_capability::CapabilityStore::new());

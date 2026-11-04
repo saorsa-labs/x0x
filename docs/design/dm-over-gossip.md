@@ -220,37 +220,43 @@ Landing in slices (ADR 0030 "Landing order"). Slices 1–2 ship:
 - Targeted capability refresh on `x0x/caps/v1/request/targeted-v2`, answered
   on `x0x/caps/v1/response/targeted-v2` (both Critical). Concurrent strict
   sends to one recipient share a single in-flight request.
-- The same targeted request has one internal trigger with no capability
-  requirement (#1776). The Welcome fetch and the join-result poll send it
-  when the joiner holds no gossip-usable binding for the authority. A
-  gossip-usable binding has a non-zero machine ID, the gossip-inbox
-  capability and a KEM key. The machine ID is the agent's own signed claim
-  in its advert, not a separate machine authentication. A fresh joiner that
-  joined the mesh after the authority's last advert beat has no other way to
-  address the authority. Rules for this addressability request:
-  - It waits for any gossip-usable binding.
-  - Concurrent addressability callers share one flight. They also join a
-    strict flight in progress.
-  - A strict send never joins an addressability flight. An addressability
-    flight's cooldown never refuses a strict send its own request, because
-    the weaker flight can finish on a binding that does not satisfy the
-    strict send.
-  - A strict flight that published a request and got no advert refuses
-    addressability requests for the 10 s cooldown. The recipient did not
-    answer moments ago, and the Welcome fetch and join-result poll retry
-    well after 10 s.
-  - Only a flight that published a request starts the cooldown. A flight
-    that was satisfied at once asked nothing.
-  - The Welcome fetch does not send the request after a failed send when
-    the binding is already usable, because the request would publish
-    nothing. The join-result poll and the request after a failed Welcome
-    fetch run detached. Only the request before a Welcome fetch send waits,
-    at most 3 s, because it replaces a send that cannot reach the
-    authority.
-  - Privacy: the request is visible on the mesh. It shows that the joiner
-    asks for the authority's advert, so observers can link a group join to
-    its authority. Strict DMs already leak the same link.
 - The **receiver durable path** and the live v2 advert (below).
+
+**Internal addressability trigger (#1776, not part of slices 1–2).** The
+ADR 0030 §3 targeted request has one internal trigger with no capability
+requirement. The Welcome fetch and the join-result poll send it
+when the joiner holds no gossip-usable binding for the authority. A
+gossip-usable binding has a non-zero machine ID, the gossip-inbox
+capability and a KEM key. The machine ID is the agent's own signed claim
+in its advert, not a separate machine authentication. A fresh joiner that
+joined the mesh after the authority's last advert beat has no other way to
+address the authority. Rules for this addressability request:
+
+- It waits for any gossip-usable binding.
+- Concurrent addressability callers share one flight. They also join a
+  strict flight in progress. A strict flight and an addressability flight
+  to the same recipient can run at the same time, so the limit is one
+  request per recipient per purpose in each cooldown window.
+- A strict send never joins an addressability flight. An addressability
+  flight's cooldown never refuses a strict send its own request, because
+  the weaker flight can finish on a binding that does not satisfy the
+  strict send.
+- A strict flight that published a request and got no advert refuses
+  addressability requests for the 10 s cooldown. The recipient did not
+  answer moments ago, and the Welcome fetch and join-result poll retry
+  well after 10 s.
+- Only a flight that published its request successfully starts the
+  cooldown. A flight that was satisfied at once, or whose publish failed,
+  asked nothing.
+- The Welcome fetch does not send the request after a failed send when
+  the binding is already usable, because the request would publish
+  nothing. The join-result poll and the request after a failed Welcome
+  fetch run detached. Only the request before a Welcome fetch send waits,
+  at most 3 s, because it replaces a send that cannot reach the
+  authority.
+- Privacy: the request is visible on the mesh. It shows that the joiner
+  asks for the authority's advert, so observers can link a group join to
+  its authority. Strict DMs already leak the same link.
 
 #### Send surfaces and defaults (ADR 0030 §4)
 
