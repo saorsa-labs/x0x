@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x0x::upgrade::restart::{readback_systemd_policy, SupervisionSignals, SystemdPolicyReadback};
 #[cfg(target_os = "linux")]
-#[path = "../src/upgrade/launcher/mod.rs"]
-mod launcher;
+#[path = "../src/upgrade/journal.rs"]
+mod journal;
 
 #[derive(Serialize)]
 struct VerdictRecord {
@@ -262,11 +262,114 @@ fn run() -> io::Result<()> {
     }
 }
 
+/// The launcher parent's identity inside a permit: pid, process start and
+/// boot id, as the launcher's own `Identity` serializes them.
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+#[allow(dead_code)] // schema-only: present so a malformed permit fails to parse
+struct FixtureParent {
+    pid: u32,
+    start: u64,
+    boot: String,
+}
+
+/// The launcher's private fd-3 permit, duplicated here only as the fixture
+/// child's read schema. `deny_unknown_fields` makes a launcher contract
+/// change fail this fixture loudly instead of silently. The full
+/// permit-versus-self verification stays in the launcher module, where its
+/// tests live; this fixture refuses a permit for another process or
+/// version, then acknowledges.
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // read schema only; the checks below bind what they need
+struct FixturePermit {
+    record: journal::BootRecord,
+    parent: FixtureParent,
+    root: PathBuf,
+    executable: PathBuf,
+    sha256: [u8; 32],
+    version: String,
+    argv: Vec<Vec<u8>>,
+    cwd: PathBuf,
+}
+
+/// The daemon side of the private boot barrier: read the whole permit from
+/// descriptor 3, refuse one that is not for this process and version, write
+/// the boot record, then acknowledge with one byte. The activation-time
+/// daemon runs this same exchange with full self-verification under
+/// `ENABLED`.
+#[cfg(target_os = "linux")]
+fn candidate_boot_fixture(version: &str) -> io::Result<()> {
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::net::UnixStream;
+    let marker = std::env::var_os("X0X_M2_BOOT_FD")
+        .ok_or_else(|| io::Error::other("boot descriptor missing"))?;
+    // No later child of this fixture may treat descriptor 3 as its own.
+    std::env::remove_var("X0X_M2_BOOT_FD");
+    if marker != "3" {
+        return Err(io::Error::other("invalid private boot descriptor"));
+    }
+    // SAFETY: the launcher duplicated the boot channel onto descriptor 3
+    // for this process; from_raw_fd takes the ownership this exchange
+    // spends here.
+    let mut reader =
+        std::io::BufReader::new(unsafe { <UnixStream as std::os::fd::FromRawFd>::from_raw_fd(3) });
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(1024 * 1024)
+        .read_until(b'\n', &mut bytes)?;
+    let permit: FixturePermit = serde_json::from_slice(&bytes)?;
+    if permit.record.pid != std::process::id() || permit.version != version {
+        return Err(io::Error::other("permit does not bind this child"));
+    }
+    // The real candidate records its boot before it acknowledges; the
+    // fixture keeps the same order so the data root looks the same.
+    journal::write_record(&permit.root.join(journal::BOOT_FILE_NAME), &permit.record)?;
+    reader.get_mut().write_all(&[1])
+}
+
+/// The daemon side of the launcher's inert flush exchange. The receipt's
+/// plan digest must equal the launcher's binding construction — SHA-256
+/// over the JSON `[instance_id, plan]` pair — so the plan is parsed with
+/// the real journal types; re-serializing a `Value` would reorder fields
+/// and change the digest.
+#[cfg(target_os = "linux")]
+fn fixture_receipt(bytes: &[u8]) -> io::Result<serde_json::Value> {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        token: String,
+        transaction_id: String,
+        generation: u64,
+        instance_id: String,
+        plan: journal::FrozenPlan,
+    }
+    let r: Request = serde_json::from_slice(bytes)?;
+    if r.token != "inert launcher fixture" {
+        return Err(io::Error::other("bad fixture credential"));
+    }
+    use sha2::Digest;
+    let pair = (r.instance_id.as_str(), &r.plan);
+    let plan_sha256: [u8; 32] = sha2::Sha256::digest(serde_json::to_vec(&pair)?).into();
+    Ok(serde_json::json!({
+        "binding": {
+            "transaction_id": r.transaction_id,
+            "generation": r.generation,
+            "plan_sha256": plan_sha256,
+        },
+        "receipt_id": "fixture-flush"
+    }))
+}
+
 #[cfg(target_os = "linux")]
 fn launcher_fixture(mode: &str) -> io::Result<()> {
     use std::io::{BufRead, Read};
     if mode == "--launcher-child" && std::env::var_os("X0X_M2_BOOT_FD").is_some() {
-        launcher::candidate_boot_for_fixture(env!("CARGO_PKG_VERSION"))?;
+        candidate_boot_fixture(env!("CARGO_PKG_VERSION"))?;
         if std::env::var("X0X_LAUNCHER_CASE").as_deref() == Ok("crash") {
             std::process::exit(19);
         }
@@ -302,7 +405,7 @@ fn launcher_fixture(mode: &str) -> io::Result<()> {
     std::io::BufReader::new(&mut socket)
         .take(1024 * 1024)
         .read_until(b'\n', &mut bytes)?;
-    let receipt = launcher::fixture_receipt(&bytes)?;
+    let receipt = fixture_receipt(&bytes)?;
     atomic_json(&root.join("fixture-flush.json"), &receipt)?;
     serde_json::to_writer(&mut socket, &serde_json::json!({"receipt": receipt}))?;
     socket.write_all(b"\n")
