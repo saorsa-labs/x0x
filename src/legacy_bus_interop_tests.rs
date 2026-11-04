@@ -4333,3 +4333,314 @@ async fn deferred_eager_retry_records_each_peer_frame_once() {
         "shutdown must not record another EAGER retry"
     );
 }
+
+/// #1455 agent build: the #501 `build` shape plus DM history, because a
+/// v2 (durable) envelope is answered only when the receiver's history is
+/// on — a strict send against a history-less peer is withheld by policy.
+async fn build_1455(dir: &Path, name: &str) -> Agent {
+    let home = dir.join(name);
+    assert!(!home.exists(), "each fixture identity starts absent");
+    Agent::builder()
+        .with_identity_dir(&home)
+        .with_machine_key(home.join("machine.key"))
+        .with_agent_key_path(home.join("agent.key"))
+        .with_user_key_path(home.join("user.key"))
+        .with_agent_cert_path(home.join("agent.cert"))
+        .with_contact_store_path(home.join("contacts.json"))
+        .with_peer_cache_dir(home.join("peers"))
+        .with_peer_cache_disabled()
+        .with_network_config(network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback address")),
+            bootstrap_nodes: vec![],
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..Default::default()
+        })
+        .with_history(crate::history::HistoryConfig {
+            db_path: Some(home.join("history.db")),
+            ..crate::history::HistoryConfig::daemon_default()
+        })
+        .build()
+        .await
+        .expect("real Agent construction with DM history")
+}
+
+/// #1455 fixture: one durable-DM pair plus bystander daemons on the same
+/// loopback plane. Every daemon runs a real durable-capable DM inbox (so
+/// all of them subscribe the compatibility bus, as in the issue's
+/// measurement), but only the pair trusts each other — no C4 warm
+/// subscribes a bystander to the pair's inbox topics. `bystanders`
+/// controls the plane width.
+async fn build_1455_plane(
+    dir: &Path,
+    bystanders: usize,
+) -> (Vec<Agent>, Vec<Arc<AgentKemKeypair>>, Vec<Inbox>) {
+    let mut names = vec!["a1455".to_string(), "b1455".to_string()];
+    for id in 1..=bystanders {
+        names.push(format!("w1455-{id}"));
+    }
+    let mut agents = Vec::new();
+    for name in &names {
+        agents.push(build_1455(dir, name).await);
+    }
+    let keys: Vec<_> = agents
+        .iter()
+        .map(|_| Arc::new(AgentKemKeypair::generate().expect("real KEM")))
+        .collect();
+    for (x, y) in [(0, 1), (1, 0)] {
+        agents[x]
+            .set_contact_trusted_for_testing(agents[y].agent_id())
+            .await;
+        agents[x].contact_store().write().await.add_machine(
+            &agents[y].agent_id(),
+            crate::contacts::MachineRecord::new(agents[y].machine_id(), None),
+        );
+    }
+    let mut receivers = Vec::new();
+    for (index, agent) in agents.iter().enumerate() {
+        let (tx, rx) = mpsc::channel(16);
+        agent
+            .start_dm_inbox(
+                Arc::clone(&keys[index]),
+                DmInboxConfig::default().with_durable_typed_payload_route(PREFIX, tx),
+            )
+            .await
+            .expect("typed inbox for every plane daemon");
+        receivers.push(rx);
+    }
+    for agent in &agents {
+        agent.join_network().await.expect("join actual runtime");
+    }
+    for (i, from) in agents.iter().enumerate() {
+        for to in &agents[i + 1..] {
+            let address = to
+                .network()
+                .expect("network")
+                .bound_addr()
+                .await
+                .expect("bound");
+            assert!(address.ip().is_loopback());
+            bounded(
+                "1455 pair connection",
+                SETUP,
+                from.network().expect("network").connect_addr(address),
+            )
+            .await
+            .expect("actual QUIC connection");
+        }
+    }
+    bounded("1455 plane admission", SETUP, async {
+        loop {
+            let mut ready = true;
+            for agent in &agents {
+                let peers = agent.network().expect("network").gossip_plane_peers().await;
+                ready &= agents
+                    .iter()
+                    .filter(|p| p.agent_id() != agent.agent_id())
+                    .all(|p| peers.contains(&ant_quic::PeerId(p.machine_id().0)));
+            }
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    for agent in &agents {
+        pubsub(agent).refresh_topic_peers().await;
+    }
+    (agents, keys, receivers)
+}
+
+/// One durable (v2) send through the production gossip helper, returning
+/// the count of `legacy_bus_fallback_publish` events for this request id.
+/// The 250 ms fallback itself stays untouched — the assertion target is
+/// that the inbox EAGER path delivers before it ever fires.
+async fn durable_send_1455(
+    sender: &Agent,
+    recipient: &Agent,
+    key: &AgentKemKeypair,
+    id: [u8; 16],
+    payload: Vec<u8>,
+) -> usize {
+    let witness = FallbackWitness {
+        expected: hex::encode(id),
+        matches: Arc::new(Mutex::new(0)),
+    };
+    let subscriber = tracing_subscriber::registry().with(witness.clone());
+    let signing = SigningContext::from_keypair(sender.identity.agent_keypair());
+    let mut stages = DurableSendStages::default();
+    let config = DmSendConfig {
+        max_retries: 0,
+        require_gossip: true,
+        require_gossip_ack: true,
+        require_durable_app_ack: true,
+        logical_request_id: Some(id),
+        timeout_per_attempt: Duration::from_secs(30),
+        ..Default::default()
+    };
+    let receipt = bounded(
+        "production durable gossip helper and v2 ACK",
+        DELIVERY,
+        dm_send::send_via_gossip(
+            DmSendContext {
+                pubsub: pubsub(sender),
+                signing: &signing,
+                self_agent_id: sender.agent_id(),
+                self_machine_id: sender.machine_id(),
+                machine_keypair: sender.identity.machine_keypair(),
+                inflight: sender.dm_inflight_acks(),
+                stages: &mut stages,
+            },
+            recipient.agent_id(),
+            Some(recipient.machine_id()),
+            &key.public_bytes,
+            payload,
+            &config,
+            None,
+        )
+        .with_subscriber(subscriber),
+    )
+    .await
+    .expect("durable helper send and correlated ACK");
+    assert_eq!(receipt.request_id, id);
+    assert_eq!(receipt.path, DmPath::GossipInbox);
+    assert_eq!(receipt.retries_used, 0);
+    let count = *witness.matches.lock().expect("healthy witness");
+    count
+}
+
+/// WHY (#1455): six bystander daemons on the sender's loopback plane take
+/// the Leaf's bounded EAGER fan-out for the recipient's inbox topic —
+/// membership carries no subscription signal, so the single inbox EAGER
+/// frame can land on bystanders that refuse unsubscribed pass-through, and
+/// the durable send pays the 250 ms legacy bus fallback (measured ~45% of
+/// sends on main). The send path now records the recipient machine as the
+/// inbox owner, so the recipient holds the eager seat for its own inbox
+/// topic on the sender. Asserted: that seat, typed delivery and receipt;
+/// the per-send `legacy_bus_fallback_publish` count (and whether local
+/// saturation shed a frame) is reported evidence — under this fixture the
+/// ACK leg alone can exceed the 250 ms window, so a wall-clock assert
+/// would flake for reasons the eager target does not control. On main
+/// the seat is a per-process-random hash-order draw that missed the
+/// recipient in 5/5 measured runs. The simulated-fabric twin
+/// `leaf_dm_inbox_owner_is_promoted_eager_over_bystanders` sweeps five
+/// owner draws, so a dropped pin escapes it only ~(2/7)^5 of the time.
+#[tokio::test]
+async fn dm_1455_bystander_plane_durable_send_stays_on_inbox_eager() {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let (agents, keys, mut receivers) = build_1455_plane(dir.path(), 6).await;
+    let (alice, bob) = (&agents[0], &agents[1]);
+    // One long-lived responder: the durable ACK releases only on the
+    // handler's completion signal, so the receiver resolves it while the
+    // send future is still waiting, then hands the payload to the loop.
+    // Bob's receiver is index 1 (the pair first, then the bystanders).
+    let mut delivered = {
+        let (done_tx, done_rx) = mpsc::channel::<crate::dm_inbox::DmTypedPayload>(16);
+        let mut rx = receivers.remove(1);
+        tokio::spawn(async move {
+            while let Some(mut actual) = rx.recv().await {
+                if let Some(tx) = actual.completion.take() {
+                    let _ = tx.send(Ok(crate::dm_inbox::DmTypedPayloadCompletion::Inserted));
+                }
+                if done_tx.send(actual).await.is_err() {
+                    break;
+                }
+            }
+        });
+        done_rx
+    };
+    let outcome = AssertUnwindSafe(async {
+        // Let the fixture's identity/capability gossip converge before the
+        // measured sends: a fresh 8-daemon plane runs a burst of capability
+        // adverts whose per-peer in-flight data permits can otherwise shed
+        // the DM EAGER frame (sg local saturation), which is unrelated to
+        // the eager-target selection under test.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for label in ["send-1", "send-2", "send-3"] {
+            let id = dm_send::fresh_request_id();
+            let payload = marked(label);
+            let budget_before = pubsub(alice).stage_stats().outbound_budget_exhausted
+                + pubsub(bob).stage_stats().outbound_budget_exhausted;
+            let fallbacks = durable_send_1455(alice, bob, &keys[1], id, payload.clone()).await;
+            // The #1455 invariant, asserted where the defect lives: the
+            // recipient's own machine must hold an eager seat in the
+            // sender's bounded EAGER set for THEIR inbox topic. On main the
+            // seat is a tied-score hash-order draw over the whole plane
+            // (per-process random), so bystanders take it on most draws —
+            // the measured failure was 5/5 runs — and the single EAGER
+            // frame then strands.
+            let snap = pubsub(alice).stage_stats();
+            let role = snap
+                .peer_scores_by_topic
+                .get(&dm::dm_inbox_topic(&bob.agent_id()).to_string())
+                .and_then(|by_peer| {
+                    by_peer.get(&saorsa_gossip_types::PeerId::new(bob.machine_id().0).to_string())
+                })
+                .map(|row| row.role.clone());
+            assert_eq!(
+                role.as_deref(),
+                Some("eager"),
+                "#1455: the recipient's machine must be eager for its own inbox topic on the sender"
+            );
+            // The ACK leg's seat: the receiver records the origin-attested
+            // sender as the owner of the SENDER's inbox topic, so the
+            // durable ACK publish also carries to the sender itself rather
+            // than a bystander.
+            let ack_role = pubsub(bob)
+                .stage_stats()
+                .peer_scores_by_topic
+                .get(&dm::dm_inbox_topic(&alice.agent_id()).to_string())
+                .and_then(|by_peer| {
+                    by_peer.get(&saorsa_gossip_types::PeerId::new(alice.machine_id().0).to_string())
+                })
+                .map(|row| row.role.clone());
+            assert_eq!(
+                ack_role.as_deref(),
+                Some("eager"),
+                "#1455: the sender's machine must be eager for its own inbox topic on the receiver"
+            );
+            let actual = bounded(
+                "receiver typed decrypt delivery",
+                DELIVERY,
+                delivered.recv(),
+            )
+            .await
+            .expect("typed receiver must remain open");
+            assert_eq!(actual.request_id, id, "exclusive request correlation");
+            assert_eq!(actual.sender, alice.agent_id());
+            assert_eq!(actual.payload, payload);
+            assert!(actual.verified);
+            // The user-visible symptom is reported, not asserted: under
+            // this fixture the ACK leg alone can exceed the 250 ms window
+            // (ack-job startup, first-publish topic joins, direct-hedge
+            // setup, or an sg local-saturation shed — `shed` below covers
+            // the byte-budget and per-peer-permit paths on both ends), so a
+            // wall-clock assert here would flake for reasons the eager
+            // target does not control. The causal chain is guarded instead:
+            // the seat assert above plus the simulated-fabric unit test's
+            // EAGER-frame-to-owner assertion.
+            let shed = snap.outbound_budget_exhausted
+                + pubsub(bob).stage_stats().outbound_budget_exhausted
+                > budget_before;
+            eprintln!(
+                "ISSUE1455 checkpoint={label} fallback_events={fallbacks} shed={shed} request={}",
+                hex::encode(id)
+            );
+            // Drain per-peer in-flight permits so one send's frames cannot
+            // shed the next send's EAGER (see the settle note above).
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .catch_unwind()
+    .await;
+    // Orderly teardown for success AND assertion panic, matching the #501
+    // cases: no spawned fixture task is left detached for nextest to flag.
+    for agent in &agents {
+        agent.shutdown().await;
+    }
+    drop(agents);
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}

@@ -977,8 +977,9 @@ const CAUSE_R: &str = "J is marked or its join times out, with no typed state in
 const R_CAP: usize = 4;
 
 /// The H-S3-r cap: `COMMIT_LOG_CAP` is a compile-time 4096, so the harness
-/// trims A's in-memory commit log to its newest [`R_CAP`] entries.
-async fn cap_log(sim: &Sim, label: &str, group: &str) -> Result<usize> {
+/// trims A's in-memory commit log to its newest [`R_CAP`] entries. Returns
+/// the number kept and the oldest revision kept.
+async fn cap_log(sim: &Sim, label: &str, group: &str) -> Result<(usize, u64)> {
     let state = sim.state(label)?;
     let mut groups = state.named_groups.write().await;
     let key = crate::server::resolve_group_entry_locked(&groups, group)
@@ -996,7 +997,13 @@ async fn cap_log(sim: &Sim, label: &str, group: &str) -> Result<usize> {
         .unwrap_or(0);
     info.commit_log
         .retain(|entry| entry.commit.revision >= keep_from);
-    Ok(info.commit_log.len())
+    let oldest = info
+        .commit_log
+        .iter()
+        .map(|entry| entry.commit.revision)
+        .min()
+        .unwrap_or(0);
+    Ok((info.commit_log.len(), oldest))
 }
 
 /// H-S3-r: S0 with A's commit log capped at 4 and admin B (default cap)
@@ -1044,14 +1051,14 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         rename(sim, "A", &group, &format!("w3h r {n}")).await?;
     }
     settled(sim, &["B"], &group, "B holds A's six renames").await?;
-    let kept = cap_log(sim, "A", &group).await?;
+    let (kept, _) = cap_log(sim, "A", &group).await?;
     sim.within("the rename resends end", RESENDS_DONE + secs(2), async {
         tokio::time::sleep(RESENDS_DONE).await;
     })
     .await?;
     let joined_at = sim.fabric().mark_indexed("case: J redeems invite I");
     let sealed = seal_j(sim, &link, &group).await?;
-    let kept_after = cap_log(sim, "A", &group).await?;
+    let (kept_after, _) = cap_log(sim, "A", &group).await?;
     receipt.setup_done(at(sim));
     receipt.evidence(
         "gap_is_six_renames_and_a_keeps_only_four_commits",
@@ -1136,6 +1143,272 @@ async fn beyond_retention(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         );
     }
     receipt.finish(FINAL_R, passed, at(sim));
+    Ok(())
+}
+
+// ─── #1661: the sealer's staged Welcome is lost after readmission (D64) ───
+
+const FINAL_W: &str = "j_ends_typed_after_the_welcome_is_lost_and_takes_the_d43_exit";
+const CAUSE_W: &str = "J loops catching_up and awaiting_attestation with no keys and no typed end";
+
+/// State-only commits before the mint in the #1661 case. They put the
+/// roster clock far enough behind the state clock that the seal's roster
+/// revision (six renames and the add later) is still at or below J's
+/// invite-seeded roster revision, so J's frontier gate does not queue the
+/// seal and the served chain reaches the classifier (`case_818`).
+const W_POLICY_CHANGES: usize = 12;
+
+/// #1661, ADR 0109 §2 "Join attempt (D64)": the attempt ends with ADR
+/// 0107's typed outcome when the staged Welcome is gone, and D43's manual
+/// exit then works. Not the H-S3-r row: it adds a sealer restart, which
+/// loses the staged Welcome, and four commits after the seal.
+///
+/// 1. S0 with [`W_POLICY_CHANGES`] policy changes, and admin B seated and
+///    promoted after step 2. A, M1 and M2 run as the previous release
+///    from the start, so A carries no join ATA.
+/// 2. Hold every message between B and J. After the mint A renames 6
+///    times (r+1 to r+6) and seals J (r+7). A serves J's chain, and J is
+///    marked (`signer_only`) on its own seal. B applies all of them.
+/// 3. Advance 130 s. A renames 4 more times (r+8 to r+11) and restarts on
+///    the candidate, with its commit log capped at 4 (r+8 to r+11). The
+///    restart loses A's staged Welcome for J. J's head is beyond A's log,
+///    so J enters `readmission_required {base_beyond_retention}`.
+/// 4. Release the B–J messages. B attests; J cannot fetch the Welcome.
+///    Advance past the Welcome's 10-minute lifetime. Desired: J's attempt
+///    ends `timed_out {rearm_original_result_unavailable}`, J shows
+///    `readmission_required {base_beyond_retention}` with the
+///    `manual_remove_and_reinvite` exit, holds no keys, and the state
+///    stays for two more request intervals. Then A removes J and re-seats
+///    it (§3, `Removal` basis): J is Active at A's state with keys. Main:
+///    J loops `catching_up` and `awaiting_attestation` with no typed end.
+async fn welcome_lost(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+    mesh(sim, R_LABELS).await?;
+    pre_s3(sim, &["A", "M1", "M2"], "J").await?;
+    let group = create_group(sim, "A").await?;
+    for member in ["M1", "M2", "B"] {
+        seat(sim, "A", member, &group).await?;
+    }
+    promote(sim, "A", "B", &group, &["A", "M1", "M2", "B"]).await?;
+    for write_access in POLICY_CHANGES.iter().cycle().take(W_POLICY_CHANGES) {
+        let (code, body) = sim
+            .api(
+                "A",
+                Method::PATCH,
+                &format!("/groups/{group}/policy"),
+                Some(json!({"write_access": write_access})),
+            )
+            .await?;
+        ensure!(code.is_success(), "policy {write_access}: {code} {body}");
+    }
+    settled(
+        sim,
+        &["M1", "M2", "B"],
+        &group,
+        "M1, M2 and B hold A's revision",
+    )
+    .await?;
+    let hold = OriginHold::install(sim, "B and J");
+    let (b, j) = (sim.peer("B")?.0, sim.peer("J")?.0);
+    hold.set(sim, "holding every message between B and J", move |f| {
+        (f.origin == b && f.dst == j) || (f.origin == j && f.dst == b)
+    });
+    let minted = view(sim, "A", &group).await?;
+    let link = invite(sim, "A", &group).await?;
+    for n in 1..=6 {
+        rename(sim, "A", &group, &format!("w3h w {n}")).await?;
+    }
+    settled(sim, &["B"], &group, "B holds A's six renames").await?;
+    sim.within("the rename resends end", RESENDS_DONE + secs(2), async {
+        tokio::time::sleep(RESENDS_DONE).await;
+    })
+    .await?;
+    let sealed = seal_j(sim, &link, &group).await?;
+    let mut first = JWindow::default();
+    watch_j(
+        sim,
+        &group,
+        "A",
+        "J joins while A runs the previous release",
+        CATCHUP,
+        false,
+        &mut first,
+    )
+    .await?;
+    // J fills the renames below its own seal (r+6), and r+7 links from
+    // r+6, so A moves R_CAP commits past the seal before J's head is
+    // beyond its log.
+    for n in 7..=6 + R_CAP {
+        rename(sim, "A", &group, &format!("w3h w {n}")).await?;
+    }
+    settled(sim, &["B"], &group, "B holds A's renames after the seal").await?;
+    let j_head = sim
+        .at_instant("read J's group", try_view_now(sim, "J", &group))
+        .await??
+        .map(|j| j.state_revision);
+    sim.restart("A", RestartMode::Graceful).await?;
+    sim.fabric()
+        .mark("case: A restarted on the candidate; its staged Welcome for J is gone");
+    let (kept, a_log) = cap_log(sim, "A", &group).await?;
+    sees_s3(sim, "J", "A").await?;
+    sees_s3(sim, "A", "J").await?;
+    let mut waits = Waits::default();
+    let entered = waits
+        .until(
+            sim,
+            &group,
+            "J hears base_beyond_retention from A",
+            RETRY_TRANSITION,
+            |r| r["state"] == "readmission_required",
+        )
+        .await?;
+    receipt.setup_done(at(sim));
+    receipt.evidence(
+        "j_is_readmission_required_with_the_welcome_gone",
+        entered
+            && sealed.state_revision == minted.state_revision + 7
+            && kept <= R_CAP
+            && j_head.is_some_and(|head| head < sealed.state_revision && head + 1 < a_log),
+        format!(
+            "mint at {}; seal {}; J head {j_head:?}; after the restart A's log kept {kept}, \
+             oldest {a_log}; J first marked {:?}; states {:?}",
+            minted.state_revision,
+            sealed.describe(),
+            first.marked,
+            waits.states
+        ),
+        at(sim),
+    );
+    let released_at = sim.fabric().mark_indexed("case: the B-J messages pass");
+    hold.set(sim, "passing everything", |_| false);
+    sees_s3(sim, "J", "B").await?;
+    sees_s3(sim, "B", "J").await?;
+    // Past the Welcome's lifetime: the next attested round ends the
+    // attempt.
+    let mut after = Waits::default();
+    after
+        .until(
+            sim,
+            &group,
+            "J's attempt ends after the Welcome lifetime",
+            RETRY_TRANSITION * 2,
+            |_| false,
+        )
+        .await?;
+    let j_hex = sim.agent_hex("J")?;
+    let b_route = sim
+        .at_instant("read B's recovery", recovery_route(sim, "B", &group))
+        .await??;
+    let by_b = answered(&b_route, &j_hex, "attested");
+    let to_b = delivered_after(sim, "J", "B", released_at)?;
+    receipt.request_delivered(
+        "j_reached_b",
+        to_b > 0,
+        format!("frames J->B since the release: {to_b}"),
+        at(sim),
+    );
+    let outcome = sim
+        .at_instant("read J's join-status", join_outcome(sim, &group))
+        .await??;
+    let typed_end = outcome.as_ref().is_some_and(|(outcome, reason)| {
+        outcome == "timed_out" && reason.as_deref() == Some("rearm_original_result_unavailable")
+    });
+    let (_, ended_text, j_ended, j_ended_status) = j_end(sim, &group, "A").await?;
+    let shows_exit = |status: &Option<Status>| {
+        status.as_ref().is_some_and(|st| {
+            st.recovery_state() == Some("readmission_required")
+                && st.recovery_cause() == Some("base_beyond_retention")
+                && st.recovery["exit"] == "manual_remove_and_reinvite"
+        })
+    };
+    let ended = typed_end && shows_exit(&j_ended_status);
+    let keyless = j_ended.as_ref().is_some_and(|j| j.epoch.is_none());
+    // The end holds: no request round moves the state any more.
+    let mut quiet = Waits::default();
+    quiet
+        .until(
+            sim,
+            &group,
+            "J stays at its typed end",
+            REQUEST_INTERVAL * 2,
+            |_| false,
+        )
+        .await?;
+    let (_, _, _, j_quiet_status) = j_end(sim, &group, "A").await?;
+    let stays = quiet.states.len() == 1 && shows_exit(&j_quiet_status);
+    receipt.note(format!(
+        "after the release: {ended_text}; states {:?}; outcomes {:?}; then {:?}; \
+         B requesters {}",
+        after.states, after.outcomes, quiet.states, b_route["requesters"]
+    ));
+    let mut exited = false;
+    if ended && stays {
+        let (code, removed) = sim
+            .api(
+                "A",
+                Method::DELETE,
+                &format!("/groups/{group}/members/{j_hex}"),
+                None,
+            )
+            .await?;
+        ensure!(code.is_success(), "A removes J: {code} {removed}");
+        sim.until("A no longer lists J", SETUP, async |s: &Sim| {
+            view_now(s, "A", &group)
+                .await
+                .is_ok_and(|a| !a.lists(&j_hex))
+        })
+        .await?;
+        // D43 for a contained node: the re-invite runs through the §3
+        // re-seat route on the `Removal` basis.
+        let removal = view(sim, "A", &group).await?;
+        let (code, answer) = sim
+            .api(
+                "A",
+                Method::POST,
+                &format!("/groups/{group}/members/{j_hex}/reseat"),
+                Some(reseat_body(&removal)),
+            )
+            .await?;
+        receipt.note(format!("A's re-seat call: {code} {answer}"));
+        let mut exit = JWindow::default();
+        watch_j(
+            sim,
+            &group,
+            "A",
+            "J is re-seated (D43)",
+            RESEAT_BOUND,
+            true,
+            &mut exit,
+        )
+        .await?;
+        let (caught, exit_text, j_exit, _) = j_end(sim, &group, "A").await?;
+        exited = caught && j_exit.as_ref().is_some_and(|j| j.epoch.is_some());
+        receipt.note(format!(
+            "after the exit: {exit_text}; states {:?}",
+            exit.recovery_states
+        ));
+    }
+    let passed = ended && keyless && stays && by_b && exited;
+    receipt.note(format!(
+        "entered={entered} by_b={by_b} typed_end={typed_end} ended={ended} keyless={keyless} \
+         stays={stays} exited={exited}"
+    ));
+    if !passed {
+        let looped = after.states.iter().any(|s| s.starts_with("catching_up"))
+            && after
+                .states
+                .iter()
+                .any(|s| s.starts_with("awaiting_attestation"));
+        receipt.cause(
+            CAUSE_W,
+            Some(format!(
+                "states {:?}; outcomes {:?}",
+                after.states, after.outcomes
+            )),
+            entered && by_b && !typed_end && looped,
+            at(sim),
+        );
+    }
+    receipt.finish(FINAL_W, passed, at(sim));
     Ok(())
 }
 
@@ -1407,6 +1680,8 @@ enum Row {
     HostCommit,
     /// H-S3-r.
     Retention,
+    /// #1661: the staged Welcome is lost after readmission.
+    WelcomeLost,
     /// H-S3-d5.
     Sibling,
 }
@@ -1416,7 +1691,7 @@ impl Row {
         match self {
             Self::Provisional => B_LABELS,
             Self::TypedWaits | Self::HostCommit => T_LABELS,
-            Self::Retention => R_LABELS,
+            Self::Retention | Self::WelcomeLost => R_LABELS,
             Self::Sibling => D5_LABELS,
         }
     }
@@ -1427,6 +1702,7 @@ impl Row {
             Self::TypedWaits => FINAL_T,
             Self::HostCommit => FINAL_T4,
             Self::Retention => FINAL_R,
+            Self::WelcomeLost => FINAL_W,
             Self::Sibling => FINAL_D5,
         }
     }
@@ -1450,6 +1726,7 @@ async fn run_row(case: &str, seed: u64, row: Row) -> Receipt {
                 Row::TypedWaits => typed_waits(&mut sim, &mut receipt, false).await,
                 Row::HostCommit => typed_waits(&mut sim, &mut receipt, true).await,
                 Row::Retention => beyond_retention(&mut sim, &mut receipt).await,
+                Row::WelcomeLost => welcome_lost(&mut sim, &mut receipt).await,
                 Row::Sibling => sibling_marker(&mut sim, &mut receipt).await,
             };
             if let Err(error) = outcome {
@@ -1550,6 +1827,25 @@ fn probe_w3h_1356_s3_r_beyond_retention() -> Result<()> {
         .await;
         ensure!(receipt.verdict().is_some(), "no verdict");
         Ok(())
+    })
+}
+
+/// #1661 (ADR 0109 §2 D64, ADR 0107): RED on the base, where J loops
+/// with no keys; GREEN once the attempt ends typed on the lost Welcome.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed() -> Result<()> {
+    super::super::block_on_paused(async move {
+        expect_row(
+            "w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed",
+            0x1356_1661,
+            Row::WelcomeLost,
+            Verdict::Green,
+        )
+        .await
     })
 }
 

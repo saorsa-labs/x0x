@@ -27,7 +27,7 @@ use saorsa_gossip_transport::GossipTransport;
 #[cfg(test)]
 use saorsa_gossip_types::MessageHeader;
 use saorsa_gossip_types::{MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -1543,6 +1543,11 @@ pub struct PubSubManager {
     /// task drains the receiver so a quiet hold cannot fill the channel
     /// and drop the PlumTree registration.
     membership_holds: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// #1455: DM inbox topic id → the machine that owns (subscribes to)
+    /// that inbox. The durable send path records the capability-resolved
+    /// recipient machine so Leaf membership promotes the actual subscriber
+    /// into the bounded EAGER set. See [`Self::note_dm_inbox_owner`].
+    dm_inbox_owners: Mutex<DmInboxOwnerRegistry>,
     /// Issue #380: Leaf skips pass-through eager-set refresh.
     participation: ParticipationMode,
     /// Why this process selected Leaf or Full (diagnostics / startup log).
@@ -2363,6 +2368,7 @@ impl PubSubManager {
             #[cfg(test)]
             admitted_transport_id_reads: reads,
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
+            dm_inbox_owners: Mutex::new(DmInboxOwnerRegistry::default()),
             participation: ParticipationMode::Leaf,
             participation_reason: "default_leaf".to_string(),
             passthrough_refresh_runs: AtomicU64::new(0),
@@ -3878,6 +3884,27 @@ impl PubSubManager {
         self.apply_preferred_eager_peer(plane, topic_ids).await;
     }
 
+    /// #1455: record the machine that owns `topic_id` — the recipient of a
+    /// direct message owns their own inbox topic. A Leaf publisher's bounded
+    /// EAGER set is chosen without any subscription signal (the gossip wire
+    /// has no SUBSCRIBE message; tied PeerScores resolve by hash order), so
+    /// on a plane with bystander daemons the single EAGER inbox frame can
+    /// land on a Leaf that refuses unsubscribed pass-through and never reach
+    /// the subscriber — the durable send then pays the 250 ms legacy bus
+    /// fallback. The recorded owner outranks the C5b Full/bootstrap
+    /// preference while it stays on the connected plane.
+    pub(crate) fn note_dm_inbox_owner(&self, topic_id: TopicId, owner: MachineId) {
+        lock_std(&self.dm_inbox_owners).note(topic_id, PeerId::new(owner.0));
+    }
+
+    /// #1455: the recorded inbox owner, but only while it is a member of
+    /// `plane`. A recipient that moved machines or went offline must not
+    /// pin eager selection; the caller falls back to the stock choice.
+    fn dm_inbox_owner_on_plane(&self, topic_id: TopicId, plane: &[PeerId]) -> Option<PeerId> {
+        let owner = lock_std(&self.dm_inbox_owners).get(&topic_id)?;
+        plane.contains(&owner).then_some(owner)
+    }
+
     /// Pre-subscribe a topic id (C4) so the first later `publish_topic_id`
     /// is not the PlumTree join. Idempotent. Leaf-safe: uses
     /// [`Self::subscribe_topic_id`] (subscribed path) and does not walk
@@ -4045,6 +4072,14 @@ impl PubSubManager {
             return;
         }
         let preferred = membership.preferred;
+        // #1455: on a Leaf writer an inbox owner recorded by the durable
+        // send path outranks the C5b Full/bootstrap pick — the owner is the
+        // one peer known to subscribe to this topic. #807 stays intact: the
+        // Full arm above returned already, so Full never forces a preferred
+        // eager peer.
+        let preferred = self
+            .dm_inbox_owner_on_plane(topic_id, &membership.full)
+            .or(preferred);
         if self.group_topic_by_id.read().await.contains_key(&topic_id) {
             // The singular SG wrapper replaces the entire persistent set.
             // Preserve an existing roster preference through membership
@@ -4105,6 +4140,36 @@ struct TopicMembership {
     full: Vec<PeerId>,
     /// The actual selected Full/bootstrap peer for C5b, when connected.
     preferred: Option<PeerId>,
+}
+
+/// #1455: bounded inbox-owner registry for the durable DM send path.
+/// FIFO eviction keeps a long-lived daemon at O(CAP) entries; an evicted or
+/// stale owner is inert because the preference applies only while the owner
+/// is on the current connected plane.
+#[derive(Default)]
+struct DmInboxOwnerRegistry {
+    owners: HashMap<TopicId, PeerId>,
+    order: VecDeque<TopicId>,
+}
+
+impl DmInboxOwnerRegistry {
+    const CAP: usize = 512;
+
+    fn note(&mut self, topic: TopicId, owner: PeerId) {
+        if !self.owners.contains_key(&topic) {
+            if self.order.len() >= Self::CAP {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.owners.remove(&evicted);
+                }
+            }
+            self.order.push_back(topic);
+        }
+        self.owners.insert(topic, owner);
+    }
+
+    fn get(&self, topic: &TopicId) -> Option<PeerId> {
+        self.owners.get(topic).copied()
+    }
 }
 
 impl TopicMembership {
@@ -6705,6 +6770,144 @@ mod tests {
             role_for(&manager, topic, other_eager),
             "excluded",
             "the disconnected eager peer must leave the topic"
+        );
+    }
+
+    /// WHY (#1455): with bystander daemons on the plane a Leaf publisher
+    /// picks its two EAGER targets with no subscription signal — tied
+    /// PeerScores resolve in per-process-randomised hash order, so the
+    /// single inbox EAGER frame can land on Leaves that refuse unsubscribed
+    /// pass-through and never reach the recipient; the durable send then
+    /// pays the 250 ms legacy bus fallback. The send path records the
+    /// recipient machine as the inbox owner, and Leaf membership promotes
+    /// that owner eager ahead of the C5b Full/bootstrap choice while it
+    /// stays connected. With the pin the owner seat is deterministic; the
+    /// sweep at the end covers five independent owner draws so a regression
+    /// that drops the pin slips through only ~(2/7)^5 of the time.
+    #[tokio::test]
+    async fn leaf_dm_inbox_owner_is_promoted_eager_over_bystanders() {
+        let bystanders = [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32]];
+        let owner = [7; 32];
+        let mut plane = bystanders.to_vec();
+        plane.push(owner);
+        let manager =
+            membership_manager(2, None, plane.iter().copied().map(PeerId::new).collect()).await;
+        let name = "x0x/dm/v1/inbox/1455-owner-eager";
+        let topic = TopicId::new([95; 32]);
+        // No subscribe call: the sender is not subscribed to the
+        // recipient's inbox (no trusted direct connect), so the publish
+        // itself must form the topic membership — the production cold shape.
+        manager.note_dm_inbox_owner(topic, MachineId(owner));
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("dm-1455-a"))
+            .await
+            .unwrap();
+        await_frame_to(&manager, owner, MessageKind::Eager).await;
+        assert_eq!(role_for(&manager, topic, owner), "eager");
+        // The Leaf ceiling still caps EAGER fan-out at two: the owner plus
+        // one hash-order bystander; every other bystander stays a lazy
+        // member (IHAVE/IWANT-repair-eligible).
+        let roles = plane_roles(&manager, topic, &plane);
+        assert_eq!(
+            roles.iter().filter(|(_, role)| role == "eager").count(),
+            2,
+            "eager degree stays capped: {roles:?}"
+        );
+        assert_eq!(
+            roles.iter().filter(|(_, role)| role == "lazy").count(),
+            bystanders.len() - 1,
+            "remaining bystanders stay lazy members: {roles:?}"
+        );
+
+        // A later publish re-applies membership idempotently; the owner
+        // must stay eager rather than churn.
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("dm-1455-b"))
+            .await
+            .unwrap();
+        assert_eq!(role_for(&manager, topic, owner), "eager");
+
+        // The recipient leaves the plane (moved or offline): the stale
+        // owner preference must lapse and the degree refill from the plane
+        // instead of holding a disconnected peer eager.
+        set_plane(&manager, bystanders.to_vec());
+        manager
+            .publish_topic_id(name.into(), topic, Bytes::from("dm-1455-c"))
+            .await
+            .unwrap();
+        assert_ne!(
+            role_for(&manager, topic, owner),
+            "eager",
+            "a disconnected owner must not stay eager"
+        );
+        assert_eq!(
+            plane_roles(&manager, topic, &bystanders)
+                .iter()
+                .filter(|(_, role)| role == "eager")
+                .count(),
+            2,
+            "degree refills from the plane after the owner leaves"
+        );
+
+        // Sweep further owners on fresh topics: saorsa-gossip resolves tied
+        // scores in per-process-randomised hash order, so ONE owner-topic
+        // can miss its owner by luck. Five independent owner draws miss all
+        // five seats only ~(2/7)^5 of the time, which is what makes this
+        // test a usable pre-fix discriminator.
+        for (index, sweep_owner) in [[8; 32], [9; 32], [10; 32], [11; 32]]
+            .into_iter()
+            .enumerate()
+        {
+            let sweep_topic = TopicId::new([96 + index as u8; 32]);
+            let mut sweep_plane = bystanders.to_vec();
+            sweep_plane.push(sweep_owner);
+            set_plane(&manager, sweep_plane);
+            manager.note_dm_inbox_owner(sweep_topic, MachineId(sweep_owner));
+            manager
+                .publish_topic_id(
+                    format!("x0x/dm/v1/inbox/1455-sweep-{index}"),
+                    sweep_topic,
+                    Bytes::from(format!("sweep-{index}")),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                role_for(&manager, sweep_topic, sweep_owner),
+                "eager",
+                "sweep owner {index} must hold an eager seat on its own topic"
+            );
+        }
+    }
+
+    /// #1455: the owner registry is bounded — a daemon that DMs thousands
+    /// of agents must not grow it without limit, and eviction is FIFO so a
+    /// re-noted topic keeps its place instead of duplicating queue entries.
+    #[test]
+    fn dm_inbox_owner_registry_is_bounded_fifo() {
+        let mut registry = DmInboxOwnerRegistry::default();
+        let id_for = |i: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            bytes
+        };
+        for i in 0..u32::try_from(DmInboxOwnerRegistry::CAP).expect("cap fits u32") {
+            let bytes = id_for(i);
+            registry.note(TopicId::new(bytes), PeerId::new(bytes));
+        }
+        let oldest = TopicId::new(id_for(0));
+        assert!(registry.get(&oldest).is_some());
+        // Re-noting a known topic must not grow the FIFO queue past CAP.
+        registry.note(oldest, PeerId::new([0xEE; 32]));
+        assert!(registry.get(&oldest).is_some(), "re-note keeps the topic");
+        registry.note(TopicId::new([0xAA; 32]), PeerId::new([0xAA; 32]));
+        assert!(
+            registry.get(&oldest).is_none(),
+            "the CAP+1-th distinct topic evicts the oldest entry"
+        );
+        assert_eq!(
+            registry.get(&TopicId::new([0xAA; 32])),
+            Some(PeerId::new([0xAA; 32])),
+            "the newest note survives the eviction"
         );
     }
 
