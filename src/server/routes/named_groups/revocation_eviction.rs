@@ -4816,6 +4816,7 @@ async fn reconcile_evjournals(
 fn waiting_json(waiting: &WaitingState) -> serde_json::Value {
     let named: Vec<String> = waiting.named.iter().map(hex::encode).collect();
     let designated = (waiting.cause == WaitingCause::WaitingForDesignatedAdmin
+        || waiting.cause == WaitingCause::UnresolvedDesignatedAdmin
         || waiting.cause == WaitingCause::LocalCommitterIneligible)
         .then(|| named.first().cloned())
         .flatten();
