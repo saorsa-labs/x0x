@@ -1600,7 +1600,10 @@ pub struct ReseatJournalV1 {
     pub authorisation: ReseatAuthorisation,
     /// The re-seat invite link.
     pub invite: String,
-    /// BLAKE3 of the full live record (JSON) at journal time.
+    /// BLAKE3 of the live record's canonical JSON at journal time
+    /// ([`ReseatJournalV1::digest_record`], #1652). Journals an older
+    /// binary wrote hold the plain-JSON digest;
+    /// [`ReseatJournalV1::staged_result_ready`] still matches both.
     pub record_digest: [u8; 32],
     /// The journal phase.
     pub phase: ReseatPhase,
@@ -1614,10 +1617,46 @@ pub struct ReseatJournalV1 {
     pub started_at_ms: u64,
 }
 
+/// The domain tag of the canonical journal record digest (#1652), in the
+/// style of `x0x.policy-hash.v1` and `x0x.group-genesis-hash.v1`.
+const RESEAT_RECORD_DIGEST_DOMAIN: &[u8] = b"x0x.reseat-record-digest.v1";
+
 impl ReseatJournalV1 {
-    /// BLAKE3 of a record's JSON, as [`Self::record_digest`] holds it.
+    /// BLAKE3 of a record's canonical JSON, as [`Self::record_digest`]
+    /// holds it (#1652). Plain `serde_json::to_vec(&GroupInfo)` is not a
+    /// canonical encoding: `issued_invites` and
+    /// `issued_invite_secrets` are hash tables, so their JSON key and
+    /// element order is per-process iteration order and the digest of an
+    /// unchanged record changes across a restart. Canonical here is the
+    /// record as a `serde_json::Value` — every object's keys sorted,
+    /// because `serde_json::Map` is a `BTreeMap` without the
+    /// `preserve_order` feature — with the invite-secrets array replaced
+    /// by the sorted set, prefixed with the `x0x.reseat-record-digest.v1`
+    /// domain tag. Every other serialized collection in `GroupInfo` is a
+    /// `BTreeMap`, `BTreeSet` or `Vec`,
+    /// which already serialise in a fixed order; a new unordered field
+    /// must be canonicalised here too (and this function returns `None`
+    /// if the secrets field it expects is absent, so a rename fails
+    /// closed instead of hashing a non-canonical encoding).
     #[must_use]
     pub fn digest_record(record: &GroupInfo) -> Option<[u8; 32]> {
+        let mut value = serde_json::to_value(record).ok()?;
+        let mut secrets: Vec<String> = record.issued_invite_secrets.iter().cloned().collect();
+        secrets.sort();
+        *value.get_mut("issued_invite_secrets")? =
+            serde_json::Value::Array(secrets.into_iter().map(serde_json::Value::String).collect());
+        let bytes = serde_json::to_vec(&value).ok()?;
+        let mut preimage = Vec::with_capacity(RESEAT_RECORD_DIGEST_DOMAIN.len() + bytes.len());
+        preimage.extend_from_slice(RESEAT_RECORD_DIGEST_DOMAIN);
+        preimage.extend_from_slice(&bytes);
+        Some(*blake3::hash(&preimage).as_bytes())
+    }
+
+    /// The pre-#1652 construction: BLAKE3 of plain `serde_json::to_vec`.
+    /// Kept only so [`Self::staged_result_ready`] still recognises the
+    /// original of a journal an older binary wrote; journals this binary
+    /// writes hold the canonical digest.
+    fn legacy_digest_record(record: &GroupInfo) -> Option<[u8; 32]> {
         serde_json::to_vec(record)
             .ok()
             .map(|bytes| *blake3::hash(&bytes).as_bytes())
@@ -1639,7 +1678,9 @@ impl ReseatJournalV1 {
     /// authorisation, not only to the seat:
     /// - the phase is past [`ReseatPhase::Prepared`]: the staging was open
     ///   durably before the staged join started;
-    /// - the record is not the journalled original (digest);
+    /// - the record is not the journalled original (digest): its canonical
+    ///   digest, or the pre-#1652 plain-JSON digest of a journal an older
+    ///   binary wrote;
     /// - it is the authorised group, uncontained (or holding only the
     ///   journalled original's marker, which the staged record holds until
     ///   the swap lifts it), and its head is past the authorisation's invite
@@ -1652,7 +1693,12 @@ impl ReseatJournalV1 {
         if self.phase == ReseatPhase::Prepared {
             return false;
         }
-        if Self::digest_record(live).is_none_or(|digest| digest == self.record_digest) {
+        let Some(canonical) = Self::digest_record(live) else {
+            return false;
+        };
+        if canonical == self.record_digest
+            || Self::legacy_digest_record(live).is_some_and(|digest| digest == self.record_digest)
+        {
             return false;
         }
         live.stable_group_id() == self.authorisation.fields.group
@@ -2604,7 +2650,7 @@ mod tests {
         ReseatJournalV1 {
             authorisation,
             invite: String::new(),
-            record_digest: *blake3::hash(&live_record).as_bytes(),
+            record_digest: ReseatJournalV1::digest_record(original).expect("digest"),
             phase: ReseatPhase::Prepared,
             live_key: original.mls_group_id.clone(),
             live_record,
@@ -2676,6 +2722,107 @@ mod tests {
         let mut public = keyless.clone();
         public.policy.confidentiality = crate::groups::GroupConfidentiality::SignedPublic;
         assert!(journal.staged_result_ready(&public, &subject, false));
+    }
+
+    /// A record with entries in both serialized hash-table fields
+    /// (`issued_invites`, `issued_invite_secrets`), whose JSON order is
+    /// per-process iteration order (#1652).
+    fn invite_heavy_record(admin: &AgentKeypair) -> GroupInfo {
+        let subject = "ab".repeat(32);
+        let mut original = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "ef".repeat(32),
+        );
+        original.add_member(
+            subject,
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            None,
+        );
+        original.seal_commit(admin, 1_000).expect("seal");
+        for n in 0..12_u64 {
+            original.issued_invites.insert(
+                format!("secret-{n:02}"),
+                crate::groups::IssuedInviteRecord {
+                    created_at_secs: n,
+                    expires_at_secs: 0,
+                    max_role: crate::groups::GroupRole::Member,
+                    consumed_by: (n % 2 == 0).then(|| format!("consumer-{n}")),
+                    consumed_at_ms: None,
+                    intended_joiner: (n % 3 == 0).then(|| format!("joiner-{n}")),
+                    origin: crate::groups::InviteOrigin::Explicit,
+                    signed_link: None,
+                },
+            );
+            original
+                .issued_invite_secrets
+                .insert(format!("invite-{n:02}"));
+        }
+        original
+    }
+
+    /// #1652: the journal digest is over a canonical encoding, pinned
+    /// here byte for byte — the domain tag, the record as a
+    /// `serde_json::Value` (every object's keys sorted) and the
+    /// invite-secrets array sorted. Before the fix the digest was BLAKE3
+    /// of plain `serde_json::to_vec(&GroupInfo)`, whose field order is
+    /// the struct's declaration order and whose hash-table fields follow
+    /// iteration order.
+    #[test]
+    fn reseat_record_digest_is_over_canonical_json() {
+        let admin = keypair();
+        let original = invite_heavy_record(&admin);
+        let digest = ReseatJournalV1::digest_record(&original).expect("digest");
+        let mut canonical = serde_json::to_value(&original).expect("value");
+        let mut secrets: Vec<String> = original.issued_invite_secrets.iter().cloned().collect();
+        secrets.sort();
+        *canonical
+            .get_mut("issued_invite_secrets")
+            .expect("secrets member") =
+            serde_json::Value::Array(secrets.into_iter().map(serde_json::Value::String).collect());
+        let mut preimage = b"x0x.reseat-record-digest.v1".to_vec();
+        preimage.extend_from_slice(&serde_json::to_vec(&canonical).expect("json"));
+        assert_eq!(digest, *blake3::hash(&preimage).as_bytes());
+    }
+
+    /// #1652: the digest of an unchanged record survives a JSON round
+    /// trip, which rebuilds both hash tables with fresh random seeds.
+    /// Before the fix the same record digested differently after a
+    /// restart, so the originality guard in `staged_result_ready` could
+    /// stop recognising the journalled original.
+    #[test]
+    fn reseat_record_digest_survives_a_json_round_trip() {
+        let admin = keypair();
+        let original = invite_heavy_record(&admin);
+        let reloaded =
+            serde_json::from_str::<GroupInfo>(&serde_json::to_string(&original).expect("json"))
+                .expect("round trip");
+        assert_eq!(
+            ReseatJournalV1::digest_record(&original).expect("digest"),
+            ReseatJournalV1::digest_record(&reloaded).expect("digest"),
+        );
+    }
+
+    /// #1652: a journal an older binary wrote holds the pre-fix digest,
+    /// BLAKE3 of plain `serde_json::to_vec`. `staged_result_ready` still
+    /// recognises the journalled original against it (fail closed) and a
+    /// genuine staged result stays ready.
+    #[test]
+    fn staged_result_ready_still_matches_a_legacy_journal_digest() {
+        let admin = keypair();
+        let subject = "ab".repeat(32);
+        let original = invite_heavy_record(&admin);
+        let legacy = *blake3::hash(&serde_json::to_vec(&original).expect("json")).as_bytes();
+        let mut journal = journal_fixture(&admin, &original);
+        journal.record_digest = legacy;
+        journal.phase = ReseatPhase::Staging;
+        assert!(!journal.staged_result_ready(&original, &subject, true));
+        let mut staged = original.clone();
+        staged.name = "staged".to_string();
+        staged.seal_commit(&admin, 2_000).expect("seal");
+        assert!(journal.staged_result_ready(&staged, &subject, true));
     }
 
     #[test]
