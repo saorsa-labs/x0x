@@ -1,27 +1,25 @@
-//! W3-H case for #1360 (ADR 0113 Validation row H7-1,
-//! `w3h_s7_h7_1_copied_key_creates_no_duplicate`, #824): a device with a
-//! copied owner key does not mint a second Home.
+//! W3-H case for #1360 (ADR 0113 H7-1, #824): a device with a copied
+//! owner key does not mint a second Home. O holds Home H. O certifies,
+//! trusts and enrolls B. With O~B partitioned, B starts with the copied
+//! `user.key`, trusts O and enrolls O and itself. C (never started) gives
+//! the seat's third agent id. The block lasts 200 s from B's start; at
+//! 10 s the case calls `POST /home` on B, at 195 s `POST /home/seat` for
+//! C. After the lift O seats B and B redeems in Home mode.
 //!
-//! O is the owner device and holds Home H. B is a second device of the
-//! same owner. C is never started; its agent id is the seat's third id.
-//! O issues B's agent certificate, trusts B and enrolls B's machine. The
-//! O~B link is partitioned, then B starts with the copied `user.key`,
-//! trusts O and enrolls O and itself. B has no Home-shaped group.
-//!
-//! Steps: the block lasts 200 s from B's start. At 10 s the case calls
-//! `POST /home` on B, at 195 s `POST /home/seat` on B for C. The block
-//! lifts and B dials O once (its startup dial fell inside the block). O
-//! seats B and B redeems in Home mode.
-//!
-//! GREEN (ADR 0113 §2, §3, §6): B never holds a Home-shaped group other
-//! than H. During the block `GET /home` is `binding_pending`, `waiting_for:
+//! GREEN (§2, §3, §6): B never holds a Home-shaped group other than H.
+//! For the whole block `GET /home` is `binding_pending`, `waiting_for:
 //! owner_sync_session`, naming O; `POST /home` is 409 `binding_pending`;
-//! the seat is 409 `home_unbound`. After redemption B is `bound` to H with
-//! `source: seated`.
+//! the seat is 409 `home_unbound`. Then B is `bound` to H, `seated`.
+//! RED (`main`): provisioning waits `(rank + 1) × 90 s`, then provisions
+//! locally, and the seat returns 200 with that group's id ([`CAUSE`]).
 //!
-//! RED (`main`, #824): startup provisioning waits `(rank + 1) × 90 s`,
-//! then provisions locally, and the seat returns 200 with that group's id
-//! ([`CAUSE`]). The S7 slice flips the test to expect GREEN.
+//! Differences from the ADR row: (1) RED accepts a duplicate up to the
+//! end of the 200 s block, not only within 180 s (`main`'s latest
+//! deadline is 180 s, so the cause is the same). (2) B dials O once after
+//! the lift; the harness has no redial. (3) The `bound.group_id` /
+//! `bound.source` shape is a guess from §6. (4) B enrolls O after start
+//! (the harness cannot do it before), so S7 must check "other machines
+//! are enrolled" at evaluation time, not only at startup.
 
 #![cfg(test)]
 
@@ -62,6 +60,9 @@ struct Watch {
     block_states: Vec<String>,
     /// A `GET /home` body during the block that had the typed settle wait.
     typed_wait: Option<Value>,
+    /// A `GET /home` sample during the block without the typed wait (the
+    /// ADR says the wait holds for the whole block).
+    untyped: bool,
     /// Last `GET /home` body during the block.
     last_block_home: Value,
 }
@@ -130,6 +131,13 @@ fn is_conflict(status: StatusCode, body: &Value, reason: &str) -> bool {
             .any(|field| field.as_str() == Some(reason))
 }
 
+/// The two ways O refuses the seat when B's duplicate won the election:
+/// O never serves H as `local` (the wait expires) or a 409
+/// `adoption_pending`. Any other error stays INFRA.
+fn seat_refused(error: &anyhow::Error) -> bool {
+    expired(error) || format!("{error:#}").contains("\"reason\":\"adoption_pending\"")
+}
+
 /// Observe B until `until` (virtual time since the fabric origin).
 async fn watch_b(
     sim: &Sim,
@@ -161,7 +169,9 @@ async fn watch_b(
             if !watch.block_states.contains(&state) {
                 watch.block_states.push(state);
             }
-            if watch.typed_wait.is_none() && is_typed_settle_wait(&home, &ctx.o_machine) {
+            if !is_typed_settle_wait(&home, &ctx.o_machine) {
+                watch.untyped = true;
+            } else if watch.typed_wait.is_none() {
                 watch.typed_wait = Some(home.clone());
             }
             watch.last_block_home = home;
@@ -254,9 +264,7 @@ async fn start_copied_key_device(sim: &mut Sim, owner: &UserKeypair) -> Result<(
     Ok(())
 }
 
-/// B dials O once the block lifts. B's only bootstrap peer is O, and its
-/// startup dial fell inside the block, so nothing redials on its own
-/// within the case budget.
+/// B dials O once the block lifts (its startup dial fell inside it).
 async fn b_dials_o(sim: &Sim) -> Result<()> {
     let network = sim
         .state("B")?
@@ -351,13 +359,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let lift_mark = sim.fabric().mark_indexed("fault O~B healed");
     b_dials_o(sim).await?;
 
-    // After the block: O seats B, B redeems in Home mode. On `main` B's
-    // duplicate can win the Home election, and then O refuses to seat
-    // (409 `adoption_pending`). That is a consequence of the duplicate,
-    // so the case records it and does not report infra.
+    // O seats B, B redeems. On `main` B's duplicate can win the election
+    // and O refuses (see `seat_refused`): a note, not INFRA.
     let invite = match sim.home_seat("O", "B", &home).await {
         Ok(invite) => invite,
-        Err(error) if watch.duplicate.is_some() => {
+        Err(error) if watch.duplicate.is_some() && seat_refused(&error) => {
             receipt.note(format!("O seat for B after the lift: {error:#}"));
             String::new()
         }
@@ -431,6 +437,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     ));
     let passed = watch.duplicate.is_none()
         && watch.typed_wait.is_some()
+        && !watch.untyped
         && create_typed
         && seat_typed
         && seated.is_some();
@@ -490,6 +497,12 @@ async fn run(case: &str) -> Receipt {
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
 )]
 fn w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate() -> Result<()> {
     super::block_on_paused(async move {
