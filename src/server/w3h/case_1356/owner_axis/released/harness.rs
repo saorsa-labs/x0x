@@ -421,6 +421,17 @@ impl Released {
     }
 }
 
+/// A row that ends early (`?` or a panic) does not call [`Released::stop`].
+/// Kill the child here, so no released daemon outlives its row.
+impl Drop for Released {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 /// The SHA-256 of each S3 sidecar file under `dir`, and the issued re-seats
 /// for `subject` they hold.
 pub(super) fn sidecar_state(dir: &Path, subject: &str) -> Result<(Vec<(PathBuf, String)>, usize)> {
