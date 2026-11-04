@@ -11,22 +11,25 @@
 //!
 //! Injections, in ADR order: (1) one signature byte changed, not
 //! re-signed (`signature`); (2) a wrong policy hash (`policy_mismatch`);
-//! (4) O's removal commit r+1 in place of A's r+3 (`removal_mismatch`);
-//! (6) role Admin, where J was a Member (`role_raised`); (7) a terminal
-//! roster hash that does not match (`binding_mismatch`). Check 2 is not
-//! injected (the ADR's own note).
+//! (3) a seating commit that did not seat J: O's r+1, which removes X
+//! before J joins (`not_previously_seated`); (4) O's removal commit r+1
+//! in place of A's r+3 (`removal_mismatch`); (5) a different owner
+//! certificate digest for J (`certificate_invalid`); (6) role Admin,
+//! where J was a Member (`role_raised`); (7) a terminal roster hash that
+//! does not match (`binding_mismatch`). Check 2 is not injected (the ADR's
+//! own note).
 //!
-//! Not injected: (3) and (5) wait for an Engineer ruling. (3) "subject E,
-//! never seated": the product's check 1 also binds the mandate subject to
-//! the event's added agent (`src/groups/recovery.rs:1414`), so it refuses
-//! as `signature` before check 4; an event that adds E is refused before
-//! the §3a rule by the certificate gate
-//! (`src/server/routes/named_groups.rs:16637`). (5) "a revoked owner
-//! certificate for J": revocation is per identity, not per certificate,
-//! and the product checks it in check 5, not check 6
-//! (`src/groups/recovery.rs:1474`,
-//! `removal_mismatch`); the same certificate gate also refuses a revoked
-//! J first, with no typed cause. The row adds no stand-in for either.
+//! (3) and (5) are the Engineer's option (b) (4 Nov 2026 04:32 GMT), a
+//! test-only change to the ADR text. The ADR's (3) "subject E, never
+//! seated" cannot reach check 4: the product's check 1 also binds the
+//! mandate subject to the event's added agent
+//! (`src/groups/recovery.rs:1414`), so it refuses as `signature`, and an
+//! event that adds E is refused before the §3a rule by the certificate
+//! gate (`src/server/routes/named_groups.rs:16637`). The ADR's (5) "a
+//! revoked owner certificate for J" cannot reach check 6: revocation is
+//! per identity, not per certificate, and the product checks it in check
+//! 5 (`src/groups/recovery.rs:1474`, `removal_mismatch`); the same
+//! certificate gate also refuses a revoked J first, with no typed cause.
 //!
 //! The observable is M1's WARN line `MemberAdded: reseat_mandate_invalid`
 //! with its `cause` field (the receive path exposes no API field or
@@ -51,10 +54,10 @@ const CAUSE_RM2: &str = "the row's main observation: M1 applies a forged re-seat
                          does not apply A's released real seal; `observed` lists each \
                          failing step";
 /// How long M1 has to log its refusal of one forgery. A window reads every
-/// refusal line from its own start, so a refusal that comes after its
-/// window has expired, or a second refusal of a re-delivered forgery, also
-/// counts in the next window. The row cannot pass by it: the next window
-/// then holds a wrong cause, a failing sub-check.
+/// refusal line from its own start. [`M1Hold`] drops a resend outside its
+/// window, but a refusal that M1 logs after its window has expired also
+/// counts in the next window. The row cannot pass by it: the late window
+/// has no cause and the next one a wrong cause, both failing sub-checks.
 const REFUSAL_WAIT: Duration = Duration::from_secs(60);
 /// The refusal line and its cause field, as `LogText` records them.
 const REFUSAL: &str = "reseat_mandate_invalid";
@@ -178,8 +181,8 @@ fn needle_of(mandate: &ReseatMandateV1) -> String {
     mandate.signature.chars().take(64).collect()
 }
 
-/// The five forgeries, built from A's real event `real` (its JSON).
-/// `r1_hash` is O's r+1 removal commit as M1 holds it.
+/// The seven forgeries, built from A's real event `real` (its JSON).
+/// `r1_hash` is O's r+1 removal of X as M1 holds it.
 fn forgeries(sim: &Sim, real: &Value, r1_hash: &str) -> Result<Vec<Forgery>> {
     let mandate: ReseatMandateV1 = serde_json::from_value(
         real.get("reseat_mandate")
@@ -209,15 +212,31 @@ fn forgeries(sim: &Sim, real: &Value, r1_hash: &str) -> Result<Vec<Forgery>> {
     flipped.signature = hex::encode(raw);
     one("(1) one signature byte changed", "signature", flipped)?;
     type Edit = fn(&mut crate::groups::recovery::ReseatMandateFields, &str);
-    let edits: [(&'static str, &'static str, Edit); 4] = [
+    let edits: [(&'static str, &'static str, Edit); 6] = [
         ("(2) a wrong policy hash", "policy_mismatch", |f, _| {
             f.policy_hash = blake3::hash(b"w3h rm2: wrong policy").to_hex().to_string();
         }),
+        (
+            "(3) a seating commit that did not seat J",
+            "not_previously_seated",
+            |f, r1| {
+                f.seating_commit_hash = r1.to_string();
+            },
+        ),
         (
             "(4) O's removal r+1 in place of r+3",
             "removal_mismatch",
             |f, r1| {
                 f.removal_commit_hash = r1.to_string();
+            },
+        ),
+        (
+            "(5) a different owner certificate for J",
+            "certificate_invalid",
+            |f, _| {
+                f.certificate_digest = blake3::hash(b"w3h rm2: another certificate")
+                    .to_hex()
+                    .to_string();
             },
         ),
         ("(6) role Admin for a Member", "role_raised", |f, _| {

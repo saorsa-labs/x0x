@@ -120,7 +120,7 @@ priority = 60
 
 # ADR 0109 H-S3-rm2 (#1572): the d3-shaped five-node prefix with M1
 # seated, the 30-minute virtual advance and a re-seat like the H-S3-c
-# rows, then five forgery windows of up to 60 s of virtual time each.
+# rows, then seven forgery windows of up to 60 s of virtual time each.
 # One run took about 161 s in the 12-CPU Lima VM, so about 320 s on the
 # 4-vCPU runner (the #1780 ratio). The 300 s kill above would end it with
 # no receipt, so it gets 15 minutes and starts early.
