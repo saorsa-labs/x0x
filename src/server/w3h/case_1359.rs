@@ -14,14 +14,17 @@
 //! 3. t=2: J calls `POST /groups/join`. B is the only reachable admin.
 //!    The case waits for the shipped join-result window `T` (120 s TreeKEM,
 //!    600 s GSS; D102) plus margin.
-//! 4. Desired (ADR 0112): B seats J, J is `active` (TreeKEM: J installed
-//!    the group) and J decrypts B's next group message. A roster seat
-//!    alone does not pass.
+//! 4. Desired (ADR 0112): by T, B seats J, J is `active` (TreeKEM: J
+//!    installed the group) and J decrypts B's next group message. J sends
+//!    no `MemberJoined` frame to A. A roster seat alone does not pass. The
+//!    "one consumption" check needs S6's consumption root, so the S6 code
+//!    slice adds it, together with the explicit V5 mint.
 //!
 //! Main: a receiver other than the inviter keeps J's `MemberJoined` as
 //! recovery evidence and does not redeem it, and J pins the join result to
 //! the inviter (`validate_join_result_inviter`). So B never seats J, and
-//! J's attempt ends with no usable membership. The causes record both.
+//! J's attempt (pinned to A's key) ends `timed_out` with no usable
+//! membership. The causes record both, each only when the case observes it.
 
 #![cfg(test)]
 
@@ -45,7 +48,7 @@ const FINAL: &str = "j_usable_member_via_b_with_inviter_a_offline";
 const CAUSE_NOT_REDEEMED: &str =
     "B received J's MemberJoined and did not seat J (only the inviter redeems)";
 const CAUSE_PINNED: &str =
-    "J's join result is pinned to inviter A, and J has no usable membership by T";
+    "J's attempt pins inviter A's key and ends timed_out with no usable membership";
 
 #[derive(Clone, Copy)]
 enum Plane {
@@ -101,13 +104,47 @@ async fn seat(
     .await
 }
 
+/// Whether `label` installed a TreeKEM group under its local key for
+/// `group`.
 async fn has_treekem(sim: &Sim, label: &str, group: &str) -> Result<bool> {
-    Ok(sim
-        .state(label)?
-        .treekem_groups
-        .read()
-        .await
-        .contains_key(group))
+    let state = sim.state(label)?;
+    let key = {
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, group).map(|(key, _)| key.to_string())
+    };
+    let Some(key) = key else {
+        return Ok(false);
+    };
+    let keyed = state.treekem_groups.read().await.contains_key(&key);
+    Ok(keyed)
+}
+
+/// The agent id of the inviter key that J's pending attempt for `group`
+/// pins (the key its join result must verify under).
+fn pinned_inviter(sim: &Sim, group: &str) -> Result<Option<String>> {
+    let state = sim.state("J")?;
+    let attempts = state
+        .pending_join_attempts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key_b64 = attempts
+        .values()
+        .find(|attempt| {
+            attempt.local_group_key == group || attempt.invite_group_id.eq_ignore_ascii_case(group)
+        })
+        .map(|attempt| attempt.inviter_public_key_b64.clone());
+    drop(attempts);
+    let Some(key_b64) = key_b64 else {
+        return Ok(None);
+    };
+    let bytes = BASE64
+        .decode(key_b64)
+        .context("pinned inviter key base64")?;
+    let key = ant_quic::MlDsaPublicKey::from_bytes(&bytes)
+        .map_err(|error| anyhow!("pinned inviter key: {error:?}"))?;
+    Ok(Some(hex::encode(
+        crate::identity::AgentId::from_public_key(&key).as_bytes(),
+    )))
 }
 
 async fn join_outcome(sim: &Sim, group: &str) -> Option<String> {
@@ -302,6 +339,9 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         )
         .await?;
     receipt.note(format!("J join: {status} {body}"));
+    let join_at = sim.fabric().now();
+    let pinned = pinned_inviter(sim, &group)?;
+    receipt.note(format!("J's attempt pins inviter {pinned:?}"));
     let window = plane.window();
     let budget = window + MARGIN;
     let reached = wait_for(
@@ -343,25 +383,66 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         at(sim),
     );
 
+    // ADR 0112: "no traffic to A". Count J's MemberJoined frames that J
+    // wrote, or tried to send, to A after A stopped.
+    let a_peer = sim.peer("A")?;
+    let j_peer = sim.peer("J")?;
+    let is_request = |bytes: &[u8]| {
+        let text = String::from_utf8_lossy(bytes);
+        text.contains("\"member_joined\"") && text.contains(&j)
+    };
+    let written_to_a = sim
+        .fabric()
+        .writes_from_between(&j_peer, position..usize::MAX)
+        .into_iter()
+        .filter(|write| write.lane.dst == a_peer.0 && is_request(&write.bytes))
+        .count();
+    let refused_to_a = sim
+        .fabric()
+        .refused_from(&j_peer, position)
+        .into_iter()
+        .filter(|refusal| {
+            refusal.dst == a_peer.0 && refusal.bytes.as_deref().is_some_and(is_request)
+        })
+        .count();
+    let traffic_to_a = written_to_a + refused_to_a;
+    receipt.note(format!(
+        "J's MemberJoined frames to A after A stopped: {written_to_a} written, \
+         {refused_to_a} refused"
+    ));
+
+    // The wait stops as soon as J is usable, so the elapsed time is when
+    // J became usable. The pass needs it, and the decrypt, by T.
     let usable_now = usable(sim, plane, &group, &j).await;
+    let (decrypted, decrypt_detail) = j_decrypts_b(sim, &group).await?;
+    let elapsed = sim.fabric().now().saturating_sub(join_at);
+    let in_time = elapsed <= window;
     let b_seat = seat(sim, "B", &group, &j).await?;
     let j_state = local_membership(sim, "J", &group).await;
     let j_keyed = has_treekem(sim, "J", &group).await?;
     let outcome = join_outcome(sim, &group).await;
-    let (decrypted, decrypt_detail) = j_decrypts_b(sim, &group).await?;
     let detail = format!(
         "B seat for J {b_seat:?}; J membership {j_state:?}, treekem {j_keyed}, \
-         last outcome {outcome:?}; {decrypt_detail}"
+         last outcome {outcome:?}; pinned inviter {pinned:?}; {decrypt_detail}; \
+         {} ms after the join",
+        elapsed.as_millis()
     );
     receipt.note(detail.clone());
     let b_seated = matches!(b_seat, Some((_, true, _)));
     if !b_seated && requests > 0 {
         receipt.cause(CAUSE_NOT_REDEEMED, Some(detail.clone()), true, at(sim));
     }
-    if !usable_now && !decrypted && signed.inviter.eq_ignore_ascii_case(&a) {
+    let pinned_to_a = pinned
+        .as_deref()
+        .is_some_and(|id| id.eq_ignore_ascii_case(&a));
+    if pinned_to_a && !usable_now && outcome.as_deref() == Some("timed_out") {
         receipt.cause(CAUSE_PINNED, Some(detail), true, at(sim));
     }
-    receipt.finish(FINAL, usable_now && decrypted, at(sim));
+    receipt.finish(
+        FINAL,
+        usable_now && decrypted && in_time && traffic_to_a == 0,
+        at(sim),
+    );
     Ok(())
 }
 
