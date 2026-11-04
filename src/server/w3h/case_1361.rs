@@ -1,4 +1,4 @@
-//! W3-H case `w3h_1361_staging_loss_restart_a` (#1361, ADR 0114
+//! W3-H case `w3h_1361_red_staging_loss_restart_a` (#1361, ADR 0114
 //! `s8b_1150_staging_loss`, the restart-A variant with no carry).
 //!
 //! Nodes: A (admin and sealer) and J (joiner). Public HTTP only.
@@ -16,15 +16,29 @@
 //!    encrypted probe goes both ways (J to A and A to J). A `join_state`
 //!    string alone does not pass.
 //!
+//! Each failing expectation records its own cause (ADR 0114: "assert each
+//! failing automatic-completion expectation separately"), so a partial fix
+//! reads RED, not INFRA.
+//!
 //! Baseline on main: J reports `active` but has no TreeKEM group and
-//! cannot encrypt. No path re-Welcomes a seat whose staging is lost.
+//! cannot encrypt or decrypt. No path re-Welcomes a seat whose staging is
+//! lost. The test pins RED with exactly [`CAUSES_ON_MAIN`]; the S8(b)
+//! implementing PR flips the expectation to GREEN and keeps the name.
 //!
 //! The repair bound (D89) has no final number until ADR 0110 (S4) is
 //! accepted. This case uses [`REPAIR_BOUND`], a harness value.
 //!
-//! The ADR's no-carry (10 minute staging horizon), carry and
-//! no-retained-row variants are later slices. The horizon variant needs
-//! the wall-clock shim, because the staging TTL reads `std::time::Instant`.
+//! Gaps against the ADR's variant shape, left to later slices:
+//! - The ADR names the no-carry, restart-A and no-retained-row variants
+//!   separately. This row combines restart-A with no carry (and so with no
+//!   retained row on J).
+//! - The fixed state asks for one leaf. This row counts A's roster listings
+//!   of J, not TreeKEM leaves.
+//! - The fixed state asks for durable keys. This row does not restart J
+//!   after the repair.
+//! - The 10-minute staging-horizon and carry variants are not here. The
+//!   horizon variant needs the wall-clock shim, because the staging TTL
+//!   reads `std::time::Instant`.
 
 #![cfg(test)]
 
@@ -41,9 +55,17 @@ use base64::Engine as _;
 use serde_json::json;
 
 const SEED: u64 = 0x1361_0001;
-const CASE: &str = "w3h_1361_staging_loss_restart_a";
+const CASE: &str = "w3h_1361_red_staging_loss_restart_a";
 const FINAL: &str = "staging_loss_repaired_with_usable_keys";
-const CAUSE: &str = "after staging loss and a base-seated retry, J holds no usable group keys";
+const CAUSE_KEYS: &str = "after staging loss and a base-seated retry, J holds no TreeKEM group";
+const CAUSE_ACTIVE: &str = "after staging loss and a base-seated retry, J does not report active";
+const CAUSE_LISTED: &str =
+    "after staging loss and a base-seated retry, A does not list J exactly once";
+const CAUSE_J_TO_A: &str =
+    "after staging loss and a base-seated retry, J cannot encrypt a probe to A";
+const CAUSE_A_TO_J: &str = "after staging loss and a base-seated retry, J cannot decrypt A's probe";
+/// The causes the row records on main (local red runs, 4 Nov 2026).
+const CAUSES_ON_MAIN: [&str; 3] = [CAUSE_KEYS, CAUSE_J_TO_A, CAUSE_A_TO_J];
 /// The harness repair bound. ADR 0114 takes the final number from ADR
 /// 0110 (S4) under D89; a fix must complete inside this budget.
 const REPAIR_BOUND: Duration = Duration::from_secs(180);
@@ -244,13 +266,14 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         at(sim),
     );
 
-    // Step 2: A restarts and loses its in-memory staging.
+    // Step 2: A restarts. Its staging is in memory only, so the restart
+    // loses it by construction; the check that matters is the seat.
     sim.restart("A", RestartMode::Graceful).await?;
     let staged_after = staged_for(sim, &j).await?;
     let still_seated = listings(sim, &group, &j).await?;
     receipt.evidence(
-        "A's restart lost the staged result, and A's roster still seats J",
-        staged_after == 0 && still_seated == 1,
+        "A's roster still seats J after A's restart",
+        still_seated == 1,
         format!("staged_after_restart={staged_after} a_listings_of_j={still_seated}"),
         at(sim),
     );
@@ -308,17 +331,29 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         "after the bound: membership={active:?} treekem={keyed} a_listings_of_j={listed} \
          j_to_a={j_to_a:?} a_to_j={a_to_j:?}"
     ));
-    if !keyed {
-        receipt.cause(
-            CAUSE,
-            Some(format!(
-                "membership={active:?} treekem=false j_to_a={j_to_a:?}"
-            )),
-            true,
-            at(sim),
-        );
+    let checks = [
+        (CAUSE_KEYS, keyed, format!("treekem={keyed}")),
+        (
+            CAUSE_ACTIVE,
+            active.as_deref() == Some("active"),
+            format!("membership={active:?}"),
+        ),
+        (
+            CAUSE_LISTED,
+            listed == 1,
+            format!("a_listings_of_j={listed}"),
+        ),
+        (CAUSE_J_TO_A, j_to_a.is_ok(), format!("{j_to_a:?}")),
+        (CAUSE_A_TO_J, a_to_j.is_ok(), format!("{a_to_j:?}")),
+    ];
+    let mut all_met = repaired;
+    for (cause, met, observed) in checks {
+        if !met {
+            all_met = false;
+            receipt.cause(cause, Some(observed), true, at(sim));
+        }
     }
-    Ok(repaired && listed == 1 && j_to_a.is_ok() && a_to_j.is_ok())
+    Ok(all_met)
 }
 
 async fn run() -> Receipt {
@@ -347,20 +382,27 @@ async fn run() -> Receipt {
     receipt
 }
 
-/// ADR 0114 `s8b_1150_staging_loss`, restart-A variant. The test expects
-/// the fixed verdict, so it is RED on main until S8(b) re-Welcomes J.
+/// ADR 0114 `s8b_1150_staging_loss`, restart-A variant. Pinned RED with
+/// the causes seen on main until S8(b) re-Welcomes J; the implementing PR
+/// flips this to GREEN.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-fn w3h_1361_staging_loss_restart_a() -> Result<()> {
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
+)]
+fn w3h_1361_red_staging_loss_restart_a() -> Result<()> {
     super::block_on_paused(async move {
         let receipt = run().await;
         ensure!(
-            receipt.verdict() == Some(Verdict::Green),
-            "{CASE}: expected GREEN, got {:?} with causes {:?} (RED is the ADR 0114 \
-             staging-loss baseline)",
+            receipt.verdict() == Some(Verdict::Red) && receipt.named_causes() == CAUSES_ON_MAIN,
+            "{CASE}: expected RED with the ADR 0114 staging-loss causes {CAUSES_ON_MAIN:?}, \
+             got {:?} with causes {:?}",
             receipt.verdict(),
             receipt.named_causes()
         );
