@@ -245,10 +245,50 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         // The defect, observed: record it as the expected cause so the
         // verdict is RED (bug reproduced), not INFRA (harness failure).
         // No API read here: the apply that waits for the Welcome holds
-        // the group membership lock, so a GET would block on it.
+        // the group membership lock, so a GET would block on it. The
+        // daemon's own WARN trail names where the joiner stalled — the
+        // observation is otherwise blind (every API read blocks on the
+        // same lock).
+        let since_join = sim.fabric().now() - secs(181);
+        let mut trail: Vec<(String, usize, f64, f64)> = Vec::new();
+        for log in sim.logs_containing(&[]) {
+            if log.at < since_join {
+                continue;
+            }
+            // Collapse a retry grind into one line: the first and last
+            // occurrence of a run of identical message bodies.
+            let body = log.text.chars().take(200).collect::<String>();
+            let at_s = log.at.as_secs_f64();
+            match trail.last_mut().filter(|(last, ..)| last == &body) {
+                Some((_, count, _, last_at)) => {
+                    *count += 1;
+                    *last_at = at_s;
+                }
+                None => trail.push((body, 1, at_s, at_s)),
+            }
+        }
+        let mut trail: Vec<String> = trail
+            .into_iter()
+            .map(|(body, count, first_at, last_at)| {
+                if count > 1 {
+                    format!("t={first_at:.1}-{last_at:.1}s (x{count}) {body}")
+                } else {
+                    format!("t={first_at:.1}s {body}")
+                }
+            })
+            .collect();
+        let trail = if trail.len() > 30 {
+            trail.split_off(trail.len() - 30)
+        } else {
+            trail
+        };
         receipt.cause(
             "welcome_fetch_never_completes_for_the_fresh_joiner",
-            Some("B never reported active membership inside the 180 s budget".to_string()),
+            Some(format!(
+                "B never reported active membership inside the 180 s budget; \
+                 WARN trail: {}",
+                trail.join(" | ")
+            )),
             true,
             at(sim),
         );
