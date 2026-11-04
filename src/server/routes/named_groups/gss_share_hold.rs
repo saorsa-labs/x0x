@@ -193,9 +193,9 @@ pub(super) struct ParkedSecret {
     pub(super) secret_epoch: u64,
     /// The lower-case hex sender of the displaced share.
     pub(super) sender: String,
-    /// The displaced secret value. The group state on the same disk held
-    /// it in the clear, so the hold file keeps the same protection
-    /// class.
+    /// The displaced secret value, in the clear. The group state on the
+    /// same disk held it in the clear too; the hold file is written 0600
+    /// from creation.
     pub(super) secret: Vec<u8>,
     /// The epoch of the wait whose own share displaced it. The record
     /// re-delivers only once a head commits this epoch: before that the
@@ -1987,6 +1987,17 @@ pub(in crate::server) mod test_seam {
             .insert(group_key.to_string(), parked);
     }
 
+    /// [`force_parked_secret`], then write the hold file, so a
+    /// [`simulate_restart`] reloads the record from disk.
+    pub(in crate::server) async fn force_parked_secret_durable(
+        state: &AppState,
+        group_key: &str,
+        parked: ParkedSecret,
+    ) -> std::io::Result<()> {
+        force_parked_secret(state, group_key, parked);
+        persist(state, group_key).await
+    }
+
     /// Seed an evicted removal's exclusion hold of `secret_epoch` that
     /// removes `removed_hex`, as [`keep_evicted_removal`] keeps one.
     pub(in crate::server) fn force_removal_hold(
@@ -2715,6 +2726,37 @@ mod tests {
             replaces_uncommitted_secret(&state, &group_key, &above, &actor, 2),
             "above the committed epoch, the waiting actor's share still replaces"
         );
+        // The parked-removal branch above the committed epoch: with the
+        // hold gone, the parked removal of epoch 2 alone admits the share.
+        super::test_seam::clear_exclusion_holds(&state, &group_key);
+        assert!(
+            !replaces_uncommitted_secret(&state, &group_key, &above, &actor, 2),
+            "with no hold and no parked removal, nothing replaces"
+        );
+        state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(group_key.clone())
+            .or_default()
+            .push(ParkedRoleUpdate {
+                event: NamedGroupMetadataEvent::MemberRemoved {
+                    group_id: group_key.clone(),
+                    revision: 3,
+                    actor: actor.clone(),
+                    agent_id: "dd".repeat(32),
+                    treekem_commit_b64: None,
+                    treekem_epoch: None,
+                    secret_epoch: Some(2),
+                    commit: None,
+                },
+                sender: AgentId([0xaa; 32]),
+                parked_at: Instant::now(),
+            });
+        assert!(
+            replaces_uncommitted_secret(&state, &group_key, &above, &actor, 2),
+            "above the committed epoch, a parked removal's share still replaces"
+        );
     }
 
     /// #1775 (claude review at 3e100c71): a failed park write or a failed
@@ -2903,7 +2945,7 @@ mod tests {
     /// loads and writes again stays v1 while it carries no v2 field, and
     /// becomes v2 when it does; its holds stay in it each time.
     #[tokio::test]
-    async fn a_v1_hold_file_rewrites_as_v2_and_keeps_its_holds() {
+    async fn a_v1_hold_file_stays_v1_until_it_carries_v2_fields() {
         let (state, _dir) = test_state().await;
         let group_key = "h".to_string();
         let path = super::test_seam::hold_path_for(&state, &group_key);

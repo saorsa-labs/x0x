@@ -1928,7 +1928,9 @@ own share is one such share, so the frame it waits for installs
 (#1775). The replace is not limited to the waiting actor. It fails
 closed: the hold stays until the actor's own share installs, so a
 third admin's replace can stall the group or lose a later key, but it
-releases no ciphertext. A displaced later secret is not lost: it parks in the
+releases no ciphertext. A hold or a parked removal replaces only for a share epoch
+above the epoch that the head commits. A keyless commit's epoch is the
+one exception, under its mark's own rule (below). A displaced later secret is not lost: it parks in the
 hold file with its sender and the displacing wait's epoch, and it
 re-delivers through the ordinary share path once a head commits that
 epoch — so the later rotation's own commit lands with its key, and an
@@ -1948,6 +1950,12 @@ Admin, or when a held removal or ban targets its sender. A replay of
 the installed frame also re-delivers it. The file keeps one parked record per group, and a live record
 keeps the slot, so a second displacement in the same window parks
 nowhere and is lost, with the same warning.
+
+The hold file is local state, not an API. It stores the parked secret
+in the clear, with its sender and epochs, written 0600 from creation.
+A file that carries a keyless mark or a parked secret is version 2;
+every other file is version 1. A binary that knows only version 1 does
+not load a version 2 file: it keeps the file and holds that group.
 
 After a #1578 keyless install, the head already commits the epoch, but
 it binds the epoch, not the secret value (#1775). The durable keyless

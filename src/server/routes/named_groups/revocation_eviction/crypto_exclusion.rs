@@ -10025,9 +10025,12 @@ mod daemon_tests {
 
         // (6) A replay of the installed frame re-delivers an eligible
         // parked record: a crash after the head persisted and before the
-        // install's replay leaves one (claude review at 5e389451).
+        // install's replay leaves one on disk (claude reviews at 5e389451
+        // and 818f565e). The record is written, the process restarts, and
+        // the replay is the first thing that runs: it must load the hold
+        // files itself.
         let next_key = [0xB8u8; 32];
-        ng::gss_share_hold::test_seam::force_parked_secret(
+        ng::gss_share_hold::test_seam::force_parked_secret_durable(
             &fx.replica,
             &fx.group_id,
             ng::gss_share_hold::ParkedSecret {
@@ -10036,7 +10039,10 @@ mod daemon_tests {
                 secret: next_key.to_vec(),
                 waits_epoch: next_secret_epoch + 1,
             },
-        );
+        )
+        .await
+        .context("the parked record is written")?;
+        ng::gss_share_hold::test_seam::simulate_restart(&fx.replica).await;
         assert_eq!(
             receive(&fx.replica, b, &b_frame).await,
             ReceiveOutcome::Duplicate,
@@ -10690,8 +10696,15 @@ mod daemon_tests {
             next_secret_epoch + 1,
             &b_hex,
         );
+        let before = group_of(&fx, &fx.group_id).await?;
         redeliver(&fx).await;
         gone(&fx, "a record whose sender a held removal targets goes");
+        let after = group_of(&fx, &fx.group_id).await?;
+        assert_eq!(
+            (after.secret_epoch, after.shared_secret),
+            (before.secret_epoch, before.shared_secret),
+            "the dropped record installed nothing"
+        );
         ng::gss_share_hold::test_seam::clear_exclusion_holds(&fx.replica, &fx.group_id);
         // The same for a held removal of B below the parked epoch.
         parked(
@@ -10707,10 +10720,17 @@ mod daemon_tests {
             next_secret_epoch,
             &b_hex,
         );
+        let before = group_of(&fx, &fx.group_id).await?;
         redeliver(&fx).await;
         gone(
             &fx,
             "a record whose sender an earlier held removal targets goes",
+        );
+        let after = group_of(&fx, &fx.group_id).await?;
+        assert_eq!(
+            (after.secret_epoch, after.shared_secret),
+            (before.secret_epoch, before.shared_secret),
+            "the dropped record installed nothing"
         );
         ng::gss_share_hold::test_seam::clear_exclusion_holds(&fx.replica, &fx.group_id);
 

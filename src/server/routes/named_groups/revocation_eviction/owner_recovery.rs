@@ -3172,6 +3172,11 @@ pub(in crate::server) async fn redeliver_parked_secret(
     state: &Arc<AppState>,
     stable_group_id: &str,
 ) {
+    // The hold files load lazily, and nothing loads them at boot: after a
+    // restart, the first caller may be this one (a `Duplicate` replay),
+    // so the parked map must be loaded before it is read (claude review
+    // at 818f565e).
+    super::super::gss_share_hold::ensure_loaded(state).await;
     if super::super::gss_share_hold::parks_no_secret(state) {
         return;
     }
@@ -3220,7 +3225,8 @@ pub(in crate::server) async fn redeliver_parked_secret(
         }
     }
     if !info.active_members().any(|member| {
-        member.agent_id == parked.sender && member.role.at_least(x0x::groups::GroupRole::Admin)
+        member.agent_id.eq_ignore_ascii_case(&parked.sender)
+            && member.role.at_least(x0x::groups::GroupRole::Admin)
     }) {
         // #1775 review round 12: a sender the current roster holds below
         // Admin — demoted, or gone — can commit no rotation this key
@@ -3229,7 +3235,6 @@ pub(in crate::server) async fn redeliver_parked_secret(
         super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
         return;
     }
-    super::super::gss_share_hold::ensure_loaded(state).await;
     if super::super::gss_share_hold::removes_share_actor(
         state,
         &group_key,
