@@ -63,6 +63,7 @@ class ShardPlanTest(unittest.TestCase):
             's3-d8': 'w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node',
             's3-d3': 'w3h_1356_control_s3_d3_authorisation_refusals_typed',
             's3-1661': 'w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed',
+            's3-d2': 'w3h_1356_control_s3_d2_fork_exposure_contained',
         }
         assigned = SHARDS.assign(self.names)
         for group, name in rows.items():
