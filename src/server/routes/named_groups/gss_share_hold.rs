@@ -33,6 +33,14 @@
 //! no actor list; its actors are unknown, so no secret that a commit
 //! does not pin ends its hold (#1775 item 3).
 //!
+//! #1775 (claude review round 11): a wait's own share may displace an
+//! installed secret of a later epoch — an honest rotation whose share
+//! arrived before its commit. The displaced value is parked here,
+//! durably, and re-delivers through the ordinary share path once the
+//! head commits the epoch of the wait that displaced it, so the later
+//! rotation's commit finds its key installed instead of a re-delivery
+//! the protocol owes no retry for.
+//!
 //! Only transitions whose signed commit the apply verified are written, so
 //! a forged removal holds nothing. The file is local state only: it is not
 //! a wire format and not an API. It carries `version`
@@ -81,6 +89,10 @@ pub(in crate::server) struct GssShareHolds {
     /// #1775: per group, the mark of a #1578 keyless commit
     /// ([`KeylessMark`]). Durable in the hold file.
     keyless: StdMutex<HashMap<String, KeylessMark>>,
+    /// #1775 (claude review round 11): per group, the parked secret a
+    /// wait's own share displaced ([`ParkedSecret`]). Durable in the hold
+    /// file.
+    parked: StdMutex<HashMap<String, ParkedSecret>>,
     /// The groups whose last write failed. A later park or hold of the
     /// group, a resend included, writes again ([`retry_unsaved`]).
     unsaved: StdMutex<HashSet<String>>,
@@ -158,6 +170,30 @@ struct HeldRemoval {
     sender: String,
 }
 
+/// #1775 (claude review round 11, Engineer ruling 4 Nov): the secret of
+/// a later epoch that a wait's own share displaced — at the share arm's
+/// replace path, or at a superseded install that drops the later key
+/// with the epoch. One slot per group: the newest displacement wins. The
+/// record re-delivers through the ordinary share path (a fresh envelope
+/// sealed to this node) once the head commits the epoch of the wait that
+/// displaced it, so the later rotation's commit lands with its key and
+/// an honest reordering stalls on nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ParkedSecret {
+    /// The epoch of the displaced secret.
+    pub(super) secret_epoch: u64,
+    /// The lower-case hex sender of the displaced share.
+    pub(super) sender: String,
+    /// The displaced secret value. The group state on the same disk held
+    /// it in the clear, so the hold file keeps the same protection
+    /// class.
+    pub(super) secret: Vec<u8>,
+    /// The epoch of the wait whose own share displaced it. The record
+    /// re-delivers only once a head commits this epoch: before that the
+    /// wait still lives, and re-delivering would swap the key back.
+    pub(super) waits_epoch: u64,
+}
+
 /// The hold file format version.
 const HOLD_FILE_VERSION: u32 = 1;
 
@@ -175,6 +211,9 @@ struct HoldFile {
     /// #1775: holds nothing; an older reader ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keyless: Option<KeylessMark>,
+    /// #1775 (round 11): holds nothing; an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parked: Option<ParkedSecret>,
 }
 
 fn hold_dir(state: &AppState) -> PathBuf {
@@ -325,6 +364,10 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
         return true;
     }
     let sent = installed_share_sender(state, group_key, info);
+    // One lookup table for every ancestry walk this call makes (claude
+    // review round 11): the send path reaches here with a full commit
+    // log, and a rebuild per parked entry or hold cost too much.
+    let by_hash = head_index(info);
     // #1775 item 1 (the parked-list half): a parked removal or ban also
     // keeps holding under an installed secret that no commit pins, unless
     // the removal's own sender sealed it. The actor's re-delivery from
@@ -341,7 +384,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
                 removal_epoch(&entry.event).is_some_and(|epoch| {
                     holds(info, Some(epoch))
                         || (info.shared_secret.is_some()
-                            && secret_unpinned(state, group_key, info)
+                            && unpinned(state, group_key, info, &by_hash)
                             && !sent.as_deref().is_some_and(|sent| {
                                 sent.eq_ignore_ascii_case(&hex::encode(entry.sender.0))
                             }))
@@ -360,7 +403,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
         .get(group_key)
         .is_some_and(|mark| {
             info.secret_epoch == mark.secret_epoch
-                && head_reaches(info, mark.secret_epoch, &mark.head, true)
+                && head_reaches_indexed(info, mark.secret_epoch, &mark.head, true, &by_hash)
                 && info.shared_secret.is_some()
                 && !sent
                     .as_deref()
@@ -376,7 +419,7 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
             .get(group_key)
             .is_some_and(|list| {
                 list.iter()
-                    .any(|hold| hold_live(state, group_key, info, hold, sent.as_deref()))
+                    .any(|hold| hold_live(state, group_key, info, hold, sent.as_deref(), &by_hash))
             })
 }
 
@@ -389,26 +432,53 @@ pub(super) fn withholds(state: &AppState, group_key: &str, info: &x0x::groups::G
 /// passing through the mark's head, so a sibling commit of the epoch
 /// voids the mark however deep the chain runs. A link the log does not
 /// retain cannot disprove the mark: withholding keeps it (fail closed),
-/// the replace path treats the unknown as pinned. A genesis reached
-/// without the mark does not keep it.
+/// and the replace path keeps it too (round 11): one rule for every
+/// caller, so an unprovable mark withholds yet still takes the waiting
+/// actor's own share, which settles it. A genesis reached without the
+/// mark does not keep it.
 fn head_reaches(
     info: &x0x::groups::GroupInfo,
     mark_epoch: u64,
     mark_head: &str,
     missing_keeps: bool,
 ) -> bool {
+    head_reaches_indexed(
+        info,
+        mark_epoch,
+        mark_head,
+        missing_keeps,
+        &head_index(info),
+    )
+}
+
+/// The retained commits by state hash, the walk's one lookup table.
+/// [`withholds`] builds it once per call: the send path reaches it with
+/// a full commit log, and a rebuild per mark hold costs too much
+/// (claude review round 11).
+type HeadIndex<'a> =
+    std::collections::HashMap<&'a str, &'a x0x::groups::state_commit::GroupStateCommit>;
+
+fn head_index(info: &x0x::groups::GroupInfo) -> HeadIndex<'_> {
+    info.commit_log
+        .iter()
+        .map(|retained| (retained.commit.state_hash.as_str(), &retained.commit))
+        .collect()
+}
+
+/// [`head_reaches`] over a table the caller built ([`head_index`]).
+fn head_reaches_indexed(
+    info: &x0x::groups::GroupInfo,
+    mark_epoch: u64,
+    mark_head: &str,
+    missing_keeps: bool,
+    by_hash: &HeadIndex<'_>,
+) -> bool {
     if info.state_hash == mark_head {
         return true;
     }
-    // One index of the retained entries, then the head's own prev links
-    // entry by entry: the log also holds adopted chains that fork from
-    // earlier ancestors, so a positional pass proves nothing, and a
-    // linear scan per step costs too much on the send path.
-    let by_hash: std::collections::HashMap<&str, &x0x::groups::state_commit::GroupStateCommit> =
-        info.commit_log
-            .iter()
-            .map(|retained| (retained.commit.state_hash.as_str(), &retained.commit))
-            .collect();
+    // Then the head's own prev links entry by entry: the log also holds
+    // adopted chains that fork from earlier ancestors, so a positional
+    // pass proves nothing.
     let mut cursor = info.state_hash.as_str();
     for _ in 0..=info.commit_log.len() {
         if cursor == mark_head {
@@ -417,7 +487,9 @@ fn head_reaches(
         let Some(commit) = by_hash.get(cursor) else {
             // The chain left the retained log. Withholding keeps the
             // mark (fail closed, as the committed epoch itself falls
-            // back); the replace path treats the unknown as pinned.
+            // back), and so does the replace path (round 11): the two
+            // agree, so the waiting actor's own share still settles an
+            // unprovable mark instead of wedging the group.
             return missing_keeps;
         };
         if commit
@@ -451,6 +523,16 @@ pub(super) fn secret_unpinned(
     group_key: &str,
     info: &x0x::groups::GroupInfo,
 ) -> bool {
+    unpinned(state, group_key, info, &head_index(info))
+}
+
+/// [`secret_unpinned`] over a table the caller built ([`head_index`]).
+fn unpinned(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    by_hash: &HeadIndex<'_>,
+) -> bool {
     x0x::groups::crypto_exclusion::committed_secret_epoch(info) < info.secret_epoch
         || state
             .gss_share_holds
@@ -460,7 +542,7 @@ pub(super) fn secret_unpinned(
             .get(group_key)
             .is_some_and(|mark| {
                 mark.secret_epoch == info.secret_epoch
-                    && head_reaches(info, mark.secret_epoch, &mark.head, true)
+                    && head_reaches_indexed(info, mark.secret_epoch, &mark.head, true, by_hash)
             })
 }
 
@@ -478,6 +560,7 @@ fn hold_live(
     info: &x0x::groups::GroupInfo,
     hold: &ExclusionHold,
     sent: Option<&str>,
+    by_hash: &HeadIndex<'_>,
 ) -> bool {
     if holds(info, Some(hold.secret_epoch)) {
         return true;
@@ -485,7 +568,7 @@ fn hold_live(
     // A secret of the hold's epoch or a later one is installed. It ends
     // the hold when a commit pins it, or when a recorded actor sealed it.
     info.shared_secret.is_some()
-        && secret_unpinned(state, group_key, info)
+        && unpinned(state, group_key, info, by_hash)
         && match &hold.actors {
             Some(actors) => {
                 !actors.is_empty()
@@ -581,6 +664,25 @@ pub(super) async fn ensure_loaded(state: &AppState) {
                 return;
             }
         };
+        // #1775 (claude review round 11): the file's name is the blake3 of
+        // the group key it claims. A file that claims another group's key
+        // loads nothing under it: a mismatched file is kept like a damaged
+        // one, held and never replaced, instead of seeding holds (or a
+        // parked secret) under a group that never wrote them.
+        if hold_path(state, &file.group_key) != path {
+            tracing::error!(
+                "#1573 GSS share hold {} claims group key {} the file name does not hash; its group makes no ciphertext until the file is repaired or removed and the daemon restarts",
+                path.display(),
+                LogHexId::group(&file.group_key)
+            );
+            state
+                .gss_share_holds
+                .undecodable
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(path);
+            continue;
+        }
         absorb(state, file);
     }
     state
@@ -617,6 +719,14 @@ fn absorb(state: &AppState, file: HoldFile) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(file.group_key.clone(), mark);
+    }
+    if let Some(parked) = file.parked {
+        state
+            .gss_share_holds
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(file.group_key.clone(), parked);
     }
     if !file.removals.is_empty() {
         let mut lot = state
@@ -723,6 +833,13 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(group_key)
         .cloned();
+    let parked = state
+        .gss_share_holds
+        .parked
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(group_key)
+        .cloned();
     let path = hold_path(state, group_key);
     if state
         .gss_share_holds
@@ -735,7 +852,12 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
             "an undecodable hold file is kept, not replaced",
         ));
     }
-    if removals.is_empty() && exclusions.is_empty() && share_sender.is_none() && keyless.is_none() {
+    if removals.is_empty()
+        && exclusions.is_empty()
+        && share_sender.is_none()
+        && keyless.is_none()
+        && parked.is_none()
+    {
         return match crate::w3h_inline::fs::remove_file(&path).await {
             Ok(()) => super::sync_parent_dir_for_path(&path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -749,6 +871,7 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
         exclusions,
         share_sender,
         keyless,
+        parked,
     };
     let bytes = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
     if let Some(parent) = path.parent() {
@@ -968,6 +1091,7 @@ pub(super) fn prune_exclusions(
     info: &x0x::groups::GroupInfo,
 ) -> bool {
     let sent = installed_share_sender(state, group_key, info);
+    let by_hash = head_index(info);
     let mut lot = state
         .gss_share_holds
         .exclusions
@@ -975,7 +1099,7 @@ pub(super) fn prune_exclusions(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dropped = lot.get_mut(group_key).is_some_and(|list| {
         let before = list.len();
-        list.retain(|hold| hold_live(state, group_key, info, hold, sent.as_deref()));
+        list.retain(|hold| hold_live(state, group_key, info, hold, sent.as_deref(), &by_hash));
         list.len() != before
     });
     if lot.get(group_key).is_some_and(Vec::is_empty) {
@@ -1071,30 +1195,65 @@ pub(super) async fn note_share_sender(
 /// epoch with no secret, so it pins no secret value. The durable mark
 /// keeps the epoch's first installed secret replaceable, and the group's
 /// new ciphertext held, until the exclusion's own actor seals a share of
-/// it.
+/// it. Returns whether the durable write landed: a mark the disk does
+/// not hold pins nothing after a restart, so the caller must not move
+/// the head over it (claude review round 11 — the head stays put and the
+/// frame retries).
 pub(super) async fn note_keyless_commit(
     state: &AppState,
     group_key: &str,
     secret_epoch: u64,
     actor_hex: &str,
     head: &str,
-) {
+) -> bool {
     ensure_loaded(state).await;
+    let mark = KeylessMark {
+        secret_epoch,
+        actor: actor_hex.to_ascii_lowercase(),
+        head: head.to_string(),
+    };
     let changed = {
         let mut lot = state
             .gss_share_holds
             .keyless
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mark = KeylessMark {
-            secret_epoch,
-            actor: actor_hex.to_ascii_lowercase(),
-            head: head.to_string(),
-        };
         lot.insert(group_key.to_string(), mark.clone()) != Some(mark)
     };
-    if changed {
-        persist_logged(state, group_key).await;
+    if !changed {
+        return true;
+    }
+    let result = persist(state, group_key).await;
+    let mut unsaved = state
+        .gss_share_holds
+        .unsaved
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match result {
+        Ok(()) => {
+            unsaved.remove(group_key);
+            true
+        }
+        Err(error) => {
+            unsaved.insert(group_key.to_string());
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "#1775 keyless mark not saved; the keyless install does not proceed: {error}"
+            );
+            // Memory matches the disk again (the file keeps the hold the
+            // park before this wrote, without the mark): a retry that
+            // installs re-writes the mark before its head.
+            drop(unsaved);
+            {
+                let mut lot = state
+                    .gss_share_holds
+                    .keyless
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                lot.remove(group_key);
+            }
+            false
+        }
     }
 }
 
@@ -1118,6 +1277,104 @@ pub(super) async fn forget_keyless_commit(
         lot.get(group_key)
             .is_some_and(|mark| mark.secret_epoch == secret_epoch && mark.head == head)
             && lot.remove(group_key).is_some()
+    };
+    if removed {
+        persist_logged(state, group_key).await;
+    }
+}
+
+/// #1775 (claude review round 11): park the later-epoch secret that
+/// `info` holds — the share a waiting transition's own replace just
+/// displaced, or the later key a superseded install drops with its
+/// epoch. `waits_epoch` is the epoch of the wait whose own share
+/// displaced it: the record re-delivers only once a head commits that
+/// epoch. A secret with no recorded sender (a crash between the key
+/// write and its record write) has no provenance to re-deliver, so it
+/// keeps the disclosed #1771 crash-window handling and parks nothing.
+/// Durable before the replacing secret installs, so a crash between the
+/// two keeps the record. One slot per group: the newest displacement
+/// wins.
+pub(super) async fn park_displaced_secret(
+    state: &AppState,
+    group_key: &str,
+    info: &x0x::groups::GroupInfo,
+    waits_epoch: u64,
+) {
+    ensure_loaded(state).await;
+    let Some(secret) = info.shared_secret.clone() else {
+        return;
+    };
+    let Some(sender) = installed_share_sender(state, group_key, info) else {
+        return;
+    };
+    let parked = ParkedSecret {
+        secret_epoch: info.secret_epoch,
+        sender,
+        secret,
+        waits_epoch,
+    };
+    let changed = {
+        let mut lot = state
+            .gss_share_holds
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lot.insert(group_key.to_string(), parked.clone()) != Some(parked)
+    };
+    if changed {
+        persist_logged(state, group_key).await;
+    }
+}
+
+/// The group's parked secret, if any (claude review round 11).
+pub(super) fn parked_secret(state: &AppState, group_key: &str) -> Option<ParkedSecret> {
+    state
+        .gss_share_holds
+        .parked
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(group_key)
+        .cloned()
+}
+
+/// Whether any group parks a secret: the re-delivery check on every
+/// replay costs one map read when none does.
+pub(super) fn parks_no_secret(state: &AppState) -> bool {
+    state
+        .gss_share_holds
+        .parked
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_empty()
+}
+
+/// Whether the parked secret re-delivers onto `info` now: the wait that
+/// displaced it completed (a head commits its epoch or a later one), no
+/// head commits the parked epoch yet (a head that did pins whatever
+/// value installed with it, so the parked one is stale), and no secret
+/// of its epoch or a later one is installed (that secret, not the parked
+/// one, is the live value).
+pub(super) fn parked_secret_reinstalls(
+    parked: &ParkedSecret,
+    info: &x0x::groups::GroupInfo,
+) -> bool {
+    let committed = x0x::groups::crypto_exclusion::committed_secret_epoch(info);
+    parked.secret_epoch > committed
+        && parked.secret_epoch > info.secret_epoch
+        && committed >= parked.waits_epoch
+}
+
+/// Drop the group's parked secret (it re-delivered, or it is stale);
+/// writes the file when one went.
+pub(super) async fn forget_parked_secret(state: &AppState, group_key: &str) {
+    ensure_loaded(state).await;
+    let removed = {
+        let mut lot = state
+            .gss_share_holds
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lot.remove(group_key).is_some()
     };
     if removed {
         persist_logged(state, group_key).await;
@@ -1237,8 +1494,9 @@ pub(super) fn replaces_uncommitted_secret(
     secret_epoch: u64,
 ) -> bool {
     let sent = installed_share_sender(state, group_key, info);
+    let by_hash = head_index(info);
     secret_epoch <= info.secret_epoch
-        && secret_unpinned(state, group_key, info)
+        && unpinned(state, group_key, info, &by_hash)
         && !sent
             .as_deref()
             .is_some_and(|sent| sent.eq_ignore_ascii_case(sender_hex))
@@ -1251,7 +1509,7 @@ pub(super) fn replaces_uncommitted_secret(
             .is_some_and(|list| {
                 list.iter().any(|hold| {
                     hold.secret_epoch == secret_epoch
-                        && hold_live(state, group_key, info, hold, sent.as_deref())
+                        && hold_live(state, group_key, info, hold, sent.as_deref(), &by_hash)
                 })
             })
             || state
@@ -1278,7 +1536,18 @@ pub(super) fn replaces_uncommitted_secret(
                 .get(group_key)
                 .is_some_and(|mark| {
                     mark.secret_epoch == secret_epoch
-                        && head_reaches(info, mark.secret_epoch, &mark.head, false)
+                        // Round 11: the unprovable mark keeps counting
+                        // here too — the same rule as withholding, so an
+                        // ancestry that leaves the retained log wedges no
+                        // group: the waiting actor's own share replaces,
+                        // and settles, the mark.
+                        && head_reaches_indexed(
+                            info,
+                            mark.secret_epoch,
+                            &mark.head,
+                            true,
+                            &by_hash,
+                        )
                 }))
 }
 
@@ -1407,6 +1676,16 @@ pub(super) async fn forget_group<'a>(
     }
     {
         let mut lot = state
+            .gss_share_holds
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for alias in aliases.clone() {
+            lot.remove(alias);
+        }
+    }
+    {
+        let mut lot = state
             .parked_gss_removals
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1427,8 +1706,8 @@ pub(in crate::server) mod test_seam {
     use super::*;
 
     /// A restart: memory loses every parked removal, held exclusion, share
-    /// sender and keyless mark (#1766, #1775), and the next check loads
-    /// the files again.
+    /// sender, keyless mark and parked secret (#1766, #1775), and the next
+    /// check loads the files again.
     pub(in crate::server) async fn simulate_restart(state: &AppState) {
         state
             .parked_gss_removals
@@ -1444,6 +1723,12 @@ pub(in crate::server) mod test_seam {
         state
             .gss_share_holds
             .keyless
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        state
+            .gss_share_holds
+            .parked
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -1788,7 +2073,7 @@ mod tests {
         let mut raised = gss_info_at_head(1, Some(foreign));
         raised.secret_epoch = 2;
         assert!(
-            secret_unpinned(&state, &group_key, &raised) || withholds(&state, &group_key, &raised),
+            secret_unpinned(&state, &group_key, &raised),
             "control: the raised epoch is not pinned by the head"
         );
         assert!(
@@ -1852,9 +2137,12 @@ mod tests {
             !withholds(&state, &group_key, &forked),
             "a keyless head sitting in the log beside the sibling chain voids nothing"
         );
-        // The replace path's strict branch (round 7): a chain that runs
-        // off the retained log cannot prove the mark, so withholding
-        // keeps it and the replace path treats the unknown as pinned.
+        // The replace path's strict branch (round 7, superseded round 11):
+        // a chain that runs off the retained log cannot prove the mark.
+        // Withholding keeps it, and — one rule for both call sites since
+        // round 11 — the replace path keeps it too: the waiting actor's
+        // own share still replaces, and settles, the unprovable mark, so
+        // an ancestry that leaves the log wedges no group.
         let mut offlog = gss_info_at_head(1, None);
         offlog.secret_epoch = 2;
         offlog.shared_secret = Some(foreign.to_vec());
@@ -1886,8 +2174,8 @@ mod tests {
             "a chain off the retained log keeps the mark for withholding"
         );
         assert!(
-            !replaces_uncommitted_secret(&state, &group_key, &offlog, &actor, 2),
-            "the replace path treats the unprovable mark as pinned"
+            replaces_uncommitted_secret(&state, &group_key, &offlog, &actor, 2),
+            "round 11: the replace path keeps the unprovable mark too, so its actor's share settles it"
         );
 
         // The reverse error: a rename on the true keyless head keeps the
@@ -1976,6 +2264,79 @@ mod tests {
         assert!(
             !replaces_uncommitted_secret(&state, &group_key, &own_info, &other, 2),
             "once the removal's sender's secret is in, no other share replaces it"
+        );
+    }
+
+    /// #1775 (claude review round 11): a displaced later secret parks
+    /// durably, with its sender and the epoch of the wait that displaced
+    /// it, and re-delivers only past that wait. The gate is proven here;
+    /// the re-delivery itself runs through the real apply in the
+    /// crypto_exclusion tests.
+    #[tokio::test]
+    async fn a_parked_secret_waits_out_its_displacing_wait() {
+        let (state, _dir) = test_state().await;
+        let group_key = "g".to_string();
+        let other = "bb".repeat(32);
+        let parent = gss_info_at_head(1, Some([0x99u8; 32]));
+        let foreign = [0xB5u8; 32];
+        let mut displaced = parent.clone();
+        displaced.secret_epoch = 3;
+        displaced.shared_secret = Some(foreign.to_vec());
+        note_share_sender(&state, &group_key, &parent, 3, &other, &foreign).await;
+        park_displaced_secret(&state, &group_key, &displaced, 2).await;
+        let parked = parked_secret(&state, &group_key).expect("the displaced secret parks");
+        assert_eq!(parked.secret_epoch, 3);
+        assert_eq!(parked.sender, other);
+        assert_eq!(parked.waits_epoch, 2);
+        assert_eq!(parked.secret, foreign.to_vec());
+        // The gate: the displacing wait's epoch must commit first, the
+        // parked epoch must not have committed, and no secret of the
+        // parked epoch may be installed.
+        let wait_live = gss_info_at_head(1, Some([0x99u8; 32]));
+        assert!(
+            !parked_secret_reinstalls(&parked, &wait_live),
+            "the displacing wait's epoch is not committed: no re-delivery"
+        );
+        let wait_done = gss_info_at_head(2, Some(foreign));
+        assert!(
+            parked_secret_reinstalls(&parked, &wait_done),
+            "the displacing wait's epoch committed: the record re-delivers"
+        );
+        let parked_committed = gss_info_at_head(3, Some(foreign));
+        assert!(
+            !parked_secret_reinstalls(&parked, &parked_committed),
+            "a head committed the parked epoch: the record is stale"
+        );
+        let mut already_in = wait_done.clone();
+        already_in.secret_epoch = 3;
+        already_in.shared_secret = Some(foreign.to_vec());
+        assert!(
+            !parked_secret_reinstalls(&parked, &already_in),
+            "a secret of the parked epoch is installed: the record is stale"
+        );
+        // The record is durable: a restart that loads the files keeps it.
+        super::test_seam::simulate_restart(&state).await;
+        ensure_loaded(&state).await;
+        assert_eq!(
+            parked_secret(&state, &group_key).map(|kept| kept.secret_epoch),
+            Some(3),
+            "the parked secret survives a restart"
+        );
+        // A displaced secret with no recorded sender parks nothing: it
+        // has no provenance to re-deliver (the #1771 crash window).
+        let mut orphan = parent.clone();
+        orphan.secret_epoch = 4;
+        orphan.shared_secret = Some([0x77u8; 32].to_vec());
+        park_displaced_secret(&state, &group_key, &orphan, 2).await;
+        assert_eq!(
+            parked_secret(&state, &group_key).map(|kept| kept.secret_epoch),
+            Some(3),
+            "no recorded sender: nothing parks"
+        );
+        forget_parked_secret(&state, &group_key).await;
+        assert!(
+            parked_secret(&state, &group_key).is_none(),
+            "the record goes on forget"
         );
     }
 
@@ -2136,7 +2497,14 @@ mod tests {
             .find(|hold| hold.secret_epoch == 2)
             .expect("the epoch-2 hold survived the cap");
         assert!(
-            hold_live(&state, &group_key, &info, at_two, Some(&first)),
+            hold_live(
+                &state,
+                &group_key,
+                &info,
+                at_two,
+                Some(&first),
+                &head_index(&info)
+            ),
             "the dropped epoch's actor does not end the later epoch's wait"
         );
     }

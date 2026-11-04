@@ -3096,8 +3096,12 @@ async fn replay_early_shares(state: &Arc<AppState>, stable_group_id: &str) {
 
 /// After a GSS recovery or crypto-only exclusion installed here: apply the
 /// held commits that chain on it, then the parked shares. Call it with no
-/// group lock held: both re-enter the ordinary apply.
+/// group lock held: both re-enter the ordinary apply. #1775 (claude
+/// review round 11): the displaced later secret re-delivers first, so a
+/// held rotation of its epoch finds its own sender's key in and commits
+/// with it.
 pub(super) async fn replay_after_gss_install(state: &Arc<AppState>, stable_group_id: &str) {
+    redeliver_parked_secret(state, stable_group_id).await;
     replay_held_events(state, stable_group_id).await;
     replay_early_shares(state, stable_group_id).await;
 }
@@ -3106,8 +3110,91 @@ pub(super) async fn replay_after_gss_install(state: &Arc<AppState>, stable_group
 /// held commits that now chain on it and, if one applied (a later admin's
 /// promotion), the parked shares of that group.
 pub(in crate::server) async fn replay_after_commit(state: &Arc<AppState>, stable_group_id: &str) {
+    redeliver_parked_secret(state, stable_group_id).await;
     if replay_held_events(state, stable_group_id).await {
         replay_early_shares(state, stable_group_id).await;
+    }
+}
+
+/// #1775 (claude review round 11, Engineer ruling 4 Nov): re-deliver the
+/// parked secret a wait's own share displaced — or a superseded install
+/// dropped with its epoch — once the head commits the displacing wait's
+/// epoch. The re-delivery is a fresh `SecureShareDelivered` sealed to
+/// this node through the ordinary share path, so every guard, the
+/// install and the sender record run exactly as for a delivery, and the
+/// later rotation's commit lands with its key: an honest reordering
+/// stalls on no share re-delivery, which no retry owes. A record whose
+/// epoch a head already committed, or whose value a secret of its epoch
+/// or a later one replaced, is stale and goes. Call it with no group
+/// lock held, and before the held events replay.
+pub(super) async fn redeliver_parked_secret(state: &Arc<AppState>, stable_group_id: &str) {
+    if super::super::gss_share_hold::parks_no_secret(state) {
+        return;
+    }
+    let Some((group_key, info)) = group_by_stable(state, stable_group_id).await else {
+        return;
+    };
+    let Some(parked) = super::super::gss_share_hold::parked_secret(state, &group_key) else {
+        return;
+    };
+    if !super::super::gss_share_hold::parked_secret_reinstalls(&parked, &info) {
+        // Early, not stale: the displacing wait still lives (no head
+        // commits its epoch), so the record stays — re-delivering now
+        // would swap the key back under the wait that displaced it.
+        let committed = x0x::groups::crypto_exclusion::committed_secret_epoch(&info);
+        if parked.secret_epoch <= committed || parked.secret_epoch <= info.secret_epoch {
+            super::super::gss_share_hold::forget_parked_secret(state, &group_key).await;
+        }
+        return;
+    }
+    let sender = hex::decode(&parked.sender)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(AgentId);
+    let secret = <[u8; 32]>::try_from(parked.secret.as_slice()).ok();
+    let (Some(sender), Some(secret)) = (sender, secret) else {
+        // A record that cannot name its sender or a secret value is
+        // damaged; it can re-deliver nothing.
+        super::super::gss_share_hold::forget_parked_secret(state, &group_key).await;
+        return;
+    };
+    {
+        // A revoked agent sends no trusted share: the ordinary apply
+        // would refuse the re-delivery for ever, so the record goes.
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(&sender) {
+            drop(revoked);
+            super::super::gss_share_hold::forget_parked_secret(state, &group_key).await;
+            return;
+        }
+    }
+    use base64::Engine as _;
+    let recipient_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let recipient_kem_b64 =
+        base64::engine::general_purpose::STANDARD.encode(&state.agent_kem_keypair.public_bytes);
+    match super::super::build_secure_share_event(
+        &group_key,
+        &recipient_hex,
+        &recipient_kem_b64,
+        &parked.sender,
+        &secret,
+        parked.secret_epoch,
+    ) {
+        Ok(event) => {
+            let took =
+                super::super::apply_named_group_metadata_event(state, event, sender, true, None)
+                    .await;
+            if took.accepted {
+                super::super::gss_share_hold::forget_parked_secret(state, &group_key).await;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                group_id = %super::super::LogHexId::group(&group_key),
+                "#1775 parked share not re-sealed for re-delivery: {error:?}"
+            );
+        }
     }
 }
 

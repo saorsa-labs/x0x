@@ -1874,43 +1874,40 @@ Active seat, the encrypted GSS plane and the frame's per-seat position
 (`state_revision`, `key_sequence`) seats the key on the member's row
 (replays, stale keys, frames signed before the seat's current
 admission, and unsigned or wrong-signer frames are refused; see the
-`X0XKR1` entry below). The republication is
-automatic: the keyless install itself sends it, and a node that boots
-into the keyless state — or into the keyed state whose share never
-installed — sends it at startup. A send the carrier does not accept is
-not done: a recipient whose verified advert is missing or expired, or
-whose send failed, keeps the frame owed, and the daemon retries it
-until the advert sets the bit or rules the frame out. A send the carrier
-accepts is not proof that the peer seated the key, so the daemon sends
-the frame again to each owed Active recipient, up to 6 carrier-accepted
-sends. The sweep interval starts at 5 s and doubles to a maximum of
-80 s. A newer republication for the same group resets the count. A
-recipient that leaves the group's Active roster, or is revoked, is no
-longer owed. The receiver refuses a repeat of a seated key as
-`stale_key`, so a repeat does no harm. The startup pass keeps the seat
-selected until the share installs, so a restart sends it again. Once
-the seat is keyed — on the survivor's own copy and on the authors' copies — the next S4
-delivery round seals the current secret to it and the share installs
-through the existing path, which ends the hold and returns the served
-head. Share completion stays distinct from that head: a catch-up answer
-from a seat an author's roster leaves keyless is not share-possession
-evidence (such a seat cannot hold the epoch secret), and the frame's
-ingest owes the republisher its sealed share on the author's open S4
-rows. That debt — not the roster key — holds the row open whatever a
-restored head already reported: it ends only when the carrier accepts a
-sealed share for the member, and a share batch whose bounded retries
-fail leaves the obligation in place, re-sealed each delivery round. If
-the member republishes while the author's GSS delivery is open, the
-author resets the member's earlier convergence: the member converges
-again only after the new-key share is accepted and the member reports
-its head. A peer whose verified advert lacks
-`key_republish_v1` (bit 12) keeps the pre-#1663 behavior, so the seat
-stays keyless in that peer's view until it upgrades or the member
-re-joins. The window between the
-keyed seat and the installed share is the same superseded-intermediate
-shape the 02:09 ruling keeps as main's answer, bounded by the share
-delivery the S4 row owes. Until one of the two keys the seat again, the
-hold lasts until one of these ends it:
+`X0XKR1` entry below). The republication is automatic: the keyless install
+itself sends it, and a node that boots into the keyless state — or into the
+keyed state whose share never installed — sends it at startup. A send the
+carrier does not accept is not done: a recipient whose verified advert is
+missing or expired, or whose send failed, keeps the frame owed, and the
+daemon retries it until the advert sets the bit or rules the frame out. A
+send the carrier accepts is not proof that the peer seated the key, so the
+daemon sends the frame again to each owed Active recipient, up to 6
+carrier-accepted sends. The sweep interval starts at 5 s and doubles to a
+maximum of 80 s. A newer republication for the same group resets the count.
+A recipient that leaves the group's Active roster, or is revoked, is no
+longer owed. The receiver refuses a repeat of a seated key as `stale_key`,
+so a repeat does no harm. The startup pass keeps the seat selected until the
+share installs, so a restart sends it again. Once the seat is keyed — on the
+survivor's own copy and on the authors' copies — the next S4 delivery round
+seals the current secret to it and the share installs through the existing
+path, which ends the hold and returns the served head. Share completion
+stays distinct from that head: a catch-up answer from a seat an author's
+roster leaves keyless is not share-possession evidence (such a seat cannot
+hold the epoch secret), and the frame's ingest owes the republisher its
+sealed share on the author's open S4 rows. That debt — not the roster key —
+holds the row open whatever a restored head already reported: it ends only
+when the carrier accepts a sealed share for the member, and a share batch
+whose bounded retries fail leaves the obligation in place, re-sealed each
+delivery round. If the member republishes while the author's GSS delivery is
+open, the author resets the member's earlier convergence: the member
+converges again only after the new-key share is accepted and the member
+reports its head. A peer whose verified advert lacks `key_republish_v1` (bit
+12) keeps the pre-#1663 behavior, so the seat stays keyless in that peer's
+view until it upgrades or the member re-joins. The window between the keyed
+seat and the installed share is the same superseded-intermediate shape the
+02:09 ruling keeps as main's answer, bounded by the share delivery the S4
+row owes. Until one of the two keys the seat again, the hold lasts until one
+of these ends it:
 - An installed share of the held epoch, or of a later epoch that a head
   commit pins. A sealed share that raised the local epoch past what the
   head commits completed no verified transition (#1775).
@@ -1926,7 +1923,15 @@ replaces the other admin's secret that no commit pins. So does a foreign
 secret of a later epoch that no commit pins: the early sealed share
 raised the local epoch past the head, and the waiting transition's own
 share of the earlier epoch displaces it, so the frame it waits for
-installs (#1775).
+installs (#1775). A displaced later secret is not lost: it parks in the
+hold file with its sender and the displacing wait's epoch, and it
+re-delivers through the ordinary share path once a head commits that
+epoch — so the later rotation's own commit lands with its key, and an
+honest share-before-commit reordering stalls on no re-delivery. A
+superseded intermediate install parks the later key it drops the same
+way. The parked record goes when its epoch commits, when a secret of its
+epoch or a later one is already in, or when its sender is revoked; the
+file keeps one parked record per group.
 
 After a #1578 keyless install, the head already commits the epoch, but
 it binds the epoch, not the secret value (#1775). The durable keyless
@@ -1939,18 +1944,17 @@ commit moved, or a commit chained on that head. A sibling commit of the
 epoch ends the mark. So does a head that commits a later epoch. A share
 of a later unpinned epoch is not the mark's actor key.
 
-A known-empty evicted-removal hold ends at a secret of
-its epoch or a later one, committed or not. A hold whose actor list is unknown (a
-pre-#1771 exclusion file) is ended by no secret that a commit does not
-pin. One that carries removed members is an evicted removal's
-containment, which ends at any secret of its epoch.
+A known-empty evicted-removal hold ends at a secret of its epoch or a later
+one, committed or not. A hold whose actor list is unknown (a pre-#1771
+exclusion file) is ended by no secret that a commit does not pin.
+One that carries removed members is an evicted removal's containment.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
 (bit 5), `owner_recovery_v1` (bit 7) and `key_republish_v1` (bit 12,
-the #1663 republication). The new frames ride the
-direct-message carrier only. They are
-not on the metadata topic and not in a legacy-decoded container:
+the #1663 republication). The new frames ride the direct-message
+carrier only. They are not on the metadata topic and not in a
+legacy-decoded container:
 
 - `X0XEVH1` — `EvictionHandoffV1`, signed evidence from one admin to the
   others. It carries no key material.
@@ -1973,11 +1977,10 @@ not on the metadata topic and not in a legacy-decoded container:
   - `actor` — the republishing member's raw agent ID. The key seats on
     this member's own row only.
   - `agent_public_key_b64` — the actor's ML-DSA-65 agent public key
-    (base64). It verifies the
-    signature and must derive `actor`.
+    (base64). It verifies the signature and must derive `actor`.
   - `kem_public_key_b64` — the ML-KEM-768 public key (base64) to seat.
-    It must parse as an
-    ML-KEM-768 public key; a correct length alone is not sufficient.
+    It must parse as an ML-KEM-768 public key; a correct length alone
+    is not sufficient.
   - `state_revision` — the group state revision (the signed state-commit
     chain) that the actor held when it signed. This is the admission
     binding (David's 2 Nov 2026 ruling).

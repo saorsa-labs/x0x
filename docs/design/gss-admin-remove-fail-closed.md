@@ -360,7 +360,10 @@ except citations explicitly marked as resolving at
   #1775 review round gave the strict arm the same single exit: a share of an earlier epoch
   installs only when it may replace the installed secret, which is then one of a later
   epoch that no commit pins. A foreign later share so cannot strand a waiting frame; every
-  other earlier-epoch share stays refused. (The
+  other earlier-epoch share stays refused. The 4 Nov round completes that recovery: the
+  displaced later secret parks in the hold file and re-delivers through the ordinary
+  share path once a head commits the displacing wait's epoch, so the later rotation's
+  own commit lands with its key and an honest reordering loses no key. (The
   parked-removal replace half that #1775 also added stays dormant until a fenced
   `gss_removal_waits_for_share` change lands, per that PR.) The strict `<` clear and
   the equal-epoch refuse survive these changes. F1 does not change the guard — it is cited

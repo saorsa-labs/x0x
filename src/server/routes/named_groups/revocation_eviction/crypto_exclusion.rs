@@ -3014,14 +3014,31 @@ async fn install_gss(
             &actor_hex,
         )
         .await;
-        ng::gss_share_hold::note_keyless_commit(
+        if !ng::gss_share_hold::note_keyless_commit(
             state,
             group_key,
             next_secret_epoch,
             &actor_hex,
             &commit.state_hash,
         )
-        .await;
+        .await
+        {
+            // #1775 (claude review round 11): the durable mark did not
+            // land, so the head must not move over it — after a restart
+            // the epoch would pin nothing and stay replaceable. The hold
+            // stays; the frame retries the install and re-writes the
+            // mark.
+            return ReceiveOutcome::LocalFailure;
+        }
+    }
+    if promoted.is_some() && info.secret_epoch > next_secret_epoch {
+        // #1775 (claude review round 11): the later epoch's installed
+        // secret — the one this install displaces with its own key, or
+        // drops at the superseded exit — is parked, durably, and
+        // re-delivers once the head commits this frame's epoch, so the
+        // later rotation's commit lands with its key instead of waiting
+        // on a share re-delivery no retry owes.
+        ng::gss_share_hold::park_displaced_secret(state, group_key, info, next_secret_epoch).await;
     }
     let next = match ng::apply_stateful_event_with_evidence(
         state,
@@ -8578,6 +8595,14 @@ mod daemon_tests {
             1,
             "the durable hold stays: no secret of the new epoch exists here"
         );
+        // #1775 (claude review round 11, major 3): the refused apply's
+        // rollback takes the keyless mark it wrote ahead of the head that
+        // never moved — a kept mark would leave a committed epoch of this
+        // number replaceable.
+        assert!(
+            !ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the refused apply's rollback took the keyless mark"
+        );
         assert!(
             ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
             "the hold outlives the refused apply on disk"
@@ -8613,6 +8638,13 @@ mod daemon_tests {
             ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
             1,
             "the keyless install keeps the hold until a share arrives"
+        );
+        // #1775 (claude review round 11, major 3): the retry that installs
+        // writes the mark again — its head commits the epoch with no
+        // secret, which pins no secret value.
+        assert!(
+            ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the retry that installs writes the keyless mark again"
         );
         Ok(())
     }
@@ -9055,8 +9087,7 @@ mod daemon_tests {
         )
         .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
         let took =
-            ng::apply_named_group_metadata_event(&fx.replica, later_share.clone(), b, true, None)
-                .await;
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
         assert!(took.accepted, "B's later-epoch share installs: {took:?}");
         let parent = head_of(&fx.replica, &fx.group_id).await;
         assert_eq!(
@@ -9079,9 +9110,9 @@ mod daemon_tests {
         // the later epoch, held on the frame's result. The walk's step
         // author sealed the installed secret, so the frame takes the
         // superseded exit and installs as an intermediate head instead of
-        // waiting for a share that the stale-envelope guard refuses. B's
-        // share then reinstalls over the intermediate head, and the held
-        // chain replays onto it.
+        // waiting for a share that the stale-envelope guard refuses. The
+        // dropped later key parks (round 11), the install's replay
+        // re-delivers it, and the held chain commits B's rotation with it.
         let parent_info = fx
             .replica
             .named_groups
@@ -9134,21 +9165,12 @@ mod daemon_tests {
             ReceiveOutcome::Applied,
             "#1775 item 2: the held later rotation leads the frame out of the wait"
         );
-        assert_eq!(
-            head_of(&fx.replica, &fx.group_id).await.as_deref(),
-            Some(body.commit.state_hash.as_str()),
-            "the frame installed as an intermediate head"
-        );
-        // B's share reinstalls the later key over the intermediate head:
-        // the superseded install dropped it with the epoch, exactly as
-        // #1508 rc15 does — the held chain's replay parks B's rotation
-        // until this share lands, and then commits it.
-        let took =
-            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
-        assert!(took.accepted, "B's share reinstalls: {took:?}");
-        // The held chain replays onto the intermediate head, B's rotation
-        // applies with its key, and a head commits the later epoch: the
-        // wait ended by pinning the secret, not by stranding it.
+        // #1775 (claude review round 11): the superseded install parks the
+        // later key it drops, and the install's replay re-delivers the
+        // parked share before the held chain runs — no manual share
+        // re-delivery. B's rotation then applies with its own sender's key
+        // in, and a head commits the later epoch: the wait ended by
+        // pinning the secret, not by stranding it.
         let installed = fx
             .replica
             .named_groups
@@ -9159,7 +9181,7 @@ mod daemon_tests {
             .context("group")?;
         assert_eq!(
             installed.state_hash, b_head,
-            "the held chain reached B's head"
+            "the held chain reached B's head with the parked share: no re-delivery"
         );
         assert_eq!(installed.secret_epoch, next_secret_epoch + 1);
         assert!(installed.shared_secret.is_some(), "B's key stayed in");
@@ -9184,7 +9206,10 @@ mod daemon_tests {
     /// guard alone would refuse that share for ever and strand the
     /// frame. Before the frame parks its hold, the same share stays
     /// refused: no verified transition of the epoch waits yet, so no
-    /// rule may displace the installed secret.
+    /// rule may displace the installed secret. Round 11 completes the
+    /// recovery: the displaced later secret parks, and the frame's own
+    /// install re-delivers it — the honest rotation loses no key to the
+    /// reordering.
     #[tokio::test]
     async fn the_actors_earlier_share_recovers_a_later_epoch_foreign_secret() -> Result<()> {
         use anyhow::Context as _;
@@ -9346,21 +9371,288 @@ mod daemon_tests {
             installed.state_hash, body.commit.state_hash,
             "the frame's result is the head"
         );
-        assert_eq!(installed.secret_epoch, next_secret_epoch);
+        assert_eq!(
+            x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
+            next_secret_epoch,
+            "the head commits the frame's epoch"
+        );
+        // #1775 (claude review round 11): the frame's own install
+        // re-delivered the parked later secret, so the honest rotation
+        // that arrived before its commit lost no key to the reordering —
+        // its commit will pin the same value it sealed.
+        assert_eq!(
+            installed.secret_epoch,
+            next_secret_epoch + 1,
+            "the displaced later secret reinstalled with the frame's commit"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the survivor holds B's re-delivered later key"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the committed epoch pins the frame's key: the group seals again"
+        );
+        Ok(())
+    }
+
+    /// #1775 (claude review round 11, Engineer ruling 4 Nov): the honest
+    /// reordering the round-10 replace could stall. B's share of the epoch
+    /// after the frame's arrives first and installs unpinned; the waiting
+    /// actor's own share then displaces it; the frame commits its epoch
+    /// with its actor's key. The displaced later secret is parked at the
+    /// displacement and re-delivers with the frame's own commit — B's
+    /// rotation commit then lands with its key installed, no share
+    /// re-delivery needed, and a replay of the same commit keeps it. Red
+    /// on dfcb0d0a: without the park, B's frame waits for a share no
+    /// retry owes.
+    #[tokio::test]
+    async fn a_displaced_later_secret_reinstalls_when_its_commit_lands() -> Result<()> {
+        use anyhow::Context as _;
+        // A raw ID above the fixture author's, so B is never the designated
+        // admin and the author authors the exclusion at once (D74: the
+        // lowest eligible admin is designated); B stays an admin of the
+        // parent roster, so its later-epoch share installs.
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let author_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // (1) B's share of the epoch after the frame's installs while the
+        // head stays at the parent: the local epoch rises, no commit pins
+        // it.
+        let foreign = [0xB5u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+
+        // (2) The frame waits under B's unpinned later secret; the waiting
+        // actor's own share of the frame's epoch displaces it (round 10)
+        // and parks it (round 11).
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "#1775 item 2: an uncommitted later-epoch secret is not the frame's key"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no result head over B's secret"
+        );
+        let actor_secret = [0x07u8; 32];
+        let recovery = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's recovery share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, recovery, admin, true, None).await;
+        assert!(
+            took.accepted,
+            "the waiting actor's share displaces the unpinned later secret: {took:?}"
+        );
+
+        // (3) The frame retries with its actor's key and commits its
+        // epoch. The install's replay re-delivers the parked later secret
+        // at once: the honest rotation lost no key to the reordering.
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the frame installs with its actor's key"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, body.commit.state_hash,
+            "the frame's result is the head"
+        );
         assert_eq!(
             x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
             next_secret_epoch,
             "the head commits the frame's epoch"
         );
         assert_eq!(
+            installed.secret_epoch,
+            next_secret_epoch + 1,
+            "the parked later secret re-delivered with the frame's own commit"
+        );
+        assert_eq!(
             installed.shared_secret.as_deref(),
-            Some(actor_secret.as_slice()),
-            "the survivor holds the actor's key, not B's"
+            Some(foreign.as_slice()),
+            "the survivor holds B's later key again"
         );
         assert_eq!(
             ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
             None,
-            "the committed epoch pins the secret: the group seals again"
+            "the committed epoch pins the frame's key: the group seals again"
+        );
+
+        // (4) B's rotation of the later epoch lands as its own commit: the
+        // re-delivered key is the installed secret of its epoch from its
+        // own sender, so the frame installs with it — no share
+        // re-delivery. A crypto-only exclusion targets the already
+        // removed leaver and keeps the parent's roster (validate's rule),
+        // so the frame is the fixture frame's shape at the next epoch.
+        let leaver_hex = hex::encode(fx.leaver.as_bytes());
+        let mut b_next = installed.clone();
+        b_next.roster_revision = b_next.roster_revision.saturating_add(1);
+        b_next.secret_epoch = next_secret_epoch + 1;
+        b_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let b_commit = b_next.seal_commit(&b_kp, ng::now_millis_u64())?;
+        let b_body = ce::CryptoExclusionBodyV1 {
+            stable_group_id: fx.stable.clone(),
+            actor: *b.as_bytes(),
+            target: *fx.leaver.as_bytes(),
+            prior_head: installed.state_hash.clone(),
+            prior_revision: installed.state_revision,
+            next_revision: b_commit.revision,
+            roster_revision: b_next.roster_revision,
+            removal_proof_hash: ce::removal_proof_for(&installed, &leaver_hex)
+                .context("the leaver's removal proof on the frame's result")?,
+            crypto: ce::CryptoExclusionCryptoV1::Gss {
+                next_secret_epoch: next_secret_epoch + 1,
+            },
+            commit: ce::CommitHeaderV1::from(&b_commit),
+        };
+        let b_frame =
+            ce::encode_frame(&ce::sign(b_body, &b_kp).context("sign B's rotation frame")?)
+                .context("encode B's rotation frame")?;
+        assert_eq!(
+            receive(&fx.replica, b, &b_frame).await,
+            ReceiveOutcome::Applied,
+            "B's rotation commits with its re-delivered key: no share re-delivery"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, b_commit.state_hash,
+            "B's rotation is the head"
+        );
+        assert_eq!(installed.secret_epoch, next_secret_epoch + 1);
+        assert_eq!(
+            x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
+            next_secret_epoch + 1,
+            "a head commits the later epoch"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the survivor holds B's key under B's own commit"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the committed later epoch pins the secret: the group seals again"
+        );
+
+        // (5) A replay of B's commit is a Duplicate and keeps the
+        // re-delivered key.
+        assert_eq!(
+            receive(&fx.replica, b, &b_frame).await,
+            ReceiveOutcome::Duplicate,
+            "the replay of B's commit installs nothing new"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, b_commit.state_hash,
+            "the duplicate moved nothing"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the re-delivered secret survives the replay"
         );
         Ok(())
     }

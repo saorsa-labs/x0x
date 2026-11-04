@@ -18902,10 +18902,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     &sender_hex,
                     secret_epoch,
                 );
-            if secret_epoch < info.secret_epoch && !replaces_unpinned_secret
-                || secret_epoch == info.secret_epoch
+            if (secret_epoch < info.secret_epoch && !replaces_unpinned_secret)
+                || (secret_epoch == info.secret_epoch
                     && info.shared_secret.is_some()
-                    && !replaces_unpinned_secret
+                    && !replaces_unpinned_secret)
             {
                 return ApplyMetadataResult::REJECTED;
             }
@@ -18955,6 +18955,22 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             {
                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "rejecting SecureShareDelivered after post-crypto terminality recheck: {e}");
                 return ApplyMetadataResult::REJECTED;
+            }
+            // #1775 (claude review round 11): a replacing share of an
+            // earlier epoch displaces a later epoch's installed secret —
+            // an honest rotation's share that arrived before its commit.
+            // The displaced value is parked, durably and before the
+            // replacing secret installs, and re-delivers once the head
+            // commits the displacing wait's epoch, so the later
+            // rotation's commit lands with its key.
+            if replaces_unpinned_secret && secret_epoch < info.secret_epoch {
+                gss_share_hold::park_displaced_secret(
+                    state,
+                    &resolved_group_key,
+                    &info,
+                    secret_epoch,
+                )
+                .await;
             }
             let mut next = info.clone();
             next.shared_secret = Some(secret.to_vec());
