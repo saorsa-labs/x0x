@@ -10668,7 +10668,8 @@ impl Agent {
                 "machine-addressed data reply withheld: the pairing was denied at the send"
             );
             return Err(dm::DmError::EnvelopeConstruction(format!(
-                "recipient pairing denied (ADR-0043 B/P): {denial:?}"
+                "{} (ADR-0043 B/P): {denial:?}",
+                dm::RECIPIENT_PAIRING_DENIED
             )));
         }
         // #1664 r4 (Engineer ruling, 31 Oct 2026 09:00 GMT): the answer
@@ -11198,7 +11199,8 @@ impl Agent {
             if let Some(denial) = self.recipient_pairing_denied(to, &machine_id).await {
                 self.direct_messaging.record_outgoing_failed(*to);
                 return Err(dm::DmError::EnvelopeConstruction(format!(
-                    "recipient pairing denied (ADR-0043 B/P): {denial:?}"
+                    "{} (ADR-0043 B/P): {denial:?}",
+                    dm::RECIPIENT_PAIRING_DENIED
                 )));
             }
         }
@@ -11318,7 +11320,8 @@ impl Agent {
                 if let Some(denial) = self.recipient_pairing_denied(to, &cap_machine).await {
                     self.direct_messaging.record_outgoing_failed(*to);
                     return Err(dm::DmError::EnvelopeConstruction(format!(
-                        "recipient pairing denied (ADR-0043 B/P, capability binding): {denial:?}"
+                        "{} (ADR-0043 B/P, capability binding): {denial:?}",
+                        dm::RECIPIENT_PAIRING_DENIED
                     )));
                 }
             }

@@ -1769,7 +1769,8 @@ every wait. A wait always names its cause; it does not stop silently.
     and without a definitive routing or eligibility failure (ADR 0110
     §2). The outcome is recorded per attempt when the dispatch
     completes, and the outcome-bearing records (`unresolved`,
-    `unsupported`) survive a restart. The cause shows while the
+    `unsupported`) survive a restart until W ends or the designation
+    changes, when the daemon drops them. The cause shows while the
     designated window W runs — L171: it "preserves priority through W,
     not forever" — so a rank whose fallback time is later (W + Δ and
     on) keeps the plain `waiting_for_designated_admin` for the rest of
@@ -1781,7 +1782,11 @@ every wait. A wait always names its cause; it does not stop silently.
     `waiting_for_designated_admin` with the
     `designated_admin_unsupported` detail once the row has dispatched
     (a verified advert that lacks `eviction_handoff_v1`, or the
-    transport's refusal for that lack).
+    transport's refusal for that lack). A definitive policy refusal (the
+    designated admin's trust policy rejected this node, or this node's
+    pairing policy denied the designated admin's machine) is not this
+    cause either: it keeps the plain `waiting_for_designated_admin` with
+    `detail: "rank"`.
     The manual remove/ban/seal 202 keeps its documented
     `waiting_for_designated_admin` answer (ADR 0110 §2's ADR 0016 §6
     amendment).

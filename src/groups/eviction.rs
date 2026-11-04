@@ -203,39 +203,48 @@ pub enum DesignatedWaitDetail {
 #[non_exhaustive]
 pub enum DesignatedHandoffOutcome {
     /// The hand-off reached an authenticated direct or routed exchange
-    /// with the designated admin (L170: `send_direct` succeeded, or the
-    /// designated admin's own acknowledgement refused this sender by
-    /// policy — the route is resolved either way). Routine, so it never rides the stored file; a completion drops
+    /// with the designated admin (L170: `send_direct` succeeded).
+    /// Routine, so it never rides the stored file; a completion drops
     /// the record entirely.
     ExchangeReached,
     /// The attempt completed without such an exchange and without a
     /// definitive current routing or eligibility failure: the designated
-    /// route is unresolved (L171). The record holds until the row
-    /// completes, terminates or reopens — there is no dispatch retry,
-    /// and a later receipt does not rewrite it. The label stops earlier:
-    /// at W, or when the designation changes (the record names another
-    /// admin), but the record itself stays until the row closes.
+    /// route is unresolved (L171). There is no dispatch retry, and a
+    /// later receipt does not rewrite the record. The pass drops it at
+    /// W and when the designation changes (the record names another
+    /// admin), and the row drops it when it completes, terminates or
+    /// reopens (Engineer ruling, 4 Nov 2026 17:22 GMT).
     Unresolved,
     /// The designated admin's current verified advert lacks
     /// `eviction_handoff_v1` (§4, L173), or its transport refused the
     /// send for that lack (`RecipientUpgradeRequired`): a definitive
     /// eligibility failure.
     Unsupported,
+    /// A definitive policy refusal (L171): the designated admin's own
+    /// acknowledgement that its trust policy refused this sender
+    /// (`RecipientRejected`), or this node's ADR-0043 pairing policy
+    /// refused the designated admin's machine. Not an unresolved route
+    /// and not a §4 capability lack, so the row keeps the plain
+    /// designated wait. Never stored (Engineer ruling, 4 Nov 2026
+    /// 18:15 GMT).
+    PolicyRefused,
 }
 
 impl DesignatedHandoffOutcome {
     /// Whether the outcome rides the `.evs` v3 extension (§5). Only
     /// `Unresolved` and `Unsupported` do; a routine `ExchangeReached`
-    /// stays in memory (Engineer ruling, 4 Nov 2026 08:25 GMT).
+    /// and a `PolicyRefused` stay in memory (Engineer rulings, 4 Nov
+    /// 2026 08:25 and 18:15 GMT).
     #[must_use]
-    pub fn persists(self) -> bool {
+    pub(crate) fn persists(self) -> bool {
         matches!(self, Self::Unresolved | Self::Unsupported)
     }
 }
 
 /// This node's recorded outbound hand-off dispatch against one
 /// designated admin. The record names the admin it targeted, so a
-/// designation change voids it. The dispatch itself runs once per
+/// designation change voids it; the S4 pass then drops it, and it also
+/// drops it at W. The dispatch itself runs once per
 /// attempt — when the row first dispatches, and again after a reopen —
 /// so a designation change alone sends no new attempt and the new
 /// designated admin holds no record until the row reopens.
@@ -470,11 +479,12 @@ pub struct ObligationRow {
     /// This node's recorded outbound hand-off dispatch outcome against
     /// the row's designated admin (§2, L170–L173). `#[serde(skip)]`: the
     /// v1 body above is frozen (§5), so the record persists only in the
-    /// v3 extension ([`EvsDesignatedHandoffsV3`]) and an old-header row
+    /// `.evs` v3 extension ([`EVS_HEADER_V3`]) and an old-header row
     /// loads with the `None` default. Only `unresolved` and
     /// `unsupported` outcomes ride that extension; a routine
-    /// `exchange_reached` stays in memory and a completion drops the
-    /// record (Engineer ruling, 4 Nov 2026 08:25 GMT).
+    /// `exchange_reached` stays in memory. The record is dropped at W,
+    /// on a designation change, and when the row completes, terminates
+    /// or reopens (Engineer rulings, 4 Nov 2026 08:25 and 17:22 GMT).
     #[serde(skip)]
     pub designated_handoff: Option<DesignatedHandoffRecord>,
 }
@@ -594,6 +604,33 @@ impl ObligationRow {
         self.designated_handoff = None;
         self.boot_id = boot_id;
         self.elapsed_budget_ms = 0;
+    }
+
+    /// Drop the hand-off record once it no longer applies, so a stored
+    /// `unresolved` or `unsupported` outcome leaves the `.evs` v3
+    /// extension and the file returns to v1/v2 (Engineer ruling, 4 Nov
+    /// 2026 17:22 GMT). The record ends at W (`past_window`): L171 keeps
+    /// an unresolved route's priority "through W, not forever", and the
+    /// §4 unsupported wait also lasts for W. It also ends when the
+    /// current designated admin (`designated`, `None` when no
+    /// designation is known this pass) is not the admin the record
+    /// names: the attempt targeted an admin that is no longer
+    /// designated. Returns whether the stored file changes, that is
+    /// whether the dropped record was an outcome-bearing one.
+    pub(crate) fn retire_designated_handoff(
+        &mut self,
+        designated: Option<[u8; 32]>,
+        past_window: bool,
+    ) -> bool {
+        let Some(record) = self.designated_handoff else {
+            return false;
+        };
+        let redesignated = designated.is_some_and(|current| current != record.designated);
+        if !(past_window || redesignated) {
+            return false;
+        }
+        self.designated_handoff = None;
+        record.outcome.persists()
     }
 }
 
@@ -1552,13 +1589,17 @@ pub const EVS_HEADER_V1: &[u8; 10] = b"X0XEVICT1\0";
 /// [`EvsQueuedBansV2`]. It is written only while a queued manual ban
 /// exists, so a store without one stays v1 and readable by a v1 binary.
 pub const EVS_HEADER_V2: &[u8; 10] = b"X0XEVICT2\0";
-/// The `.evs` v3 header (10 bytes): the v2 body followed by
-/// [`EvsDesignatedHandoffsV3`]. It is written only while some row holds
-/// an `unresolved` or `unsupported` hand-off outcome — a routine
-/// `exchange_reached` never rides the file and a completion drops the
-/// record (Engineer ruling, 4 Nov 2026 08:25 GMT) — so a store without
-/// an outcome-bearing record stays v1 or v2 and readable by a v1 or v2
-/// binary.
+/// The `.evs` v3 header (10 bytes): the v2 body followed by this node's
+/// recorded designated hand-off outcomes. It is written only while some
+/// open row holds an `unresolved` or `unsupported` hand-off outcome
+/// inside W against its current designated admin — a routine
+/// `exchange_reached` never rides the file, and the record is dropped
+/// at W, on a designation change and when the row closes or reopens
+/// (Engineer rulings, 4 Nov 2026 08:25 and 17:22 GMT) — so a store
+/// without such a record stays v1 or v2 and readable by a v1 or v2
+/// binary. A binary older than v3 reads a v3 file as a newer format
+/// and runs S4 memory-only for that whole run: it never rewrites a
+/// newer file, so only a v3-reading binary returns it to v1/v2.
 pub const EVS_HEADER_V3: &[u8; 10] = b"X0XEVICT3\0";
 /// The `.evjournal` v1 header (8 bytes).
 pub const EVJOURNAL_HEADER_V1: &[u8; 8] = b"X0XEVJ1\0";
@@ -1621,7 +1662,7 @@ pub struct EvsQueuedBansV2 {
 
 /// One persisted designated-admin hand-off outcome, keyed by its row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DesignatedHandoffV3 {
+pub(crate) struct DesignatedHandoffV3 {
     /// Stable group ID of the row.
     pub stable_group_id: String,
     /// Target agent ID of the row.
@@ -1636,7 +1677,7 @@ pub struct DesignatedHandoffV3 {
 /// §4 downgrade survive a restart. Only `unresolved` and `unsupported`
 /// outcomes ride it (Engineer ruling, 4 Nov 2026 08:25 GMT).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct EvsDesignatedHandoffsV3 {
+pub(crate) struct EvsDesignatedHandoffsV3 {
     /// One recorded outcome per row that holds one.
     pub handoffs: Vec<DesignatedHandoffV3>,
 }
@@ -1815,7 +1856,7 @@ pub fn decode_evs(bytes: &[u8]) -> Result<EvsBodyV1, SidecarDecodeError> {
 /// # Errors
 ///
 /// Returns the postcard error when encoding fails.
-pub fn encode_evs_with_extensions(
+pub(crate) fn encode_evs_with_extensions(
     body: &EvsBodyV1,
     queued_bans: &[QueuedBanV1],
     handoffs: &[DesignatedHandoffV3],
@@ -2671,6 +2712,18 @@ mod tests {
             Some(WaitingCause::WaitingForDesignatedAdmin)
         );
 
+        // A definitive policy refusal keeps the plain wait (L171;
+        // Engineer ruling, 4 Nov 2026 18:15 GMT).
+        row.designated_handoff = Some(DesignatedHandoffRecord {
+            designated: id(1),
+            outcome: DesignatedHandoffOutcome::PolicyRefused,
+        });
+        let refused = evaluate_row(&row, &ctx(3, &admins, &none, during_window), &timing);
+        assert_eq!(
+            refused.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+
         // A definitive failure is §4's, never an unresolved route.
         row.designated_handoff = Some(DesignatedHandoffRecord {
             designated: id(1),
@@ -2864,6 +2917,40 @@ mod tests {
         store.get_mut(&k).expect("row").designated_handoff = Some(record);
         assert!(store.terminate(&k, TerminationCause::GroupDeleted));
         assert_eq!(store.get(&k).expect("row").designated_handoff, None);
+    }
+
+    /// #1581 (Engineer ruling, 4 Nov 2026 17:22 GMT): the record ends
+    /// at W and when the designated admin is no longer the one it
+    /// names; only an outcome-bearing record changes the stored file.
+    #[test]
+    fn the_handoff_record_retires_at_w_and_on_a_designation_change() {
+        let mut store = ObligationStore::new();
+        let k = key(9);
+        store.intake(&k, revocation(1), Some("seat-a"), 1, [0; 16]);
+        let row = store.get_mut(&k).expect("row");
+        let record = |outcome| DesignatedHandoffRecord {
+            designated: id(1),
+            outcome,
+        };
+        // Inside W, same admin, or no designation known: kept.
+        row.designated_handoff = Some(record(DesignatedHandoffOutcome::Unresolved));
+        assert!(!row.retire_designated_handoff(Some(id(1)), false));
+        assert!(!row.retire_designated_handoff(None, false));
+        assert!(row.designated_handoff.is_some());
+        // At W: dropped, and the stored file changes.
+        assert!(row.retire_designated_handoff(Some(id(1)), true));
+        assert_eq!(row.designated_handoff, None);
+        // Another designated admin: dropped.
+        row.designated_handoff = Some(record(DesignatedHandoffOutcome::Unsupported));
+        assert!(row.retire_designated_handoff(Some(id(2)), false));
+        assert_eq!(row.designated_handoff, None);
+        // A memory-only outcome is dropped too, but no file changes.
+        row.designated_handoff = Some(record(DesignatedHandoffOutcome::ExchangeReached));
+        assert!(!row.retire_designated_handoff(Some(id(1)), true));
+        assert_eq!(row.designated_handoff, None);
+        row.designated_handoff = Some(record(DesignatedHandoffOutcome::PolicyRefused));
+        assert!(!row.retire_designated_handoff(Some(id(2)), false));
+        assert_eq!(row.designated_handoff, None);
     }
 
     #[test]
