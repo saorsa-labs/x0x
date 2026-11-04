@@ -2704,10 +2704,14 @@ mod tests {
         assert_eq!(status["held_self_rebinds"], serde_json::json!([]));
     }
 
-    /// #1581: an `OwnerCertified` group whose creator `admin` is the only
-    /// admin seat, holding a committed certificate that expires at
-    /// `not_after`.
-    fn sole_admin_group(
+    /// #1581: an `OwnerCertified` group whose creator holds only a plain
+    /// Member seat, and whose `admin` — a non-creator, so the #1023
+    /// creator exemption never applies to its seat — is the only admin
+    /// seat, holding a committed certificate that expires at `not_after`.
+    /// This is the seat shape a real daemon pass keeps: it derives the
+    /// §1a expiry trigger for `admin` itself and never ends the row with
+    /// `CreatorSeatExempt`.
+    pub(super) fn sole_admin_group(
         not_after: u64,
     ) -> (
         x0x::identity::UserKeypair,
@@ -2715,18 +2719,42 @@ mod tests {
         GroupInfo,
     ) {
         let owner = x0x::identity::UserKeypair::generate().expect("owner");
+        let creator = x0x::identity::AgentKeypair::generate().expect("creator");
         let admin = x0x::identity::AgentKeypair::generate().expect("admin");
         let mut info = GroupInfo::new(
             "g".to_string(),
             String::new(),
-            admin.agent_id(),
+            creator.agent_id(),
             "ab".repeat(16),
         );
         info.policy.admission =
             x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        // The creator stays a plain Member: expiry work never targets its
+        // seat (#1023), so the admin seat carries the sole-admin shape.
+        if let Some(seat) = info
+            .members_v2
+            .get_mut(&hex::encode(creator.agent_id().as_bytes()))
+        {
+            seat.role = GroupRole::Member;
+        }
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut seat = x0x::groups::GroupMember::new_member(
+            admin_hex.clone(),
+            None,
+            Some(hex::encode(creator.agent_id().as_bytes())),
+            1,
+        );
+        seat.role = GroupRole::Admin;
+        info.members_v2.insert(admin_hex.clone(), seat);
         cr::install_certificate(
             &mut info,
-            &hex::encode(admin.agent_id().as_bytes()),
+            &hex::encode(creator.agent_id().as_bytes()),
+            AgentCertificate::issue_with_expiry(&owner, &creator, Some(not_after + 86_400))
+                .expect("certificate"),
+        );
+        cr::install_certificate(
+            &mut info,
+            &admin_hex,
             AgentCertificate::issue_with_expiry(&owner, &admin, Some(not_after))
                 .expect("certificate"),
         );
@@ -2752,55 +2780,10 @@ mod tests {
         store.get(&key).expect("row").clone()
     }
 
-    /// #1581 (ADR 0110 §1a, §4b(2)): a sole admin whose selected
-    /// certificate is expired on this node's clock (own trigger,
-    /// `not_after + τ`) is itself the admin whose owner renewal the row
-    /// waits for, so the row shows `waiting_for_admin_certificate_renewal`
-    /// naming the target, not the fallback `waiting_for_active_admin`.
-    /// `admins_needing_renewal` still answers `None` with no other admin
-    /// (it gates the §4b(2) self-rebind permission), so this changes only
-    /// what the row shows, never who may rebind.
-    #[test]
-    fn row_override_waits_for_the_renewal_of_a_sole_expired_admin() {
-        const NOW: u64 = 1_000_000;
-        let expired = NOW - s4::EXPIRY_TOLERANCE_SECS - 1;
-        let (_owner, admin, info) = sole_admin_group(expired);
-        let row = expiry_row(&info, *admin.agent_id().as_bytes(), expired);
-        assert_eq!(
-            row_override(&RebindState::default(), &info, &row, true, NOW)
-                .map(|wait| (wait.cause, wait.named)),
-            Some((
-                WaitingCause::WaitingForAdminCertificateRenewal,
-                vec![*admin.agent_id().as_bytes()]
-            ))
-        );
-    }
-
-    /// #1581: while the sole admin's §4b(2) self-rebind is held by the D76
-    /// rule, the same row shows `waiting_for_receiver_upgrade` naming the
-    /// holders — the override shape the multi-admin row already has.
-    #[test]
-    fn row_override_names_the_holders_of_a_held_sole_admin_self_rebind() {
-        const NOW: u64 = 1_000_000;
-        let expired = NOW - s4::EXPIRY_TOLERANCE_SECS - 1;
-        let (owner, admin, info) = sole_admin_group(expired);
-        let holder = [7u8; 32];
-        let mut rebind = RebindState::default();
-        rebind.held.insert(
-            EvictionKey::new(info.stable_group_id(), *admin.agent_id().as_bytes()),
-            HeldSelfRebind {
-                group_key: "g".to_string(),
-                certificate: AgentCertificate::issue_with_expiry(&owner, &admin, Some(NOW + 600))
-                    .expect("renewal"),
-                holders: vec![holder],
-            },
-        );
-        let row = expiry_row(&info, *admin.agent_id().as_bytes(), expired);
-        assert_eq!(
-            row_override(&rebind, &info, &row, true, NOW).map(|wait| (wait.cause, wait.named)),
-            Some((WaitingCause::WaitingForReceiverUpgrade, vec![holder]))
-        );
-    }
+    // The sole-admin waits themselves (#1581) run through the real
+    // daemon pass in [`daemon_tests`]: a non-creator sole admin's row
+    // must survive intake and reconcile, not be handed to
+    // `row_override` pre-built.
 
     /// The sole-admin wait starts only at the own trigger (`not_after +
     /// τ`, #1533 Codex P2): past its cutoff but not yet expired, the sole
@@ -3545,6 +3528,113 @@ mod daemon_tests {
                 .admin_waits
                 .contains_key(&key),
             "a landed rebind still ends the wait"
+        );
+        Ok(())
+    }
+
+    /// #1581 (ADR 0110 §1a, §4b(2)) through the daemon pass: the sole
+    /// admin is a non-creator seat, so the pass itself derives the §1a
+    /// expiry trigger, opens the row and keeps it — no
+    /// `CreatorSeatExempt` (#1023) — and the row waits for the target's
+    /// own renewal (`waiting_for_admin_certificate_renewal` naming the
+    /// target), not the fallback `waiting_for_active_admin`.
+    /// `admins_needing_renewal` still answers `None` with no other admin
+    /// (it gates the §4b(2) self-rebind permission), so this pins only
+    /// what the row shows, never who may rebind.
+    #[tokio::test]
+    async fn a_sole_expired_admin_waits_for_its_own_renewal_through_the_pass() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let now = now_unix_ms() / 1000;
+        let (_owner, admin, info) = super::tests::sole_admin_group(now - 3_600);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(info.stable_group_id().to_string(), info.clone());
+        super::super::revocation_eviction_pass(&state).await;
+        let key = EvictionKey::new(info.stable_group_id(), *admin.agent_id().as_bytes());
+        let row = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            inner.store.get(&key).cloned()
+        }
+        .context("the pass opened the sole admin's expiry row by itself")?;
+        assert!(
+            row.phase.is_open(),
+            "a non-creator sole admin's expiry row survives the pass"
+        );
+        assert_eq!(
+            row.waiting.map(|wait| (wait.cause, wait.named)),
+            Some((
+                WaitingCause::WaitingForAdminCertificateRenewal,
+                vec![*admin.agent_id().as_bytes()]
+            ))
+        );
+        Ok(())
+    }
+
+    /// #1581 through the daemon pass: while the sole admin's §4b(2)
+    /// self-rebind is held by the D76 rule, the same pass-opened row
+    /// shows `waiting_for_receiver_upgrade` naming the holders — the
+    /// override shape the multi-admin row already has.
+    #[tokio::test]
+    async fn a_held_sole_admin_self_rebind_names_its_holders_through_the_pass() -> Result<()> {
+        let (state, _dir) = ng::tests::secure_endpoint_test_state().await?;
+        let now = now_unix_ms() / 1000;
+        let (owner, admin, info) = super::tests::sole_admin_group(now - 3_600);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(info.stable_group_id().to_string(), info.clone());
+        let key = EvictionKey::new(info.stable_group_id(), *admin.agent_id().as_bytes());
+        // One pass opens the row on its own renewal wait; the renewal is
+        // then held as the D76 rule's route hold leaves it (an Active
+        // member's verified advert lacks `certificate_rebind_v1`).
+        super::super::revocation_eviction_pass(&state).await;
+        let opened = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            inner.store.get(&key).cloned()
+        }
+        .context("the pass opened the sole admin's expiry row by itself")?;
+        assert!(
+            opened.phase.is_open(),
+            "a non-creator sole admin's expiry row survives the pass"
+        );
+        assert_eq!(
+            opened.waiting.map(|wait| (wait.cause, wait.named)),
+            Some((
+                WaitingCause::WaitingForAdminCertificateRenewal,
+                vec![*admin.agent_id().as_bytes()]
+            ))
+        );
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.rebind.held.insert(
+                key.clone(),
+                HeldSelfRebind {
+                    group_key: info.stable_group_id().to_string(),
+                    certificate: AgentCertificate::issue_with_expiry(
+                        &owner,
+                        &admin,
+                        Some(now + 600),
+                    )?,
+                    holders: vec![[7; 32]],
+                },
+            );
+        }
+        super::super::revocation_eviction_pass(&state).await;
+        let row = {
+            let inner = state.revocation_evictions.inner.lock().await;
+            inner.store.get(&key).cloned()
+        }
+        .context("the pass keeps the sole admin's expiry row open")?;
+        assert!(
+            row.phase.is_open(),
+            "a non-creator sole admin's expiry row survives the pass"
+        );
+        assert_eq!(
+            row.waiting.map(|wait| (wait.cause, wait.named)),
+            Some((WaitingCause::WaitingForReceiverUpgrade, vec![[7; 32]]))
         );
         Ok(())
     }
