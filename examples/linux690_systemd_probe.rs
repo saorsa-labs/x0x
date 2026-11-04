@@ -4,6 +4,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x0x::upgrade::restart::{readback_systemd_policy, SupervisionSignals, SystemdPolicyReadback};
+#[cfg(target_os = "linux")]
+#[path = "../src/upgrade/launcher/mod.rs"]
+mod launcher;
 
 #[derive(Serialize)]
 struct VerdictRecord {
@@ -170,8 +173,18 @@ fn parse_args() -> io::Result<PathBuf> {
 }
 
 fn run() -> io::Result<()> {
+    if let Some(result) = x0x::upgrade::verification_probe::run_if_requested() {
+        return result.map_err(io::Error::other);
+    }
     // Every invocation, including respawns, admits itself before fixture work.
     let isolation = sample_isolation()?;
+    #[cfg(target_os = "linux")]
+    if let Some(mode) = std::env::args()
+        .nth(1)
+        .filter(|arg| arg.starts_with("--launcher-"))
+    {
+        return launcher_fixture(&mode);
+    }
     let artifact = parse_args()?;
     fs::create_dir_all(&artifact)?;
     let invocation = claim_invocation(&artifact)?;
@@ -247,6 +260,52 @@ fn run() -> io::Result<()> {
     loop {
         std::thread::park_timeout(Duration::from_secs(60));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn launcher_fixture(mode: &str) -> io::Result<()> {
+    use std::io::{BufRead, Read};
+    if mode == "--launcher-child" && std::env::var_os("X0X_M2_BOOT_FD").is_some() {
+        launcher::candidate_boot_for_fixture(env!("CARGO_PKG_VERSION"))?;
+        if std::env::var("X0X_LAUNCHER_CASE").as_deref() == Ok("crash") {
+            std::process::exit(19);
+        }
+        loop {
+            std::thread::park_timeout(Duration::from_secs(60));
+        }
+    }
+    if mode != "--launcher-child" {
+        return Err(io::Error::other("unknown launcher fixture"));
+    }
+    let root = PathBuf::from(
+        std::env::args_os()
+            .nth(2)
+            .ok_or_else(|| io::Error::other("missing fixture root"))?,
+    );
+    if root.join("fixture-flush.json").exists() {
+        atomic_json(
+            &root.join("restored-started.json"),
+            &serde_json::json!({"pid": std::process::id()}),
+        )?;
+        loop {
+            std::thread::park_timeout(Duration::from_secs(60));
+        }
+    }
+    let listener = std::os::unix::net::UnixListener::bind(root.join("upgrade-flush.sock"))?;
+    atomic_json(
+        &root.join("old-ready.json"),
+        &serde_json::json!({"pid": std::process::id()}),
+    )?;
+    let (mut socket, _) = listener.accept()?;
+    socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut bytes = Vec::new();
+    std::io::BufReader::new(&mut socket)
+        .take(1024 * 1024)
+        .read_until(b'\n', &mut bytes)?;
+    let receipt = launcher::fixture_receipt(&bytes)?;
+    atomic_json(&root.join("fixture-flush.json"), &receipt)?;
+    serde_json::to_writer(&mut socket, &serde_json::json!({"receipt": receipt}))?;
+    socket.write_all(b"\n")
 }
 
 fn main() {
