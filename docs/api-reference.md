@@ -1764,8 +1764,18 @@ every wait. A wait always names its cause; it does not stop silently.
     is `rank` (this node waits for its fallback time, `remaining_ms`) or
     `designated_admin_unsupported` (the designated admin's advert lacks
     `eviction_handoff_v1`).
-  - `unresolved_designated_admin` — the hand-off has not reached the
-    designated admin yet.
+  - `unresolved_designated_admin` — this node's own hand-off dispatch
+    against the designated admin completed without an exchange with it
+    and without a definitive routing or eligibility failure (ADR 0110
+    §2). The outcome is recorded per designated admin and survives a
+    restart, so the cause shows while the rank still waits (during W;
+    rank 1 and two-admin groups included) and stops when the designation
+    changes. `detail` is `rank` with `remaining_ms`, like the plain
+    wait. A definitive failure is not this cause: it keeps
+    `waiting_for_designated_admin` with `detail:
+    `designated_admin_unsupported`. The manual remove/ban/seal 202 keeps
+    its documented `waiting_for_designated_admin` answer (ADR 0110 §2's
+    ADR 0016 §6 amendment).
   - `local_committer_ineligible` — this admin may not seal (demoted,
     removed, revoked, left, or its own certificate expired).
   - `waiting_for_durable_intake` — the obligation is not on disk yet; the

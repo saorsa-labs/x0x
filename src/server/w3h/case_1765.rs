@@ -5,7 +5,7 @@
 //! sole admin, so the designated committer), B and C in a TreeKEM group
 //! settled at e0.
 //!
-//! A stops, a `X0XEVICT3\0` sidecar is put at A's `.evs` path and A
+//! A stops, a `X0XEVICT4\0` sidecar is put at A's `.evs` path and A
 //! restarts, so A's S4 store runs memory-only (`sidecar_newer_format`).
 //! After the restart sync wait, the case makes A's revocation-store
 //! write fail and B revokes its own agent (`POST /identity/revoke` on
@@ -75,7 +75,7 @@ const SETTLE: Duration = Duration::from_secs(10);
 
 /// The newer `.evs` layout this binary must leave untouched (#1508 reads
 /// v2, so v3 is the newer form).
-const NEWER_EVS: &[u8] = b"X0XEVICT3\0future layout";
+const NEWER_EVS: &[u8] = b"X0XEVICT4\0future layout";
 /// The v1 revocation store's file name in the identity directory.
 const REVOCATION_FILE: &str = "revocations.bin";
 /// The fault mode of A's identity directory: read and search, no write.
@@ -460,7 +460,7 @@ async fn body(
     passed &= record_check(
         receipt,
         "the_sidecar_runs_memory_only_newer_format",
-        state == "sidecar_newer_format" && detail.as_deref() == Some("version 3"),
+        state == "sidecar_newer_format" && detail.as_deref() == Some("version 4"),
         CAUSE_NEWER_MISCLASSIFIED,
         Some(format!("state={state} detail={detail:?}")),
         format!("state={state:?} detail={detail:?}; the file must stay untouched"),
@@ -774,7 +774,7 @@ const LABELS: &[&str] = &["A", "B", "C"];
 /// ADR 0110 `s4_sidecar_rebuild`, the newer-file variant with a new
 /// trigger whose evidence is not yet in the revocation store, with a
 /// failed-then-successful revocation-store write (line 378):
-/// under a `X0XEVICT3\0` memory-only sidecar, B's self-revocation reaches
+/// under a `X0XEVICT4\0` memory-only sidecar, B's self-revocation reaches
 /// A while A's revocation-store write fails. A's row shows the typed
 /// `waiting_for_durable_intake` and A stays at e0; when the write
 /// succeeds, the row completes with exactly one rotation and the newer
