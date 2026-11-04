@@ -118,6 +118,7 @@ mod gaps;
 mod owner_axis;
 mod reseat_route;
 mod segments;
+mod segments_s;
 
 const JOIN_LABELS: &[&str] = &["A", "M1", "M2", "J"];
 const SETUP: Duration = Duration::from_secs(180);

@@ -151,7 +151,7 @@ async fn after_responder_interval(sim: &Sim) -> Result<()> {
 }
 
 /// Drops every gossip write to J on `group`'s metadata topic.
-async fn hold_meta_from_j(sim: &Sim, group: &str) -> Result<()> {
+pub(super) async fn hold_meta_from_j(sim: &Sim, group: &str) -> Result<()> {
     use crate::network::sim::{Fault, LaneClass};
     let topic = {
         let state = sim.state("A")?;
