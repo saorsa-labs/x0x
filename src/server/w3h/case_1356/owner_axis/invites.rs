@@ -17,7 +17,8 @@
 //! Desired: J refuses (1) `reseat_invite_outside_staging`, (3)
 //! `owner_mismatch`, (4) `reseat_invite_unpaired` and (5)
 //! `invite_downgraded`. Each refusal is counted in `invites_refused
-//! {reason}` before any staging stub. J stays `reseat_required` and
+//! {reason}`. J stays `reseat_required`, with no re-seat journal or
+//! staging record left, and
 //! `last_refusal` names the reason (the API reference adds the prefix
 //! `authorisation_refused:` to a refused authorisation). E refuses (2)
 //! `reseat_invite_outside_staging` and has no record of the group. Then
@@ -27,6 +28,13 @@
 //! real invite with an authorisation that A re-signed for another invite
 //! secret. For (1) the join route answers J's operator and writes no
 //! recovery state, so the row reads that answer, not `last_refusal`.
+//!
+//! Where the code differs from the ADR text: ADR 0109 §3a puts the owner
+//! pin (check 3) "before any staging stub". The code runs it in the
+//! staged join, so (3) and (5) stage, are refused there, and the staging
+//! rolls back. The row checks the result the ruling accepts (4 Nov 2026,
+//! as for H-S3-rm2 option (b)): after the refusal J holds no re-seat
+//! journal and no staging record, and its live record is unchanged.
 //!
 //! (3) to (5) are the red proof of the fix in `group_recovery.rs`. Before
 //! it, the rollback of the refused staged join in (3) and (5) wrote
@@ -49,7 +57,7 @@ const FINAL_RM4: &str =
     "j_refuses_the_reseat_invite_variant_then_the_real_authorisation_reseats_it";
 const CAUSE_RM4: &str = "the row's main observation: A's re-seat route returns 404 (no S3 \
                          re-seat); or J (or E) does not refuse the variant with its reason \
-                         and count before any stub, J leaves containment, or A's real \
+                         and count with no stub left, J leaves containment, or A's real \
                          authorisation does not re-seat J at r+4; `observed` lists each \
                          failing step";
 /// H-S3-c's nodes plus E, never seated (variant 2 only).
