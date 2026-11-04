@@ -39,13 +39,19 @@
 //! durably, and re-delivers through the ordinary share path once the
 //! head commits the epoch of the wait that displaced it, so the later
 //! rotation's commit finds its key installed instead of a re-delivery
-//! the protocol owes no retry for.
+//! the protocol owes no retry for. The re-delivery runs after the
+//! apply of an installed share and after any accepted commit (round
+//! 12): a keyless commit can commit the displacing wait's epoch with
+//! no share of its own that follows, so no later commit would carry
+//! the re-delivery.
 //!
 //! Only transitions whose signed commit the apply verified are written, so
 //! a forged removal holds nothing. The file is local state only: it is not
 //! a wire format and not an API. It carries `version`
-//! ([`HOLD_FILE_VERSION`]); a file of another version is not decoded, so it
-//! holds its group and is never replaced, as a damaged file is.
+//! ([`HOLD_FILE_VERSION`]); a file of a version this binary does not know
+//! is not decoded, so it holds its group and is never replaced, as a
+//! damaged file is. A v1 file still loads: every field v2 added is
+//! optional.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -173,11 +179,12 @@ struct HeldRemoval {
 /// #1775 (claude review round 11, Engineer ruling 4 Nov): the secret of
 /// a later epoch that a wait's own share displaced — at the share arm's
 /// replace path, or at a superseded install that drops the later key
-/// with the epoch. One slot per group: the newest displacement wins. The
-/// record re-delivers through the ordinary share path (a fresh envelope
-/// sealed to this node) once the head commits the epoch of the wait that
-/// displaced it, so the later rotation's commit lands with its key and
-/// an honest reordering stalls on nothing.
+/// with the epoch. One slot per group: a live record keeps it (round 12
+/// — the earlier displacement re-delivers first), and a dead one goes.
+/// The record re-delivers through the ordinary share path (a fresh
+/// envelope sealed to this node) once the head commits the epoch of the
+/// wait that displaced it, so the later rotation's commit lands with its
+/// key and an honest reordering stalls on nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ParkedSecret {
     /// The epoch of the displaced secret.
@@ -194,8 +201,13 @@ pub(super) struct ParkedSecret {
     pub(super) waits_epoch: u64,
 }
 
-/// The hold file format version.
-const HOLD_FILE_VERSION: u32 = 1;
+/// The hold file format version. v2 (ADR 0085, #1775 review round 12)
+/// adds the optional `share_sender` (#1766), `keyless` (#1775) and
+/// `parked` (#1775 round 11) fields. A binary that knows only v1 refuses
+/// a v2 file (`decode_hold_file`), so it never loads one, drops the new
+/// state in memory and re-saves without it: a downgrade keeps the file
+/// intact and its group held instead.
+const HOLD_FILE_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct HoldFile {
@@ -205,13 +217,18 @@ struct HoldFile {
     removals: Vec<HeldRemoval>,
     #[serde(default)]
     exclusions: Vec<ExclusionHold>,
-    /// #1766: holds nothing; an older reader ignores it.
+    /// #1766: a v1 file carries none, and it holds nothing then. A v2
+    /// file without it holds nothing too; an older reader never sees a
+    /// v2 file (see [`HOLD_FILE_VERSION`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     share_sender: Option<ShareSender>,
-    /// #1775: holds nothing; an older reader ignores it.
+    /// #1775: a v1 file carries no mark, so the mark holds nothing
+    /// there; a file of this version or later keeps at most one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keyless: Option<KeylessMark>,
-    /// #1775 (round 11): holds nothing; an older reader ignores it.
+    /// #1775 (round 11): a v1 file carries no parked secret, so nothing
+    /// re-delivers from it; a file of this version or later keeps at
+    /// most one per group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parked: Option<ParkedSecret>,
 }
@@ -694,9 +711,14 @@ pub(super) async fn ensure_loaded(state: &AppState) {
 
 fn decode_hold_file(bytes: &[u8]) -> Result<HoldFile, String> {
     let file: HoldFile = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-    if file.version != HOLD_FILE_VERSION {
+    // #1775 review round 12 (ADR 0085): a v1 file still loads — every
+    // field v2 added is optional, so the older layout decodes whole. A
+    // file of a version this binary does not know loads nothing: it is
+    // kept like a damaged one, its group stays held and no write of this
+    // binary replaces it, so a downgrade deletes no newer state.
+    if file.version == 0 || file.version > HOLD_FILE_VERSION {
         return Err(format!(
-            "unsupported hold file version {} (expected {HOLD_FILE_VERSION})",
+            "unsupported hold file version {} (supported 1..={HOLD_FILE_VERSION})",
             file.version
         ));
     }
@@ -1290,22 +1312,40 @@ pub(super) async fn forget_keyless_commit(
 /// displaced it: the record re-delivers only once a head commits that
 /// epoch. A secret with no recorded sender (a crash between the key
 /// write and its record write) has no provenance to re-deliver, so it
-/// keeps the disclosed #1771 crash-window handling and parks nothing.
-/// Durable before the replacing secret installs, so a crash between the
-/// two keeps the record. One slot per group: the newest displacement
-/// wins.
+/// keeps the disclosed #1771 crash-window handling and parks nothing,
+/// and the daemon warns — that value is lost (round 12).
+///
+/// Returns whether the park needs nothing more from the disk (round 12,
+/// Major 2 of the claude review): `false` is a failed durable write, and
+/// the caller must not install the replacing secret — after a restart
+/// the displaced value would be gone with no re-delivery, so the
+/// displacing share retries instead (the same rule as
+/// [`note_keyless_commit`]).
+///
+/// One slot per group. A record whose epoch the group's installed
+/// secrets have not reached — an earlier displacement, which re-delivers
+/// first — stays, and the newer displaced value keeps the disclosed loss
+/// handling above, with a warning (round 12: no later park overwrites a
+/// live record). A record the installed epoch already passed is dead,
+/// and the newer park replaces it.
 pub(super) async fn park_displaced_secret(
     state: &AppState,
     group_key: &str,
     info: &x0x::groups::GroupInfo,
     waits_epoch: u64,
-) {
+) -> bool {
     ensure_loaded(state).await;
     let Some(secret) = info.shared_secret.clone() else {
-        return;
+        return true;
     };
     let Some(sender) = installed_share_sender(state, group_key, info) else {
-        return;
+        tracing::warn!(
+            group_id = %LogHexId::group(group_key),
+            secret_epoch = info.secret_epoch,
+            "#1775 a displaced secret with no recorded sender parks nowhere; \
+             it keeps the disclosed #1771 crash-window handling"
+        );
+        return true;
     };
     let parked = ParkedSecret {
         secret_epoch: info.secret_epoch,
@@ -1319,10 +1359,55 @@ pub(super) async fn park_displaced_secret(
             .parked
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(kept) = lot.get(group_key) {
+            if kept.secret_epoch > parked.secret_epoch {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_key),
+                    kept_epoch = kept.secret_epoch,
+                    parked_epoch = parked.secret_epoch,
+                    "#1775 the one parked slot keeps the earlier live record; \
+                     the newly displaced value parks nowhere"
+                );
+                return true;
+            }
+        }
         lot.insert(group_key.to_string(), parked.clone()) != Some(parked)
     };
-    if changed {
-        persist_logged(state, group_key).await;
+    if !changed {
+        return true;
+    }
+    let result = persist(state, group_key).await;
+    let mut unsaved = state
+        .gss_share_holds
+        .unsaved
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match result {
+        Ok(()) => {
+            unsaved.remove(group_key);
+            true
+        }
+        Err(error) => {
+            unsaved.insert(group_key.to_string());
+            tracing::error!(
+                group_id = %LogHexId::group(group_key),
+                "#1775 parked secret not saved; the replacing secret does not install: {error}"
+            );
+            // Memory matches the disk again (the file keeps whatever it
+            // held, without this record): the displaced value stays
+            // installed, and a retry that displaces it again re-parks it
+            // before the replacing secret installs.
+            drop(unsaved);
+            {
+                let mut lot = state
+                    .gss_share_holds
+                    .parked
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                lot.remove(group_key);
+            }
+            false
+        }
     }
 }
 
@@ -1540,7 +1625,12 @@ pub(super) fn replaces_uncommitted_secret(
                         // here too — the same rule as withholding, so an
                         // ancestry that leaves the retained log wedges no
                         // group: the waiting actor's own share replaces,
-                        // and settles, the mark.
+                        // and settles, the mark. Round 12 narrows what an
+                        // unprovable mark authorises: a mark the chain
+                        // proves keeps the epoch's rule — any different
+                        // sender's share replaces, the disclosed two-admin
+                        // swap — while a mark it cannot prove admits only
+                        // its own actor, the one share that settles it.
                         && head_reaches_indexed(
                             info,
                             mark.secret_epoch,
@@ -1548,6 +1638,13 @@ pub(super) fn replaces_uncommitted_secret(
                             true,
                             &by_hash,
                         )
+                        && (head_reaches_indexed(
+                            info,
+                            mark.secret_epoch,
+                            &mark.head,
+                            false,
+                            &by_hash,
+                        ) || mark.actor.eq_ignore_ascii_case(sender_hex))
                 }))
 }
 
@@ -1794,6 +1891,49 @@ pub(in crate::server) mod test_seam {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(group_key)
+    }
+
+    /// Whether the group parks a secret.
+    pub(in crate::server) fn parked_secret_present(state: &AppState, group_key: &str) -> bool {
+        state
+            .gss_share_holds
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(group_key)
+    }
+
+    /// Seed the group's parked record directly, for the re-delivery
+    /// branches that no displacement can reach in a test.
+    pub(in crate::server) fn force_parked_secret(
+        state: &AppState,
+        group_key: &str,
+        parked: ParkedSecret,
+    ) {
+        state
+            .gss_share_holds
+            .parked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(group_key.to_string(), parked);
+    }
+
+    /// The hold file format version this binary writes.
+    pub(in crate::server) fn hold_file_version() -> u32 {
+        HOLD_FILE_VERSION
+    }
+
+    /// Make the group's hold file write fail, as a damaged file does:
+    /// the path joins the undecodable set, so [`persist`] refuses to
+    /// replace it while memory keeps every record. [`simulate_restart`]
+    /// clears it.
+    pub(in crate::server) fn force_hold_write_failure(state: &AppState, group_key: &str) {
+        state
+            .gss_share_holds
+            .undecodable
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(hold_path(state, group_key));
     }
 }
 
@@ -2177,6 +2317,10 @@ mod tests {
             replaces_uncommitted_secret(&state, &group_key, &offlog, &actor, 2),
             "round 11: the replace path keeps the unprovable mark too, so its actor's share settles it"
         );
+        assert!(
+            !replaces_uncommitted_secret(&state, &group_key, &offlog, &other, 2),
+            "round 12: a foreign sender's share is still refused when the mark cannot be proved"
+        );
 
         // The reverse error: a rename on the true keyless head keeps the
         // mark though the log holds an unrelated fork below the epoch.
@@ -2337,6 +2481,152 @@ mod tests {
         assert!(
             parked_secret(&state, &group_key).is_none(),
             "the record goes on forget"
+        );
+    }
+
+    /// #1775 (claude review round 12, Major 2): a park whose durable
+    /// write fails keeps no record, returns `false`, and leaves the file
+    /// untouched — the caller must not install the replacing secret over
+    /// it, or a restart loses the displaced value with no re-delivery.
+    #[tokio::test]
+    async fn a_failed_park_write_keeps_no_record_and_reports_it() {
+        let (state, _dir) = test_state().await;
+        let group_key = "g".to_string();
+        let other = "bb".repeat(32);
+        let parent = gss_info_at_head(1, Some([0x99u8; 32]));
+        let foreign = [0xB5u8; 32];
+        let mut displaced = parent.clone();
+        displaced.secret_epoch = 3;
+        displaced.shared_secret = Some(foreign.to_vec());
+        note_share_sender(&state, &group_key, &parent, 3, &other, &foreign).await;
+        super::test_seam::force_hold_write_failure(&state, &group_key);
+        assert!(
+            !park_displaced_secret(&state, &group_key, &displaced, 2).await,
+            "the park reports the failed durable write"
+        );
+        assert!(
+            parked_secret(&state, &group_key).is_none(),
+            "memory keeps no record the disk refused"
+        );
+        assert!(
+            persist(&state, &group_key).await.is_err(),
+            "the write stays refused while the failure is forced"
+        );
+        // The failure gone, the same displacement parks again.
+        super::test_seam::simulate_restart(&state).await;
+        ensure_loaded(&state).await;
+        note_share_sender(&state, &group_key, &parent, 3, &other, &foreign).await;
+        assert!(
+            park_displaced_secret(&state, &group_key, &displaced, 2).await,
+            "the park needs nothing more once the write lands"
+        );
+        assert_eq!(
+            parked_secret(&state, &group_key).map(|kept| kept.secret_epoch),
+            Some(3),
+            "the record parks after the failure clears"
+        );
+    }
+
+    /// #1775 (claude review round 12): the one parked slot keeps a live
+    /// record — an earlier displacement whose epoch the group has not
+    /// reached re-delivers first, so a later park takes nothing. A record
+    /// the installed epoch already passed is dead, and the slot goes to
+    /// the newer displacement.
+    #[tokio::test]
+    async fn a_live_parked_record_keeps_the_one_slot() {
+        let (state, _dir) = test_state().await;
+        let group_key = "g".to_string();
+        let b = "bb".repeat(32);
+        let c = "cc".repeat(32);
+        let parent = gss_info_at_head(2, Some([0x99u8; 32]));
+        let b_key = [0xB5u8; 32];
+        let mut at_five = parent.clone();
+        at_five.secret_epoch = 5;
+        at_five.shared_secret = Some(b_key.to_vec());
+        note_share_sender(&state, &group_key, &parent, 5, &b, &b_key).await;
+        assert!(park_displaced_secret(&state, &group_key, &at_five, 3).await);
+        // A displacement of an earlier epoch's secret parks nowhere: the
+        // kept epoch-5 record still re-delivers once epoch 3 commits.
+        let c_key = [0xC3u8; 32];
+        let mut at_four = parent.clone();
+        at_four.secret_epoch = 4;
+        at_four.shared_secret = Some(c_key.to_vec());
+        note_share_sender(&state, &group_key, &parent, 4, &c, &c_key).await;
+        assert!(
+            park_displaced_secret(&state, &group_key, &at_four, 3).await,
+            "the skipped park is no failed write"
+        );
+        let kept = parked_secret(&state, &group_key).expect("a record is kept");
+        assert_eq!(kept.secret_epoch, 5, "the live record keeps the slot");
+        assert_eq!(kept.sender, b);
+        // The group's installed epoch passes 5: the kept record is dead,
+        // and the next displacement of that epoch takes the slot.
+        note_share_sender(&state, &group_key, &parent, 5, &c, &c_key).await;
+        let mut again = parent.clone();
+        again.secret_epoch = 5;
+        again.shared_secret = Some(c_key.to_vec());
+        assert!(park_displaced_secret(&state, &group_key, &again, 4).await);
+        let kept = parked_secret(&state, &group_key).expect("the slot refills");
+        assert_eq!(
+            (kept.secret_epoch, kept.sender.as_str()),
+            (5, c.as_str()),
+            "a dead record yields the slot to the newer displacement"
+        );
+    }
+
+    /// #1775 review round 12 (ADR 0085): a hold file of a version this
+    /// binary does not know fails closed — its group stays held, no write
+    /// replaces it, and the file stays byte-identical — while a v1 file
+    /// still loads and holds its group.
+    #[tokio::test]
+    async fn a_newer_version_hold_file_fails_closed_and_stays_intact() {
+        let (state, _dir) = test_state().await;
+        let newer_key = "g".to_string();
+        let v1_key = "h".to_string();
+        let newer = format!(
+            "{{\"version\":{},\"group_key\":\"g\",\"exclusions\":\
+             [{{\"parent_state_hash\":\"p\",\"secret_epoch\":2}}]}}",
+            HOLD_FILE_VERSION + 1
+        );
+        let v1 = "{\"version\":1,\"group_key\":\"h\",\"exclusions\":\
+             [{\"parent_state_hash\":\"p\",\"secret_epoch\":2}]}"
+            .to_string();
+        let newer_path = super::test_seam::hold_path_for(&state, &newer_key);
+        let v1_path = super::test_seam::hold_path_for(&state, &v1_key);
+        for (path, body) in [(&newer_path, newer.as_str()), (&v1_path, v1.as_str())] {
+            std::fs::create_dir_all(path.parent().expect("the hold dir has a parent"))
+                .expect("make the hold dir");
+            std::fs::write(path, body).expect("write the hold file");
+        }
+        ensure_loaded(&state).await;
+        let other = "bb".repeat(32);
+        let foreign = [0xB5u8; 32];
+        for key in [&newer_key, &v1_key] {
+            let parent = gss_info_at_head(1, None);
+            let mut info = parent.clone();
+            info.secret_epoch = 2;
+            info.shared_secret = Some(foreign.to_vec());
+            note_share_sender(&state, key, &parent, 2, &other, &foreign).await;
+            assert!(
+                withholds(&state, key, &info),
+                "a hold file of any unreadable shape holds its group ({key})"
+            );
+        }
+        assert!(
+            persist(&state, &newer_key).await.is_err(),
+            "a file this binary cannot decode is kept, not replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&newer_path).expect("the file stays"),
+            newer,
+            "the newer-version file is byte-identical after the refused write"
+        );
+        // The v1 file loaded its exclusion: a committed secret of its
+        // epoch releases the hold, which proves the file was read.
+        let settled = gss_info_at_head(2, Some(foreign));
+        assert!(
+            !withholds(&state, &v1_key, &settled),
+            "the v1 file loaded: its hold answers the group's state"
         );
     }
 

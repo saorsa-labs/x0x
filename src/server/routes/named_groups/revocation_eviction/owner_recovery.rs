@@ -3125,9 +3125,17 @@ pub(in crate::server) async fn replay_after_commit(state: &Arc<AppState>, stable
 /// later rotation's commit lands with its key: an honest reordering
 /// stalls on no share re-delivery, which no retry owes. A record whose
 /// epoch a head already committed, or whose value a secret of its epoch
-/// or a later one replaced, is stale and goes. Call it with no group
-/// lock held, and before the held events replay.
-pub(super) async fn redeliver_parked_secret(state: &Arc<AppState>, stable_group_id: &str) {
+/// or a later one replaced, is stale and goes; so is a record whose
+/// sender is revoked, demoted below Admin, or gone (round 12) — the
+/// apply would refuse that re-delivery for ever. Call it with no group
+/// lock held, and before the held events replay. Round 12: the share
+/// apply calls it after an accepted share too, because a keyless commit
+/// can commit the displacing wait's epoch with no later commit that
+/// would carry the re-delivery.
+pub(in crate::server) async fn redeliver_parked_secret(
+    state: &Arc<AppState>,
+    stable_group_id: &str,
+) {
     if super::super::gss_share_hold::parks_no_secret(state) {
         return;
     }
@@ -3168,6 +3176,16 @@ pub(super) async fn redeliver_parked_secret(state: &Arc<AppState>, stable_group_
             super::super::gss_share_hold::forget_parked_secret(state, &group_key).await;
             return;
         }
+    }
+    if !info.active_members().any(|member| {
+        member.agent_id == parked.sender && member.role.at_least(x0x::groups::GroupRole::Admin)
+    }) {
+        // #1775 review round 12: a sender the current roster holds below
+        // Admin — demoted, or gone — can commit no rotation this key
+        // would serve, and the apply refuses its share for ever, so the
+        // record goes instead of re-sealing on every replay.
+        super::super::gss_share_hold::forget_parked_secret(state, &group_key).await;
+        return;
     }
     use base64::Engine as _;
     let recipient_hex = hex::encode(state.agent.agent_id().as_bytes());

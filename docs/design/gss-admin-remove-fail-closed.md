@@ -363,7 +363,11 @@ except citations explicitly marked as resolving at
   other earlier-epoch share stays refused. The 4 Nov round completes that recovery: the
   displaced later secret parks in the hold file and re-delivers through the ordinary
   share path once a head commits the displacing wait's epoch, so the later rotation's
-  own commit lands with its key and an honest reordering loses no key. (The
+  own commit lands with its key and an honest reordering loses no key. The 4 Nov
+  round-12 review narrows the mark's unprovable shape: when the retained log cannot
+  prove the mark's head, only the mark's own actor's share may replace — the one
+  share that settles it — while a proved mark keeps the epoch's any-different-sender
+  rule. (The
   parked-removal replace half that #1775 also added stays dormant until a fenced
   `gss_removal_waits_for_share` change lands, per that PR.) The strict `<` clear and
   the equal-epoch refuse survive these changes. F1 does not change the guard — it is cited

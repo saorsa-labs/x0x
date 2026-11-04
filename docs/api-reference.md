@@ -1929,9 +1929,18 @@ re-delivers through the ordinary share path once a head commits that
 epoch — so the later rotation's own commit lands with its key, and an
 honest share-before-commit reordering stalls on no re-delivery. A
 superseded intermediate install parks the later key it drops the same
-way. The parked record goes when its epoch commits, when a secret of its
-epoch or a later one is already in, or when its sender is revoked; the
-file keeps one parked record per group.
+way. One exception: when the hold file records no sender for the
+displaced secret, that secret parks nowhere and is lost. A crash
+between the key write and its record write leaves the sender unknown,
+with no provenance to re-deliver, and the daemon logs a warning. The
+re-delivery also runs after an accepted share installs: a keyless
+commit can commit the displacing wait's epoch with no share of its
+own, so no later commit would carry it. The parked record goes when
+its epoch commits, when a secret of its epoch or a later one is
+already in, or when its sender is revoked or the roster holds below
+Admin; the file keeps one parked record per group, and a live record
+keeps the slot, so a second displacement in the same window parks
+nowhere and is lost, with the same warning.
 
 After a #1578 keyless install, the head already commits the epoch, but
 it binds the epoch, not the secret value (#1775). The durable keyless
@@ -1942,7 +1951,9 @@ any secret whose sender the record does not name stays replaceable.
 The mark claims exactly its own epoch, and the head that its keyless
 commit moved, or a commit chained on that head. A sibling commit of the
 epoch ends the mark. So does a head that commits a later epoch. A share
-of a later unpinned epoch is not the mark's actor key.
+of a later unpinned epoch is not the mark's actor key. When the retained
+log cannot prove the mark's head, the mark still holds its group, but
+only its own actor's share may replace — the one share that settles it.
 
 A known-empty evicted-removal hold ends at a secret of its epoch or a later
 one, committed or not. A hold whose actor list is unknown (a pre-#1771
