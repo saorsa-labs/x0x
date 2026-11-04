@@ -922,6 +922,8 @@ jobs:
           --expect w3h_1427_offline_member_reaches_the_epoch_it_missed=GREEN
           --require w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer
           --expect w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer=GREEN
+          --require w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate
+          --expect w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate=RED
           --require w3h_1161_card_import_invite
           --expect w3h_1161_card_import_invite=GREEN
           --require w3h_1161_control_share_withheld_is_red

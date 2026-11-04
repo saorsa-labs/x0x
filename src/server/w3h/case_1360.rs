@@ -1,10 +1,11 @@
 //! W3-H case for #1360 (ADR 0113 H7-1, #824): a device with a copied
 //! owner key does not mint a second Home. O holds Home H. O certifies,
 //! trusts and enrolls B. With O~B partitioned, B starts with the copied
-//! `user.key`, trusts O and enrolls O and itself. C (never started) gives
-//! the seat's third agent id. The block lasts 200 s from B's start; at
-//! 10 s the case calls `POST /home` on B, at 195 s `POST /home/seat` for
-//! C. After the lift O seats B and B redeems in Home mode.
+//! `user.key` and a sync store that already enrolls O and B, then trusts
+//! O. C (never started) gives the seat's third agent id. The block lasts
+//! 200 s from the end of B's setup; at 10 s the case calls `POST /home`
+//! on B, at 195 s `POST /home/seat` for C. After the lift O seats B and B
+//! redeems in Home mode.
 //!
 //! GREEN (§2, §3, §6): B never holds a Home-shaped group other than H.
 //! For the whole block `GET /home` is `binding_pending`, `waiting_for:
@@ -17,16 +18,15 @@
 //! end of the 200 s block, not only within 180 s (`main`'s latest
 //! deadline is 180 s, so the cause is the same). (2) B dials O once after
 //! the lift; the harness has no redial. (3) The `bound.group_id` /
-//! `bound.source` shape is a guess from §6. (4) B enrolls O after start
-//! (the harness cannot do it before), so S7 must check "other machines
-//! are enrolled" at evaluation time, not only at startup.
+//! `bound.source` shape is a guess from §6. (4) The test name does not
+//! match the ADR's proposed `test(w3h_s7_)` selector (repo convention).
 
 #![cfg(test)]
 
 use super::home::HomeIds;
 use super::receipt::{Receipt, Verdict};
 use super::*;
-use crate::identity::{UserId, UserKeypair};
+use crate::identity::{MachineId, UserId, UserKeypair};
 use anyhow::ensure;
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -132,10 +132,13 @@ fn is_conflict(status: StatusCode, body: &Value, reason: &str) -> bool {
 }
 
 /// The two ways O refuses the seat when B's duplicate won the election:
-/// O never serves H as `local` (the wait expires) or a 409
-/// `adoption_pending`. Any other error stays INFRA.
+/// the seat helper's wait for O to serve H expires, or a 409
+/// `adoption_pending`. Any other error (a hung seat call too) is INFRA.
 fn seat_refused(error: &anyhow::Error) -> bool {
-    expired(error) || format!("{error:#}").contains("\"reason\":\"adoption_pending\"")
+    let serve_wait = error
+        .downcast_ref::<BudgetExceeded>()
+        .is_some_and(|budget| budget.barrier == "O serves the canonical Home");
+    serve_wait || format!("{error:#}").contains("\"reason\":\"adoption_pending\"")
 }
 
 /// Observe B until `until` (virtual time since the fabric origin).
@@ -192,6 +195,28 @@ async fn ok_api(sim: &Sim, label: &str, method: Method, path: &str, body: Value)
     Ok(response)
 }
 
+/// Write B's owner-sync store before B starts, so that B's daemon loads
+/// with O and B already enrolled (the H7-1 precondition).
+async fn enroll_before_start(sim: &Sim, owner: &UserKeypair, b: MachineId) -> Result<()> {
+    let store = crate::owner_sync::OwnerSyncStore::load(&sim.root.path().join("B").join("data"))
+        .await
+        .map_err(|error| anyhow!("B sync store: {error}"))?;
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let o = MachineId(sim.peer("O")?.0);
+    for machine in [o, b] {
+        let enrollment = crate::owner_sync::OwnerEnrollment::sign(machine, owner, now_ms, None)?;
+        store
+            .enroll(enrollment)
+            .await
+            .map_err(|error| anyhow!("enroll before start: {error}"))?;
+    }
+    Ok(())
+}
+
 /// Prepare and start B with the copied owner key, partitioned from O.
 async fn start_copied_key_device(sim: &mut Sim, owner: &UserKeypair) -> Result<()> {
     let (machine, agent) = sim.take_keys("B")?;
@@ -232,6 +257,7 @@ async fn start_copied_key_device(sim: &mut Sim, owner: &UserKeypair) -> Result<(
     sim.fabric()
         .mark("fault O~B partitioned (ADR 0113 H7-1 block)");
     sim.fabric().set_partitioned(&sim.peer("O")?, &b_peer, true);
+    enroll_before_start(sim, owner, machine.machine_id()).await?;
     sim.start_node_with(
         "B",
         Provision {
@@ -243,24 +269,8 @@ async fn start_copied_key_device(sim: &mut Sim, owner: &UserKeypair) -> Result<(
     )
     .await?;
     let o_agent = sim.agent_hex("O")?;
-    let o_machine = sim.machine_hex("O")?;
-    ok_api(
-        sim,
-        "B",
-        Method::POST,
-        "/contacts/trust",
-        json!({"agent_id": o_agent, "level": "trusted"}),
-    )
-    .await?;
-    ok_api(
-        sim,
-        "B",
-        Method::POST,
-        "/sync/devices/enroll",
-        json!({"machine_id": o_machine}),
-    )
-    .await?;
-    ok_api(sim, "B", Method::POST, "/sync/devices/enroll", json!({})).await?;
+    let trust = json!({"agent_id": o_agent, "level": "trusted"});
+    ok_api(sim, "B", Method::POST, "/contacts/trust", trust).await?;
     Ok(())
 }
 
@@ -383,13 +393,9 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let mut seated: Option<Value> = None;
     let mut last_after = Value::Null;
     let mut seen = Observations::default();
-    // With no invite there is nothing to wait for: read B once.
-    let deadline = sim.fabric().now()
-        + if invite.is_empty() {
-            Duration::ZERO
-        } else {
-            AFTER
-        };
+    // Once B holds a duplicate the row cannot pass (`main`'s end state), so
+    // the wait stops after that read.
+    let deadline = sim.fabric().now() + AFTER;
     sim.until("B binds to H as seated", AFTER + SLACK, async |s: &Sim| {
         let Some(groups) = seen.observe(home_shaped(s, "B", &ctx.owner)).await else {
             return true;
@@ -407,7 +413,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             seated = Some(home);
             return true;
         }
-        s.fabric().now() >= deadline
+        watch.duplicate.is_some() || s.fabric().now() >= deadline
     })
     .await?;
     seen.verify("B binds to H as seated")?;
