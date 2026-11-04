@@ -7571,6 +7571,37 @@ enum CapabilityRefreshState {
     Finished,
 }
 
+/// What a capability refresh flight waits for (#1776).
+///
+/// A strict send (ADR 0030 durable ACK, ADR 0093 application bit) waits for
+/// a specific capability. An addressability flight (the Welcome fetch and
+/// the join-result poll) waits only for any binding the gossip-inbox DM leg
+/// can use. A weaker flight must not hold back a stronger one: it can finish
+/// on a binding that does not satisfy the strict send, so a strict send
+/// never joins it and never waits out its cooldown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CapabilityRefreshPurpose {
+    /// Any gossip-usable binding is enough.
+    Addressability,
+    /// A durable-ACK or application-bit requirement.
+    Requirement,
+}
+
+impl CapabilityRefreshPurpose {
+    /// The purposes whose in-flight or recently finished flight already
+    /// answers a flight of this purpose. Every flight asks for the full
+    /// signed advert, so a requirement flight also answers addressability;
+    /// an addressability flight never answers a requirement.
+    fn answered_by(self) -> &'static [Self] {
+        match self {
+            Self::Addressability => &[Self::Addressability, Self::Requirement],
+            Self::Requirement => &[Self::Requirement],
+        }
+    }
+}
+
+type CapabilityRefreshKey = ([u8; 32], CapabilityRefreshPurpose);
+
 #[derive(Debug)]
 struct CapabilityRefreshEntry {
     flight_id: u64,
@@ -7582,15 +7613,15 @@ struct CapabilityRefreshEntry {
 struct CapabilityRefreshRegistryState {
     closed: bool,
     next_flight_id: u64,
-    inflight: std::collections::HashMap<[u8; 32], CapabilityRefreshEntry>,
-    /// Finish time of the last flight per recipient, feeding the
+    inflight: std::collections::HashMap<CapabilityRefreshKey, CapabilityRefreshEntry>,
+    /// Finish time of the last flight per recipient and purpose, feeding the
     /// requester-side cooldown. Kept on the tokio clock so the cooldown
     /// lives in the same time domain as the convergence window it bounds:
     /// under a paused test clock (W3-H) a wall-clock stamp would suppress
     /// re-requests for whole runs of virtual seconds that elapse in
     /// moments of real time (#1776). Zero-duration cooldown (tests,
     /// pre-cooldown behaviour) disables the check.
-    last_finished: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
+    last_finished: std::collections::HashMap<CapabilityRefreshKey, tokio::time::Instant>,
     cooldown: std::time::Duration,
 }
 /// Bounded, recipient-keyed single-flight registry for strict capability
@@ -7641,6 +7672,7 @@ impl CapabilityRefreshRegistry {
     fn register_or_start<F, Fut>(
         self: &std::sync::Arc<Self>,
         recipient: identity::AgentId,
+        purpose: CapabilityRefreshPurpose,
         worker: F,
     ) -> CapabilityRefreshRegistration
     where
@@ -7654,7 +7686,11 @@ impl CapabilityRefreshRegistry {
             return CapabilityRefreshRegistration::Unavailable;
         };
         let recipient_key = *recipient.as_bytes();
-        if let Some(existing) = state.inflight.get(&recipient_key) {
+        let answered_by = purpose.answered_by();
+        if let Some(existing) = answered_by
+            .iter()
+            .find_map(|answer| state.inflight.get(&(recipient_key, *answer)))
+        {
             return CapabilityRefreshRegistration::Joined(existing.completion.clone());
         }
         if state.closed || state.inflight.len() >= MAX_INFLIGHT_CAPABILITY_REFRESHES {
@@ -7664,12 +7700,16 @@ impl CapabilityRefreshRegistry {
         // moments ago, so its targeted request was answered (or provably
         // could not be) within the convergence window. Fail the send
         // straight through the gate instead of re-amplifying the request
-        // on every product retry.
+        // on every product retry. Only a flight that answers this purpose
+        // counts (#1776): an addressability flight's cooldown must not
+        // refuse a strict send its own refresh.
         if state.cooldown > std::time::Duration::ZERO
-            && state
-                .last_finished
-                .get(&recipient_key)
-                .is_some_and(|finished_at| finished_at.elapsed() < state.cooldown)
+            && answered_by.iter().any(|answer| {
+                state
+                    .last_finished
+                    .get(&(recipient_key, *answer))
+                    .is_some_and(|finished_at| finished_at.elapsed() < state.cooldown)
+            })
         {
             return CapabilityRefreshRegistration::Unavailable;
         }
@@ -7677,8 +7717,9 @@ impl CapabilityRefreshRegistry {
         let flight_id = state.next_flight_id;
         let (completion_tx, completion) =
             tokio::sync::watch::channel(CapabilityRefreshState::Pending);
+        let key = (recipient_key, purpose);
         state.inflight.insert(
-            recipient_key,
+            key,
             CapabilityRefreshEntry {
                 flight_id,
                 completion: completion.clone(),
@@ -7691,11 +7732,11 @@ impl CapabilityRefreshRegistry {
         // authoritative worker handle.
         let guard = CapabilityRefreshGuard {
             registry: std::sync::Arc::clone(self),
-            recipient_key,
+            key,
             flight_id,
         };
         let handle = tokio::spawn(worker(guard, completion_tx));
-        if let Some(entry) = state.inflight.get_mut(&recipient_key) {
+        if let Some(entry) = state.inflight.get_mut(&key) {
             entry.worker = Some(handle);
         }
         CapabilityRefreshRegistration::Started(completion)
@@ -7725,16 +7766,16 @@ impl CapabilityRefreshRegistry {
         let _results = futures::future::join_all(handles).await;
     }
 
-    fn remove(&self, recipient_key: &[u8; 32], flight_id: u64) {
+    fn remove(&self, key: &CapabilityRefreshKey, flight_id: u64) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
         if state
             .inflight
-            .get(recipient_key)
+            .get(key)
             .is_some_and(|entry| entry.flight_id == flight_id)
         {
-            state.inflight.remove(recipient_key);
+            state.inflight.remove(key);
             // Stamp the cooldown clock and, while we hold the lock, evict
             // stamps that can never gate again (bounded memory on
             // long-lived daemons with churny recipient sets). Runs before
@@ -7746,7 +7787,7 @@ impl CapabilityRefreshRegistry {
                     .retain(|_, finished_at| finished_at.elapsed() < cooldown);
                 state
                     .last_finished
-                    .insert(*recipient_key, tokio::time::Instant::now());
+                    .insert(*key, tokio::time::Instant::now());
             }
         }
     }
@@ -7762,13 +7803,13 @@ impl CapabilityRefreshRegistry {
 
 struct CapabilityRefreshGuard {
     registry: std::sync::Arc<CapabilityRefreshRegistry>,
-    recipient_key: [u8; 32],
+    key: CapabilityRefreshKey,
     flight_id: u64,
 }
 
 impl Drop for CapabilityRefreshGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.recipient_key, self.flight_id);
+        self.registry.remove(&self.key, self.flight_id);
     }
 }
 
@@ -11984,8 +12025,14 @@ impl Agent {
         let shutdown_token = self.shutdown_token.clone();
         let deadline = tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
 
+        let purpose = if require_durable_ack || required_application.is_some() {
+            CapabilityRefreshPurpose::Requirement
+        } else {
+            CapabilityRefreshPurpose::Addressability
+        };
         let mut completion = match self.capability_refreshes.register_or_start(
             recipient,
+            purpose,
             move |guard, completion_tx| async move {
                 run_strict_capability_refresh(
                     recipient,
@@ -29999,11 +30046,13 @@ mod tests {
 
         let first = registry.register_or_start(
             recipient,
+            CapabilityRefreshPurpose::Requirement,
             make_worker(publishes.clone(), release_rx.clone()),
         );
         assert!(matches!(first, CapabilityRefreshRegistration::Started(_)));
         let second = registry.register_or_start(
             recipient,
+            CapabilityRefreshPurpose::Requirement,
             make_worker(publishes.clone(), release_rx.clone()),
         );
         assert!(
@@ -30012,8 +30061,11 @@ mod tests {
         );
         // A different recipient is a genuinely different question and starts
         // its own flight.
-        let third =
-            registry.register_or_start(other, make_worker(publishes.clone(), release_rx.clone()));
+        let third = registry.register_or_start(
+            other,
+            CapabilityRefreshPurpose::Requirement,
+            make_worker(publishes.clone(), release_rx.clone()),
+        );
         assert!(matches!(third, CapabilityRefreshRegistration::Started(_)));
 
         release_tx.send_replace(true);
@@ -30050,7 +30102,11 @@ mod tests {
             std::time::Duration::from_secs(3_600),
         ));
         assert!(matches!(
-            registry.register_or_start(recipient, finish_now),
+            registry.register_or_start(
+                recipient,
+                CapabilityRefreshPurpose::Requirement,
+                finish_now
+            ),
             CapabilityRefreshRegistration::Started(_)
         ));
         for _ in 0..200 {
@@ -30062,7 +30118,11 @@ mod tests {
         assert_eq!(registry.len(), 0, "flight drained");
         assert!(
             matches!(
-                registry.register_or_start(recipient, finish_now),
+                registry.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Requirement,
+                    finish_now
+                ),
                 CapabilityRefreshRegistration::Unavailable
             ),
             "an immediate reflight within the cooldown must fail fast"
@@ -30074,7 +30134,7 @@ mod tests {
             std::time::Duration::ZERO,
         ));
         assert!(matches!(
-            eager.register_or_start(recipient, finish_now),
+            eager.register_or_start(recipient, CapabilityRefreshPurpose::Requirement, finish_now),
             CapabilityRefreshRegistration::Started(_)
         ));
         for _ in 0..200 {
@@ -30084,7 +30144,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(matches!(
-            eager.register_or_start(recipient, finish_now),
+            eager.register_or_start(recipient, CapabilityRefreshPurpose::Requirement, finish_now),
             CapabilityRefreshRegistration::Started(_)
         ));
     }
@@ -30095,6 +30155,7 @@ mod tests {
         registry.close();
         let registration = registry.register_or_start(
             identity::AgentId([0x73_u8; 32]),
+            CapabilityRefreshPurpose::Requirement,
             |guard, completion_tx| async move {
                 completion_tx.send_replace(CapabilityRefreshState::Finished);
                 drop(guard);
@@ -30105,6 +30166,175 @@ mod tests {
             CapabilityRefreshRegistration::Unavailable
         ));
         assert_eq!(registry.len(), 0);
+    }
+
+    /// #1776 review (finding 3): the Welcome fetch's addressability flight
+    /// shares the recipient with strict sends. Its cooldown must not refuse
+    /// a strict (durable-ACK or application-bit) send its own refresh, and a
+    /// strict send must not join it, because it can finish on a binding
+    /// that does not satisfy the strict send. A strict flight still answers
+    /// addressability: the reverse direction joins and honours the cooldown.
+    #[tokio::test]
+    async fn capability_refresh_addressability_flight_never_holds_back_a_strict_refresh() {
+        let recipient = identity::AgentId([0x91_u8; 32]);
+        let finish_now =
+            |guard: CapabilityRefreshGuard,
+             completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            };
+        let drain = |registry: std::sync::Arc<CapabilityRefreshRegistry>| async move {
+            for _ in 0..200 {
+                if registry.len() == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(registry.len(), 0, "flight drained");
+        };
+
+        // Cooldown: addressability first, then strict.
+        let registry = std::sync::Arc::new(CapabilityRefreshRegistry::with_cooldown(
+            std::time::Duration::from_secs(3_600),
+        ));
+        assert!(matches!(
+            registry.register_or_start(
+                recipient,
+                CapabilityRefreshPurpose::Addressability,
+                finish_now
+            ),
+            CapabilityRefreshRegistration::Started(_)
+        ));
+        drain(std::sync::Arc::clone(&registry)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Requirement,
+                    finish_now
+                ),
+                CapabilityRefreshRegistration::Started(_)
+            ),
+            "an addressability cooldown must not refuse a strict refresh"
+        );
+        drain(std::sync::Arc::clone(&registry)).await;
+        assert!(
+            matches!(
+                registry.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Addressability,
+                    finish_now
+                ),
+                CapabilityRefreshRegistration::Unavailable
+            ),
+            "a strict flight's answer also covers addressability"
+        );
+
+        // Single flight across purposes.
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let hold = |mut release: tokio::sync::watch::Receiver<bool>| {
+            move |guard: CapabilityRefreshGuard,
+                  completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                while !*release.borrow_and_update() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            }
+        };
+        let fresh = std::sync::Arc::new(CapabilityRefreshRegistry::with_cooldown(
+            std::time::Duration::from_secs(3_600),
+        ));
+        assert!(matches!(
+            fresh.register_or_start(
+                recipient,
+                CapabilityRefreshPurpose::Addressability,
+                hold(release_rx.clone())
+            ),
+            CapabilityRefreshRegistration::Started(_)
+        ));
+        assert!(
+            matches!(
+                fresh.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Requirement,
+                    hold(release_rx.clone())
+                ),
+                CapabilityRefreshRegistration::Started(_)
+            ),
+            "a strict send must not join a weaker in-flight request"
+        );
+        assert!(
+            matches!(
+                fresh.register_or_start(
+                    recipient,
+                    CapabilityRefreshPurpose::Addressability,
+                    hold(release_rx.clone())
+                ),
+                CapabilityRefreshRegistration::Joined(_)
+            ),
+            "an addressability caller joins an in-flight request"
+        );
+        assert_eq!(fresh.len(), 2);
+        release_tx.send_replace(true);
+        drain(fresh).await;
+    }
+
+    /// #1776 review (finding 5): a refresh with no durable-ACK and no
+    /// application-bit requirement returns at once only when the store
+    /// already holds a gossip-usable binding. With no binding, or with a
+    /// stale binding the gossip-inbox leg cannot use, it must publish its
+    /// one targeted request. Before #1776 such a flight was ready at once
+    /// and published nothing.
+    #[tokio::test(start_paused = true)]
+    async fn no_requirement_refresh_publishes_unless_the_binding_is_gossip_usable() {
+        let recipient = identity::AgentId([0x92_u8; 32]);
+        let machine = identity::MachineId([0x93_u8; 32]);
+        let run = |store: std::sync::Arc<dm_capability::CapabilityStore>| async move {
+            let publishes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = std::sync::Arc::clone(&publishes);
+            run_strict_capability_refresh(
+                recipient,
+                None,
+                false,
+                store,
+                tokio_util::sync::CancellationToken::new(),
+                tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+            publishes.load(std::sync::atomic::Ordering::SeqCst)
+        };
+
+        let empty = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+        assert_eq!(run(empty).await, 1, "no binding: publish one request");
+
+        let stale = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+        assert!(stale.insert(
+            recipient,
+            machine,
+            dm::DmCapabilities::pending(),
+            dm_capability::now_unix_ms(),
+        ));
+        assert_eq!(
+            run(stale).await,
+            1,
+            "a binding without gossip inbox or KEM key is not usable"
+        );
+
+        let usable = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+        assert!(usable.insert(
+            recipient,
+            machine,
+            dm::DmCapabilities::v1_gossip_ready(vec![7_u8; 1184]),
+            dm_capability::now_unix_ms(),
+        ));
+        assert_eq!(run(usable).await, 0, "a usable binding needs no request");
     }
 
     /// #461 regression (b8a9e2a HOLD): the provenance entry used by the

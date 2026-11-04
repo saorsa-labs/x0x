@@ -50625,11 +50625,20 @@ async fn send_welcome_fetch_request(
     // the repair must not depend on which one this interleaving produced.
     // Whenever the failed send leaves the authority still unaddressable,
     // ask for its advert; the retry schedule above re-sends once the
-    // binding lands.
+    // binding lands. The request is detached, not awaited: the metadata
+    // apply path calls this fetch while it holds the group membership
+    // lock, and the retry needs only the binding, not this caller's wait.
+    // Only the proactive wait above stays on the lock (at most
+    // `CAPABILITY_REFRESH_CONVERGENCE_WAIT` per attempt), because it
+    // replaces a doomed send that would hold the lock far longer.
     if matches!(error, x0x::dm::DmError::RecipientUndiscovered(_))
         || !state.agent.holds_gossip_usable_dm_binding(agent_id)
     {
-        state.agent.refresh_dm_capability_binding(*agent_id).await;
+        let agent = Arc::clone(&state.agent);
+        let recipient = *agent_id;
+        tokio::spawn(async move {
+            agent.refresh_dm_capability_binding(recipient).await;
+        });
     }
     Err(classify_welcome_fetch_send_error(error))
 }

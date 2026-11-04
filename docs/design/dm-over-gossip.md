@@ -220,6 +220,17 @@ Landing in slices (ADR 0030 "Landing order"). Slices 1–2 ship:
 - Targeted capability refresh on `x0x/caps/v1/request/targeted-v2`, answered
   on `x0x/caps/v1/response/targeted-v2` (both Critical). Concurrent strict
   sends to one recipient share a single in-flight request.
+- The same targeted request has one internal trigger with no capability
+  requirement (#1776). The Welcome fetch and the join-result poll send it
+  when the joiner holds no gossip-usable binding for the authority (a real
+  machine, the gossip-inbox capability and a KEM key). A fresh joiner that
+  joined the mesh after the authority's last advert beat has no other way to
+  address it. This addressability request waits for any gossip-usable
+  binding. Concurrent addressability callers share one flight, and they also
+  join a strict flight in progress. A strict send never joins an
+  addressability flight, and an addressability flight's 10 s cooldown never
+  refuses a strict send its own request: the weaker flight can finish on a
+  binding that does not satisfy the strict send.
 - The **receiver durable path** and the live v2 advert (below).
 
 #### Send surfaces and defaults (ADR 0030 §4)
