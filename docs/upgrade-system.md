@@ -938,9 +938,31 @@ no gossip, binds nothing, and takes no instance lock.
 ## Update Flow (for x0xd)
 
 1. **Startup (background, post-bind)**: after the API listener is bound — and as a non-blocking background task, so an unreachable GitHub never delays API readiness (#1086) — check GitHub for a new release and apply it if found (the startup manifest broadcast is a separate task, run by `broadcast_current_manifest`)
-2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
+2. **Gossip listener**: Receive manifests on `x0x/release` topic, verify signature, rebroadcast, apply if newer
 3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
-4. **Authenticated HTTP apply**: Verify the release and wait for staging, then
+4. **Announce on first observation** (#1169): the publish points that
+   predate #1169 are the startup manifest broadcast
+   (`broadcast_current_manifest`, on every launch; the startup check's own
+   publish site is dormant because the daemon runs it with no agent), the
+   fallback poll and the gossip relay. #1169 adds the one that stayed
+   silent: a manual `/upgrade/apply` announces the signed manifest on the
+   release topic before its apply work, so subscribed peers start their
+   update check from the announcement instead of their own fallback poll.
+   The GitHub poll cadence does not change (A14 / ADR 0045): gossip is
+   the fast path. The announcement is bounded (10 s) and best effort;
+   peer rebroadcast limiting and the apply owner's dedup handle repeats.
+   The read-only `/upgrade` check announces nothing (Engineer ruling
+   3 Nov 2026 17:40 GMT): a check-path announce self-delivers through
+   gossip and feeds this node's own apply owner — a background install
+   triggered by a read, which no credential gate on a GET can justify.
+   Self-delivery also applies to the apply-path announcement: the
+   applying node's own gossip listener receives it back and, with gossip
+   updates on, feeds the same version to its background apply owner — a
+   duplicate attempt of an operator-requested release, serialized by the
+   shared apply lock and version dedup. Recording announcements as
+   self-published so the driver skips that needs the shared tracker on
+   the daemon state (#1774).
+5. **Authenticated HTTP apply**: Verify the release and wait for staging, then
    recheck admission under the install lock before replacement. The CLI
    `upgrade --apply` uses this route; `--now` skips only the staging delay.
 
@@ -951,8 +973,10 @@ durable hold.
 
 `x0xd --skip-update-check` disables self-update for that process invocation. It
 suppresses the startup GitHub check, gossip-delivered apply, manifest broadcast,
-fallback polling, and manual `/upgrade/apply`. The setting is not persisted;
-launching the daemon normally later restores the configured updater behavior.
+fallback polling, and manual `/upgrade/apply`. The `/upgrade` check keeps
+answering; it is read-only and never announces, with or without the flag. The
+setting is not persisted; launching the daemon normally later restores the
+configured updater behavior.
 
 All nodes verify and rebroadcast manifests (symmetric propagation — no privileged bootstrap role).
 
