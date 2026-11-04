@@ -70,6 +70,12 @@ filter = 'test(/(^|::)w3h_1356_control_s3_s64_segment_boundary$/)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 priority = 55
 
+# The ADR 0111 H6 row (#1358): see the `w3h-gate` override below.
+[[profile.w3h.overrides]]
+filter = 'test(/(^|::)w3h_1358_red_h6_invite_roster_above_cap$/)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+priority = 60
+
 # The CI `W3-H harness` gate job only: the same as `w3h`, plus raw payload
 # dumps (`<case>-<pid>.payloads`, test identities only; the first run of
 # each case and the first run whose digest differs from it) next to the
@@ -120,6 +126,16 @@ priority = 60
 filter = 'test(/(^|::)w3h_1356_control_s3_s64_segment_boundary$/)'
 slow-timeout = { period = "60s", terminate-after = 10 }
 priority = 55
+
+# ADR 0111 H6 (#1358): 26 daemons, and A seats 21 of them one at a time
+# through the public invite API before the #646 refusal on `main`. One
+# run took 170-197 s locally, so about 400 s on the 4-vCPU runner. The
+# 300 s kill above would end it with no receipt, so this row gets 15
+# minutes and starts early.
+[[profile.w3h-gate.overrides]]
+filter = 'test(/(^|::)w3h_1358_red_h6_invite_roster_above_cap$/)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+priority = 60
 
 # Start the longest sims first in each rerun. In list order the 83 s
 # #1427 catch-up case waited for the 1023 sims (about 145 s each on the

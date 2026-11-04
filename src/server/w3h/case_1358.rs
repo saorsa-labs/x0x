@@ -22,9 +22,10 @@
 //!
 //! Baseline on `main`: RED. A cannot mint an invite whose base roster has
 //! more than `MAX_INVITE_ROSTER_ENTRIES` (20) entries (#646,
-//! `src/groups/invite.rs`). The mint for the 21st member after A (base
-//! roster 21) is `413 invite_too_large` with `field = base_roster`, so
-//! step 2 never reaches 25 seats. The red test pins that cause: the 413
+//! `src/groups/invite.rs`). With 21 seats seated (A, H and M01–M19),
+//! the mint for M20, the 22nd seat, is `413 invite_too_large` with
+//! `field = base_roster` and `size = 21`. So step 2 never reaches 25
+//! seats. The red test pins that cause: the 413
 //! body must name `base_roster` and a size above 20. Any other failure
 //! is INFRA, never the expected RED.
 //!
