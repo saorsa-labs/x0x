@@ -73,8 +73,8 @@ const COMPLETE: Duration = Duration::from_secs(60);
 /// second rotation (another epoch step) is seen.
 const SETTLE: Duration = Duration::from_secs(10);
 
-/// The newer `.evs` layout this binary must leave untouched (#1508 reads
-/// v2, so v3 is the newer form).
+/// The newer `.evs` layout this binary must leave untouched (this
+/// binary reads up to v3, so v4 is the newer form).
 const NEWER_EVS: &[u8] = b"X0XEVICT4\0future layout";
 /// The v1 revocation store's file name in the identity directory.
 const REVOCATION_FILE: &str = "revocations.bin";

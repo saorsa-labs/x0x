@@ -3129,8 +3129,9 @@ fn designated_send_outcome(
 /// open and still runs that attempt. A send task that finishes after
 /// the row completed or terminated never puts back the record the close
 /// dropped, and a send task left over from before a reopen never labels
-/// the fresh attempt. The outcome-bearing records persist in the `.evs` v3 extension
-/// (§5); a routine `exchange_reached` stays in memory.
+/// the fresh attempt. The outcome-bearing records persist in the `.evs`
+/// v3 extension (§5); a routine `exchange_reached` stays in memory, so
+/// it rewrites the sidecar only when it replaces a stored record.
 async fn record_designated_handoff(
     state: &Arc<AppState>,
     key: &EvictionKey,
@@ -3145,12 +3146,20 @@ async fn record_designated_handoff(
             // completed or terminated must not put back the record that
             // the close dropped.
             Some(row) if row.phase.is_open() && row.first_dispatch_unix_ms == Some(attempt) => {
+                // The stored file changes only when the new or the
+                // replaced record is an outcome-bearing one.
+                let changes_file = outcome.persists()
+                    || row
+                        .designated_handoff
+                        .is_some_and(|record| record.outcome.persists());
                 row.designated_handoff = Some(s4::DesignatedHandoffRecord {
                     designated,
                     outcome,
                 });
-                inner.dirty = true;
-                true
+                if changes_file {
+                    inner.dirty = true;
+                }
+                changes_file
             }
             _ => false,
         }
@@ -4477,13 +4486,7 @@ fn begin_persist(inner: &mut S4Inner, gate_open: bool) -> Result<PersistSnapshot
         .iter()
         .filter_map(|row| {
             row.designated_handoff
-                .filter(|record| {
-                    matches!(
-                        record.outcome,
-                        s4::DesignatedHandoffOutcome::Unresolved
-                            | s4::DesignatedHandoffOutcome::Unsupported
-                    )
-                })
+                .filter(|record| record.outcome.persists())
                 .map(|record| s4::DesignatedHandoffV3 {
                     stable_group_id: row.stable_group_id.clone(),
                     target: row.target,
@@ -7588,11 +7591,12 @@ pub(super) mod tests {
 
     /// One pass over the [`uda_state_after_restart`] shape, then the
     /// row's waiting state through the public group status
-    /// (`GET /groups/:id` shape).
+    /// (`GET /groups/:id` shape), the sidecar bytes and the designated
+    /// admin.
     async fn uda_row_waiting_after_restart(
         outcome: Option<s4::DesignatedHandoffOutcome>,
-    ) -> anyhow::Result<(serde_json::Value, Vec<u8>)> {
-        let (state, group_id, key, _designated, bytes, _dir) =
+    ) -> anyhow::Result<(serde_json::Value, Vec<u8>, [u8; 32])> {
+        let (state, group_id, key, designated, bytes, _dir) =
             uda_state_after_restart(outcome).await?;
         revocation_eviction_pass(&state).await;
         let target_hex = hex::encode(key.target);
@@ -7612,7 +7616,7 @@ pub(super) mod tests {
             .find(|row| row["target"].as_str() == Some(target_hex.as_str()))
             .cloned()
             .expect("the row is shown");
-        Ok((row["waiting"].clone(), bytes))
+        Ok((row["waiting"].clone(), bytes, designated))
     }
 
     /// The recorded unresolved outcome against the designated admin
@@ -7620,7 +7624,7 @@ pub(super) mod tests {
     /// still shows `unresolved_designated_admin` naming that admin.
     #[tokio::test]
     async fn an_unresolved_designated_handoff_survives_a_restart() -> anyhow::Result<()> {
-        let (waiting, bytes) =
+        let (waiting, bytes, designated) =
             uda_row_waiting_after_restart(Some(s4::DesignatedHandoffOutcome::Unresolved)).await?;
         assert_eq!(
             &bytes[..10],
@@ -7631,7 +7635,12 @@ pub(super) mod tests {
             waiting["cause"].as_str(),
             Some("unresolved_designated_admin")
         );
-        assert!(waiting["designated_admin"].as_str().is_some());
+        let designated_hex = hex::encode(designated);
+        assert_eq!(
+            waiting["designated_admin"].as_str(),
+            Some(designated_hex.as_str()),
+            "the cause names the designated admin the attempt targeted"
+        );
         assert_eq!(waiting["detail"].as_str(), Some("rank"));
         assert!(waiting["remaining_ms"].as_u64().is_some());
         Ok(())
@@ -7643,7 +7652,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn an_unsupported_designated_handoff_downgrades_through_public_status(
     ) -> anyhow::Result<()> {
-        let (waiting, bytes) =
+        let (waiting, bytes, _designated) =
             uda_row_waiting_after_restart(Some(s4::DesignatedHandoffOutcome::Unsupported)).await?;
         assert_eq!(
             &bytes[..10],
@@ -7669,7 +7678,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn an_exchange_reached_outcome_keeps_the_old_header_and_the_plain_wait(
     ) -> anyhow::Result<()> {
-        let (waiting, bytes) =
+        let (waiting, bytes, _designated) =
             uda_row_waiting_after_restart(Some(s4::DesignatedHandoffOutcome::ExchangeReached))
                 .await?;
         assert_eq!(
@@ -7764,6 +7773,72 @@ pub(super) mod tests {
             inner.store.get(&key).expect("the row").designated_handoff,
             Some(record(s4::DesignatedHandoffOutcome::Unresolved))
         );
+        Ok(())
+    }
+
+    /// #1581 rc7 review (Low 2): a routine `exchange_reached` never
+    /// rides the file, so recording it over no record leaves the store
+    /// clean (no sidecar rewrite); replacing a stored `unresolved`
+    /// record with it does change the file, so that write is due.
+    #[tokio::test]
+    async fn a_routine_exchange_outcome_rewrites_the_sidecar_only_over_a_stored_record(
+    ) -> anyhow::Result<()> {
+        let (state, _group_id, key, designated, _bytes, _dir) =
+            uda_state_after_restart(None).await?;
+        let attempt = {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.dirty = false;
+            inner
+                .store
+                .get(&key)
+                .and_then(|row| row.first_dispatch_unix_ms)
+                .expect("the row has dispatched")
+        };
+        // The probe: remove the sidecar, so any rewrite puts it back.
+        std::fs::remove_file(evs_path(&state))?;
+        record_designated_handoff(
+            &state,
+            &key,
+            attempt,
+            designated,
+            s4::DesignatedHandoffOutcome::ExchangeReached,
+        )
+        .await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(!inner.dirty, "a routine outcome marks nothing dirty");
+            assert_eq!(
+                inner.store.get(&key).expect("the row").designated_handoff,
+                Some(s4::DesignatedHandoffRecord {
+                    designated,
+                    outcome: s4::DesignatedHandoffOutcome::ExchangeReached,
+                }),
+                "the routine outcome is still held in memory"
+            );
+        }
+        assert!(
+            !evs_path(&state).exists(),
+            "a routine outcome over no record rewrites no sidecar"
+        );
+        // Over a stored record the file changes: v3 back to v1.
+        record_designated_handoff(
+            &state,
+            &key,
+            attempt,
+            designated,
+            s4::DesignatedHandoffOutcome::Unresolved,
+        )
+        .await;
+        assert_eq!(&std::fs::read(evs_path(&state))?[..10], s4::EVS_HEADER_V3);
+        record_designated_handoff(
+            &state,
+            &key,
+            attempt,
+            designated,
+            s4::DesignatedHandoffOutcome::ExchangeReached,
+        )
+        .await;
+        assert_eq!(&std::fs::read(evs_path(&state))?[..10], s4::EVS_HEADER_V1);
         Ok(())
     }
 

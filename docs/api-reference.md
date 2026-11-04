@@ -1779,8 +1779,9 @@ every wait. A wait always names its cause; it does not stop silently.
     `detail` is `rank` with `remaining_ms`, like the plain wait. A
     definitive failure is not this cause: it keeps
     `waiting_for_designated_admin` with the
-    `designated_admin_unsupported` detail (a verified advert that lacks
-    `eviction_handoff_v1`, or the transport's refusal for that lack).
+    `designated_admin_unsupported` detail once the row has dispatched
+    (a verified advert that lacks `eviction_handoff_v1`, or the
+    transport's refusal for that lack).
     The manual remove/ban/seal 202 keeps its documented
     `waiting_for_designated_admin` answer (ADR 0110 §2's ADR 0016 §6
     amendment).

@@ -221,6 +221,16 @@ pub enum DesignatedHandoffOutcome {
     Unsupported,
 }
 
+impl DesignatedHandoffOutcome {
+    /// Whether the outcome rides the `.evs` v3 extension (§5). Only
+    /// `Unresolved` and `Unsupported` do; a routine `ExchangeReached`
+    /// stays in memory (Engineer ruling, 4 Nov 2026 08:25 GMT).
+    #[must_use]
+    pub fn persists(self) -> bool {
+        matches!(self, Self::Unresolved | Self::Unsupported)
+    }
+}
+
 /// This node's recorded outbound hand-off dispatch against one
 /// designated admin. The record names the admin it targeted, so a
 /// designation change voids it. The dispatch itself runs once per
@@ -2629,6 +2639,21 @@ mod tests {
         );
         assert_eq!(
             past_window.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+        // The boundary itself: 1 ms before W still shows the cause, and
+        // the budget at exactly W is past the window (L171).
+        let boundary = |elapsed| {
+            evaluate_row(&row, &ctx(3, &admins, &none, elapsed), &timing)
+                .waiting
+                .map(|waiting| waiting.cause)
+        };
+        assert_eq!(
+            boundary(timing.designated_window - Duration::from_millis(1)),
+            Some(WaitingCause::UnresolvedDesignatedAdmin)
+        );
+        assert_eq!(
+            boundary(timing.designated_window),
             Some(WaitingCause::WaitingForDesignatedAdmin)
         );
 

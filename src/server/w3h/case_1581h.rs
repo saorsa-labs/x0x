@@ -90,8 +90,8 @@ const WATCH: Duration = Duration::from_secs(45);
 /// A `.evs` whose v2 header is valid but whose body cannot decode: the
 /// row's "damage the `.evs` body" form.
 const DAMAGED_BODY: &[u8] = b"X0XEVICT2\0not a postcard body";
-/// The newer `.evs` layout this binary must leave untouched (#1508
-/// reads v2, so v3 is the newer form).
+/// The newer `.evs` layout this binary must leave untouched (this
+/// binary reads up to v3, so v4 is the newer form).
 const NEWER_EVS: &[u8] = b"X0XEVICT4\0future layout";
 
 const FINAL_CONTROL: &str = "the_rebuilt_store_rederives_the_open_row_and_completes_one_rotation";
