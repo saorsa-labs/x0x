@@ -26,6 +26,7 @@ use harness::*;
 use std::path::Path;
 
 mod harness;
+mod rm3;
 
 const CASE: &str = "released_s3_rm1_floor_names_the_released_member";
 const SEED: u64 = 0x1356_0152;
