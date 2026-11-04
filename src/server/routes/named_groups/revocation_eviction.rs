@@ -7809,7 +7809,9 @@ pub(super) mod tests {
             assert_eq!(&bytes[..10], s4::EVS_HEADER_V3, "{outcome:?} rides v3");
             let window = state.revocation_evictions.timing.designated_window;
             // Inside W the record and the v3 file stay.
-            uda_set_budget(&state, &key, window.saturating_sub(Duration::from_secs(1))).await;
+            // A 5 s margin below W (18 s by default) keeps a loaded runner
+            // from crossing W between this set and the pass.
+            uda_set_budget(&state, &key, window.saturating_sub(Duration::from_secs(5))).await;
             let (record, header) = uda_record_and_header_after_pass(&state, &key).await?;
             assert_eq!(
                 record,
@@ -7973,7 +7975,15 @@ pub(super) mod tests {
                 designated_send_outcome(&Err(refusal)),
             )
             .await;
-            let (_record, header) = uda_record_and_header_after_pass(&state, &key).await?;
+            let (record, header) = uda_record_and_header_after_pass(&state, &key).await?;
+            assert_eq!(
+                record,
+                Some(s4::DesignatedHandoffRecord {
+                    designated,
+                    outcome: s4::DesignatedHandoffOutcome::PolicyRefused,
+                }),
+                "the refusal is held in memory as a policy refusal"
+            );
             assert_eq!(header, s4::EVS_HEADER_V1.to_vec(), "never stored");
             let info = state
                 .named_groups
@@ -8279,7 +8289,7 @@ pub(super) mod tests {
     /// is `unsupported`, never an unresolved route (L171), while the
     /// missing-binding and timeout shapes stay `unresolved`.
     #[test]
-    fn designated_send_outcome_maps_definitive_refusals_to_unsupported() {
+    fn designated_send_outcome_classifies_every_refusal() {
         let receipt = x0x::dm::DmReceipt {
             request_id: [0; 16],
             accepted_at: std::time::Instant::now(),

@@ -1782,11 +1782,15 @@ every wait. A wait always names its cause; it does not stop silently.
     `waiting_for_designated_admin` with the
     `designated_admin_unsupported` detail once the row has dispatched
     (a verified advert that lacks `eviction_handoff_v1`, or the
-    transport's refusal for that lack). A definitive policy refusal (the
-    designated admin's trust policy rejected this node, or this node's
-    pairing policy denied the designated admin's machine) is not this
-    cause either: it keeps the plain `waiting_for_designated_admin` with
-    `detail: "rank"`.
+    transport's refusal for that lack). A definitive policy refusal is
+    not this cause either: it keeps the plain
+    `waiting_for_designated_admin` with `detail: "rank"`. Two refusals
+    count. The first is the designated admin's trust policy that rejects
+    this node. The second is this node's pairing policy that denies the
+    designated admin's machine in the pre-send check of the direct send.
+    A pairing denial on the raw-QUIC or DM-registry path is reported as
+    a peer that is not verified, with no policy reason. That outcome is
+    `unresolved`, and it is stored, like any other failed send.
     The manual remove/ban/seal 202 keeps its documented
     `waiting_for_designated_admin` answer (ADR 0110 §2's ADR 0016 §6
     amendment).
