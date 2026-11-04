@@ -149,12 +149,19 @@ impl Host {
                     }
                 }
             }
+            // ADR 0094 S4: once restoration is complete, the cause is
+            // retained. Restored children may already run, so a later cause
+            // must not change the hold decision behind them.
+            let restored = record.phase == journal::Phase::Restored;
             let result = (|| {
                 record.phase = journal::Phase::RollingBack;
                 // A recorded Failed cause is never downgraded to Interrupted
-                // by a later launcher restart (ADR 0094 S4). Otherwise the
-                // first cause wins: only Failed replaces an Interrupted one.
+                // by a later launcher restart. Before restoration completes,
+                // the first cause wins, except that a Failed cause replaces
+                // an Interrupted one, so the hold is durable before any
+                // restored start.
                 let keep = match &record.cause {
+                    Some(_) if restored => true,
                     Some(existing) => {
                         existing.class == journal::CauseClass::Failed
                             || cause.class != journal::CauseClass::Failed
@@ -337,9 +344,10 @@ mod tests {
         let trials = [(root.join("trial.json"), trial(&host))];
         host.restore(&trials, cause(journal::CauseClass::Interrupted))
             .unwrap();
-        // A second restore from Restored must not overwrite the first cause.
+        // A second restore from Restored must not overwrite the first
+        // cause, not even with a Failed one.
         let later = journal::Cause {
-            class: journal::CauseClass::Interrupted,
+            class: journal::CauseClass::Failed,
             reason: "later restore".into(),
         };
         host.restore(&trials, later).unwrap();
@@ -371,6 +379,27 @@ mod tests {
         let kept = journal_record(&root).cause.unwrap();
         assert_eq!(kept.class, journal::CauseClass::Failed);
         assert_eq!(kept.reason, "fixture cause");
+    }
+
+    /// Before restoration completes, a Failed cause replaces an Interrupted
+    /// one, so the failed-release hold is durable before a restored start.
+    #[test]
+    fn restore_lets_a_failed_cause_replace_an_interrupted_one_before_restored() {
+        let (_dir, root, _host, mut record) = fixture(journal::Phase::RollingBack);
+        record.cause = Some(cause(journal::CauseClass::Interrupted));
+        journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
+        let host = Host::new(root.clone(), record).unwrap();
+        let trials = [(root.join("trial.json"), trial(&host))];
+        let failed = journal::Cause {
+            class: journal::CauseClass::Failed,
+            reason: "launch attempts exhausted".into(),
+        };
+        host.restore(&trials, failed).unwrap();
+        let record = journal_record(&root);
+        assert_eq!(record.phase, journal::Phase::Restored);
+        let kept = record.cause.unwrap();
+        assert_eq!(kept.class, journal::CauseClass::Failed);
+        assert_eq!(kept.reason, "launch attempts exhausted");
     }
 
     /// Restore never runs while an OLD or candidate process still exists.
