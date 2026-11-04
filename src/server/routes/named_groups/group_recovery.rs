@@ -618,6 +618,17 @@ struct SubjectState {
     /// its promotion path through the ordinary path, with the head at which
     /// it last asked the signer for a catch-up page.
     provisional: Option<(AdminTerminalAttestation, u64)>,
+    /// §3 "Beyond retention": this node entered `readmission_required
+    /// {base_beyond_retention}` while this record lived.
+    readmitted: bool,
+    /// When this pre-Welcome joiner's own seal first did not apply because
+    /// its staged Welcome could not be fetched (#1661). The seal, and so
+    /// the staged Welcome for it, is older.
+    welcome_unfetched_at: Option<Instant>,
+    /// §2 "Join attempt (D64)" (#1661): after readmission the sealer's
+    /// staged Welcome is gone, so the attempt has ended with ADR 0107's
+    /// typed outcome (see [`end_on_welcome_loss`]).
+    welcome_lost: bool,
 }
 
 impl SubjectState {
@@ -638,7 +649,18 @@ impl SubjectState {
             progress_at: now,
             armed_at: now,
             provisional: None,
+            readmitted: false,
+            welcome_unfetched_at: None,
+            welcome_lost: false,
         }
+    }
+
+    /// #1661: forget the ended join attempt's readmission, failed-fetch
+    /// and lost-Welcome flags ([`begin_join_attempt`]).
+    fn clear_attempt_flags(&mut self) {
+        self.readmitted = false;
+        self.welcome_unfetched_at = None;
+        self.welcome_lost = false;
     }
 
     fn end_round(&mut self, now: Instant) {
@@ -3767,6 +3789,192 @@ async fn apply_kept_chain(
     accepted
 }
 
+/// #1661: this node's own seal (`MemberAdded` or `JoinRequestApproved`
+/// with a `welcome_ref` and no inline Welcome) could not fetch its staged
+/// Welcome from the sealer. The shared Welcome apply path calls this when
+/// the fetch fails, so a seal from the kept-chain replay and a seal after a
+/// join carry are both recorded. Other rejections (decode, crypto, epoch,
+/// install) do not record. The first failed fetch counts: the seal, and so
+/// the staged Welcome for it, is older. Only a live recovery record keeps
+/// it. The caller holds no group-recovery lock.
+pub(super) async fn note_welcome_unfetched(state: &AppState, stable: &str) {
+    if let Some(subject) = state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .subjects
+        .get_mut(stable)
+    {
+        subject
+            .welcome_unfetched_at
+            .get_or_insert_with(Instant::now);
+    }
+}
+
+/// #1661, §2 "Join attempt (D64)": a verified invite starts a new join
+/// attempt for `stable`. The readmission, failed-fetch and lost-Welcome
+/// flags belong to the attempt that ended, so they reset on the existing
+/// record (its refs, view and ATA state stay). The new attempt's seal has a
+/// new staged Welcome. The join route calls this with the membership guard
+/// held, before it installs the attempt.
+pub(super) async fn begin_join_attempt(state: &AppState, stable: &str) {
+    if let Some(subject) = state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .subjects
+        .get_mut(stable)
+    {
+        subject.clear_attempt_flags();
+    }
+}
+
+/// §2 "Join attempt (D64)" on the readmission path (#1661). A readmitted
+/// pre-Welcome joiner's own seal did not apply because its staged Welcome
+/// could not be fetched ([`note_welcome_unfetched`]). Only the sealer holds
+/// that Welcome, in memory, for `PENDING_WELCOME_TTL` from the seal, and a
+/// sealer restart loses it sooner. When that lifetime has passed since the
+/// first failed fetch (the seal is older), no retry can bring the keys. The
+/// tick checks this, because an armed gate does not replay the seal again
+/// on every round. The attempt then ends with ADR 0107's typed outcome,
+/// `timed_out {rearm_original_result_unavailable}`, and the node shows
+/// `readmission_required {base_beyond_retention}` again, with D43's manual
+/// remove and re-invite as the exit. The attempt's bookkeeping (polls,
+/// inviter pin, registry entry) is retired, so that exit's new invite is
+/// not refused `join_already_pending`; the stub and its row stay, as the
+/// armed record owns them. It sends no further request and applies no
+/// later ATA for this attempt. Authority re-Welcome is S8 (b) (ADR 0114).
+///
+/// It ends nothing on a node that holds its keys (an active seat or a
+/// TreeKEM group): a later seal apply succeeded, so the flags are cleared.
+/// Under a recorded attestation conflict the conflict's view and its
+/// re-seat exit stay. The end runs under the membership lock, so a new
+/// invite's attempt ([`begin_join_attempt`]) is never retired by it.
+/// Returns whether the attempt has ended. The caller holds no membership
+/// lock.
+async fn end_on_welcome_loss(
+    state: &AppState,
+    group_key: &str,
+    info: &GroupInfo,
+    now: Instant,
+) -> bool {
+    let stable = info.stable_group_id();
+    let local = local_hex(state);
+    let keyed = holds_keys(state, group_key, info).await;
+    let due = |subject: &SubjectState| {
+        subject.readmitted
+            && subject
+                .welcome_unfetched_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= super::PENDING_WELCOME_TTL)
+    };
+    {
+        let mut inner = state.group_recovery.inner.lock().await;
+        let conflict = inner
+            .sidecars
+            .get(stable)
+            .is_some_and(|body| body.attestation_conflict.is_some());
+        let Some(subject) = inner.subjects.get_mut(stable) else {
+            return false;
+        };
+        if keyed {
+            subject.clear_attempt_flags();
+            return false;
+        }
+        if conflict {
+            return subject.welcome_lost;
+        }
+        if subject.welcome_lost {
+            // A tick that deferred the record (for example
+            // `home_gate_closed`) may have replaced the view.
+            subject.view = SubjectView::Readmission {
+                cause: "base_beyond_retention",
+            };
+            return true;
+        }
+        if !due(subject) {
+            return false;
+        }
+    }
+    let lock = super::group_membership_lock(state, group_key).await;
+    let _membership_guard = lock.lock().await;
+    // Check again under the membership lock. A seal apply may have
+    // brought the keys, or a new invite may have started an attempt and
+    // reset the flags. A concurrent tick that ended the attempt has
+    // already set the view.
+    let current = state.named_groups.read().await.get(group_key).cloned();
+    let keyed = match &current {
+        Some(current) => holds_keys(state, group_key, current).await,
+        None => true,
+    };
+    {
+        let mut inner = state.group_recovery.inner.lock().await;
+        let conflict = inner
+            .sidecars
+            .get(stable)
+            .is_some_and(|body| body.attestation_conflict.is_some());
+        let Some(subject) = inner.subjects.get_mut(stable) else {
+            return false;
+        };
+        if subject.welcome_lost {
+            return true;
+        }
+        if keyed || conflict || !due(subject) {
+            return false;
+        }
+        subject.welcome_lost = true;
+        subject.pending = None;
+        subject.view = SubjectView::Readmission {
+            cause: "base_beyond_retention",
+        };
+    }
+    // Its `Seated` finalize retires bookkeeping only; the outcome is
+    // written below.
+    super::retire_join_attempts_after_self_removal(
+        state,
+        group_key,
+        stable,
+        &info.mls_group_id,
+        &local,
+    )
+    .await;
+    state
+        .last_join_outcomes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            group_key.to_string(),
+            super::LastJoinOutcome {
+                outcome: "timed_out",
+                reason: Some(super::JOIN_REARM_TIMEOUT_REASON),
+                finished_at_ms: now_ms(),
+            },
+        );
+    tracing::warn!(group_id = %LogHexId::group(group_key), "ADR 0109 S3: the sealer's staged Welcome is gone after readmission; the join attempt ends timed_out (rearm_original_result_unavailable), readmission_required (base_beyond_retention)");
+    true
+}
+
+/// Whether this node holds its keys for the group: an active seat in
+/// `info`, or a TreeKEM group ([`end_on_welcome_loss`]).
+async fn holds_keys(state: &AppState, group_key: &str, info: &GroupInfo) -> bool {
+    info.has_active_member(&local_hex(state))
+        || state.treekem_groups.read().await.contains_key(group_key)
+}
+
+/// Whether the attempt for `stable` ended on a lost Welcome
+/// ([`end_on_welcome_loss`]).
+async fn welcome_lost(state: &AppState, stable: &str) -> bool {
+    state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .subjects
+        .get(stable)
+        .is_some_and(|subject| subject.welcome_lost)
+}
+
 /// §2 "Segments": the admin-armed ATA's segment is exhausted (the head is
 /// its last hash) while the kept terminal is still ahead. The gate stays
 /// armed with an empty remaining sequence, which admits nothing, and the
@@ -4156,7 +4364,9 @@ async fn subject_tick(state: &Arc<AppState>) {
         if defer_for_host_commit(state, &stable, info.state_revision).await {
             continue;
         }
-        if local_state_lost(state, &key, &info, now).await {
+        if local_state_lost(state, &key, &info, now).await
+            || end_on_welcome_loss(state, &key, &info, now).await
+        {
             continue;
         }
         provisional_tick(state, &key, &info).await;
@@ -4630,6 +4840,7 @@ async fn handle_response(state: &Arc<AppState>, sender: AgentId, response: Group
                         subject.view = SubjectView::Readmission {
                             cause: "base_beyond_retention",
                         };
+                        subject.readmitted = true;
                     }
                     advance_round(subject, now, from_pending);
                 }
@@ -4921,6 +5132,9 @@ async fn arm_from_response(
     // A pre-Welcome joiner that kept its served chain applies it now.
     let pre_welcome = !info.has_active_member(&local)
         && !state.treekem_groups.read().await.contains_key(group_key);
+    if pre_welcome && welcome_lost(state, &stable).await {
+        return;
+    }
     if pre_welcome && apply_kept_chain(state, group_key, info, &ata).await {
         return;
     }
@@ -7915,6 +8129,69 @@ pub(in crate::server) async fn record_conflict_at_head_for_test(
     )
 }
 
+/// Test only (#1661): the join-attempt flags of this node's recovery
+/// record for `stable`, as `(readmitted, welcome_unfetched, welcome_lost)`.
+/// `None` when no record exists.
+#[cfg(test)]
+pub(super) async fn attempt_flags_for_test(
+    state: &AppState,
+    stable: &str,
+) -> Option<(bool, bool, bool)> {
+    state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .subjects
+        .get(stable)
+        .map(|subject| {
+            (
+                subject.readmitted,
+                subject.welcome_unfetched_at.is_some(),
+                subject.welcome_lost,
+            )
+        })
+}
+
+/// Test only (#1661): when the record for `stable` first saw a failed
+/// Welcome fetch.
+#[cfg(test)]
+pub(super) async fn welcome_unfetched_at_for_test(
+    state: &AppState,
+    stable: &str,
+) -> Option<Instant> {
+    state
+        .group_recovery
+        .inner
+        .lock()
+        .await
+        .subjects
+        .get(stable)
+        .and_then(|subject| subject.welcome_unfetched_at)
+}
+
+/// Test only (#1661): make sure a recovery record exists for `stable` and
+/// set its join-attempt flags. `welcome_unfetched` sets the failed-fetch
+/// time to now.
+#[cfg(test)]
+pub(super) async fn seed_attempt_flags_for_test(
+    state: &AppState,
+    stable: &str,
+    readmitted: bool,
+    welcome_unfetched: bool,
+    welcome_lost: bool,
+) {
+    let now = Instant::now();
+    let mut inner = state.group_recovery.inner.lock().await;
+    let subject = inner
+        .subjects
+        .entry(stable.to_string())
+        .or_insert_with(|| SubjectState::new(now, 0));
+    subject.readmitted = readmitted;
+    subject.welcome_unfetched_at = welcome_unfetched.then_some(now);
+    subject.welcome_lost = welcome_lost;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10145,6 +10422,592 @@ mod tests {
         assert_eq!(recovery["state"], "readmission_required");
         assert_eq!(recovery["cause"], "local_state_lost");
         assert_eq!(recovery["exit"], "manual_remove_and_reinvite");
+        Ok(())
+    }
+
+    /// #1661, §2 "Join attempt (D64)": a readmitted pre-Welcome joiner whose
+    /// own seal could not fetch its staged Welcome ends the attempt with ADR
+    /// 0107's typed outcome once the Welcome's lifetime has passed. It shows
+    /// `readmission_required {base_beyond_retention}` with D43's exit and
+    /// asks no target again. Controls: a node that never entered
+    /// readmission, and one still inside the lifetime, keep trying. Inert.
+    #[tokio::test]
+    async fn a_lost_welcome_after_readmission_ends_the_attempt_typed() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let now = Instant::now();
+        let mut subject = SubjectState::new(now, info.state_revision);
+        subject.view = SubjectView::CatchingUp {
+            attested_by: ata.fields.attested_by.clone(),
+            verified: true,
+            segment_terminal: ata.fields.segment_terminal_revision,
+        };
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .insert(stable.clone(), subject);
+        let later = now + super::super::PENDING_WELCOME_TTL;
+        // The joiner before its Welcome: no Active seat and no tree.
+        let mut pre_welcome = info.clone();
+        pre_welcome.remove_member(&local, None);
+        // The membership-locked recheck reads the stored record.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), pre_welcome.clone());
+        assert!(!state.treekem_groups.read().await.contains_key(&key));
+
+        let set = |readmitted: bool, unfetched: Option<Instant>| {
+            let state = &state;
+            let stable = stable.clone();
+            async move {
+                if let Some(subject) = state
+                    .group_recovery
+                    .inner
+                    .lock()
+                    .await
+                    .subjects
+                    .get_mut(&stable)
+                {
+                    subject.readmitted = readmitted;
+                    subject.welcome_unfetched_at = unfetched;
+                }
+            }
+        };
+        // Never readmitted: not this path.
+        set(false, Some(now)).await;
+        assert!(!end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        // No failed fetch: the seal may still apply.
+        set(true, None).await;
+        assert!(!end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        // A recent failed fetch (a later re-invite's seal) in an older
+        // record: its Welcome may still be served.
+        set(true, Some(later)).await;
+        assert!(!end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        set(true, Some(now)).await;
+        // Inside the lifetime the Welcome may still be served.
+        assert!(!end_on_welcome_loss(&state, &key, &pre_welcome, now).await);
+        assert!(!welcome_lost(&state, &stable).await);
+
+        assert!(end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        assert!(welcome_lost(&state, &stable).await);
+        let readmission = Some(SubjectView::Readmission {
+            cause: "base_beyond_retention",
+        });
+        assert_eq!(view_of(&state, &stable).await, readmission);
+        // A deferring tick replaces the view; the ended attempt restores it.
+        set_view(
+            &state,
+            &stable,
+            info.state_revision,
+            SubjectView::Deferred {
+                cause: "home_gate_closed",
+            },
+        )
+        .await;
+        assert!(end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        assert_eq!(view_of(&state, &stable).await, readmission);
+        let outcome = state
+            .last_join_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("join outcome"))?;
+        assert_eq!(outcome.outcome, "timed_out");
+        assert_eq!(
+            outcome.reason,
+            Some(super::super::JOIN_REARM_TIMEOUT_REASON)
+        );
+        let recovery = recovery_json(&state, &pre_welcome)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("recovery object"))?;
+        assert_eq!(recovery["state"], "readmission_required");
+        assert_eq!(recovery["cause"], "base_beyond_retention");
+        assert_eq!(recovery["exit"], "manual_remove_and_reinvite");
+        Ok(())
+    }
+
+    /// Set the join attempt flags on `stable`'s subject record, if any:
+    /// `readmitted`, `welcome_unfetched_at` and `welcome_lost`.
+    async fn set_attempt(
+        state: &AppState,
+        stable: &str,
+        readmitted: bool,
+        unfetched: Option<Instant>,
+        lost: bool,
+    ) {
+        if let Some(subject) = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get_mut(stable)
+        {
+            subject.readmitted = readmitted;
+            subject.welcome_unfetched_at = unfetched;
+            subject.welcome_lost = lost;
+        }
+    }
+
+    /// The join attempt flags of `stable`'s subject record, in the order of
+    /// [`set_attempt`]. `None` when there is no record.
+    async fn attempt_of(state: &AppState, stable: &str) -> Option<(bool, Option<Instant>, bool)> {
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get(stable)
+            .map(|subject| {
+                (
+                    subject.readmitted,
+                    subject.welcome_unfetched_at,
+                    subject.welcome_lost,
+                )
+            })
+    }
+
+    /// Whether a join outcome is written for `key`.
+    fn has_join_outcome(state: &AppState, key: &str) -> bool {
+        state
+            .last_join_outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(key)
+    }
+
+    /// #1661, §2 "Join attempt (D64)": the end checks the keys again under
+    /// the membership lock, from the stored record. The tick's snapshot
+    /// shows a pre-Welcome joiner, but a seal apply seated the node before
+    /// the lock: the attempt does not end and no outcome is written.
+    /// Control: with the stored record still pre-Welcome, the same call
+    /// ends. Inert.
+    #[tokio::test]
+    async fn the_end_rechecks_the_keys_under_the_membership_lock() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let mut stale = info.clone();
+        stale.remove_member(&local, None);
+        let now = Instant::now();
+        let later = now + super::super::PENDING_WELCOME_TTL;
+        subject_showing(&state, &info, info.state_revision, catching_up(&ata, true)).await;
+        // The stored record (from the fixture) seats the local node.
+        set_attempt(&state, &stable, true, Some(now), false).await;
+        assert!(!end_on_welcome_loss(&state, &key, &stale, later).await);
+        assert!(!has_join_outcome(&state, &key));
+        assert!(!welcome_lost(&state, &stable).await);
+        // Control: the stored record is pre-Welcome too.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), stale.clone());
+        assert!(end_on_welcome_loss(&state, &key, &stale, later).await);
+        assert!(has_join_outcome(&state, &key));
+        Ok(())
+    }
+
+    /// #1661 (ZCode on 1780, MAJOR), §2 "Join attempt (D64)": a node that
+    /// holds its keys ends no attempt on a lost Welcome. A later seal apply
+    /// succeeded, so the flags are cleared. The keys are an Active seat or a
+    /// TreeKEM group. The node writes no join outcome and keeps its view. An
+    /// attempt that already ended does not pin `readmission_required` on a
+    /// keyed node. Control: the same pre-Welcome record with no tree ends.
+    /// Red on bbfd24720: the end did not check for keys. Inert.
+    #[tokio::test]
+    async fn a_keyed_node_ends_no_attempt_on_a_lost_welcome() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let now = Instant::now();
+        let later = now + super::super::PENDING_WELCOME_TTL;
+        let held = catching_up(&ata, true);
+        subject_showing(&state, &info, info.state_revision, held.clone()).await;
+
+        // Keyed by an Active seat: a due attempt does not end.
+        set_attempt(&state, &stable, true, Some(now), false).await;
+        assert!(!end_on_welcome_loss(&state, &key, &info, later).await);
+        assert!(!has_join_outcome(&state, &key));
+        assert_eq!(view_of(&state, &stable).await, Some(held.clone()));
+        assert_eq!(
+            attempt_of(&state, &stable).await,
+            Some((false, None, false))
+        );
+
+        // An attempt that ended before the node became keyed does not pin
+        // `readmission_required`.
+        set_attempt(&state, &stable, true, Some(now), true).await;
+        assert!(!end_on_welcome_loss(&state, &key, &info, later).await);
+        assert_eq!(
+            attempt_of(&state, &stable).await,
+            Some((false, None, false))
+        );
+        assert_eq!(view_of(&state, &stable).await, Some(held.clone()));
+        assert!(!has_join_outcome(&state, &key));
+
+        // Keyed by a TreeKEM group, with no Active seat.
+        let mut pre_welcome = info.clone();
+        pre_welcome.remove_member(&local, None);
+        // The membership-locked recheck reads the stored record.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), pre_welcome.clone());
+        let group_id = hex::decode(&key)?;
+        let seed = super::super::agent_treekem_seed(state.agent.as_ref(), &group_id);
+        let tree = x0x::mls::TreeKemMlsGroup::create(group_id, state.agent.agent_id(), &seed)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(key.clone(), Arc::new(tokio::sync::Mutex::new(tree)));
+        set_attempt(&state, &stable, true, Some(now), false).await;
+        assert!(!end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        assert!(!has_join_outcome(&state, &key));
+        assert_eq!(view_of(&state, &stable).await, Some(held));
+        assert_eq!(
+            attempt_of(&state, &stable).await,
+            Some((false, None, false))
+        );
+
+        // Control: without the tree the same record ends.
+        state.treekem_groups.write().await.remove(&key);
+        set_attempt(&state, &stable, true, Some(now), false).await;
+        assert!(end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        assert!(has_join_outcome(&state, &key));
+        Ok(())
+    }
+
+    /// #1661, §2 "Conflict" and "Join attempt (D64)": under a recorded
+    /// attestation conflict a due readmitted attempt does not end on a
+    /// lost Welcome. The conflict's view `reseat_required
+    /// {attestation_conflict}` and its re-seat exit stay, and no join
+    /// outcome is written. An attempt that already ended stays ended, and
+    /// it does not replace the conflict's view. Red on bbfd24720: the end
+    /// replaced the view with `readmission_required`. Inert.
+    #[tokio::test]
+    async fn a_recorded_conflict_keeps_its_view_over_a_lost_welcome() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, _ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let mut pre_welcome = info.clone();
+        pre_welcome.remove_member(&local, None);
+        // The membership-locked recheck reads the stored record.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), pre_welcome.clone());
+        let now = Instant::now();
+        let later = now + super::super::PENDING_WELCOME_TTL;
+        fresh_subject(&state, &info, now).await;
+        assert!(record_conflict_at_head_for_test(&state, &pre_welcome).await?);
+        show_conflict(&state, &pre_welcome).await;
+        let conflict_view = view_of(&state, &stable).await;
+        assert!(matches!(
+            conflict_view,
+            Some(SubjectView::Reseat {
+                cause: "attestation_conflict",
+                ..
+            })
+        ));
+
+        set_attempt(&state, &stable, true, Some(now), false).await;
+        assert!(!end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        assert_eq!(view_of(&state, &stable).await, conflict_view);
+        assert!(!welcome_lost(&state, &stable).await);
+        assert!(!has_join_outcome(&state, &key));
+
+        // An ended attempt stays ended, under the conflict's view.
+        set_attempt(&state, &stable, true, Some(now), true).await;
+        assert!(end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        assert_eq!(view_of(&state, &stable).await, conflict_view);
+        assert!(!has_join_outcome(&state, &key));
+        Ok(())
+    }
+
+    /// #1661, §2 "Join attempt (D64)" (ruling: reset, do not replace): a
+    /// verified invite starts a new attempt. `begin_join_attempt` resets
+    /// the ended attempt's readmission, failed-fetch and lost-Welcome flags
+    /// on the existing record. The record, its view and its round state
+    /// stay. After the reset the attempt does not end at once, and an ATA
+    /// arms the pre-Welcome joiner again. With no record it creates none.
+    /// Red on bbfd24720: there was no reset, so the new attempt was ended
+    /// by the old flags. Inert.
+    #[tokio::test]
+    async fn begin_join_attempt_resets_the_flags_and_keeps_the_record() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let mut pre_welcome = info.clone();
+        pre_welcome.remove_member(&local, None);
+        // The membership-locked recheck reads the stored record.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), pre_welcome.clone());
+        let now = Instant::now();
+        let later = now + super::super::PENDING_WELCOME_TTL;
+        let readmission = SubjectView::Readmission {
+            cause: "base_beyond_retention",
+        };
+        subject_showing(&state, &info, info.state_revision, readmission.clone()).await;
+        if let Some(subject) = state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .get_mut(&stable)
+        {
+            subject
+                .asked
+                .insert("ad".repeat(32), "base_beyond_retention".to_string());
+            subject.attempts = 3;
+        }
+        set_attempt(&state, &stable, true, Some(now), true).await;
+
+        begin_join_attempt(&state, &stable).await;
+        assert_eq!(
+            attempt_of(&state, &stable).await,
+            Some((false, None, false))
+        );
+        {
+            let inner = state.group_recovery.inner.lock().await;
+            let subject = inner
+                .subjects
+                .get(&stable)
+                .ok_or_else(|| anyhow::anyhow!("the record stays"))?;
+            assert_eq!(subject.view, readmission, "the view stays");
+            assert_eq!(subject.attempts, 3);
+            assert_eq!(
+                subject.asked.get(&"ad".repeat(32)).map(String::as_str),
+                Some("base_beyond_retention")
+            );
+        }
+        assert!(!end_on_welcome_loss(&state, &key, &pre_welcome, later).await);
+        assert!(!has_join_outcome(&state, &key));
+        // The new attempt arms from an ATA.
+        arm_from_response(&state, &key, &pre_welcome, ata).await;
+        assert!(sidecar_snapshot(&state, &stable)
+            .await
+            .and_then(|body| body.active_ata)
+            .is_some());
+
+        // No record: none is created.
+        state
+            .group_recovery
+            .inner
+            .lock()
+            .await
+            .subjects
+            .remove(&stable);
+        begin_join_attempt(&state, &stable).await;
+        assert!(attempt_of(&state, &stable).await.is_none());
+        Ok(())
+    }
+
+    /// #1661: `note_welcome_unfetched` keeps the first failed fetch. The
+    /// seal, and so its staged Welcome, is older than any later failure, so
+    /// a second call does not move the time. With no subject record it
+    /// creates none. Red on bbfd24720: the function did not exist; the
+    /// record was only written on the kept-chain replay. Inert: paused
+    /// time.
+    #[tokio::test]
+    async fn note_welcome_unfetched_keeps_the_first_failed_fetch() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, _ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        tokio::time::pause();
+
+        note_welcome_unfetched(&state, &stable).await;
+        assert!(attempt_of(&state, &stable).await.is_none(), "no record");
+
+        fresh_subject(&state, &info, Instant::now()).await;
+        let first = Instant::now();
+        note_welcome_unfetched(&state, &stable).await;
+        assert_eq!(
+            attempt_of(&state, &stable).await,
+            Some((false, Some(first), false))
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(Instant::now() > first);
+        note_welcome_unfetched(&state, &stable).await;
+        assert_eq!(
+            attempt_of(&state, &stable).await,
+            Some((false, Some(first), false)),
+            "the first failed fetch counts"
+        );
+        Ok(())
+    }
+
+    /// #1661, §3 "Beyond retention" (D97): when every reached admin refuses
+    /// `base_beyond_retention`, `handle_response` shows
+    /// `readmission_required {base_beyond_retention}` and marks the attempt
+    /// readmitted, which the lost-Welcome end requires. Control: a
+    /// `not_a_member` refusal does not mark it. Inert.
+    #[tokio::test]
+    async fn base_beyond_retention_marks_the_attempt_readmitted() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let (_key, info, _ata, admin) = armed_fixture_with_signer(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        fresh_subject(&state, &info, Instant::now()).await;
+
+        let view = refused_with(&state, &info, &admin, AttestRefusalReason::NotAMember).await;
+        assert!(matches!(
+            view,
+            Some(SubjectView::Reseat {
+                cause: "not_a_member",
+                ..
+            })
+        ));
+        assert_eq!(
+            attempt_of(&state, &stable).await,
+            Some((false, None, false))
+        );
+
+        let view = refused_with(
+            &state,
+            &info,
+            &admin,
+            AttestRefusalReason::BaseBeyondRetention,
+        )
+        .await;
+        assert_eq!(
+            view,
+            Some(SubjectView::Readmission {
+                cause: "base_beyond_retention"
+            })
+        );
+        assert_eq!(attempt_of(&state, &stable).await, Some((true, None, false)));
+        Ok(())
+    }
+
+    /// #1661, §2 "Join attempt (D64)": a pre-Welcome joiner whose attempt
+    /// ended on a lost Welcome arms no ATA from a response. Its kept chain
+    /// is not applied, no `active_ata` is written and the view stays.
+    /// Control: the same joiner with no lost Welcome arms. Inert.
+    #[tokio::test]
+    async fn a_lost_welcome_arms_no_ata_from_a_response() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let mut pre_welcome = info.clone();
+        pre_welcome.remove_member(&local, None);
+        // The membership-locked recheck reads the stored record.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), pre_welcome.clone());
+        let now = Instant::now();
+        let readmission = SubjectView::Readmission {
+            cause: "base_beyond_retention",
+        };
+        subject_showing(&state, &info, info.state_revision, readmission.clone()).await;
+        let armed = || async {
+            sidecar_snapshot(&state, &stable)
+                .await
+                .and_then(|body| body.active_ata)
+                .is_some()
+        };
+
+        set_attempt(&state, &stable, true, Some(now), true).await;
+        arm_from_response(&state, &key, &pre_welcome, ata.clone()).await;
+        assert!(!armed().await, "no ATA arms");
+        assert_eq!(view_of(&state, &stable).await, Some(readmission));
+
+        // Control: no lost Welcome.
+        set_attempt(&state, &stable, true, Some(now), false).await;
+        arm_from_response(&state, &key, &pre_welcome, ata.clone()).await;
+        assert!(armed().await, "the control arms");
+        assert_eq!(
+            view_of(&state, &stable).await,
+            Some(catching_up(&ata, true))
+        );
+        Ok(())
+    }
+
+    /// #1661, §2 "Join attempt (D64)": the recovery tick reaches the
+    /// lost-Welcome end. A pre-Welcome joiner with a live ref, readmitted,
+    /// whose first failed fetch is `PENDING_WELCOME_TTL` old, ends its
+    /// attempt in one tick: `timed_out {rearm_original_result_unavailable}`
+    /// and `readmission_required {base_beyond_retention}`. It asks no
+    /// target. Control: the same joiner, not readmitted, goes on to target
+    /// selection and writes no outcome. Inert: an offline agent, paused
+    /// time.
+    #[tokio::test]
+    async fn the_tick_ends_a_readmitted_attempt_after_the_welcome_lifetime() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let local = local_hex(&state);
+        let (key, info, ata) = armed_fixture(&state).await?;
+        let stable = info.stable_group_id().to_string();
+        let mut pre_welcome = info.clone();
+        pre_welcome.remove_member(&local, None);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(key.clone(), pre_welcome.clone());
+        assert!(update_sidecar(&state, &stable, move |body| body.active_ata = Some(ata)).await);
+        assert!(!live_refs(&state, &pre_welcome).await.is_empty());
+        let readmission = Some(SubjectView::Readmission {
+            cause: "base_beyond_retention",
+        });
+        tokio::time::pause();
+
+        for readmitted in [false, true] {
+            fresh_subject(&state, &pre_welcome, Instant::now()).await;
+            set_attempt(&state, &stable, readmitted, Some(Instant::now()), false).await;
+            tokio::time::advance(super::super::PENDING_WELCOME_TTL).await;
+            tokio::time::timeout(Duration::from_secs(60), subject_tick(&state)).await?;
+            let view = view_of(&state, &stable).await;
+            if !readmitted {
+                assert!(!has_join_outcome(&state, &key), "the control goes on");
+                assert!(!welcome_lost(&state, &stable).await);
+                assert_ne!(view, readmission);
+                continue;
+            }
+            assert!(welcome_lost(&state, &stable).await);
+            assert_eq!(view, readmission);
+            let outcome = state
+                .last_join_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("join outcome"))?;
+            assert_eq!(outcome.outcome, "timed_out");
+            assert_eq!(
+                outcome.reason,
+                Some(super::super::JOIN_REARM_TIMEOUT_REASON)
+            );
+            let inner = state.group_recovery.inner.lock().await;
+            let subject = inner
+                .subjects
+                .get(&stable)
+                .ok_or_else(|| anyhow::anyhow!("subject"))?;
+            assert!(subject.pending.is_none(), "no request is open");
+            assert!(subject.asked.is_empty(), "no target is asked");
+        }
         Ok(())
     }
 
