@@ -349,12 +349,30 @@ async fn eligible_admins(state: &AppState, info: &GroupInfo, seat: &[u8; 32]) ->
 
 // ─── S4 row override (§1a, §4b(2)) ─────────────────────────────────────────
 
+/// #1581: the sole-admin form of the §1a wait. The target is the only
+/// Admin-or-higher Active seat, and its own selected certificate is expired
+/// on this node's clock (own trigger, `not_after + τ`), so the renewal the
+/// row waits for is the target's own: the wait names the target.
+/// [`cr::admins_needing_renewal`] keeps answering `None` with no other
+/// admin, because the §4b(2) self-rebind permission reads it; this rule
+/// changes what the row shows, never who may rebind.
+fn sole_admin_renewal(info: &GroupInfo, target: &[u8; 32], now_unix: u64) -> Option<Vec<[u8; 32]>> {
+    let admins = admins_with_expiry(info);
+    let sole_expired = admins.iter().any(|(id, not_after)| {
+        id == target
+            && not_after.is_some_and(|not_after| s4::own_expiry_trigger_due(not_after, now_unix))
+    });
+    (sole_expired && admins.iter().all(|(id, _)| id == target)).then(|| vec![*target])
+}
+
 /// §1a and §4b(2): an expiry-only row of a seated target in an
 /// `OwnerCertified` group, where every admin other than the target holds an
 /// expired selected certificate, waits for an owner renewal
-/// (`waiting_for_admin_certificate_renewal`, naming those admins). While a
-/// renewing admin's self-rebind is held by the D76 rule, the row shows
-/// `waiting_for_receiver_upgrade`, naming the holders.
+/// (`waiting_for_admin_certificate_renewal`, naming those admins). When the
+/// target itself is the only admin and its selected certificate is expired,
+/// the wait names the target (#1581). While a renewing admin's self-rebind
+/// is held by the D76 rule, the row shows `waiting_for_receiver_upgrade`,
+/// naming the holders.
 pub(super) fn row_override(
     rebind: &RebindState,
     info: &GroupInfo,
@@ -365,7 +383,8 @@ pub(super) fn row_override(
     if !row.expiry_only() || !target_seated || !owner_certified(info) {
         return None;
     }
-    let admins = cr::admins_needing_renewal(&admins_with_expiry(info), &row.target, now_unix)?;
+    let admins = cr::admins_needing_renewal(&admins_with_expiry(info), &row.target, now_unix)
+        .or_else(|| sole_admin_renewal(info, &row.target, now_unix))?;
     let holders: Vec<[u8; 32]> = rebind
         .held
         .iter()
@@ -2682,6 +2701,227 @@ mod tests {
             hex::encode([2u8; 32])
         );
         assert_eq!(status["held_self_rebinds"], serde_json::json!([]));
+    }
+
+    /// #1581: an `OwnerCertified` group whose creator `admin` is the only
+    /// admin seat, holding a committed certificate that expires at
+    /// `not_after`.
+    fn sole_admin_group(
+        not_after: u64,
+    ) -> (
+        x0x::identity::UserKeypair,
+        x0x::identity::AgentKeypair,
+        GroupInfo,
+    ) {
+        let owner = x0x::identity::UserKeypair::generate().expect("owner");
+        let admin = x0x::identity::AgentKeypair::generate().expect("admin");
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            admin.agent_id(),
+            "ab".repeat(16),
+        );
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        cr::install_certificate(
+            &mut info,
+            &hex::encode(admin.agent_id().as_bytes()),
+            AgentCertificate::issue_with_expiry(&owner, &admin, Some(not_after))
+                .expect("certificate"),
+        );
+        info.recompute_state_hash();
+        (owner, admin, info)
+    }
+
+    /// An expiry-only row for `target` on `info`'s group.
+    fn expiry_row(info: &GroupInfo, target: [u8; 32], not_after: u64) -> ObligationRow {
+        let mut store = s4::ObligationStore::new();
+        let key = EvictionKey::new(info.stable_group_id(), target);
+        store.intake(
+            &key,
+            s4::EvictionTrigger::CertificateExpiry {
+                certificate_digest: cr::committed_digest(&info.members_v2[&hex::encode(target)])
+                    .expect("committed digest"),
+                not_after,
+            },
+            None,
+            0,
+            [0; 16],
+        );
+        store.get(&key).expect("row").clone()
+    }
+
+    /// #1581 (ADR 0110 §1a, §4b(2)): a sole admin whose selected
+    /// certificate is expired on this node's clock (own trigger,
+    /// `not_after + τ`) is itself the admin whose owner renewal the row
+    /// waits for, so the row shows `waiting_for_admin_certificate_renewal`
+    /// naming the target, not the fallback `waiting_for_active_admin`.
+    /// `admins_needing_renewal` still answers `None` with no other admin
+    /// (it gates the §4b(2) self-rebind permission), so this changes only
+    /// what the row shows, never who may rebind.
+    #[test]
+    fn row_override_waits_for_the_renewal_of_a_sole_expired_admin() {
+        const NOW: u64 = 1_000_000;
+        let expired = NOW - s4::EXPIRY_TOLERANCE_SECS - 1;
+        let (_owner, admin, info) = sole_admin_group(expired);
+        let row = expiry_row(&info, *admin.agent_id().as_bytes(), expired);
+        assert_eq!(
+            row_override(&RebindState::default(), &info, &row, true, NOW)
+                .map(|wait| (wait.cause, wait.named)),
+            Some((
+                WaitingCause::WaitingForAdminCertificateRenewal,
+                vec![*admin.agent_id().as_bytes()]
+            ))
+        );
+    }
+
+    /// #1581: while the sole admin's §4b(2) self-rebind is held by the D76
+    /// rule, the same row shows `waiting_for_receiver_upgrade` naming the
+    /// holders — the override shape the multi-admin row already has.
+    #[test]
+    fn row_override_names_the_holders_of_a_held_sole_admin_self_rebind() {
+        const NOW: u64 = 1_000_000;
+        let expired = NOW - s4::EXPIRY_TOLERANCE_SECS - 1;
+        let (owner, admin, info) = sole_admin_group(expired);
+        let holder = [7u8; 32];
+        let mut rebind = RebindState::default();
+        rebind.held.insert(
+            EvictionKey::new(info.stable_group_id(), *admin.agent_id().as_bytes()),
+            HeldSelfRebind {
+                group_key: "g".to_string(),
+                certificate: AgentCertificate::issue_with_expiry(&owner, &admin, Some(NOW + 600))
+                    .expect("renewal"),
+                holders: vec![holder],
+            },
+        );
+        let row = expiry_row(&info, *admin.agent_id().as_bytes(), expired);
+        assert_eq!(
+            row_override(&rebind, &info, &row, true, NOW).map(|wait| (wait.cause, wait.named)),
+            Some((WaitingCause::WaitingForReceiverUpgrade, vec![holder]))
+        );
+    }
+
+    /// The sole-admin wait starts only at the own trigger (`not_after +
+    /// τ`, #1533 Codex P2): past its cutoff but not yet expired, the sole
+    /// admin is still an eligible admin and the row keeps its default
+    /// wait.
+    #[test]
+    fn row_override_stays_off_before_the_sole_admins_own_trigger() {
+        const NOW: u64 = 1_000_000;
+        let (_owner, admin, info) = sole_admin_group(NOW + 60);
+        let row = expiry_row(&info, *admin.agent_id().as_bytes(), NOW + 60);
+        assert_eq!(
+            row_override(&RebindState::default(), &info, &row, true, NOW),
+            None
+        );
+    }
+
+    /// The fallback does not fill the admin-empty gap (ADR 0088 §2 item
+    /// 3, still open on #1581): a plain member's row on a roster with no
+    /// admin seat keeps the default `waiting_for_active_admin` wait.
+    #[test]
+    fn row_override_leaves_an_admin_empty_roster_to_the_default_wait() {
+        const NOW: u64 = 1_000_000;
+        let expired = NOW - s4::EXPIRY_TOLERANCE_SECS - 1;
+        let owner = x0x::identity::UserKeypair::generate().expect("owner");
+        let member = x0x::identity::AgentKeypair::generate().expect("member");
+        let mut info = GroupInfo::new(
+            "g".to_string(),
+            String::new(),
+            member.agent_id(),
+            "ab".repeat(16),
+        );
+        info.policy.admission =
+            x0x::groups::policy::GroupAdmission::OwnerCertified(owner.user_id());
+        let member_hex = hex::encode(member.agent_id().as_bytes());
+        // No Admin-or-higher seat stays: the creator is demoted.
+        if let Some(seat) = info.members_v2.get_mut(&member_hex) {
+            seat.role = GroupRole::Member;
+        }
+        cr::install_certificate(
+            &mut info,
+            &member_hex,
+            AgentCertificate::issue_with_expiry(&owner, &member, Some(expired))
+                .expect("certificate"),
+        );
+        info.recompute_state_hash();
+        let row = expiry_row(&info, *member.agent_id().as_bytes(), expired);
+        assert_eq!(
+            row_override(&RebindState::default(), &info, &row, true, NOW),
+            None
+        );
+    }
+
+    /// With another admin holding an unexpired certificate, the row does
+    /// not wait for a renewal: that admin commits the rebind.
+    #[test]
+    fn row_override_stays_off_while_another_admin_is_eligible() {
+        const NOW: u64 = 1_000_000;
+        let expired = NOW - s4::EXPIRY_TOLERANCE_SECS - 1;
+        let (owner, admin, mut info) = sole_admin_group(expired);
+        let other = x0x::identity::AgentKeypair::generate().expect("other admin");
+        let other_hex = hex::encode(other.agent_id().as_bytes());
+        let mut seat = x0x::groups::GroupMember::new_member(
+            other_hex.clone(),
+            None,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            1,
+        );
+        seat.role = GroupRole::Admin;
+        info.members_v2.insert(other_hex.clone(), seat);
+        cr::install_certificate(
+            &mut info,
+            &other_hex,
+            AgentCertificate::issue_with_expiry(&owner, &other, Some(NOW + 86_400))
+                .expect("certificate"),
+        );
+        info.recompute_state_hash();
+        let row = expiry_row(&info, *admin.agent_id().as_bytes(), expired);
+        assert_eq!(
+            row_override(&RebindState::default(), &info, &row, true, NOW),
+            None
+        );
+    }
+
+    /// The multi-admin form (the rule before #1581): with every admin
+    /// other than the target expired, the row names them in raw-ID order
+    /// and does not name the target.
+    #[test]
+    fn row_override_names_every_expired_admin_around_the_target() {
+        const NOW: u64 = 1_000_000;
+        let expired = NOW - s4::EXPIRY_TOLERANCE_SECS - 1;
+        let (owner, admin, mut info) = sole_admin_group(expired);
+        let others = [
+            x0x::identity::AgentKeypair::generate().expect("admin b"),
+            x0x::identity::AgentKeypair::generate().expect("admin c"),
+        ];
+        let mut named: Vec<[u8; 32]> = Vec::new();
+        for other in &others {
+            let other_hex = hex::encode(other.agent_id().as_bytes());
+            let mut seat = x0x::groups::GroupMember::new_member(
+                other_hex.clone(),
+                None,
+                Some(hex::encode(admin.agent_id().as_bytes())),
+                1,
+            );
+            seat.role = GroupRole::Admin;
+            info.members_v2.insert(other_hex.clone(), seat);
+            cr::install_certificate(
+                &mut info,
+                &other_hex,
+                AgentCertificate::issue_with_expiry(&owner, other, Some(expired))
+                    .expect("certificate"),
+            );
+            named.push(*other.agent_id().as_bytes());
+        }
+        info.recompute_state_hash();
+        let row = expiry_row(&info, *admin.agent_id().as_bytes(), expired);
+        named.sort_unstable();
+        assert_eq!(
+            row_override(&RebindState::default(), &info, &row, true, NOW)
+                .map(|wait| (wait.cause, wait.named)),
+            Some((WaitingCause::WaitingForAdminCertificateRenewal, named))
+        );
     }
 }
 
