@@ -17290,6 +17290,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                // #1661: an own seal whose staged Welcome
+                                // is not served; the S3 record times it.
+                                group_recovery::note_welcome_unfetched(
+                                    state,
+                                    next.stable_group_id(),
+                                )
+                                .await;
                                 return ApplyMetadataResult::REJECTED;
                             }
                         }
@@ -18530,6 +18537,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
+                                // #1661: an own seal whose staged Welcome
+                                // is not served; the S3 record times it.
+                                group_recovery::note_welcome_unfetched(
+                                    state,
+                                    next.stable_group_id(),
+                                )
+                                .await;
                                 return ApplyMetadataResult::REJECTED;
                             }
                         }
@@ -24515,6 +24529,8 @@ async fn rearm_sealed_unconfirmed_join(
             expected_key.clone(),
             invite.inviter.clone(),
         );
+        // #1661: the re-armed attempt starts with fresh S3 attempt flags.
+        group_recovery::begin_join_attempt(state.as_ref(), &stable).await;
         state
             .last_join_outcomes
             .lock()
@@ -25605,6 +25621,9 @@ pub(super) async fn join_group_via_invite_inner(
                     join_result_key(&stable_id_for_event, &joiner_hex),
                     invite.inviter.clone(),
                 );
+                // #1661: the new attempt starts with fresh S3 attempt
+                // flags on any existing recovery record.
+                group_recovery::begin_join_attempt(state.as_ref(), &stable_id_for_event).await;
                 state
                     .last_join_outcomes
                     .lock()
@@ -52621,6 +52640,16 @@ pub(in crate::server) mod tests {
         data_dir: &FsPath,
         agent: Arc<Agent>,
     ) -> Result<Arc<AppState>> {
+        secure_endpoint_test_state_at_with_self_update(data_dir, agent, false).await
+    }
+
+    /// #1169 fix round: upgrade-route tests need the self-update arm
+    /// switched on without touching the shared fixture default.
+    pub(in crate::server) async fn secure_endpoint_test_state_at_with_self_update(
+        data_dir: &FsPath,
+        agent: Arc<Agent>,
+        self_update_enabled: bool,
+    ) -> Result<Arc<AppState>> {
         let treekem_dir = data_dir.join("treekem");
         tokio::fs::create_dir_all(&treekem_dir).await?;
         let named_groups_path = data_dir.join("named_groups.json");
@@ -52816,7 +52845,7 @@ pub(in crate::server) mod tests {
             shutdown_tx,
             shutdown_notify,
             update_config: DaemonUpdateConfig::default(),
-            self_update_enabled: false,
+            self_update_enabled,
             upgrade_check_cache: Mutex::new(None),
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             http_upgrade_wait_lock: Arc::new(Mutex::new(())),
@@ -56928,6 +56957,375 @@ pub(in crate::server) mod tests {
                     "({case}) the invite is not consumed"
                 );
             }
+        }
+
+        /// #1661, §2 "Join attempt (D64)": a new join attempt from the join
+        /// route resets the S3 attempt flags (readmitted, failed Welcome
+        /// fetch, lost Welcome) on the existing recovery record. The record
+        /// stays. The flags belong to the attempt that ended: if they stay,
+        /// the new seal's failed fetch is timed from the old attempt and
+        /// the tick ends the new attempt at once. The route is a real
+        /// `POST /groups/join` with a real signed invite. Inert: offline
+        /// agents.
+        #[tokio::test]
+        async fn issue1661_a_new_join_attempt_resets_the_s3_attempt_flags() -> anyhow::Result<()> {
+            let (authority_state, _a) = fresh_state().await;
+            let (joiner_state, _j) = fresh_state().await;
+            let group = "1661".repeat(8);
+            seed_authority_group(&authority_state, &group, "sec-1661", None, false, false).await;
+            let (_inviter, link) = mint_real_invite(&authority_state, &group).await;
+            // The ended attempt left all three flags set on the record.
+            super::super::group_recovery::seed_attempt_flags_for_test(
+                &joiner_state,
+                &group,
+                true,
+                true,
+                true,
+            )
+            .await;
+            assert_eq!(
+                super::super::group_recovery::attempt_flags_for_test(&joiner_state, &group).await,
+                Some((true, true, true))
+            );
+
+            let response = join_group_via_invite(
+                State(Arc::clone(&joiner_state)),
+                Json(JoinGroupRequest {
+                    invite: link,
+                    display_name: None,
+                    mode: None,
+                    expected_owner_user_id: None,
+                }),
+            )
+            .await
+            .into_response();
+            let (code, body) = response_json(response).await?;
+            assert_eq!(code, StatusCode::OK, "route join succeeded: {body:?}");
+            let joiner = hex::encode(joiner_state.agent.agent_id().as_bytes());
+            assert!(
+                joiner_state
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(&join_result_key(&group, &joiner)),
+                "the new attempt is installed"
+            );
+            assert_eq!(
+                super::super::group_recovery::attempt_flags_for_test(&joiner_state, &group).await,
+                Some((false, false, false)),
+                "the new attempt starts with clear flags on the kept record"
+            );
+            Ok(())
+        }
+    }
+
+    /// #1661 (S2): this node's own seal records a failed Welcome fetch on
+    /// the S3 recovery record through the ordinary apply path, not only
+    /// through the kept-chain replay. Other seal rejections do not record.
+    mod issue1661_own_seal_welcome_unfetched {
+        use super::super::group_recovery;
+        use super::*;
+
+        /// A TreeKEM group in which this node is not a member yet, held by
+        /// this node, and the admin that seals this node's add.
+        struct OwnSealFixture {
+            state: Arc<AppState>,
+            _dir: tempfile::TempDir,
+            admin: x0x::identity::AgentKeypair,
+            admin_hex: String,
+            local: String,
+            parent: x0x::groups::GroupInfo,
+        }
+
+        async fn own_seal_fixture(group_id: &str) -> Result<OwnSealFixture> {
+            let (state, dir) = secure_endpoint_test_state().await?;
+            let local = hex::encode(state.agent.agent_id().as_bytes());
+            let admin = x0x::identity::AgentKeypair::generate()?;
+            let admin_hex = hex::encode(admin.agent_id().as_bytes());
+            let mut parent = x0x::groups::GroupInfo::with_policy(
+                "issue 1661 own seal".to_string(),
+                String::new(),
+                admin.agent_id(),
+                group_id.to_string(),
+                x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+            );
+            parent.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+            parent.shared_secret = None;
+            parent.secret_epoch = 0;
+            parent.security_binding = Some("treekem:epoch=0".to_string());
+            parent.recompute_state_hash();
+            Ok(OwnSealFixture {
+                state,
+                _dir: dir,
+                admin,
+                admin_hex,
+                local,
+                parent,
+            })
+        }
+
+        async fn install(fixture: &OwnSealFixture) {
+            fixture
+                .state
+                .named_groups
+                .write()
+                .await
+                .insert(fixture.parent.mls_group_id.clone(), fixture.parent.clone());
+        }
+
+        /// The admin's signed commit from `parent` to `scratch`.
+        fn sign(
+            parent: &x0x::groups::GroupInfo,
+            scratch: &x0x::groups::GroupInfo,
+            admin: &x0x::identity::AgentKeypair,
+            now_ms: u64,
+        ) -> Result<x0x::groups::GroupStateCommit> {
+            Ok(x0x::groups::GroupStateCommit::sign(
+                parent.stable_group_id().to_string(),
+                parent.state_revision.saturating_add(1),
+                Some(parent.state_hash.clone()),
+                x0x::groups::compute_roster_root(&scratch.members_v2),
+                x0x::groups::compute_policy_hash(&scratch.policy),
+                x0x::groups::compute_public_meta_hash(&scratch.public_meta()),
+                scratch.security_binding.clone(),
+                scratch.withdrawn,
+                now_ms,
+                admin,
+            )?)
+        }
+
+        /// The admin's `MemberAdded` that seats this node at TreeKEM epoch
+        /// 1, as the apply arm rebuilds it. `welcome` is the inline Welcome
+        /// and `welcome_ref` the staged one.
+        fn own_member_added(
+            fixture: &OwnSealFixture,
+            welcome: Option<String>,
+            welcome_ref: Option<WelcomeRef>,
+        ) -> Result<NamedGroupMetadataEvent> {
+            let parent = &fixture.parent;
+            let revision = parent.roster_revision.saturating_add(1);
+            let mut scratch = parent.clone();
+            scratch.roster_revision = adopt_roster_revision(scratch.roster_revision, revision);
+            scratch.add_member(
+                fixture.local.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(fixture.admin_hex.clone()),
+                None,
+            );
+            scratch.secret_epoch = 1;
+            scratch.security_binding = Some("treekem:epoch=1".to_string());
+            let commit = sign(parent, &scratch, &fixture.admin, 2_000)?;
+            Ok(NamedGroupMetadataEvent::MemberAdded {
+                roster_certificates_b64: Vec::new(),
+                group_id: parent.stable_group_id().to_string(),
+                revision,
+                actor: fixture.admin_hex.clone(),
+                agent_id: fixture.local.clone(),
+                display_name: None,
+                treekem_commit_b64: Some("Yw==".to_string()),
+                treekem_welcome_b64: welcome,
+                welcome_ref,
+                treekem_epoch: Some(1),
+                treekem_key_package_hash: None,
+                member_joined_recovery: None,
+                member_recovery_history: Vec::new(),
+                certificate_b64: None,
+                owner_mandate: None,
+                commit: Some(commit),
+                reseat_mandate: None,
+            })
+        }
+
+        /// The admin's `JoinRequestApproved` for this node's pending
+        /// request `request_id`, as the apply arm rebuilds it.
+        fn own_join_request_approved(
+            fixture: &OwnSealFixture,
+            request_id: &str,
+            welcome: Option<String>,
+            welcome_ref: Option<WelcomeRef>,
+        ) -> Result<NamedGroupMetadataEvent> {
+            let parent = &fixture.parent;
+            let revision = parent.roster_revision.saturating_add(1);
+            let package_hash = "ab".repeat(32);
+            let committed_at = 2_000;
+            let mut scratch = parent.clone();
+            set_join_request_approved(
+                &mut scratch,
+                request_id,
+                &fixture.admin_hex,
+                &fixture.local,
+                revision,
+                committed_at,
+            );
+            scratch.set_member_treekem_key_package_hash(&fixture.local, package_hash.clone());
+            scratch.secret_epoch = 1;
+            scratch.security_binding = Some("treekem:epoch=1".to_string());
+            let commit = sign(parent, &scratch, &fixture.admin, committed_at)?;
+            Ok(NamedGroupMetadataEvent::JoinRequestApproved {
+                group_id: parent.stable_group_id().to_string(),
+                request_id: request_id.to_string(),
+                revision,
+                actor: fixture.admin_hex.clone(),
+                requester_agent_id: fixture.local.clone(),
+                treekem_commit_b64: Some("Yw==".to_string()),
+                treekem_welcome_b64: welcome,
+                welcome_ref,
+                treekem_epoch: Some(1),
+                treekem_key_package_hash: Some(package_hash),
+                commit: Some(commit),
+            })
+        }
+
+        /// A staged Welcome whose fetch fails at once: its source is not
+        /// an agent id, so no request is sent and no retry waits.
+        fn unfetchable_welcome_ref() -> WelcomeRef {
+            WelcomeRef {
+                welcome_id: "issue1661-unfetchable".to_string(),
+                byte_len: 1,
+                source: "not-an-agent-id".to_string(),
+            }
+        }
+
+        async fn apply_from_admin(
+            fixture: &OwnSealFixture,
+            event: NamedGroupMetadataEvent,
+        ) -> ApplyMetadataResult {
+            apply_named_group_metadata_event(
+                &fixture.state,
+                event,
+                fixture.admin.agent_id(),
+                true,
+                None,
+            )
+            .await
+        }
+
+        /// #1661: this node's own `MemberAdded` with a staged Welcome that
+        /// cannot be fetched, applied through the ordinary apply path (as a
+        /// seal after a join carry is), records the first failed fetch on
+        /// the existing S3 record. The record of a second failed fetch
+        /// keeps the first time. Without a record nothing is created.
+        /// Before the fix only the kept-chain replay recorded, so this
+        /// path left `welcome_unfetched_at` empty. Inert: no send.
+        #[tokio::test]
+        async fn own_member_added_with_an_unfetchable_welcome_records_the_failed_fetch(
+        ) -> Result<()> {
+            let fixture = own_seal_fixture(&"166a".repeat(16)).await?;
+            install(&fixture).await;
+            let stable = fixture.parent.stable_group_id().to_string();
+            let event = own_member_added(&fixture, None, Some(unfetchable_welcome_ref()))?;
+
+            // No recovery record: the failed fetch creates none.
+            let applied = apply_from_admin(&fixture, event.clone()).await;
+            assert!(!applied.accepted, "the seal has no Welcome to apply");
+            assert_eq!(
+                group_recovery::attempt_flags_for_test(&fixture.state, &stable).await,
+                None
+            );
+
+            group_recovery::seed_attempt_flags_for_test(
+                &fixture.state,
+                &stable,
+                true,
+                false,
+                false,
+            )
+            .await;
+            let applied = apply_from_admin(&fixture, event.clone()).await;
+            assert!(!applied.accepted, "the seal has no Welcome to apply");
+            assert_eq!(
+                group_recovery::attempt_flags_for_test(&fixture.state, &stable).await,
+                Some((true, true, false)),
+                "the failed fetch of the own seal is recorded"
+            );
+            let first = group_recovery::welcome_unfetched_at_for_test(&fixture.state, &stable)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("first failed fetch recorded"))?;
+            let applied = apply_from_admin(&fixture, event).await;
+            assert!(!applied.accepted);
+            assert_eq!(
+                group_recovery::welcome_unfetched_at_for_test(&fixture.state, &stable).await,
+                Some(first),
+                "the first failed fetch counts"
+            );
+            Ok(())
+        }
+
+        /// #1661: the same record for this node's own `JoinRequestApproved`
+        /// (the request-approval seal) with an unfetchable staged Welcome.
+        /// Before the fix this path did not record. Inert: no send.
+        #[tokio::test]
+        async fn own_join_request_approved_with_an_unfetchable_welcome_records_the_failed_fetch(
+        ) -> Result<()> {
+            let mut fixture = own_seal_fixture(&"166b".repeat(16)).await?;
+            let request = x0x::groups::JoinRequest::new(
+                fixture.parent.mls_group_id.clone(),
+                fixture.local.clone(),
+                None,
+                now_millis_u64(),
+            );
+            let request_id = request.request_id.clone();
+            fixture
+                .parent
+                .join_requests
+                .insert(request_id.clone(), request);
+            fixture.parent.recompute_state_hash();
+            install(&fixture).await;
+            let stable = fixture.parent.stable_group_id().to_string();
+            group_recovery::seed_attempt_flags_for_test(
+                &fixture.state,
+                &stable,
+                true,
+                false,
+                false,
+            )
+            .await;
+
+            let event = own_join_request_approved(
+                &fixture,
+                &request_id,
+                None,
+                Some(unfetchable_welcome_ref()),
+            )?;
+            let applied = apply_from_admin(&fixture, event).await;
+            assert!(!applied.accepted, "the seal has no Welcome to apply");
+            assert_eq!(
+                group_recovery::attempt_flags_for_test(&fixture.state, &stable).await,
+                Some((true, true, false)),
+                "the failed fetch of the own approval seal is recorded"
+            );
+            Ok(())
+        }
+
+        /// #1661 control: an own seal that is refused for another cause
+        /// does not record a failed fetch: the inline Welcome does not
+        /// decode, or it decodes but does not join. Only a failed fetch of
+        /// this node's own staged Welcome starts the Welcome lifetime.
+        /// Inert: no send.
+        #[tokio::test]
+        async fn own_seal_refused_for_another_cause_records_no_failed_fetch() -> Result<()> {
+            let fixture = own_seal_fixture(&"166c".repeat(16)).await?;
+            install(&fixture).await;
+            let stable = fixture.parent.stable_group_id().to_string();
+            group_recovery::seed_attempt_flags_for_test(
+                &fixture.state,
+                &stable,
+                true,
+                false,
+                false,
+            )
+            .await;
+            for (case, welcome) in [("not_base64", "!!not base64!!"), ("not_a_welcome", "dw==")] {
+                let event = own_member_added(&fixture, Some(welcome.to_string()), None)?;
+                let applied = apply_from_admin(&fixture, event).await;
+                assert!(!applied.accepted, "({case}) the Welcome does not join");
+                assert_eq!(
+                    group_recovery::attempt_flags_for_test(&fixture.state, &stable).await,
+                    Some((true, false, false)),
+                    "({case}) a refused inline Welcome is not a failed fetch"
+                );
+            }
+            Ok(())
         }
     }
 
