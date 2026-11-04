@@ -203,8 +203,9 @@ pub enum DesignatedWaitDetail {
 #[non_exhaustive]
 pub enum DesignatedHandoffOutcome {
     /// The hand-off reached an authenticated direct or routed exchange
-    /// with the designated admin (L170: `send_direct` succeeded).
-    /// Routine, so it never rides the stored file; a completion drops
+    /// with the designated admin (L170: `send_direct` succeeded, or the
+    /// designated admin's own acknowledgement refused this sender by
+    /// policy — the route is resolved either way). Routine, so it never rides the stored file; a completion drops
     /// the record entirely.
     ExchangeReached,
     /// The attempt completed without such an exchange and without a

@@ -3108,14 +3108,22 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
 /// failure — the recipient's current verified advert lacks
 /// `eviction_handoff_v1`, the same evidence as the pre-send
 /// `Some(false)` read — so it is `Unsupported` (L171 keeps definitive
-/// failures out of the unresolved label). Every other error leaves the
-/// route unresolved: the missing-binding, timeout and offline shapes
-/// are transient or unknown-support, never a definitive refusal.
+/// failures out of the unresolved label). `RecipientRejected` is the
+/// designated admin's own acknowledgement that its trust policy refused
+/// this sender: the route to it is resolved and the answer is
+/// definitive, so it is `ExchangeReached` (plain wait, never stored),
+/// not an unresolved route. Every other error leaves the route
+/// unresolved: the missing-binding, timeout and offline shapes are
+/// transient or unknown-support, and `ReceiverBackpressured` is a
+/// transient "retry later" with no hand-off delivered — none is a
+/// definitive refusal.
 fn designated_send_outcome(
     result: &Result<x0x::dm::DmReceipt, x0x::dm::DmError>,
 ) -> s4::DesignatedHandoffOutcome {
     match result {
-        Ok(_) => s4::DesignatedHandoffOutcome::ExchangeReached,
+        Ok(_) | Err(x0x::dm::DmError::RecipientRejected { .. }) => {
+            s4::DesignatedHandoffOutcome::ExchangeReached
+        }
         Err(x0x::dm::DmError::RecipientUpgradeRequired { .. }) => {
             s4::DesignatedHandoffOutcome::Unsupported
         }
@@ -8009,6 +8017,22 @@ pub(super) mod tests {
         assert_eq!(
             designated_send_outcome(&Err(x0x::dm::DmError::PeerDisconnected {
                 reason: "closed".into()
+            })),
+            s4::DesignatedHandoffOutcome::Unresolved
+        );
+        // The designated admin's own policy refusal: the route is
+        // resolved and the answer definitive, so never unresolved (L171).
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientRejected {
+                reason: "trust policy".into()
+            })),
+            s4::DesignatedHandoffOutcome::ExchangeReached
+        );
+        // Backpressure is a transient "retry later": nothing was
+        // delivered and nothing definitive came back.
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::ReceiverBackpressured {
+                reason: "busy".into()
             })),
             s4::DesignatedHandoffOutcome::Unresolved
         );
