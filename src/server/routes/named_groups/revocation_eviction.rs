@@ -1498,14 +1498,21 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             inner.attempt_wait.remove(&key);
         }
         // §4: a hand-off to an unsupported designated admin waits for W
-        // with cause `designated_admin_unsupported`.
+        // with cause `designated_admin_unsupported`. The current verified
+        // advert is read on every pass, so the knowledge survives a
+        // restart (whose dispatch never re-runs and whose in-memory set
+        // is empty) and stays fresh through a designation change.
         if let (Some(waiting), Some(designation)) =
             (evaluation.waiting.as_mut(), evaluation.designation.as_ref())
         {
             let unsupported = inner
                 .unsupported_handoff
                 .get(&key)
-                .is_some_and(|ids| ids.contains(&designation.designated));
+                .is_some_and(|ids| ids.contains(&designation.designated))
+                || state.agent.capability_store().verified_registry_supports(
+                    &x0x::identity::AgentId(designation.designated),
+                    x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
+                ) == Some(false);
             if unsupported && waiting.designated_detail == Some(s4::DesignatedWaitDetail::Rank) {
                 // §2 (L171): a definitive hand-off failure (the §4
                 // unsupported advert) is never labelled an unresolved

@@ -2439,6 +2439,23 @@ mod tests {
             Some(WaitingCause::WaitingForDesignatedAdmin)
         );
 
+        // One millisecond short of W has not consumed the window, and a
+        // clock behind the dispatch time (rollback) never flips early.
+        row.first_dispatch_unix_ms = Some(
+            now_ms - u64::try_from(timing.designated_window.as_millis()).expect("W in ms") + 1,
+        );
+        let short = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
+        assert_eq!(
+            short.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+        row.first_dispatch_unix_ms = Some(now_ms + 5_000);
+        let rolled_back = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
+        assert_eq!(
+            rolled_back.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+
         // A row that has not dispatched yet keeps the plain wait.
         row.first_dispatch_unix_ms = None;
         let undispatched = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
