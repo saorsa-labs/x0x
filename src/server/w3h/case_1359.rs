@@ -16,9 +16,10 @@
 //!    600 s GSS; D102) plus margin.
 //! 4. Desired (ADR 0112): by T, measured from J's join call, B seats J,
 //!    J is `active` (TreeKEM: J installed the group) and J decrypts B's
-//!    next group message. J sends no join/redemption frame to A after A
-//!    stops (written or refused; matched as `request_kind` matches). Other
-//!    J-to-A traffic is only noted. A roster seat alone does not pass.
+//!    next group message. J sends no Direct-lane frame to A after A stops
+//!    (written, or refused with bytes; any kind, so an encrypted V5
+//!    envelope also fails). PubSub `member_joined` frames toward A and
+//!    lane-less dials are noted only. A roster seat alone does not pass.
 //!
 //! Main: a receiver other than the inviter keeps J's `MemberJoined` as
 //! recovery evidence and does not redeem it. J's attempt waits for a result
@@ -33,6 +34,12 @@
 //! The S6 code slice (after David accepts ADR 0112) must:
 //! - mint an explicit V5 invite (V4 stays pinned to its issuer);
 //! - add the "one consumption" check (it needs S6's consumption root);
+//! - add the OwnerCertified variant with owner-key device O (A holds the
+//!   owner's USER key at mint; stop A and O before redemption). This slice
+//!   covers the ordinary variant only;
+//! - add the ADR's t=1 step, "deliver current signed adverts for B and all
+//!   needed authorized evidence", as an explicit delivery barrier. This
+//!   slice leaves B's advert to normal gossip during setup;
 //! - switch `request_delivered` to the V5 redemption envelope. This slice
 //!   identifies main's request by lane and kind: a Direct frame whose JSON
 //!   body is J's `member_joined` event, or a PubSub frame that carries it.
@@ -122,15 +129,20 @@ async fn seat(
 /// `group`.
 async fn has_treekem(sim: &Sim, label: &str, group: &str) -> Result<bool> {
     let state = sim.state(label)?;
-    let key = {
-        let groups = state.named_groups.read().await;
-        crate::server::resolve_group_entry_locked(&groups, group).map(|(key, _)| key.to_string())
-    };
-    let Some(key) = key else {
-        return Ok(false);
-    };
-    let keyed = state.treekem_groups.read().await.contains_key(&key);
-    Ok(keyed)
+    let group = group.to_string();
+    sim.at_instant(&format!("read {label}'s TreeKEM group"), async move {
+        let key = {
+            let groups = state.named_groups.read().await;
+            crate::server::resolve_group_entry_locked(&groups, &group)
+                .map(|(key, _)| key.to_string())
+        };
+        let Some(key) = key else {
+            return false;
+        };
+        let keyed = state.treekem_groups.read().await.contains_key(&key);
+        keyed
+    })
+    .await
 }
 
 /// The agent id of the inviter key that J's pending attempt for `group`
@@ -182,8 +194,7 @@ async fn join_outcome(sim: &Sim, group: &str) -> Result<Option<String>> {
 /// frame (`[stream type][sender agent id (32)][JSON]`) whose body names J
 /// as `member_agent_id` and is J's `member_joined` event or its JoinResult
 /// `fetch_request`. A PubSub frame that carries J's `member_joined` event.
-/// Where the frame carries a `group_id`, it must be `group`. `None` for any
-/// other frame.
+/// The frame must carry `"group_id":"<group>"`. `None` for any other frame.
 fn request_kind(class: LaneClass, bytes: &[u8], j: &str, group: &str) -> Option<&'static str> {
     match class {
         LaneClass::Direct => {
@@ -193,7 +204,7 @@ fn request_kind(class: LaneClass, bytes: &[u8], j: &str, group: &str) -> Option<
                 .is_some_and(|id| id.eq_ignore_ascii_case(j));
             let in_group = body["group_id"]
                 .as_str()
-                .is_none_or(|id| id.eq_ignore_ascii_case(group));
+                .is_some_and(|id| id.eq_ignore_ascii_case(group));
             if !joiner || !in_group {
                 None
             } else if body["event"] == "member_joined" {
@@ -206,7 +217,7 @@ fn request_kind(class: LaneClass, bytes: &[u8], j: &str, group: &str) -> Option<
         }
         LaneClass::PubSub => {
             let text = String::from_utf8_lossy(bytes);
-            let in_group = !text.contains("\"group_id\"") || text.contains(group);
+            let in_group = text.contains(&format!("\"group_id\":\"{group}\""));
             (text.contains("\"member_joined\"") && text.contains(j) && in_group)
                 .then_some("pubsub member_joined")
         }
@@ -381,10 +392,11 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
     // t=1: A, the inviter and only issued-invite holder, stops.
     let offline = sim.fabric().mark_indexed("t1: A stops");
     sim.stop("A", RestartMode::Crash).await?;
+    let a_online = sim.fabric().is_online(&sim.peer("A")?);
     receipt.evidence(
         "A is stopped before J's join; B is the only reachable admin",
-        true,
-        "crash stop",
+        a_online == Some(false),
+        format!("crash stop; fabric online {a_online:?}"),
         at(sim),
     );
 
@@ -471,28 +483,42 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
             *by_kind.entry(kind).or_default() += 1;
         }
     }
-    let requests: usize = by_kind.values().sum();
+    // Only `member_joined` kinds count: the stage and the cause name J's
+    // MemberJoined. `fetch_request` frames are in the detail only.
+    let requests: usize = by_kind
+        .iter()
+        .filter(|(kind, _)| kind.ends_with("member_joined"))
+        .map(|(_, count)| count)
+        .sum();
     receipt.request_delivered(
         "J's MemberJoined reached B after J's join",
         requests > 0,
-        format!("J-to-B request frames delivered, by lane and kind: {by_kind:?}"),
+        format!("J-to-B join frames delivered, by lane and kind: {by_kind:?}"),
         at(sim),
     );
 
     // ADR 0112 "no traffic to A", counted by trace position from A's stop
-    // mark. The pass counts only J's join/redemption-kind frames to A
-    // (`request_kind`): frames J wrote to A in any fate, and refused sends
-    // that carry such bytes. The full J-to-A count (every refused send or
-    // dial by lane class, and every delivered frame) is a note only.
+    // mark. The pass fails closed on ANY Direct-lane frame from J to A: a
+    // frame J wrote to A in any fate, or a refused Direct send that carried
+    // bytes. It does not use `request_kind`, so an encrypted V5 envelope to
+    // A also fails. PubSub `member_joined` frames toward A and lane-less
+    // dials are notes only (see the FOR ENGINEER line in the PR).
     let a_peer = sim.peer("A")?;
     let j_peer = sim.peer("J")?;
-    let written_requests = sim
+    let written: Vec<_> = sim
         .fabric()
         .writes_from_between(&j_peer, offline..usize::MAX)
         .into_iter()
+        .filter(|write| write.lane.dst == a_peer.0)
+        .collect();
+    let direct_written = written
+        .iter()
+        .filter(|write| write.lane.class == LaneClass::Direct)
+        .count();
+    let gossip_written = written
+        .iter()
         .filter(|write| {
-            write.lane.dst == a_peer.0
-                && request_kind(write.lane.class, &write.bytes, &j, &group).is_some()
+            request_kind(write.lane.class, &write.bytes, &j, &group) == Some("pubsub member_joined")
         })
         .count();
     let refused: Vec<_> = sim
@@ -501,10 +527,16 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         .into_iter()
         .filter(|refusal| refusal.dst == a_peer.0)
         .collect();
-    let refused_requests = refused
+    let direct_refused = refused
+        .iter()
+        .filter(|refusal| refusal.class == Some(LaneClass::Direct) && refusal.bytes.is_some())
+        .count();
+    let gossip_refused = refused
         .iter()
         .filter(|refusal| match (refusal.class, refusal.bytes.as_deref()) {
-            (Some(class), Some(bytes)) => request_kind(class, bytes, &j, &group).is_some(),
+            (Some(class), Some(bytes)) => {
+                request_kind(class, bytes, &j, &group) == Some("pubsub member_joined")
+            }
             _ => false,
         })
         .count();
@@ -520,11 +552,12 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         .fabric()
         .delivered_writes_after(&j_peer, &a_peer, offline)
         .len();
-    let redemption_to_a = written_requests + refused_requests;
+    let direct_to_a = direct_written + direct_refused;
     receipt.note(format!(
-        "J to A after A stopped: {redemption_to_a} join/redemption frames \
-         ({written_requests} written, {refused_requests} refused); all traffic: \
-         refused by class {refused_by_class:?}, {delivered_to_a} frames delivered"
+        "J to A after A stopped: {direct_to_a} Direct frames (pass gate; \
+         {direct_written} written, {direct_refused} refused with bytes); notes: \
+         {gossip_written} written and {gossip_refused} refused PubSub member_joined \
+         frames, refused by class {refused_by_class:?}, {delivered_to_a} frames delivered"
     ));
 
     let b_seat = seat(sim, "B", &group, &j).await?;
@@ -547,7 +580,7 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
     if pinned_to_a && !passed && outcome.as_deref() == Some("timed_out") {
         receipt.cause(CAUSE_PINNED, Some(detail), true, at(sim));
     }
-    receipt.finish(FINAL, in_time && redemption_to_a == 0, at(sim));
+    receipt.finish(FINAL, in_time && direct_to_a == 0, at(sim));
     Ok(())
 }
 
