@@ -383,9 +383,10 @@ async fn scenario(sim: &Sim, receipt: &mut Receipt, variant: Variant) -> Result<
     // doc): this row checks the authority, not J's local view.
     let reported_active = redeem_body["join_state"].as_str() == Some("active")
         || redeem_state.as_deref() == Some("active");
-    // A received J's `MemberJoined` and its ban check refused it. On main
-    // there is no ban check, so the counter stays at 0 and this wait ends
-    // at its bound; that is a RED input, not an infra error.
+    // A received J's `MemberJoined` and its ban check refused it. With no
+    // ban check the counter stays at 0 and this wait ends at its bound.
+    // That is a RED input, so it feeds `fixed` and the cause only: an
+    // evidence stage that is not ok makes the receipt INFRA.
     let refused_counted = sim
         .until(
             &format!("{name}: A's ban check refuses J's MemberJoined"),
@@ -395,12 +396,10 @@ async fn scenario(sim: &Sim, receipt: &mut Receipt, variant: Variant) -> Result<
         .await
         .is_ok();
     let refusals = banned_refusals(sim, &group)?;
-    receipt.evidence(
-        &format!("{name}: A refused J's MemberJoined from the stale invite as banned"),
-        refused_counted,
-        format!("member_joined_rejected_banned={refusals}"),
-        at(sim),
-    );
+    receipt.note(format!(
+        "{name}: A's ban check refused J's MemberJoined={refused_counted} \
+         member_joined_rejected_banned={refusals}"
+    ));
 
     // 6: lift the drop so A's answer and any Welcome can reach J.
     block.set(false);
@@ -423,6 +422,8 @@ async fn scenario(sim: &Sim, receipt: &mut Receipt, variant: Variant) -> Result<
             detail,
         )
     } else {
+        // SignedPublic has no group secret to read, so this variant rests
+        // on A's ban-refusal counter and A's row for J.
         (None, None, false, "no group secret".to_string())
     };
     let fixed = refused_counted && end_a_row.as_deref() == Some("banned") && !end_keyed && !j_reads;
