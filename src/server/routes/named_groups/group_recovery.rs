@@ -6742,6 +6742,9 @@ async fn consume_reseat(
     let Ok(live_record) = serde_json::to_vec(&info) else {
         return;
     };
+    let Some(record_digest) = ReseatJournalV1::digest_record(&info) else {
+        return;
+    };
     let live_tree = {
         let tree = state.treekem_groups.read().await.get(group_key).cloned();
         match tree {
@@ -6752,7 +6755,7 @@ async fn consume_reseat(
     let journal = ReseatJournalV1 {
         authorisation: authorisation.clone(),
         invite: invite_link.clone(),
-        record_digest: *blake3::hash(&live_record).as_bytes(),
+        record_digest,
         phase: ReseatPhase::Prepared,
         live_key: group_key.to_string(),
         live_record,
@@ -8075,7 +8078,7 @@ pub(in crate::server) async fn open_staging_journal_for_test(
     let journal = ReseatJournalV1 {
         authorisation,
         invite: String::new(),
-        record_digest: *blake3::hash(&live_record).as_bytes(),
+        record_digest: ReseatJournalV1::digest_record(original).expect("digest"),
         phase: ReseatPhase::Staging,
         live_key: key.to_string(),
         live_record,
@@ -8248,7 +8251,7 @@ mod tests {
         let journal = ReseatJournalV1 {
             authorisation,
             invite: String::new(),
-            record_digest: *blake3::hash(&live_record).as_bytes(),
+            record_digest: ReseatJournalV1::digest_record(&info).expect("digest"),
             phase,
             live_key: info.mls_group_id.clone(),
             live_record,
@@ -11311,7 +11314,7 @@ mod tests {
         let journal = ReseatJournalV1 {
             authorisation,
             invite: String::new(),
-            record_digest: *blake3::hash(&live_record).as_bytes(),
+            record_digest: ReseatJournalV1::digest_record(&info).expect("digest"),
             phase: ReseatPhase::Prepared,
             live_key: key.clone(),
             live_record,
@@ -11692,7 +11695,7 @@ mod tests {
             super::super::AtomicWriteOutcome::Durable
         ));
         journal.live_record = serde_json::to_vec(&info)?;
-        journal.record_digest = *blake3::hash(&journal.live_record).as_bytes();
+        journal.record_digest = ReseatJournalV1::digest_record(&info).expect("digest");
         state
             .group_recovery
             .inner
