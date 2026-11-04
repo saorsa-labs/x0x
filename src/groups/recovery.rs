@@ -76,8 +76,8 @@ thread_local! {
 }
 
 /// Test builds only: sets [`ata_max_links`] for the current thread until
-/// the guard drops (ADR 0109 §10 rows H-S3-s and H-S3-q, "segment length
-/// set by test configuration").
+/// the guard drops (ADR 0109 Validation table, rows H-S3-s and H-S3-q:
+/// "segment length set by test configuration").
 ///
 /// The value is per thread, not per daemon. A W3-H case runs all of its
 /// daemons on the one test thread (`block_on_paused` builds a
