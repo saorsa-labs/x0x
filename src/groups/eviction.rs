@@ -1146,11 +1146,11 @@ pub fn evaluate_row(row: &ObligationRow, ctx: &RowContext<'_>, timing: &S4Timing
             // outcome. A dispatch that reached no verified exchange and
             // returned no definitive routing failure is an unresolved
             // designated route once route resolution has consumed W
-            // (L174), measured on the same suspend-inclusive monotonic
-            // budget as the fallback clock, so a restart or a wall-clock
-            // jump can never flip the split early or late. The fallback
-            // clock itself is untouched: the rank keeps its fallback
-            // time.
+            // (L174), measured on the same monotonic budget as the
+            // fallback clock (CLOCK_MONOTONIC: suspend time is #1581's
+            // open clock gap), so a restart or a wall-clock jump can
+            // never flip the split early or late. The fallback clock
+            // itself is untouched: the rank keeps its fallback time.
             let unresolved = row.first_dispatch_unix_ms.is_some()
                 && row.earliest_handoff_receipt_unix_ms.is_none()
                 && ctx.elapsed >= timing.designated_window;
@@ -2410,6 +2410,13 @@ mod tests {
             .waiting
             .as_ref()
             .is_some_and(|waiting| waiting.remaining_ms.is_some()));
+        assert_eq!(
+            unresolved
+                .waiting
+                .as_ref()
+                .and_then(|waiting| waiting.designated_detail),
+            Some(DesignatedWaitDetail::Rank)
+        );
 
         // The split lands at exactly W of the budget, not after, and one
         // millisecond short of W has not consumed the window.
