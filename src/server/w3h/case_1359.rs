@@ -14,17 +14,30 @@
 //! 3. t=2: J calls `POST /groups/join`. B is the only reachable admin.
 //!    The case waits for the shipped join-result window `T` (120 s TreeKEM,
 //!    600 s GSS; D102) plus margin.
-//! 4. Desired (ADR 0112): by T, B seats J, J is `active` (TreeKEM: J
-//!    installed the group) and J decrypts B's next group message. J sends
-//!    no `MemberJoined` frame to A. A roster seat alone does not pass. The
-//!    "one consumption" check needs S6's consumption root, so the S6 code
-//!    slice adds it, together with the explicit V5 mint.
+//! 4. Desired (ADR 0112): by T, measured from J's join call, B seats J,
+//!    J is `active` (TreeKEM: J installed the group) and J decrypts B's
+//!    next group message. J sends nothing to A after A stops: no delivered
+//!    frame and no refused send or dial. A roster seat alone does not pass.
 //!
 //! Main: a receiver other than the inviter keeps J's `MemberJoined` as
-//! recovery evidence and does not redeem it, and J pins the join result to
-//! the inviter (`validate_join_result_inviter`). So B never seats J, and
-//! J's attempt (pinned to A's key) ends `timed_out` with no usable
-//! membership. The causes record both, each only when the case observes it.
+//! recovery evidence and does not redeem it. J's attempt waits for a result
+//! from inviter A only, and A is offline. So B never seats J, and J's
+//! attempt ends `timed_out` with no usable membership. The case records
+//! each cause only when it observes it.
+//!
+//! The row is red on main and the test asserts RED with both causes. It
+//! carries the #1559 Linux ignore like the other red rows; CI runs it in the
+//! W3-H gate (`--expect ...=RED`).
+//!
+//! The S6 code slice (after David accepts ADR 0112) must:
+//! - mint an explicit V5 invite (V4 stays pinned to its issuer);
+//! - add the "one consumption" check (it needs S6's consumption root);
+//! - switch `request_delivered` to the V5 redemption envelope. This slice
+//!   identifies main's request by lane and kind: a Direct frame whose JSON
+//!   body is J's `member_joined` event, or a PubSub frame that carries it.
+//!   S6 sends an encrypted point-to-point envelope, which this match does
+//!   not see, so without the switch the fixed run scores INFRA;
+//! - flip the assertion and the CI pins to GREEN.
 
 #![cfg(test)]
 
@@ -33,7 +46,7 @@ use super::receipt::{Receipt, Verdict};
 use super::*;
 use crate::groups::invite::SignedInvite;
 use crate::groups::GroupRole;
-use crate::network::sim::LaneClass;
+use crate::network::sim::{LaneClass, Write};
 use anyhow::ensure;
 use base64::Engine as _;
 use serde_json::json;
@@ -48,7 +61,7 @@ const FINAL: &str = "j_usable_member_via_b_with_inviter_a_offline";
 const CAUSE_NOT_REDEEMED: &str =
     "B received J's MemberJoined and did not seat J (only the inviter redeems)";
 const CAUSE_PINNED: &str =
-    "J's attempt pins inviter A's key and ends timed_out with no usable membership";
+    "J's attempt waits for offline inviter A and ends timed_out with no usable membership";
 
 #[derive(Clone, Copy)]
 enum Plane {
@@ -160,6 +173,28 @@ async fn join_outcome(sim: &Sim, group: &str) -> Option<String> {
     body["last_join_outcome"]["outcome"]
         .as_str()
         .map(str::to_string)
+}
+
+/// The lane and kind of a J-to-B frame that is J's join request on main:
+/// a Direct frame (`[stream type][sender agent id (32)][JSON]`) whose body
+/// is J's `member_joined` event, or a PubSub frame that carries J's
+/// `member_joined` event. `None` for any other frame.
+fn request_kind(write: &Write, j: &str) -> Option<&'static str> {
+    match write.lane.class {
+        LaneClass::Direct => {
+            let body = serde_json::from_slice::<serde_json::Value>(write.bytes.get(33..)?).ok()?;
+            let joiner = body["member_agent_id"]
+                .as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case(j));
+            (body["event"] == "member_joined" && joiner).then_some("direct member_joined")
+        }
+        LaneClass::PubSub => {
+            let text = String::from_utf8_lossy(&write.bytes);
+            (text.contains("\"member_joined\"") && text.contains(j))
+                .then_some("pubsub member_joined")
+        }
+        _ => None,
+    }
 }
 
 /// J holds usable membership: B seats J, J reports `active`, and on the
@@ -320,6 +355,7 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
     receipt.setup_done(at(sim));
 
     // t=1: A, the inviter and only issued-invite holder, stops.
+    let offline = sim.fabric().mark_indexed("t1: A stops");
     sim.stop("A", RestartMode::Crash).await?;
     receipt.evidence(
         "A is stopped before J's join; B is the only reachable admin",
@@ -330,6 +366,7 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
 
     // t=2: J joins with B as the only reachable admin.
     let position = sim.fabric().mark_indexed("t2: J joins with A stopped");
+    let join_at = sim.fabric().now();
     let (status, body) = sim
         .api(
             "J",
@@ -339,7 +376,6 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         )
         .await?;
     receipt.note(format!("J join: {status} {body}"));
-    let join_at = sim.fabric().now();
     let pinned = pinned_inviter(sim, &group)?;
     receipt.note(format!("J's attempt pins inviter {pinned:?}"));
     let window = plane.window();
@@ -365,50 +401,44 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         MARGIN.as_secs()
     ));
 
-    // The request: J's MemberJoined for this group reached B after the join.
-    let requests = sim
-        .fabric()
-        .delivered_writes_after(&sim.peer("J")?, &sim.peer("B")?, position)
-        .into_iter()
-        .filter(|(write, _)| matches!(write.lane.class, LaneClass::PubSub | LaneClass::Direct))
-        .filter(|(write, _)| {
-            let text = String::from_utf8_lossy(&write.bytes);
-            text.contains("\"member_joined\"") && text.contains(&j)
-        })
-        .count();
+    // The request, by lane and kind: J's MemberJoined reached B after the
+    // join (see `request_kind`; the S6 slice switches this stage).
+    let mut by_kind = std::collections::BTreeMap::<&str, usize>::new();
+    for (write, _) in
+        sim.fabric()
+            .delivered_writes_after(&sim.peer("J")?, &sim.peer("B")?, position)
+    {
+        if let Some(kind) = request_kind(&write, &j) {
+            *by_kind.entry(kind).or_default() += 1;
+        }
+    }
+    let requests: usize = by_kind.values().sum();
     receipt.request_delivered(
         "J's MemberJoined reached B after A stopped",
         requests > 0,
-        format!("{requests} matching J-to-B frames delivered"),
+        format!("J-to-B request frames delivered, by lane and kind: {by_kind:?}"),
         at(sim),
     );
 
-    // ADR 0112: "no traffic to A". Count J's MemberJoined frames that J
-    // wrote, or tried to send, to A after A stopped.
+    // ADR 0112 "no traffic to A", as `control.rs` counts an offline node:
+    // every J-to-A send or dial the fabric refused, and every J-to-A frame
+    // delivered, after A's stop mark.
     let a_peer = sim.peer("A")?;
     let j_peer = sim.peer("J")?;
-    let is_request = |bytes: &[u8]| {
-        let text = String::from_utf8_lossy(bytes);
-        text.contains("\"member_joined\"") && text.contains(&j)
-    };
-    let written_to_a = sim
-        .fabric()
-        .writes_from_between(&j_peer, position..usize::MAX)
-        .into_iter()
-        .filter(|write| write.lane.dst == a_peer.0 && is_request(&write.bytes))
-        .count();
     let refused_to_a = sim
         .fabric()
-        .refused_from(&j_peer, position)
+        .refused_from(&j_peer, offline)
         .into_iter()
-        .filter(|refusal| {
-            refusal.dst == a_peer.0 && refusal.bytes.as_deref().is_some_and(is_request)
-        })
+        .filter(|refusal| refusal.dst == a_peer.0)
         .count();
-    let traffic_to_a = written_to_a + refused_to_a;
+    let delivered_to_a = sim
+        .fabric()
+        .delivered_writes_after(&j_peer, &a_peer, offline)
+        .len();
+    let traffic_to_a = refused_to_a + delivered_to_a;
     receipt.note(format!(
-        "J's MemberJoined frames to A after A stopped: {written_to_a} written, \
-         {refused_to_a} refused"
+        "J to A after A stopped: {refused_to_a} refused sends or dials, \
+         {delivered_to_a} frames delivered"
     ));
 
     // The wait stops as soon as J is usable, so the elapsed time is when
@@ -468,9 +498,11 @@ async fn run(case: &str, seed: u64, plane: Plane) -> Receipt {
 
 async fn expect(case: &str, seed: u64, plane: Plane) -> Result<()> {
     let receipt = run(case, seed, plane).await;
+    // Main baseline. The S6 code slice flips this, and the CI pins, to GREEN.
     ensure!(
-        receipt.verdict() == Some(Verdict::Green),
-        "{case}: expected GREEN (ADR 0112 S6), got {:?}; RED is the main baseline: {:?}",
+        receipt.verdict() == Some(Verdict::Red)
+            && receipt.named_causes() == [CAUSE_NOT_REDEEMED, CAUSE_PINNED],
+        "{case}: expected RED with both main causes, got {:?} {:?}",
         receipt.verdict(),
         receipt.named_causes()
     );
@@ -478,11 +510,17 @@ async fn expect(case: &str, seed: u64, plane: Plane) -> Result<()> {
 }
 
 /// ADR 0112 `s6_offline_inviter_other_admin_admits`, TreeKEM plane: RED on
-/// `main`, GREEN with S6.
+/// `main` (asserted here), GREEN with S6.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
 )]
 fn w3h_1359_red_s6_offline_inviter_other_admin_admits_treekem() -> Result<()> {
     super::block_on_paused(async move {
@@ -496,11 +534,17 @@ fn w3h_1359_red_s6_offline_inviter_other_admin_admits_treekem() -> Result<()> {
 }
 
 /// ADR 0112 `s6_offline_inviter_other_admin_admits`, GSS plane: RED on
-/// `main`, GREEN with S6.
+/// `main` (asserted here), GREEN with S6.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "#1559: needs the W3-H entropy shim (nextest profile w3h / w3h-gate \
+              --run-ignored all); plain suites run unseeded entropy, which is not an \
+              observation"
 )]
 fn w3h_1359_red_s6_offline_inviter_other_admin_admits_gss() -> Result<()> {
     super::block_on_paused(async move {
