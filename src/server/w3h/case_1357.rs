@@ -443,6 +443,13 @@ const MANUAL_WITHOUT_OBLIGATION: Arm = Arm {
 /// observed by hand-off 6–265 ms after t = 0, and H (11.1–13.1 s) was set
 /// by A's restart sync wait from process start, which the case now waits
 /// out before t = 0.
+///
+/// `unresolved_cause` stays `false` in this arm (#1581 review r7,
+/// finding 8): the L427 typed-cause assertion runs in the manual flow
+/// below (`s4_fallback_rank_manual`), and here A is reachable — the
+/// held paths release at W/2, so D's and E's dispatches against it
+/// reach an exchange before W ends and record `exchange_reached`, never
+/// an unresolved route.
 const LATE_OBSERVATION: Arm = Arm {
     survivors: &["A", "D", "E", "C"],
     hold: Hold::AllPathsUntilHalfW,
@@ -455,6 +462,12 @@ const LATE_OBSERVATION: Arm = Arm {
     ..MANUAL_DURING_WINDOW
 };
 
+/// `unresolved_cause` stays `false` here too (#1581 review r7,
+/// finding 8): A is off the fabric, so D's and E's unresolved routes
+/// toward it are real, but this arm's verdict is the ranked fallback
+/// reaching H — the L427 pass condition is asserted by
+/// `s4_fallback_rank_manual`, which holds A off the fabric through the
+/// same wait.
 const STALLED_A_FALLBACK: Arm = Arm {
     manual: false,
     unresolved_cause: false,
@@ -1608,9 +1621,11 @@ async fn scenario(sim: &mut Sim, arm: Arm, receipt: &mut Receipt) -> Result<()> 
         // ADR 0110 L427: seeing `unresolved_designated_admin` is part
         // of this row's pass condition. A is off the fabric, so D's and
         // E's outbound dispatches against it complete with no exchange
-        // and no definitive failure, and a waiting rank (D until W, E
-        // until W + Δ) exposes the unresolved designated route naming A
-        // through the public status before its fallback time.
+        // and no definitive failure, and a waiting rank (D until its
+        // fallback at W, E until W + Δ) exposes the unresolved
+        // designated route naming A through the public status during W
+        // (L171: the label holds through W, not forever), before its
+        // fallback time.
         if arm.unresolved_cause {
             let timing = timing();
             let deadline = started

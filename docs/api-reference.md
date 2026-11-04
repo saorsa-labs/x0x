@@ -1767,15 +1767,23 @@ every wait. A wait always names its cause; it does not stop silently.
   - `unresolved_designated_admin` — this node's own hand-off dispatch
     against the designated admin completed without an exchange with it
     and without a definitive routing or eligibility failure (ADR 0110
-    §2). The outcome is recorded per designated admin and survives a
-    restart, so the cause shows while the rank still waits (during W;
-    rank 1 and two-admin groups included) and stops when the designation
-    changes. `detail` is `rank` with `remaining_ms`, like the plain
-    wait. A definitive failure is not this cause: it keeps
-    `waiting_for_designated_admin` with `detail:
-    `designated_admin_unsupported`. The manual remove/ban/seal 202 keeps
-    its documented `waiting_for_designated_admin` answer (ADR 0110 §2's
-    ADR 0016 §6 amendment).
+    §2). The outcome is recorded per attempt when the dispatch
+    completes, and the outcome-bearing records (`unresolved`,
+    `unsupported`) survive a restart. The cause shows while the
+    designated window W runs — L171: it "preserves priority through W,
+    not forever" — so a rank whose fallback time is later (W + Δ and
+    on) keeps the plain `waiting_for_designated_admin` for the rest of
+    its stagger wait. The cause also stops when the designation
+    changes or the row reopens or completes; the dispatch is not
+    retried, and a later hand-off receipt does not rewrite the outcome.
+    `detail` is `rank` with `remaining_ms`, like the plain wait. A
+    definitive failure is not this cause: it keeps
+    `waiting_for_designated_admin` with the
+    `designated_admin_unsupported` detail (a verified advert that lacks
+    `eviction_handoff_v1`, or the transport's refusal for that lack).
+    The manual remove/ban/seal 202 keeps its documented
+    `waiting_for_designated_admin` answer (ADR 0110 §2's ADR 0016 §6
+    amendment).
   - `local_committer_ineligible` — this admin may not seal (demoted,
     removed, revoked, left, or its own certificate expired).
   - `waiting_for_durable_intake` — the obligation is not on disk yet; the
