@@ -19287,6 +19287,23 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
 
+            // 6b. #1149: an invite does not end a ban. An invite minted
+            //     before the ban is still in the ledger, and
+            //     `add_member_with_kem` below sets a banned row back to
+            //     Active, so with no check here the banned agent gets its
+            //     seat and the TreeKEM Welcome again. The request and
+            //     approve paths refuse a banned agent the same way. Only
+            //     the unban route ends a ban. Refuse before the invite is
+            //     consumed, so other holders can still use it.
+            if info.is_banned(&member_agent_id) {
+                tracing::info!(
+                    group_id = %resolved_group_key,
+                    member = %LogHexId::agent(&member_agent_id),
+                    "MemberJoined: rejecting a banned agent (#1149)"
+                );
+                return ApplyMetadataResult::REJECTED;
+            }
+
             // 7. Idempotent — if the joiner is already active, a replayed
             //    MemberJoined after the inviter committed the add is a no-op and
             //    must not consume any fresh invite record.
