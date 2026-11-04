@@ -71,6 +71,15 @@ class ShardPlanTest(unittest.TestCase):
             'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node_more'), 's3')
         self.assertFalse(set(rows.values()) & set(assigned.get('s3', [])))
 
+    def test_rm4_variants_share_their_own_shard(self):
+        # The H-S3-rm4 variants run the H-S3-c prefix, so they stay out of
+        # `s3` and share one split shard.
+        assigned = SHARDS.assign(self.names)
+        rm4 = [name for name in self.names if name.startswith('w3h_1356_control_s3_rm4_')]
+        self.assertTrue(rm4)
+        self.assertEqual(sorted(assigned.get('s3-rm4', [])), sorted(rm4))
+        self.assertFalse(set(rm4) & set(assigned.get('s3', [])))
+
     def test_split_parts_run_the_full_rerun_count_together(self):
         # D196: the gate counts exactly RUNS receipts per case, so the
         # parts of a split group add up to RUNS and run the same filter.
