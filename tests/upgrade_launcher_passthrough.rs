@@ -23,9 +23,11 @@ const EXIT_USAGE: i32 = 64;
 /// The stub reports `$0`, its PID, one bracketed line per argument
 /// (`"$@"`, never `$*`, so argument boundaries stay visible), the boot
 /// marker variable and the probe variable, then exits with `exit`.
+/// The log goes to `daemon.log` beside the stub, named from `$0` inside a
+/// quoted expansion, so no path is spliced into the shell code and a
+/// `TMPDIR` with spaces or shell metacharacters cannot split it.
 fn stub_daemon(root: &TempDir, exit: u8) -> std::path::PathBuf {
     let daemon = root.path().join("x0xd");
-    let log = root.path().join("daemon.log");
     let script = format!(
         "#!/bin/sh\n\
          {{\n\
@@ -35,9 +37,8 @@ fn stub_daemon(root: &TempDir, exit: u8) -> std::path::PathBuf {
          \x20 printf 'boot-fd=%s\\n' \"${{X0X_M2_BOOT_FD-unset}}\"\n\
          \x20 printf 'probe=%s\\n' \"${{X0X_PASSTHROUGH_PROBE-unset}}\"\n\
          \x20 exit {exit}\n\
-         }} >{log}\n",
+         }} >\"${{0%/*}}/daemon.log\"\n",
         exit = exit,
-        log = log.display()
     );
     std::fs::write(&daemon, script).unwrap();
     let mut permissions = std::fs::metadata(&daemon).unwrap().permissions();

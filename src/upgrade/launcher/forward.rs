@@ -112,11 +112,14 @@ mod tests {
         let Some(script) = std::env::var_os("X0X_LAUNCHER_FORWARD_FIXTURE") else {
             let dir = tempfile::tempdir().unwrap();
             let marker = dir.path().join("exec-marker");
-            let script = format!("printf '%s' \"$$ $0\" >{}", marker.display());
+            // The marker path reaches the shell as a variable, never as
+            // shell code, so a `TMPDIR` with spaces cannot split it.
+            let script = "printf '%s' \"$$ $0\" >\"$X0X_LAUNCHER_FORWARD_MARKER\"";
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("--exact")
                 .arg(NAME)
                 .env("X0X_LAUNCHER_FORWARD_FIXTURE", script)
+                .env("X0X_LAUNCHER_FORWARD_MARKER", &marker)
                 .env("X0X_LAUNCHER_FORWARD_ARG", "daemon-argument")
                 .spawn()
                 .unwrap();
