@@ -210,9 +210,10 @@ pub enum DesignatedHandoffOutcome {
     /// The attempt completed without such an exchange and without a
     /// definitive current routing or eligibility failure: the designated
     /// route is unresolved (L171). The record holds until the row
-    /// completes or reopens or the designation changes — there is no
-    /// dispatch retry, and a later receipt does not rewrite it — and
-    /// the label itself stops at W.
+    /// completes, terminates or reopens — there is no dispatch retry,
+    /// and a later receipt does not rewrite it. The label stops earlier:
+    /// at W, or when the designation changes (the record names another
+    /// admin), but the record itself stays until the row closes.
     Unresolved,
     /// The designated admin's current verified advert lacks
     /// `eviction_handoff_v1` (§4, L173), or its transport refused the

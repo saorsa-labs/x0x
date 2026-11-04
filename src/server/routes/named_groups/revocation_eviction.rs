@@ -4478,10 +4478,13 @@ fn begin_persist(inner: &mut S4Inner, gate_open: bool) -> Result<PersistSnapshot
     // §5 v3 (Engineer ruling, 4 Nov 2026 08:25 GMT): only the
     // outcome-bearing records ride the extension — a routine
     // `exchange_reached` (every successful designated send) and the
-    // record a completion drops never reach the file — so the store
-    // stays v1/v2 unless some row actually holds an `unresolved` or
-    // `unsupported` outcome, and a rollback to a pre-#1785 binary hits
-    // a memory-only S4 only in that rare case.
+    // record a completion, termination or reopen drops never reach
+    // the file — so the store stays v1/v2 unless some open row holds an
+    // `unresolved` or `unsupported` outcome. Such a row is common while
+    // a designated admin is offline (any send failure but
+    // `RecipientUpgradeRequired` records `unresolved`), and a rollback
+    // to a pre-#1785 binary then runs S4 memory-only until those rows
+    // close; the file stays byte-identical.
     let handoffs: Vec<s4::DesignatedHandoffV3> = rows
         .iter()
         .filter_map(|row| {

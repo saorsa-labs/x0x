@@ -1774,7 +1774,7 @@ every wait. A wait always names its cause; it does not stop silently.
     not forever" — so a rank whose fallback time is later (W + Δ and
     on) keeps the plain `waiting_for_designated_admin` for the rest of
     its stagger wait. The cause also stops when the designation
-    changes or the row reopens or completes; the dispatch is not
+    changes or the row reopens, completes or terminates; the dispatch is not
     retried, and a later hand-off receipt does not rewrite the outcome.
     `detail` is `rank` with `remaining_ms`, like the plain wait. A
     definitive failure is not this cause: it keeps
