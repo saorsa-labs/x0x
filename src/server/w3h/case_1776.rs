@@ -49,10 +49,20 @@
 //! 3. B starts, bootstraps only to O, and redeems the invitation once.
 //! 4. A seats B over the topic mesh. On main, B's local membership never
 //!    turns `active`: its group install waits for a Welcome it cannot
-//!    request. With the fix, the failed fetch triggers a targeted
-//!    capability refresh, the retry goes out on the gossip-inbox leg, and
-//!    B installs the group — proven further by B opening the group store,
-//!    which needs the group key the Welcome carries.
+//!    request — and on an interleaving where the seat event itself never
+//!    reaches B (every mesh envelope to B is opaque to the fault rule and
+//!    every DM is dropped until a binding exists), B never even learns it
+//!    was seated: it re-applies its own `member_joined` while its join
+//!    poll's fetches to the authority die on the instant `AgentNotFound`
+//!    path. With the fix, whichever leg is stuck asks for the authority's
+//!    advert over the targeted control topics — the poll's fetch when it
+//!    cannot address the inviter, and the Welcome fetch before its first
+//!    send and again after any send that still leaves the authority
+//!    unaddressable, whichever `DmError` variant surfaced — so the binding
+//!    lands, the staged result and then the Welcome come back over the
+//!    gossip-inbox leg, and B installs the group; proven further by B
+//!    opening the group store, which needs the group key the Welcome
+//!    carries.
 
 use super::control::{
     create_group, invite, join, local_membership, members, mesh, open_store, try_open_store,
@@ -216,11 +226,15 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     sim.fabric().mark("checkpoint: A seated B");
 
     // The step that never completes on main: B's own seat installs only
-    // with the Welcome, and B's group lookup 404s until then. The budget
-    // covers the blind window's full grind: the first FetchRequest send
-    // only surfaces its recipient_undiscovered after the DM ladder's
-    // internal retries (~100 s here), then the targeted refresh lands the
-    // binding and the next retry delivers.
+    // with the Welcome, and B's group lookup 404s until then. On an
+    // interleaving where the seat event reached B the fetch's own repair
+    // applies: the fix refreshes the authority's advert before the first
+    // send, so the path activates within seconds. Where the seat event
+    // never arrived, the join poll's 2 s fetches repair addressability the
+    // same way and retrieve the authority's staged result, and the Welcome
+    // fetch (binding now held) follows. The budget covers the grind of a
+    // send that burns its whole absolute budget (~70 s here) before the
+    // reactive refresh lands the binding and the retry delivers.
     let b_active = sim
         .until("B reports active membership", secs(180), async |s: &Sim| {
             local_membership(s, "B", &group).await.as_deref() == Some("active")

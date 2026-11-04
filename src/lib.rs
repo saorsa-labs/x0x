@@ -7583,10 +7583,14 @@ struct CapabilityRefreshRegistryState {
     closed: bool,
     next_flight_id: u64,
     inflight: std::collections::HashMap<[u8; 32], CapabilityRefreshEntry>,
-    /// Wall-clock finish time of the last flight per recipient, feeding
-    /// the requester-side cooldown. Zero-duration cooldown (tests,
+    /// Finish time of the last flight per recipient, feeding the
+    /// requester-side cooldown. Kept on the tokio clock so the cooldown
+    /// lives in the same time domain as the convergence window it bounds:
+    /// under a paused test clock (W3-H) a wall-clock stamp would suppress
+    /// re-requests for whole runs of virtual seconds that elapse in
+    /// moments of real time (#1776). Zero-duration cooldown (tests,
     /// pre-cooldown behaviour) disables the check.
-    last_finished: std::collections::HashMap<[u8; 32], std::time::Instant>,
+    last_finished: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
     cooldown: std::time::Duration,
 }
 /// Bounded, recipient-keyed single-flight registry for strict capability
@@ -7742,7 +7746,7 @@ impl CapabilityRefreshRegistry {
                     .retain(|_, finished_at| finished_at.elapsed() < cooldown);
                 state
                     .last_finished
-                    .insert(*recipient_key, std::time::Instant::now());
+                    .insert(*recipient_key, tokio::time::Instant::now());
             }
         }
     }
@@ -7787,14 +7791,11 @@ async fn run_strict_capability_refresh(
         let binding = capability_store.lookup_binding(&recipient);
         // #1776: a flight with neither a durable-ack nor an application-bit
         // requirement still has one — a binding the gossip-inbox DM leg can
-        // actually use. A weaker conjunct would let such a flight return
-        // before publishing anything, so a stale or partial binding (no
-        // gossip inbox, empty KEM key, zeroed machine) would satisfy it.
-        let binding_usable_for_gossip = binding.as_ref().is_some_and(|binding| {
-            binding.machine_id.0 != [0; 32]
-                && binding.capabilities.gossip_inbox
-                && !binding.capabilities.kem_public_key.is_empty()
-        });
+        // actually use (`binding_is_gossip_usable`). A weaker conjunct would
+        // let such a flight return before publishing anything.
+        let binding_usable_for_gossip = binding
+            .as_ref()
+            .is_some_and(dm_capability::binding_is_gossip_usable);
         (require_durable_ack || required_application.is_some() || binding_usable_for_gossip)
             && binding.is_some()
             && (!require_durable_ack || capability_binding_supports_durable_ack(binding.as_ref()))
@@ -17538,6 +17539,20 @@ impl Agent {
     pub async fn refresh_application_capability(&self, recipient: identity::AgentId, bit: u64) {
         self.refresh_strict_dm_capability(recipient, Some(bit), false)
             .await;
+    }
+
+    /// #1776: whether the store holds a binding the gossip-inbox DM leg can
+    /// use for `recipient` — a real machine, the gossip-inbox capability,
+    /// and KEM material to seal to it. A direct send to an agent without
+    /// one cannot be addressed by any retry unaided: it either fails fast
+    /// on the raw-QUIC `AgentNotFound` path or grinds its whole absolute
+    /// send budget and ends `Timeout`, and the two variants must repair
+    /// addressability the same way.
+    pub(crate) fn holds_gossip_usable_dm_binding(&self, recipient: &identity::AgentId) -> bool {
+        self.capability_store()
+            .lookup_binding(recipient)
+            .as_ref()
+            .is_some_and(dm_capability::binding_is_gossip_usable)
     }
 
     /// #1776: ask `recipient` to republish its signed capability advert and

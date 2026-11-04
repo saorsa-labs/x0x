@@ -370,6 +370,19 @@ pub struct CapabilityBinding {
     pub machine_id: MachineId,
 }
 
+/// #1776: whether `binding` can carry a gossip-inbox DM — a real machine,
+/// the gossip-inbox capability, and KEM material to seal to it. The
+/// targeted capability refresh's no-requirement readiness check and the
+/// Welcome fetch's addressability check share this one definition, so a
+/// stale or partial binding (no gossip inbox, empty KEM key, zeroed
+/// machine) satisfies neither.
+#[must_use]
+pub fn binding_is_gossip_usable(binding: &CapabilityBinding) -> bool {
+    binding.machine_id.0 != [0; 32]
+        && binding.capabilities.gossip_inbox
+        && !binding.capabilities.kem_public_key.is_empty()
+}
+
 impl Default for CapabilityStore {
     fn default() -> Self {
         Self::new()

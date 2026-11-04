@@ -50181,7 +50181,9 @@ async fn poll_join_result_until_membership_confirmed(
         // hole: the direct message is unusable until the joiner has resolved
         // the authority's DM key material (routinely still pending here, and
         // the reason a DM-only retry cannot repair the very window it
-        // targets), while the metadata publish needs no key material but only
+        // targets — the fetch below therefore also asks for the authority's
+        // advert over the targeted control topics when it cannot address it,
+        // #1776), while the metadata publish needs no key material but only
         // reaches an authority the mesh already covers.
         //
         // Spawned, not awaited, for the same reason every other named-group
@@ -50318,6 +50320,19 @@ async fn poll_join_result_until_membership_confirmed(
             .send_direct_with_config(&inviter, payload, direct_message_send_config())
             .await
         {
+            // #1776: this poll is the joiner's own repair loop, but a DM
+            // cannot repair the very window it targets (above) — a fresh
+            // joiner behind the advert cadence holds no binding for the
+            // authority, so every fetch dies on the instant
+            // `AgentNotFound` path. The mesh's targeted control topics are
+            // the one leg that still reaches the authority: ask for its
+            // advert whenever the poll cannot address it, and the next
+            // fetch rides the gossip-inbox leg instead of grinding. The
+            // flight registry and per-recipient cooldown bound repeat
+            // requests while the window lasts.
+            if !state.agent.holds_gossip_usable_dm_binding(&inviter) {
+                state.agent.refresh_dm_capability_binding(inviter).await;
+            }
             tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
             tracing::debug!(
                 target: "treekem.trace",
@@ -50565,6 +50580,18 @@ async fn send_welcome_fetch_request(
         detached_send_test_seam::park(&detached_send_test_seam::welcome_fetch_key(welcome_id))
             .await;
     }
+    // #1776, proactive: an unaddressable authority is not a transient gap
+    // the send ladder can climb — a fresh joiner joined the mesh after the
+    // staging authority's last advert beat, and neither the advert cadence
+    // (600 s) nor the identity heartbeat replays onto meshes joined later.
+    // Ask for the advert over the mesh's targeted control topics BEFORE
+    // the send: the request's convergence wait (bounded, and free when a
+    // usable binding already exists) is cheaper than the doomed send it
+    // replaces — a send that cannot address its recipient either fails
+    // fast on `AgentNotFound` or grinds its whole absolute send budget.
+    if !state.agent.holds_gossip_usable_dm_binding(agent_id) {
+        state.agent.refresh_dm_capability_binding(*agent_id).await;
+    }
     let error = match state
         .agent
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request))
@@ -50573,15 +50600,16 @@ async fn send_welcome_fetch_request(
         Ok(_) => return Ok(()),
         Err(error) => error,
     };
-    // #1776: an undiscovered recipient is not only a transient gap — for a
-    // fresh joiner it is structural. It joined the mesh after the staging
-    // authority's last advert beat, and neither the advert cadence (600 s)
-    // nor the identity heartbeat replays onto meshes joined later, so no
-    // retry inside the fetch window can succeed unaided. The membership
-    // event itself reached this node over the gossip mesh, so ask the
-    // authority for a fresh advert over the mesh's targeted control topics;
-    // the retry schedule above re-sends once the binding lands.
-    if matches!(error, x0x::dm::DmError::RecipientUndiscovered(_)) {
+    // #1776, reactive: the same structural gap can surface as either
+    // variant — `RecipientUndiscovered` from the fast `AgentNotFound`
+    // path, or `Timeout` after the send's absolute budget burned — and
+    // the repair must not depend on which one this interleaving produced.
+    // Whenever the failed send leaves the authority still unaddressable,
+    // ask for its advert; the retry schedule above re-sends once the
+    // binding lands.
+    if matches!(error, x0x::dm::DmError::RecipientUndiscovered(_))
+        || !state.agent.holds_gossip_usable_dm_binding(agent_id)
+    {
         state.agent.refresh_dm_capability_binding(*agent_id).await;
     }
     Err(classify_welcome_fetch_send_error(error))
