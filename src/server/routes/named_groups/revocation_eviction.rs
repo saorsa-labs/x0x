@@ -1501,7 +1501,9 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
         // with cause `designated_admin_unsupported`. The current verified
         // advert is read on every pass, so the knowledge survives a
         // restart (whose dispatch never re-runs and whose in-memory set
-        // is empty) and stays fresh through a designation change.
+        // is empty) and follows a designation change. The in-memory set
+        // is still never pruned when an advert later gains the
+        // capability.
         if let (Some(waiting), Some(designation)) =
             (evaluation.waiting.as_mut(), evaluation.designation.as_ref())
         {

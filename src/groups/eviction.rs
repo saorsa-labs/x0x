@@ -1145,16 +1145,15 @@ pub fn evaluate_row(row: &ObligationRow, ctx: &RowContext<'_>, timing: &S4Timing
             // §2: split the designated wait on the hand-off exchange
             // outcome. A dispatch that reached no verified exchange and
             // returned no definitive routing failure is an unresolved
-            // designated route once route resolution has consumed W; the
-            // fallback clock is untouched, so the rank keeps its fallback
-            // time. The seconds-truncated clock can only delay the split,
-            // never advance it.
-            let now_ms = ctx.now_unix.saturating_mul(1000);
-            let unresolved = row.first_dispatch_unix_ms.is_some_and(|dispatch_ms| {
-                row.earliest_handoff_receipt_unix_ms.is_none()
-                    && Duration::from_millis(now_ms.saturating_sub(dispatch_ms))
-                        >= timing.designated_window
-            });
+            // designated route once route resolution has consumed W
+            // (L174), measured on the same suspend-inclusive monotonic
+            // budget as the fallback clock, so a restart or a wall-clock
+            // jump can never flip the split early or late. The fallback
+            // clock itself is untouched: the rank keeps its fallback
+            // time.
+            let unresolved = row.first_dispatch_unix_ms.is_some()
+                && row.earliest_handoff_receipt_unix_ms.is_none()
+                && ctx.elapsed >= timing.designated_window;
             let mut waiting = named_designated(if unresolved {
                 WaitingCause::UnresolvedDesignatedAdmin
             } else {
@@ -2382,18 +2381,18 @@ mod tests {
         // §2 (L171, L174): a waiting rank whose dispatched hand-off reached
         // no verified exchange and returned no definitive routing failure
         // reports the unresolved designated route once route resolution has
-        // consumed W since the first dispatch; the rank keeps its fallback
-        // time. An exchange reached, a dispatch younger than W or no
-        // dispatch at all keeps the plain designated wait.
+        // consumed W of the same monotonic budget the fallback clock uses;
+        // the rank keeps its fallback time. An exchange reached, a budget
+        // younger than W or no dispatch at all keeps the plain designated
+        // wait.
         let timing = S4Timing::default();
         let mut row = sample_row();
         let admins = [id(1), id(2), id(3)];
         let none = BTreeSet::new();
-        let now_ms = 1_000_u64.saturating_mul(1000);
         // Rank 2 (id 3) still waits past W; its fallback time is W + Δ.
         let waiting_rank = timing.designated_window + Duration::from_secs(2);
 
-        row.first_dispatch_unix_ms = Some(now_ms - 19_000);
+        row.first_dispatch_unix_ms = Some(981_000);
         let unresolved = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
         assert_eq!(unresolved.action, RowAction::None);
         assert_eq!(
@@ -2412,51 +2411,44 @@ mod tests {
             .as_ref()
             .is_some_and(|waiting| waiting.remaining_ms.is_some()));
 
-        // The split lands at exactly W since the first dispatch, not after.
-        row.first_dispatch_unix_ms =
-            Some(now_ms - u64::try_from(timing.designated_window.as_millis()).expect("W in ms"));
-        let boundary = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
+        // The split lands at exactly W of the budget, not after, and one
+        // millisecond short of W has not consumed the window.
+        let boundary = evaluate_row(
+            &row,
+            &ctx(3, &admins, &none, timing.designated_window),
+            &timing,
+        );
         assert_eq!(
             boundary.waiting.as_ref().map(|waiting| waiting.cause),
             Some(WaitingCause::UnresolvedDesignatedAdmin)
         );
-        row.first_dispatch_unix_ms = Some(now_ms - 19_000);
+        let short = evaluate_row(
+            &row,
+            &ctx(
+                3,
+                &admins,
+                &none,
+                timing
+                    .designated_window
+                    .saturating_sub(Duration::from_millis(1)),
+            ),
+            &timing,
+        );
+        assert_eq!(
+            short.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
 
         // Any verified exchange reached keeps the plain designated wait.
-        row.earliest_handoff_receipt_unix_ms = Some(now_ms - 1_000);
+        row.earliest_handoff_receipt_unix_ms = Some(999_000);
         let exchanged = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
         assert_eq!(
             exchanged.waiting.as_ref().map(|waiting| waiting.cause),
             Some(WaitingCause::WaitingForDesignatedAdmin)
         );
 
-        // A dispatch younger than W has reached no exchange yet.
-        row.earliest_handoff_receipt_unix_ms = None;
-        row.first_dispatch_unix_ms = Some(now_ms - 5_000);
-        let young = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
-        assert_eq!(
-            young.waiting.as_ref().map(|waiting| waiting.cause),
-            Some(WaitingCause::WaitingForDesignatedAdmin)
-        );
-
-        // One millisecond short of W has not consumed the window, and a
-        // clock behind the dispatch time (rollback) never flips early.
-        row.first_dispatch_unix_ms = Some(
-            now_ms - u64::try_from(timing.designated_window.as_millis()).expect("W in ms") + 1,
-        );
-        let short = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
-        assert_eq!(
-            short.waiting.as_ref().map(|waiting| waiting.cause),
-            Some(WaitingCause::WaitingForDesignatedAdmin)
-        );
-        row.first_dispatch_unix_ms = Some(now_ms + 5_000);
-        let rolled_back = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
-        assert_eq!(
-            rolled_back.waiting.as_ref().map(|waiting| waiting.cause),
-            Some(WaitingCause::WaitingForDesignatedAdmin)
-        );
-
         // A row that has not dispatched yet keeps the plain wait.
+        row.earliest_handoff_receipt_unix_ms = None;
         row.first_dispatch_unix_ms = None;
         let undispatched = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
         assert_eq!(
