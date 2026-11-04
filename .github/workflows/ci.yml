@@ -664,8 +664,8 @@ jobs:
     # `PARTS` in w3h-shards.py). The #1661 welcome-lost row has its own
     # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
     # H-S3-rm4 variants share `s3-rm4.1` and `s3-rm4.2`, and H-S3-rm2 has
-    # its own group (`s3-rm2`). A group is omitted when the tree has no
-    # matching test.
+    # its own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each). A group is
+    # omitted when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
     timeout-minutes: 10

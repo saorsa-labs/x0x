@@ -22,8 +22,9 @@
 //! as `signature` before check 4; an event that adds E is refused before
 //! the §3a rule by the certificate gate
 //! (`src/server/routes/named_groups.rs:16637`). (5) "a revoked owner
-//! certificate for J": revocation is per agent only, and the product
-//! checks it in check 5, not check 6 (`src/groups/recovery.rs:1471`,
+//! certificate for J": revocation is per identity, not per certificate,
+//! and the product checks it in check 5, not check 6
+//! (`src/groups/recovery.rs:1474`,
 //! `removal_mismatch`); the same certificate gate also refuses a revoked
 //! J first, with no typed cause. The row adds no stand-in for either.
 //!
@@ -49,7 +50,11 @@ const CAUSE_RM2: &str = "the row's main observation: M1 applies a forged re-seat
                          refuses one with no or another cause, or its record moves; or M1 \
                          does not apply A's released real seal; `observed` lists each \
                          failing step";
-/// How long M1 has to log its refusal of one forgery.
+/// How long M1 has to log its refusal of one forgery. A window reads every
+/// refusal line from its own start, so a refusal that comes after its
+/// window has expired, or a second refusal of a re-delivered forgery, also
+/// counts in the next window. The row cannot pass by it: the next window
+/// then holds a wrong cause, a failing sub-check.
 const REFUSAL_WAIT: Duration = Duration::from_secs(60);
 /// The refusal line and its cause field, as `LogText` records them.
 const REFUSAL: &str = "reseat_mandate_invalid";
@@ -386,7 +391,7 @@ async fn mandate_refusals(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     let r1_by_o = r1
         .as_ref()
         .is_some_and(|(_, by)| by.eq_ignore_ascii_case(&o_hex));
-    let mut checks = vec![
+    let mut checks: Vec<(String, bool)> = [
         ("a_holds_o_and_m1_mandate_adverts", floor),
         (
             "a_removal_at_r_plus_3",
@@ -403,21 +408,35 @@ async fn mandate_refusals(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             swap.head.state_revision == p.minted.state_revision + 4,
         ),
         ("a_publishes_a_reseat_mandate", real.is_some()),
-    ];
+    ]
+    .into_iter()
+    .map(|(name, ok)| (name.to_string(), ok))
+    .collect();
     let real_json = real
         .as_ref()
         .and_then(|(_, b)| serde_json::from_slice::<Value>(b).ok());
+    checks.push((
+        "a_real_seal_parses_as_json".to_string(),
+        real_json.is_some(),
+    ));
     let (Some((topic, real_bytes)), Some(real_json), Some((r1_hash, _)), true) =
         (real.clone(), real_json, r1, checks.iter().all(|c| c.1))
     else {
-        let failing: Vec<&str> = checks.iter().filter(|c| !c.1).map(|c| c.0).collect();
+        let failing: Vec<&str> = checks
+            .iter()
+            .filter(|c| !c.1)
+            .map(|c| c.0.as_str())
+            .collect();
         let observed = format!(
             "failing {failing:?}; reseat {}; A {}; M1 {}",
             swap.code,
             swap.head.describe(),
             base.describe()
         );
-        // No forgery has reached M1 (no `request_delivered`): INFRA.
+        // `advance` has recorded `o_reached_j`, but no forgery has reached
+        // M1 yet. A failing step here is a false `cause` stage, so the
+        // receipt is INFRA; only a missing re-seat route (404, pre-S3
+        // `main`) is RED, as in H-S3-c3 and H-S3-d3.
         let red = swap.code == StatusCode::NOT_FOUND;
         conclude_row(
             receipt,
@@ -475,15 +494,20 @@ async fn mandate_refusals(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             forgery.cause,
             answer.unchanged
         ));
+        // Each forgery has a distinct cause, so it names its sub-checks.
+        let cause = forgery.cause;
         checks.push((
-            "forgery_reaches_m1_only",
+            format!("{cause}_forgery_reaches_m1_only"),
             answer.to_m1 > 0 && answer.elsewhere == 0,
         ));
-        checks.push(("m1_refuses_with_the_forgery_cause", refused));
-        checks.push(("m1_state_unchanged_after_the_forgery", answer.unchanged));
+        checks.push((format!("m1_refuses_{cause}_forgery_typed"), refused));
+        checks.push((
+            format!("m1_state_unchanged_after_{cause}_forgery"),
+            answer.unchanged,
+        ));
     }
     red |= real_to_m1 > 0 && !applied;
-    checks.push(("m1_applies_a_real_seal_at_r_plus_4", applied));
+    checks.push(("m1_applies_a_real_seal_at_r_plus_4".to_string(), applied));
     receipt.request_delivered(
         "a_reached_m1",
         answers.iter().all(|a| a.to_m1 > 0),
@@ -493,7 +517,11 @@ async fn mandate_refusals(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         ),
         at(sim),
     );
-    let failing: Vec<&str> = checks.iter().filter(|c| !c.1).map(|c| c.0).collect();
+    let failing: Vec<&str> = checks
+        .iter()
+        .filter(|c| !c.1)
+        .map(|c| c.0.as_str())
+        .collect();
     receipt.note(format!("sub-checks {checks:?}"));
     let observed = format!(
         "failing {failing:?}; M1 before {}; M1 at the end {}; A {}",
