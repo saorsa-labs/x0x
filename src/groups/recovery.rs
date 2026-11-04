@@ -2808,7 +2808,13 @@ mod tests {
     /// #1652: a journal an older binary wrote holds the pre-fix digest,
     /// BLAKE3 of plain `serde_json::to_vec`. `staged_result_ready` still
     /// recognises the journalled original against it (fail closed) and a
-    /// genuine staged result stays ready.
+    /// genuine staged result stays ready. The invite base sits one
+    /// revision under the original's head, so the original passes every
+    /// other readiness check: the legacy comparison alone refuses it,
+    /// and this test fails when that comparison is removed. The
+    /// JSON-reloaded original is the restart case: the fresh hash-table
+    /// order defeats the legacy digest (the #1652 defect), while the
+    /// canonical digest this binary journals still recognises it.
     #[test]
     fn staged_result_ready_still_matches_a_legacy_journal_digest() {
         let admin = keypair();
@@ -2818,11 +2824,32 @@ mod tests {
         let mut journal = journal_fixture(&admin, &original);
         journal.record_digest = legacy;
         journal.phase = ReseatPhase::Staging;
+        // One revision under the original's head, so the original is past
+        // the invite base like a staged result (the readiness check reads
+        // the fields, not the signature).
+        journal.authorisation.fields.invite_base_revision = original.state_revision - 1;
         assert!(!journal.staged_result_ready(&original, &subject, true));
+        // A restart reloads the original from the journal's JSON, so both
+        // hash tables come back with fresh seeds. The legacy digest was
+        // over the writing process's iteration order and cannot match the
+        // reloaded record, so this guard alone does not refuse it: across
+        // a restart the caller refuses the original by head
+        // (`is_journalled_original`), and the canonical digest below is
+        // what keeps this guard itself restart-proof.
+        let reloaded =
+            serde_json::from_str::<GroupInfo>(&serde_json::to_string(&original).expect("json"))
+                .expect("round trip");
+        assert!(journal.staged_result_ready(&reloaded, &subject, true));
+        let mut canonical = journal_fixture(&admin, &original);
+        canonical.phase = ReseatPhase::Staging;
+        canonical.authorisation.fields.invite_base_revision = original.state_revision - 1;
+        assert!(!canonical.staged_result_ready(&reloaded, &subject, true));
+        // A genuine staged result stays ready under either journal.
         let mut staged = original.clone();
         staged.name = "staged".to_string();
         staged.seal_commit(&admin, 2_000).expect("seal");
         assert!(journal.staged_result_ready(&staged, &subject, true));
+        assert!(canonical.staged_result_ready(&staged, &subject, true));
     }
 
     #[test]
