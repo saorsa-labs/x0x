@@ -26,6 +26,12 @@
 //! from inviter A only, and A is offline. So B never seats J, and J's
 //! attempt ends `timed_out` with no usable membership. The case records
 //! each cause only when it observes it.
+//! A third cause records Direct frames from J to the stopped A, so a run
+//! where J is admitted but still contacts A reads RED, not INFRA.
+//!
+//! Reads inside a `Sim::until` predicate use `Sim::request` (no barrier);
+//! `Sim::api` opens its own barrier and fails there with "nested barrier".
+//! `probe_decrypt_in_barrier` checks both on every run.
 //!
 //! The row is red on main and the test asserts RED with both causes. It
 //! carries the #1559 Linux ignore like the other red rows; CI runs it in the
@@ -68,6 +74,7 @@ const MARGIN: Duration = Duration::from_secs(60);
 const FINAL: &str = "j_usable_member_via_b_with_inviter_a_offline";
 const CAUSE_NOT_REDEEMED: &str =
     "B received J's MemberJoined and did not seat J (only the inviter redeems)";
+const CAUSE_TRAFFIC_TO_A: &str = "J sent Direct frames to offline A after its stop";
 const CAUSE_PINNED: &str =
     "J's attempt waits for offline inviter A and ends timed_out with no usable membership";
 
@@ -238,37 +245,96 @@ async fn usable(sim: &Sim, plane: Plane, group: &str, j: &str) -> Result<bool> {
     Ok(seated && active && keyed)
 }
 
+/// How a request reaches a node's router.
+#[derive(Clone, Copy)]
+enum Via {
+    /// `Sim::api`: opens its own barrier, so only outside a barrier.
+    Api,
+    /// `Sim::request`: no barrier, for use inside a `Sim::until`
+    /// predicate (which already runs inside one).
+    Request,
+}
+
+async fn call(
+    sim: &Sim,
+    via: Via,
+    label: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<(StatusCode, serde_json::Value)> {
+    match via {
+        Via::Api => sim.api(label, Method::POST, path, Some(body)).await,
+        Via::Request => sim.request(label, Method::POST, path, Some(body)).await,
+    }
+}
+
 /// B encrypts the probe; whether J recovers it.
-async fn j_decrypts_b(sim: &Sim, group: &str) -> Result<(bool, String)> {
-    let (status, cipher) = sim
-        .api(
-            "B",
-            Method::POST,
-            &format!("/groups/{group}/secure/encrypt"),
-            Some(json!({"payload_b64": BASE64.encode(PROBE)})),
-        )
-        .await?;
+async fn j_decrypts_b(sim: &Sim, via: Via, group: &str) -> Result<(bool, String)> {
+    let (status, cipher) = call(
+        sim,
+        via,
+        "B",
+        &format!("/groups/{group}/secure/encrypt"),
+        json!({"payload_b64": BASE64.encode(PROBE)}),
+    )
+    .await?;
     if !status.is_success() {
         return Ok((false, format!("B encrypt: {status} {cipher}")));
     }
-    let (status, body) = sim
-        .api(
-            "J",
-            Method::POST,
-            &format!("/groups/{group}/secure/decrypt"),
-            Some(json!({
-                "ciphertext_b64": cipher["ciphertext_b64"],
-                "nonce_b64": cipher["nonce_b64"],
-                "secret_epoch": cipher["secret_epoch"],
-            })),
-        )
-        .await?;
+    let (status, body) = call(
+        sim,
+        via,
+        "J",
+        &format!("/groups/{group}/secure/decrypt"),
+        json!({
+            "ciphertext_b64": cipher["ciphertext_b64"],
+            "nonce_b64": cipher["nonce_b64"],
+            "secret_epoch": cipher["secret_epoch"],
+        }),
+    )
+    .await?;
     let ok = status.is_success()
         && body["payload_b64"]
             .as_str()
             .and_then(|payload| BASE64.decode(payload).ok())
             .is_some_and(|payload| payload == PROBE);
     Ok((ok, format!("J decrypt: {status} {body}")))
+}
+
+/// Forced-path check of the pass path's decrypt read, run on every
+/// scenario (on main the pass path never reaches it). Inside one barrier,
+/// the `Via::Request` form must complete, and the `Via::Api` form must
+/// fail with "nested barrier" (the reason the wait uses `Via::Request`).
+/// A nested-barrier error returns before it touches the gate, so the probe
+/// leaves the barrier state unchanged.
+async fn probe_decrypt_in_barrier(sim: &Sim, group: &str) -> Result<String> {
+    let what = "decrypt probe inside a barrier";
+    let mut seen = Observations::default();
+    let mut nested = None;
+    let mut inside = None;
+    sim.until(what, Duration::from_secs(5), async |s: &Sim| {
+        nested = Some(
+            j_decrypts_b(s, Via::Api, group)
+                .await
+                .err()
+                .map(|e| format!("{e:#}")),
+        );
+        inside = seen.observe(j_decrypts_b(s, Via::Request, group)).await;
+        true
+    })
+    .await?;
+    seen.verify(what)?;
+    let nested = nested.flatten();
+    ensure!(
+        nested
+            .as_deref()
+            .is_some_and(|e| e.contains("nested barrier")),
+        "INFRA: {what}: the Api form did not report a nested barrier: {nested:?}"
+    );
+    let (_, detail) = inside.context("decrypt probe made no read")?;
+    Ok(format!(
+        "Request form completed ({detail}); Api form: {nested:?}"
+    ))
 }
 
 async fn wait_for(
@@ -430,7 +496,7 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         if !ready {
             return false;
         }
-        match seen.observe(j_decrypts_b(s, &group)).await {
+        match seen.observe(j_decrypts_b(s, Via::Request, &group)).await {
             Some((decrypted, detail)) => {
                 decrypt_detail = detail;
                 decrypted
@@ -460,9 +526,11 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         })
         .await?;
         seen.verify(what)?;
-        let (_, detail) = j_decrypts_b(sim, &group).await?;
+        let (_, detail) = j_decrypts_b(sim, Via::Api, &group).await?;
         decrypt_detail = detail;
     }
+    let probe = probe_decrypt_in_barrier(sim, &group).await?;
+    receipt.note(format!("decrypt probe inside a barrier: {probe}"));
     receipt.note(format!(
         "usable-and-decrypt wait {} {} ms after the join (T {} s); outcome wait \
          ended at {} us",
@@ -553,12 +621,13 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         .delivered_writes_after(&j_peer, &a_peer, offline)
         .len();
     let direct_to_a = direct_written + direct_refused;
-    receipt.note(format!(
+    let to_a = format!(
         "J to A after A stopped: {direct_to_a} Direct frames (pass gate; \
          {direct_written} written, {direct_refused} refused with bytes); notes: \
          {gossip_written} written and {gossip_refused} refused PubSub member_joined \
          frames, refused by class {refused_by_class:?}, {delivered_to_a} frames delivered"
-    ));
+    );
+    receipt.note(to_a.clone());
 
     let b_seat = seat(sim, "B", &group, &j).await?;
     let j_state = local_membership(sim, "J", &group).await;
@@ -573,6 +642,9 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
     let b_seated = matches!(b_seat, Some((_, true, _)));
     if !b_seated && requests > 0 {
         receipt.cause(CAUSE_NOT_REDEEMED, Some(detail.clone()), true, at(sim));
+    }
+    if direct_to_a > 0 {
+        receipt.cause(CAUSE_TRAFFIC_TO_A, Some(to_a), true, at(sim));
     }
     let pinned_to_a = pinned
         .as_deref()
