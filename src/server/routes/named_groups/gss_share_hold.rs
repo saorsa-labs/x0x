@@ -178,8 +178,10 @@ struct HeldRemoval {
 
 /// #1775 (claude review round 11, Engineer ruling 4 Nov): the secret of
 /// a later epoch that a wait's own share displaced — at the share arm's
-/// replace path, or at a superseded install that drops the later key
-/// with the epoch. One slot per group: a live record keeps it (round 12
+/// replace path, or at a promoted or superseded install whose held
+/// chain's raising step was authored by the secret's sender (Engineer
+/// ruling on the review at 5e389451: any other later secret is dropped
+/// there, as on main). One slot per group: a live record keeps it (round 12
 /// — the earlier displacement re-delivers first), and a dead one goes.
 /// The record re-delivers through the ordinary share path (a fresh
 /// envelope sealed to this node) once the head commits the epoch of the
@@ -202,8 +204,8 @@ pub(super) struct ParkedSecret {
 }
 
 /// The hold file format version. v2 (ADR 0085, #1775 review round 12)
-/// adds the optional `share_sender` (#1766), `keyless` (#1775) and
-/// `parked` (#1775 round 11) fields. A binary that knows only v1 refuses
+/// adds the optional `keyless` (#1775) and `parked` (#1775 round 11)
+/// fields. v1 already carries the optional `share_sender` (#1766). A binary that knows only v1 refuses
 /// a v2 file (`decode_hold_file`), so it never loads one, drops the new
 /// state in memory and re-saves without it: a downgrade keeps the file
 /// intact and its group held instead.
@@ -217,9 +219,8 @@ struct HoldFile {
     removals: Vec<HeldRemoval>,
     #[serde(default)]
     exclusions: Vec<ExclusionHold>,
-    /// #1766: a v1 file carries none, and it holds nothing then. A v2
-    /// file without it holds nothing too; an older reader never sees a
-    /// v2 file (see [`HOLD_FILE_VERSION`]).
+    /// #1766: optional in v1 and v2. A file without it holds nothing
+    /// for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     share_sender: Option<ShareSender>,
     /// #1775: a v1 file carries no mark, so the mark holds nothing
@@ -1234,15 +1235,15 @@ pub(super) async fn note_keyless_commit(
         actor: actor_hex.to_ascii_lowercase(),
         head: head.to_string(),
     };
-    let changed = {
+    let previous = {
         let mut lot = state
             .gss_share_holds
             .keyless
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        lot.insert(group_key.to_string(), mark.clone()) != Some(mark)
+        lot.insert(group_key.to_string(), mark.clone())
     };
-    if !changed {
+    if previous.as_ref() == Some(&mark) {
         return true;
     }
     let result = persist(state, group_key).await;
@@ -1263,8 +1264,10 @@ pub(super) async fn note_keyless_commit(
                 "#1775 keyless mark not saved; the keyless install does not proceed: {error}"
             );
             // Memory matches the disk again (the file keeps the hold the
-            // park before this wrote, without the mark): a retry that
-            // installs re-writes the mark before its head.
+            // park before this wrote, and the earlier mark if any): a
+            // retry that installs re-writes the mark before its head.
+            // The earlier mark is restored, not dropped (claude review
+            // at 5e389451).
             drop(unsaved);
             {
                 let mut lot = state
@@ -1272,7 +1275,16 @@ pub(super) async fn note_keyless_commit(
                     .keyless
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                lot.remove(group_key);
+                if lot.get(group_key) == Some(&mark) {
+                    match previous {
+                        Some(previous) => {
+                            lot.insert(group_key.to_string(), previous);
+                        }
+                        None => {
+                            lot.remove(group_key);
+                        }
+                    }
+                }
             }
             false
         }
@@ -1307,8 +1319,9 @@ pub(super) async fn forget_keyless_commit(
 
 /// #1775 (claude review round 11): park the later-epoch secret that
 /// `info` holds — the share a waiting transition's own replace just
-/// displaced, or the later key a superseded install drops with its
-/// epoch. `waits_epoch` is the epoch of the wait whose own share
+/// displaced, or the later key a promoted or superseded install drops
+/// when the held chain's raising step was authored by that key's sender
+/// (the install checks the author). `waits_epoch` is the epoch of the wait whose own share
 /// displaced it: the record re-delivers only once a head commits that
 /// epoch. A secret with no recorded sender (a crash between the key
 /// write and its record write) has no provenance to re-deliver, so it
@@ -1322,12 +1335,12 @@ pub(super) async fn forget_keyless_commit(
 /// displacing share retries instead (the same rule as
 /// [`note_keyless_commit`]).
 ///
-/// One slot per group. A record whose epoch the group's installed
-/// secrets have not reached — an earlier displacement, which re-delivers
-/// first — stays, and the newer displaced value keeps the disclosed loss
-/// handling above, with a warning (round 12: no later park overwrites a
-/// live record). A record the installed epoch already passed is dead,
-/// and the newer park replaces it.
+/// One slot per group. A live record — no head commits its epoch, and
+/// its epoch is at or above the newly displaced one — stays, and the
+/// newer displaced value keeps the disclosed loss handling above, with
+/// a warning (no later park overwrites a live record). A record that a
+/// head committed past, or whose epoch the installed secret passed, is
+/// dead, and the newer park replaces it.
 pub(super) async fn park_displaced_secret(
     state: &AppState,
     group_key: &str,
@@ -1353,14 +1366,23 @@ pub(super) async fn park_displaced_secret(
         secret,
         waits_epoch,
     };
-    let changed = {
+    let previous = {
         let mut lot = state
             .gss_share_holds
             .parked
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A record is live while no head commits its epoch and no
+        // installed secret passed it. The newer park replaces only a
+        // dead record, or one of a lower epoch that the installed
+        // secret passed (claude review at 5e389451: an equal-epoch park
+        // of another value no longer overwrites a live record).
+        let committed = x0x::groups::crypto_exclusion::committed_secret_epoch(info);
         if let Some(kept) = lot.get(group_key) {
-            if kept.secret_epoch > parked.secret_epoch {
+            if kept != &parked
+                && kept.secret_epoch >= parked.secret_epoch
+                && kept.secret_epoch > committed
+            {
                 tracing::warn!(
                     group_id = %LogHexId::group(group_key),
                     kept_epoch = kept.secret_epoch,
@@ -1371,9 +1393,9 @@ pub(super) async fn park_displaced_secret(
                 return true;
             }
         }
-        lot.insert(group_key.to_string(), parked.clone()) != Some(parked)
+        lot.insert(group_key.to_string(), parked.clone())
     };
-    if !changed {
+    if previous.as_ref() == Some(&parked) {
         return true;
     }
     let result = persist(state, group_key).await;
@@ -1394,9 +1416,10 @@ pub(super) async fn park_displaced_secret(
                 "#1775 parked secret not saved; the replacing secret does not install: {error}"
             );
             // Memory matches the disk again (the file keeps whatever it
-            // held, without this record): the displaced value stays
-            // installed, and a retry that displaces it again re-parks it
-            // before the replacing secret installs.
+            // held, without this record, so the record this park replaced
+            // comes back): the displaced value stays installed, and a
+            // retry that displaces it again re-parks it before the
+            // replacing secret installs.
             drop(unsaved);
             {
                 let mut lot = state
@@ -1404,7 +1427,16 @@ pub(super) async fn park_displaced_secret(
                     .parked
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                lot.remove(group_key);
+                if lot.get(group_key) == Some(&parked) {
+                    match previous {
+                        Some(previous) => {
+                            lot.insert(group_key.to_string(), previous);
+                        }
+                        None => {
+                            lot.remove(group_key);
+                        }
+                    }
+                }
             }
             false
         }
@@ -1449,9 +1481,11 @@ pub(super) fn parked_secret_reinstalls(
         && committed >= parked.waits_epoch
 }
 
-/// Drop the group's parked secret (it re-delivered, or it is stale);
-/// writes the file when one went.
-pub(super) async fn forget_parked_secret(state: &AppState, group_key: &str) {
+/// Drop the group's parked secret `read` (it re-delivered, or it is
+/// stale); writes the file when one went. A record that a concurrent
+/// park put in the slot after the caller read `read` stays (claude
+/// review at 5e389451).
+pub(super) async fn forget_parked_secret(state: &AppState, group_key: &str, read: &ParkedSecret) {
     ensure_loaded(state).await;
     let removed = {
         let mut lot = state
@@ -1459,7 +1493,7 @@ pub(super) async fn forget_parked_secret(state: &AppState, group_key: &str) {
             .parked
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        lot.remove(group_key).is_some()
+        lot.get(group_key) == Some(read) && lot.remove(group_key).is_some()
     };
     if removed {
         persist_logged(state, group_key).await;
@@ -2477,7 +2511,16 @@ mod tests {
             Some(3),
             "no recorded sender: nothing parks"
         );
-        forget_parked_secret(&state, &group_key).await;
+        let kept = parked_secret(&state, &group_key).expect("the epoch-3 record");
+        let mut other = kept.clone();
+        other.secret_epoch = 9;
+        forget_parked_secret(&state, &group_key, &other).await;
+        assert_eq!(
+            parked_secret(&state, &group_key).as_ref(),
+            Some(&kept),
+            "a forget of a record the slot no longer holds removes nothing"
+        );
+        forget_parked_secret(&state, &group_key, &kept).await;
         assert!(
             parked_secret(&state, &group_key).is_none(),
             "the record goes on forget"
@@ -2527,11 +2570,12 @@ mod tests {
         );
     }
 
-    /// #1775 (claude review round 12): the one parked slot keeps a live
-    /// record — an earlier displacement whose epoch the group has not
-    /// reached re-delivers first, so a later park takes nothing. A record
-    /// the installed epoch already passed is dead, and the slot goes to
-    /// the newer displacement.
+    /// #1775 (claude review round 12 and the review at 5e389451): the
+    /// one parked slot keeps a live record — no head commits its epoch,
+    /// and it is at or above the newly displaced epoch — so a later park
+    /// of a lower or an equal epoch takes nothing. A record that a head
+    /// committed past is dead, and the slot goes to the newer
+    /// displacement.
     #[tokio::test]
     async fn a_live_parked_record_keeps_the_one_slot() {
         let (state, _dir) = test_state().await;
@@ -2559,17 +2603,31 @@ mod tests {
         let kept = parked_secret(&state, &group_key).expect("a record is kept");
         assert_eq!(kept.secret_epoch, 5, "the live record keeps the slot");
         assert_eq!(kept.sender, b);
-        // The group's installed epoch passes 5: the kept record is dead,
-        // and the next displacement of that epoch takes the slot.
+        // Another value of the same epoch 5 does not overwrite the live
+        // record either.
         note_share_sender(&state, &group_key, &parent, 5, &c, &c_key).await;
         let mut again = parent.clone();
         again.secret_epoch = 5;
         again.shared_secret = Some(c_key.to_vec());
         assert!(park_displaced_secret(&state, &group_key, &again, 4).await);
+        let kept = parked_secret(&state, &group_key).expect("a record is kept");
+        assert_eq!(
+            (kept.secret_epoch, kept.sender.as_str()),
+            (5, b.as_str()),
+            "an equal-epoch park keeps the live record"
+        );
+        // A head commits epoch 5: the kept record is dead, and the next
+        // displacement takes the slot.
+        let committed_five = gss_info_at_head(5, Some(b_key));
+        note_share_sender(&state, &group_key, &committed_five, 6, &c, &c_key).await;
+        let mut at_six = committed_five.clone();
+        at_six.secret_epoch = 6;
+        at_six.shared_secret = Some(c_key.to_vec());
+        assert!(park_displaced_secret(&state, &group_key, &at_six, 5).await);
         let kept = parked_secret(&state, &group_key).expect("the slot refills");
         assert_eq!(
             (kept.secret_epoch, kept.sender.as_str()),
-            (5, c.as_str()),
+            (6, c.as_str()),
             "a dead record yields the slot to the newer displacement"
         );
     }
@@ -2621,12 +2679,55 @@ mod tests {
             newer,
             "the newer-version file is byte-identical after the refused write"
         );
-        // The v1 file loaded its exclusion: a committed secret of its
-        // epoch releases the hold, which proves the file was read.
+        // The v1 file loaded its exclusion; a committed secret of its
+        // epoch then releases the hold.
+        assert_eq!(
+            super::test_seam::held_exclusions(&state, &v1_key),
+            1,
+            "the v1 file's exclusion is in memory: the file was read"
+        );
         let settled = gss_info_at_head(2, Some(foreign));
         assert!(
             !withholds(&state, &v1_key, &settled),
             "the v1 file loaded: its hold answers the group's state"
+        );
+    }
+
+    /// #1775 review round 12 (ADR 0085, claude review at 5e389451): a
+    /// v1 file that this binary loads and then writes again becomes a
+    /// v2 file, and its holds stay in it.
+    #[tokio::test]
+    async fn a_v1_hold_file_rewrites_as_v2_and_keeps_its_holds() {
+        let (state, _dir) = test_state().await;
+        let group_key = "h".to_string();
+        let path = super::test_seam::hold_path_for(&state, &group_key);
+        std::fs::create_dir_all(path.parent().expect("the hold dir has a parent"))
+            .expect("make the hold dir");
+        std::fs::write(
+            &path,
+            "{\"version\":1,\"group_key\":\"h\",\"exclusions\":\
+             [{\"parent_state_hash\":\"p\",\"secret_epoch\":2,\
+             \"actors\":[\"aa\"]}]}",
+        )
+        .expect("write the v1 file");
+        ensure_loaded(&state).await;
+        // A second actor's wait on the same parent and epoch merges into
+        // the loaded hold and writes the file.
+        hold_exclusion(&state, &group_key, "p", 2, &"bb".repeat(32)).await;
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("the file stays"))
+                .expect("the rewritten file decodes");
+        assert_eq!(written["version"], 2, "the rewrite carries version 2");
+        let exclusions = written["exclusions"]
+            .as_array()
+            .expect("the rewrite keeps its exclusions");
+        assert_eq!(exclusions.len(), 1, "the v1 hold is kept, merged");
+        assert_eq!(exclusions[0]["parent_state_hash"], "p");
+        assert_eq!(exclusions[0]["secret_epoch"], 2);
+        assert_eq!(
+            exclusions[0]["actors"].as_array().map(Vec::len),
+            Some(2),
+            "both waiting actors are kept"
         );
     }
 
@@ -2782,10 +2883,13 @@ mod tests {
             .get(&group_key)
             .cloned()
             .expect("the group's holds");
+        // The second actor's own epoch-2 hold (parent "q"): the probe
+        // does not depend on which epoch-2 hold the cap's `min_by_key`
+        // kept.
         let at_two = held
             .iter()
-            .find(|hold| hold.secret_epoch == 2)
-            .expect("the epoch-2 hold survived the cap");
+            .find(|hold| hold.secret_epoch == 2 && hold.parent_state_hash == "q")
+            .expect("the second actor's epoch-2 hold survived the cap");
         assert!(
             hold_live(
                 &state,

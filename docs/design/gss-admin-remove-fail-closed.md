@@ -353,23 +353,17 @@ except citations explicitly marked as resolving at
   baseline it was
   `if secret_epoch < info.secret_epoch || (secret_epoch == info.secret_epoch &&
   info.shared_secret.is_some())` (statement `:5831-5835`; the conjunct is `:5832`), whose
-  own doc comment (`:5827-5830`) states the intent. #1766/#1771 added a third conjunct —
-  the equal-epoch arm refuses only when the share may not replace the installed
-  secret that no commit pins (`!gss_share_hold::replaces_uncommitted_secret`) — and #1775 widened
-  that replace to a secret no verified commit pins and a keyless commit's mark. The 3 Nov
-  #1775 review round gave the strict arm the same single exit: a share of an earlier epoch
-  installs only when it may replace the installed secret, which is then one of a later
-  epoch that no commit pins. A foreign later share so cannot strand a waiting frame; every
-  other earlier-epoch share stays refused. The 4 Nov round completes that recovery: the
-  displaced later secret parks in the hold file and re-delivers through the ordinary
-  share path once a head commits the displacing wait's epoch, so the later rotation's
-  own commit lands with its key and an honest reordering loses no key. The 4 Nov
-  round-12 review narrows the mark's unprovable shape: when the retained log cannot
-  prove the mark's head, only the mark's own actor's share may replace — the one
-  share that settles it — while a proved mark keeps the epoch's any-different-sender
-  rule. (The
-  parked-removal replace half that #1775 also added stays dormant until a fenced
-  `gss_removal_waits_for_share` change lands, per that PR.) The strict `<` clear and
+  own doc comment (`:5827-5830`) states the intent. #1766/#1771 and #1775 add one
+  exit to both arms: a share installs over an installed secret only when
+  `gss_share_hold::replaces_uncommitted_secret` allows it. That is, no verified commit
+  pins the installed secret (a later epoch than the head commits, or the epoch of a
+  keyless commit's mark), and a verified transition of the share's epoch still waits for
+  its own actor. A displaced later secret parks in the hold file. It re-delivers through
+  the ordinary share path when a head commits the displacing wait's epoch. A promoted or
+  superseded install parks a later secret only when the held step that raises to its
+  epoch was authored by its sender; it drops any other later secret, as before #1775.
+  The parked-removal half of the replace rule has no effect until the fenced
+  `gss_removal_waits_for_share` change lands (#1775 item 1). The strict `<` clear and
   the equal-epoch refuse survive these changes. F1 does not change the guard — it is cited
   at the baseline, and its comment names only a *prior `MemberBanned` commit*, because
   remove had no GSS rotation to
