@@ -7592,6 +7592,15 @@ impl CapabilityRefreshPurpose {
     /// answers a flight of this purpose. Every flight asks for the full
     /// signed advert, so a requirement flight also answers addressability;
     /// an addressability flight never answers a requirement.
+    ///
+    /// This holds for the cooldown too, including a requirement flight
+    /// that ended at its convergence deadline with no advert at all: for
+    /// [`CAPABILITY_REFRESH_COOLDOWN`] (10 s) after it, an addressability
+    /// request to the same recipient is refused (`Unavailable`) and its
+    /// caller proceeds unaided. That is deliberate. The recipient did not
+    /// answer a request moments ago, so a second request inside the window
+    /// is unlikely to change the answer, and the Welcome fetch and the
+    /// join-result poll retry well past 10 s.
     fn answered_by(self) -> &'static [Self] {
         match self {
             Self::Addressability => &[Self::Addressability, Self::Requirement],
@@ -11307,17 +11316,26 @@ impl Agent {
         // whose advert we simply have not heard yet must not be reported as
         // incapable, but the refusal must still be bounded — the whole point
         // of the 409 is that it is fast and deterministic, never a hang.
-        if (config.require_durable_app_ack
+        //
+        // The refresh runs only for a real requirement (durable ACK or the
+        // payload's application bit). `require_payload_capability` fails
+        // only when `required_for_payload` names a bit, so the last
+        // conjunct is defensive: it keeps this gate from starting an
+        // addressability flight (#1776) if those two ever diverge.
+        let required_application =
+            dm::CapabilityRegistry::required_for_payload(&payload).map(|(bit, _)| bit);
+        if ((config.require_durable_app_ack
             && stored_cap.is_none()
             && !capability_binding_supports_durable_ack(advert_binding.as_ref()))
             || self
                 .capability_store
                 .require_payload_capability(to, &payload)
-                .is_err()
+                .is_err())
+            && (config.require_durable_app_ack || required_application.is_some())
         {
             self.refresh_strict_dm_capability(
                 *to,
-                dm::CapabilityRegistry::required_for_payload(&payload).map(|(bit, _)| bit),
+                required_application,
                 config.require_durable_app_ack,
             )
             .await;
@@ -30280,6 +30298,19 @@ mod tests {
         assert_eq!(fresh.len(), 2);
         release_tx.send_replace(true);
         drain(fresh).await;
+    }
+
+    /// #1776 review round 2: the strict-send gate refreshes only for a real
+    /// requirement. A payload with no application prefix can never fail
+    /// `require_payload` (even against a registry that supports nothing),
+    /// so the gate never starts an addressability flight for it.
+    #[test]
+    fn a_plain_payload_never_fails_the_application_gate() {
+        let plain = b"plain direct message".to_vec();
+        assert!(dm::CapabilityRegistry::required_for_payload(&plain).is_none());
+        assert!(dm::CapabilityRegistry::default()
+            .require_payload(&plain)
+            .is_ok());
     }
 
     /// #1776 review (finding 5): a refresh with no durable-ACK and no

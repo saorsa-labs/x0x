@@ -80,7 +80,26 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 const DM_TOPIC_MARKER: &[u8] = b"x0x/dm/v1/";
-const TARGETED_MARKER: &[u8] = b"targeted";
+/// The targeted capability refresh carriers (ADR 0030 §3), matched by their
+/// exact wire names: the Critical request and response topics, and the
+/// domain prefix of the warm request copy that rides the steady advert
+/// topic. These are the only wire strings that contain "targeted", so this
+/// is the same set of frames the earlier `b"targeted"` substring passed,
+/// but no unrelated frame can pass Fault 1 by a partial name match.
+const TARGETED_CARRIERS: [&[u8]; 3] = [
+    crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC.as_bytes(),
+    crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.as_bytes(),
+    crate::dm_capability_service::WARM_TARGETED_REQUEST_DOMAIN,
+];
+
+fn is_targeted_capability_carrier(write: &Write) -> bool {
+    TARGETED_CARRIERS
+        .iter()
+        .any(|marker| contains(&write.bytes, marker))
+}
+
+/// Virtual-time budget for B to report active membership after the join.
+const B_ACTIVE_BUDGET: Duration = secs(180);
 
 fn is_dm(write: &Write) -> bool {
     match write.lane.class {
@@ -172,7 +191,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             && write.lane.class == LaneClass::PubSub
             && !is_dm(write)
             && !contains(&write.bytes, &topic_bytes)
-            && !contains(&write.bytes, TARGETED_MARKER)
+            && !is_targeted_capability_carrier(write)
         {
             Fault::Drop
         } else {
@@ -236,9 +255,11 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     // send that burns its whole absolute budget (~70 s here) before the
     // reactive refresh lands the binding and the retry delivers.
     let b_active = sim
-        .until("B reports active membership", secs(180), async |s: &Sim| {
-            local_membership(s, "B", &group).await.as_deref() == Some("active")
-        })
+        .until(
+            "B reports active membership",
+            B_ACTIVE_BUDGET,
+            async |s: &Sim| local_membership(s, "B", &group).await.as_deref() == Some("active"),
+        )
         .await
         .is_ok();
     if !b_active {
@@ -249,7 +270,8 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         // daemon's own WARN trail names where the joiner stalled — the
         // observation is otherwise blind (every API read blocks on the
         // same lock).
-        let since_join = sim.fabric().now() - secs(181);
+        // One second past the budget, so the trail starts before the join.
+        let since_join = sim.fabric().now() - (B_ACTIVE_BUDGET + secs(1));
         let mut trail: Vec<(String, usize, f64, f64)> = Vec::new();
         for log in sim.logs_containing(&[]) {
             if log.at < since_join {
