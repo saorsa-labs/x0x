@@ -1628,7 +1628,9 @@ pub(super) fn share_sent_by(
 /// (#1775 item 4). The waiting transition keeps a secret only from its
 /// own actor, so without this its actor's share could never install.
 /// Once the actor's secret is in, or a commit pins the value, no other
-/// share replaces it. Call [`ensure_loaded`] first.
+/// share replaces it. A hold or a parked removal replaces only for an
+/// epoch above the one the head commits (claude review at a1fa57cd).
+/// Call [`ensure_loaded`] first.
 pub(super) fn replaces_uncommitted_secret(
     state: &AppState,
     group_key: &str,
@@ -1638,39 +1640,48 @@ pub(super) fn replaces_uncommitted_secret(
 ) -> bool {
     let sent = installed_share_sender(state, group_key, info);
     let by_hash = head_index(info);
+    // #1775 (claude review at a1fa57cd): a hold or a parked removal
+    // replaces only for an epoch above the one the head commits. A hold
+    // can outlive its pin (a sibling commit committed its epoch, then a
+    // failed write and a restart reload it); its share must not install
+    // over the key that the head commits. A keyless commit's epoch is
+    // committed with no key, so only the mark's own branch below admits
+    // a share of it.
+    let above_head = secret_epoch > x0x::groups::crypto_exclusion::committed_secret_epoch(info);
     secret_epoch <= info.secret_epoch
         && unpinned(state, group_key, info, &by_hash)
         && !sent
             .as_deref()
             .is_some_and(|sent| sent.eq_ignore_ascii_case(sender_hex))
-        && (state
-            .gss_share_holds
-            .exclusions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(group_key)
-            .is_some_and(|list| {
-                list.iter().any(|hold| {
-                    hold.secret_epoch == secret_epoch
-                        && hold_live(state, group_key, info, hold, sent.as_deref(), &by_hash)
-                })
-            })
-            || state
-                .parked_gss_removals
+        && ((above_head
+            && (state
+                .gss_share_holds
+                .exclusions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(group_key)
                 .is_some_and(|list| {
-                    list.iter().any(|entry| {
-                        removal_epoch(&entry.event) == Some(secret_epoch)
+                    list.iter().any(|hold| {
+                        hold.secret_epoch == secret_epoch
+                            && hold_live(state, group_key, info, hold, sent.as_deref(), &by_hash)
+                    })
+                })
+                || state
+                    .parked_gss_removals
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(group_key)
+                    .is_some_and(|list| {
+                        list.iter().any(|entry| {
+                            removal_epoch(&entry.event) == Some(secret_epoch)
                             // The removal's own sender's secret is in: no
                             // other share replaces it, exactly as for a
                             // hold's actor.
                             && !sent.as_deref().is_some_and(|sent| {
                                 sent.eq_ignore_ascii_case(&hex::encode(entry.sender.0))
                             })
-                    })
-                })
+                        })
+                    })))
             || state
                 .gss_share_holds
                 .keyless
@@ -2624,6 +2635,88 @@ mod tests {
         );
     }
 
+    /// #1775 (claude review at a1fa57cd, Major): a share of an epoch that
+    /// the head already commits replaces no installed later secret. A
+    /// sibling commit committed epoch 2 with its own key, and the
+    /// exclusion's epoch-2 hold survived (a failed write, then a restart
+    /// that reloads it). A later admin's unpinned epoch-3 share then
+    /// makes that hold look live again. The waiting actor's epoch-2
+    /// share, sealed to a roster that may still seat a removed member,
+    /// must not take the replace path: it would install over the key the
+    /// head commits. The same holds for a parked removal of epoch 2.
+    /// Above the committed epoch, the item 2 replace still works.
+    #[tokio::test]
+    async fn a_share_of_a_committed_epoch_replaces_no_later_secret() {
+        let (state, _dir) = test_state().await;
+        let group_key = "g".to_string();
+        let actor = "aa".repeat(32);
+        let later_admin = "cc".repeat(32);
+        let committed = gss_info_at_head(2, Some([0x22u8; 32]));
+        hold_exclusion(&state, &group_key, "p", 2, &actor).await;
+        super::test_seam::simulate_restart(&state).await;
+        ensure_loaded(&state).await;
+        assert_eq!(
+            super::test_seam::held_exclusions(&state, &group_key),
+            1,
+            "the epoch-2 hold survived the restart"
+        );
+        let later_key = [0xC3u8; 32];
+        note_share_sender(&state, &group_key, &committed, 3, &later_admin, &later_key).await;
+        let mut installed = committed.clone();
+        installed.secret_epoch = 3;
+        installed.shared_secret = Some(later_key.to_vec());
+        assert!(
+            !replaces_uncommitted_secret(&state, &group_key, &installed, &actor, 2),
+            "a hold's share of a committed epoch replaces nothing"
+        );
+
+        // The parked-removal branch: a removal of epoch 2 waits parked.
+        super::test_seam::clear_exclusion_holds(&state, &group_key);
+        state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(group_key.clone())
+            .or_default()
+            .push(ParkedRoleUpdate {
+                event: NamedGroupMetadataEvent::MemberRemoved {
+                    group_id: group_key.clone(),
+                    revision: 3,
+                    actor: actor.clone(),
+                    agent_id: "dd".repeat(32),
+                    treekem_commit_b64: None,
+                    treekem_epoch: None,
+                    secret_epoch: Some(2),
+                    commit: None,
+                },
+                sender: AgentId([0xaa; 32]),
+                parked_at: Instant::now(),
+            });
+        assert!(
+            !replaces_uncommitted_secret(&state, &group_key, &installed, &actor, 2),
+            "a parked removal's share of a committed epoch replaces nothing"
+        );
+
+        // Control: the head commits epoch 1, so epoch 2 is above it, and
+        // the waiting actor's share still displaces the unpinned epoch-3
+        // secret (#1775 item 2).
+        state
+            .parked_gss_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&group_key);
+        hold_exclusion(&state, &group_key, "p", 2, &actor).await;
+        let parent = gss_info_at_head(1, Some([0x11u8; 32]));
+        note_share_sender(&state, &group_key, &parent, 3, &later_admin, &later_key).await;
+        let mut above = parent.clone();
+        above.secret_epoch = 3;
+        above.shared_secret = Some(later_key.to_vec());
+        assert!(
+            replaces_uncommitted_secret(&state, &group_key, &above, &actor, 2),
+            "above the committed epoch, the waiting actor's share still replaces"
+        );
+    }
+
     /// #1775 (claude review at 3e100c71): a failed park write or a failed
     /// keyless-mark write puts the record it replaced back in memory, as
     /// the disk still holds it.
@@ -2851,8 +2944,9 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).expect("the file stays"))
                 .expect("the rewritten file decodes");
         assert_eq!(written["version"], 2, "a file with a v2 field is version 2");
+        let shown = format!("{:?}", parked_secret(&state, &group_key));
         assert!(
-            !format!("{:?}", parked_secret(&state, &group_key)).contains("195"),
+            shown.contains("<redacted>") && !shown.contains("195"),
             "the record's Debug form does not print the key bytes"
         );
         let exclusions = written["exclusions"]
@@ -2865,6 +2959,25 @@ mod tests {
             exclusions[0]["actors"].as_array().map(Vec::len),
             Some(2),
             "both waiting actors are kept"
+        );
+        // Both v2 fields cleared: the next write is version 1 again.
+        let record = parked_secret(&state, &group_key).expect("the parked record");
+        forget_parked_secret(&state, &group_key, &record).await;
+        let read = |path: &PathBuf| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).expect("the file stays"))
+                .expect("the file decodes")
+        };
+        assert_eq!(
+            read(&path)["version"],
+            1,
+            "a file whose v2 fields are cleared is version 1 again"
+        );
+        // A keyless mark alone is a v2 field too.
+        assert!(note_keyless_commit(&state, &group_key, 5, &"aa".repeat(32), "h5").await);
+        assert_eq!(
+            read(&path)["version"],
+            2,
+            "a file with only a keyless mark is version 2"
         );
     }
 

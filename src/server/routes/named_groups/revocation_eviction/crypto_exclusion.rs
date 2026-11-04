@@ -10659,9 +10659,8 @@ mod daemon_tests {
             let member = groups
                 .get_mut(&fx.group_id)
                 .and_then(|info| info.members_v2.get_mut(&b_hex));
-            if let Some(member) = member {
-                member.role = x0x::groups::GroupRole::Member;
-            }
+            let member = member.context("B is seated on the roster")?;
+            member.role = x0x::groups::GroupRole::Member;
         }
         redeliver(&fx).await;
         gone(&fx, "a demoted sender's record goes");
@@ -10693,6 +10692,26 @@ mod daemon_tests {
         );
         redeliver(&fx).await;
         gone(&fx, "a record whose sender a held removal targets goes");
+        ng::gss_share_hold::test_seam::clear_exclusion_holds(&fx.replica, &fx.group_id);
+        // The same for a held removal of B below the parked epoch.
+        parked(
+            &fx,
+            next_secret_epoch + 1,
+            b_hex.clone(),
+            foreign.to_vec(),
+            committed,
+        );
+        ng::gss_share_hold::test_seam::force_removal_hold(
+            &fx.replica,
+            &fx.group_id,
+            next_secret_epoch,
+            &b_hex,
+        );
+        redeliver(&fx).await;
+        gone(
+            &fx,
+            "a record whose sender an earlier held removal targets goes",
+        );
         ng::gss_share_hold::test_seam::clear_exclusion_holds(&fx.replica, &fx.group_id);
 
         // Gone: the sender is no member of the roster at all.
@@ -10774,6 +10793,11 @@ mod daemon_tests {
         );
         redeliver(&fx).await;
         gone(&fx, "a revoked sender's record goes");
+        assert_eq!(
+            group_of(&fx, &fx.group_id).await?.secret_epoch,
+            next_secret_epoch + 1,
+            "the revoked sender's record installed nothing"
+        );
         Ok(())
     }
 

@@ -357,8 +357,11 @@ except citations explicitly marked as resolving at
   exit to both arms: a share installs over an installed secret only when
   `gss_share_hold::replaces_uncommitted_secret` allows it. That is, no verified commit
   pins the installed secret (a later epoch than the head commits, or the epoch of a
-  keyless commit's mark), and a verified transition of the share's epoch still waits for
-  its own actor. A displaced later secret parks in the hold file. It re-delivers through
+  keyless commit's mark), and a verified transition of the share's epoch still waits. The
+  share's sender can be any admin other than the installed secret's sender, not only the
+  waiting actor; this fails closed (the hold stays until the actor's own share installs).
+  Unless a keyless commit's mark covers that exact epoch, the share's epoch must be above
+  the epoch that the head commits. A displaced later secret parks in the hold file. It re-delivers through
   the ordinary share path when a head commits the displacing wait's epoch. A promoted or
   superseded install parks a later secret only when the held step that raises to its
   epoch was authored by its sender; it drops any other later secret, as before #1775.
