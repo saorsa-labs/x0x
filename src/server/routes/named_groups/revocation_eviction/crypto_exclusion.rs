@@ -2919,8 +2919,10 @@ async fn install_gss(
     // share. A secret from another sender, or with no sender record for
     // that exact secret (another install path, or a crash between the
     // key write and the record write), is not kept: the frame waits for
-    // its actor's share, which may replace it
-    // ([`ng::gss_share_hold::replaces_uncommitted_secret`]).
+    // its actor's share, which may replace it — over a later epoch's
+    // unpinned secret too, so the wait keeps its way out when a foreign
+    // share raised the local epoch past the head (3 Nov review thread;
+    // [`ng::gss_share_hold::replaces_uncommitted_secret`]).
     ng::gss_share_hold::ensure_loaded(state).await;
     let actor_hex = hex::encode(body.actor);
     let foreign_secret = info.shared_secret.is_some()
@@ -9165,6 +9167,195 @@ mod daemon_tests {
             x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
             next_secret_epoch + 1,
             "a head commits the later epoch"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the committed epoch pins the secret: the group seals again"
+        );
+        Ok(())
+    }
+
+    /// #1775 (3 Nov review thread): a foreign share of a later epoch
+    /// holds an earlier frame through the `>=` check, and the actor's own
+    /// share of the frame's epoch must resolve that wait. The installed
+    /// later secret is unpinned, so the waiting transition's replace rule
+    /// lets the actor's share displace it; the strict stale-envelope
+    /// guard alone would refuse that share for ever and strand the
+    /// frame. Before the frame parks its hold, the same share stays
+    /// refused: no verified transition of the epoch waits yet, so no
+    /// rule may displace the installed secret.
+    #[tokio::test]
+    async fn the_actors_earlier_share_recovers_a_later_epoch_foreign_secret() -> Result<()> {
+        use anyhow::Context as _;
+        // A raw ID above the fixture author's, so B is never the designated
+        // admin and the author authors the exclusion at once (D74: the
+        // lowest eligible admin is designated); B stays an admin of the
+        // parent roster, so its later-epoch share installs.
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let author_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's share of the epoch after the frame's installs while the
+        // head stays at the parent: the local epoch rises, no commit
+        // pins it.
+        let foreign = [0xB5u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+
+        // Before the frame parks its hold, the actor's share of the
+        // frame's epoch is an ordinary stale envelope: no verified
+        // transition of that epoch waits here, so no rule displaces B's
+        // secret with it.
+        let actor_secret = [0x07u8; 32];
+        let early = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's share"))?;
+        let refused =
+            ng::apply_named_group_metadata_event(&fx.replica, early, admin, true, None).await;
+        assert!(
+            !refused.accepted,
+            "no waiting transition of the epoch: the stale guard still refuses: {refused:?}"
+        );
+
+        // The frame waits under B's secret, and its hold names the actor.
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "#1775 item 2: an uncommitted later-epoch secret is not the frame's key"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no result head over B's secret"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "the frame's hold withholds new ciphertext under B's later-epoch secret"
+        );
+
+        // The actor's own share of the frame's epoch resolves the wait:
+        // it displaces B's unpinned later secret, and the frame retry
+        // installs with it and pins the epoch — the recovery the 3 Nov
+        // review thread asked for, not a wait on B's rotation arriving.
+        let recovery = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's recovery share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, recovery, admin, true, None).await;
+        assert!(
+            took.accepted,
+            "the waiting actor's share displaces the unpinned later secret: {took:?}"
+        );
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the frame installs with its actor's key"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, body.commit.state_hash,
+            "the frame's result is the head"
+        );
+        assert_eq!(installed.secret_epoch, next_secret_epoch);
+        assert_eq!(
+            x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
+            next_secret_epoch,
+            "the head commits the frame's epoch"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(actor_secret.as_slice()),
+            "the survivor holds the actor's key, not B's"
         );
         assert_eq!(
             ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,

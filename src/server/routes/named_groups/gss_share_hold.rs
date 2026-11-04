@@ -1217,15 +1217,18 @@ pub(super) fn share_sent_by(
 }
 
 /// #1766/#1775: whether a share of `secret_epoch` from `sender_hex` may
-/// replace the secret of the same epoch that `info` holds. Only a secret
-/// that no verified commit pins can go, only for a different sender, and
-/// only while a verified transition of that epoch still waits: a
-/// crypto-only exclusion's hold, a parked removal or ban (#1775 item 1),
-/// or a keyless commit's mark (#1775 item 4). The waiting transition
-/// keeps a secret only from its own actor, so without this its actor's
-/// share could never install. Once the actor's secret is in, or a commit
-/// pins the value, no other share replaces it. Call [`ensure_loaded`]
-/// first.
+/// replace the secret that `info` holds — of the same epoch, or of a
+/// later one that no verified commit pins (a sealed share raised the
+/// local epoch past the head, #1775 item 2; the waiting transition's own
+/// share still recovers its frame, or the strict stale-envelope guard
+/// would refuse it for ever). Only a secret that no verified commit pins
+/// can go, only for a different sender, and only while a verified
+/// transition of that epoch still waits: a crypto-only exclusion's hold,
+/// a parked removal or ban (#1775 item 1), or a keyless commit's mark
+/// (#1775 item 4). The waiting transition keeps a secret only from its
+/// own actor, so without this its actor's share could never install.
+/// Once the actor's secret is in, or a commit pins the value, no other
+/// share replaces it. Call [`ensure_loaded`] first.
 pub(super) fn replaces_uncommitted_secret(
     state: &AppState,
     group_key: &str,
@@ -1234,7 +1237,7 @@ pub(super) fn replaces_uncommitted_secret(
     secret_epoch: u64,
 ) -> bool {
     let sent = installed_share_sender(state, group_key, info);
-    secret_epoch == info.secret_epoch
+    secret_epoch <= info.secret_epoch
         && secret_unpinned(state, group_key, info)
         && !sent
             .as_deref()

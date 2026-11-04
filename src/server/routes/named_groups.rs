@@ -18889,16 +18889,23 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // MemberBanned commit but have not yet received the actual shared
             // secret material. #1766: a waiting transition's share may
             // replace an uncommitted secret of its epoch from another sender.
-            if secret_epoch < info.secret_epoch
-                || (secret_epoch == info.secret_epoch
+            // #1775 (3 Nov review thread): a share of an earlier epoch takes
+            // that same replace path over a secret of a later epoch that no
+            // commit pins — the sealed share that raised the local epoch past
+            // the head — so the waiting transition's own share recovers its
+            // frame; the strict guard alone would refuse it for ever.
+            let replaces_unpinned_secret = info.shared_secret.is_some()
+                && gss_share_hold::replaces_uncommitted_secret(
+                    state,
+                    &resolved_group_key,
+                    &info,
+                    &sender_hex,
+                    secret_epoch,
+                );
+            if secret_epoch < info.secret_epoch && !replaces_unpinned_secret
+                || secret_epoch == info.secret_epoch
                     && info.shared_secret.is_some()
-                    && !gss_share_hold::replaces_uncommitted_secret(
-                        state,
-                        &resolved_group_key,
-                        &info,
-                        &sender_hex,
-                        secret_epoch,
-                    ))
+                    && !replaces_unpinned_secret
             {
                 return ApplyMetadataResult::REJECTED;
             }

@@ -1922,7 +1922,11 @@ A share of the held epoch ends the hold only when its sender is a
 recorded actor of that hold, and the share's secret is the one recorded
 for that sender (#1766). A share of the same epoch from a different
 admin installs, but the hold stays. The actor's share of that epoch then
-replaces the other admin's secret that no commit pins.
+replaces the other admin's secret that no commit pins. So does a foreign
+secret of a later epoch that no commit pins: the early sealed share
+raised the local epoch past the head, and the waiting transition's own
+share of the earlier epoch displaces it, so the frame it waits for
+installs (#1775).
 
 After a #1578 keyless install, the head already commits the epoch, but
 it binds the epoch, not the secret value (#1775). The durable keyless
