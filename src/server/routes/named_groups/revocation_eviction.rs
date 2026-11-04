@@ -1507,6 +1507,12 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
                 .get(&key)
                 .is_some_and(|ids| ids.contains(&designation.designated));
             if unsupported && waiting.designated_detail == Some(s4::DesignatedWaitDetail::Rank) {
+                // §2 (L171): a definitive hand-off failure (the §4
+                // unsupported advert) is never labelled an unresolved
+                // route.
+                if waiting.cause == WaitingCause::UnresolvedDesignatedAdmin {
+                    waiting.cause = WaitingCause::WaitingForDesignatedAdmin;
+                }
                 waiting.designated_detail =
                     Some(s4::DesignatedWaitDetail::DesignatedAdminUnsupported);
             }

@@ -2412,6 +2412,16 @@ mod tests {
             .as_ref()
             .is_some_and(|waiting| waiting.remaining_ms.is_some()));
 
+        // The split lands at exactly W since the first dispatch, not after.
+        row.first_dispatch_unix_ms =
+            Some(now_ms - u64::try_from(timing.designated_window.as_millis()).expect("W in ms"));
+        let boundary = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
+        assert_eq!(
+            boundary.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::UnresolvedDesignatedAdmin)
+        );
+        row.first_dispatch_unix_ms = Some(now_ms - 19_000);
+
         // Any verified exchange reached keeps the plain designated wait.
         row.earliest_handoff_receipt_unix_ms = Some(now_ms - 1_000);
         let exchanged = evaluate_row(&row, &ctx(3, &admins, &none, waiting_rank), &timing);
