@@ -177,22 +177,37 @@ async fn join_outcome(sim: &Sim, group: &str) -> Result<Option<String>> {
         .map(str::to_string))
 }
 
-/// The lane and kind of a frame from J that is J's join request on main:
-/// a Direct frame (`[stream type][sender agent id (32)][JSON]`) whose body
-/// is J's `member_joined` event, or a PubSub frame that carries J's
-/// `member_joined` event. `None` for any other frame.
-fn request_kind(class: LaneClass, bytes: &[u8], j: &str) -> Option<&'static str> {
+/// The lane and kind of a frame from J that is J's join message for
+/// `group`, as `case_1023`'s `join_message_kind` matches it. A Direct
+/// frame (`[stream type][sender agent id (32)][JSON]`) whose body names J
+/// as `member_agent_id` and is J's `member_joined` event or its JoinResult
+/// `fetch_request`. A PubSub frame that carries J's `member_joined` event.
+/// Where the frame carries a `group_id`, it must be `group`. `None` for any
+/// other frame.
+fn request_kind(class: LaneClass, bytes: &[u8], j: &str, group: &str) -> Option<&'static str> {
     match class {
         LaneClass::Direct => {
             let body = serde_json::from_slice::<serde_json::Value>(bytes.get(33..)?).ok()?;
             let joiner = body["member_agent_id"]
                 .as_str()
                 .is_some_and(|id| id.eq_ignore_ascii_case(j));
-            (body["event"] == "member_joined" && joiner).then_some("direct member_joined")
+            let in_group = body["group_id"]
+                .as_str()
+                .is_none_or(|id| id.eq_ignore_ascii_case(group));
+            if !joiner || !in_group {
+                None
+            } else if body["event"] == "member_joined" {
+                Some("direct member_joined")
+            } else if body["type"] == "fetch_request" {
+                Some("direct fetch_request")
+            } else {
+                None
+            }
         }
         LaneClass::PubSub => {
             let text = String::from_utf8_lossy(bytes);
-            (text.contains("\"member_joined\"") && text.contains(j))
+            let in_group = !text.contains("\"group_id\"") || text.contains(group);
+            (text.contains("\"member_joined\"") && text.contains(j) && in_group)
                 .then_some("pubsub member_joined")
         }
         _ => None,
@@ -452,7 +467,7 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         sim.fabric()
             .delivered_writes_after(&sim.peer("J")?, &sim.peer("B")?, position)
     {
-        if let Some(kind) = request_kind(write.lane.class, &write.bytes, &j) {
+        if let Some(kind) = request_kind(write.lane.class, &write.bytes, &j, &group) {
             *by_kind.entry(kind).or_default() += 1;
         }
     }
@@ -476,7 +491,8 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
         .writes_from_between(&j_peer, offline..usize::MAX)
         .into_iter()
         .filter(|write| {
-            write.lane.dst == a_peer.0 && request_kind(write.lane.class, &write.bytes, &j).is_some()
+            write.lane.dst == a_peer.0
+                && request_kind(write.lane.class, &write.bytes, &j, &group).is_some()
         })
         .count();
     let refused: Vec<_> = sim
@@ -488,7 +504,7 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
     let refused_requests = refused
         .iter()
         .filter(|refusal| match (refusal.class, refusal.bytes.as_deref()) {
-            (Some(class), Some(bytes)) => request_kind(class, bytes, &j).is_some(),
+            (Some(class), Some(bytes)) => request_kind(class, bytes, &j, &group).is_some(),
             _ => false,
         })
         .count();
