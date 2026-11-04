@@ -1,7 +1,8 @@
 //! OwnerCertified harness support (#1666) and the ADR 0109 §10 rows
-//! H-S3-c, H-S3-c2, H-S3-c3, H-S3-d3 and H-S3-d8 (#871, D78, D79, D121, D156, #1572). O is the only
-//! install with the owner's USER key; A, X and J hold owner-issued agent
-//! certificates only (test builds load `agent.cert` without a user key).
+//! H-S3-c, H-S3-c2, H-S3-c3, H-S3-d3, H-S3-d8 and H-S3-rm4 (#871, D78, D79,
+//! D121, D156, #1572). O is the only install with the owner's USER key;
+//! A, X and J hold owner-issued agent certificates only (test builds load
+//! `agent.cert` without a user key).
 //!
 //! Control, expected GREEN on `main`: A joins O's OwnerCertified group, O
 //! promotes it, and A's own seal reaches O.
@@ -17,6 +18,7 @@
 
 use super::*;
 
+mod invites;
 mod refusals;
 
 const LABELS: &[&str] = &["O", "A"];

@@ -11,8 +11,9 @@ S3 case, and 20 reruns of them in one job do not fit the S3 test deadline.
 One rerun of H-S3-d3 takes about 16 min on a runner, so its 20 reruns
 are split across parallel parts (`PARTS`): matrix entries `s3-d3.1` to
 `s3-d3.4`, 5 reruns each. The #1661 welcome-lost row has its own shard
-too, split as `s3-1661.1` and `s3-1661.2`, 10 reruns each. The summary
-job still counts 20 receipts.
+too, split as `s3-1661.1` and `s3-1661.2`, 10 reruns each. The H-S3-rm4
+variants run the H-S3-c prefix and share one shard, split as `s3-rm4.1`
+and `s3-rm4.2`, 10 reruns each. The summary job still counts 20 receipts.
 
 The S3 shard is omitted when the tree has no `w3h_1356_` test, so `main`
 does not spend a runner on an empty filter. Adding those tests makes the
@@ -38,6 +39,7 @@ GROUPS = (
     ('s3-d8', 'w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node$'),
     ('s3-d3', 'w3h_1356_control_s3_d3_authorisation_refusals_typed$'),
     ('s3-1661', 'w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed$'),
+    ('s3-rm4', 'w3h_1356_control_s3_rm4_'),
     ('s3', 'w3h_1356_'),
 )
 
@@ -52,7 +54,11 @@ RUNS = 20
 # 460 s on the runner; 20 reruns (about 153 min) leave almost no margin
 # under the 155-min S3 test deadline. 2 parts of 10 reruns take about
 # 80 min each.
-PARTS = {'s3-d3': 4, 's3-1661': 2}
+# H-S3-rm4 (1) and (2): one rerun of both is about 220 s in the 12-CPU VM,
+# so about 440 s on the runner; 20 reruns (about 147 min) leave almost no
+# margin under the 155-min S3 test deadline. 2 parts of 10 reruns take
+# about 75 min each.
+PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 2}
 
 ROOT = Path(__file__).resolve().parents[2]
 
