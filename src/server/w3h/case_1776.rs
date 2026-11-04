@@ -37,8 +37,8 @@
 //!   reconciled no state for the late joiner. The `MemberAdded` still
 //!   arrives (the issue's reporter observed that), and a fresh on-demand
 //!   capability exchange still converges.
-//! - No DM-class frame reaches B while B holds no capability binding for
-//!   A: the blind window's other half (in the report, nothing from the
+//! - No DM-class frame reaches B while B holds no gossip-usable capability
+//!   binding for A: the blind window's other half (in the report, nothing from the
 //!   authority ever reached the joiner). The rule releases the moment B
 //!   can address A — which on main never happens, and with the fix is
 //!   exactly what the targeted refresh brings about.
@@ -131,7 +131,7 @@ async fn run() -> Receipt {
     receipt.note(
         "The fabric drops every pubsub frame to B except the group's own \
          metadata topic and the targeted capability control topics, and every \
-         DM to B while B holds no capability binding for A: the deployment's \
+         DM to B while B holds no gossip-usable capability binding for A: the deployment's \
          blind window. Welcome delivery is observed as B's own active \
          membership plus B opening the group store, which needs the group \
          key the Welcome carries.",
@@ -201,8 +201,8 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
 
     sim.start_node_with("B", Provision::default()).await?;
     mesh(sim, &["O", "B"]).await?;
-    // Fault 2: no DM-class frame reaches B while B holds no capability
-    // binding for A. Installed after B's daemon exists, before the join:
+    // Fault 2: no DM-class frame reaches B while B holds no gossip-usable
+    // capability binding for A (the same check production uses). Installed after B's daemon exists, before the join:
     // A has nothing to send B before the join volley. The rule holds only
     // a Weak handle, so it cannot keep B's daemon state alive past
     // shutdown.
@@ -212,11 +212,12 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         if write.lane.dst == b_machine
             && is_dm(write)
             && b_state.upgrade().is_some_and(|state| {
-                state
+                !state
                     .agent
                     .capability_store
                     .lookup_binding(&a_agent)
-                    .is_none()
+                    .as_ref()
+                    .is_some_and(crate::dm_capability::binding_is_gossip_usable)
             })
         {
             Fault::Drop
@@ -243,6 +244,22 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         at(sim),
     );
     sim.fabric().mark("checkpoint: A seated B");
+    // The A->B leg (the Welcome reply rides A's pinned path to B) needs a
+    // binding on A's side. Record what A holds for B when it seats B, so a
+    // receipt shows which source the reply leg used. Observation only.
+    let b_agent = sim.ids("B")?.0;
+    let a_binding = sim
+        .state("A")?
+        .agent
+        .capability_store
+        .lookup_binding(&b_agent);
+    receipt.note(format!(
+        "a_binding_for_b_at_seat: present={} gossip_usable={}",
+        a_binding.is_some(),
+        a_binding
+            .as_ref()
+            .is_some_and(crate::dm_capability::binding_is_gossip_usable),
+    ));
 
     // The step that never completes on main: B's own seat installs only
     // with the Welcome, and B's group lookup 404s until then. On an

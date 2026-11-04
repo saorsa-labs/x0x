@@ -7837,9 +7837,10 @@ impl Drop for CapabilityRefreshGuard {
 /// send that raced an in-flight advert from paying the full window.
 ///
 /// Returns whether the targeted request was published successfully, which
-/// is what starts the requester-side cooldown. A failed publish, or a
-/// deadline or shutdown before the publish completes, returns `false` at
-/// once.
+/// is what starts the requester-side cooldown. A deadline or shutdown
+/// before the publish completes returns `false` at once. A failed publish
+/// returns `false` at once for an addressability flight; a strict flight
+/// still waits out its convergence window, as before #1776.
 async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
     required_application: Option<u64>,
@@ -7877,32 +7878,40 @@ async fn run_strict_capability_refresh(
         () = tokio::time::sleep_until(deadline) => None,
         () = shutdown_token.cancelled() => None,
     };
-    // A request that never left this node starts no cooldown and earns no
-    // convergence wait: nothing can answer it (#1776 review).
+    // A request that never left this node starts no cooldown (#1776
+    // review). An addressability flight also stops waiting at once, because
+    // nothing can answer it. A strict flight keeps the convergence wait it
+    // had before #1776, so the strict gate's refusal timing is unchanged.
     let Some(published) = published else {
         return false;
     };
-    if let Err(error) = published {
-        tracing::warn!(
-            target: "dm.trace",
-            recipient = %hex::encode(recipient.as_bytes()),
-            %error,
-            "targeted capability refresh publish failed"
-        );
+    let published = match published {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                target: "dm.trace",
+                recipient = %hex::encode(recipient.as_bytes()),
+                %error,
+                "targeted capability refresh publish failed"
+            );
+            false
+        }
+    };
+    if !published && !require_durable_ack && required_application.is_none() {
         return false;
     }
 
     loop {
         if ready() {
-            return true;
+            return published;
         }
         if tokio::time::Instant::now() >= deadline {
-            return true;
+            return published;
         }
         tokio::select! {
             _ = tokio::time::sleep(CAPABILITY_REFRESH_POLL_INTERVAL) => {}
-            () = tokio::time::sleep_until(deadline) => return true,
-            () = shutdown_token.cancelled() => return true,
+            () = tokio::time::sleep_until(deadline) => return published,
+            () = shutdown_token.cancelled() => return published,
         }
     }
 }
@@ -17644,8 +17653,8 @@ impl Agent {
     /// later), so every direct send dies on the raw-QUIC `AgentNotFound`
     /// path. The targeted request travels on the same control topics the
     /// mesh already carries, giving the gossip-inbox DM leg its KEM
-    /// material. Concurrent callers share one flight; the per-recipient
-    /// cooldown bounds repeat requests.
+    /// material. Concurrent callers share one flight; the cooldown, kept
+    /// per recipient and per purpose, bounds repeat requests.
     pub(crate) async fn refresh_dm_capability_binding(&self, recipient: identity::AgentId) {
         self.refresh_strict_dm_capability(recipient, None, false)
             .await;
@@ -30455,6 +30464,25 @@ mod tests {
             tokio::time::Instant::now(),
             started,
             "a failed publish must not wait for an answer"
+        );
+
+        // A strict flight keeps its pre-#1776 convergence wait after a
+        // failed publish, so the strict gate's refusal timing is unchanged.
+        let started = tokio::time::Instant::now();
+        let published = run_strict_capability_refresh(
+            recipient,
+            None,
+            true,
+            std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            tokio_util::sync::CancellationToken::new(),
+            started + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            async { Err(error::NetworkError::BroadcastError("test".into())) },
+        )
+        .await;
+        assert!(!published, "a failed strict publish starts no cooldown");
+        assert!(
+            tokio::time::Instant::now() >= started + CAPABILITY_REFRESH_CONVERGENCE_WAIT,
+            "a strict flight still waits out its convergence window"
         );
 
         let usable = std::sync::Arc::new(dm_capability::CapabilityStore::new());
