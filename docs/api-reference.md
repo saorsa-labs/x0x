@@ -1918,20 +1918,25 @@ of these ends it:
 A share of the held epoch ends the hold only when its sender is a
 recorded actor of that hold, and the share's secret is the one recorded
 for that sender (#1766). A share of the same epoch from a different
-admin installs, but the hold stays. The actor's share of that epoch then
-replaces the other admin's secret that no commit pins. So does a foreign
-secret of a later epoch that no commit pins: the early sealed share
-raised the local epoch past the head, and the waiting transition's own
-share of the earlier epoch displaces it, so the frame it waits for
-installs (#1775). A displaced later secret is not lost: it parks in the
+admin installs, but the hold stays. While a verified transition of
+that epoch waits, a share of that epoch from any admin other than the
+installed secret's sender replaces a secret that no commit pins. The
+same rule applies to an unpinned secret of a later epoch: the early
+sealed share raised the local epoch past the head, and a share of the
+earlier epoch from any other admin displaces it. The waiting actor's
+own share is one such share, so the frame it waits for installs
+(#1775). The replace is not limited to the waiting actor. It fails
+closed: the hold stays until the actor's own share installs, so a
+third admin's replace can stall the group or lose a later key, but it
+releases no ciphertext. A displaced later secret is not lost: it parks in the
 hold file with its sender and the displacing wait's epoch, and it
 re-delivers through the ordinary share path once a head commits that
 epoch — so the later rotation's own commit lands with its key, and an
 honest share-before-commit reordering stalls on no re-delivery. A
 promoted or superseded intermediate install parks the later key it
 drops only when the held step that raises to that epoch has the key's
-sender as its author. It drops any other later key. One exception: when the hold file records no sender for the
-displaced secret, that secret parks nowhere and is lost. A crash
+sender as its author. It drops any other later key. One exception:
+when the hold file records no sender for the displaced secret, that secret parks nowhere and is lost. A crash
 between the key write and its record write leaves the sender unknown,
 with no provenance to re-deliver, and the daemon logs a warning. The
 re-delivery also runs after an accepted share installs: a keyless
