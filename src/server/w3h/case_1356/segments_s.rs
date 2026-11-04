@@ -153,12 +153,16 @@ impl Run {
     }
 
     /// Segment 2 arms from J's head after the restart: J is back at r+2,
-    /// never below it, every answer starts at r+2 with 2 entries, and J
-    /// converges with no marker.
+    /// never below it, A lists J's last request from r+2, J sees at least
+    /// one answer after the restart, every such answer starts at r+2 with
+    /// 2 entries, and J converges with no marker. An empty answer list
+    /// fails: then nothing shows that the second ATA came from J's head.
     fn second_segment(&self) -> bool {
         let end = self.segment_end();
         self.restart_heads.1 == end
             && self.heads_after.iter().all(|head| *head >= end)
+            && self.requested_from == Some(end)
+            && !self.answered_after.is_empty()
             && self
                 .answered_after
                 .iter()
@@ -468,6 +472,7 @@ fn w3h_1356_s_segment_shapes() {
         restart_heads: (7, 7),
         heads_after: vec![7, 9],
         answered_after: vec![(7, 2)],
+        requested_from: Some(7),
         caught_up: true,
         ..Run::default()
     };
@@ -494,7 +499,18 @@ fn w3h_1356_s_segment_shapes() {
     run.restart_heads = (7, 7);
     run.answered_after = vec![(5, 2)];
     assert!(!run.second_segment(), "the second ATA is not from J's head");
+    run.answered_after.clear();
+    assert!(!run.second_segment(), "no answer seen after the restart");
     run.answered_after = vec![(7, 2)];
+    run.requested_from = None;
+    assert!(!run.second_segment(), "A lists no request from J");
+    run.requested_from = Some(5);
+    assert!(
+        !run.second_segment(),
+        "J's last request is not from its head"
+    );
+    run.requested_from = Some(7);
+    assert!(run.second_segment());
     run.caught_up = false;
     assert!(!run.second_segment(), "J did not converge");
     run.head_at_seal = 7;
