@@ -115,6 +115,14 @@ pub(super) fn run_trial(
                 return Err(invalid("host is not ready for protected start"));
             }
             host.verify_candidate()?;
+            // The lock wait and the candidate hash can outlast the budget
+            // after the loop-head check passed. Read the clock again here,
+            // immediately before the reservation. An expired budget is a
+            // typed result, not an error, so it rolls back with its cause.
+            let clock = now()?;
+            if let Some(cause) = trial.expired(&clock) {
+                return Ok(Err(cause));
+            }
             trial.reserve(path, &clock)?;
             child::Owned::spawn(
                 trial,
@@ -123,11 +131,14 @@ pub(super) fn run_trial(
                 &host.plan().candidate_version,
                 host.plan().daemon.candidate_sha256,
             )
+            .map(Ok)
         });
         let mut child = match spawned? {
-            Some(child) => child,
+            // Nothing was reserved or spawned for this attempt.
+            Err(cause) => return rollback(host, path, trial, cause),
+            Ok(Some(child)) => child,
             // Exec or boot setup failed. The attempt stays charged.
-            None => {
+            Ok(None) => {
                 trial.child = None;
                 trial.phase = Phase::Authorized;
                 trial.next_launch_ms = now()?.ms.saturating_add(GAP_MS);
@@ -425,6 +436,45 @@ mod tests {
             .to_string();
         assert!(error.contains("not ready"), "{error}");
         assert_eq!(trial.attempts, 0);
+    }
+
+    /// The budget is read again inside the install lock. The lock wait and
+    /// the candidate hash can outlast the deadline after the loop-head check
+    /// passed, so no attempt may be charged or spawned on the stale clock.
+    #[test]
+    fn an_attempt_may_not_spawn_on_a_clock_stale_from_the_lock_wait() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = trial_in(&host, &path, Phase::Authorized, 0);
+        let boot = trial.boot.clone();
+        let deadline = trial.deadline_ms;
+        let mut reads = 0;
+        // The first read is the loop head; every later read is past the
+        // deadline, as if the lock wait had used up the budget.
+        let clock = move || {
+            reads += 1;
+            let ms = if reads == 1 {
+                deadline - 1
+            } else {
+                deadline + 1
+            };
+            Ok(Clock {
+                boot: boot.clone(),
+                ms,
+            })
+        };
+        let outcome = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
+        // The fixture's previous bytes cannot start, so the restored start
+        // fails. The typed rollback cause is what must survive.
+        assert!(outcome.is_err());
+        assert_eq!(trial.attempts, 0);
+        assert_previous_pair(&host);
+        let cause = journal_record(&root).cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
+        assert!(
+            cause.reason.contains("total trial deadline reached"),
+            "{cause:?}"
+        );
     }
 
     /// Linux custody: the restored child starts after rollback, a restarted
