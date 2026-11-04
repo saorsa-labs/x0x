@@ -19109,9 +19109,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
 
-            // 4. Derived AgentId must match the claimed member_agent_id.
+            // 4. Derived AgentId must match the claimed member_agent_id
+            //    exactly. The roster, ban list and invite ledger are keyed
+            //    by the lowercase `hex::encode` id, so a case-folded id
+            //    would get around `is_banned` (#1149).
             let derived = hex::encode(ant_quic::derive_peer_id_from_public_key(&pubkey).0);
-            if !derived.eq_ignore_ascii_case(&member_agent_id) {
+            if derived != member_agent_id {
                 tracing::debug!(
                     group_id = %resolved_group_key,
                     "MemberJoined: derived agent_id {} != claimed {}",
@@ -19292,15 +19295,22 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             //     `add_member_with_kem` below sets a banned row back to
             //     Active, so with no check here the banned agent gets its
             //     seat and the TreeKEM Welcome again. The request and
-            //     approve paths refuse a banned agent the same way. Only
-            //     the unban route ends a ban. Refuse before the invite is
-            //     consumed, so other holders can still use it.
+            //     approve paths refuse a banned agent the same way. A
+            //     joiner-signed event cannot end a ban: only an admin
+            //     action (the unban route, or an admin add route) can.
+            //     Refuse before the invite is consumed, so other holders
+            //     can still use it. Step 4 makes `member_agent_id` the
+            //     exact derived lowercase id, so this lookup cannot be
+            //     bypassed by letter case.
             if info.is_banned(&member_agent_id) {
                 tracing::info!(
                     group_id = %resolved_group_key,
                     member = %LogHexId::agent(&member_agent_id),
                     "MemberJoined: rejecting a banned agent (#1149)"
                 );
+                state
+                    .groups_diagnostics
+                    .record_member_joined_rejected_banned(&resolved_group_key);
                 return ApplyMetadataResult::REJECTED;
             }
 
@@ -64412,6 +64422,191 @@ pub(in crate::server) mod tests {
             !persisted.contains(&forger_public_key_b64),
             "forged member public key / protected material must not be persisted after rejection"
         );
+        Ok(())
+    }
+
+    /// #1149 fixture: a PublicOpen group whose local agent is the inviter,
+    /// with one unaddressed invite minted BEFORE `banned` was banned.
+    async fn banned_joiner_with_pre_ban_invite_for_test(
+        group_byte: u8,
+    ) -> Result<(
+        Arc<AppState>,
+        tempfile::TempDir,
+        String,
+        String,
+        String,
+        x0x::identity::AgentKeypair,
+    )> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let group_id = format!("{group_byte:02x}").repeat(32);
+        let inviter = state.agent.agent_id();
+        let inviter_hex = hex::encode(inviter.as_bytes());
+        let invite_secret = format!("issue1149-pre-ban-invite-{group_byte:02x}");
+        let banned = x0x::identity::AgentKeypair::generate()?;
+        let banned_hex = hex::encode(banned.agent_id().as_bytes());
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "#1149 banned joiner".to_string(),
+            String::new(),
+            inviter,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        info.record_issued_invite(
+            invite_secret.clone(),
+            now_millis_u64() / 1_000,
+            0,
+            x0x::groups::GroupRole::Member,
+        );
+        info.add_member(
+            banned_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(inviter_hex.clone()),
+            None,
+        );
+        info.ban_member(&banned_hex, Some(inviter_hex.clone()));
+        assert!(info.is_banned(&banned_hex), "fixture bans the joiner");
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        assert!(save_named_groups(&state).await);
+        Ok((state, dir, group_id, inviter_hex, invite_secret, banned))
+    }
+
+    /// #1149: the invite record and every roster row for `banned_hex`
+    /// (any letter case) after a refused `MemberJoined`.
+    async fn assert_banned_joiner_not_readmitted(
+        state: &AppState,
+        group_id: &str,
+        banned_hex: &str,
+        invite_secret: &str,
+    ) {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(group_id).expect("group retained");
+        assert!(
+            live.is_banned(banned_hex),
+            "#1149: the banned row must stay banned"
+        );
+        let rows: Vec<(String, x0x::groups::GroupMemberState)> = live
+            .members_v2
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(banned_hex))
+            .map(|(key, member)| (key.clone(), member.state))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(
+                banned_hex.to_string(),
+                x0x::groups::GroupMemberState::Banned
+            )],
+            "#1149: exactly one row (the canonical lowercase key) and it is banned"
+        );
+        let record = live
+            .issued_invites
+            .get(invite_secret)
+            .expect("pre-ban invite still recorded");
+        assert_eq!(
+            record.consumed_by, None,
+            "#1149: the refused join must not consume the pre-ban invite"
+        );
+    }
+
+    /// #1149 review blocker: an UPPERCASE `member_agent_id` is the same
+    /// agent as the lowercase banned roster key. Before the fix the
+    /// case-insensitive step-4 compare let it through, `is_banned` and
+    /// `has_active_member` missed (exact-case keys), and
+    /// `add_member_with_kem` seated a second, Active row under the
+    /// uppercase key. The authority now refuses any id that is not the
+    /// exact derived lowercase id.
+    #[tokio::test]
+    async fn issue1149_uppercase_member_id_of_banned_agent_is_refused() -> Result<()> {
+        let (state, _dir, group_id, inviter_hex, invite_secret, banned) =
+            banned_joiner_with_pre_ban_invite_for_test(0x49).await?;
+        let banned_id = banned.agent_id();
+        let banned_hex = hex::encode(banned_id.as_bytes());
+        let upper_hex = banned_hex.to_ascii_uppercase();
+        assert_ne!(upper_hex, banned_hex, "the id has hex letters to fold");
+
+        // The joiner signs its own event, so it can choose the case.
+        let public_key_b64 = BASE64.encode(banned.public_key().as_bytes());
+        let ts_ms = now_millis_u64();
+        let canonical = canonical_member_joined_bytes(
+            &group_id,
+            Some(&group_id),
+            &upper_hex,
+            &public_key_b64,
+            x0x::groups::GroupRole::Member,
+            None,
+            &inviter_hex,
+            &invite_secret,
+            ts_ms,
+            None,
+        );
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            banned.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| anyhow::anyhow!("sign uppercase MemberJoined: {e:?}"))?;
+        let event = NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.clone(),
+            stable_group_id: Some(group_id.clone()),
+            member_agent_id: upper_hex.clone(),
+            member_public_key_b64: public_key_b64,
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: inviter_hex,
+            invite_secret: invite_secret.clone(),
+            ts_ms,
+            treekem_key_package_b64: None,
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
+            certificate_b64: None,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: BASE64.encode(signature.as_bytes()),
+        };
+        let result = apply_named_group_metadata_event(&state, event, banned_id, true, None).await;
+        assert!(
+            !result.accepted,
+            "#1149: an uppercase id must not re-admit the banned agent"
+        );
+        assert_banned_joiner_not_readmitted(&state, &group_id, &banned_hex, &invite_secret).await;
+        Ok(())
+    }
+
+    /// #1149: the exact (lowercase) id of a banned agent with a pre-ban
+    /// invite is refused by the ban check, which counts the refusal and
+    /// leaves the invite unused.
+    #[tokio::test]
+    async fn issue1149_banned_member_joined_is_refused_and_counted() -> Result<()> {
+        let (state, _dir, group_id, inviter_hex, invite_secret, banned) =
+            banned_joiner_with_pre_ban_invite_for_test(0x4a).await?;
+        assert_eq!(
+            state
+                .groups_diagnostics
+                .member_joined_rejected_banned(&group_id),
+            0
+        );
+        let (banned_id, banned_hex, _, event) = signed_member_joined_event_for_test(
+            &banned,
+            &group_id,
+            &inviter_hex,
+            &invite_secret,
+            x0x::groups::GroupRole::Member,
+        )?;
+        let result = apply_named_group_metadata_event(&state, event, banned_id, true, None).await;
+        assert!(!result.accepted, "#1149: a banned agent must be refused");
+        assert_eq!(
+            state
+                .groups_diagnostics
+                .member_joined_rejected_banned(&group_id),
+            1,
+            "#1149: the ban check refused the join and counted it"
+        );
+        assert_banned_joiner_not_readmitted(&state, &group_id, &banned_hex, &invite_secret).await;
         Ok(())
     }
 

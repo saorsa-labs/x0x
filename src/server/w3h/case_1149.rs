@@ -1,5 +1,6 @@
-//! W3-H case `w3h_1149_banned_agent_not_readmitted_by_pre_ban_invite`
-//! (#1149).
+//! W3-H cases `w3h_1149_treekem_banned_agent_not_readmitted_by_pre_ban_invite`
+//! and `w3h_1149_signed_public_banned_agent_not_readmitted_by_pre_ban_invite`
+//! (#1149, the authority side).
 //!
 //! Nodes: A (owner, the authority) and J (joiner). Public HTTP only.
 //!
@@ -13,7 +14,7 @@
 //! 6. The drop lifts, and the clock moves on. A encrypts a probe at its
 //!    current TreeKEM epoch, and J tries to decrypt it.
 //!
-//! The case runs once per confidentiality: `private_secure` (TreeKEM) and
+//! There is one test per confidentiality: `private_secure` (TreeKEM) and
 //! `public_open` (SignedPublic).
 //!
 //! Baseline on main: A applies J's `MemberJoined` from the pre-ban invite.
@@ -21,8 +22,10 @@
 //! row back to `active`. A seats J again, and in the TreeKEM variant J
 //! gets the group keys and reads the probe that A encrypts after the ban.
 //! Fixed: A refuses the `MemberJoined` of a banned agent before it
-//! consumes the invite. A's row for J stays `banned`, and J holds no
-//! TreeKEM group and cannot read the probe.
+//! consumes the invite, and counts the refusal. A's row for J stays
+//! `banned`, and J holds no TreeKEM group and cannot read the probe. The
+//! row is GREEN only when A's ban-refusal counter went up, so it proves
+//! that J's `MemberJoined` reached A and that the ban check refused it.
 //!
 //! J's local report from the invite base (`base_seats_joiner`) is a note
 //! only. This row does not assert it.
@@ -43,7 +46,6 @@ use base64::Engine as _;
 use serde_json::json;
 
 const SEED: u64 = 0x1149_0001;
-const CASE: &str = "w3h_1149_banned_agent_not_readmitted_by_pre_ban_invite";
 const FINAL: &str = "banned_agent_stays_banned";
 const CAUSE: &str = "A re-admits banned J from an invite minted before the ban";
 /// Time after the drop lifts for A's current answer to reach J.
@@ -63,6 +65,22 @@ impl Variant {
         match self {
             Self::TreeKem => "treekem",
             Self::SignedPublic => "signed_public",
+        }
+    }
+
+    fn case(self) -> &'static str {
+        match self {
+            Self::TreeKem => "w3h_1149_treekem_banned_agent_not_readmitted_by_pre_ban_invite",
+            Self::SignedPublic => {
+                "w3h_1149_signed_public_banned_agent_not_readmitted_by_pre_ban_invite"
+            }
+        }
+    }
+
+    fn seed(self) -> u64 {
+        match self {
+            Self::TreeKem => SEED,
+            Self::SignedPublic => SEED + 1,
         }
     }
 
@@ -244,6 +262,15 @@ async fn row_state(sim: &Sim, label: &str, group: &str, agent: &str) -> Result<O
         .map(str::to_string))
 }
 
+/// A's count of `MemberJoined` events refused because the joiner is
+/// banned (#1149).
+fn banned_refusals(sim: &Sim, group: &str) -> Result<u64> {
+    Ok(sim
+        .state("A")?
+        .groups_diagnostics
+        .member_joined_rejected_banned(group))
+}
+
 /// True when `label`'s roster holds `agent` in the `active` state.
 async fn listed(sim: &Sim, label: &str, group: &str, agent: &str) -> Result<bool> {
     Ok(row_state(sim, label, group, agent).await?.as_deref() == Some("active"))
@@ -356,6 +383,24 @@ async fn scenario(sim: &Sim, receipt: &mut Receipt, variant: Variant) -> Result<
     // doc): this row checks the authority, not J's local view.
     let reported_active = redeem_body["join_state"].as_str() == Some("active")
         || redeem_state.as_deref() == Some("active");
+    // A received J's `MemberJoined` and its ban check refused it. On main
+    // there is no ban check, so the counter stays at 0 and this wait ends
+    // at its bound; that is a RED input, not an infra error.
+    let refused_counted = sim
+        .until(
+            &format!("{name}: A's ban check refuses J's MemberJoined"),
+            secs(60),
+            async |s| banned_refusals(s, &group).unwrap_or(0) > 0,
+        )
+        .await
+        .is_ok();
+    let refusals = banned_refusals(sim, &group)?;
+    receipt.evidence(
+        &format!("{name}: A refused J's MemberJoined from the stale invite as banned"),
+        refused_counted,
+        format!("member_joined_rejected_banned={refusals}"),
+        at(sim),
+    );
 
     // 6: lift the drop so A's answer and any Welcome can reach J.
     block.set(false);
@@ -380,17 +425,18 @@ async fn scenario(sim: &Sim, receipt: &mut Receipt, variant: Variant) -> Result<
     } else {
         (None, None, false, "no group secret".to_string())
     };
-    if end_a_row.as_deref() != Some("banned") || end_keyed || j_reads {
+    let fixed = refused_counted && end_a_row.as_deref() == Some("banned") && !end_keyed && !j_reads;
+    if !fixed {
         receipt.cause(
             CAUSE,
             Some(format!(
-                "{name}: A's row for J={end_a_row:?} J keyed={end_keyed} J reads={j_reads}"
+                "{name}: A's row for J={end_a_row:?} J keyed={end_keyed} J reads={j_reads} \
+                 A ban refusals={refusals}"
             )),
             true,
             at(sim),
         );
     }
-    let fixed = end_a_row.as_deref() == Some("banned") && !end_keyed && !j_reads;
     receipt.note(format!(
         "{name}: redeem join_state={} membership={redeem_state:?} \
          reported_active={reported_active} a_seats_j={a_seats_j}; after {}s \
@@ -406,39 +452,31 @@ async fn scenario(sim: &Sim, receipt: &mut Receipt, variant: Variant) -> Result<
     Ok(fixed)
 }
 
-async fn run() -> Receipt {
-    let mut receipt = Receipt::new(CASE, SEED);
-    let mut all_fixed = true;
-    for (index, variant) in [Variant::TreeKem, Variant::SignedPublic]
-        .into_iter()
-        .enumerate()
-    {
-        let seed = SEED + index as u64;
-        match Sim::start(CASE, seed, &["A", "J"]).await {
-            Ok(sim) => {
-                match scenario(&sim, &mut receipt, variant).await {
-                    Ok(fixed) => all_fixed &= fixed,
-                    Err(error) => {
-                        all_fixed = false;
-                        receipt.infra(
-                            format!("{}: {error:#}", variant.name()),
-                            sim.fabric().now().as_micros(),
-                        );
-                    }
-                }
-                if let Err(error) = sim.finish().await {
-                    all_fixed = false;
-                    receipt.infra(format!("{} finish: {error:#}", variant.name()), 0);
+async fn run(variant: Variant) -> Receipt {
+    let mut receipt = Receipt::new(variant.case(), variant.seed());
+    let mut fixed = false;
+    match Sim::start(variant.case(), variant.seed(), &["A", "J"]).await {
+        Ok(sim) => {
+            match scenario(&sim, &mut receipt, variant).await {
+                Ok(done) => fixed = done,
+                Err(error) => {
+                    receipt.infra(
+                        format!("{}: {error:#}", variant.name()),
+                        sim.fabric().now().as_micros(),
+                    );
                 }
             }
-            Err(error) => {
-                all_fixed = false;
-                receipt.infra(format!("{} sim: {error:#}", variant.name()), 0);
+            if let Err(error) = sim.finish().await {
+                fixed = false;
+                receipt.infra(format!("{} finish: {error:#}", variant.name()), 0);
             }
+        }
+        Err(error) => {
+            receipt.infra(format!("{} sim: {error:#}", variant.name()), 0);
         }
     }
     if receipt.verdict().is_none() {
-        receipt.finish(FINAL, all_fixed && !receipt.has_infra(), 0);
+        receipt.finish(FINAL, fixed && !receipt.has_infra(), 0);
     }
     if receipt.has_infra() {
         receipt.reclassify(FINAL);
@@ -447,21 +485,37 @@ async fn run() -> Receipt {
     receipt
 }
 
-/// #1149: a banned agent is not admitted again by an invite that A minted
-/// before the ban, and it gets no TreeKEM keys.
+fn expect_green(variant: Variant) -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run(variant).await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "{}: expected GREEN, got {:?} (RED: A re-admits banned J)",
+            variant.case(),
+            receipt.verdict()
+        );
+        Ok(())
+    })
+}
+
+/// #1149, TreeKEM: a banned agent is not admitted again by an invite that
+/// A minted before the ban, and it gets no TreeKEM keys.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "W3-H daemon cases run in the Linux isolated namespace only"
 )]
-fn w3h_1149_banned_agent_not_readmitted_by_pre_ban_invite() -> Result<()> {
-    super::block_on_paused(async move {
-        let receipt = run().await;
-        ensure!(
-            receipt.verdict() == Some(Verdict::Green),
-            "{CASE}: expected GREEN, got {:?} (RED: A re-admits banned J)",
-            receipt.verdict()
-        );
-        Ok(())
-    })
+fn w3h_1149_treekem_banned_agent_not_readmitted_by_pre_ban_invite() -> Result<()> {
+    expect_green(Variant::TreeKem)
+}
+
+/// #1149, SignedPublic: a banned agent is not seated again by an invite
+/// that A minted before the ban.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1149_signed_public_banned_agent_not_readmitted_by_pre_ban_invite() -> Result<()> {
+    expect_green(Variant::SignedPublic)
 }
