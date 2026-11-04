@@ -20,6 +20,9 @@
 //! the lift; the harness has no redial. (3) The `bound.group_id` /
 //! `bound.source` shape is a guess from §6. (4) The test name does not
 //! match the ADR's proposed `test(w3h_s7_)` selector (repo convention).
+//! (5) B's owner-sync store is not empty: it holds the O and B
+//! enrollments (no Home pointer), written before start. (6) "Never holds
+//! a group other than H" is checked over Home-shaped groups only.
 
 #![cfg(test)]
 
@@ -54,8 +57,9 @@ const CAUSE: &str = "B provisions a Home-shaped group other than H during the O~
 /// What the case saw on B.
 #[derive(Debug, Default)]
 struct Watch {
-    /// First Home-shaped group on B other than H, with its virtual time.
-    duplicate: Option<(String, u128)>,
+    /// First Home-shaped group on B other than H (map key, stable id),
+    /// with its virtual time.
+    duplicate: Option<(String, String, u128)>,
     /// Every distinct `GET /home` state seen on B during the block.
     block_states: Vec<String>,
     /// A `GET /home` body during the block that had the typed settle wait.
@@ -88,12 +92,12 @@ async fn home_shaped(sim: &Sim, label: &str, owner: &UserId) -> Result<Vec<(Stri
         .collect())
 }
 
-/// The first of `groups` that is not `gid` (by key or stable id).
-fn other_than(groups: Vec<(String, String)>, gid: &str) -> Option<String> {
+/// The first of `groups` that is not `gid` (by key or stable id), as
+/// (key, stable id).
+fn other_than(groups: Vec<(String, String)>, gid: &str) -> Option<(String, String)> {
     groups
         .into_iter()
         .find(|(key, stable)| key != gid && stable != gid)
-        .map(|(_, stable)| stable)
 }
 
 /// The fixed facts the watch compares against.
@@ -162,7 +166,7 @@ async fn watch_b(
         if let Some(other) = other_than(groups, &ctx.gid) {
             watch
                 .duplicate
-                .get_or_insert((other, s.fabric().now().as_micros()));
+                .get_or_insert((other.0, other.1, s.fabric().now().as_micros()));
         }
         if polls.is_multiple_of(HOME_EVERY) {
             let Some(home) = seen.observe(get_home(s, "B")).await else {
@@ -197,8 +201,23 @@ async fn ok_api(sim: &Sim, label: &str, method: Method, path: &str, body: Value)
 
 /// Write B's owner-sync store before B starts, so that B's daemon loads
 /// with O and B already enrolled (the H7-1 precondition).
+/// Runs in a sim barrier, so a hang is INFRA.
 async fn enroll_before_start(sim: &Sim, owner: &UserKeypair, b: MachineId) -> Result<()> {
-    let store = crate::owner_sync::OwnerSyncStore::load(&sim.root.path().join("B").join("data"))
+    let o = MachineId(sim.peer("O")?.0);
+    let dir = sim.root.path().join("B").join("data");
+    sim.at_instant(
+        "B's sync store before start",
+        write_enrollments(dir, owner, [o, b]),
+    )
+    .await?
+}
+
+async fn write_enrollments(
+    dir: std::path::PathBuf,
+    owner: &UserKeypair,
+    machines: [MachineId; 2],
+) -> Result<()> {
+    let store = crate::owner_sync::OwnerSyncStore::load(&dir)
         .await
         .map_err(|error| anyhow!("B sync store: {error}"))?;
     let now_ms = u64::try_from(
@@ -206,8 +225,7 @@ async fn enroll_before_start(sim: &Sim, owner: &UserKeypair, b: MachineId) -> Re
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis(),
     )?;
-    let o = MachineId(sim.peer("O")?.0);
-    for machine in [o, b] {
+    for machine in machines {
         let enrollment = crate::owner_sync::OwnerEnrollment::sign(machine, owner, now_ms, None)?;
         store
             .enroll(enrollment)
@@ -403,7 +421,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         if let Some(other) = other_than(groups, &ctx.gid) {
             watch
                 .duplicate
-                .get_or_insert((other, s.fabric().now().as_micros()));
+                .get_or_insert((other.0, other.1, s.fabric().now().as_micros()));
         }
         let Some(home) = seen.observe(get_home(s, "B")).await else {
             return true;
@@ -450,10 +468,10 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     if !passed {
         let seat_gid = seat_body["group_id"].as_str().unwrap_or_default();
         let duplicate = watch.duplicate.as_ref();
-        let observed = duplicate.is_some_and(|(dup, at_us)| {
+        let observed = duplicate.is_some_and(|(key, stable, at_us)| {
             *at_us <= (started + BLOCK).as_micros()
                 && seat_status == StatusCode::OK
-                && seat_gid == dup
+                && (seat_gid == key || seat_gid == stable)
                 && seat_gid != gid
         });
         receipt.cause(
