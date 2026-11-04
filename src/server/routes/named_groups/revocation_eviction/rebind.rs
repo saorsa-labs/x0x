@@ -352,10 +352,11 @@ async fn eligible_admins(state: &AppState, info: &GroupInfo, seat: &[u8; 32]) ->
 /// #1581: the sole-admin form of the §1a wait. The target is the only
 /// Admin-or-higher Active seat, and its own selected certificate is expired
 /// on this node's clock (own trigger, `not_after + τ`), so the renewal the
-/// row waits for is the target's own: the wait names the target.
-/// [`cr::admins_needing_renewal`] keeps answering `None` with no other
-/// admin, because the §4b(2) self-rebind permission reads it; this rule
-/// changes what the row shows, never who may rebind.
+/// row waits for is the target's own: the wait names the target. This rule
+/// is display-only: the §4b(2) self-rebind permission is decided by
+/// [`self_rebind_rule`], which has its own sole-admin arm and reads
+/// [`cr::admins_needing_renewal`] — unchanged, still `None` with no other
+/// admin — so nothing that reads it changes.
 fn sole_admin_renewal(info: &GroupInfo, target: &[u8; 32], now_unix: u64) -> Option<Vec<[u8; 32]>> {
     let admins = admins_with_expiry(info);
     let sole_expired = admins.iter().any(|(id, not_after)| {
@@ -2813,6 +2814,62 @@ mod tests {
         assert_eq!(
             row_override(&RebindState::default(), &info, &row, true, NOW),
             None
+        );
+    }
+
+    /// The exact own-trigger boundary (`now == not_after + τ`): the
+    /// trigger is a strict `>`, so at the boundary the sole admin is not
+    /// expired yet and the row keeps its default wait.
+    #[test]
+    fn row_override_stays_off_at_the_exact_own_trigger_boundary() {
+        const NOW: u64 = 1_000_000;
+        let boundary = NOW - s4::EXPIRY_TOLERANCE_SECS;
+        let (_owner, admin, info) = sole_admin_group(boundary);
+        let row = expiry_row(&info, *admin.agent_id().as_bytes(), boundary);
+        assert_eq!(
+            row_override(&RebindState::default(), &info, &row, true, NOW),
+            None
+        );
+    }
+
+    /// A sole admin whose certificate never expires, and a digest-only
+    /// seat this node holds no certificate bytes for, have no usable
+    /// `not_after`: neither is expired, so the row keeps its default wait.
+    #[test]
+    fn row_override_stays_off_for_a_sole_admin_without_a_usable_expiry() {
+        const NOW: u64 = 1_000_000;
+        let (owner, admin, info) = sole_admin_group(NOW + 600);
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut never = info.clone();
+        cr::install_certificate(
+            &mut never,
+            &admin_hex,
+            AgentCertificate::issue_with_expiry(&owner, &admin, None).expect("certificate"),
+        );
+        never.recompute_state_hash();
+        let never_row = expiry_row(&never, *admin.agent_id().as_bytes(), NOW + 600);
+        assert_eq!(
+            row_override(&RebindState::default(), &never, &never_row, true, NOW),
+            None,
+            "a certificate that never expires is never past the own trigger"
+        );
+        let mut digest_only = info;
+        digest_only
+            .members_v2
+            .get_mut(&admin_hex)
+            .expect("the admin seat")
+            .certificate = None;
+        let digest_only_row = expiry_row(&digest_only, *admin.agent_id().as_bytes(), NOW + 600);
+        assert_eq!(
+            row_override(
+                &RebindState::default(),
+                &digest_only,
+                &digest_only_row,
+                true,
+                NOW
+            ),
+            None,
+            "a seat with no certificate bytes has no expiry to check"
         );
     }
 
