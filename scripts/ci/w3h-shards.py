@@ -49,8 +49,9 @@ RUNS = 20
 # test deadline or the 360-min hosted job limit. 4 parts of 5 reruns take
 # about 85 min each.
 # #1661 welcome-lost row: one rerun is about 230 s on a 12-CPU VM, so about
-# twice that on the runner; 20 reruns (about 155 min) do not fit the S3
-# test deadline. 2 parts of 10 reruns take about 80 min each.
+# 460 s on the runner; 20 reruns (about 153 min) leave almost no margin
+# under the 155-min S3 test deadline. 2 parts of 10 reruns take about
+# 80 min each.
 PARTS = {'s3-d3': 4, 's3-1661': 2}
 
 ROOT = Path(__file__).resolve().parents[2]

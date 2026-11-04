@@ -1306,7 +1306,9 @@ async fn welcome_lost(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         format!("frames J->B since the release: {to_b}"),
         at(sim),
     );
-    let outcome = join_outcome(sim, &group).await?;
+    let outcome = sim
+        .at_instant("read J's join-status", join_outcome(sim, &group))
+        .await??;
     let typed_end = outcome.as_ref().is_some_and(|(outcome, reason)| {
         outcome == "timed_out" && reason.as_deref() == Some("rearm_original_result_unavailable")
     });
