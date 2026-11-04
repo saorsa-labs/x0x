@@ -19294,10 +19294,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             //     before the ban is still in the ledger, and
             //     `add_member_with_kem` below sets a banned row back to
             //     Active, so with no check here the banned agent gets its
-            //     seat and the TreeKEM Welcome again. The request and
-            //     approve paths refuse a banned agent the same way. A
+            //     seat and the TreeKEM Welcome again. The
+            //     `JoinRequestCreated` / `JoinRequestApproved` applies and
+            //     the TreeKEM approve route also refuse a banned agent. A
             //     joiner-signed event cannot end a ban: only an admin
-            //     action (the unban route, or an admin add route) can.
+            //     action can (the unban route, an admin add route, or the
+            //     admin GSS request-approve route, which has no ban check).
             //     Refuse before the invite is consumed, so other holders
             //     can still use it. Step 4 makes `member_agent_id` the
             //     exact derived lowercase id, so this lookup cannot be
@@ -64572,6 +64574,13 @@ pub(in crate::server) mod tests {
         assert!(
             !result.accepted,
             "#1149: an uppercase id must not re-admit the banned agent"
+        );
+        assert_eq!(
+            state
+                .groups_diagnostics
+                .member_joined_rejected_banned(&group_id),
+            0,
+            "#1149: step 4 (exact derived id) refuses it, before the ban check"
         );
         assert_banned_joiner_not_readmitted(&state, &group_id, &banned_hex, &invite_secret).await;
         Ok(())
