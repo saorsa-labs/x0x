@@ -8,7 +8,8 @@
 //! data and identity dirs. Phase 2, on real loopback sockets on a new
 //! plane: O, A and J run in-process on the copies, M runs the released
 //! `x0xd` on M1's copy. A holds O's mandate advert (`Some(true)`) and M's
-//! advert without the bit (`Some(false)`), so the floor check is not blind.
+//! advert without the bit (`Some(false)`), so the floor check has a
+//! verified advert for each member.
 //!
 //! Row. Stop O. A removes J (r+3) and calls the re-seat with basis
 //! `Removal(r+3)`. M restarts on the candidate; once A verifies M's current
@@ -87,8 +88,8 @@ async fn floor_row(out: &Path, ex: &Exported, bin: &Path, receipt: &mut Receipt)
     let (second, answer) = a
         .call(Method::POST, &reseat, Some(reseat_body(&removal)))
         .await?;
-    // Read at once: A prunes its issued re-seat when J is seated. This also
-    // shows that the sidecar read is not blind.
+    // Read at once: A prunes its issued re-seat when J is seated. A count
+    // of 1 here also shows that `sidecar_state` sees issued re-seats.
     let issued = sidecar_state(&a_data, j_hex)?;
     // J must reach A's r+4 head; J's state is read, not its API.
     let deadline = tokio::time::Instant::now() + RESEAT_BOUND;
@@ -169,8 +170,12 @@ fn row(receipt: &mut Receipt) -> Result<()> {
     Ok(())
 }
 
-/// H-S3-rm1 (capability floor, D156): a control (on `main` the route
-/// returned 404).
+/// H-S3-rm1 (capability floor, D156). This row has no red proof. It
+/// tests the S3 floor check, which came in with the re-seat route
+/// (`POST /groups/:id/members/:agent_id/reseat`). That route is on
+/// `main` now. Before S3 the route did not exist, and the released
+/// v0.46.1 still returns 404 for it, so a revert gives a 404, not a
+/// failed floor check.
 #[test]
 #[ignore = "released-binary row: needs X0X_V0461_BIN; runs in its own CI job (#1572)"]
 fn released_s3_rm1_floor_names_the_released_member() -> Result<()> {

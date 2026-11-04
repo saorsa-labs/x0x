@@ -425,7 +425,7 @@ impl Released {
 /// Kill the child here, so no released daemon outlives its row.
 impl Drop for Released {
     fn drop(&mut self) {
-        if matches!(self.child.try_wait(), Ok(None)) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }

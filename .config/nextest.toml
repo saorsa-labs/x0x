@@ -320,13 +320,13 @@ slow-timeout = { period = "60s", terminate-after = 25 }
 [test-groups.h-s3-home-released]
 max-threads = 2
 
-# ADR 0109 §10 H-S3-rm released-binary rows (#1572), rm1 and rm3. They
-# are `#[ignore]` and run only in the `h-s3-released-rows` CI job. Each
-# row runs a W3-H prefix, then four or five daemons on real loopback
-# sockets, one of them the published v0.46.1. A row took 145-250 s on a
-# 12-CPU VM, and the 4-vCPU runner takes about twice as long, so the
-# 10-minute default limit is too near. The limit is 25 minutes per row.
-# The group runs one row at a time.
+# ADR 0109 §10 H-S3-rm released-binary rows (#1572): rm1, rm3 (i) and
+# rm3 (ii). They are `#[ignore]` and run only in the `h-s3-released-rows`
+# CI job. Each row runs a W3-H prefix, then four or five daemons on real
+# loopback sockets, one of them the published v0.46.1. A row took
+# 145-250 s on a 12-CPU VM, and the 4-vCPU runner takes about twice as
+# long, so the 10-minute default limit is too near. The limit is 25
+# minutes per row. The group runs one row at a time.
 [[profile.default.overrides]]
 filter = 'test(/::owner_axis::released::/)'
 test-group = "h-s3-released-rows"

@@ -554,15 +554,16 @@ jobs:
           if-no-files-found: warn
 
   # ADR 0109 §10 H-S3-rm released-binary rows (#1572): rm1 (capability
-  # floor) and rm3 (older receiver after the seal). Phase 1 of each row
-  # runs on the paused W3-H sim; phase 2 runs candidate daemons on real
-  # loopback sockets, with member M on the published v0.46.1 daemon. The
-  # rows are `#[ignore]` and run only here, one at a time. A row takes
-  # 3 to 4 minutes on a 12-CPU VM. The job is separate because it needs
-  # the released binary. It is not a required check. The pinned v0.46.1
-  # is installed before the loopback-only namespace: nextest-isolated.sh
-  # fetches it only for the `h_s3_home_released` binary, and these rows
-  # are in the lib test binary. `tokio_unstable` matches the VM runs.
+  # floor) and rm3 (i) and (ii) (older receiver after the seal). Phase
+  # 1 of each row runs on the paused W3-H sim; phase 2 runs candidate daemons on real loopback sockets, with member
+  # M on the published v0.46.1 daemon. The rows are `#[ignore]` and run
+  # only here, one at a time. A row took 145-250 s on a 12-CPU VM, and
+  # the 4-vCPU runner takes about twice as long. The job is separate
+  # because it needs the released binary. It is not a required check.
+  # The pinned v0.46.1 is installed before the loopback-only namespace:
+  # nextest-isolated.sh fetches it only for the `h_s3_home_released`
+  # binary, and these rows are in the lib test binary. `tokio_unstable`
+  # matches the VM runs.
   h-s3-released-rows:
     name: H-S3-rm released-binary rows
     runs-on: ubuntu-latest
@@ -610,9 +611,15 @@ jobs:
           else
             export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--cfg tokio_unstable"
           fi
+          # Keep the run output, with each row's W3H-RECEIPT line, as an
+          # artifact. The file is outside `target` so the cache does not
+          # keep it. pipefail keeps the nextest exit status.
+          set -o pipefail
+          mkdir -p h-s3-released-rows-logs
           bash scripts/ci/nextest-isolated.sh --locked --all-features --lib -- \
             --run-ignored ignored-only --no-tests=fail --success-output final \
-            -E 'test(/::owner_axis::released::/)'
+            -E 'test(/::owner_axis::released::/)' \
+            2>&1 | tee h-s3-released-rows-logs/nextest.log
 
       - name: Upload H-S3-rm custody
         if: always()
@@ -625,6 +632,17 @@ jobs:
             ${{ runner.temp }}/x0x-metadata-*/
             ${{ runner.temp }}/x0x-isolation-*/
           if-no-files-found: warn
+
+      - name: Upload H-S3-rm row logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: h-s3-released-rows-logs
+          # The nextest output: each row's notes and W3H-RECEIPT line, and
+          # the v0.46.1 stderr if that daemon stopped before its API.
+          path: h-s3-released-rows-logs/nextest.log
+          if-no-files-found: warn
+          retention-days: 14
 
   linux-systemd-policy:
     name: Linux systemd policy acceptance
