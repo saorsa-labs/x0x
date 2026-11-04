@@ -9,36 +9,50 @@
 //! 1. A creates the group and seats H through the public invite API. A
 //!    promotes H to Admin.
 //! 2. A seats M01–M23 through the public invite API, one at a time, so
-//!    the group has 25 Active seats. H applies every add.
-//! 3. A mints an invite for J through the public invite API. Above the
-//!    cap this is ADR 0112's V5 view, which binds the base root R.
+//!    the group has 25 Active seats. The 25 seats converge: A, H and
+//!    every member list all 25.
+//! 3. A mints an invite for J through the public invite API. The request
+//!    is addressed to J (`intended_joiner`) and has an explicit finite
+//!    lifetime (`expiry_secs`, the 7-day default). These are the two
+//!    fields that ADR 0112 V5 makes mandatory (D99, D104). On `main`
+//!    there is no V5, so this request mints a V4 invite.
 //! 4. A stops (crash). H stays online.
 //! 5. J calls `POST /groups/join`.
 //!
-//! FINAL `j_holds_the_25_seat_base_roster_from_h_while_a_is_stopped`:
-//! within 120 s of the join call, J lists all 25 base seats. A is
-//! stopped, so on the ADR 0111/0112 path the roster comes from H (S5's
-//! `roster_projection` fetch at R).
+//! FINAL `j_holds_the_25_seat_base_roster_while_a_is_stopped`: within
+//! 120 s of the join call, J lists all 25 base seats while A is stopped.
 //!
 //! Baseline on `main`: RED. A cannot mint an invite whose base roster has
 //! more than `MAX_INVITE_ROSTER_ENTRIES` (20) entries (#646,
-//! `src/groups/invite.rs`). With 21 seats seated (A, H and M01–M19),
-//! the mint for M20, the 22nd seat, is `413 invite_too_large` with
+//! `src/groups/invite.rs`). With 21 seats (A, H and M01–M19), the mint
+//! for M20, the 22nd seat, is `413 invite_too_large` with
 //! `field = base_roster` and `size = 21`. So step 2 never reaches 25
-//! seats. The red test pins that cause: the 413
-//! body must name `base_roster` and a size above 20. Any other failure
-//! is INFRA, never the expected RED.
+//! seats. The red test pins that cause: the 413 body must name
+//! `base_roster` and a size equal to the seats A holds, above 20. Any
+//! other failure is INFRA, never the expected RED.
 //!
-//! Fidelity notes:
+//! Fidelity notes (what the GREEN slice must change):
+//! - Step 3 sends the V5 request fields, but it mints a V4 invite on
+//!   `main`. A V4 invite stays issuer-pinned (ADR 0112, D99), so with A
+//!   stopped it cannot turn GREEN. The V5 slice must make this request
+//!   mint the InviteV5 view that binds the base root R (or change the
+//!   request to the V5 mint selector it adds), and assert that it did.
 //! - ADR H6's setup also gives J an authenticated relationship with H and
 //!   H's verified advert with the S5 bit. Those surfaces do not exist on
 //!   `main`. On the S5/S6 branch the case must add them before step 5.
-//! - The S5 serving assertions (H admits the request inside the
-//!   membership lock; J makes no other pre-member fetch) need S5
-//!   counters that `main` does not have. The FINAL here is the public
-//!   observable only: J holds the 25-seat base roster while A is down.
-//! - The test expects RED until S5 (ADR 0111) and V5 (ADR 0112) merge.
-//!   Then it flips to GREEN, as #1256 and #1357 did.
+//! - The FINAL is the public observable only: J lists the 25 base seats
+//!   while A is down. It does not show which holder served the roster
+//!   (H or a member: all are online), and it does not check that J
+//!   re-derives R. H6's S5 assertions (J sends H one
+//!   `group_object_fetch_v1` for `roster_projection` at R, H admits it
+//!   inside the membership lock, J re-derives R, J makes no other
+//!   pre-member fetch) need S5 counters that `main` does not have. The
+//!   S5 slice must add them.
+//! - The test expects RED with the #646 cause pinned. When S5 (ADR 0111)
+//!   and V5 (ADR 0112) merge, the implementing PR changes the expectation
+//!   to GREEN and keeps the `_red_` name, as #1256 and #1357 did.
+//! - ADR 0111's control C4 (no roster to a banned or forged joiner) is
+//!   not in this case. It is a later slice.
 
 #![cfg(test)]
 
@@ -49,13 +63,11 @@ use super::control::{create_group, invite, join, members, mesh};
 use super::home::membership_state;
 use super::receipt::{Receipt, Verdict};
 use super::*;
-use anyhow::ensure;
-use axum::http::StatusCode;
 use serde_json::{json, Value};
 
 const SEED: u64 = 0x1358_0006;
 const CASE: &str = "w3h_1358_red_h6_invite_roster_above_cap";
-const FINAL: &str = "j_holds_the_25_seat_base_roster_from_h_while_a_is_stopped";
+const FINAL: &str = "j_holds_the_25_seat_base_roster_while_a_is_stopped";
 /// The shipped v4 invite roster cap (#646). A literal on purpose: if
 /// `MAX_INVITE_ROSTER_ENTRIES` changes, this case must be read again.
 const INVITE_ROSTER_CAP: usize = 20;
@@ -95,15 +107,24 @@ fn is_roster_cap_refusal(status: StatusCode, body: &Value) -> bool {
             .is_some_and(|size| size > INVITE_ROSTER_CAP as u64)
 }
 
-/// One mint through the public invite API: the link, or the #646 refusal
-/// body. Any other failure is an error (INFRA).
-async fn mint(sim: &Sim, group: &str) -> Result<std::result::Result<String, Value>> {
+/// The shipped default invite lifetime (`DEFAULT_EXPIRY_SECS`, 7 days),
+/// sent explicitly for J's invite: ADR 0112 V5 needs a finite expiry
+/// (D104).
+const J_INVITE_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// One mint through the public invite API with `request` as the body: the
+/// link, or the #646 refusal body. Any other failure is an error (INFRA).
+async fn mint(
+    sim: &Sim,
+    group: &str,
+    request: Value,
+) -> Result<std::result::Result<String, Value>> {
     let (status, body) = sim
         .api(
             "A",
             Method::POST,
             &format!("/groups/{group}/invite"),
-            Some(json!({})),
+            Some(request),
         )
         .await?;
     if is_roster_cap_refusal(status, &body) {
@@ -187,10 +208,11 @@ async fn record_refusal(
         format!("seats={}", seated.len()),
         at(sim),
     );
+    let size_is_seats = body["size"].as_u64() == u64::try_from(seated.len()).ok();
     receipt.cause(
         CAUSE,
         Some(format!("seats={} body={body}", seated.len())),
-        seated.len() > INVITE_ROSTER_CAP,
+        seated.len() > INVITE_ROSTER_CAP && size_is_seats,
         at(sim),
     );
     Ok(())
@@ -217,7 +239,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
 
     // Step 2: 25 Active seats through the public invite API.
     for member in MEMBERS {
-        match mint(sim, &group).await? {
+        match mint(sim, &group, json!({})).await? {
             Ok(link) => seat_with(sim, &link, member, &group).await?,
             Err(body) => {
                 record_refusal(sim, receipt, &group, &seated, &body).await?;
@@ -227,19 +249,32 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         seated.insert(sim.agent_hex(member)?);
     }
     ensure!(seated.len() == SEATS, "seated {} of {SEATS}", seated.len());
-    sim.until("H applies all 25 seats", SETUP, async |s: &Sim| {
-        lists_all(s, "H", &group, &seated).await
+    // Step 1 of H6: the 25 seats converge on every seated node.
+    let mut holders = vec!["A", "H"];
+    holders.extend_from_slice(MEMBERS);
+    sim.until("the 25 seats converge", SETUP, async |s: &Sim| {
+        for holder in &holders {
+            if !lists_all(s, holder, &group, &seated).await {
+                return false;
+            }
+        }
+        true
     })
     .await?;
     receipt.evidence(
-        "A seated 25 Active members and H lists all of them",
+        "A seated 25 Active members and every seated node lists all of them",
         true,
         format!("seats={}", seated.len()),
         at(sim),
     );
 
-    // Step 3: J's invite. Above the cap this is ADR 0112's V5 view.
-    let link = match mint(sim, &group).await? {
+    // Step 3: J's invite, addressed to J with a finite expiry (the ADR
+    // 0112 V5 request fields, D99 and D104). On `main` this is a V4 invite.
+    let request = json!({
+        "intended_joiner": sim.agent_hex("J")?,
+        "expiry_secs": J_INVITE_EXPIRY_SECS,
+    });
+    let link = match mint(sim, &group, request).await? {
         Ok(link) => link,
         Err(body) => {
             record_refusal(sim, receipt, &group, &seated, &body).await?;
@@ -249,6 +284,8 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
 
     // Steps 4 and 5: A stops, H stays online, J joins.
     sim.stop("A", RestartMode::Crash).await?;
+    // H6 measures the 120 s from the join call.
+    let started = sim.fabric().now();
     let (status, body) = sim
         .api(
             "J",
@@ -258,18 +295,18 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<bool> {
         )
         .await?;
     receipt.note(format!("J join with A stopped: {status} {body}"));
-    let started = sim.fabric().now();
+    let remaining = ROSTER_BUDGET.saturating_sub(sim.fabric().now().saturating_sub(started));
     let holds = sim
         .until(
             "J holds the 25-seat base roster with A stopped",
-            ROSTER_BUDGET,
+            remaining,
             async |s: &Sim| lists_all(s, "J", &group, &seated).await,
         )
         .await
         .is_ok();
     let elapsed = sim.fabric().now().saturating_sub(started);
     receipt.request_delivered(
-        "J holds the 25-seat base roster while A is stopped (H is the only issuer-side holder)",
+        "J holds the 25-seat base roster within 120 s of the join call while A is stopped",
         holds,
         format!("elapsed_ms={}", elapsed.as_millis()),
         at(sim),
@@ -309,8 +346,9 @@ async fn run(case: &str, seed: u64) -> Receipt {
     receipt
 }
 
-/// ADR 0111 H6 on `main`: RED, with the #646 cause pinned. It flips to
-/// GREEN once S5 (ADR 0111) and V5 (ADR 0112) have merged.
+/// ADR 0111 H6 on `main`: RED, with the #646 cause pinned. The PR that
+/// implements S5 (ADR 0111) and V5 (ADR 0112) changes this expectation to
+/// GREEN and keeps the `_red_` name, as #1357 did.
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
