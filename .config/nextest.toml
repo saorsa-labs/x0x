@@ -320,7 +320,8 @@ slow-timeout = { period = "60s", terminate-after = 25 }
 [test-groups.h-s3-home-released]
 max-threads = 2
 
-# ADR 0109 §10 H-S3-rm released-binary rows (#1572), rm1 and rm3. They
+# ADR 0109 §10 H-S3-rm released-binary rows (#1572). Only rm1 exists
+# now; the filter also selects later rows in the same module. They
 # are `#[ignore]` and run only in the `h-s3-released-rows` CI job. Each
 # row runs a W3-H prefix, then four or five daemons on real loopback
 # sockets, one of them the published v0.46.1. A row took 145-250 s on a
