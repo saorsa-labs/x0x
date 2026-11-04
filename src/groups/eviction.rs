@@ -338,7 +338,8 @@ pub struct WaitingState {
     /// The agent IDs the state names (designated admin, revoked admins,
     /// holding survivors).
     pub named: Vec<[u8; 32]>,
-    /// For `waiting_for_designated_admin`: why.
+    /// For the designated-wait causes (`waiting_for_designated_admin`,
+    /// `unresolved_designated_admin`): why.
     pub designated_detail: Option<DesignatedWaitDetail>,
     /// For timed waits: the remaining budget in milliseconds at the time
     /// the state was computed.
@@ -2462,6 +2463,12 @@ mod tests {
             undispatched.waiting.as_ref().map(|waiting| waiting.cause),
             Some(WaitingCause::WaitingForDesignatedAdmin)
         );
+
+        // Rank 1 falls back at W, so it never reaches the split at all.
+        row.first_dispatch_unix_ms = Some(981_000);
+        let rank_one = evaluate_row(&row, &ctx(2, &admins, &none, waiting_rank), &timing);
+        assert_eq!(rank_one.waiting, None);
+        assert_eq!(rank_one.action, RowAction::CommitRemoval { rank: 1 });
     }
 
     #[test]
