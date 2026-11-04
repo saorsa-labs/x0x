@@ -26,6 +26,8 @@
 //! no node commits. J's `recovery.asked` shows each answer (§8). Only an
 //! admin's `GET /groups/:id/recovery` lists requesters (§8), so A's list
 //! also shows J was refused before any walk; M1's and M2's are empty.
+//! J's own check of the ATA refuses it (`HeadMismatch`), and at least one
+//! X->J direct frame carries that recovery response for J's head.
 //!
 //! Fidelity: the hold keys on a write's origin (the first sender of its
 //! pubsub message ID), so relays are held too. Transport control passes.
@@ -36,7 +38,7 @@ use super::gaps::{answered, promote, recovery_route, recovery_text, sees_s3};
 use super::*;
 use crate::groups::recovery::{
     encode_message, AdminTerminalAttestation, AttestAnswer, GroupAttestResponseV1,
-    GroupRecoveryMessageV1,
+    GroupRecoveryMessageV1, RecoveryRefusal, GROUP_RECOVERY_PREFIX,
 };
 use crate::network::sim::{Fault, Key, LaneClass};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -359,8 +361,9 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     if !exposed {
         let observed =
             format!("J {j1_text}; marked {j_marked:?}; A/M1/M2 first change {main_changed:?}");
-        let red = j_marked.is_some() || main_changed.is_some();
-        receipt.cause(CAUSE, Some(observed), red, at(sim));
+        // X sealed J (setup) and J's join reached X, so a J that is not
+        // Active on X's branch after the first advance is a row failure.
+        receipt.cause(CAUSE, Some(observed), true, at(sim));
         receipt.finish(FINAL, false, at(sim));
         return Ok(());
     }
@@ -474,6 +477,18 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     if !all_refused(&j_recovery, &main_hex, &a_route, &j_hex) {
         failing.push("a_m1_m2_each_refuse_not_a_member");
     }
+    // §8: only an active admin lists requesters, so M1's and M2's lists
+    // are empty although they answer J.
+    let mut member_lists: Vec<String> = Vec::new();
+    for label in ["M1", "M2"] {
+        let route = recovery_route(sim, label, &group).await?;
+        if !route["requesters"].as_array().is_some_and(Vec::is_empty) {
+            member_lists.push(format!("{label} {}", route["requesters"]));
+        }
+    }
+    if !member_lists.is_empty() {
+        failing.push("m1_m2_requester_lists_empty");
+    }
     let typed = status(sim, "J", &group).await?.is_some_and(|st| {
         st.recovery_state() == Some("reseat_required")
             && st.recovery_cause() == Some("not_a_member")
@@ -495,6 +510,9 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         carry.fields.issued_at_ms,
         false,
     );
+    if !matches!(local, Err(RecoveryRefusal::HeadMismatch)) {
+        failing.push("j_local_check_refuses_the_ata_head_mismatch");
+    }
     let payload = encode_message(&GroupRecoveryMessageV1::Response(GroupAttestResponseV1 {
         group: carry.fields.group.clone(),
         subject: sim.ids("J")?.0 .0,
@@ -506,18 +524,36 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         .fabric()
         .mark_indexed("case: X injects its join-carry ATA");
     let (agent, j_id) = (sim.state("X")?.agent.clone(), sim.ids("J")?.0);
-    sim.within("X sends the ATA", SEND_BOUND, async {
-        let _ = agent.send_direct(&j_id, payload).await;
-    })
-    .await?;
+    let sent = sim
+        .within("X sends the ATA", SEND_BOUND, async {
+            agent.send_direct(&j_id, payload).await
+        })
+        .await?;
     hold.set(sim, CUT_X, "everything to and from X");
-    let injected = delivered_after(sim, "X", "J", injected_at)?;
+    // A failed send is INFRA: the row could not test J's handling.
+    sent.map_err(|error| anyhow::anyhow!("X's ATA send to J failed: {error}"))?;
+    // Only direct frames with the recovery prefix and J's head hash are
+    // the injected response; X's other traffic to J does not count.
+    let injected = sim
+        .fabric()
+        .delivered_writes_after(&sim.peer("X")?, &sim.peer("J")?, injected_at)
+        .iter()
+        .filter(|(w, _)| matches!(w.lane.class, LaneClass::Direct | LaneClass::RelayedDm))
+        .filter(|(w, _)| has(&w.bytes, GROUP_RECOVERY_PREFIX))
+        .filter(|(w, _)| has(&w.bytes, j2.state_hash.as_bytes()))
+        .count();
     receipt.request_delivered(
         "x_ata_reached_j",
         injected > 0,
-        format!("frames X->J for the injection: {injected}; local verify {local:?}"),
+        format!(
+            "direct X->J frames carrying the recovery response for J's head: {injected}; \
+             local verify {local:?}"
+        ),
         at(sim),
     );
+    if injected == 0 {
+        failing.push("x_ata_reached_j");
+    }
     sim.within("J handles the ATA", AFTER_INJECT + secs(2), async {
         tokio::time::sleep(AFTER_INJECT).await;
     })
@@ -535,8 +571,8 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
     }
     let observed = format!(
         "failing {failing:?}; J marker {marker:?} -> {marker_after:?} (A's r+1 {} by {}); J \
-         states {states:?} -> {end_text}; J asked {}; A's requesters {}; heads {before:?} -> \
-         {after:?}; held writes {}",
+         states {states:?} -> {end_text}; J asked {}; A's requesters {}; M1/M2 non-empty \
+         lists {member_lists:?}; heads {before:?} -> {after:?}; held writes {}",
         short(&removal.state_hash),
         short(&a_hex),
         j_recovery["asked"],
