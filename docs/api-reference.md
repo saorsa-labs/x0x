@@ -1928,8 +1928,9 @@ hold file with its sender and the displacing wait's epoch, and it
 re-delivers through the ordinary share path once a head commits that
 epoch — so the later rotation's own commit lands with its key, and an
 honest share-before-commit reordering stalls on no re-delivery. A
-superseded intermediate install parks the later key it drops the same
-way. One exception: when the hold file records no sender for the
+promoted or superseded intermediate install parks the later key it
+drops only when the held step that raises to that epoch has the key's
+sender as its author. It drops any other later key. One exception: when the hold file records no sender for the
 displaced secret, that secret parks nowhere and is lost. A crash
 between the key write and its record write leaves the sender unknown,
 with no provenance to re-deliver, and the daemon logs a warning. The
@@ -1937,8 +1938,9 @@ re-delivery also runs after an accepted share installs: a keyless
 commit can commit the displacing wait's epoch with no share of its
 own, so no later commit would carry it. The parked record goes when
 its epoch commits, when a secret of its epoch or a later one is
-already in, or when its sender is revoked or the roster holds below
-Admin; the file keeps one parked record per group, and a live record
+already in, when its sender is revoked or the roster holds below
+Admin, or when a held removal or ban targets its sender. A replay of
+the installed frame also re-delivers it. The file keeps one parked record per group, and a live record
 keeps the slot, so a second displacement in the same window parks
 nowhere and is lost, with the same warning.
 

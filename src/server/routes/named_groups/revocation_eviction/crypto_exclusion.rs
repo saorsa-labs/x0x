@@ -10022,6 +10022,43 @@ mod daemon_tests {
             Some(foreign.as_slice()),
             "the re-delivered secret survives the replay"
         );
+
+        // (6) A replay of the installed frame re-delivers an eligible
+        // parked record: a crash after the head persisted and before the
+        // install's replay leaves one (claude review at 5e389451).
+        let next_key = [0xB8u8; 32];
+        ng::gss_share_hold::test_seam::force_parked_secret(
+            &fx.replica,
+            &fx.group_id,
+            ng::gss_share_hold::ParkedSecret {
+                secret_epoch: next_secret_epoch + 2,
+                sender: b_hex.clone(),
+                secret: next_key.to_vec(),
+                waits_epoch: next_secret_epoch + 1,
+            },
+        );
+        assert_eq!(
+            receive(&fx.replica, b, &b_frame).await,
+            ReceiveOutcome::Duplicate,
+            "the installed frame replays as a duplicate"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+            "the duplicate replay re-delivered the record"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            (installed.secret_epoch, installed.shared_secret.as_deref()),
+            (next_secret_epoch + 2, Some(next_key.as_slice())),
+            "the duplicate replay installed the parked key"
+        );
         Ok(())
     }
 
@@ -10637,6 +10674,26 @@ mod daemon_tests {
                 member.role = x0x::groups::GroupRole::Admin;
             }
         }
+
+        // Removed: a held removal of B waits at the parked epoch. The
+        // share apply refuses B's key, so the record goes without a
+        // re-seal (claude review at 5e389451).
+        parked(
+            &fx,
+            next_secret_epoch + 1,
+            b_hex.clone(),
+            foreign.to_vec(),
+            committed,
+        );
+        ng::gss_share_hold::test_seam::force_removal_hold(
+            &fx.replica,
+            &fx.group_id,
+            next_secret_epoch + 1,
+            &b_hex,
+        );
+        redeliver(&fx).await;
+        gone(&fx, "a record whose sender a held removal targets goes");
+        ng::gss_share_hold::test_seam::clear_exclusion_holds(&fx.replica, &fx.group_id);
 
         // Gone: the sender is no member of the roster at all.
         parked(

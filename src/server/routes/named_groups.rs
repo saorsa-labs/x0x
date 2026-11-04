@@ -61359,7 +61359,7 @@ pub(in crate::server) mod tests {
         let path = gss_share_hold::test_seam::hold_path_for(&f.state, &f.group_id);
         let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let version = gss_share_hold::test_seam::hold_file_version();
-        assert_eq!(written["version"], 2, "the written file carries version 2");
+        assert_eq!(written["version"], 1, "the written file carries version 1");
         let newer = serde_json::to_vec(&serde_json::json!({
             "version": version + 1,
             "group_key": f.group_id,

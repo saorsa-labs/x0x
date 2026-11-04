@@ -187,7 +187,7 @@ struct HeldRemoval {
 /// envelope sealed to this node) once the head commits the epoch of the
 /// wait that displaced it, so the later rotation's commit lands with its
 /// key and an honest reordering stalls on nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ParkedSecret {
     /// The epoch of the displaced secret.
     pub(super) secret_epoch: u64,
@@ -203,13 +203,32 @@ pub(super) struct ParkedSecret {
     pub(super) waits_epoch: u64,
 }
 
+/// The secret value is not printed: a log line of the record must not
+/// carry the key.
+impl std::fmt::Debug for ParkedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParkedSecret")
+            .field("secret_epoch", &self.secret_epoch)
+            .field("sender", &self.sender)
+            .field("secret", &"<redacted>")
+            .field("waits_epoch", &self.waits_epoch)
+            .finish()
+    }
+}
+
 /// The hold file format version. v2 (ADR 0085, #1775 review round 12)
 /// adds the optional `keyless` (#1775) and `parked` (#1775 round 11)
-/// fields. v1 already carries the optional `share_sender` (#1766). A binary that knows only v1 refuses
+/// fields. v1 already carries the optional `share_sender` (#1766). A
+/// file is written as v2 only when it carries one of the v2 fields
+/// (Engineer ruling (b), 4 Nov 05:25 GMT); every other file stays v1,
+/// so a downgrade holds only the groups that carry v2 state. A binary that knows only v1 refuses
 /// a v2 file (`decode_hold_file`), so it never loads one, drops the new
 /// state in memory and re-saves without it: a downgrade keeps the file
 /// intact and its group held instead.
 const HOLD_FILE_VERSION: u32 = 2;
+
+/// The version of a hold file that carries no v2 field.
+const HOLD_FILE_VERSION_V1: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct HoldFile {
@@ -887,8 +906,13 @@ pub(super) async fn persist(state: &AppState, group_key: &str) -> std::io::Resul
             Err(error) => Err(error),
         };
     }
+    let version = if keyless.is_some() || parked.is_some() {
+        HOLD_FILE_VERSION
+    } else {
+        HOLD_FILE_VERSION_V1
+    };
     let file = HoldFile {
-        version: HOLD_FILE_VERSION,
+        version,
         group_key: group_key.to_string(),
         removals,
         exclusions,
@@ -1952,6 +1976,36 @@ pub(in crate::server) mod test_seam {
             .insert(group_key.to_string(), parked);
     }
 
+    /// Seed an evicted removal's exclusion hold of `secret_epoch` that
+    /// removes `removed_hex`, as [`keep_evicted_removal`] keeps one.
+    pub(in crate::server) fn force_removal_hold(
+        state: &AppState,
+        group_key: &str,
+        secret_epoch: u64,
+        removed_hex: &str,
+    ) {
+        push_exclusion(
+            state,
+            group_key,
+            ExclusionHold {
+                parent_state_hash: String::new(),
+                secret_epoch,
+                removed: vec![removed_hex.to_ascii_lowercase()],
+                actors: Some(Vec::new()),
+            },
+        );
+    }
+
+    /// Drop every exclusion hold of the group from memory.
+    pub(in crate::server) fn clear_exclusion_holds(state: &AppState, group_key: &str) {
+        state
+            .gss_share_holds
+            .exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(group_key);
+    }
+
     /// The hold file format version this binary writes.
     pub(in crate::server) fn hold_file_version() -> u32 {
         HOLD_FILE_VERSION
@@ -2570,6 +2624,64 @@ mod tests {
         );
     }
 
+    /// #1775 (claude review at 3e100c71): a failed park write or a failed
+    /// keyless-mark write puts the record it replaced back in memory, as
+    /// the disk still holds it.
+    #[tokio::test]
+    async fn a_failed_write_restores_the_replaced_record() {
+        let (state, _dir) = test_state().await;
+        let group_key = "g".to_string();
+        // A dead parked record (a head commits its epoch) that the next
+        // park replaces.
+        let dead = ParkedSecret {
+            secret_epoch: 2,
+            sender: "aa".repeat(32),
+            secret: vec![0xA2; 32],
+            waits_epoch: 1,
+        };
+        super::test_seam::force_parked_secret(&state, &group_key, dead.clone());
+        let other = "bb".repeat(32);
+        let parent = gss_info_at_head(2, Some([0x99u8; 32]));
+        let foreign = [0xB5u8; 32];
+        let mut displaced = parent.clone();
+        displaced.secret_epoch = 4;
+        displaced.shared_secret = Some(foreign.to_vec());
+        note_share_sender(&state, &group_key, &parent, 4, &other, &foreign).await;
+        super::test_seam::force_hold_write_failure(&state, &group_key);
+        assert!(
+            !park_displaced_secret(&state, &group_key, &displaced, 3).await,
+            "the park reports the failed durable write"
+        );
+        assert_eq!(
+            parked_secret(&state, &group_key),
+            Some(dead),
+            "the replaced record is back in memory"
+        );
+        // The keyless mark: an earlier mark, then a failed write of a
+        // newer one.
+        super::test_seam::simulate_restart(&state).await;
+        ensure_loaded(&state).await;
+        assert!(note_keyless_commit(&state, &group_key, 2, &"aa".repeat(32), "h2").await);
+        super::test_seam::force_hold_write_failure(&state, &group_key);
+        assert!(
+            !note_keyless_commit(&state, &group_key, 3, &"aa".repeat(32), "h3").await,
+            "the mark reports the failed durable write"
+        );
+        let mark = state
+            .gss_share_holds
+            .keyless
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&group_key)
+            .cloned()
+            .expect("the earlier mark is back");
+        assert_eq!(
+            (mark.secret_epoch, mark.head.as_str()),
+            (2, "h2"),
+            "the earlier mark is restored, not dropped"
+        );
+    }
+
     /// #1775 (claude review round 12 and the review at 5e389451): the
     /// one parked slot keeps a live record — no head commits its epoch,
     /// and it is at or above the newly displaced epoch — so a later park
@@ -2693,9 +2805,10 @@ mod tests {
         );
     }
 
-    /// #1775 review round 12 (ADR 0085, claude review at 5e389451): a
-    /// v1 file that this binary loads and then writes again becomes a
-    /// v2 file, and its holds stay in it.
+    /// #1775 review round 12 (ADR 0085, Engineer ruling (b), claude
+    /// reviews at 5e389451 and 3e100c71): a v1 file that this binary
+    /// loads and writes again stays v1 while it carries no v2 field, and
+    /// becomes v2 when it does; its holds stay in it each time.
     #[tokio::test]
     async fn a_v1_hold_file_rewrites_as_v2_and_keeps_its_holds() {
         let (state, _dir) = test_state().await;
@@ -2717,7 +2830,31 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("the file stays"))
                 .expect("the rewritten file decodes");
-        assert_eq!(written["version"], 2, "the rewrite carries version 2");
+        assert_eq!(
+            written["version"], 1,
+            "a rewrite with no v2 field stays version 1"
+        );
+        // A parked secret is a v2 field: the next write is version 2,
+        // and the holds stay in it.
+        super::test_seam::force_parked_secret(
+            &state,
+            &group_key,
+            ParkedSecret {
+                secret_epoch: 3,
+                sender: "cc".repeat(32),
+                secret: vec![0xC3; 32],
+                waits_epoch: 2,
+            },
+        );
+        persist(&state, &group_key).await.expect("the write lands");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("the file stays"))
+                .expect("the rewritten file decodes");
+        assert_eq!(written["version"], 2, "a file with a v2 field is version 2");
+        assert!(
+            !format!("{:?}", parked_secret(&state, &group_key)).contains("195"),
+            "the record's Debug form does not print the key bytes"
+        );
         let exclusions = written["exclusions"]
             .as_array()
             .expect("the rewrite keeps its exclusions");
