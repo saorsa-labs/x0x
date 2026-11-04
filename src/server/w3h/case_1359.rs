@@ -16,8 +16,9 @@
 //!    600 s GSS; D102) plus margin.
 //! 4. Desired (ADR 0112): by T, measured from J's join call, B seats J,
 //!    J is `active` (TreeKEM: J installed the group) and J decrypts B's
-//!    next group message. J sends nothing to A after A stops: no delivered
-//!    frame and no refused send or dial. A roster seat alone does not pass.
+//!    next group message. J sends no join/redemption frame to A after A
+//!    stops (written or refused; matched as `request_kind` matches). Other
+//!    J-to-A traffic is only noted. A roster seat alone does not pass.
 //!
 //! Main: a receiver other than the inviter keeps J's `MemberJoined` as
 //! recovery evidence and does not redeem it. J's attempt waits for a result
@@ -46,7 +47,7 @@ use super::receipt::{Receipt, Verdict};
 use super::*;
 use crate::groups::invite::SignedInvite;
 use crate::groups::GroupRole;
-use crate::network::sim::{LaneClass, Write};
+use crate::network::sim::LaneClass;
 use anyhow::ensure;
 use base64::Engine as _;
 use serde_json::json;
@@ -160,7 +161,9 @@ fn pinned_inviter(sim: &Sim, group: &str) -> Result<Option<String>> {
     )))
 }
 
-async fn join_outcome(sim: &Sim, group: &str) -> Option<String> {
+/// J's `last_join_outcome` for `group` (`join-status` answers it even on
+/// a 404). A failed request is an error.
+async fn join_outcome(sim: &Sim, group: &str) -> Result<Option<String>> {
     let (_, body) = sim
         .request(
             "J",
@@ -168,28 +171,27 @@ async fn join_outcome(sim: &Sim, group: &str) -> Option<String> {
             &format!("/groups/{group}/join-status"),
             None,
         )
-        .await
-        .ok()?;
-    body["last_join_outcome"]["outcome"]
+        .await?;
+    Ok(body["last_join_outcome"]["outcome"]
         .as_str()
-        .map(str::to_string)
+        .map(str::to_string))
 }
 
-/// The lane and kind of a J-to-B frame that is J's join request on main:
+/// The lane and kind of a frame from J that is J's join request on main:
 /// a Direct frame (`[stream type][sender agent id (32)][JSON]`) whose body
 /// is J's `member_joined` event, or a PubSub frame that carries J's
 /// `member_joined` event. `None` for any other frame.
-fn request_kind(write: &Write, j: &str) -> Option<&'static str> {
-    match write.lane.class {
+fn request_kind(class: LaneClass, bytes: &[u8], j: &str) -> Option<&'static str> {
+    match class {
         LaneClass::Direct => {
-            let body = serde_json::from_slice::<serde_json::Value>(write.bytes.get(33..)?).ok()?;
+            let body = serde_json::from_slice::<serde_json::Value>(bytes.get(33..)?).ok()?;
             let joiner = body["member_agent_id"]
                 .as_str()
                 .is_some_and(|id| id.eq_ignore_ascii_case(j));
             (body["event"] == "member_joined" && joiner).then_some("direct member_joined")
         }
         LaneClass::PubSub => {
-            let text = String::from_utf8_lossy(&write.bytes);
+            let text = String::from_utf8_lossy(bytes);
             (text.contains("\"member_joined\"") && text.contains(j))
                 .then_some("pubsub member_joined")
         }
@@ -199,14 +201,15 @@ fn request_kind(write: &Write, j: &str) -> Option<&'static str> {
 
 /// J holds usable membership: B seats J, J reports `active`, and on the
 /// TreeKEM plane J installed the group.
-async fn usable(sim: &Sim, plane: Plane, group: &str, j: &str) -> bool {
-    let seated = matches!(seat(sim, "B", group, j).await, Ok(Some((_, true, _))));
+/// A failed read is an error.
+async fn usable(sim: &Sim, plane: Plane, group: &str, j: &str) -> Result<bool> {
+    let seated = matches!(seat(sim, "B", group, j).await?, Some((_, true, _)));
     let active = local_membership(sim, "J", group).await.as_deref() == Some("active");
     let keyed = match plane {
-        Plane::TreeKem => has_treekem(sim, "J", group).await.unwrap_or(false),
+        Plane::TreeKem => has_treekem(sim, "J", group).await?,
         Plane::Gss => true,
     };
-    seated && active && keyed
+    Ok(seated && active && keyed)
 }
 
 /// B encrypts the probe; whether J recovers it.
@@ -300,16 +303,22 @@ async fn setup(sim: &Sim, plane: Plane, receipt: &mut Receipt) -> Result<String>
         )
         .await?;
     ensure!(status.is_success(), "promote B: {status} {body}");
-    let settled = wait_for(sim, "B is admin at A's head", SETUP, async |s: &Sim| {
-        let (Ok(Some((rev_a, _, _))), Ok(Some((rev_b, true, Some(GroupRole::Admin))))) = (
-            seat(s, "A", &group, &b).await,
-            seat(s, "B", &group, &b).await,
+    let what = "B is admin at A's head";
+    let mut seen = Observations::default();
+    let settled = wait_for(sim, what, SETUP, async |s: &Sim| {
+        let (Some(a_view), Some(b_view)) = (
+            seen.observe(seat(s, "A", &group, &b)).await,
+            seen.observe(seat(s, "B", &group, &b)).await,
         ) else {
-            return false;
+            return true;
         };
-        rev_a == rev_b
+        match (a_view, b_view) {
+            (Some((rev_a, _, _)), Some((rev_b, true, Some(GroupRole::Admin)))) => rev_a == rev_b,
+            _ => false,
+        }
     })
     .await?;
+    seen.verify(what)?;
     let (a_view, b_view) = (
         seat(sim, "A", &group, &b).await?,
         seat(sim, "B", &group, &b).await?,
@@ -379,82 +388,136 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
     let pinned = pinned_inviter(sim, &group)?;
     receipt.note(format!("J's attempt pins inviter {pinned:?}"));
     let window = plane.window();
-    let budget = window + MARGIN;
-    let reached = wait_for(
-        sim,
-        "J reaches usable membership or its attempt ends",
-        budget,
-        async |s: &Sim| {
-            usable(s, plane, &group, &j).await || join_outcome(s, &group).await.is_some()
-        },
-    )
+
+    // By T: J is usable and decrypts B's next message. The checks repeat
+    // until they pass or T (from before J's join call) runs out; `elapsed`
+    // is taken when this wait ends.
+    let what = "J is usable and decrypts B's message by T";
+    let mut seen = Observations::default();
+    let mut decrypt_detail = "J was never usable, so no decrypt was tried".to_string();
+    let remaining = window.saturating_sub(sim.fabric().now().saturating_sub(join_at));
+    let passed = wait_for(sim, what, remaining, async |s: &Sim| {
+        let Some(ready) = seen.observe(usable(s, plane, &group, &j)).await else {
+            return true;
+        };
+        if !ready {
+            return false;
+        }
+        match seen.observe(j_decrypts_b(s, &group)).await {
+            Some((decrypted, detail)) => {
+                decrypt_detail = detail;
+                decrypted
+            }
+            None => true,
+        }
+    })
     .await?;
+    seen.verify(what)?;
+    let elapsed = sim.fabric().now().saturating_sub(join_at);
+    let in_time = passed && elapsed <= window;
+
+    // Not passed: give J's attempt the margin to record its outcome.
+    let mut outcome = None;
+    if !passed {
+        let what = "J's attempt records an outcome";
+        let mut seen = Observations::default();
+        wait_for(sim, what, MARGIN, async |s: &Sim| {
+            match seen.observe(join_outcome(s, &group)).await {
+                Some(found) => {
+                    let ended = found.is_some();
+                    outcome = found;
+                    ended
+                }
+                None => true,
+            }
+        })
+        .await?;
+        seen.verify(what)?;
+        let (_, detail) = j_decrypts_b(sim, &group).await?;
+        decrypt_detail = detail;
+    }
     receipt.note(format!(
-        "wait ended {} at {} us (T {} s + {} s margin)",
-        if reached {
-            "on a result"
-        } else {
-            "at the budget"
-        },
-        at(sim),
+        "usable-and-decrypt wait {} {} ms after the join (T {} s); outcome wait \
+         ended at {} us",
+        if passed { "passed" } else { "ran out" },
+        elapsed.as_millis(),
         window.as_secs(),
-        MARGIN.as_secs()
+        at(sim)
     ));
 
-    // The request, by lane and kind: J's MemberJoined reached B after the
-    // join (see `request_kind`; the S6 slice switches this stage).
+    // The request, by lane and kind (`request_kind`): J's MemberJoined
+    // reached B after J's join mark. The S6 slice switches this stage.
     let mut by_kind = std::collections::BTreeMap::<&str, usize>::new();
     for (write, _) in
         sim.fabric()
             .delivered_writes_after(&sim.peer("J")?, &sim.peer("B")?, position)
     {
-        if let Some(kind) = request_kind(&write, &j) {
+        if let Some(kind) = request_kind(write.lane.class, &write.bytes, &j) {
             *by_kind.entry(kind).or_default() += 1;
         }
     }
     let requests: usize = by_kind.values().sum();
     receipt.request_delivered(
-        "J's MemberJoined reached B after A stopped",
+        "J's MemberJoined reached B after J's join",
         requests > 0,
         format!("J-to-B request frames delivered, by lane and kind: {by_kind:?}"),
         at(sim),
     );
 
-    // ADR 0112 "no traffic to A", as `control.rs` counts an offline node:
-    // every J-to-A send or dial the fabric refused, and every J-to-A frame
-    // delivered, after A's stop mark.
+    // ADR 0112 "no traffic to A", counted by trace position from A's stop
+    // mark. The pass counts only J's join/redemption-kind frames to A
+    // (`request_kind`): frames J wrote to A in any fate, and refused sends
+    // that carry such bytes. The full J-to-A count (every refused send or
+    // dial by lane class, and every delivered frame) is a note only.
     let a_peer = sim.peer("A")?;
     let j_peer = sim.peer("J")?;
-    let refused_to_a = sim
+    let written_requests = sim
+        .fabric()
+        .writes_from_between(&j_peer, offline..usize::MAX)
+        .into_iter()
+        .filter(|write| {
+            write.lane.dst == a_peer.0 && request_kind(write.lane.class, &write.bytes, &j).is_some()
+        })
+        .count();
+    let refused: Vec<_> = sim
         .fabric()
         .refused_from(&j_peer, offline)
         .into_iter()
         .filter(|refusal| refusal.dst == a_peer.0)
+        .collect();
+    let refused_requests = refused
+        .iter()
+        .filter(|refusal| match (refusal.class, refusal.bytes.as_deref()) {
+            (Some(class), Some(bytes)) => request_kind(class, bytes, &j).is_some(),
+            _ => false,
+        })
         .count();
+    let mut refused_by_class = std::collections::BTreeMap::<String, usize>::new();
+    for refusal in &refused {
+        let class = refusal.class.map_or_else(
+            || "no lane (dial or link)".to_string(),
+            |class| format!("{class:?}"),
+        );
+        *refused_by_class.entry(class).or_default() += 1;
+    }
     let delivered_to_a = sim
         .fabric()
         .delivered_writes_after(&j_peer, &a_peer, offline)
         .len();
-    let traffic_to_a = refused_to_a + delivered_to_a;
+    let redemption_to_a = written_requests + refused_requests;
     receipt.note(format!(
-        "J to A after A stopped: {refused_to_a} refused sends or dials, \
-         {delivered_to_a} frames delivered"
+        "J to A after A stopped: {redemption_to_a} join/redemption frames \
+         ({written_requests} written, {refused_requests} refused); all traffic: \
+         refused by class {refused_by_class:?}, {delivered_to_a} frames delivered"
     ));
 
-    // The wait stops as soon as J is usable, so the elapsed time is when
-    // J became usable. The pass needs it, and the decrypt, by T.
-    let usable_now = usable(sim, plane, &group, &j).await;
-    let (decrypted, decrypt_detail) = j_decrypts_b(sim, &group).await?;
-    let elapsed = sim.fabric().now().saturating_sub(join_at);
-    let in_time = elapsed <= window;
     let b_seat = seat(sim, "B", &group, &j).await?;
     let j_state = local_membership(sim, "J", &group).await;
     let j_keyed = has_treekem(sim, "J", &group).await?;
-    let outcome = join_outcome(sim, &group).await;
     let detail = format!(
         "B seat for J {b_seat:?}; J membership {j_state:?}, treekem {j_keyed}, \
          last outcome {outcome:?}; pinned inviter {pinned:?}; {decrypt_detail}; \
-         {} ms after the join",
+         wait ended {} ms after the join",
         elapsed.as_millis()
     );
     receipt.note(detail.clone());
@@ -465,14 +528,10 @@ async fn scenario(sim: &mut Sim, plane: Plane, receipt: &mut Receipt) -> Result<
     let pinned_to_a = pinned
         .as_deref()
         .is_some_and(|id| id.eq_ignore_ascii_case(&a));
-    if pinned_to_a && !usable_now && outcome.as_deref() == Some("timed_out") {
+    if pinned_to_a && !passed && outcome.as_deref() == Some("timed_out") {
         receipt.cause(CAUSE_PINNED, Some(detail), true, at(sim));
     }
-    receipt.finish(
-        FINAL,
-        usable_now && decrypted && in_time && traffic_to_a == 0,
-        at(sim),
-    );
+    receipt.finish(FINAL, in_time && redemption_to_a == 0, at(sim));
     Ok(())
 }
 
