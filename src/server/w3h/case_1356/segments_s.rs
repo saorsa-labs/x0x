@@ -1,4 +1,4 @@
-//! ADR 0109 §10 row H-S3-s (segments across a restart; #1572). Control,
+//! ADR 0109 Validation table row H-S3-s (segments across a restart; #1572). Control,
 //! expected GREEN with S3.
 //!
 //! The test configuration sets the segment length to 2 on the case thread
@@ -15,17 +15,22 @@
 //!   r+2 only. The second ATA arms from J's head r+2 and covers r+3 and
 //!   the terminal. J converges with no marker.
 //!
-//! J can show `segment_exhausted` before the restart too. Before the
-//! restart J's view is usually still `catching_up` (its join is not
-//! confirmed while the hold below drops its writes), so the case accepts
-//! the state on either side of the restart, at r+2 only.
+//! **J's state before the restart.** The ADR text says the exhausted
+//! node shows `awaiting_attestation {segment_exhausted}`. Before the
+//! restart J shows `catching_up` at r+2 instead: its join is not confirmed
+//! while the hold below drops its writes. Every recorded VM run showed
+//! this. The case asserts it: J's last state before the restart must be
+//! `catching_up` or `segment_exhausted`, and the receipt names which.
+//! `segment_exhausted` at r+2 is required on one side of the restart (in
+//! practice after it), and at r+2 only.
 //!
 //! **Holds.** The case drops every gossip write to J on the group's
 //! metadata topic, as H-S3-s64 does, so only S3 moves J's head. J asks for
 //! the next segment at once (#1726). Then A answers in the same instant,
 //! and the restart is not between the segments. So the case also drops
 //! every write from J (except membership and plane hello frames) from the
-//! first one that J makes at r+2 or later until J restarts. J's direct
+//! first one that J makes at r+2 or later until J's graceful stop is
+//! complete; the hold is released before J starts again. J's direct
 //! messages are encrypted envelopes, so the hold cannot pick out the S3
 //! request by its bytes. The first ATA comes with the join result or as
 //! an answer to J's request at r, before the hold starts. An S3 answer
@@ -33,7 +38,12 @@
 //!
 //! **Observations.** J's head and `recovery` state at each poll; A's S3
 //! answers to J (`recovery::decode_message` on J's direct messages); J's
-//! head when it restarts and again when it is back.
+//! head when it restarts and again when it is back. The restart makes a
+//! new agent, so the case subscribes to the new agent's direct messages
+//! on the test thread as soon as the start returns, before any other
+//! await. If J converges after asking from r+2 but the case saw no answer
+//! after the restart (one could arrive while J starts), the run is INFRA,
+//! not GREEN.
 
 use super::gaps::{recovery_route, recovery_text, remove, s0, seal_j, sees_s3};
 use super::segments::hold_meta_from_j;
@@ -44,7 +54,7 @@ use crate::groups::recovery::{
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const LABELS: &[&str] = &["A", "M1", "M2", "J"];
-/// The test segment length (ADR 0109 §10 H-S3-s).
+/// The test segment length (ADR 0109 Validation table, H-S3-s).
 const SEGMENT: u64 = 2;
 const FINAL: &str = "two_link_segments_the_second_arms_from_j_head_after_a_restart";
 const CAUSE: &str = "a segment does not cover exactly 2 links (J moves past r+2 before the \
@@ -57,6 +67,7 @@ const WINDOW: Duration = Duration::from_secs(130);
 /// restarts.
 const QUIET: Duration = Duration::from_secs(30);
 const EXHAUSTED: &str = "awaiting_attestation{segment_exhausted}";
+const CATCHING_UP: &str = "catching_up";
 
 /// What the case saw of J.
 #[derive(Default)]
@@ -145,6 +156,26 @@ impl Run {
                 .all(|answer| *answer == (self.base, SEGMENT as usize))
     }
 
+    /// J's last state before the restart is `catching_up` (its join is
+    /// not confirmed while its writes are held) or `segment_exhausted`.
+    /// The ADR text names only `segment_exhausted`; see the module doc.
+    fn state_before_restart(&self) -> bool {
+        self.states_before
+            .last()
+            .is_some_and(|state| state == CATCHING_UP || state == EXHAUSTED)
+    }
+
+    /// J converged from r+2 after asking from there, but the case saw no
+    /// answer after the restart: the answer may have arrived while J
+    /// started, before the case subscribed. INFRA, not a verdict.
+    fn answer_not_observed(&self) -> bool {
+        let end = self.segment_end();
+        self.answered_after.is_empty()
+            && self.requested_from == Some(end)
+            && self.restart_heads.1 == end
+            && self.caught_up
+    }
+
     /// The exhausted segment: J shows `segment_exhausted` at r+2 and at
     /// no other head.
     fn exhausted_at_end(&self) -> bool {
@@ -181,8 +212,11 @@ struct MuteAtEnd {
 impl MuteAtEnd {
     /// From J's first write at head `end` or later, drop J's writes
     /// (except membership and plane hello frames) until [`Self::release`].
-    /// The rule reads J's head without waiting: when J's group map is
-    /// locked, it keeps its last decision.
+    /// The rule reads J's head without waiting. Before the hold latches, a
+    /// write that finds J's group map locked passes; so a write at `end`
+    /// can get out before the latch. If that write is J's request, A's
+    /// answer from `end` arrives before the restart, and the case reports
+    /// INFRA (a hold leak). After the latch, every such write is dropped.
     fn install(sim: &Sim, group: &str, end: u64) -> Result<Self> {
         use crate::network::sim::{Fault, LaneClass};
         let j = sim.peer("J")?.0;
@@ -332,12 +366,18 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         )
         .await;
     run.restart_heads.0 = view(sim, "J", &group).await?.state_revision;
+    drain_answers(&mut rx, &a_id, &mut run.answered_before);
 
-    // The restart, between the segments.
+    // The restart, between the segments. The hold stays until J's graceful
+    // stop is complete, so no retry from J gets out at r+2 while it stops.
+    sim.stop("J", RestartMode::Graceful).await?;
+    drain_answers(&mut rx, &a_id, &mut run.answered_before);
+    drop(rx);
     run.held = mute.release(sim);
-    sim.restart("J", RestartMode::Graceful).await?;
-    run.restart_heads.1 = view(sim, "J", &group).await?.state_revision;
+    sim.start_again("J").await?;
+    // No await between the start and the subscription.
     let mut rx = sim.state("J")?.agent.subscribe_direct();
+    run.restart_heads.1 = view(sim, "J", &group).await?.state_revision;
     sees_s3(sim, "J", "A").await?;
     sees_s3(sim, "A", "J").await?;
 
@@ -415,11 +455,26 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
             at(sim),
         );
     }
+    if run.answer_not_observed() {
+        receipt.infra(
+            format!(
+                "J converged after asking from r+2, but the case saw no answer after \
+                 the restart: {}",
+                run.describe()
+            ),
+            at(sim),
+        );
+    }
     let ok1 = run.first_segment();
+    let before = run.state_before_restart();
     let exhausted = run.exhausted_at_end();
     let ok2 = run.second_segment();
     receipt.note(format!(
         "segment_1_covers_r_plus_1_and_r_plus_2_only: ok={ok1}"
+    ));
+    receipt.note(format!(
+        "state_before_restart_is_catching_up_or_segment_exhausted: ok={before} (last {:?})",
+        run.states_before.last()
     ));
     receipt.note(format!(
         "segment_exhausted_at_r_plus_2_only: ok={exhausted}"
@@ -428,7 +483,7 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         "segment_2_arms_from_r_plus_2_after_the_restart_and_j_converges: ok={ok2}"
     ));
     receipt.note(run.describe());
-    let passed = ok1 && exhausted && ok2;
+    let passed = ok1 && before && exhausted && ok2;
     if !passed {
         receipt.cause(CAUSE, Some(run.describe()), true, at(sim));
     }
@@ -467,6 +522,7 @@ fn w3h_1356_s_segment_shapes() {
         head_at_seal: 5,
         terminal: 9,
         heads_before: vec![5, 6, 7],
+        states_before: vec![CATCHING_UP.to_string()],
         exhausted_at: vec![7],
         answered_before: vec![(5, 2)],
         restart_heads: (7, 7),
@@ -478,6 +534,21 @@ fn w3h_1356_s_segment_shapes() {
     };
     assert!(run.first_segment());
     assert!(run.second_segment());
+    assert!(run.state_before_restart());
+    assert!(!run.answer_not_observed());
+    run.states_before = vec![EXHAUSTED.to_string()];
+    assert!(run.state_before_restart());
+    run.states_before = vec![CATCHING_UP.to_string(), "null".to_string()];
+    assert!(
+        !run.state_before_restart(),
+        "J's last state before the restart is null"
+    );
+    run.states_before.clear();
+    assert!(
+        !run.state_before_restart(),
+        "no state read before the restart"
+    );
+    run.states_before = vec![CATCHING_UP.to_string()];
     run.heads_before.push(8);
     assert!(!run.first_segment(), "a link past the segment end applied");
     run.heads_before.pop();
@@ -501,6 +572,7 @@ fn w3h_1356_s_segment_shapes() {
     assert!(!run.second_segment(), "the second ATA is not from J's head");
     run.answered_after.clear();
     assert!(!run.second_segment(), "no answer seen after the restart");
+    assert!(run.answer_not_observed(), "a missed answer is INFRA");
     run.answered_after = vec![(7, 2)];
     run.requested_from = None;
     assert!(!run.second_segment(), "A lists no request from J");
