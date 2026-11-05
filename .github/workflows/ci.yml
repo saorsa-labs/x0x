@@ -1026,6 +1026,10 @@ jobs:
           --expect w3h_1581e_red_crash_commit_fork_contained=RED
           --require w3h_1581e_control_crash_commit_same_chain_resume
           --expect w3h_1581e_control_crash_commit_same_chain_resume=GREEN
+          --require w3h_1359_red_s6_offline_inviter_other_admin_admits_treekem
+          --expect w3h_1359_red_s6_offline_inviter_other_admin_admits_treekem=RED
+          --require w3h_1359_red_s6_offline_inviter_other_admin_admits_gss
+          --expect w3h_1359_red_s6_offline_inviter_other_admin_admits_gss=RED
           --require w3h_1581f_control_local_authority_exit_revoked_committer
           --expect w3h_1581f_control_local_authority_exit_revoked_committer=GREEN
           --require w3h_1581f_red_local_authority_exit_demoted_form
