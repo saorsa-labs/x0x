@@ -41630,6 +41630,9 @@ async fn preserve_unsupported_saved_bytes(path: &FsPath) -> Result<()> {
         .await
         .is_ok_and(|held| held == bytes)
     {
+        // #1809: the copy holds the same group secrets as `path`, so an
+        // earlier 0644 copy is tightened when it is reused.
+        tighten_secret_file_mode(&backup).await;
         // Reused: make sure the earlier copy itself is on stable storage.
         let file = tokio::fs::File::open(&backup)
             .await
@@ -41659,9 +41662,25 @@ async fn sync_parent_dir(path: &FsPath) -> Result<()> {
 async fn write_durably(path: &FsPath, bytes: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let tmp = path.with_extension("tmp-1604");
-    let mut file = tokio::fs::File::create(&tmp)
+    // #1809: the bytes are a copy of a group secret file. A new temp file
+    // is created 0600; a stale temp left by a crash keeps its old mode
+    // through a truncating open, so it is set to 0600 on the open handle
+    // before any byte lands.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(SECRET_FILE_MODE);
+    let mut file = options
+        .open(&tmp)
         .await
         .with_context(|| format!("failed to create {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(SECRET_FILE_MODE))
+            .await
+            .with_context(|| format!("failed to restrict {}", tmp.display()))?;
+    }
     file.write_all(bytes)
         .await
         .with_context(|| format!("failed to write {}", tmp.display()))?;
@@ -44491,6 +44510,9 @@ pub(in crate::server) async fn tighten_secret_file_mode(path: &FsPath) {
         if metadata.permissions().mode() & 0o077 == 0 {
             return;
         }
+        // `set_permissions` follows a symlink. That is acceptable: the
+        // path is in the daemon's own data dir, and a link there already
+        // decides where the daemon reads and writes these secrets.
         if let Err(error) =
             tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(SECRET_FILE_MODE))
                 .await

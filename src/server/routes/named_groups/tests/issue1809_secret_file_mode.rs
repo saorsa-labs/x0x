@@ -63,3 +63,37 @@ async fn load_tightens_existing_group_files() {
     assert_eq!(mode_of(&named), 0o600, "loaded named_groups.json mode");
     assert_eq!(mode_of(&sidecar), 0o600, "loaded sidecar mode");
 }
+
+/// The #1604 unsupported-bytes backup is a byte copy of a secret file, so
+/// it is written 0600, even over a stale 0644 temp left by a crash.
+#[tokio::test]
+async fn unsupported_backup_is_owner_only() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("named_groups.json");
+    let bytes = b"{\"shared_secret\":\"held\"}";
+    std::fs::write(&path, bytes).expect("seed");
+    let backup = unsupported_backup_path(&path, bytes);
+    seed_world_readable(&backup.with_extension("tmp-1604"), b"stale");
+
+    preserve_unsupported_saved_bytes(&path)
+        .await
+        .expect("preserve");
+    assert_eq!(std::fs::read(&backup).expect("read backup"), bytes);
+    assert_eq!(mode_of(&backup), 0o600, "new backup mode");
+}
+
+/// An earlier 0644 backup with the same bytes is reused and tightened.
+#[tokio::test]
+async fn reused_unsupported_backup_is_tightened() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("named_groups.json");
+    let bytes = b"{\"shared_secret\":\"held\"}";
+    std::fs::write(&path, bytes).expect("seed");
+    let backup = unsupported_backup_path(&path, bytes);
+    seed_world_readable(&backup, bytes);
+
+    preserve_unsupported_saved_bytes(&path)
+        .await
+        .expect("preserve");
+    assert_eq!(mode_of(&backup), 0o600, "reused backup mode");
+}
