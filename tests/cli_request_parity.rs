@@ -779,6 +779,7 @@ const SERVER_SOURCES: &[&str] = &[
     "src/server/routes/presence.rs",
     "src/server/routes/profile.rs",
     "src/server/routes/public_group_bootstrap_outbox.rs",
+    "src/server/routes/sidecar_quarantine.rs",
     "src/server/routes/status.rs",
     "src/server/routes/stores.rs",
     "src/server/routes/sync.rs",
