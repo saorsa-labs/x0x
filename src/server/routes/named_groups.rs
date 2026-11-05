@@ -15376,6 +15376,9 @@ async fn apply_named_group_metadata_event_with_binding(
     } else {
         None
     };
+    // #1775 (claude review round 12): only the share half moves parked
+    // secrets on; a role update replays removals, not re-deliveries.
+    let secure_share = matches!(event, NamedGroupMetadataEvent::SecureShareDelivered { .. });
     // #946 C3: a member who leaves or is removed/banned loses any
     // certificate-unobtainable refusal window, so a later rejoin starts
     // retryable. Captured before `event` moves.
@@ -15443,6 +15446,17 @@ async fn apply_named_group_metadata_event_with_binding(
         }
     }
     if let Some(gid) = share_group {
+        // #1775 (claude review round 12): an accepted share can complete
+        // the wait a parked secret records with no commit that follows
+        // it — a keyless commit already committed the displacing wait's
+        // epoch — so the re-delivery runs here, with every apply guard
+        // dropped, before the removals replay: the re-delivered key lets
+        // that replay find keys, the order replay_after_gss_install
+        // keeps.
+        if secure_share && applied.accepted {
+            Box::pin(revocation_eviction::owner_recovery::redeliver_parked_secret(state, &gid))
+                .await;
+        }
         replay_parked_gss_removals(state, &gid).await;
     }
     refresh_group_rosters_for_gossip(state).await;
@@ -18926,16 +18940,23 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // MemberBanned commit but have not yet received the actual shared
             // secret material. #1766: a waiting transition's share may
             // replace an uncommitted secret of its epoch from another sender.
-            if secret_epoch < info.secret_epoch
+            // #1775 (3 Nov review thread): a share of an earlier epoch takes
+            // that same replace path over a secret of a later epoch that no
+            // commit pins — the sealed share that raised the local epoch past
+            // the head — so the waiting transition's own share recovers its
+            // frame; the strict guard alone would refuse it for ever.
+            let replaces_unpinned_secret = info.shared_secret.is_some()
+                && gss_share_hold::replaces_uncommitted_secret(
+                    state,
+                    &resolved_group_key,
+                    &info,
+                    &sender_hex,
+                    secret_epoch,
+                );
+            if (secret_epoch < info.secret_epoch && !replaces_unpinned_secret)
                 || (secret_epoch == info.secret_epoch
                     && info.shared_secret.is_some()
-                    && !gss_share_hold::replaces_uncommitted_secret(
-                        state,
-                        &resolved_group_key,
-                        &info,
-                        &sender_hex,
-                        secret_epoch,
-                    ))
+                    && !replaces_unpinned_secret)
             {
                 return ApplyMetadataResult::REJECTED;
             }
@@ -18984,6 +19005,28 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             .await
             {
                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "rejecting SecureShareDelivered after post-crypto terminality recheck: {e}");
+                return ApplyMetadataResult::REJECTED;
+            }
+            // #1775 (claude review round 11): a replacing share of an
+            // earlier epoch displaces a later epoch's installed secret —
+            // an honest rotation's share that arrived before its commit.
+            // The displaced value is parked, durably and before the
+            // replacing secret installs, and re-delivers once the head
+            // commits the displacing wait's epoch, so the later
+            // rotation's commit lands with its key. Round 12: a park
+            // whose durable write fails installs nothing — the displaced
+            // value must not pass to a restart with no record behind it —
+            // and the share retries.
+            if replaces_unpinned_secret
+                && secret_epoch < info.secret_epoch
+                && !gss_share_hold::park_displaced_secret(
+                    state,
+                    &resolved_group_key,
+                    &info,
+                    secret_epoch,
+                )
+                .await
+            {
                 return ApplyMetadataResult::REJECTED;
             }
             let mut next = info.clone();
@@ -61339,9 +61382,10 @@ pub(in crate::server) mod tests {
         assert!(!held.accepted);
         let path = gss_share_hold::test_seam::hold_path_for(&f.state, &f.group_id);
         let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let version = gss_share_hold::test_seam::hold_file_version();
         assert_eq!(written["version"], 1, "the written file carries version 1");
         let newer = serde_json::to_vec(&serde_json::json!({
-            "version": 2,
+            "version": version + 1,
             "group_key": f.group_id,
             "removals": [],
             "exclusions": [],

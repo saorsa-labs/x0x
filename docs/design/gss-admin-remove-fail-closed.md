@@ -349,18 +349,35 @@ except citations explicitly marked as resolving at
 - **What makes both publish orderings work is one conjunct, and it is load-bearing.** The
   clear is gated on *strict* `<` (D7), so an envelope that installed first survives the
   later commit. The reverse ordering — commit first, envelope second at equal epoch —
-  works only because the stale-envelope guard is
+  works only because the stale-envelope guard keeps its strict/equal split. At the F1
+  baseline it was
   `if secret_epoch < info.secret_epoch || (secret_epoch == info.secret_epoch &&
   info.shared_secret.is_some())` (statement `:5831-5835`; the conjunct is `:5832`), whose
-  own doc comment (`:5827-5830`) states the intent. That guard is pre-existing and F1 does
-  not change it — it is cited at the baseline, and its comment names only a *prior
-  `MemberBanned` commit*, because remove had no GSS rotation to produce the same ordering
-  when it was written. Tightening that predicate to
+  own doc comment (`:5827-5830`) states the intent. #1766/#1771 and #1775 add one
+  exit to both arms: a share installs over an installed secret only when
+  `gss_share_hold::replaces_uncommitted_secret` allows it. That is, no verified commit
+  pins the installed secret (a later epoch than the head commits, or the epoch of a
+  keyless commit's mark), and a verified transition of the share's epoch still waits. The
+  share's sender can be any admin other than the installed secret's sender, not only the
+  waiting actor; this fails closed (the hold stays until the actor's own share installs).
+  Unless a keyless commit's mark covers that exact epoch, the share's epoch must be above
+  the epoch that the head commits. A displaced later secret parks in the hold file. It re-delivers through
+  the ordinary share path when a head commits the displacing wait's epoch. A promoted or
+  superseded install parks a later secret only when the held step that raises to its
+  epoch was authored by its sender; it drops any other later secret, as before #1775.
+  The parked-removal half of the replace rule has no effect until the fenced
+  `gss_removal_waits_for_share` change lands (#1775 item 1). The strict `<` clear and
+  the equal-epoch refuse survive these changes. F1 does not change the guard — it is cited
+  at the baseline, and its comment names only a *prior `MemberBanned` commit*, because
+  remove had no GSS rotation to
+  produce the same ordering when it was written. Tightening that predicate to
   `secret_epoch <= info.secret_epoch` would silently strand every survivor on the
   commit-first ordering: cleared by the commit, then refusing its own replacement, in
   consensus with a matching `state_hash` and decrypting nothing. That is the F1 failure
   re-created by a one-token edit, which is why Validation item 3 must be written to fail
   when the conjunct is deleted rather than merely to exercise both orderings.
+  #1766/#1775 narrow that damage, they do not remove it: the replace path saves a
+  survivor only while no verified commit pins the secret's value.
 - **The preflight bounds construction, not delivery, and this ADR claims nothing beyond
   that.** `publish_named_group_metadata_event` (`:1797-1833`) returns `()` and folds both a
   publish error and a timeout into `tracing::warn!`; the direct path's own doc comment
