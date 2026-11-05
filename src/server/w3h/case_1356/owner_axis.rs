@@ -20,6 +20,7 @@ use super::*;
 
 mod invites;
 mod refusals;
+mod released;
 
 const LABELS: &[&str] = &["O", "A"];
 const FINAL: &str = "certificate_only_admin_seals_an_owner_certified_group";
