@@ -200,6 +200,10 @@ fn start_restored(
     trial: &mut Trial,
 ) -> io::Result<child::Owned> {
     if trial.restored_starts >= MAX_ATTEMPTS {
+        // The last restored child is gone, as on the start path below. Clear
+        // it so the RecoveryFailed save passes `validate_trial` when that
+        // child ran on an earlier boot.
+        trial.child = None;
         return Err(trial.recovery_failed(path, invalid("restored starts exhausted")));
     }
     trial.restored_starts += 1;
@@ -510,6 +514,10 @@ mod tests {
             .to_string();
         assert!(error.contains("restored starts exhausted"), "{error}");
         assert_eq!(trial.phase, Phase::RecoveryFailed);
+        assert_eq!(
+            Trial::load(&path, &trial.binding, "alice").unwrap().phase,
+            Phase::RecoveryFailed
+        );
         assert_eq!(
             journal_record(&root).cause.unwrap().class,
             journal::CauseClass::Interrupted
