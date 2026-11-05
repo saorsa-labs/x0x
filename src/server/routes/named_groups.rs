@@ -46243,6 +46243,11 @@ pub(in crate::server) enum JoinAttemptOutcome {
 /// remove-member + re-invite.
 pub(in crate::server) const JOIN_REARM_TIMEOUT_REASON: &str = "rearm_original_result_unavailable";
 
+/// ADR 0108 §8: the `timed_out` reason when the attempt reached its poll
+/// deadline without a verified `JoinPendingNotice`. With a held notice the
+/// reason is that notice's cause instead.
+pub(in crate::server) const JOIN_NO_ADMISSION_RESULT_REASON: &str = "no_admission_result";
+
 /// #477 C5 — the SEAT finalizer at the `MemberAdded` apply site (the
 /// caller holds the group's membership guard): whatever attempt is pending
 /// for `(event_group_id, member)` is finalized as `Seated` — its polls and
@@ -46418,6 +46423,9 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
     // ADR 0107: whether the finalized attempt was a fetch-only S8 (a) re-arm
     // (a registered attempt with no stored volley).
     let mut fetch_only = false;
+    // ADR 0108 §8: the cause of the verified notice the attempt held, in
+    // its join-status display form. A `TimedOut` names it as its reason.
+    let mut held_cause: Option<&'static str> = None;
     // The legacy TimedOut owner has no registry entry. It still clears its
     // pin after this lock drops. An owned entry clears its pin inside the
     // lock (#1191).
@@ -46439,6 +46447,10 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             // join can record the same key in any gap after this remove.
             clear_expected_join_result_inviter(state, &expected_key);
             fetch_only = entry.stored_resend.is_none();
+            held_cause = entry
+                .held_pending_notice
+                .as_ref()
+                .map(|held| display_join_pending_cause(&held.cause).0);
             (
                 std::mem::take(&mut entry.polls),
                 std::mem::take(&mut entry.tasks),
@@ -46532,9 +46544,15 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
         // that times out names its cause on the existing status surface:
         // the authority's original result or Welcome could not be fetched.
         // The remnant stays for the owner remove-member + re-invite exit.
+        // ADR 0108 §8 / §6 (D64): any other `TimedOut` names its cause —
+        // the last verified notice's cause, or `no_admission_result` when
+        // the attempt held no verified notice.
         let reason = match (outcome, reason) {
             (JoinAttemptOutcome::TimedOut, None) if fetch_only && !stub_is_pending => {
                 Some(JOIN_REARM_TIMEOUT_REASON)
+            }
+            (JoinAttemptOutcome::TimedOut, None) => {
+                Some(held_cause.unwrap_or(JOIN_NO_ADMISSION_RESULT_REASON))
             }
             (_, reason) => reason,
         };
