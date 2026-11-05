@@ -235,11 +235,16 @@ async fn write_manifest_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()>
         // Creating before the first await point means the guard always sees
         // the file; a blocking write still in flight at cancellation goes to
         // the unlinked inode and is freed on close.
+        //
+        // #1809: on Unix the temp file is created 0600 before any byte
+        // lands, the same as the named-groups writer, and the rename
+        // replaces an older 0644 manifest with a 0600 one.
         let mut file = {
-            let std_file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let std_file = options.open(&temp_path)?;
             tokio::fs::File::from_std(std_file)
         };
         file.write_all(bytes).await?;
@@ -1023,6 +1028,27 @@ mod tests {
             .await
             .expect("write manifest");
         assert_eq!(read_manifest(&path).await, loaded);
+    }
+
+    /// #1809: the manifest is written 0600, and a save replaces an older
+    /// 0644 manifest with a 0600 one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manifest_is_written_owner_only_1809() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crdt-subscriptions.json");
+        std::fs::write(&path, b"{}").expect("seed manifest");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("seed 0644");
+
+        let mut manifest = CrdtSubscriptionManifest::default();
+        manifest.upsert(entry(KIND_KV_STORE, "party", ROLE_JOINED));
+        write_manifest(&path, &manifest)
+            .await
+            .expect("write manifest");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "manifest mode after save is {mode:o}");
     }
 
     /// WHY: upsert must replace, not duplicate, so a re-create after restart
