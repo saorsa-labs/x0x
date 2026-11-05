@@ -662,8 +662,9 @@ jobs:
     # their own S3 group (`s3-c`, `s3-c2`, `s3-c3`, `s3-d8`, `s3-d3`). H-S3-d3
     # runs as four parallel parts (`s3-d3.1` to `s3-d3.4`, 5 reruns each;
     # `PARTS` in w3h-shards.py). The #1661 welcome-lost row has its own
-    # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), and the
-    # H-S3-rm4 variants share `s3-rm4.1` and `s3-rm4.2`. A group is
+    # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
+    # H-S3-rm4 variants share `s3-rm4.1` and `s3-rm4.2`, and H-S3-rm2 has
+    # its own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each). A group is
     # omitted when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
@@ -1010,6 +1011,8 @@ jobs:
           --expect w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node=GREEN
           --require w3h_1356_control_s3_d3_authorisation_refusals_typed
           --expect w3h_1356_control_s3_d3_authorisation_refusals_typed=GREEN
+          --require w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed
+          --expect w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed=GREEN
           --require w3h_1666_control_certificate_only_admin_seals
           --expect w3h_1666_control_certificate_only_admin_seals=GREEN
           --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
