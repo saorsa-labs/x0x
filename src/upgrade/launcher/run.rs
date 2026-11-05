@@ -81,39 +81,25 @@ pub(super) fn run_trial(
         _ => return Err(invalid("no durable start authority")),
     }
     loop {
-        // Check exhaustion first: once every attempt has failed, the verdict
-        // is Failed, and a later stop or reboot must not reclass it as
-        // Interrupted (which would leave the failed release unheld).
-        if trial.attempts >= MAX_ATTEMPTS {
-            let reason = format!(
-                "launch attempts exhausted: {}",
-                trial.cause.as_deref().unwrap_or("no health commit")
-            );
-            return rollback(
-                host,
-                path,
-                trial,
-                cause(journal::CauseClass::Failed, reason),
-            );
-        }
-        // A run-out total budget is Failed and wins over a stop that arrives
-        // in the same pass. A changed boot or a regressed clock stays
-        // Interrupted: the launcher cannot tell whether the deadline passed
-        // before the reboot.
+        // Exhausted attempts or a run-out total budget are Failed. A stop in
+        // the same pass records that verdict before it saves Stopped, so the
+        // next start rolls back as Failed (rollback keeps a stored verdict)
+        // and the failed release is held. The restore still waits for the
+        // next start, as for any stop. A changed boot or a regressed clock
+        // stays Interrupted: the launcher cannot tell whether the deadline
+        // passed before the reboot.
         let clock = now()?;
         let expired = trial.expired(&clock);
-        if let Some(cause) = expired
-            .as_ref()
-            .filter(|cause| cause.class == journal::CauseClass::Failed)
-        {
-            return rollback(host, path, trial, cause.clone());
-        }
+        let failed = failed_verdict(trial, Some(&clock));
         if stop() {
+            if let Some(cause) = failed {
+                trial.verdict.get_or_insert(cause);
+            }
             trial.phase = Phase::Stopped;
             trial.save(path)?;
             return Ok(Outcome::Stopped);
         }
-        if let Some(cause) = expired {
+        if let Some(cause) = failed.or(expired) {
             return rollback(host, path, trial, cause);
         }
         if clock.ms < trial.next_launch_ms {
@@ -162,6 +148,10 @@ pub(super) fn run_trial(
         };
         let failure = loop {
             if stop() {
+                // A clock error must not leave the child unreaped.
+                if let Some(cause) = failed_verdict(trial, now().ok().as_ref()) {
+                    trial.verdict.get_or_insert(cause);
+                }
                 if let Err(error) = child.reap() {
                     return Err(trial.recovery_failed(path, error));
                 }
@@ -198,6 +188,21 @@ pub(super) fn run_trial(
         trial.next_launch_ms = now()?.ms.saturating_add(GAP_MS);
         trial.save(path)?;
     }
+}
+
+/// The Failed verdict a trial has already reached, if any: every attempt
+/// used, or the total budget run out on this boot.
+fn failed_verdict(trial: &Trial, clock: Option<&Clock>) -> Option<journal::Cause> {
+    if trial.attempts >= MAX_ATTEMPTS {
+        let reason = format!(
+            "launch attempts exhausted: {}",
+            trial.cause.as_deref().unwrap_or("no health commit")
+        );
+        return Some(cause(journal::CauseClass::Failed, reason));
+    }
+    clock
+        .and_then(|clock| trial.expired(clock))
+        .filter(|cause| cause.class == journal::CauseClass::Failed)
 }
 
 fn interrupted(reason: &str) -> journal::Cause {
@@ -465,7 +470,15 @@ mod tests {
         let path = root.join("trial.json");
         let mut trial = trial_in(&host, &path, Phase::Authorized, MAX_ATTEMPTS);
         let clock = fast_clock(&trial);
-        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || true);
+        let outcome = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || true);
+        // The stop restores nothing now; it records the Failed verdict.
+        assert!(matches!(outcome, Ok(Outcome::Stopped)));
+        let mut trial = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert_eq!(trial.phase, Phase::Stopped);
+        assert!(trial.verdict.is_some());
+        // The next start rolls back with the stored Failed verdict.
+        let clock = fast_clock(&trial);
+        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
         assert_previous_pair(&host);
         let cause = journal_record(&root).cause.unwrap();
         assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
@@ -490,7 +503,21 @@ mod tests {
                 ms: late,
             })
         };
-        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || true);
+        let outcome = run_trial(
+            &host,
+            &path,
+            &mut trial,
+            clock.clone(),
+            |_| Ok(false),
+            || true,
+        );
+        // The stop restores nothing now; it records the Failed verdict.
+        assert!(matches!(outcome, Ok(Outcome::Stopped)));
+        let mut trial = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert_eq!(trial.phase, Phase::Stopped);
+        assert!(trial.verdict.is_some());
+        // The next start rolls back with the stored Failed verdict.
+        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
         assert_previous_pair(&host);
         let cause = journal_record(&root).cause.unwrap();
         assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
@@ -569,6 +596,49 @@ mod tests {
     /// Linux custody: the restored child starts after rollback, a restarted
     /// launcher starts only the missing restored child, and restored starts
     /// stop at the bound with RecoveryFailed.
+    /// A stop that arrives while a live candidate is health-checked, after
+    /// the total budget ran out, records the Failed verdict before it saves
+    /// Stopped. The next start rolls back as Failed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_during_health_checks_after_the_budget_ran_out_stays_failed() {
+        let (_dir, root, _host, record) = fixture(journal::Phase::SwappedCli);
+        let host = executable_candidate(&root, record);
+        let path = root.join("trial.json");
+        let mut trial = trial_in(&host, &path, Phase::Authorized, 0);
+        let boot = trial.boot.clone();
+        let (early, late) = (trial.started_ms + 1_000, trial.deadline_ms);
+        let reads = std::cell::Cell::new(0u32);
+        // The outer loop and the reservation read the clock inside the
+        // budget; the inner loop's stop reads it after the deadline.
+        let clock = || {
+            reads.set(reads.get() + 1);
+            Ok(Clock {
+                boot: boot.clone(),
+                ms: if reads.get() <= 2 { early } else { late },
+            })
+        };
+        let polls = std::cell::Cell::new(0u32);
+        let stop = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        };
+        let outcome = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), stop);
+        assert!(matches!(outcome, Ok(Outcome::Stopped)));
+        assert_eq!(trial.attempts, 1);
+        let mut trial = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert_eq!(trial.phase, Phase::Stopped);
+        let clock = fast_clock(&trial);
+        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
+        assert_previous_pair(&host);
+        let cause = journal_record(&root).cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
+        assert!(
+            cause.reason.contains("total trial deadline reached"),
+            "{cause:?}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn restored_starts_are_reserved_and_bounded() {
