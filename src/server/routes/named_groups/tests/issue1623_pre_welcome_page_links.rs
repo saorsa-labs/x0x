@@ -54,6 +54,9 @@ fn base_group(owner: &AgentKeypair, local_seat: Option<&str>) -> anyhow::Result<
     );
     request.request_id = REQUEST_ID.to_string();
     set_join_request_created(&mut base, request, None);
+    // A TreeKEM group has a TreeKEM binding from creation
+    // (`create_named_group`), not `GroupInfo::new`'s `gss:epoch=0`.
+    base.security_binding = Some("treekem:epoch=0".to_string());
     base.seal_commit(owner, 1_000)?;
     Ok(base)
 }
@@ -501,6 +504,107 @@ async fn pre_welcome_removal_that_changes_policy_is_refused() -> anyhow::Result<
     assert_eq!(verdict, Err("pre_welcome_policy_change"));
     deliver_direct(&state, &key, &owner, event).await;
     assert_eq!(head_of(&state, &key).await?.state_hash, base.state_hash);
+    Ok(())
+}
+
+/// Guard (b): a link that sets a GSS binding is refused, even when the
+/// armed sequence names it. The ordinary `JoinRequestApproved` apply
+/// copies the signed binding, so only the guard refuses it.
+#[tokio::test]
+async fn pre_welcome_approval_that_sets_a_gss_binding_is_refused() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = base_group(&owner, None)?;
+    let revision = base.state_revision + 1;
+    let approval = seal_link(&mut base.clone(), &owner, 2_000, |next| {
+        set_join_request_approved(
+            next,
+            REQUEST_ID,
+            &owner_hex,
+            &agent(REQUESTER),
+            revision,
+            2_000,
+        );
+        next.set_member_treekem_key_package_hash(&agent(REQUESTER), KEY_PACKAGE_HASH.to_string());
+        next.secret_epoch = TREEKEM_EPOCH;
+        next.security_binding = Some("gss:epoch=9".to_string());
+    })?;
+    let event = NamedGroupMetadataEvent::JoinRequestApproved {
+        group_id: base.stable_group_id().to_string(),
+        request_id: REQUEST_ID.to_string(),
+        revision: approval.revision,
+        actor: owner_hex,
+        requester_agent_id: agent(REQUESTER),
+        treekem_commit_b64: treekem_commit_b64(),
+        treekem_welcome_b64: Some(BASE64.encode(b"issue1623-welcome-for-requester")),
+        welcome_ref: None,
+        treekem_epoch: Some(TREEKEM_EPOCH),
+        treekem_key_package_hash: Some(KEY_PACKAGE_HASH.to_string()),
+        commit: Some(approval.clone()),
+    };
+    let mut stub = base.clone();
+    arm(&mut stub, vec![approval.state_hash.clone()], &owner);
+    let key = install_stub(&state, stub).await?;
+    let trace = refusal_trace(&state, &key, &owner, event).await;
+    let head = head_of(&state, &key).await?;
+    assert_eq!(
+        head.state_hash, base.state_hash,
+        "the GSS-binding approval is refused: head binding {:?}",
+        head.security_binding
+    );
+    assert!(trace.contains("pre_welcome_gss_binding_change"), "{trace}");
+    assert_no_tree(&state, &key).await;
+    Ok(())
+}
+
+/// Guard (b): a link that moves the head off a GSS binding is refused. The
+/// ordinary removal apply takes the link's TreeKEM binding, so only the
+/// guard refuses it.
+#[tokio::test]
+async fn pre_welcome_removal_from_a_gss_head_is_refused() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let mut base = base_group(&owner, None)?;
+    seal_link(&mut base, &owner, 1_500, |next| {
+        next.security_binding = Some("gss:epoch=3".to_string());
+    })?;
+    let (removal, event) = removal_link(&base, &owner, false)?;
+    assert_eq!(
+        removal.security_binding.as_deref(),
+        Some(format!("treekem:epoch={TREEKEM_EPOCH}").as_str())
+    );
+    let mut stub = base.clone();
+    arm(&mut stub, vec![removal.state_hash.clone()], &owner);
+    let key = install_stub(&state, stub).await?;
+    let trace = refusal_trace(&state, &key, &owner, event).await;
+    let head = head_of(&state, &key).await?;
+    assert_eq!(
+        head.state_hash, base.state_hash,
+        "the removal off the GSS head is refused: head binding {:?}",
+        head.security_binding
+    );
+    assert!(trace.contains("pre_welcome_gss_binding_change"), "{trace}");
+    Ok(())
+}
+
+/// Control for guard (b): a TreeKEM-to-TreeKEM binding move is not a GSS
+/// binding change, so the guard admits it.
+#[tokio::test]
+async fn pre_welcome_treekem_binding_move_is_not_a_gss_change() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let base = base_group(&owner, None)?;
+    let (removal, event) = removal_link(&base, &owner, false)?;
+    assert_ne!(removal.security_binding, base.security_binding);
+    let mut stub = base.clone();
+    arm(&mut stub, vec![removal.state_hash.clone()], &owner);
+    let key = install_stub(&state, stub).await?;
+    let stub = head_of(&state, &key).await?;
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    let verdict =
+        admit_pre_welcome_state_only_link(&state, &stub, &mut stub.clone(), &event, &local).await;
+    assert_eq!(verdict, Ok(()));
     Ok(())
 }
 

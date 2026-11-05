@@ -13169,8 +13169,14 @@ fn catchup_page_within_attested_sequence(
 /// leaves a sequence, or a link after the ATA signer lost its Active admin
 /// seat, is refused. A link that changes the policy hash is refused (§2);
 /// the ordinary apply also refuses it, because the state hash is
-/// recomputed from the local policy. The TreeKEM commit is then
-/// skipped: no tree and no epoch come from it. On admission `next` keeps
+/// recomputed from the local policy. A link that changes a GSS security
+/// binding (`gss:epoch=N` on the head or on the link) is refused (§2, as
+/// #458 r6 item 4 refuses it): the joiner cannot verify a GSS secret
+/// rotation from the chain. A TreeKEM-to-TreeKEM binding move is not a GSS
+/// change; every link with a TreeKEM commit makes one. The ordinary apply
+/// takes the link's binding, so this guard alone refuses a GSS change.
+/// The TreeKEM commit is then skipped: no tree and no epoch come from
+/// it. On admission `next` keeps
 /// this node's `secret_epoch`, as `apply_link_state_only` does; the signed
 /// `security_binding` stays, because the state hash covers it. The node's
 /// keys come only from its own Welcome at the terminal. `MemberAdded` has
@@ -13191,6 +13197,14 @@ async fn admit_pre_welcome_state_only_link(
         };
         if commit.policy_hash != x0x::groups::compute_policy_hash(&info.policy) {
             break 'check Err("pre_welcome_policy_change");
+        }
+        let is_gss = |binding: Option<&str>| binding.is_some_and(|b| b.starts_with("gss:"));
+        let (head_binding, link_binding) = (
+            info.security_binding.as_deref(),
+            commit.security_binding.as_deref(),
+        );
+        if head_binding != link_binding && (is_gss(head_binding) || is_gss(link_binding)) {
+            break 'check Err("pre_welcome_gss_binding_change");
         }
         let link = std::slice::from_ref(event);
         let owner_sequence =
