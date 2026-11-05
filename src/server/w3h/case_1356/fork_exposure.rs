@@ -26,8 +26,8 @@
 //! no node commits. J's `recovery.asked` shows each answer (§8). Only an
 //! admin's `GET /groups/:id/recovery` lists requesters (§8), so A's list
 //! also shows J was refused before any walk; M1's and M2's are empty.
-//! J's own check of the ATA refuses it (`HeadMismatch`), and at least one
-//! X->J direct frame carries that recovery response for J's head.
+//! J's own check of the ATA refuses it (`HeadMismatch`), and J's DM layer
+//! receives the exact response bytes from X.
 //!
 //! Fidelity: the hold keys on a write's origin (the first sender of its
 //! pubsub message ID), so relays are held too. Transport control passes.
@@ -38,7 +38,7 @@ use super::gaps::{answered, promote, recovery_route, recovery_text, sees_s3};
 use super::*;
 use crate::groups::recovery::{
     encode_message, AdminTerminalAttestation, AttestAnswer, GroupAttestResponseV1,
-    GroupRecoveryMessageV1, RecoveryRefusal, GROUP_RECOVERY_PREFIX,
+    GroupRecoveryMessageV1, RecoveryRefusal,
 };
 use crate::network::sim::{Fault, Key, LaneClass};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -519,6 +519,20 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         for_head_state_hash: j2.state_hash.clone(),
         answer: AttestAnswer::Attested(Box::new(carry)),
     }))?;
+    // J's DM layer sees the injected bytes from X. X sends a gossip DM to
+    // J, which is encrypted on the wire, so the frames alone cannot show it.
+    let x_agent = sim.state("X")?.agent.agent_id();
+    let mut j_inbox = sim.state("J")?.agent.subscribe_direct();
+    let expected = payload.clone();
+    let received = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::clone(&received);
+    let watch = tokio::spawn(async move {
+        while let Some(msg) = j_inbox.recv().await {
+            if msg.sender == x_agent && msg.payload == expected {
+                sink.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
     hold.set(sim, INJECT, "X cut, except X's writes to J");
     let injected_at = sim
         .fabric()
@@ -530,34 +544,36 @@ async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
         })
         .await?;
     hold.set(sim, CUT_X, "everything to and from X");
-    // A failed send is INFRA: the row could not test J's handling.
-    sent.map_err(|error| anyhow::anyhow!("X's ATA send to J failed: {error}"))?;
-    // Only direct frames with the recovery prefix and J's head hash are
-    // the injected response; X's other traffic to J does not count.
-    let injected = sim
-        .fabric()
-        .delivered_writes_after(&sim.peer("X")?, &sim.peer("J")?, injected_at)
-        .iter()
-        .filter(|(w, _)| matches!(w.lane.class, LaneClass::Direct | LaneClass::RelayedDm))
-        .filter(|(w, _)| has(&w.bytes, GROUP_RECOVERY_PREFIX))
-        .filter(|(w, _)| has(&w.bytes, j2.state_hash.as_bytes()))
-        .count();
-    receipt.request_delivered(
-        "x_ata_reached_j",
-        injected > 0,
-        format!(
-            "direct X->J frames carrying the recovery response for J's head: {injected}; \
-             local verify {local:?}"
-        ),
-        at(sim),
-    );
-    if injected == 0 {
-        failing.push("x_ata_reached_j");
+    let frames = delivered_after(sim, "X", "J", injected_at)?;
+    // INJECT holds every write to X, so J's ACK cannot reach X and the
+    // send normally ends with an ACK timeout. A failed send with no frame
+    // at J is INFRA: the row could not test J's handling.
+    if frames == 0 {
+        if let Err(error) = &sent {
+            watch.abort();
+            anyhow::bail!("X's ATA send to J failed and no frame reached J: {error}");
+        }
     }
     sim.within("J handles the ATA", AFTER_INJECT + secs(2), async {
         tokio::time::sleep(AFTER_INJECT).await;
     })
     .await?;
+    watch.abort();
+    let dm_received = received.load(Ordering::SeqCst);
+    receipt.request_delivered(
+        "x_ata_reached_j",
+        dm_received > 0,
+        format!(
+            "J's DM layer received the injected response from X {dm_received} times; frames \
+             X->J after the injection {frames}; send {}; local verify {local:?}",
+            sent.as_ref()
+                .map_or_else(|e| e.to_string(), |_| "acked".to_string())
+        ),
+        at(sim),
+    );
+    if dm_received == 0 {
+        failing.push("x_ata_reached_j");
+    }
     let after = heads(sim, &group).await?;
     let marker_after = marker_of(sim, "J", &group).await?;
     let end_text = status(sim, "J", &group)
