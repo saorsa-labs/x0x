@@ -18,6 +18,10 @@ and `s3-rm4.2`, 10 reruns each. The summary job still counts 20 receipts.
 The S3 shard is omitted when the tree has no `w3h_1356_` test, so `main`
 does not spend a runner on an empty filter. Adding those tests makes the
 shard appear on the next plan.
+
+ADR 0111 H6 (#1358) has its own shard, split as `h6-1358.1` and
+`h6-1358.2`, 10 reruns each. It is not an S3 group, so each part keeps
+the 120-min job and the 6600 s test deadline.
 """
 import argparse
 import json
@@ -33,6 +37,7 @@ from pathlib import Path
 GROUPS = (
     ('long-1023', 'w3h_1023_'),
     ('s4', 'w3h_1357_'),
+    ('h6-1358', 'w3h_1358_red_h6_invite_roster_above_cap$'),
     ('s3-c', 'w3h_1356_red_s3_c_promoted_admin_reseats_owner_axis_node$'),
     ('s3-c2', 'w3h_1356_red_s3_c2_reseat_retires_marker_and_gap$'),
     ('s3-c3', 'w3h_1356_control_s3_c3_owner_reseats_owner_axis_node$'),
@@ -59,6 +64,16 @@ RUNS = 20
 # margin under the 155-min S3 test deadline. 2 parts of 10 reruns take
 # about 75 min each.
 PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 2}
+
+# ADR 0111 H6 (#1358): 26 daemons; on `main` A seats 21 of them through
+# the invite API, then the #646 refusal. One rerun took 170-197 s
+# locally, so about 400 s on the 4-vCPU runner, and 20 reruns about
+# 133 min. That does not fit the 6600 s test deadline of a non-S3 group,
+# and the `rest` shard already takes 63-65 min. Split it, do not raise
+# the budget (31 Oct ruling, #1733): 2 parts of 10 reruns take about
+# 67 min each. A separate statement keeps this hunk away from the
+# `PARTS` line that open PRs edit.
+PARTS['h6-1358'] = 2
 
 ROOT = Path(__file__).resolve().parents[2]
 
