@@ -336,8 +336,10 @@ start. It reserves each attempt durably before exec, so a failed exec still
 counts. The limits are at most 3 attempts, 120 s to readiness per attempt,
 60 s of stable health and a 660 s total trial, with 10 s between attempts.
 These values are provisional until David rules on them. When the attempts
-or the total budget run out, the cause is Failed, and a later stop or reboot
-does not change it. A changed boot, a launcher restart during exec or
+or the total budget run out, the cause is Failed, and a later service stop
+does not change it. Exhausted attempts also stay Failed after a reboot. A
+reboot before the launcher sees the run-out total budget is Interrupted,
+because the launcher cannot tell when the deadline passed. A changed boot, a launcher restart during exec or
 rollback, or a service stop while attempts remain is Interrupted. The
 launcher then restores the previous pair and starts the restored daemon. For
 a service stop, the restore happens on the next launcher start; the candidate
