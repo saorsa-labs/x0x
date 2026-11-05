@@ -6549,6 +6549,45 @@ async fn refuse_authorisation(state: &AppState, stable: &str, revision: u64, che
     }
 }
 
+/// §3a "Invite check at the subject": refuse the re-seat invite that an
+/// authorisation brings. ADR 0109 §3a: "Refusals surface as ADR 0059's
+/// `invites_refused {reason}` diagnostics". So this function counts the
+/// reported cause under `group_key` (row H-S3-rm4 (4)). Then it refuses
+/// the authorisation as [`refuse_authorisation`] does.
+async fn refuse_reseat_invite(
+    state: &AppState,
+    group_key: &str,
+    stable: &str,
+    revision: u64,
+    check: &str,
+) {
+    state
+        .groups_diagnostics
+        .record_invite_refusal(group_key, authorisation_refused_cause(check));
+    refuse_authorisation(state, stable, revision, check).await;
+}
+
+/// The `last_refusal` for a staged join that did not succeed. When the
+/// join route refuses the invite, it answers 409 with the reason in
+/// `error`, and it counts that reason in `invites_refused`. ADR 0109 §3a
+/// sets that reason as `last_refusal` (row H-S3-rm4 (3) and (5):
+/// `owner_mismatch`, `invite_downgraded`). Any other answer gives
+/// `join_<status>`.
+async fn staged_join_refusal(response: axum::response::Response) -> String {
+    let status = response.status();
+    if status == StatusCode::CONFLICT {
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await;
+        let reason = body
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|body| body["error"].as_str().map(str::to_string));
+        if let Some(reason) = reason {
+            return reason;
+        }
+    }
+    format!("join_{}", status.as_u16())
+}
+
 /// §3 subject checks anchored in this node's own verified record
 /// (#1533 review, Codex P1; Engineer ruling of 22 Oct). The invite's base
 /// roster is the signer's own claim, so it is never the authority by
@@ -6692,7 +6731,14 @@ async fn consume_reseat(
     // paired invite's inline inviter key, which must hash to the signer.
     let Ok(invite) = x0x::groups::invite::SignedInvite::from_link(&invite_link) else {
         drop(membership_guard);
-        refuse_authorisation(state, &stable, info.state_revision, "invite_malformed").await;
+        refuse_reseat_invite(
+            state,
+            group_key,
+            &stable,
+            info.state_revision,
+            "invite_malformed",
+        )
+        .await;
         return;
     };
     let inviter_key = {
@@ -6731,7 +6777,7 @@ async fn consume_reseat(
         .and_then(|()| check_reseat_keys(group_key, &info, &invite))
     {
         drop(membership_guard);
-        refuse_authorisation(state, &stable, info.state_revision, cause).await;
+        refuse_reseat_invite(state, group_key, &stable, info.state_revision, cause).await;
         return;
     }
     // §4 "Timing": the journal is the first sidecar write; it waits for
@@ -6836,8 +6882,9 @@ async fn consume_reseat(
         .into_response();
     if !response.status().is_success() {
         let status = response.status();
-        tracing::warn!(group_id = %LogHexId::group(group_key), %status, "ADR 0109 S3: the staged join was refused; restoring the live record");
-        rollback_reseat(state, &stable, digest, &format!("join_{}", status.as_u16())).await;
+        let why = staged_join_refusal(response).await;
+        tracing::warn!(group_id = %LogHexId::group(group_key), %status, why, "ADR 0109 S3: the staged join was refused; restoring the live record");
+        rollback_reseat(state, &stable, digest, &why).await;
     } else {
         // The join can return with the record already Active with keys:
         // swap now rather than at the next worker tick.
@@ -17498,13 +17545,100 @@ mod tests {
             (revision, &hash),
         )?;
         let refusal = deliver_offer(&state, &info, &admin, offer).await;
-        assert!(
-            refusal
-                .as_deref()
-                .is_some_and(|why| why.starts_with("join_")),
-            "the staged join ran: {refusal:?}"
-        );
+        // The staged join ran: the join route refuses the fixture's
+        // invite base, and `last_refusal` names that reason (H-S3-rm4).
+        assert_eq!(refusal.as_deref(), Some("invite_base_inconsistent"));
         original_kept(&state, &key, &info).await
+    }
+
+    /// `invites_refused_reasons[reason]` for `group` on `state`.
+    fn invite_refusals(state: &AppState, group: &str, reason: &str) -> u64 {
+        state
+            .groups_diagnostics
+            .snapshot(
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+                state.groups_config.mandate_grace_days,
+            )
+            .groups
+            .into_iter()
+            .find(|row| row.group_id == group)
+            .and_then(|row| row.counters.invites_refused_reasons.get(reason).copied())
+            .unwrap_or(0)
+    }
+
+    /// ADR 0109 row H-S3-rm4 (4) (#1572): the admin's re-seat invite comes
+    /// with an authorisation for another invite secret. The subject refuses
+    /// `reseat_invite_unpaired` before it journals anything, and it counts
+    /// the refusal in `invites_refused {reason}`. Before the fix it set
+    /// `last_refusal` only. Inert (offline agent).
+    #[tokio::test]
+    async fn an_unpaired_reseat_invite_is_counted_as_an_invite_refusal() -> anyhow::Result<()> {
+        let (state, _dir) = super::super::tests::secure_endpoint_test_state().await?;
+        let admin = x0x::identity::AgentKeypair::generate()?;
+        let member = x0x::identity::AgentKeypair::generate()?;
+        let (key, info) = authority_fixture(&state, &admin, &member, None).await?;
+        let (basis, revision, hash) = unseen_removal(&info);
+        let (authorisation, link) = reseat_offer(
+            &info,
+            &admin,
+            state.agent.agent_id(),
+            basis,
+            (revision, &hash),
+        )?;
+        let mut fields = authorisation.fields;
+        fields.invite_secret_hash = s3::invite_secret_hash("another invite secret");
+        let unpaired = ReseatAuthorisation::sign(fields, &admin)?;
+        let reason = "reseat_invite_unpaired";
+        let before = invite_refusals(&state, &key, reason);
+        let refusal = deliver_offer(&state, &info, &admin, (unpaired, link)).await;
+        assert_eq!(
+            refusal.as_deref(),
+            Some("authorisation_refused:reseat_invite_unpaired")
+        );
+        assert_eq!(invite_refusals(&state, &key, reason), before + 1);
+        original_kept(&state, &key, &info).await
+    }
+
+    /// ADR 0109 row H-S3-rm4 (3) and (5) (#1572): a staged join that the
+    /// join route refuses for its invite (409 with the reason in `error`)
+    /// gives that reason as `last_refusal`. Before the fix the rollback
+    /// wrote `join_409`. Any other answer still gives `join_<status>`.
+    #[tokio::test]
+    async fn a_refused_staged_join_names_the_invite_reason() {
+        let answer = |code: StatusCode, body: serde_json::Value| (code, Json(body)).into_response();
+        for (response, want) in [
+            (
+                answer(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({ "ok": false, "error": "owner_mismatch" }),
+                ),
+                "owner_mismatch",
+            ),
+            (
+                answer(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({ "ok": false, "error": "invite_downgraded" }),
+                ),
+                "invite_downgraded",
+            ),
+            (
+                answer(StatusCode::CONFLICT, serde_json::json!({ "ok": false })),
+                "join_409",
+            ),
+            (StatusCode::CONFLICT.into_response(), "join_409"),
+            (
+                answer(
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::json!({ "ok": false, "error": "owner_mismatch" }),
+                ),
+                "join_502",
+            ),
+        ] {
+            assert_eq!(staged_join_refusal(response).await, want);
+        }
     }
 
     /// A Member that this node saw promoted to Admin, in a signed commit it
@@ -17527,12 +17661,9 @@ mod tests {
             (revision, &hash),
         )?;
         let refusal = deliver_offer(&state, &info, &promoted, offer).await;
-        assert!(
-            refusal
-                .as_deref()
-                .is_some_and(|why| why.starts_with("join_")),
-            "the staged join ran: {refusal:?}"
-        );
+        // The staged join ran: the join route refuses the fixture's
+        // invite base, and `last_refusal` names that reason (H-S3-rm4).
+        assert_eq!(refusal.as_deref(), Some("invite_base_inconsistent"));
         original_kept(&state, &key, &info).await
     }
 
@@ -17688,12 +17819,9 @@ mod tests {
             (revision, &hash),
         )?;
         let refusal = deliver_offer(&state, &info, &admin, offer).await;
-        assert!(
-            refusal
-                .as_deref()
-                .is_some_and(|why| why.starts_with("join_")),
-            "the staged join ran: {refusal:?}"
-        );
+        // The staged join ran: the join route refuses the fixture's
+        // invite base, and `last_refusal` names that reason (H-S3-rm4).
+        assert_eq!(refusal.as_deref(), Some("invite_base_inconsistent"));
         original_kept(&state, &key, &info).await
     }
 

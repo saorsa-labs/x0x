@@ -1,5 +1,6 @@
 //! ADR 0109 §10 row H-S3-rm4 (the re-seat invite check, ADR 0059
-//! exception, D156; #1572), variants (1) and (2).
+//! exception, D156; #1572), variants (1) to (5). Variant (6), the Home
+//! policy, is not in this file.
 //!
 //! Setup: H-S3-c up to A's re-seat call. O stops and A removes J (r+3).
 //! J's writes and A's writes to J are held, and A re-seats J with basis
@@ -7,45 +8,56 @@
 //! variant runs, and one test runs each variant:
 //! (1) J's operator calls `POST /groups/join` with A's re-seat invite.
 //! (2) Node E, never seated, calls `POST /groups/join` with it.
+//! (3) A sends J an authorisation whose invite names another owner in its
+//! policy, re-signed with A's key.
+//! (4) A sends J the re-seat invite with no authorisation paired to it.
+//! (5) A sends J a re-seat invite whose policy has no owner axis.
 //! Last, J's writes pass and A sends J its real authorisation.
 //!
-//! Desired: J refuses (1) and E refuses (2) with
-//! `reseat_invite_outside_staging`, and each refusal is counted in
-//! `invites_refused {reason}`. J stays `reseat_required`, with no staging
-//! stub and an unchanged live record. E has no record of the group. Then
-//! A's real authorisation re-seats J: J is Active with keys at r+4. The
-//! join route answers J's operator and writes no recovery state, so for
-//! (1) the row reads that answer, not `last_refusal`.
+//! Desired: J refuses (1) `reseat_invite_outside_staging`, (3)
+//! `owner_mismatch`, (4) `reseat_invite_unpaired` and (5)
+//! `invite_downgraded`. Each refusal is counted in `invites_refused
+//! {reason}`. J stays `reseat_required`, with no re-seat journal or
+//! staging record left, and
+//! `last_refusal` names the reason (the API reference adds the prefix
+//! `authorisation_refused:` to a refused authorisation). E refuses (2)
+//! `reseat_invite_outside_staging` and has no record of the group. Then
+//! A's real authorisation re-seats J: J is Active with keys at r+4.
 //!
-//! Not in this file: variants (3) to (5) are RED on `main`. J refuses each
-//! one, but reports the refusal in the wrong place:
-//! - (3) and (5): the staged join refuses with `owner_mismatch` or
-//!   `invite_downgraded` and counts it, but `consume_reseat` rolls back
-//!   with `last_refusal = "join_409"`, which drops the reason
-//!   (`src/server/routes/named_groups/group_recovery.rs:6623`).
-//! - (4): `refuse_authorisation` (`group_recovery.rs:6320`) sets
-//!   `last_refusal`, but does not count the refusal in `invites_refused`.
+//! `AttestAnswer::Reseat` always carries an authorisation, so (4) sends the
+//! real invite with an authorisation that A re-signed for another invite
+//! secret. For (1) the join route answers J's operator and writes no
+//! recovery state, so the row reads that answer, not `last_refusal`.
 //!
-//! The fix is in `group_recovery.rs`, which open PRs change, so (3) to (5)
-//! come with that fix as its red proof. Variant (6), the Home policy, is
-//! not in this file. A released joiner's refusal of (2) needs a released
-//! binary (the H-S3-home gate harness).
+//! Where the code differs from the ADR text: ADR 0109 §3a puts the owner
+//! pin (check 3) "before any staging stub". The code runs it in the
+//! staged join, so (3) and (5) stage, are refused there, and the staging
+//! rolls back. The row checks the result the ruling accepts (4 Nov 2026,
+//! as for H-S3-rm2 option (b)): after the refusal J holds no re-seat
+//! journal and no staging record, and its live record is unchanged.
+//!
+//! (3) to (5) are the red proof of the fix in `group_recovery.rs`. Before
+//! it, the rollback of the refused staged join in (3) and (5) wrote
+//! `last_refusal = "join_409"`, and the refusal of (4) was not counted in
+//! `invites_refused`. A released joiner's refusal of (2) needs a released
+//! binary (the H-S3-home gate harness), so it is not in this file.
 //!
 //! RED: the variant reached J (or E) and the refusal, the count, J's
 //! containment or the last re-seat is wrong. Any other failure is INFRA.
 
 use super::*;
 use crate::groups::recovery::{
-    encode_message, AttestAnswer, GroupAttestResponseV1, GroupRecoveryMessageV1, IssuedReseatV1,
-    ReseatAuthorisation,
+    encode_message, invite_secret_hash, AttestAnswer, GroupAttestResponseV1,
+    GroupRecoveryMessageV1, IssuedReseatV1, ReseatAuthorisation,
 };
+use crate::groups::state_commit as sc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const FINAL_RM4: &str =
     "j_refuses_the_reseat_invite_variant_then_the_real_authorisation_reseats_it";
 const CAUSE_RM4: &str = "the row's main observation: A's re-seat route returns 404 (no S3 \
                          re-seat); or J (or E) does not refuse the variant with its reason \
-                         and count before any stub, J leaves containment, or A's real \
+                         and count with no stub left, J leaves containment, or A's real \
                          authorisation does not re-seat J at r+4; `observed` lists each \
                          failing step";
 /// H-S3-c's nodes plus E, never seated (variant 2 only).
@@ -55,17 +67,25 @@ const RM4_E_LABELS: &[&str] = &["O", "A", "X", "J", "E"];
 const PUSH_DONE: Duration = Duration::from_secs(120);
 /// One direct send with J's ack held: every attempt and its retry.
 const SEND_BOUND: Duration = Duration::from_secs(60);
+/// How long J has to record its answer to one variant.
+const REFUSAL_WAIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Variant {
     PlainJoin,
     Stranger,
+    OtherOwner,
+    Unpaired,
+    Downgraded,
 }
 
 impl Variant {
     fn reason(self) -> &'static str {
         match self {
             Self::PlainJoin | Self::Stranger => "reseat_invite_outside_staging",
+            Self::OtherOwner => "owner_mismatch",
+            Self::Unpaired => "reseat_invite_unpaired",
+            Self::Downgraded => "invite_downgraded",
         }
     }
 
@@ -73,6 +93,9 @@ impl Variant {
         match self {
             Self::PlainJoin => "(1) J's operator joins with the re-seat invite",
             Self::Stranger => "(2) E joins with the re-seat invite",
+            Self::OtherOwner => "(3) an invite naming another owner",
+            Self::Unpaired => "(4) the re-seat invite with no paired authorisation",
+            Self::Downgraded => "(5) an invite with no owner axis",
         }
     }
 }
@@ -112,6 +135,12 @@ fn count(reasons: &Value, reason: &str) -> u64 {
     reasons[reason].as_u64().unwrap_or(0)
 }
 
+/// Whether `last_refusal` names `reason`, with or without the
+/// `authorisation_refused:` prefix.
+fn names(last: Option<&str>, reason: &str) -> bool {
+    last.and_then(|r| r.rsplit(':').next()) == Some(reason)
+}
+
 /// Whether `label` holds a re-seat journal or a staging record.
 fn has_journal(sim: &Sim, label: &str) -> Result<bool> {
     Ok(sidecars(sim, label)?
@@ -146,6 +175,59 @@ async fn send_reseat(
     })
     .await?;
     delivered_after(sim, "A", "J", cut)
+}
+
+/// The variant's authorisation and invite, built from A's real pair and
+/// re-signed with A's key. (3) and (5) change the invite's policy, so the
+/// base hash is derived again (as the join route derives it) and the
+/// authorisation names the new hash.
+fn forged(
+    sim: &Sim,
+    real: &IssuedReseatV1,
+    variant: Variant,
+) -> Result<(ReseatAuthorisation, String)> {
+    let state = sim.state("A")?;
+    let a_key = state.agent.identity().agent_keypair();
+    let mut fields = real.authorisation.fields.clone();
+    let mut link = real.invite.clone();
+    if variant == Variant::Unpaired {
+        fields.invite_secret_hash = invite_secret_hash("w3h rm4: another invite secret");
+    } else {
+        let mut invite = crate::groups::invite::SignedInvite::from_link(&real.invite)
+            .map_err(|e| anyhow!("A's re-seat invite: {e}"))?;
+        let policy = invite.policy.as_mut().context("A's invite has no policy")?;
+        policy.admission = match variant {
+            Variant::OtherOwner => {
+                let other = crate::identity::UserKeypair::from_seed(&[0x31; 32])?;
+                crate::groups::GroupAdmission::OwnerCertified(other.user_id())
+            }
+            _ => crate::groups::GroupAdmission::InviteOnly,
+        };
+        let view = crate::groups::invite::InviteSignedViewV4::from_invite(&invite)
+            .map_err(|r| anyhow!("the changed invite's view: {}", r.reason()))?;
+        let policy = view.policy.as_ref().context("the view has no policy")?;
+        let hash = sc::compute_state_hash(
+            &view.stable_group_id,
+            view.base_state_revision,
+            view.base_prev_state_hash.as_deref(),
+            &sc::roster_root_of_projection(&view.base_roster),
+            &sc::compute_policy_hash(policy),
+            &sc::compute_public_meta_hash(&view.public_meta),
+            view.base_security_binding.as_deref(),
+            false,
+        );
+        invite.base_state_hash = Some(hash.clone());
+        invite
+            .sign_v4(a_key, None)
+            .map_err(|e| anyhow!("A re-signs the changed invite: {e}"))?;
+        link = invite
+            .encode_link()
+            .map_err(|e| anyhow!("the changed invite link: {e:?}"))?;
+        fields.invite_base_state_hash = hash;
+    }
+    let authorisation = ReseatAuthorisation::sign(fields, a_key)
+        .map_err(|e| anyhow!("A signs the authorisation: {}", e.as_str()))?;
+    Ok((authorisation, link))
 }
 
 /// What one variant left: its sub-checks, whether it reached its target,
@@ -199,6 +281,45 @@ async fn run_variant(
             (
                 true,
                 format!("{joiner} join {code} {answer}; refusals before {before} after {after}"),
+            )
+        }
+        _ => {
+            let (authorisation, link) = forged(sim, issued, variant)?;
+            let delivered = send_reseat(sim, group, variant.what(), &authorisation, &link).await?;
+            let mut last = None;
+            let mut after = Value::Null;
+            let waited = sim
+                .until(
+                    &format!("J refuses {}", variant.what()),
+                    REFUSAL_WAIT,
+                    async |s: &Sim| {
+                        let st = status_now(s, "J", group).await.ok().flatten();
+                        last = st.as_ref().and_then(|st| {
+                            st.recovery["last_refusal"].as_str().map(str::to_string)
+                        });
+                        after = refused(s, "J", group).await.unwrap_or(Value::Null);
+                        names(last.as_deref(), reason)
+                            && count(&after, reason) > count(&before, reason)
+                    },
+                )
+                .await;
+            if let Err(error) = waited {
+                ensure!(expired(&error), error);
+            }
+            checks.push((
+                "last_refusal_names_the_reason",
+                names(last.as_deref(), reason),
+            ));
+            checks.push((
+                "refusal_counted_under_the_reason",
+                count(&after, reason) > count(&before, reason),
+            ));
+            (
+                delivered > 0,
+                format!(
+                    "frames A->J {delivered}; J last_refusal {last:?}; refusals before {before} \
+                     after {after}"
+                ),
             )
         }
     };
@@ -448,4 +569,37 @@ fn w3h_1356_control_s3_rm4_plain_join_refused_outside_staging() -> Result<()> {
 fn w3h_1356_control_s3_rm4_stranger_join_refused_outside_staging() -> Result<()> {
     let case = "w3h_1356_control_s3_rm4_stranger_join_refused_outside_staging";
     super::super::super::block_on_paused(expect(case, 0x1356_0122, Variant::Stranger))
+}
+
+/// H-S3-rm4 (3): an invite that names another owner is refused.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1356_control_s3_rm4_other_owner_refused() -> Result<()> {
+    let case = "w3h_1356_control_s3_rm4_other_owner_refused";
+    super::super::super::block_on_paused(expect(case, 0x1356_0123, Variant::OtherOwner))
+}
+
+/// H-S3-rm4 (4): the re-seat invite with no paired authorisation is refused.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1356_control_s3_rm4_unpaired_invite_refused() -> Result<()> {
+    let case = "w3h_1356_control_s3_rm4_unpaired_invite_refused";
+    super::super::super::block_on_paused(expect(case, 0x1356_0124, Variant::Unpaired))
+}
+
+/// H-S3-rm4 (5): a re-seat invite with no owner axis is refused.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1356_control_s3_rm4_downgraded_invite_refused() -> Result<()> {
+    let case = "w3h_1356_control_s3_rm4_downgraded_invite_refused";
+    super::super::super::block_on_paused(expect(case, 0x1356_0125, Variant::Downgraded))
 }

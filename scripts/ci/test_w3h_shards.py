@@ -79,6 +79,10 @@ class ShardPlanTest(unittest.TestCase):
         self.assertTrue(rm4)
         self.assertEqual(sorted(assigned.get('s3-rm4', [])), sorted(rm4))
         self.assertFalse(set(rm4) & set(assigned.get('s3', [])))
+        # (1) to (5): one rerun of all five is about 1100 s on a runner, so
+        # 4 parts of 5 reruns stay under the 155-min S3 test deadline.
+        self.assertGreaterEqual(len(rm4), 5)
+        self.assertEqual(SHARDS.stress_count('s3-rm4.1'), 5)
 
     def test_split_parts_run_the_full_rerun_count_together(self):
         # D196: the gate counts exactly RUNS receipts per case, so the
