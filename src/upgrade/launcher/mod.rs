@@ -376,6 +376,35 @@ mod tests {
     }
 
     #[test]
+    fn a_foreign_boot_restored_child_blocks_the_recovery_failed_save() {
+        let (_dir, path, mut trial, clock) = fixture();
+        trial.phase = Phase::Authorized;
+        trial.reserve(&path, &clock).unwrap();
+        trial.phase = Phase::Restored;
+        trial.verdict = Some(cause(journal::CauseClass::Interrupted, "candidate exited"));
+        trial.child = Some(Identity {
+            pid: 2,
+            start: 3,
+            boot: "boot-0".into(),
+        });
+        trial.save(&path).unwrap();
+        // Only Restored may hold a child from another boot, so the exhausted
+        // restored-start path must clear it before RecoveryFailed.
+        let mut kept = trial.clone();
+        kept.recovery_failed(&path, invalid("restored starts exhausted"));
+        assert_eq!(
+            Trial::load(&path, &trial.binding, "alice").unwrap().phase,
+            Phase::Restored
+        );
+        trial.child = None;
+        trial.recovery_failed(&path, invalid("restored starts exhausted"));
+        assert_eq!(
+            Trial::load(&path, &trial.binding, "alice").unwrap().phase,
+            Phase::RecoveryFailed
+        );
+    }
+
+    #[test]
     fn readiness_and_stable_health_are_both_bounded() {
         let (_dir, path, mut trial, clock) = fixture();
         trial.phase = Phase::Authorized;
