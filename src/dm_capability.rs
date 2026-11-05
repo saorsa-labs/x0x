@@ -370,6 +370,19 @@ pub struct CapabilityBinding {
     pub machine_id: MachineId,
 }
 
+/// #1776: whether `binding` can carry a gossip-inbox DM — a real machine,
+/// the gossip-inbox capability, and KEM material to seal to it. The
+/// targeted capability refresh's no-requirement readiness check and the
+/// Welcome fetch's addressability check share this one definition, so a
+/// stale or partial binding (no gossip inbox, empty KEM key, zeroed
+/// machine) satisfies neither.
+#[must_use]
+pub(crate) fn binding_is_gossip_usable(binding: &CapabilityBinding) -> bool {
+    binding.machine_id.0 != [0; 32]
+        && binding.capabilities.gossip_inbox
+        && !binding.capabilities.kem_public_key.is_empty()
+}
+
 impl Default for CapabilityStore {
     fn default() -> Self {
         Self::new()
@@ -936,6 +949,39 @@ pub fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1776: a binding is gossip-usable only with a real machine, the
+    /// gossip-inbox capability and KEM material. Each missing part alone
+    /// must reject it, so a stale or partial advert cannot satisfy the
+    /// no-requirement refresh or the Welcome fetch addressability check.
+    #[test]
+    fn binding_is_gossip_usable_requires_machine_inbox_and_kem_key() {
+        let usable = CapabilityBinding {
+            capabilities: DmCapabilities::v1_gossip_ready(vec![7u8; 1184]),
+            machine_id: MachineId([2u8; 32]),
+        };
+        assert!(binding_is_gossip_usable(&usable));
+
+        let zero_machine = CapabilityBinding {
+            machine_id: MachineId([0u8; 32]),
+            ..usable.clone()
+        };
+        assert!(!binding_is_gossip_usable(&zero_machine), "zeroed machine");
+
+        let mut no_inbox = usable.clone();
+        no_inbox.capabilities.gossip_inbox = false;
+        assert!(!binding_is_gossip_usable(&no_inbox), "no gossip inbox");
+
+        let mut no_kem = usable.clone();
+        no_kem.capabilities.kem_public_key = Vec::new();
+        assert!(!binding_is_gossip_usable(&no_kem), "empty KEM key");
+
+        let pending = CapabilityBinding {
+            capabilities: DmCapabilities::pending(),
+            machine_id: MachineId([2u8; 32]),
+        };
+        assert!(!binding_is_gossip_usable(&pending), "pending advert");
+    }
 
     #[test]
     fn capability_store_insert_and_lookup() {

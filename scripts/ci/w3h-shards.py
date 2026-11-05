@@ -13,8 +13,10 @@ are split across parallel parts (`PARTS`): matrix entries `s3-d3.1` to
 `s3-d3.4`, 5 reruns each. The #1661 welcome-lost row has its own shard
 too, split as `s3-1661.1` and `s3-1661.2`, 10 reruns each. The H-S3-rm4
 variants run the H-S3-c prefix and share one shard, split as `s3-rm4.1`
-and `s3-rm4.2`, 10 reruns each. H-S3-d2 has its own shard (`s3-d2`).
-The summary job still counts 20 receipts.
+and `s3-rm4.2`, 10 reruns each. H-S3-rm2 runs the H-S3-d3 five-node
+prefix with M1 seated, then the H-S3-c advance and re-seat; it has its
+own shard, split as `s3-rm2.1` and `s3-rm2.2`, 10 reruns each. H-S3-d2
+has its own shard (`s3-d2`). The summary job still counts 20 receipts.
 
 The S3 shard is omitted when the tree has no `w3h_1356_` test, so `main`
 does not spend a runner on an empty filter. Adding those tests makes the
@@ -41,6 +43,7 @@ GROUPS = (
     ('s3-d3', 'w3h_1356_control_s3_d3_authorisation_refusals_typed$'),
     ('s3-1661', 'w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed$'),
     ('s3-rm4', 'w3h_1356_control_s3_rm4_'),
+    ('s3-rm2', 'w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed$'),
     ('s3-d2', 'w3h_1356_control_s3_d2_fork_exposure_contained$'),
     ('s3', 'w3h_1356_'),
 )
@@ -60,7 +63,12 @@ RUNS = 20
 # so about 440 s on the runner; 20 reruns (about 147 min) leave almost no
 # margin under the 155-min S3 test deadline. 2 parts of 10 reruns take
 # about 75 min each.
-PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 2}
+# H-S3-rm2: one rerun took about 161 s in the 12-CPU Lima VM, so about
+# 320 s on the runner (the #1780 ratio; no runner measurement yet), and
+# 20 reruns about 107 min. That estimate is not a clear margin under the
+# 155-min S3 test deadline, so split it, do not raise the budget (31 Oct
+# ruling, #1733): 2 parts of 10 reruns take about 55 min each.
+PARTS = {'s3-d3': 4, 's3-1661': 2, 's3-rm4': 2, 's3-rm2': 2}
 
 ROOT = Path(__file__).resolve().parents[2]
 
