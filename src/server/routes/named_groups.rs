@@ -14785,8 +14785,31 @@ async fn request_treekem_catchup_page(
         (from_revision, from_epoch, current_state_hash.clone()),
     );
     #[cfg(test)]
+    detached_send_test_seam::park(&format!("treekem-catchup-page:{group_id}")).await;
+    // #1655 (ADR 0110 §3): re-read the agent revocation immediately
+    // before the write. Every caller decided on its peer before one or
+    // more awaits (the response handler applies and persists a whole
+    // page first), so a revocation can land in between. An agent-revoked
+    // peer gets no new message from this node, and its answer would die
+    // at the page gate ([`treekem_catchup_sender_departed`]) anyway. The
+    // machine and binding holds and the resync hold are not checked
+    // here: they keep the callers' #1685 round 9 behaviour (the ask goes
+    // to the agent, whose clean machine may answer). A refused ask
+    // returns `false`, the "could not send" result every caller handles.
     {
-        detached_send_test_seam::park(&format!("treekem-catchup-page:{group_id}")).await;
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if treekem_catchup_sender_departed(&revoked, peer) {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                peer = %LogHexId::agent(&hex::encode(peer.as_bytes())),
+                "TreeKEM catch-up page request withheld: the peer's agent was revoked before the send"
+            );
+            return false;
+        }
+    }
+    #[cfg(test)]
+    {
         if state
             .named_group_test_recorders
             .catchup_page_force_ok
@@ -51938,6 +51961,7 @@ pub(in crate::server) mod tests {
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
     mod issue1649_reseat_mandate_receive;
+    mod issue1655_catchup_recheck_before_write;
     mod issue1657_typed_refusal_catchup;
     mod issue1664_machine_addressed_replies;
     mod issue1685_catchup_page_no_progress;
