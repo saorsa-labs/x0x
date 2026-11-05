@@ -13180,7 +13180,7 @@ fn catchup_page_within_attested_sequence(
 /// this node's `secret_epoch`, as `apply_link_state_only` does; the signed
 /// `security_binding` stays, because the state hash covers it. The node's
 /// keys come only from its own Welcome at the terminal. `MemberAdded` has
-/// its own older pre-Welcome rule, which also keeps the local epoch.
+/// its own older pre-Welcome rule, which this check does not change.
 async fn admit_pre_welcome_state_only_link(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
@@ -17513,9 +17513,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         // cannot process their TreeKEM commits. Applying the
                         // signed metadata commit advances the roster/state hash
                         // so the joiner's own later MemberAdded Welcome can
-                        // validate against the correct frontier. ADR 0109
-                        // §2: no epoch is taken from the chain.
-                        next.secret_epoch = info.secret_epoch;
+                        // validate against the correct frontier.
                         tracing::debug!(
                             target: "treekem.trace",
                             stage = "member_added_pre_welcome_state_only_apply",
