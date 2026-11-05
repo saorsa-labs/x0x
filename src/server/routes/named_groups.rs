@@ -41696,6 +41696,9 @@ async fn preserve_unsupported_saved_bytes(path: &FsPath) -> Result<()> {
         .await
         .is_ok_and(|held| held == bytes)
     {
+        // #1809: the copy holds the same group secrets as `path`, so an
+        // earlier 0644 copy is tightened when it is reused.
+        tighten_secret_file_mode(&backup).await;
         // Reused: make sure the earlier copy itself is on stable storage.
         let file = tokio::fs::File::open(&backup)
             .await
@@ -41725,9 +41728,25 @@ async fn sync_parent_dir(path: &FsPath) -> Result<()> {
 async fn write_durably(path: &FsPath, bytes: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let tmp = path.with_extension("tmp-1604");
-    let mut file = tokio::fs::File::create(&tmp)
+    // #1809: the bytes are a copy of a group secret file. A new temp file
+    // is created 0600; a stale temp left by a crash keeps its old mode
+    // through a truncating open, so it is set to 0600 on the open handle
+    // before any byte lands.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(SECRET_FILE_MODE);
+    let mut file = options
+        .open(&tmp)
         .await
         .with_context(|| format!("failed to create {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(SECRET_FILE_MODE))
+            .await
+            .with_context(|| format!("failed to restrict {}", tmp.display()))?;
+    }
     file.write_all(bytes)
         .await
         .with_context(|| format!("failed to write {}", tmp.display()))?;
@@ -41750,6 +41769,9 @@ pub(in crate::server) async fn load_named_groups_merged(
     // the shared test fixture), which sit close to the Linux CI
     // test-thread stack ceiling (PR #465 CI abort).
     Box::pin(async move {
+        // #1809: both files hold group shared secrets.
+        tighten_secret_file_mode(named_groups_path).await;
+        tighten_secret_file_mode(sidecar_path).await;
         let named = load_named_groups(named_groups_path).await?;
         let sidecar = load_home_suite_groups(sidecar_path).await?;
         let mut merged = merge_home_suite_groups(named, sidecar);
@@ -44535,6 +44557,43 @@ pub(in crate::server) mod atomic_write_test_seam {
     }
 }
 
+/// #1809: Unix mode for files that hold group shared secrets or key
+/// material (owner read and write only).
+#[cfg(unix)]
+pub(in crate::server) const SECRET_FILE_MODE: u32 = 0o600;
+
+/// #1809: best-effort tighten of an existing secret file to
+/// [`SECRET_FILE_MODE`] when group or other bits are set. A file written by
+/// an older daemon keeps its 0644 mode until the next save; this closes
+/// that gap at load. A missing file or a failed `chmod` is not an error.
+pub(in crate::server) async fn tighten_secret_file_mode(path: &FsPath) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = tokio::fs::metadata(path).await else {
+            return;
+        };
+        if metadata.permissions().mode() & 0o077 == 0 {
+            return;
+        }
+        // `set_permissions` follows a symlink. That is acceptable: the
+        // path is in the daemon's own data dir, and a link there already
+        // decides where the daemon reads and writes these secrets.
+        if let Err(error) =
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(SECRET_FILE_MODE))
+                .await
+        {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "#1809: cannot tighten a group secret file to 0600"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 pub(in crate::server) async fn write_named_groups_json_atomic(
     path: &FsPath,
     json: &str,
@@ -44547,12 +44606,15 @@ pub(in crate::server) async fn write_named_groups_json_atomic(
 
     // Finding 1 (Sam 6664f60) / Watson ruling: stage-aware atomic
     // replacement. The rename is the point of no return.
-    let mut file = match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .await
-    {
+    //
+    // #1809: these files hold group shared secrets. On Unix the temp file
+    // is created 0600 before any byte lands, and the rename replaces the
+    // destination inode, so an older 0644 file is tightened on this save.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(SECRET_FILE_MODE);
+    let mut file = match options.open(&temp_path).await {
         Ok(file) => file,
         Err(error) => {
             tracing::error!(
@@ -52008,6 +52070,8 @@ pub(in crate::server) mod tests {
     mod issue1657_typed_refusal_catchup;
     mod issue1664_machine_addressed_replies;
     mod issue1685_catchup_page_no_progress;
+    #[cfg(unix)]
+    mod issue1809_secret_file_mode;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
