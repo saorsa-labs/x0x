@@ -336,12 +336,17 @@ start. It reserves each attempt durably before exec, so a failed exec still
 counts. The limits are at most 3 attempts, 120 s to readiness per attempt,
 60 s of stable health and a 660 s total trial, with 10 s between attempts.
 These values are provisional until David rules on them. When the attempts
-or the total budget run out, the cause is Failed. A changed boot, a launcher
-restart during exec or rollback, or a service stop during the trial is
-Interrupted. In each case the launcher restores the previous pair and starts
-the restored daemon. A restarted launcher resumes an interrupted rollback,
-keeps the first rollback cause, and starts only a missing restored child, at
-most 3 times. A failed reap or a failed restored start stops automatic
+or the total budget run out, the cause is Failed, and a later stop or reboot
+does not change it. A changed boot, a launcher restart during exec or
+rollback, or a service stop while attempts remain is Interrupted. The
+launcher then restores the previous pair and starts the restored daemon. For
+a service stop, the restore happens on the next launcher start; the candidate
+bytes stay installed until then. A restarted launcher resumes an interrupted
+rollback and starts only a missing restored child, at most 3 times. The
+trial keeps its first rollback cause. Until the host journal reaches
+Restored, a Failed cause there replaces an Interrupted one, so the journal
+cause, which decides the hold, can differ from the trial cause. After
+Restored, the journal cause does not change. A failed reap or a failed restored start stops automatic
 recovery (`RecoveryFailed`) until an operator repairs the host.
 
 The `x0x-launcher` binary builds only with the non-default `m2-launcher`
