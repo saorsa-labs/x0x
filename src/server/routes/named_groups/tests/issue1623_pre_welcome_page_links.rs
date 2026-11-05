@@ -416,6 +416,58 @@ async fn pre_welcome_direct_applies_other_approval_state_only() -> anyhow::Resul
     Ok(())
 }
 
+/// `JoinRequestApproved` for another requester, from a catch-up page
+/// whose responder is the signer (the real catch-up response handler).
+#[tokio::test]
+async fn pre_welcome_page_applies_other_approval_state_only() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = base_group(&owner, None)?;
+    let mut ahead = base.clone();
+    let revision = base.state_revision + 1;
+    let approval = seal_link(&mut ahead, &owner, 2_000, |next| {
+        set_join_request_approved(
+            next,
+            REQUEST_ID,
+            &owner_hex,
+            &agent(REQUESTER),
+            revision,
+            2_000,
+        );
+        next.set_member_treekem_key_package_hash(&agent(REQUESTER), KEY_PACKAGE_HASH.to_string());
+        take_treekem_epoch(next);
+    })?;
+    let event = NamedGroupMetadataEvent::JoinRequestApproved {
+        group_id: base.stable_group_id().to_string(),
+        request_id: REQUEST_ID.to_string(),
+        revision: approval.revision,
+        actor: owner_hex,
+        requester_agent_id: agent(REQUESTER),
+        treekem_commit_b64: treekem_commit_b64(),
+        treekem_welcome_b64: Some(BASE64.encode(b"issue1623-welcome-for-requester")),
+        welcome_ref: None,
+        treekem_epoch: Some(TREEKEM_EPOCH),
+        treekem_key_package_hash: Some(KEY_PACKAGE_HASH.to_string()),
+        commit: Some(approval.clone()),
+    };
+    let mut stub = base.clone();
+    arm(&mut stub, vec![approval.state_hash.clone()], &owner);
+    let key = install_stub(&state, stub).await?;
+
+    deliver_page(&state, &key, &owner, vec![event]).await;
+
+    let head = head_of(&state, &key).await?;
+    assert_eq!(
+        head.state_hash, approval.state_hash,
+        "the approval applied state-only"
+    );
+    assert!(head.has_active_member(&agent(REQUESTER)));
+    assert_epoch_kept(&head, &base);
+    assert_no_tree(&state, &key).await;
+    Ok(())
+}
+
 /// Control: with no armed attested sequence the removal is refused.
 #[tokio::test]
 async fn pre_welcome_removal_without_armed_sequence_is_refused() -> anyhow::Result<()> {
@@ -734,6 +786,11 @@ async fn pre_welcome_joiner_pages_two_links_from_a_real_responder() -> anyhow::R
         head.secret_epoch, base.secret_epoch,
         "no epoch from the chain"
     );
+    assert_eq!(
+        head.security_binding.as_deref(),
+        Some("treekem:epoch=2"),
+        "the joiner carries the last link's binding"
+    );
     assert_no_tree(&joiner, &key).await;
     Ok(())
 }
@@ -803,10 +860,76 @@ async fn pre_welcome_page_that_applies_nothing_stops_the_page_loop() -> anyhow::
     Ok(())
 }
 
+/// The TreeKEM epoch a head's binding names. Like production, it reads
+/// only the leading digits, so a suffixed binding
+/// (`treekem:epoch=5;member-recovery=…`) still names epoch 5.
 fn treekem_epoch_of_binding(info: &GroupInfo) -> Option<u64> {
-    info.security_binding
+    let rest = info
+        .security_binding
         .as_deref()?
-        .strip_prefix("treekem:epoch=")?
-        .parse()
-        .ok()
+        .strip_prefix("treekem:epoch=")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// The catch-up cursor epoch: a node with a local tree asks from its own
+/// secret epoch. A node without a tree asks from the larger of its secret
+/// epoch and the epoch its head's TreeKEM binding names (leading digits
+/// only, so suffixed bindings count). Any other binding, or a value that
+/// is not a u64, falls back to the secret epoch.
+#[test]
+fn treekem_catchup_cursor_epoch_maps_the_head_binding() {
+    let recovery = format!(
+        "treekem:epoch=5;{MEMBER_JOINED_RECOVERY_BINDING_PREFIX}{}",
+        blake3::hash(b"member record").to_hex()
+    );
+    let cases: [(u64, Option<&str>, bool, u64, &str); 10] = [
+        (
+            0,
+            Some("treekem:epoch=9"),
+            true,
+            0,
+            "local tree keeps secret epoch",
+        ),
+        (
+            3,
+            Some(&recovery),
+            true,
+            3,
+            "local tree ignores a suffixed binding",
+        ),
+        (4, None, false, 4, "no binding"),
+        (4, Some("other:x"), false, 4, "non-TreeKEM binding"),
+        (4, Some("gss:epoch=9"), false, 4, "GSS binding"),
+        (
+            7,
+            Some("treekem:epoch=5"),
+            false,
+            7,
+            "secret epoch above binding",
+        ),
+        (0, Some("treekem:epoch=5"), false, 5, "plain binding"),
+        (0, Some(&recovery), false, 5, "member-recovery suffix"),
+        (
+            0,
+            Some("treekem:epoch=7:commit=ab"),
+            false,
+            7,
+            "commit suffix",
+        ),
+        (
+            2,
+            Some("treekem:epoch=99999999999999999999999"),
+            false,
+            2,
+            "epoch overflows u64",
+        ),
+    ];
+    for (secret_epoch, binding, has_local_tree, expected, why) in cases {
+        assert_eq!(
+            treekem_catchup_cursor_epoch_of(secret_epoch, binding, has_local_tree),
+            expected,
+            "{why}: secret {secret_epoch}, binding {binding:?}, tree {has_local_tree}"
+        );
+    }
 }
