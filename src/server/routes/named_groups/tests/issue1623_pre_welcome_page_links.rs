@@ -527,3 +527,109 @@ async fn pre_welcome_removal_outside_armed_sequence_is_refused() -> anyhow::Resu
     assert_eq!(head_of(&state, &key).await?.state_hash, base.state_hash);
     Ok(())
 }
+
+/// Round 4: a real responder pages two links, one event per page, to a
+/// pre-Welcome joiner. The joiner keeps its local epoch (ADR 0109 §2), so
+/// its request names the head epoch from the signed binding; with the
+/// local epoch the responder serves the applied link again and the joiner
+/// stalls after the first link.
+#[tokio::test]
+async fn pre_welcome_joiner_pages_two_links_from_a_real_responder() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (responder, _responder_dir) = secure_endpoint_test_state().await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let owner = AgentKeypair::generate()?;
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = base_group(&owner, None)?;
+    let mut ahead = base.clone();
+    let mut links = Vec::new();
+    for (epoch, member, at_ms) in [(1_u64, REMOVED, 2_000), (2, BANNED, 3_000)] {
+        let commit = seal_link(&mut ahead, &owner, at_ms, |next| {
+            next.remove_member(&agent(member), Some(owner_hex.clone()));
+            next.secret_epoch = epoch;
+            next.security_binding = Some(format!("treekem:epoch={epoch}"));
+        })?;
+        let mut event = removal_event(&base, &owner_hex, &commit);
+        if let NamedGroupMetadataEvent::MemberRemoved {
+            agent_id,
+            treekem_epoch,
+            ..
+        } = &mut event
+        {
+            *agent_id = agent(member);
+            *treekem_epoch = Some(epoch);
+        }
+        links.push((commit, event));
+    }
+    let mut stub = base.clone();
+    let sequence = links.iter().map(|(c, _)| c.state_hash.clone()).collect();
+    arm(&mut stub, sequence, &owner);
+    let key = install_stub(&joiner, stub).await?;
+    // The responder seats the joiner (so it serves it) and logs both links.
+    let mut served = ahead.clone();
+    served.add_member(
+        joiner_hex.clone(),
+        x0x::groups::GroupRole::Member,
+        None,
+        None,
+    );
+    install_stub(&responder, served).await?;
+    let events = links.iter().map(|(_, e)| e.clone()).collect();
+    responder
+        .treekem_event_log
+        .write()
+        .await
+        .insert(key.clone(), events);
+
+    let terminal = links.last().map(|(c, _)| c.state_hash.clone());
+    for _ in 0..4 {
+        let head = head_of(&joiner, &key).await?;
+        if Some(&head.state_hash) == terminal.as_ref() {
+            break;
+        }
+        let cursor = (head.secret_epoch, head.security_binding.clone());
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: key.clone(),
+            requester_agent_id: joiner_hex.clone(),
+            from_revision: head.state_revision,
+            from_treekem_epoch: treekem_catchup_cursor_epoch(
+                &joiner,
+                std::slice::from_ref(&key),
+                cursor,
+            )
+            .await,
+            current_state_hash: head.state_hash.clone(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        let machine = x0x::identity::MachineId([0x24; 32]);
+        let recorder = &responder.named_group_test_recorders.catchup_responses;
+        recorder.lock().expect("recorder").clear();
+        handle_treekem_catchup_request(
+            &responder,
+            &joiner.agent.agent_id(),
+            &machine,
+            true,
+            request,
+        )
+        .await;
+        let payload = recorder.lock().expect("recorder").pop();
+        let page: TreeKemCatchupResponse = serde_json::from_slice(&payload.unwrap_or_default())?;
+        assert_eq!(page.events.len(), 1, "one event per page");
+        deliver_page(&joiner, &key, &owner, page.events).await;
+    }
+    let head = head_of(&joiner, &key).await?;
+    assert_eq!(
+        Some(head.state_hash),
+        terminal,
+        "the joiner reached the final head"
+    );
+    assert_eq!(
+        head.secret_epoch, base.secret_epoch,
+        "no epoch from the chain"
+    );
+    assert_no_tree(&joiner, &key).await;
+    Ok(())
+}

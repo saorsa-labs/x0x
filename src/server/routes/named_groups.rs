@@ -11163,6 +11163,36 @@ fn admit_treekem_pending_event(
     Some(peers)
 }
 
+/// #1623 round 4: the TreeKEM epoch a catch-up request names as its
+/// cursor. A node with a local TreeKEM group names its own `secret_epoch`,
+/// as before. A pre-Welcome node keeps its local `secret_epoch` (ADR 0109
+/// §2), so it names the epoch of its committed head instead, from the
+/// signed `treekem:epoch=N` binding. Otherwise the responder, which keeps
+/// events past either cursor field, serves the applied link again and the
+/// paging stalls. No wire change.
+async fn treekem_catchup_cursor_epoch(
+    state: &AppState,
+    aliases: &[String],
+    (secret_epoch, binding): (u64, Option<String>),
+) -> u64 {
+    {
+        let trees = state.treekem_groups.read().await;
+        if aliases.iter().any(|alias| trees.contains_key(alias)) {
+            return secret_epoch;
+        }
+    }
+    binding
+        .as_deref()
+        .and_then(|binding| binding.strip_prefix("treekem:epoch="))
+        .map(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .map_or(secret_epoch, |epoch| epoch.max(secret_epoch))
+}
+
 async fn request_treekem_catchup_for_gap(
     state: &Arc<AppState>,
     group_id: &str,
@@ -11179,7 +11209,7 @@ async fn request_treekem_catchup_for_gap(
     // fence aliases under the same read that fills the request; each
     // admitted peer's ask cursor is recorded once its send LEFT (see
     // the note at the send below).
-    let (from_revision, from_epoch, current_state_hash, fence_aliases) = {
+    let (from_revision, head_epoch, current_state_hash, fence_aliases) = {
         let groups = state.named_groups.read().await;
         let resolved = groups
             .get_key_value(group_id)
@@ -11206,11 +11236,12 @@ async fn request_treekem_catchup_for_gap(
         fence_aliases.dedup();
         (
             info.state_revision,
-            info.secret_epoch,
+            (info.secret_epoch, info.security_binding.clone()),
             info.state_hash.clone(),
             fence_aliases,
         )
     };
+    let from_epoch = treekem_catchup_cursor_epoch(state, &fence_aliases, head_epoch).await;
     for peer in peers {
         let peer_hex = hex::encode(peer.as_bytes());
         let throttle_key = format!("{group_id}:{peer_hex}:{from_revision}:{from_epoch}");
@@ -14810,7 +14841,7 @@ async fn request_treekem_catchup_page(
     // peer's page moved it. The alias family is resolved under the
     // same read that fills the request, so every spelling of the
     // group a response can carry finds the row.
-    let (from_revision, from_epoch, current_state_hash, fence_aliases) = {
+    let (from_revision, head_epoch, current_state_hash, fence_aliases) = {
         let groups = state.named_groups.read().await;
         let resolved = groups
             .get_key_value(group_id)
@@ -14834,11 +14865,12 @@ async fn request_treekem_catchup_page(
         fence_aliases.dedup();
         (
             info.state_revision,
-            info.secret_epoch,
+            (info.secret_epoch, info.security_binding.clone()),
             info.state_hash.clone(),
             fence_aliases,
         )
     };
+    let from_epoch = treekem_catchup_cursor_epoch(state, &fence_aliases, head_epoch).await;
     treekem_page_ask_cursor_note(
         &fence_aliases,
         &hex::encode(peer.as_bytes()),
@@ -15202,7 +15234,7 @@ async fn request_member_key_package_catchup(
     member_agent_id: &str,
 ) {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let (from_revision, from_epoch, current_state_hash, candidates, fence_ids) = {
+    let (from_revision, head_epoch, current_state_hash, candidates, fence_ids) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(group_id).or_else(|| {
             groups
@@ -15233,7 +15265,7 @@ async fn request_member_key_package_catchup(
         }
         (
             info.state_revision,
-            info.secret_epoch,
+            (info.secret_epoch, info.security_binding.clone()),
             info.state_hash.clone(),
             candidate_hexes,
             vec![
@@ -15243,6 +15275,7 @@ async fn request_member_key_package_catchup(
             ],
         )
     };
+    let from_epoch = treekem_catchup_cursor_epoch(state, &fence_ids, head_epoch).await;
     for candidate_hex in candidates {
         if candidate_hex.eq_ignore_ascii_case(&local_agent_hex) {
             continue;
