@@ -90,7 +90,7 @@ pub(super) fn run_trial(
         // passed before the reboot.
         let clock = now()?;
         let expired = trial.expired(&clock);
-        let failed = failed_verdict(trial, Some(&clock));
+        let failed = failed_verdict(trial, &clock);
         if stop() {
             if let Some(cause) = failed {
                 trial.verdict.get_or_insert(cause);
@@ -148,8 +148,14 @@ pub(super) fn run_trial(
         };
         let failure = loop {
             if stop() {
-                // A clock error must not leave the child unreaped.
-                if let Some(cause) = failed_verdict(trial, now().ok().as_ref()) {
+                // The running attempt is already counted but has not failed,
+                // so only a run-out total budget is a Failed verdict here. A
+                // clock error must not leave the child unreaped.
+                if let Some(cause) = now()
+                    .ok()
+                    .and_then(|clock| trial.expired(&clock))
+                    .filter(|cause| cause.class == journal::CauseClass::Failed)
+                {
                     trial.verdict.get_or_insert(cause);
                 }
                 if let Err(error) = child.reap() {
@@ -190,9 +196,11 @@ pub(super) fn run_trial(
     }
 }
 
-/// The Failed verdict a trial has already reached, if any: every attempt
-/// used, or the total budget run out on this boot.
-fn failed_verdict(trial: &Trial, clock: Option<&Clock>) -> Option<journal::Cause> {
+/// The Failed verdict a trial has already reached between attempts, if
+/// any: every attempt used and failed, or the total budget run out on this
+/// boot. Do not call it while an attempt runs: that attempt is counted but
+/// has not failed.
+fn failed_verdict(trial: &Trial, clock: &Clock) -> Option<journal::Cause> {
     if trial.attempts >= MAX_ATTEMPTS {
         let reason = format!(
             "launch attempts exhausted: {}",
@@ -200,8 +208,8 @@ fn failed_verdict(trial: &Trial, clock: Option<&Clock>) -> Option<journal::Cause
         );
         return Some(cause(journal::CauseClass::Failed, reason));
     }
-    clock
-        .and_then(|clock| trial.expired(clock))
+    trial
+        .expired(clock)
         .filter(|cause| cause.class == journal::CauseClass::Failed)
 }
 
@@ -635,6 +643,44 @@ mod tests {
         assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
         assert!(
             cause.reason.contains("total trial deadline reached"),
+            "{cause:?}"
+        );
+    }
+
+    /// A stop during the last attempt, inside the budget, is Interrupted:
+    /// that attempt is counted but has not failed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_during_the_last_attempt_is_interrupted() {
+        let (_dir, root, _host, record) = fixture(journal::Phase::SwappedCli);
+        let host = executable_candidate(&root, record);
+        let path = root.join("trial.json");
+        let mut trial = trial_in(&host, &path, Phase::Authorized, MAX_ATTEMPTS - 1);
+        let boot = trial.boot.clone();
+        let early = trial.started_ms + 1_000;
+        let clock = || {
+            Ok(Clock {
+                boot: boot.clone(),
+                ms: early,
+            })
+        };
+        let polls = std::cell::Cell::new(0u32);
+        let stop = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        };
+        let outcome = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), stop);
+        assert!(matches!(outcome, Ok(Outcome::Stopped)));
+        assert_eq!(trial.attempts, MAX_ATTEMPTS);
+        let mut trial = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert!(trial.verdict.is_none());
+        let clock = fast_clock(&trial);
+        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
+        assert_previous_pair(&host);
+        let cause = journal_record(&root).cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Interrupted, "{cause:?}");
+        assert!(
+            cause.reason.contains("service stopped during trial"),
             "{cause:?}"
         );
     }
