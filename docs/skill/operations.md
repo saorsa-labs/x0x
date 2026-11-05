@@ -40,20 +40,21 @@ The daemon REST surface owns installation and restart and is governed by the dae
 ### 7.3 Diagnostics
 
 ```bash
-x0x diagnostics <area>              # connectivity|ack|gossip|transport|relay|dm|groups|history|connect|ws|exec
+x0x diagnostics <area>              # connectivity|ack|gossip|transport|relay|dm|groups|history|connect|ws|sidecar-quarantine|exec
 x0x peer probe|health|events        # per-peer liveness, health snapshot, SSE lifecycle
 x0x network status                  # NAT type, external addrs, direct capability
 ```
 
-The complete read-only snapshot inventory is `/diagnostics/connectivity`
+The read-only snapshots are `/diagnostics/connectivity`
 (NodeStatus: UPnP, NAT, relay, mDNS), `/diagnostics/ack` (ACK-v2 latency
 buckets), `/diagnostics/gossip` (drop detection and participation),
 `/diagnostics/transport` (connection accounting), `/diagnostics/relay` (ADR-0035
 metering), `/diagnostics/dm` (DM counters and per-peer state),
-`/diagnostics/groups` (ingest and drop buckets; ADR-0064 fork-quarantine and owner-mandate counters, plus per-agent `mandate_capability` rows — see the [fork quarantine runbook](https://github.com/saorsa-labs/x0x/blob/main/docs/runbooks/fork-quarantine.md)), `/diagnostics/history`
+`/diagnostics/groups` (ingest and drop buckets; ADR-0064 fork-quarantine and owner-mandate counters, plus per-agent `mandate_capability` rows; runbook link in §7.4), `/diagnostics/history`
 (writer/reaper), `/diagnostics/connect` (ACL allow/deny),
-`/diagnostics/ws` (outbound-queue health), and `/diagnostics/exec` (counters
-and ACL summary).
+`/diagnostics/ws` (outbound-queue health), `/diagnostics/sidecar-quarantine`
+(quarantined sidecar copies, sizes), and `/diagnostics/exec` (counters and ACL
+summary).
 
 The three routes detailed below are `GET` with no request body and require the
 normal local bearer token. They return snapshots, not SLAs or proof that a peer

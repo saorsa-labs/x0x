@@ -29,6 +29,7 @@ mod owner;
 mod presence;
 mod profile;
 pub(crate) mod public_group_bootstrap_outbox;
+mod sidecar_quarantine;
 pub(super) mod status;
 pub(super) mod stores;
 mod sync;
@@ -143,6 +144,7 @@ pub(super) use presence::{
     presence, presence_find, presence_foaf, presence_online, presence_status,
 };
 pub(super) use profile::{get_profile, owner_agents, update_profile};
+pub(super) use sidecar_quarantine::sidecar_quarantine_diagnostics;
 pub(super) use status::{
     get_constitution, get_constitution_json, health, shutdown_handler, status,
 };
