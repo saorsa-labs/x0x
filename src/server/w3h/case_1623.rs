@@ -24,7 +24,9 @@
 //!
 //! Not covered: a `JoinRequestApproved` link for another requester (it
 //! needs a second pending join request inside the gap); the admin-armed
-//! (ATA) sequence. The unit tests of #1813 cover both kinds and guards.
+//! (ATA) sequence. The unit tests of #1813 cover the `JoinRequestApproved`
+//! kind, by direct delivery. No test arms an ATA sequence yet: the helpers
+//! for it are in `group_recovery.rs` (follow-up work, Refs #1623).
 //! Receipts use `w3h.receipt/1`.
 
 #![cfg(test)]
