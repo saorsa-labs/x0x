@@ -23,7 +23,7 @@ const TARGETED_REQUEST_PROTOCOL_VERSION: u16 = 2;
 
 /// Domain prefix that lets a targeted request ride the steady advert topic
 /// without a pre-0030 subscriber mistaking it for an advert.
-const WARM_TARGETED_REQUEST_DOMAIN: &[u8] = b"x0x/caps/v1/targeted-request-v2\0";
+pub(crate) const WARM_TARGETED_REQUEST_DOMAIN: &[u8] = b"x0x/caps/v1/targeted-request-v2\0";
 
 const FIRST_PUBLISH_DELAY_MS: u64 = 250;
 
