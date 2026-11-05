@@ -415,6 +415,34 @@ mod tests {
 
     /// A service stop during the trial never wedges the host: the next
     /// start records an interruption and restores the previous pair.
+    /// A launcher start after a reboot, with restored starts exhausted and
+    /// the last restored child recorded from the earlier boot, must save
+    /// RecoveryFailed to disk, not only in memory.
+    #[test]
+    fn exhausted_restored_starts_after_a_reboot_save_recovery_failed() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = trial_in(&host, &path, Phase::Authorized, 1);
+        trial.verdict = Some(interrupted("candidate exited before commit"));
+        trial.phase = Phase::Restored;
+        trial.restored_starts = MAX_ATTEMPTS;
+        trial.child = Some(Identity {
+            pid: 2,
+            start: 3,
+            boot: format!("{}-earlier", trial.boot),
+        });
+        trial.save(&path).unwrap();
+        let clock = fast_clock(&trial);
+        let error = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("restored starts exhausted"), "{error}");
+        let saved = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert_eq!(saved.phase, Phase::RecoveryFailed);
+        assert!(saved.child.is_none());
+    }
+
     #[test]
     fn a_stopped_trial_restores_the_previous_pair_on_the_next_start() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
