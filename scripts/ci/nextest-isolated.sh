@@ -30,6 +30,11 @@ scratch=$(mktemp -d "${RUNNER_TEMP:?}/x0x-metadata-XXXXXX")
 # Resolve once. Both binary preparation and reuse consume this exact graph.
 cargo metadata "${metadata[@]}" > "$scratch/cargo.json"
 sha256sum Cargo.lock > "$scratch/lock.sha256"
+# CI: shrink debuginfo so rustc of x0x-test-harness is not SIGTERM'd (#1789).
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  export CARGO_PROFILE_DEV_DEBUG=line-tables-only
+  export CARGO_PROFILE_TEST_DEBUG=line-tables-only
+fi
 # binaries-only builds without executing discovery; no archive/extraction copy.
 cargo nextest list "${build[@]}" --locked --cargo-metadata "$scratch/cargo.json" \
   --list-type binaries-only --message-format json > "$scratch/binaries.json"
