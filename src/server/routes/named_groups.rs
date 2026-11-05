@@ -13115,36 +13115,53 @@ fn catchup_page_within_attested_sequence(
 /// seat, is refused. A link that changes the policy hash is refused (§2);
 /// the ordinary apply also refuses it, because the state hash is
 /// recomputed from the local policy. The TreeKEM commit is then
-/// skipped: no tree and no epoch come from it. The node's keys come only
-/// from its own Welcome at the terminal. `MemberAdded` has its own older
-/// pre-Welcome rule and does not use this check.
-async fn pre_welcome_state_only_link_admitted(
+/// skipped: no tree and no epoch come from it. On admission `next` keeps
+/// this node's `secret_epoch`, as `apply_link_state_only` does; the signed
+/// `security_binding` stays, because the state hash covers it. The node's
+/// keys come only from its own Welcome at the terminal. `MemberAdded` has
+/// its own older pre-Welcome rule, which also keeps the local epoch.
+async fn admit_pre_welcome_state_only_link(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
+    next: &mut x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
     local_agent_hex: &str,
-) -> bool {
-    if info.has_active_member(local_agent_hex) {
-        return false;
-    }
-    let Some(commit) = named_group_metadata_event_commit(event) else {
-        return false;
+) -> Result<(), &'static str> {
+    let verdict = 'check: {
+        if info.has_active_member(local_agent_hex) {
+            break 'check Err("pre_welcome_local_seat_active");
+        }
+        let Some(commit) = named_group_metadata_event_commit(event) else {
+            break 'check Err("pre_welcome_no_commit");
+        };
+        if commit.policy_hash != x0x::groups::compute_policy_hash(&info.policy) {
+            break 'check Err("pre_welcome_policy_change");
+        }
+        let link = std::slice::from_ref(event);
+        let owner_sequence =
+            armed_anchored_gap_sequence(info).map(|record| &record.attested_chain_hashes);
+        let admin_sequence = group_recovery::armed_admin_sequence(state, info).await;
+        if owner_sequence.is_none() && admin_sequence.is_none() {
+            break 'check Err("pre_welcome_no_armed_sequence");
+        }
+        if owner_sequence.is_some_and(|sequence| {
+            !catchup_page_within_attested_sequence(link, &info.state_hash, sequence)
+        }) || admin_sequence.is_some_and(|sequence| {
+            !catchup_page_within_attested_sequence(link, &info.state_hash, &sequence)
+        }) {
+            break 'check Err("pre_welcome_outside_armed_sequence");
+        }
+        // ADR 0109 §2: no epoch is taken from the chain.
+        next.secret_epoch = info.secret_epoch;
+        Ok(())
     };
-    if commit.policy_hash != x0x::groups::compute_policy_hash(&info.policy) {
-        return false;
+    if let Err(reason) = verdict {
+        tracing::debug!(
+            target: "treekem.trace", stage = "pre_welcome_state_only_refused",
+            group_id = %info.mls_group_id, reason,
+        );
     }
-    let link = std::slice::from_ref(event);
-    let owner_sequence =
-        armed_anchored_gap_sequence(info).map(|record| &record.attested_chain_hashes);
-    let admin_sequence = group_recovery::armed_admin_sequence(state, info).await;
-    if owner_sequence.is_none() && admin_sequence.is_none() {
-        return false;
-    }
-    owner_sequence.is_none_or(|sequence| {
-        catchup_page_within_attested_sequence(link, &info.state_hash, sequence)
-    }) && admin_sequence.is_none_or(|sequence| {
-        catchup_page_within_attested_sequence(link, &info.state_hash, &sequence)
-    })
+    verdict
 }
 
 /// Test-only mirror of [`armed_anchored_gap_sequence`]: is the #846
@@ -17413,7 +17430,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         // cannot process their TreeKEM commits. Applying the
                         // signed metadata commit advances the roster/state hash
                         // so the joiner's own later MemberAdded Welcome can
-                        // validate against the correct frontier.
+                        // validate against the correct frontier. ADR 0109
+                        // §2: no epoch is taken from the chain.
+                        next.secret_epoch = info.secret_epoch;
                         tracing::debug!(
                             target: "treekem.trace",
                             stage = "member_added_pre_welcome_state_only_apply",
@@ -17769,13 +17788,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM remove commit: {e}");
                         return ApplyMetadataResult::REJECTED;
                     }
-                } else if !pre_welcome_state_only_link_admitted(
+                } else if admit_pre_welcome_state_only_link(
                     state,
                     &info,
+                    &mut next,
                     &event_for_log,
                     &local_agent_hex,
                 )
                 .await
+                .is_err()
                 {
                     return ApplyMetadataResult::REJECTED;
                 }
@@ -18242,13 +18263,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             &resolved_group_key,
                         );
                     }
-                } else if !pre_welcome_state_only_link_admitted(
+                } else if admit_pre_welcome_state_only_link(
                     state,
                     &info,
+                    &mut next,
                     &event_for_log,
                     &local_agent_hex,
                 )
                 .await
+                .is_err()
                 {
                     // A seated node with no tree is missing its tree; a
                     // pre-Welcome node failed the rule (b) check.
@@ -18543,7 +18566,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             let request_key_package_b64 = req_snapshot.treekem_key_package_b64.clone();
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(
+            let Ok(mut next) = apply_stateful_event_with_evidence(
                 state,
                 &resolved_group_key,
                 &current,
@@ -18677,13 +18700,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM add commit: {e}");
                             return ApplyMetadataResult::REJECTED;
                         }
-                    } else if !pre_welcome_state_only_link_admitted(
+                    } else if admit_pre_welcome_state_only_link(
                         state,
                         &info,
+                        &mut next,
                         &event_for_log,
                         &local_agent_hex,
                     )
                     .await
+                    .is_err()
                     {
                         return ApplyMetadataResult::REJECTED;
                     }

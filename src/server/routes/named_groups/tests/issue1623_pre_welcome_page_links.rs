@@ -4,7 +4,7 @@
 //! link that carries a TreeKEM commit (`MemberRemoved`, `MemberBanned`,
 //! `JoinRequestApproved`) was refused, because the joiner has no TreeKEM
 //! group yet. The negative cases pin each guard of
-//! `pre_welcome_state_only_link_admitted`. Inert: no daemon, no network.
+//! `admit_pre_welcome_state_only_link`. Inert: no daemon, no network.
 
 use super::*;
 use x0x::groups::GroupInfo;
@@ -206,6 +206,53 @@ async fn assert_no_tree(state: &AppState, key: &str) {
     );
 }
 
+/// ADR 0109 §2: no epoch is taken from the chain; the signed binding stays.
+fn assert_epoch_kept(head: &GroupInfo, base: &GroupInfo) {
+    assert_ne!(
+        base.secret_epoch, TREEKEM_EPOCH,
+        "the link names another epoch"
+    );
+    assert_eq!(
+        head.secret_epoch, base.secret_epoch,
+        "no epoch from the chain"
+    );
+    let binding = format!("treekem:epoch={TREEKEM_EPOCH}");
+    assert_eq!(head.security_binding.as_deref(), Some(binding.as_str()));
+}
+
+/// `deliver_direct`, with the `treekem.trace` text it produced. The test
+/// runtime is current-thread, so only this delivery's events land here.
+async fn refusal_trace(
+    state: &Arc<AppState>,
+    key: &str,
+    sender: &AgentKeypair,
+    event: NamedGroupMetadataEvent,
+) -> String {
+    #[derive(Clone, Default)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    deliver_direct(state, key, sender, event).await;
+    drop(guard);
+    let bytes = sink.0.lock().expect("sink").clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Inside an armed attested sequence, every page link applies state-only on
 /// the pre-Welcome joiner: the role change, the rename and the removal
 /// that carries a TreeKEM commit.
@@ -270,9 +317,7 @@ async fn pre_welcome_page_applies_role_rename_and_removal_state_only() -> anyhow
     );
     assert!(!head.has_active_member(&agent(REMOVED)));
     assert!(!head.has_active_member(&local), "still pre-Welcome");
-    // Pins today's behaviour (FOR ENGINEER in #1623): the state-only apply
-    // takes `secret_epoch` from the link, as the `MemberAdded` rule does.
-    assert_eq!(head.secret_epoch, TREEKEM_EPOCH);
+    assert_epoch_kept(&head, &base);
     assert_no_tree(&state, &key).await;
     Ok(())
 }
@@ -311,6 +356,7 @@ async fn pre_welcome_page_applies_ban_state_only() -> anyhow::Result<()> {
         "the ban applied state-only"
     );
     assert!(head.is_banned(&agent(BANNED)));
+    assert_epoch_kept(&head, &base);
     assert_no_tree(&state, &key).await;
     Ok(())
 }
@@ -362,6 +408,7 @@ async fn pre_welcome_direct_applies_other_approval_state_only() -> anyhow::Resul
         "the approval applied state-only"
     );
     assert!(head.has_active_member(&agent(REQUESTER)));
+    assert_epoch_kept(&head, &base);
     assert_no_tree(&state, &key).await;
     Ok(())
 }
@@ -374,7 +421,38 @@ async fn pre_welcome_removal_without_armed_sequence_is_refused() -> anyhow::Resu
     let base = base_group(&owner, None)?;
     let (_, event) = removal_link(&base, &owner, false)?;
     let key = install_stub(&state, base.clone()).await?;
-    deliver_direct(&state, &key, &owner, event).await;
+    let trace = refusal_trace(&state, &key, &owner, event).await;
+    assert!(trace.contains("pre_welcome_no_armed_sequence"), "{trace}");
+    assert_eq!(head_of(&state, &key).await?.state_hash, base.state_hash);
+    Ok(())
+}
+
+/// A ban with no armed sequence on a node with no Welcome is refused
+/// with the rule (b) reason, not `treekem_group_missing`.
+#[tokio::test]
+async fn pre_welcome_ban_without_armed_sequence_is_refused() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = base_group(&owner, None)?;
+    let ban = seal_link(&mut base.clone(), &owner, 2_000, |next| {
+        next.ban_member(&agent(BANNED), Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let event = NamedGroupMetadataEvent::MemberBanned {
+        group_id: base.stable_group_id().to_string(),
+        revision: ban.revision,
+        actor: owner_hex,
+        agent_id: agent(BANNED),
+        secret_epoch: None,
+        treekem_commit_b64: treekem_commit_b64(),
+        treekem_epoch: Some(TREEKEM_EPOCH),
+        commit: Some(ban),
+    };
+    let key = install_stub(&state, base.clone()).await?;
+    let trace = refusal_trace(&state, &key, &owner, event).await;
+    assert!(trace.contains("pre_welcome_no_armed_sequence"), "{trace}");
+    assert!(trace.contains("pre_welcome_link_not_admitted"), "{trace}");
     assert_eq!(head_of(&state, &key).await?.state_hash, base.state_hash);
     Ok(())
 }
@@ -392,7 +470,8 @@ async fn seated_node_without_tree_refuses_removal() -> anyhow::Result<()> {
     let mut stub = base.clone();
     arm(&mut stub, vec![removal.state_hash.clone()], &owner);
     let key = install_stub(&state, stub).await?;
-    deliver_direct(&state, &key, &owner, event).await;
+    let trace = refusal_trace(&state, &key, &owner, event).await;
+    assert!(trace.contains("pre_welcome_local_seat_active"), "{trace}");
     assert_eq!(head_of(&state, &key).await?.state_hash, base.state_hash);
     assert_no_tree(&state, &key).await;
     Ok(())
@@ -413,6 +492,13 @@ async fn pre_welcome_removal_that_changes_policy_is_refused() -> anyhow::Result<
     let mut stub = base.clone();
     arm(&mut stub, vec![removal.state_hash.clone()], &owner);
     let key = install_stub(&state, stub).await?;
+    // The ordinary apply refuses it first (the state hash is recomputed
+    // from the local policy), so the guard's own reason is read directly.
+    let stub = head_of(&state, &key).await?;
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    let verdict =
+        admit_pre_welcome_state_only_link(&state, &stub, &mut stub.clone(), &event, &local).await;
+    assert_eq!(verdict, Err("pre_welcome_policy_change"));
     deliver_direct(&state, &key, &owner, event).await;
     assert_eq!(head_of(&state, &key).await?.state_hash, base.state_hash);
     Ok(())
@@ -433,7 +519,11 @@ async fn pre_welcome_removal_outside_armed_sequence_is_refused() -> anyhow::Resu
         catchup_846_gate_armed(&head_of(&state, &key).await?),
         "armed"
     );
-    deliver_direct(&state, &key, &owner, event).await;
+    let trace = refusal_trace(&state, &key, &owner, event).await;
+    assert!(
+        trace.contains("pre_welcome_outside_armed_sequence"),
+        "{trace}"
+    );
     assert_eq!(head_of(&state, &key).await?.state_hash, base.state_hash);
     Ok(())
 }

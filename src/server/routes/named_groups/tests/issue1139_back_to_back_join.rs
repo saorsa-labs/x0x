@@ -1125,18 +1125,26 @@ async fn issue1139_fetch_request_serves_the_intervening_carry() -> Result<()> {
     Ok(())
 }
 
+async fn j2_epoch(s: &BackToBack) -> Option<u64> {
+    let groups = s.j2.named_groups.read().await;
+    groups.get(&s.group_key).map(|info| info.secret_epoch)
+}
+
 /// WHY (#1139): the ordering control — r+1 before r+2 converges with no
 /// catch-up at all (the pre-Welcome state-only apply takes r+1).
 #[tokio::test]
 async fn issue1139_r1_before_own_result_converges() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
+    let stub_epoch = j2_epoch(&s).await;
     assert!(
         apply_named_group_metadata_event(&s.j2, s.add_j1.event.clone(), s.authority_id, true, None)
             .await
             .accepted,
         "r+1 applies state-only on the pre-Welcome stub"
     );
+    // ADR 0109 §2 (#1623): no epoch is taken from the chain.
+    assert_eq!(j2_epoch(&s).await, stub_epoch);
     deliver_j2_legacy_result(&s).await;
     assert_eq!(join_state(&s.j2, &s.group_key).await, "active");
     assert!(s.j2.treekem_groups.read().await.contains_key(&s.group_key));
