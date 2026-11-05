@@ -1556,7 +1556,7 @@ token. A session token is refused before the body is read.
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 20) and 429 `invite_cap_reached` (64 live unconsumed records/group). **Invites are single-use**: the link carries a one-time secret that the issuing daemon consumes on the first validated `MemberJoined` (before it publishes the authority-signed `MemberAdded`). A replay's fate depends on where it lands: after the authority validated the original join, a replayed secret is rejected `invite_secret_consumed` and never seated; if the authority has NOT validated yet (event still in flight, or it restarted first) the secret is unburned; a replay by an already-active member is refused earlier as an idempotent no-op (and a same-node duplicate join is an idempotent local success, #188); an addressed invite replayed by the wrong joiner is refused without consuming the secret. None of these paths proves YOUR seat — mint a fresh invite instead. `expiry_secs` only bounds how long an *unconsumed* invite stays valid |
 | POST | `/groups/:id/stores` | `x0x group store create <GROUP_ID> <NAME>` | Open or idempotently re-open a creator-anchored group store: signed plaintext for `SignedPublic`, encrypted for `MlsEncrypted` GSS; current group policy gates writes |
 | POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `reseat_invite_outside_staging` (an ADR 0109 §3a re-seat invite: owner-axis policy, no inline owner key; it is valid only in the §3 staging join), `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
-| GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. ADR 0108 §8 (#1575): the **200** body always carries the `pending_cause` key (null unless `join_state` is `pending_authority_commit` and the joiner holds a verified `JoinPendingNotice`), holding `pending_cause {cause, raw_cause?, detail {count?, revision?, digests?}, issued_at_ms, signer_agent_id}`; the 404 body after a terminal finalize carries no `pending_cause` key; a well-formed cause this build does not know shows as `unrecognized_cause` with the raw name in `raw_cause`, never a decode failure. A later Result or Refused replaces it. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
+| GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out(reason)}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. ADR 0108 §8 (#1575): the **200** body always carries the `pending_cause` key (null unless `join_state` is `pending_authority_commit` and the joiner holds a verified `JoinPendingNotice`), holding `pending_cause {cause, raw_cause?, detail {count?, revision?, digests?}, issued_at_ms, signer_agent_id}`; the 404 body after a terminal finalize carries no `pending_cause` key; a well-formed cause this build does not know shows as `unrecognized_cause` with the raw name in `raw_cause`, never a decode failure. A later Result or Refused replaces it. Timed-out reasons (ADR 0108 §8, #1640): a `timed_out` outcome always carries a `reason`. An ADR 0107 fetch-only re-arm gives `rearm_original_result_unavailable`, and this rule wins over the two rules after it. Else the reason is the cause of the verified `JoinPendingNotice` that the attempt held, in its `pending_cause.cause` form (`unrecognized_cause` for a cause this build does not know; the raw name is not kept in `reason`). Else the reason is `no_admission_result`: the attempt reached its poll deadline with no verified notice. An attempt that ADR 0109 S3 holds reports reason `adr0109_recovery_held`, not a bare `timed_out`. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set the local agent's own display name. Body `{"name":"<display name>"}`. Requires an active seat in the group, any role, on any token class. The label is local, so there is no Home durable fence. The name is not part of the signed roster |
 | PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
 | PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |
@@ -1765,8 +1765,36 @@ every wait. A wait always names its cause; it does not stop silently.
     is `rank` (this node waits for its fallback time, `remaining_ms`) or
     `designated_admin_unsupported` (the designated admin's advert lacks
     `eviction_handoff_v1`).
-  - `unresolved_designated_admin` — the hand-off has not reached the
-    designated admin yet.
+  - `unresolved_designated_admin` — this node's own hand-off dispatch
+    against the designated admin completed without an exchange with it
+    and without a definitive routing or eligibility failure (ADR 0110
+    §2). The outcome is recorded per attempt when the dispatch
+    completes, and the outcome-bearing records (`unresolved`,
+    `unsupported`) survive a restart until W ends or the designation
+    changes, when the daemon drops them. The cause shows while the
+    designated window W runs — L171: it "preserves priority through W,
+    not forever" — so a rank whose fallback time is later (W + Δ and
+    on) keeps the plain `waiting_for_designated_admin` for the rest of
+    its stagger wait. The cause also stops when the designation
+    changes or the row reopens, completes or terminates; the dispatch is not
+    retried, and a later hand-off receipt does not rewrite the outcome.
+    `detail` is `rank` with `remaining_ms`, like the plain wait. A
+    definitive failure is not this cause: it keeps
+    `waiting_for_designated_admin` with the
+    `designated_admin_unsupported` detail once the row has dispatched
+    (a verified advert that lacks `eviction_handoff_v1`, or the
+    transport's refusal for that lack). A definitive policy refusal is
+    not this cause either: it keeps the plain
+    `waiting_for_designated_admin` with `detail: "rank"`. Two refusals
+    count. The first is the designated admin's trust policy that rejects
+    this node. The second is this node's pairing policy that denies the
+    designated admin's machine in the pre-send check of the direct send.
+    A pairing denial on the raw-QUIC or DM-registry path is reported as
+    a peer that is not verified, with no policy reason. That outcome is
+    `unresolved`, and it is stored, like any other failed send.
+    The manual remove/ban/seal 202 keeps its documented
+    `waiting_for_designated_admin` answer (ADR 0110 §2's ADR 0016 §6
+    amendment).
   - `local_committer_ineligible` — this admin may not seal (demoted,
     removed, revoked, left, or its own certificate expired).
   - `waiting_for_durable_intake` — the obligation is not on disk yet; the
@@ -1875,56 +1903,113 @@ Active seat, the encrypted GSS plane and the frame's per-seat position
 (`state_revision`, `key_sequence`) seats the key on the member's row
 (replays, stale keys, frames signed before the seat's current
 admission, and unsigned or wrong-signer frames are refused; see the
-`X0XKR1` entry below). The republication is
-automatic: the keyless install itself sends it, and a node that boots
-into the keyless state — or into the keyed state whose share never
-installed — sends it at startup. A send the carrier does not accept is
-not done: a recipient whose verified advert is missing or expired, or
-whose send failed, keeps the frame owed, and the daemon retries it
-until the advert sets the bit or rules the frame out. A send the carrier
-accepts is not proof that the peer seated the key, so the daemon sends
-the frame again to each owed Active recipient, up to 6 carrier-accepted
-sends. The sweep interval starts at 5 s and doubles to a maximum of
-80 s. A newer republication for the same group resets the count. A
-recipient that leaves the group's Active roster, or is revoked, is no
-longer owed. The receiver refuses a repeat of a seated key as
-`stale_key`, so a repeat does no harm. The startup pass keeps the seat
-selected until the share installs, so a restart sends it again. Once
-the seat is keyed — on the survivor's own copy and on the authors' copies — the next S4
-delivery round seals the current secret to it and the share installs
-through the existing path, which ends the hold and returns the served
-head. Share completion stays distinct from that head: a catch-up answer
-from a seat an author's roster leaves keyless is not share-possession
-evidence (such a seat cannot hold the epoch secret), and the frame's
-ingest owes the republisher its sealed share on the author's open S4
-rows. That debt — not the roster key — holds the row open whatever a
-restored head already reported: it ends only when the carrier accepts a
-sealed share for the member, and a share batch whose bounded retries
-fail leaves the obligation in place, re-sealed each delivery round. If
-the member republishes while the author's GSS delivery is open, the
-author resets the member's earlier convergence: the member converges
-again only after the new-key share is accepted and the member reports
-its head. A peer whose verified advert lacks
-`key_republish_v1` (bit 12) keeps the pre-#1663 behavior, so the seat
-stays keyless in that peer's view until it upgrades or the member
-re-joins. The window between the
-keyed seat and the installed share is the same superseded-intermediate
-shape the 02:09 ruling keeps as main's answer, bounded by the share
-delivery the S4 row owes. Until one of the two keys the seat again, the
-hold lasts: an installed share of the held epoch, or a later one, or
-the #1663 republication (while the node holds no secret), ends it. A
-share of the held epoch ends the hold only when its sender is a
-recorded actor of that hold and the share's secret is the one recorded
+`X0XKR1` entry below). The republication is automatic: the keyless install
+itself sends it, and a node that boots into the keyless state — or into the
+keyed state whose share never installed — sends it at startup. A send the
+carrier does not accept is not done: a recipient whose verified advert is
+missing or expired, or whose send failed, keeps the frame owed, and the
+daemon retries it until the advert sets the bit or rules the frame out. A
+send the carrier accepts is not proof that the peer seated the key, so the
+daemon sends the frame again to each owed Active recipient, up to 6
+carrier-accepted sends. The sweep interval starts at 5 s and doubles to a
+maximum of 80 s. A newer republication for the same group resets the count.
+A recipient that leaves the group's Active roster, or is revoked, is no
+longer owed. The receiver refuses a repeat of a seated key as `stale_key`,
+so a repeat does no harm. The startup pass keeps the seat selected until the
+share installs, so a restart sends it again. Once the seat is keyed — on the
+survivor's own copy and on the authors' copies — the next S4 delivery round
+seals the current secret to it and the share installs through the existing
+path, which ends the hold and returns the served head. Share completion
+stays distinct from that head: a catch-up answer from a seat an author's
+roster leaves keyless is not share-possession evidence (such a seat cannot
+hold the epoch secret), and the frame's ingest owes the republisher its
+sealed share on the author's open S4 rows. That debt — not the roster key —
+holds the row open whatever a restored head already reported: it ends only
+when the carrier accepts a sealed share for the member, and a share batch
+whose bounded retries fail leaves the obligation in place, re-sealed each
+delivery round. If the member republishes while the author's GSS delivery is
+open, the author resets the member's earlier convergence: the member
+converges again only after the new-key share is accepted and the member
+reports its head. A peer whose verified advert lacks `key_republish_v1` (bit
+12) keeps the pre-#1663 behavior, so the seat stays keyless in that peer's
+view until it upgrades or the member re-joins. The window between the keyed
+seat and the installed share is the same superseded-intermediate shape the
+02:09 ruling keeps as main's answer, bounded by the share delivery the S4
+row owes. Until one of the two keys the seat again, the hold lasts until one
+of these ends it:
+- An installed share of the held epoch, or of a later epoch that a head
+  commit pins. A sealed share that raised the local epoch past what the
+  head commits completed no verified transition (#1775).
+- A recorded actor of the hold sealing a later epoch's unpinned secret.
+- The #1663 republication, while the node holds no secret.
+- The exclusion installing with its own key. This ends every older hold.
+
+A share of the held epoch ends the hold only when its sender is a
+recorded actor of that hold, and the share's secret is the one recorded
 for that sender (#1766). A share of the same epoch from a different
-admin installs, but the hold stays. The actor's share of that epoch
-then replaces the other admin's uncommitted secret.
+admin installs, but the hold stays. While a verified transition of
+that epoch waits, a share of that epoch from any admin other than the
+installed secret's sender replaces a secret that no commit pins. The
+same rule applies to an unpinned secret of a later epoch: the early
+sealed share raised the local epoch past the head, and a share of the
+earlier epoch from any other admin displaces it. The waiting actor's
+own share is one such share, so the frame it waits for installs
+(#1775). The replace is not limited to the waiting actor. It fails
+closed: the hold stays until the actor's own share installs, so a
+third admin's replace can stall the group or lose a later key, but it
+releases no ciphertext. A hold or a parked removal replaces only for a share epoch
+above the epoch that the head commits. A keyless commit's epoch is the
+one exception, under its mark's own rule (below). A displaced later secret is not lost: it parks in the
+hold file with its sender and the displacing wait's epoch, and it
+re-delivers through the ordinary share path once a head commits that
+epoch — so the later rotation's own commit lands with its key, and an
+honest share-before-commit reordering stalls on no re-delivery. A
+promoted or superseded intermediate install parks the later key it
+drops only when the held step that raises to that epoch has the key's
+sender as its author. It drops any other later key. One exception:
+when the hold file records no sender for the displaced secret, that secret parks nowhere and is lost. A crash
+between the key write and its record write leaves the sender unknown,
+with no provenance to re-deliver, and the daemon logs a warning. The
+re-delivery also runs after an accepted share installs: a keyless
+commit can commit the displacing wait's epoch with no share of its
+own, so no later commit would carry it. The parked record goes when
+its epoch commits, when a secret of its epoch or a later one is
+already in, when its sender is revoked or the roster holds below
+Admin, or when a held removal or ban targets its sender. A replay of
+the installed frame also re-delivers it. The file keeps one parked record per group, and a live record
+keeps the slot, so a second displacement in the same window parks
+nowhere and is lost, with the same warning.
+
+The hold file is local state, not an API. It stores the parked secret
+in the clear, with its sender and epochs, written 0600 from creation.
+A file that carries a keyless mark or a parked secret is version 2;
+every other file is version 1. A binary that knows only version 1 does
+not load a version 2 file: it keeps the file and holds that group.
+
+After a #1578 keyless install, the head already commits the epoch, but
+it binds the epoch, not the secret value (#1775). The durable keyless
+mark keeps that epoch's first installed secret replaceable, and the
+group's new ciphertext held, until the exclusion's own actor seals a
+share of it. This also holds past the #1663 republication. Until then,
+any secret whose sender the record does not name stays replaceable.
+The mark claims exactly its own epoch, and the head that its keyless
+commit moved, or a commit chained on that head. A sibling commit of the
+epoch ends the mark. So does a head that commits a later epoch. A share
+of a later unpinned epoch is not the mark's actor key. When the retained
+log cannot prove the mark's head, the mark still holds its group, but
+only its own actor's share may replace — the one share that settles it.
+
+A known-empty evicted-removal hold ends at a secret of its epoch or a later
+one, committed or not. A hold whose actor list is unknown (a pre-#1771
+exclusion file) is ended by no secret that a commit does not pin.
+One that carries removed members is an evicted removal's containment.
 
 **Wire and capabilities.** The daemon advertises four more ADR 0093
 application bits: `eviction_handoff_v1` (bit 4), `crypto_exclusion_v1`
 (bit 5), `owner_recovery_v1` (bit 7) and `key_republish_v1` (bit 12,
-the #1663 republication). The new frames ride the
-direct-message carrier only. They are
-not on the metadata topic and not in a legacy-decoded container:
+the #1663 republication). The new frames ride the direct-message
+carrier only. They are not on the metadata topic and not in a
+legacy-decoded container:
 
 - `X0XEVH1` — `EvictionHandoffV1`, signed evidence from one admin to the
   others. It carries no key material.
@@ -1947,11 +2032,10 @@ not on the metadata topic and not in a legacy-decoded container:
   - `actor` — the republishing member's raw agent ID. The key seats on
     this member's own row only.
   - `agent_public_key_b64` — the actor's ML-DSA-65 agent public key
-    (base64). It verifies the
-    signature and must derive `actor`.
+    (base64). It verifies the signature and must derive `actor`.
   - `kem_public_key_b64` — the ML-KEM-768 public key (base64) to seat.
-    It must parse as an
-    ML-KEM-768 public key; a correct length alone is not sufficient.
+    It must parse as an ML-KEM-768 public key; a correct length alone
+    is not sufficient.
   - `state_revision` — the group state revision (the signed state-commit
     chain) that the actor held when it signed. This is the admission
     binding (David's 2 Nov 2026 ruling).

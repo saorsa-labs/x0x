@@ -1498,15 +1498,38 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
             inner.attempt_wait.remove(&key);
         }
         // §4: a hand-off to an unsupported designated admin waits for W
-        // with cause `designated_admin_unsupported`.
+        // with cause `designated_admin_unsupported`. L174 ties a result
+        // to an attempt, so the first two sources are read only once the
+        // row has dispatched; the live advert is re-read on every pass,
+        // so that knowledge survives a restart (whose dispatch never
+        // re-runs and whose in-memory set is empty) and follows a
+        // designation change. The persisted §5 v3 outcome is itself
+        // attempt-tied and also survives an expired advert. The
+        // in-memory set is still never pruned when an advert later gains
+        // the capability.
         if let (Some(waiting), Some(designation)) =
             (evaluation.waiting.as_mut(), evaluation.designation.as_ref())
         {
-            let unsupported = inner
-                .unsupported_handoff
-                .get(&key)
-                .is_some_and(|ids| ids.contains(&designation.designated));
+            let unsupported = row.first_dispatch_unix_ms.is_some()
+                && (inner
+                    .unsupported_handoff
+                    .get(&key)
+                    .is_some_and(|ids| ids.contains(&designation.designated))
+                    || state.agent.capability_store().verified_registry_supports(
+                        &x0x::identity::AgentId(designation.designated),
+                        x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1,
+                    ) == Some(false)
+                    || row.designated_handoff.is_some_and(|attempt| {
+                        attempt.designated == designation.designated
+                            && attempt.outcome == s4::DesignatedHandoffOutcome::Unsupported
+                    }));
             if unsupported && waiting.designated_detail == Some(s4::DesignatedWaitDetail::Rank) {
+                // §2 (L171): a definitive hand-off failure (the §4
+                // unsupported advert) is never labelled an unresolved
+                // route.
+                if waiting.cause == WaitingCause::UnresolvedDesignatedAdmin {
+                    waiting.cause = WaitingCause::WaitingForDesignatedAdmin;
+                }
                 waiting.designated_detail =
                     Some(s4::DesignatedWaitDetail::DesignatedAdminUnsupported);
             }
@@ -1575,6 +1598,7 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
                 .max(runtime.timing.completion_bound),
         );
         let mut budget_moved = false;
+        let mut handoff_retired = false;
         if let Some(row) = inner.store.get_mut(&key) {
             let elapsed_ms = s4::duration_ms(elapsed);
             budget_moved =
@@ -1585,8 +1609,17 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
                 row.designated = Some(designation.designated);
                 row.ranks = designation.ranks.clone();
             }
+            // §2 (L171) and §5 v3 (Engineer ruling, 4 Nov 2026 17:22
+            // GMT): the hand-off record ends at W and when the
+            // designated admin changes, so a stored `unresolved` or
+            // `unsupported` outcome leaves the v3 extension and the file
+            // returns to v1/v2 well before the row closes.
+            handoff_retired = row.retire_designated_handoff(
+                designation.as_ref().map(|current| current.designated),
+                elapsed >= runtime.timing.designated_window,
+            );
         }
-        if changed_designation || budget_moved {
+        if changed_designation || budget_moved || handoff_retired {
             inner.dirty = true;
         }
         inner.store.set_waiting(&key, evaluation.waiting.clone());
@@ -2977,7 +3010,12 @@ pub(in crate::server) async fn s4_no_eligible_admin_refusal(
 /// Send the first hand-off of every due row to every other eligible admin
 /// whose current verified advert sets `eviction_handoff_v1` (§2, §4). A
 /// known lacking advert is an unsupported attempt; an unknown advert sends
-/// nothing (ADR 0093: unknown support never implies support).
+/// nothing (ADR 0093: unknown support never implies support). The
+/// designated admin's own dispatch outcome is recorded against its
+/// attempt (L174), and the outcome-bearing records persist (§2
+/// L170–L173, §5 v3), so `unresolved_designated_admin` and the §4
+/// downgrade survive a restart; a routine reached exchange stays in
+/// memory (Engineer ruling, 4 Nov 2026 08:25 GMT).
 async fn dispatch_handoffs(state: &Arc<AppState>) {
     let due: Vec<(EvictionKey, ObligationRow)> = {
         let mut inner = state.revocation_evictions.inner.lock().await;
@@ -3003,7 +3041,14 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
             // route (§4); the receiver's own observation still applies.
             _ => continue,
         };
+        let designated = row.designated;
+        // L174: the first-dispatch time is the attempt marker. The row
+        // was queued with it set; a reopen that raced before this drain
+        // leaves `None`, and its fresh attempt re-queues on the next
+        // pass — this dispatch then records nothing.
+        let attempt = row.first_dispatch_unix_ms;
         let mut unsupported = BTreeSet::new();
+        let mut unsupported_outcome: Option<[u8; 32]> = None;
         for recipient in recipients
             .into_iter()
             .filter(|id| *id != local && *id != key.target)
@@ -3016,14 +3061,31 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
                 Some(true) => {
                     let send_state = Arc::clone(state);
                     let bytes = payload.clone();
+                    let designated_attempt = attempt
+                        .filter(|_| Some(recipient) == designated)
+                        .map(|attempt| (key.clone(), attempt));
                     let _spawned = state.spawn_detached(async move {
-                        if let Err(error) = send_state.agent.send_direct(&agent, bytes).await {
+                        let result = send_state.agent.send_direct(&agent, bytes).await;
+                        if let Err(error) = &result {
                             tracing::debug!(%error, "ADR 0110 S4: hand-off send failed");
+                        }
+                        if let Some((key, attempt)) = designated_attempt {
+                            record_designated_handoff(
+                                &send_state,
+                                &key,
+                                attempt,
+                                recipient,
+                                designated_send_outcome(&result),
+                            )
+                            .await;
                         }
                     });
                 }
                 Some(false) => {
                     unsupported.insert(recipient);
+                    if Some(recipient) == designated {
+                        unsupported_outcome = Some(recipient);
+                    }
                 }
                 None => {}
             }
@@ -3035,10 +3097,137 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
                 .lock()
                 .await
                 .unsupported_handoff
-                .entry(key)
+                .entry(key.clone())
                 .or_default()
                 .extend(unsupported);
         }
+        if let (Some(designated), Some(attempt)) = (unsupported_outcome, attempt) {
+            record_designated_handoff(
+                state,
+                &key,
+                attempt,
+                designated,
+                s4::DesignatedHandoffOutcome::Unsupported,
+            )
+            .await;
+        }
+    }
+}
+
+/// Map one `send_direct` result of a designated-admin hand-off to its
+/// §2 (L170–L173) outcome. Every `DmError` variant is matched by name,
+/// so a new variant must be classified here before the code builds.
+///
+/// - `Ok` reached an authenticated exchange: `ExchangeReached`.
+/// - `RecipientUpgradeRequired` is a definitive current eligibility
+///   failure — the recipient's current verified advert lacks
+///   `eviction_handoff_v1`, the same evidence as the pre-send
+///   `Some(false)` read — so it is `Unsupported`.
+/// - `RecipientRejected` (the designated admin's own acknowledgement that
+///   its trust policy refused this sender) and the ADR-0043 pairing
+///   denial (`RecipientPairingDenied`, or the legacy
+///   `EnvelopeConstruction` with the `RECIPIENT_PAIRING_DENIED` prefix:
+///   this node's policy refused the designated admin's machine) are
+///   definitive policy refusals under
+///   L171: `PolicyRefused`, the plain designated wait, never stored
+///   (Engineer ruling, 4 Nov 2026 18:15 GMT).
+/// - Every other error leaves the route unresolved: the missing-binding,
+///   key-material, timeout, offline, disconnect and connectivity shapes
+///   are transient or unknown-support, `ReceiverBackpressured` is a
+///   transient "retry later" with nothing delivered, and the local
+///   build, payload and idempotency failures are no answer from the
+///   route at all — none is a definitive refusal by the designated
+///   admin or by policy.
+fn designated_send_outcome(
+    result: &Result<x0x::dm::DmReceipt, x0x::dm::DmError>,
+) -> s4::DesignatedHandoffOutcome {
+    use s4::DesignatedHandoffOutcome as Outcome;
+    use x0x::dm::DmError;
+    let Err(error) = result else {
+        return Outcome::ExchangeReached;
+    };
+    match error {
+        DmError::RecipientUpgradeRequired { .. } => Outcome::Unsupported,
+        DmError::RecipientRejected { .. } => Outcome::PolicyRefused,
+        DmError::RecipientPairingDenied { .. } => Outcome::PolicyRefused,
+        DmError::EnvelopeConstruction(message)
+            if message.starts_with(x0x::dm::RECIPIENT_PAIRING_DENIED) =>
+        {
+            Outcome::PolicyRefused
+        }
+        DmError::EnvelopeConstruction(_)
+        | DmError::RecipientUndiscovered(_)
+        | DmError::RecipientKeyUnavailable(_)
+        | DmError::RecipientKeyInvalid(_)
+        | DmError::AckSemanticsUnavailable(_)
+        | DmError::IdempotencyConflict(_)
+        | DmError::Timeout { .. }
+        | DmError::PeerLikelyOffline { .. }
+        | DmError::PeerDisconnected { .. }
+        | DmError::ReceiverBackpressured { .. }
+        | DmError::LocalGossipUnavailable(_)
+        | DmError::PayloadTooLarge { .. }
+        | DmError::NoConnectivity(_)
+        | DmError::PublishFailed(_)
+        | DmError::NoRelayCandidate
+        | DmError::RelayBuildFailed(_) => Outcome::Unresolved,
+    }
+}
+
+/// Write one designated-admin hand-off outcome onto its row (§2,
+/// L170–L173). `attempt` is the first-dispatch time of the attempt that
+/// produced the outcome (L174): the write lands only while the row is
+/// open and still runs that attempt. A send task that finishes after
+/// the row completed or terminated never puts back the record the close
+/// dropped, and a send task left over from before a reopen never labels
+/// the fresh attempt. The outcome-bearing records persist in the `.evs`
+/// v3 extension (§5); a routine `exchange_reached` stays in memory, so
+/// it rewrites the sidecar only when it replaces a stored record.
+async fn record_designated_handoff(
+    state: &Arc<AppState>,
+    key: &EvictionKey,
+    attempt: u64,
+    designated: [u8; 32],
+    outcome: s4::DesignatedHandoffOutcome,
+) {
+    let recorded = {
+        let mut inner = state.revocation_evictions.inner.lock().await;
+        // A send that completes at or after W, or after the designation
+        // moved to another admin, records nothing that lasts: the pass
+        // would drop it at once (Engineer ruling, 4 Nov 2026 17:22 GMT),
+        // so it never moves the file to v3 for one pass.
+        let past_window = inner
+            .budgets
+            .get(key)
+            .map_or(Duration::ZERO, |budget| budget.elapsed(Instant::now()))
+            >= state.revocation_evictions.timing.designated_window;
+        match inner.store.get_mut(key) {
+            // An open row only: a send that completes after the row
+            // completed or terminated must not put back the record that
+            // the close dropped.
+            Some(row) if row.phase.is_open() && row.first_dispatch_unix_ms == Some(attempt) => {
+                let replaced = row.designated_handoff;
+                row.designated_handoff = Some(s4::DesignatedHandoffRecord {
+                    designated,
+                    outcome,
+                });
+                row.retire_designated_handoff(row.designated, past_window);
+                // The stored file changes only when the new or the
+                // replaced record is an outcome-bearing one.
+                let changes_file = [replaced, row.designated_handoff]
+                    .into_iter()
+                    .flatten()
+                    .any(|record| record.outcome.persists());
+                if changes_file {
+                    inner.dirty = true;
+                }
+                changes_file
+            }
+            _ => false,
+        }
+    };
+    if recorded {
+        persist_obligations(state).await;
     }
 }
 
@@ -4347,9 +4536,37 @@ fn begin_persist(inner: &mut S4Inner, gate_open: bool) -> Result<PersistSnapshot
         inner.dirty = false;
         return Err(true);
     }
+    let rows = inner.store.to_rows();
+    // §5 v3 (Engineer rulings, 4 Nov 2026 08:25 and 17:22 GMT): only
+    // the outcome-bearing records ride the extension. A routine
+    // `exchange_reached` (every successful designated send) and a
+    // `policy_refused` never reach the file, and the pass drops a
+    // record at W and on a designation change, as a completion,
+    // termination or reopen does. So the store is v3 only while some
+    // open row is inside W with an `unresolved` or `unsupported`
+    // outcome against its current designated admin. That is not rare:
+    // it is the usual state while a designated admin is offline (most
+    // send failures record `unresolved`). An older binary that starts
+    // on a v3 file reads it as a newer format and runs S4 memory-only
+    // (ADR 0108 §5a): it never rewrites a newer file, so the file stays
+    // v3, byte-identical, and that binary stays memory-only for its
+    // whole run, until a v3-reading binary runs again and returns the
+    // file to v1/v2 (no later than the next pass past W).
+    let handoffs: Vec<s4::DesignatedHandoffV3> = rows
+        .iter()
+        .filter_map(|row| {
+            row.designated_handoff
+                .filter(|record| record.outcome.persists())
+                .map(|record| s4::DesignatedHandoffV3 {
+                    stable_group_id: row.stable_group_id.clone(),
+                    target: row.target,
+                    record,
+                })
+        })
+        .collect();
     let body = EvsBodyV1 {
         rebuilt_from: inner.rebuilt_from.clone(),
-        rows: inner.store.to_rows(),
+        rows,
     };
     let queued_bans: Vec<QueuedBanV1> = inner
         .queued_bans
@@ -4360,7 +4577,7 @@ fn begin_persist(inner: &mut S4Inner, gate_open: bool) -> Result<PersistSnapshot
             queued_at_unix_ms: *queued_at_unix_ms,
         })
         .collect();
-    match s4::encode_evs_with_queued_bans(&body, &queued_bans) {
+    match s4::encode_evs_with_extensions(&body, &queued_bans, &handoffs) {
         Ok(bytes) => {
             inner.dirty = false;
             Ok(PersistSnapshot {
@@ -4818,6 +5035,7 @@ async fn reconcile_evjournals(
 fn waiting_json(waiting: &WaitingState) -> serde_json::Value {
     let named: Vec<String> = waiting.named.iter().map(hex::encode).collect();
     let designated = (waiting.cause == WaitingCause::WaitingForDesignatedAdmin
+        || waiting.cause == WaitingCause::UnresolvedDesignatedAdmin
         || waiting.cause == WaitingCause::LocalCommitterIneligible)
         .then(|| named.first().cloned())
         .flatten();
@@ -5036,6 +5254,78 @@ pub(super) mod tests {
                 queued_at_unix_ms: 77,
             }]
         );
+    }
+
+    /// #1581 review r7 (Engineer ruling, 4 Nov 08:25 GMT): only the
+    /// outcome-bearing records (`unresolved`, `unsupported`) ride the
+    /// v3 extension. A routine `exchange_reached` — the outcome of
+    /// every successful designated send — and the record a completion
+    /// clears keep the store at the old header, so a store without an
+    /// unresolved or unsupported row stays readable by a pre-#1785
+    /// binary and a rollback never meets a v3 file for routine traffic.
+    #[test]
+    fn begin_persist_omits_routine_and_cleared_handoff_outcomes() {
+        let mut inner = S4Inner {
+            file_exists: true,
+            ..S4Inner::default()
+        };
+        let trigger = |hash: u8| s4::EvictionTrigger::AgentRevocation {
+            record_hash: [hash; 32],
+            record_bytes: vec![hash],
+        };
+        let open = EvictionKey::new("g".to_string(), [1; 32]);
+        let done = EvictionKey::new("g".to_string(), [2; 32]);
+        inner.store.intake(&open, trigger(1), None, 1, [0; 16]);
+        inner.store.intake(&done, trigger(2), None, 1, [0; 16]);
+        let record = |outcome| s4::DesignatedHandoffRecord {
+            designated: [7; 32],
+            outcome,
+        };
+        inner.store.get_mut(&open).expect("row").designated_handoff =
+            Some(record(s4::DesignatedHandoffOutcome::ExchangeReached));
+        inner.store.get_mut(&done).expect("row").designated_handoff =
+            Some(record(s4::DesignatedHandoffOutcome::Unresolved));
+        assert!(inner.store.complete(&done, Some("head".into()), None, 2));
+
+        inner.dirty = true;
+        let snapshot = begin_persist(&mut inner, true).expect("a write is due");
+        assert_eq!(
+            &snapshot.bytes[..10],
+            s4::EVS_HEADER_V1,
+            "a routine exchange outcome and a completed row keep the v1 header"
+        );
+        inner.queued_bans.insert(open.clone(), 77);
+        inner.dirty = true;
+        let snapshot = begin_persist(&mut inner, true).expect("a write is due");
+        assert_eq!(
+            &snapshot.bytes[..10],
+            s4::EVS_HEADER_V2,
+            "a queued ban alone raises the header to v2"
+        );
+
+        // An outcome-bearing record is the one thing that raises it to
+        // v3, and it rides for its own row only.
+        inner.store.get_mut(&open).expect("row").designated_handoff =
+            Some(record(s4::DesignatedHandoffOutcome::Unresolved));
+        inner.dirty = true;
+        let snapshot = begin_persist(&mut inner, true).expect("a write is due");
+        assert_eq!(&snapshot.bytes[..10], s4::EVS_HEADER_V3);
+        let (body, _) = s4::decode_evs_with_queued_bans(&snapshot.bytes).expect("decode");
+        let open_row = body
+            .rows
+            .iter()
+            .find(|row| row.target == [1; 32])
+            .expect("the open row");
+        assert_eq!(
+            open_row.designated_handoff,
+            Some(record(s4::DesignatedHandoffOutcome::Unresolved))
+        );
+        let done_row = body
+            .rows
+            .iter()
+            .find(|row| row.target == [2; 32])
+            .expect("the completed row");
+        assert_eq!(done_row.designated_handoff, None);
     }
 
     // ─── Codex round 1, item 3: head sync is not elapsed time ──────────
@@ -7270,6 +7560,815 @@ pub(super) mod tests {
             "T_obs is the raw not_after"
         );
         Ok(())
+    }
+
+    /// The [`uda_state_after_restart`] result: the state, the group ID,
+    /// the row key, the designated admin, the sidecar bytes and the data
+    /// directory guard.
+    type UdaRestart = (
+        Arc<AppState>,
+        String,
+        EvictionKey,
+        [u8; 32],
+        Vec<u8>,
+        tempfile::TempDir,
+    );
+
+    /// #1581 (ADR 0110 §2, L170–L173, David 4 Nov 2026): the restart-test
+    /// shape. Open one revocation row where the local admin waits as
+    /// rank 1 under a lower designated admin, attach the given outbound
+    /// hand-off outcome against that designated admin (`None` for no
+    /// record), persist the sidecar and reload the whole S4 state from
+    /// disk. Returns the state, the group ID, the row key, the
+    /// designated admin, the bytes the sidecar write put on disk, and
+    /// the data directory guard: the caller holds it, so a later
+    /// sidecar write still finds the directory.
+    async fn uda_state_after_restart(
+        outcome: Option<s4::DesignatedHandoffOutcome>,
+    ) -> anyhow::Result<UdaRestart> {
+        let (state, dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let local = *state.agent.agent_id().as_bytes();
+        // The designated admin is the lowest raw-ID eligible admin, so
+        // generate one lower than the local admin: the local node waits
+        // as rank 1 and never dispatches to itself.
+        let designated_kp = loop {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            if candidate.agent_id().as_bytes() < &local {
+                break candidate;
+            }
+        };
+        let designated = *designated_kp.agent_id().as_bytes();
+        let target = *x0x::identity::AgentKeypair::generate()?
+            .agent_id()
+            .as_bytes();
+        let target_hex = hex::encode(target);
+        let local_hex = hex::encode(local);
+        let group_id = "b7".repeat(16);
+        let mut info = GroupInfo::new(
+            "s4-uda".into(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+        );
+        info.add_member(
+            hex::encode(designated),
+            GroupRole::Admin,
+            Some(local_hex.clone()),
+            None,
+        );
+        info.add_member(target_hex.clone(), GroupRole::Member, Some(local_hex), None);
+        info.recompute_state_hash();
+        let stable = info.stable_group_id().to_string();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // The row: observed, dispatched, and this node's dispatch
+        // against the designated admin completed with `outcome`.
+        let key = EvictionKey::new(stable, target);
+        let boot_id = state.revocation_evictions.boot_id;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.store.intake(
+                &key,
+                s4::EvictionTrigger::AgentRevocation {
+                    record_hash: [7; 32],
+                    record_bytes: vec![7],
+                },
+                None,
+                now_unix_ms(),
+                boot_id,
+            );
+            let row = inner.store.get_mut(&key).expect("the row opens");
+            row.first_dispatch_unix_ms = Some(now_unix_ms());
+            row.designated_handoff = outcome.map(|outcome| s4::DesignatedHandoffRecord {
+                designated,
+                outcome,
+            });
+            inner.dirty = true;
+        }
+        assert!(persist_obligations(&state).await, "the row is durable");
+        let bytes = std::fs::read(evs_path(&state))?;
+
+        // Restart: the whole S4 state is reloaded from disk.
+        *state.revocation_evictions.inner.lock().await = S4Inner::default();
+        load_persisted_obligations(&state).await;
+        Ok((state, group_id, key, designated, bytes, dir))
+    }
+
+    /// One pass over the [`uda_state_after_restart`] shape, then the
+    /// row's waiting state through the public group status
+    /// (`GET /groups/:id` shape), the sidecar bytes and the designated
+    /// admin.
+    async fn uda_row_waiting_after_restart(
+        outcome: Option<s4::DesignatedHandoffOutcome>,
+    ) -> anyhow::Result<(serde_json::Value, Vec<u8>, [u8; 32])> {
+        let (state, group_id, key, designated, bytes, _dir) =
+            uda_state_after_restart(outcome).await?;
+        revocation_eviction_pass(&state).await;
+        let target_hex = hex::encode(key.target);
+        let info = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .cloned()
+            .expect("the group");
+        let status = group_status_json(&state, &info).await;
+        let row = status
+            .rows
+            .as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["target"].as_str() == Some(target_hex.as_str()))
+            .cloned()
+            .expect("the row is shown");
+        Ok((row["waiting"].clone(), bytes, designated))
+    }
+
+    /// The recorded unresolved outcome against the designated admin
+    /// survives the restart (the §5 v3 extension), so the public status
+    /// still shows `unresolved_designated_admin` naming that admin.
+    #[tokio::test]
+    async fn an_unresolved_designated_handoff_survives_a_restart() -> anyhow::Result<()> {
+        let (waiting, bytes, designated) =
+            uda_row_waiting_after_restart(Some(s4::DesignatedHandoffOutcome::Unresolved)).await?;
+        assert_eq!(
+            &bytes[..10],
+            s4::EVS_HEADER_V3,
+            "a row with an outcome persists as v3"
+        );
+        assert_eq!(
+            waiting["cause"].as_str(),
+            Some("unresolved_designated_admin")
+        );
+        let designated_hex = hex::encode(designated);
+        assert_eq!(
+            waiting["designated_admin"].as_str(),
+            Some(designated_hex.as_str()),
+            "the cause names the designated admin the attempt targeted"
+        );
+        assert_eq!(waiting["detail"].as_str(), Some("rank"));
+        assert!(waiting["remaining_ms"].as_u64().is_some());
+        Ok(())
+    }
+
+    /// A definitive §4 unsupported outcome (L173) is never an unresolved
+    /// route: after the restart the public status shows the plain
+    /// designated wait with the `designated_admin_unsupported` detail.
+    #[tokio::test]
+    async fn an_unsupported_designated_handoff_downgrades_through_public_status(
+    ) -> anyhow::Result<()> {
+        let (waiting, bytes, _designated) =
+            uda_row_waiting_after_restart(Some(s4::DesignatedHandoffOutcome::Unsupported)).await?;
+        assert_eq!(
+            &bytes[..10],
+            s4::EVS_HEADER_V3,
+            "a row with an outcome persists as v3"
+        );
+        assert_eq!(
+            waiting["cause"].as_str(),
+            Some("waiting_for_designated_admin")
+        );
+        assert_eq!(
+            waiting["detail"].as_str(),
+            Some("designated_admin_unsupported")
+        );
+        Ok(())
+    }
+
+    /// #1581 review r7 (Engineer ruling, 4 Nov 08:25 GMT): a routine
+    /// `exchange_reached` — the outcome of every successful designated
+    /// send — is memory state of its attempt and never rides the file,
+    /// so the sidecar keeps the old header and the restart loads no
+    /// record: the row shows the plain designated wait.
+    #[tokio::test]
+    async fn an_exchange_reached_outcome_keeps_the_old_header_and_the_plain_wait(
+    ) -> anyhow::Result<()> {
+        let (waiting, bytes, _designated) =
+            uda_row_waiting_after_restart(Some(s4::DesignatedHandoffOutcome::ExchangeReached))
+                .await?;
+        assert_eq!(
+            &bytes[..10],
+            s4::EVS_HEADER_V1,
+            "a routine exchange outcome never moves the file to v3"
+        );
+        assert_eq!(
+            waiting["cause"].as_str(),
+            Some("waiting_for_designated_admin")
+        );
+        assert_eq!(waiting["detail"].as_str(), Some("rank"));
+        Ok(())
+    }
+
+    /// The row's stored hand-off record and the sidecar header after
+    /// one pass and one sidecar write.
+    async fn uda_record_and_header_after_pass(
+        state: &Arc<AppState>,
+        key: &EvictionKey,
+    ) -> anyhow::Result<(Option<s4::DesignatedHandoffRecord>, Vec<u8>)> {
+        revocation_eviction_pass(state).await;
+        assert!(persist_obligations(state).await, "the row is durable");
+        let record = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .store
+            .get(key)
+            .expect("the row")
+            .designated_handoff;
+        let header = std::fs::read(evs_path(state))?[..10].to_vec();
+        Ok((record, header))
+    }
+
+    /// Set the row's consumed budget to `consumed`, as a restart with
+    /// that saved budget would.
+    async fn uda_set_budget(state: &AppState, key: &EvictionKey, consumed: Duration) {
+        state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .budgets
+            .insert(key.clone(), RowBudget::resume(consumed, Instant::now()));
+    }
+
+    /// #1581 (Engineer ruling, 4 Nov 2026 17:22 GMT): the stored
+    /// hand-off record ends at W — L171 keeps an unresolved route's
+    /// priority "through W, not forever", and the §4 unsupported wait
+    /// also lasts for W — so the pass drops it and the sidecar returns
+    /// from v3 to the old header. Just inside W it stays.
+    #[tokio::test]
+    async fn the_stored_handoff_record_is_dropped_at_w() -> anyhow::Result<()> {
+        for outcome in [
+            s4::DesignatedHandoffOutcome::Unresolved,
+            s4::DesignatedHandoffOutcome::Unsupported,
+        ] {
+            let (state, _group_id, key, designated, bytes, _dir) =
+                uda_state_after_restart(Some(outcome)).await?;
+            assert_eq!(&bytes[..10], s4::EVS_HEADER_V3, "{outcome:?} rides v3");
+            let window = state.revocation_evictions.timing.designated_window;
+            // Inside W the record and the v3 file stay.
+            // A 5 s margin below W (18 s by default) keeps a loaded runner
+            // from crossing W between this set and the pass.
+            uda_set_budget(&state, &key, window.saturating_sub(Duration::from_secs(5))).await;
+            let (record, header) = uda_record_and_header_after_pass(&state, &key).await?;
+            assert_eq!(
+                record,
+                Some(s4::DesignatedHandoffRecord {
+                    designated,
+                    outcome
+                }),
+                "{outcome:?}: inside W the record stays"
+            );
+            assert_eq!(header, s4::EVS_HEADER_V3.to_vec());
+            // At W the pass drops it and the file returns to v1.
+            uda_set_budget(&state, &key, window).await;
+            let (record, header) = uda_record_and_header_after_pass(&state, &key).await?;
+            assert_eq!(record, None, "{outcome:?}: the record ends at W");
+            assert_eq!(
+                header,
+                s4::EVS_HEADER_V1.to_vec(),
+                "{outcome:?}: the sidecar leaves v3 at W"
+            );
+        }
+        Ok(())
+    }
+
+    /// #1581 (Engineer ruling, 4 Nov 2026 17:22 GMT): a send that
+    /// completes at or after W records nothing that lasts, so it never
+    /// moves the sidecar to v3.
+    #[tokio::test]
+    async fn an_outcome_completed_after_w_is_not_stored() -> anyhow::Result<()> {
+        let (state, _group_id, key, designated, _bytes, _dir) =
+            uda_state_after_restart(None).await?;
+        let window = state.revocation_evictions.timing.designated_window;
+        uda_set_budget(&state, &key, window).await;
+        let attempt = state
+            .revocation_evictions
+            .inner
+            .lock()
+            .await
+            .store
+            .get(&key)
+            .and_then(|row| row.first_dispatch_unix_ms)
+            .expect("the row has dispatched");
+        record_designated_handoff(
+            &state,
+            &key,
+            attempt,
+            designated,
+            s4::DesignatedHandoffOutcome::Unresolved,
+        )
+        .await;
+        assert_eq!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .expect("the row")
+                .designated_handoff,
+            None,
+            "a result past W is not kept"
+        );
+        assert_eq!(&std::fs::read(evs_path(&state))?[..10], s4::EVS_HEADER_V1);
+        Ok(())
+    }
+
+    /// #1581 (Engineer ruling, 4 Nov 2026 17:22 GMT): a designation
+    /// change voids the record (it names an admin that is no longer
+    /// designated), so the pass drops it and the sidecar returns from
+    /// v3 to the old header; the row then waits on the new designated
+    /// admin with the plain cause.
+    #[tokio::test]
+    async fn a_designation_change_drops_the_stored_handoff_record() -> anyhow::Result<()> {
+        let (state, group_id, key, designated, bytes, _dir) =
+            uda_state_after_restart(Some(s4::DesignatedHandoffOutcome::Unresolved)).await?;
+        assert_eq!(&bytes[..10], s4::EVS_HEADER_V3);
+        // A new admin below the designated one becomes the designated
+        // admin (the lowest raw-ID eligible admin).
+        let newcomer = loop {
+            let candidate = *x0x::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes();
+            if candidate < designated {
+                break candidate;
+            }
+        };
+        {
+            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(&group_id).expect("the group");
+            info.add_member(
+                hex::encode(newcomer),
+                GroupRole::Admin,
+                Some(local_hex),
+                None,
+            );
+            info.recompute_state_hash();
+        }
+        let (record, header) = uda_record_and_header_after_pass(&state, &key).await?;
+        assert_eq!(
+            state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .expect("the row")
+                .designated,
+            Some(newcomer),
+            "the designation moved"
+        );
+        assert_eq!(record, None, "the old admin's record is dropped");
+        assert_eq!(
+            header,
+            s4::EVS_HEADER_V1.to_vec(),
+            "the sidecar leaves v3 on a designation change"
+        );
+        Ok(())
+    }
+
+    /// #1581 (Engineer ruling, 4 Nov 2026 18:15 GMT): a pairing denial
+    /// of the designated admin and the designated admin's own
+    /// `RecipientRejected` are definitive policy refusals (L171). The
+    /// row keeps the plain `waiting_for_designated_admin` through the
+    /// public status, and the outcome is never stored, so the sidecar
+    /// stays at the old header. `ReceiverBackpressured` is transient and
+    /// stays an unresolved route.
+    #[tokio::test]
+    async fn a_policy_refusal_is_the_plain_wait_and_never_stored() -> anyhow::Result<()> {
+        let refusals = [
+            x0x::dm::DmError::EnvelopeConstruction(format!(
+                "{} (ADR-0043 B/P): denied",
+                x0x::dm::RECIPIENT_PAIRING_DENIED
+            )),
+            x0x::dm::DmError::EnvelopeConstruction(format!(
+                "{} (ADR-0043 B/P, capability binding): denied",
+                x0x::dm::RECIPIENT_PAIRING_DENIED
+            )),
+            x0x::dm::DmError::RecipientRejected {
+                reason: "trust policy".into(),
+            },
+        ];
+        for refusal in refusals {
+            let (state, group_id, key, designated, _bytes, _dir) =
+                uda_state_after_restart(None).await?;
+            let attempt = state
+                .revocation_evictions
+                .inner
+                .lock()
+                .await
+                .store
+                .get(&key)
+                .and_then(|row| row.first_dispatch_unix_ms)
+                .expect("the row has dispatched");
+            record_designated_handoff(
+                &state,
+                &key,
+                attempt,
+                designated,
+                designated_send_outcome(&Err(refusal)),
+            )
+            .await;
+            let (record, header) = uda_record_and_header_after_pass(&state, &key).await?;
+            assert_eq!(
+                record,
+                Some(s4::DesignatedHandoffRecord {
+                    designated,
+                    outcome: s4::DesignatedHandoffOutcome::PolicyRefused,
+                }),
+                "the refusal is held in memory as a policy refusal"
+            );
+            assert_eq!(header, s4::EVS_HEADER_V1.to_vec(), "never stored");
+            let info = state
+                .named_groups
+                .read()
+                .await
+                .get(&group_id)
+                .cloned()
+                .expect("the group");
+            let status = group_status_json(&state, &info).await;
+            let target_hex = hex::encode(key.target);
+            let row = status
+                .rows
+                .as_array()
+                .expect("rows")
+                .iter()
+                .find(|row| row["target"].as_str() == Some(target_hex.as_str()))
+                .cloned()
+                .expect("the row is shown");
+            assert_eq!(
+                row["waiting"]["cause"].as_str(),
+                Some("waiting_for_designated_admin"),
+                "a policy refusal is not an unresolved route"
+            );
+            assert_eq!(row["waiting"]["detail"].as_str(), Some("rank"));
+        }
+        Ok(())
+    }
+
+    /// Seed a current verified advert for `agent` whose application
+    /// registry clears every bit, so `verified_registry_supports`
+    /// answers `Some(false)` for `eviction_handoff_v1`.
+    fn seed_advert_without_handoff_support(state: &AppState, agent: [u8; 32]) {
+        let mut caps = x0x::dm::DmCapabilities::v1_gossip_ready(vec![42; 1184]);
+        caps.application_registry = x0x::dm::CapabilityRegistry {
+            version: 1,
+            bits: 0,
+        };
+        assert!(
+            state.agent.capability_store().insert(
+                x0x::identity::AgentId(agent),
+                x0x::identity::MachineId([5; 32]),
+                caps,
+                now_unix_ms(),
+            ),
+            "the advert is fresh"
+        );
+        assert_eq!(
+            state.agent.capability_store().verified_registry_supports(
+                &x0x::identity::AgentId(agent),
+                x0x::dm::CapabilityRegistry::EVICTION_HANDOFF_V1
+            ),
+            Some(false)
+        );
+    }
+
+    /// #1581 review r7 (blocking finding 1): an outcome lands only on
+    /// the attempt that produced it (L174). A send task left over from
+    /// before a reopen — the row no longer runs its first-dispatch
+    /// time — cannot write its result onto the fresh attempt.
+    #[tokio::test]
+    async fn a_stale_attempt_outcome_never_lands_on_the_row() -> anyhow::Result<()> {
+        let (state, _group_id, key, designated, _bytes, _dir) =
+            uda_state_after_restart(None).await?;
+        let record = |outcome| s4::DesignatedHandoffRecord {
+            designated,
+            outcome,
+        };
+        // The row now runs the attempt that first dispatched at 500 and
+        // holds its in-memory `exchange_reached` (a routine outcome is
+        // never on disk, so it is set here after the reload); a task
+        // from the superseded attempt (400) completes.
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            let row = inner.store.get_mut(&key).expect("the row");
+            row.first_dispatch_unix_ms = Some(500);
+            row.designated_handoff = Some(record(s4::DesignatedHandoffOutcome::ExchangeReached));
+        }
+        record_designated_handoff(
+            &state,
+            &key,
+            400,
+            designated,
+            s4::DesignatedHandoffOutcome::Unresolved,
+        )
+        .await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.store.get(&key).expect("the row").designated_handoff,
+                Some(record(s4::DesignatedHandoffOutcome::ExchangeReached)),
+                "the superseded attempt's result is refused"
+            );
+        }
+        // The current attempt's own result still lands.
+        record_designated_handoff(
+            &state,
+            &key,
+            500,
+            designated,
+            s4::DesignatedHandoffOutcome::Unresolved,
+        )
+        .await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).expect("the row").designated_handoff,
+            Some(record(s4::DesignatedHandoffOutcome::Unresolved))
+        );
+        Ok(())
+    }
+
+    /// #1581 rc7 review (Low 2): a routine `exchange_reached` never
+    /// rides the file, so recording it over no record leaves the store
+    /// clean (no sidecar rewrite); replacing a stored `unresolved`
+    /// record with it does change the file, so that write is due.
+    #[tokio::test]
+    async fn a_routine_exchange_outcome_rewrites_the_sidecar_only_over_a_stored_record(
+    ) -> anyhow::Result<()> {
+        let (state, _group_id, key, designated, _bytes, _dir) =
+            uda_state_after_restart(None).await?;
+        let attempt = {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            inner.dirty = false;
+            inner
+                .store
+                .get(&key)
+                .and_then(|row| row.first_dispatch_unix_ms)
+                .expect("the row has dispatched")
+        };
+        // The probe: remove the sidecar, so any rewrite puts it back.
+        std::fs::remove_file(evs_path(&state))?;
+        record_designated_handoff(
+            &state,
+            &key,
+            attempt,
+            designated,
+            s4::DesignatedHandoffOutcome::ExchangeReached,
+        )
+        .await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert!(!inner.dirty, "a routine outcome marks nothing dirty");
+            assert_eq!(
+                inner.store.get(&key).expect("the row").designated_handoff,
+                Some(s4::DesignatedHandoffRecord {
+                    designated,
+                    outcome: s4::DesignatedHandoffOutcome::ExchangeReached,
+                }),
+                "the routine outcome is still held in memory"
+            );
+        }
+        assert!(
+            !evs_path(&state).exists(),
+            "a routine outcome over no record rewrites no sidecar"
+        );
+        // Over a stored record the file changes: v3 back to v1.
+        record_designated_handoff(
+            &state,
+            &key,
+            attempt,
+            designated,
+            s4::DesignatedHandoffOutcome::Unresolved,
+        )
+        .await;
+        assert_eq!(&std::fs::read(evs_path(&state))?[..10], s4::EVS_HEADER_V3);
+        record_designated_handoff(
+            &state,
+            &key,
+            attempt,
+            designated,
+            s4::DesignatedHandoffOutcome::ExchangeReached,
+        )
+        .await;
+        assert_eq!(&std::fs::read(evs_path(&state))?[..10], s4::EVS_HEADER_V1);
+        Ok(())
+    }
+
+    /// #1581 rc7 (Engineer ruling, 4 Nov 08:25 GMT): completion clears
+    /// the record, so the send task of the completed attempt — it still
+    /// carries the row's first-dispatch time — must not put an
+    /// `unresolved` record back when it finishes late. Otherwise the
+    /// closed row would hold the sidecar at v3 for as long as it is kept.
+    #[tokio::test]
+    async fn a_late_outcome_never_lands_on_a_completed_row() -> anyhow::Result<()> {
+        let (state, _group_id, key, designated, _bytes, _dir) =
+            uda_state_after_restart(None).await?;
+        let attempt = {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            let attempt = inner
+                .store
+                .get(&key)
+                .and_then(|row| row.first_dispatch_unix_ms)
+                .expect("the row has dispatched");
+            assert!(inner
+                .store
+                .complete(&key, Some("head".into()), Some(3), now_unix_ms()));
+            inner.dirty = true;
+            attempt
+        };
+        record_designated_handoff(
+            &state,
+            &key,
+            attempt,
+            designated,
+            s4::DesignatedHandoffOutcome::Unresolved,
+        )
+        .await;
+        {
+            let inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.store.get(&key).expect("the row").designated_handoff,
+                None,
+                "a late result does not reopen the record on a closed row"
+            );
+        }
+        assert!(persist_obligations(&state).await, "the row is durable");
+        let bytes = std::fs::read(evs_path(&state))?;
+        assert_eq!(
+            &bytes[..10],
+            s4::EVS_HEADER_V1,
+            "the completed row keeps the old header"
+        );
+        Ok(())
+    }
+
+    /// #1581 review r7 (finding 7): the dispatch's `Some(false)` arm
+    /// records `unsupported` against the designated admin's attempt,
+    /// the same definitive evidence the §4 advert read carries.
+    #[tokio::test]
+    async fn a_lacking_advert_records_the_unsupported_outcome() -> anyhow::Result<()> {
+        let (state, _group_id, key, designated, bytes, _dir) =
+            uda_state_after_restart(None).await?;
+        assert_eq!(&bytes[..10], s4::EVS_HEADER_V1, "no record rode the file");
+        seed_advert_without_handoff_support(&state, designated);
+        // One pass derives the designation onto the row (`row.designated`
+        // is what the dispatch compares each recipient against); the row
+        // has already dispatched, so the pass queues nothing itself.
+        revocation_eviction_pass(&state).await;
+        {
+            let mut inner = state.revocation_evictions.inner.lock().await;
+            assert_eq!(
+                inner.store.get(&key).expect("the row").designated,
+                Some(designated)
+            );
+            inner.pending_dispatch.insert(key.clone());
+        }
+        dispatch_handoffs(&state).await;
+        let inner = state.revocation_evictions.inner.lock().await;
+        assert_eq!(
+            inner.store.get(&key).expect("the row").designated_handoff,
+            Some(s4::DesignatedHandoffRecord {
+                designated,
+                outcome: s4::DesignatedHandoffOutcome::Unsupported,
+            })
+        );
+        assert!(inner
+            .unsupported_handoff
+            .get(&key)
+            .is_some_and(|ids| ids.contains(&designated)));
+        Ok(())
+    }
+
+    /// #1581 review r7 (finding 7): the §4 downgrade's live advert read
+    /// — re-read on every pass once the row has dispatched, so it needs
+    /// no record and no in-memory set — downgrades a rank-1 wait
+    /// through the public status.
+    #[tokio::test]
+    async fn a_lacking_live_advert_downgrades_the_wait_through_public_status() -> anyhow::Result<()>
+    {
+        let (state, group_id, key, designated, _bytes, _dir) =
+            uda_state_after_restart(None).await?;
+        seed_advert_without_handoff_support(&state, designated);
+        revocation_eviction_pass(&state).await;
+        let info = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .cloned()
+            .expect("the group");
+        let status = group_status_json(&state, &info).await;
+        let target_hex = hex::encode(key.target);
+        let row = status
+            .rows
+            .as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["target"].as_str() == Some(target_hex.as_str()))
+            .cloned()
+            .expect("the row is shown");
+        assert_eq!(
+            row["waiting"]["cause"].as_str(),
+            Some("waiting_for_designated_admin")
+        );
+        assert_eq!(
+            row["waiting"]["detail"].as_str(),
+            Some("designated_admin_unsupported")
+        );
+        Ok(())
+    }
+
+    /// #1581 review r7 (finding 6): the `send_direct` result maps to
+    /// the §2 (L170–L173) outcomes — a definitive capability refusal
+    /// is `unsupported`, never an unresolved route (L171), while the
+    /// missing-binding and timeout shapes stay `unresolved`.
+    #[test]
+    fn designated_send_outcome_classifies_every_refusal() {
+        let receipt = x0x::dm::DmReceipt {
+            request_id: [0; 16],
+            accepted_at: std::time::Instant::now(),
+            retries_used: 0,
+            path: x0x::dm::DmPath::GossipInbox,
+        };
+        assert_eq!(
+            designated_send_outcome(&Ok(receipt)),
+            s4::DesignatedHandoffOutcome::ExchangeReached
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientUpgradeRequired {
+                capability: "eviction_handoff_v1"
+            })),
+            s4::DesignatedHandoffOutcome::Unsupported
+        );
+        // The missing-binding and timeout shapes: absence of knowledge
+        // and no answer, never a definitive refusal (L171).
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientKeyUnavailable(
+                "no known DM capability advert".into()
+            ))),
+            s4::DesignatedHandoffOutcome::Unresolved
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::Timeout {
+                retries: 3,
+                elapsed: std::time::Duration::from_secs(9)
+            })),
+            s4::DesignatedHandoffOutcome::Unresolved
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::PeerDisconnected {
+                reason: "closed".into()
+            })),
+            s4::DesignatedHandoffOutcome::Unresolved
+        );
+        // The designated admin's own policy refusal and this node's
+        // pairing denial: definitive policy refusals, never unresolved
+        // (L171; Engineer ruling, 4 Nov 2026 18:15 GMT).
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientRejected {
+                reason: "trust policy".into()
+            })),
+            s4::DesignatedHandoffOutcome::PolicyRefused
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientPairingDenied {
+                denial: x0x::key_move::PairingDenial::BindingRevoked,
+            })),
+            s4::DesignatedHandoffOutcome::PolicyRefused
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::EnvelopeConstruction(format!(
+                "{} (ADR-0043 B/P): denied",
+                x0x::dm::RECIPIENT_PAIRING_DENIED
+            )))),
+            s4::DesignatedHandoffOutcome::PolicyRefused
+        );
+        // Any other envelope failure is a local failure, not an answer
+        // from the route.
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::EnvelopeConstruction(
+                "AEAD encryption failed".into()
+            ))),
+            s4::DesignatedHandoffOutcome::Unresolved
+        );
+        // Backpressure is a transient "retry later": nothing was
+        // delivered and nothing definitive came back.
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::ReceiverBackpressured {
+                reason: "busy".into()
+            })),
+            s4::DesignatedHandoffOutcome::Unresolved
+        );
     }
 
     /// ADR 0115 §3 (#1508 review r8 P1): a roster certificate is not

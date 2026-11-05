@@ -2634,10 +2634,17 @@ pub(in crate::server) async fn receive(
         // a forged frame that names an Active member changes nothing.
         // Idempotent: a view without the target, including the empty view
         // of a fresh process, changes nothing.
-        if matches!(body.crypto, ce::CryptoExclusionCryptoV1::Gss { .. })
-            && seat_left_the_roster(&info, &body.target)
-        {
-            remove_legacy_mls_member(state, &group_key, AgentId(body.target)).await;
+        if matches!(body.crypto, ce::CryptoExclusionCryptoV1::Gss { .. }) {
+            if seat_left_the_roster(&info, &body.target) {
+                remove_legacy_mls_member(state, &group_key, AgentId(body.target)).await;
+            }
+            // #1775 (claude review at 5e389451): a crash after the head
+            // persisted and before the install's replay leaves a parked
+            // secret that nothing else re-delivers; this replay of the
+            // installed frame does it. The share apply re-enters the
+            // group lock, so it runs after the guard drops.
+            drop(membership_guard);
+            super::owner_recovery::redeliver_parked_secret(state, &body.stable_group_id).await;
         }
         return ReceiveOutcome::Duplicate;
     }
@@ -2911,17 +2918,23 @@ async fn install_gss(
     frame_bytes: Arc<Vec<u8>>,
 ) -> ReceiveOutcome {
     use super::super as ng;
-    // #1766: a secret of the frame's epoch is uncommitted (the frame binds
-    // the parent's committed epoch + 1). It is the frame's key only when
-    // the frame's actor sealed its share. A secret from another sender,
-    // or with no sender record for that exact secret (another install
-    // path, or a crash between the key write and the record write), is
-    // not kept: the frame waits for its actor's share, which may replace
-    // it ([`ng::gss_share_hold::replaces_uncommitted_secret`]).
+    // #1766 (#1775 items 2 and 4): a secret of the frame's epoch or a
+    // later one is uncommitted — no verified commit pins its value —
+    // until the head commits its epoch, and a #1578 keyless commit binds
+    // the epoch with no secret, which pins no value either. Such a
+    // secret is the frame's key only when the frame's actor sealed its
+    // share. A secret from another sender, or with no sender record for
+    // that exact secret (another install path, or a crash between the
+    // key write and the record write), is not kept: the frame waits for
+    // its actor's share, which may replace it — over a later epoch's
+    // unpinned secret too, so the wait keeps its way out when a foreign
+    // share raised the local epoch past the head (3 Nov review thread;
+    // [`ng::gss_share_hold::replaces_uncommitted_secret`]).
     ng::gss_share_hold::ensure_loaded(state).await;
     let actor_hex = hex::encode(body.actor);
-    let foreign_secret = info.secret_epoch == next_secret_epoch
-        && info.shared_secret.is_some()
+    let foreign_secret = info.shared_secret.is_some()
+        && info.secret_epoch >= next_secret_epoch
+        && ng::gss_share_hold::secret_unpinned(state, group_key, info)
         && !ng::gss_share_hold::share_sent_by(state, group_key, info, &actor_hex);
     let waiting =
         info.secret_epoch < next_secret_epoch || info.shared_secret.is_none() || foreign_secret;
@@ -2943,9 +2956,9 @@ async fn install_gss(
         .ok()
     };
     let result = if waiting { keyless() } else { None };
-    let promoted = match result {
+    let promoted = match &result {
         Some(result) => {
-            super::owner_recovery::promoted_admin_secret(state, &result, next_secret_epoch).await
+            super::owner_recovery::promoted_admin_secret(state, result, next_secret_epoch).await
         }
         None => None,
     };
@@ -2995,7 +3008,11 @@ async fn install_gss(
     if awaiting_share {
         // The keyless install holds through the same durable hold: it is
         // written before the state change, so a crash between the two
-        // leaves the hold and a retry that installs again.
+        // leaves the hold and a retry that installs again. #1775 item 4:
+        // the keyless commit's mark is written here too, before the head
+        // moves — a crash between the two leaves a mark for an epoch the
+        // head does not commit, which pins nothing, and the retry that
+        // installs again writes it.
         ng::gss_share_hold::hold_exclusion(
             state,
             group_key,
@@ -3004,6 +3021,50 @@ async fn install_gss(
             &actor_hex,
         )
         .await;
+        if !ng::gss_share_hold::note_keyless_commit(
+            state,
+            group_key,
+            next_secret_epoch,
+            &actor_hex,
+            &commit.state_hash,
+        )
+        .await
+        {
+            // #1775 (claude review round 11): the durable mark did not
+            // land, so the head must not move over it — after a restart
+            // the epoch would pin nothing and stay replaceable. The hold
+            // stays; the frame retries the install and re-writes the
+            // mark.
+            return ReceiveOutcome::LocalFailure;
+        }
+    }
+    // #1775 (claude review round 11; Engineer ruling 4 Nov on the review
+    // at 5e389451): the later epoch's installed secret — the one this
+    // install displaces with its own key, or drops at the superseded
+    // exit — is parked only when the held step that raises the chain to
+    // its epoch was authored by its recorded sender. That key is the held
+    // chain's own: it re-delivers once the head commits this frame's
+    // epoch, and the later rotation's commit lands with it. Any other
+    // later secret is dropped, as on main: re-delivered before the held
+    // chain, it would let a later removal of its own sender commit over
+    // it. Round 12: a park whose durable write fails fails locally —
+    // this install must not drop a later key the disk holds no record
+    // of — and the frame retries (the same rule as the keyless mark).
+    let parks_raise_authors_secret = match (&result, promoted) {
+        (Some(result), Some(_)) if info.secret_epoch > next_secret_epoch => {
+            super::owner_recovery::held_raise_author(state, result, info.secret_epoch)
+                .await
+                .is_some_and(|author| {
+                    ng::gss_share_hold::share_sent_by(state, group_key, info, &author)
+                })
+        }
+        _ => false,
+    };
+    if parks_raise_authors_secret
+        && !ng::gss_share_hold::park_displaced_secret(state, group_key, info, next_secret_epoch)
+            .await
+    {
+        return ReceiveOutcome::LocalFailure;
     }
     let next = match ng::apply_stateful_event_with_evidence(
         state,
@@ -3043,6 +3104,18 @@ async fn install_gss(
         Ok(next) => next,
         Err(error) => {
             tracing::info!(group_id = %LogHexId::group(group_key), "ADR 0110 S4: GSS crypto-only exclusion commit refused: {error}");
+            // #1775 (claude review round 2): the head did not move, so
+            // the keyless mark written ahead of the commit goes — kept,
+            // it would keep a committed epoch of this number replaceable.
+            if awaiting_share {
+                ng::gss_share_hold::forget_keyless_commit(
+                    state,
+                    group_key,
+                    next_secret_epoch,
+                    &commit.state_hash,
+                )
+                .await;
+            }
             return ReceiveOutcome::Refused(ce::CryptoExclusionRefusal::BadSignature);
         }
     };
@@ -3056,6 +3129,17 @@ async fn install_gss(
         // frame stays durable for the retry and the roster keeps the
         // parent. `ReplacedNotDurable` means the install is staged in
         // the live map, so the steps below report installed state only.
+        // #1775 (claude review round 2): nothing was staged, so the
+        // keyless mark goes with it.
+        if awaiting_share {
+            ng::gss_share_hold::forget_keyless_commit(
+                state,
+                group_key,
+                next_secret_epoch,
+                &commit.state_hash,
+            )
+            .await;
+        }
         return ReceiveOutcome::LocalFailure;
     }
     remove_legacy_mls_member(state, group_key, AgentId(body.target)).await;
@@ -4944,6 +5028,16 @@ mod daemon_tests {
         committer_seats_kem: bool,
         replica_seats_kem: bool,
     ) -> Result<GssLeave> {
+        gss_leave_fixture_seats(extra.as_slice(), committer_seats_kem, replica_seats_kem).await
+    }
+
+    /// [`gss_leave_fixture_seated`], with each extra agent seated in its
+    /// role. [`GssLeave::extra`] names the first.
+    async fn gss_leave_fixture_seats(
+        extras: &[(AgentId, x0x::groups::GroupRole)],
+        committer_seats_kem: bool,
+        replica_seats_kem: bool,
+    ) -> Result<GssLeave> {
         let (mut state, dir) = ng::tests::secure_endpoint_test_state().await?;
         // Only the per-group head round holds a seal, not the boot wait.
         anyhow::Context::context(
@@ -4983,10 +5077,10 @@ mod daemon_tests {
             None,
             committer_seats_kem.then(|| survivor_kem_b64.clone()),
         );
-        if let Some((extra, role)) = extra {
+        for (extra, role) in extras {
             info.add_member(
                 hex::encode(extra.as_bytes()),
-                role,
+                *role,
                 Some(admin_hex.clone()),
                 None,
             );
@@ -5040,7 +5134,7 @@ mod daemon_tests {
             leaver_kp,
             leave,
             old_secret,
-            extra: extra.map(|(extra, _)| extra),
+            extra: extras.first().map(|(extra, _)| *extra),
         })
     }
 
@@ -6887,9 +6981,19 @@ mod daemon_tests {
             ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
             0
         );
+        // #1775 item 4: the file stays, but it holds nothing — it keeps
+        // the keyless commit's durable mark, which survives the
+        // republication so that the first foreign share of the epoch
+        // cannot win permanently. The withheld answer above proves no
+        // hold remains; the actor's share below settles the mark and
+        // writes the file away.
         assert!(
-            !ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
-            "the release wrote the file away"
+            ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
+            "the released hold leaves only the keyless mark in the file"
+        );
+        assert!(
+            ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the mark itself survived the release"
         );
         let served = served_responder_head(&fx.replica, admin, &fx.group_id).await?;
         assert_eq!(
@@ -7050,6 +7154,14 @@ mod daemon_tests {
         assert!(
             took.accepted,
             "the share sealed to the republished key installs: {took:?}"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
+            "#1775: the actor's share settles the keyless mark and writes the file away"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the mark is settled"
         );
         // #1663 review P1 (Codex controller, 30 Oct): the carrier's
         // acceptance of the sealed share — the spawned egress's admitted
@@ -8519,6 +8631,14 @@ mod daemon_tests {
             1,
             "the durable hold stays: no secret of the new epoch exists here"
         );
+        // #1775 (claude review round 11, major 3): the refused apply's
+        // rollback takes the keyless mark it wrote ahead of the head that
+        // never moved — a kept mark would leave a committed epoch of this
+        // number replaceable.
+        assert!(
+            !ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the refused apply's rollback took the keyless mark"
+        );
         assert!(
             ng::gss_share_hold::test_seam::hold_file_exists(&fx.replica, &fx.group_id),
             "the hold outlives the refused apply on disk"
@@ -8554,6 +8674,13 @@ mod daemon_tests {
             ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
             1,
             "the keyless install keeps the hold until a share arrives"
+        );
+        // #1775 (claude review round 11, major 3): the retry that installs
+        // writes the mark again — its head commits the epoch with no
+        // secret, which pins no secret value.
+        assert!(
+            ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the retry that installs writes the keyless mark again"
         );
         Ok(())
     }
@@ -8723,6 +8850,2537 @@ mod daemon_tests {
             installed.shared_secret,
             Some(actor_secret),
             "the survivor holds the actor's key, not B's"
+        );
+        Ok(())
+    }
+
+    /// #1775 item 4 (Engineer ruling, 3 Nov 15:58 GMT): after a #1578
+    /// keyless install the head already commits the epoch, but it binds
+    /// the epoch, not the secret value. The first foreign admin share of
+    /// that epoch — sealed to the seat once the #1663 republication
+    /// re-keyed it — must not win permanently: the keyless commit's
+    /// durable mark keeps the group's ciphertext held under it, the
+    /// waiting actor's own share replaces it, and the settled epoch is
+    /// pinned again. The updated #1663 republish test proves the same
+    /// through the real republication flow.
+    #[tokio::test]
+    async fn a_keyless_commit_keeps_the_first_foreign_share_replaceable() -> Result<()> {
+        use anyhow::Context as _;
+        let other_admin = AgentId([0xfe; 32]);
+        let other_admin_hex = hex::encode(other_admin.as_bytes());
+        let fx = gss_leave_fixture_seated(
+            Some((other_admin, x0x::groups::GroupRole::Admin)),
+            false,
+            false,
+        )
+        .await?;
+        fx.replica
+            .named_group_test_recorders
+            .key_republish_suppressed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let admin = fx.state.agent.agent_id();
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            // The worker round is time-sensitive under a loaded machine;
+            // drive it again, bounded.
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let actor_secret: [u8; 32] = fx
+            .state
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .and_then(|info| info.shared_secret.clone())
+            .context("the actor's new secret")?
+            .as_slice()
+            .try_into()
+            .ok()
+            .context("the secret is 32 bytes")?;
+
+        // The survivor is keyless: the frame installs keyless, and the
+        // head it moves commits the epoch with no secret.
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the keyless survivor installs the verified frame (#1578)"
+        );
+
+        // The #1663 republication keys the seat and releases the keyless
+        // hold; the mark of the keyless commit stays.
+        let keyless = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        ng::gss_share_hold::release_keyless_on_republish(&fx.replica, &fx.group_id, &keyless).await;
+        assert_eq!(
+            ng::gss_share_hold::test_seam::held_exclusions(&fx.replica, &fx.group_id),
+            0,
+            "the republication released the keyless hold; only the mark remains"
+        );
+
+        // B's share of the keyless-committed epoch installs — the arm
+        // opens it with the live keypair, as a re-keyed seat's share
+        // would be opened. On main the hold died with the keyless
+        // commit's epoch and the actor's share could never replace B's.
+        let foreign = [0xB5u8; 32];
+        let foreign_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &other_admin_hex,
+            &foreign,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's share"))?;
+        let took = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            foreign_share.clone(),
+            other_admin,
+            true,
+            None,
+        )
+        .await;
+        assert!(took.accepted, "B is an admin: {took:?}");
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "#1775 item 4: the keyless commit's mark keeps holding under B's secret"
+        );
+
+        // The actor's share replaces B's; the settled epoch is pinned
+        // again, so B's duplicate no longer replaces it.
+        let actor_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &hex::encode(admin.as_bytes()),
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's share"))?;
+        let took = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            actor_share.clone(),
+            admin,
+            true,
+            None,
+        )
+        .await;
+        assert!(took.accepted, "the actor's share replaces B's: {took:?}");
+        let again = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            foreign_share,
+            other_admin,
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            !again.accepted,
+            "the settled epoch is pinned: B's duplicate replaces nothing: {again:?}"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.shared_secret,
+            Some(actor_secret.to_vec()),
+            "the survivor holds the actor's key, not B's"
+        );
+        Ok(())
+    }
+
+    /// #1775 item 2: a foreign share of a later epoch, installed while
+    /// the head stays at the parent, ends no wait — the frame's install
+    /// compares the share against the epoch the head commits, not the
+    /// local one. The frame of the earlier epoch waits, and the group's
+    /// new ciphertext stays held, until a head commits the later epoch.
+    #[tokio::test]
+    async fn a_later_epoch_foreign_share_ends_no_wait() -> Result<()> {
+        use anyhow::Context as _;
+        // A raw ID above the fixture author's, so B is never the
+        // designated admin and the author authors the exclusion at once
+        // (D74: the lowest eligible admin is designated). The held walk
+        // checks the commit as the ordinary apply does, so B seals with
+        // its own keypair; the fixture is rebuilt until the coin lands.
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            // The worker round is time-sensitive under a loaded machine;
+            // drive it again, bounded.
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's share of the epoch after the frame's installs while the
+        // head stays at the parent: the local epoch rises, no commit
+        // pins it.
+        let foreign = [0xB5u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "#1775 item 2: an uncommitted later-epoch secret is not the frame's key"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no result head over B's secret"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "the frame's hold withholds new ciphertext under B's later-epoch secret"
+        );
+
+        // The honest way out (claude review round 1): B's own rotation to
+        // the later epoch, held on the frame's result. The walk's step
+        // author sealed the installed secret, so the frame takes the
+        // superseded exit and installs as an intermediate head instead of
+        // waiting for a share that the stale-envelope guard refuses. The
+        // dropped later key parks (round 11), the install's replay
+        // re-delivers it, and the held chain commits B's rotation with it.
+        let parent_info = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("the survivor's group")?;
+        let frame_commit = body.commit.to_commit();
+        let f_result = ng::apply_stateful_event_to_group(
+            &parent_info,
+            &frame_commit,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.roster_revision =
+                    ng::adopt_roster_revision(next.roster_revision, body.next_revision);
+                next.secret_epoch = next_secret_epoch;
+                next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+            },
+        )
+        .context("the frame's keyless result")?;
+        let author_hex = hex::encode(admin.as_bytes());
+        let mut b_next = f_result.clone();
+        b_next.roster_revision = b_next.roster_revision.saturating_add(1);
+        b_next.remove_member(&author_hex, Some(b_hex.clone()));
+        b_next.secret_epoch = next_secret_epoch + 1;
+        b_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let b_commit = b_next.seal_commit(&b_kp, 0).context("seal B's removal")?;
+        let b_head = b_commit.state_hash.clone();
+        let b_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: fx.group_id.clone(),
+            revision: b_next.roster_revision,
+            actor: b_hex.clone(),
+            agent_id: author_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(next_secret_epoch + 1),
+            commit: Some(b_commit),
+        };
+        super::super::owner_recovery::seed_held_event_for_test(
+            &fx.replica,
+            &fx.stable,
+            b_removal,
+            b,
+            Some(f_result.state_hash.clone()),
+        )
+        .await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "#1775 item 2: the held later rotation leads the frame out of the wait"
+        );
+        // #1775 (claude review round 11): the superseded install parks the
+        // later key it drops — B authored the held step that raises to
+        // its epoch, and B sealed it — and the install's replay re-delivers the
+        // parked share before the held chain runs — no manual share
+        // re-delivery. B's rotation then applies with its own sender's key
+        // in, and a head commits the later epoch: the wait ended by
+        // pinning the secret, not by stranding it.
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, b_head,
+            "the held chain reached B's head with the parked share: no re-delivery"
+        );
+        assert_eq!(installed.secret_epoch, next_secret_epoch + 1);
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "B's key stayed in"
+        );
+        assert_eq!(
+            x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
+            next_secret_epoch + 1,
+            "a head commits the later epoch"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the committed epoch pins the secret: the group seals again"
+        );
+        Ok(())
+    }
+
+    /// #1775 (claude review at 5e389451, missing test): the superseded
+    /// install parks the held raise author's later key before the head
+    /// moves. When that durable write fails, the install fails locally:
+    /// the head stays at the parent and B's key stays installed, so no
+    /// restart loses it. Once the write lands, the retry installs and the
+    /// held chain commits B's rotation with B's key.
+    #[tokio::test]
+    async fn a_superseded_install_whose_park_cannot_write_moves_no_head() -> Result<()> {
+        use anyhow::Context as _;
+        // A raw ID above the fixture author's, so B is never the
+        // designated admin and the author authors the exclusion at once
+        // (D74: the lowest eligible admin is designated). The held walk
+        // checks the commit as the ordinary apply does, so B seals with
+        // its own keypair; the fixture is rebuilt until the coin lands.
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            // The worker round is time-sensitive under a loaded machine;
+            // drive it again, bounded.
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's share of the epoch after the frame's installs while the
+        // head stays at the parent: the local epoch rises, no commit
+        // pins it.
+        let foreign = [0xB5u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "#1775 item 2: an uncommitted later-epoch secret is not the frame's key"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no result head over B's secret"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "the frame's hold withholds new ciphertext under B's later-epoch secret"
+        );
+
+        // The honest way out (claude review round 1): B's own rotation to
+        // the later epoch, held on the frame's result. The walk's step
+        // author sealed the installed secret, so the frame takes the
+        // superseded exit and installs as an intermediate head instead of
+        // waiting for a share that the stale-envelope guard refuses. The
+        // dropped later key parks (round 11), the install's replay
+        // re-delivers it, and the held chain commits B's rotation with it.
+        let parent_info = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("the survivor's group")?;
+        let frame_commit = body.commit.to_commit();
+        let f_result = ng::apply_stateful_event_to_group(
+            &parent_info,
+            &frame_commit,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.roster_revision =
+                    ng::adopt_roster_revision(next.roster_revision, body.next_revision);
+                next.secret_epoch = next_secret_epoch;
+                next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+            },
+        )
+        .context("the frame's keyless result")?;
+        let author_hex = hex::encode(admin.as_bytes());
+        let mut b_next = f_result.clone();
+        b_next.roster_revision = b_next.roster_revision.saturating_add(1);
+        b_next.remove_member(&author_hex, Some(b_hex.clone()));
+        b_next.secret_epoch = next_secret_epoch + 1;
+        b_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let b_commit = b_next.seal_commit(&b_kp, 0).context("seal B's removal")?;
+        let b_head = b_commit.state_hash.clone();
+        let b_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: fx.group_id.clone(),
+            revision: b_next.roster_revision,
+            actor: b_hex.clone(),
+            agent_id: author_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(next_secret_epoch + 1),
+            commit: Some(b_commit),
+        };
+        super::super::owner_recovery::seed_held_event_for_test(
+            &fx.replica,
+            &fx.stable,
+            b_removal,
+            b,
+            Some(f_result.state_hash.clone()),
+        )
+        .await;
+        ng::gss_share_hold::test_seam::force_hold_write_failure(&fx.replica, &fx.group_id);
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::LocalFailure,
+            "a park whose durable write fails moves no head"
+        );
+        let kept = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            Some(kept.state_hash.clone()),
+            parent,
+            "the head stays at the parent"
+        );
+        assert_eq!(
+            (kept.secret_epoch, kept.shared_secret.as_deref()),
+            (next_secret_epoch + 1, Some(foreign.as_slice())),
+            "B's key stays installed"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+            "memory keeps no record the disk refused"
+        );
+        // The failure clears (a restart reloads the files); the retry
+        // parks, installs and replays the held chain.
+        ng::gss_share_hold::test_seam::simulate_restart(&fx.replica).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the retry installs once the park lands"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, b_head,
+            "the held chain reached B's head"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "B's rotation committed with B's own key"
+        );
+        Ok(())
+    }
+
+    /// #1775 (claude review at 5e389451, missing tests): a #1578 keyless
+    /// install writes its durable mark before the head moves. (1) A
+    /// failed mark write fails the install locally: no head moves and
+    /// no mark stays in memory. (2) A roster write that reports
+    /// `NotReplaced` stages nothing, so the mark written ahead of it
+    /// goes. (3) With both faults gone, the retry installs keyless and
+    /// keeps the mark.
+    #[tokio::test]
+    async fn a_keyless_install_that_cannot_land_keeps_no_mark() -> Result<()> {
+        use anyhow::Context as _;
+        let fx = gss_leave_fixture_build(None, false).await?;
+        fx.replica
+            .named_group_test_recorders
+            .key_republish_suppressed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let admin = fx.state.agent.agent_id();
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+
+        // (1) The mark's durable write fails.
+        ng::gss_share_hold::test_seam::force_hold_write_failure(&fx.replica, &fx.group_id);
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::LocalFailure,
+            "a keyless install whose mark cannot write fails locally"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no head moves over a mark the disk refused"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "memory keeps no mark the disk refused"
+        );
+
+        // (2) The roster write stages nothing (`NotReplaced`).
+        ng::gss_share_hold::test_seam::simulate_restart(&fx.replica).await;
+        fx.replica
+            .named_groups_save_fault
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::LocalFailure,
+            "a roster write that stages nothing fails locally"
+        );
+        fx.replica
+            .named_groups_save_fault
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "the head stays at the parent"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the mark written ahead of the unstaged commit goes"
+        );
+
+        // (3) The retry installs keyless and keeps the mark.
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the retry installs keyless (#1578)"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await.as_deref(),
+            Some(body.commit.state_hash.as_str()),
+            "the frame's result is the head"
+        );
+        assert!(
+            ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the keyless commit keeps its mark"
+        );
+        Ok(())
+    }
+
+    /// #1775 (3 Nov review thread): a foreign share of a later epoch
+    /// holds an earlier frame through the `>=` check, and the actor's own
+    /// share of the frame's epoch must resolve that wait. The installed
+    /// later secret is unpinned, so the waiting transition's replace rule
+    /// lets the actor's share displace it; the strict stale-envelope
+    /// guard alone would refuse that share for ever and strand the
+    /// frame. Before the frame parks its hold, the same share stays
+    /// refused: no verified transition of the epoch waits yet, so no
+    /// rule may displace the installed secret. Round 11 completes the
+    /// recovery: the displaced later secret parks, and the frame's own
+    /// install re-delivers it — the honest rotation loses no key to the
+    /// reordering.
+    #[tokio::test]
+    async fn the_actors_earlier_share_recovers_a_later_epoch_foreign_secret() -> Result<()> {
+        use anyhow::Context as _;
+        // A raw ID above the fixture author's, so B is never the designated
+        // admin and the author authors the exclusion at once (D74: the
+        // lowest eligible admin is designated); B stays an admin of the
+        // parent roster, so its later-epoch share installs.
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let author_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's share of the epoch after the frame's installs while the
+        // head stays at the parent: the local epoch rises, no commit
+        // pins it.
+        let foreign = [0xB5u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+
+        // Before the frame parks its hold, the actor's share of the
+        // frame's epoch is an ordinary stale envelope: no verified
+        // transition of that epoch waits here, so no rule displaces B's
+        // secret with it.
+        let actor_secret = [0x07u8; 32];
+        let early = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's share"))?;
+        let refused =
+            ng::apply_named_group_metadata_event(&fx.replica, early, admin, true, None).await;
+        assert!(
+            !refused.accepted,
+            "no waiting transition of the epoch: the stale guard still refuses: {refused:?}"
+        );
+
+        // The frame waits under B's secret, and its hold names the actor.
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "#1775 item 2: an uncommitted later-epoch secret is not the frame's key"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no result head over B's secret"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            Some(ng::GroupCiphertextHold::PendingGssRemoval),
+            "the frame's hold withholds new ciphertext under B's later-epoch secret"
+        );
+
+        // The actor's own share of the frame's epoch resolves the wait:
+        // it displaces B's unpinned later secret, and the frame retry
+        // installs with it and pins the epoch — the recovery the 3 Nov
+        // review thread asked for, not a wait on B's rotation arriving.
+        let recovery = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's recovery share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, recovery, admin, true, None).await;
+        assert!(
+            took.accepted,
+            "the waiting actor's share displaces the unpinned later secret: {took:?}"
+        );
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the frame installs with its actor's key"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, body.commit.state_hash,
+            "the frame's result is the head"
+        );
+        assert_eq!(
+            x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
+            next_secret_epoch,
+            "the head commits the frame's epoch"
+        );
+        // #1775 (claude review round 11): the frame's own install
+        // re-delivered the parked later secret, so the honest rotation
+        // that arrived before its commit lost no key to the reordering —
+        // its commit will pin the same value it sealed.
+        assert_eq!(
+            installed.secret_epoch,
+            next_secret_epoch + 1,
+            "the displaced later secret reinstalled with the frame's commit"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the survivor holds B's re-delivered later key"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the committed epoch pins the frame's key: the group seals again"
+        );
+        Ok(())
+    }
+
+    /// #1775 (claude review round 11, Engineer ruling 4 Nov): the honest
+    /// reordering the round-10 replace could stall. B's share of the epoch
+    /// after the frame's arrives first and installs unpinned; the waiting
+    /// actor's own share then displaces it; the frame commits its epoch
+    /// with its actor's key. The displaced later secret is parked at the
+    /// displacement and re-delivers with the frame's own commit — B's
+    /// rotation commit then lands with its key installed, no share
+    /// re-delivery needed, and a replay of the same commit keeps it. Red
+    /// on dfcb0d0a: without the park, B's frame waits for a share no
+    /// retry owes.
+    #[tokio::test]
+    async fn a_displaced_later_secret_reinstalls_when_its_commit_lands() -> Result<()> {
+        use anyhow::Context as _;
+        // A raw ID above the fixture author's, so B is never the designated
+        // admin and the author authors the exclusion at once (D74: the
+        // lowest eligible admin is designated); B stays an admin of the
+        // parent roster, so its later-epoch share installs.
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let author_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // (1) B's share of the epoch after the frame's installs while the
+        // head stays at the parent: the local epoch rises, no commit pins
+        // it.
+        let foreign = [0xB5u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+
+        // (2) The frame waits under B's unpinned later secret; the waiting
+        // actor's own share of the frame's epoch displaces it (round 10)
+        // and parks it (round 11).
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "#1775 item 2: an uncommitted later-epoch secret is not the frame's key"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no result head over B's secret"
+        );
+        let actor_secret = [0x07u8; 32];
+        let recovery = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's recovery share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, recovery, admin, true, None).await;
+        assert!(
+            took.accepted,
+            "the waiting actor's share displaces the unpinned later secret: {took:?}"
+        );
+
+        // (3) The frame retries with its actor's key and commits its
+        // epoch. The install's replay re-delivers the parked later secret
+        // at once: the honest rotation lost no key to the reordering.
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the frame installs with its actor's key"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, body.commit.state_hash,
+            "the frame's result is the head"
+        );
+        assert_eq!(
+            x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
+            next_secret_epoch,
+            "the head commits the frame's epoch"
+        );
+        assert_eq!(
+            installed.secret_epoch,
+            next_secret_epoch + 1,
+            "the parked later secret re-delivered with the frame's own commit"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the survivor holds B's later key again"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the committed epoch pins the frame's key: the group seals again"
+        );
+
+        // (4) B's rotation of the later epoch lands as its own commit: the
+        // re-delivered key is the installed secret of its epoch from its
+        // own sender, so the frame installs with it — no share
+        // re-delivery. A crypto-only exclusion targets the already
+        // removed leaver and keeps the parent's roster (validate's rule),
+        // so the frame is the fixture frame's shape at the next epoch.
+        let leaver_hex = hex::encode(fx.leaver.as_bytes());
+        let mut b_next = installed.clone();
+        b_next.roster_revision = b_next.roster_revision.saturating_add(1);
+        b_next.secret_epoch = next_secret_epoch + 1;
+        b_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let b_commit = b_next.seal_commit(&b_kp, ng::now_millis_u64())?;
+        let b_body = ce::CryptoExclusionBodyV1 {
+            stable_group_id: fx.stable.clone(),
+            actor: *b.as_bytes(),
+            target: *fx.leaver.as_bytes(),
+            prior_head: installed.state_hash.clone(),
+            prior_revision: installed.state_revision,
+            next_revision: b_commit.revision,
+            roster_revision: b_next.roster_revision,
+            removal_proof_hash: ce::removal_proof_for(&installed, &leaver_hex)
+                .context("the leaver's removal proof on the frame's result")?,
+            crypto: ce::CryptoExclusionCryptoV1::Gss {
+                next_secret_epoch: next_secret_epoch + 1,
+            },
+            commit: ce::CommitHeaderV1::from(&b_commit),
+        };
+        let b_frame =
+            ce::encode_frame(&ce::sign(b_body, &b_kp).context("sign B's rotation frame")?)
+                .context("encode B's rotation frame")?;
+        assert_eq!(
+            receive(&fx.replica, b, &b_frame).await,
+            ReceiveOutcome::Applied,
+            "B's rotation commits with its re-delivered key: no share re-delivery"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, b_commit.state_hash,
+            "B's rotation is the head"
+        );
+        assert_eq!(installed.secret_epoch, next_secret_epoch + 1);
+        assert_eq!(
+            x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
+            next_secret_epoch + 1,
+            "a head commits the later epoch"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the survivor holds B's key under B's own commit"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the committed later epoch pins the secret: the group seals again"
+        );
+
+        // (5) A replay of B's commit is a Duplicate and keeps the
+        // re-delivered key.
+        assert_eq!(
+            receive(&fx.replica, b, &b_frame).await,
+            ReceiveOutcome::Duplicate,
+            "the replay of B's commit installs nothing new"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, b_commit.state_hash,
+            "the duplicate moved nothing"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the re-delivered secret survives the replay"
+        );
+
+        // (6) A replay of the installed frame re-delivers an eligible
+        // parked record: a crash after the head persisted and before the
+        // install's replay leaves one on disk (claude reviews at 5e389451
+        // and 818f565e). The record is written, the process restarts, and
+        // the replay is the first thing that runs: it must load the hold
+        // files itself.
+        let next_key = [0xB8u8; 32];
+        ng::gss_share_hold::test_seam::force_parked_secret_durable(
+            &fx.replica,
+            &fx.group_id,
+            ng::gss_share_hold::ParkedSecret {
+                secret_epoch: next_secret_epoch + 2,
+                sender: b_hex.clone(),
+                secret: next_key.to_vec(),
+                waits_epoch: next_secret_epoch + 1,
+            },
+        )
+        .await
+        .context("the parked record is written")?;
+        ng::gss_share_hold::test_seam::simulate_restart(&fx.replica).await;
+        assert_eq!(
+            receive(&fx.replica, b, &b_frame).await,
+            ReceiveOutcome::Duplicate,
+            "the installed frame replays as a duplicate"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+            "the duplicate replay re-delivered the record"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            (installed.secret_epoch, installed.shared_secret.as_deref()),
+            (next_secret_epoch + 2, Some(next_key.as_slice())),
+            "the duplicate replay installed the parked key"
+        );
+        Ok(())
+    }
+
+    /// #1775 (claude review round 12, Major 1): the keyless path. A
+    /// #1578 keyless install commits epoch E with no secret and writes
+    /// the mark; B's E+1 share installs unpinned; the waiting actor's E
+    /// share displaces it through the mark's replace branch, and the
+    /// parked record's wait (E) is already committed, so no commit
+    /// follows the actor's share that could carry the re-delivery. The
+    /// re-delivery runs from the share apply itself: B's key is back in
+    /// at once, and B's E+1 frame commits with it. Red on d5f52dfe: the
+    /// record parked, nothing re-delivered it, and B's frame returned
+    /// `WaitingForShare` until an unrelated commit landed.
+    #[tokio::test]
+    async fn a_keyless_displacement_redelivers_from_the_share_arm() -> Result<()> {
+        use anyhow::Context as _;
+        // A raw ID above the fixture author's, so B is never the
+        // designated admin and the author authors the exclusion at once
+        // (D74). B stays an admin of the parent roster; the author's
+        // view seats the survivor's KEM key while the survivor's own
+        // seat carries none, so the frame installs keyless (#1578 round
+        // 1's divergent view).
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                false,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let author_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        fx.replica
+            .named_group_test_recorders
+            .key_republish_suppressed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        advertise_crypto_exclusion(&fx.state, fx.replica.agent.agent_id());
+        fx.state
+            .named_group_test_recorders
+            .catchup_page_force_ok
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        run_worker(&fx.state).await;
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // (1) The keyless install: the head moves to the frame's result,
+        // commits epoch E with no secret, and writes the mark.
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the keyless survivor installs the verified frame (#1578)"
+        );
+        assert!(
+            ng::gss_share_hold::test_seam::keyless_mark_present(&fx.replica, &fx.group_id),
+            "the keyless install writes the mark of its epoch"
+        );
+
+        // (2) B's share of E+1 installs while the head commits only E:
+        // unpinned, so the mark keeps it replaceable.
+        let foreign = [0xB5u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+
+        // (3) The actor's own share of E displaces B's secret and parks
+        // it. The displacing wait's epoch is already committed, so the
+        // re-delivery must come from this share apply: the assertion red
+        // on d5f52dfe, where the survivor kept the actor's E key and
+        // B's record waited on nothing.
+        let actor_secret = [0x07u8; 32];
+        let recovery = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's recovery share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, recovery, admin, true, None).await;
+        assert!(
+            took.accepted,
+            "the waiting actor's share displaces the unpinned later secret: {took:?}"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.secret_epoch,
+            next_secret_epoch + 1,
+            "the parked later secret re-delivered with the actor's share itself"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the survivor holds B's later key again"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+            "the successful re-delivery consumed the record"
+        );
+
+        // (4) B's rotation of E+1 lands as its own commit: the
+        // re-delivered key is the installed secret of its epoch from its
+        // own sender, so no share re-delivery waits. The frame is the
+        // fixture frame's shape at the next epoch (a crypto-only
+        // exclusion keeps the parent's roster).
+        let leaver_hex = hex::encode(fx.leaver.as_bytes());
+        let mut b_next = installed.clone();
+        b_next.roster_revision = b_next.roster_revision.saturating_add(1);
+        b_next.secret_epoch = next_secret_epoch + 1;
+        b_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let b_commit = b_next.seal_commit(&b_kp, ng::now_millis_u64())?;
+        let b_body = ce::CryptoExclusionBodyV1 {
+            stable_group_id: fx.stable.clone(),
+            actor: *b.as_bytes(),
+            target: *fx.leaver.as_bytes(),
+            prior_head: installed.state_hash.clone(),
+            prior_revision: installed.state_revision,
+            next_revision: b_commit.revision,
+            roster_revision: b_next.roster_revision,
+            removal_proof_hash: ce::removal_proof_for(&installed, &leaver_hex)
+                .context("the leaver's removal proof on the re-delivered state")?,
+            crypto: ce::CryptoExclusionCryptoV1::Gss {
+                next_secret_epoch: next_secret_epoch + 1,
+            },
+            commit: ce::CommitHeaderV1::from(&b_commit),
+        };
+        let b_frame =
+            ce::encode_frame(&ce::sign(b_body, &b_kp).context("sign B's rotation frame")?)
+                .context("encode B's rotation frame")?;
+        assert_eq!(
+            receive(&fx.replica, b, &b_frame).await,
+            ReceiveOutcome::Applied,
+            "B's rotation commits with its re-delivered key: no wait, no share owed"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.state_hash, b_commit.state_hash,
+            "B's rotation is the head"
+        );
+        assert_eq!(
+            x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
+            next_secret_epoch + 1,
+            "a head commits the later epoch"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the survivor holds B's key under B's own commit"
+        );
+        assert_eq!(
+            ng::group_ciphertext_withheld(&fx.replica, &fx.group_id, None).await,
+            None,
+            "the committed later epoch pins the secret: the group seals again"
+        );
+        Ok(())
+    }
+
+    /// #1775 (claude review round 12, Major 2): a displacing share whose
+    /// park cannot reach the disk installs nothing. The displaced value
+    /// stays installed with its sender record, no record the disk does
+    /// not hold is kept, and a retried share displaces and parks for
+    /// real once the write answers.
+    #[tokio::test]
+    async fn a_displacing_share_whose_park_cannot_write_installs_nothing() -> Result<()> {
+        use anyhow::Context as _;
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let author_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's later-epoch share installs; the frame waits under it.
+        let foreign = [0xB5u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+        let parent = head_of(&fx.replica, &fx.group_id).await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "the frame waits under B's unpinned later secret"
+        );
+
+        // The actor's displacing share parks first; the hold-file write
+        // is forced to fail, so the share installs nothing and B's
+        // secret stays.
+        let actor_secret = [0x07u8; 32];
+        let recovery = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's recovery share"))?;
+        ng::gss_share_hold::test_seam::force_hold_write_failure(&fx.replica, &fx.group_id);
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, recovery, admin, true, None).await;
+        assert!(
+            !took.accepted,
+            "the displacing share installs nothing while the park cannot write: {took:?}"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.secret_epoch,
+            next_secret_epoch + 1,
+            "B's later secret stays installed"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the displaced value passed to no restart with no record behind it"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+            "memory keeps no record the disk refused"
+        );
+        assert_eq!(
+            head_of(&fx.replica, &fx.group_id).await,
+            parent,
+            "no head moved"
+        );
+
+        // The write answers again (a restart clears the failure and
+        // loads the file); the retried share displaces and parks for
+        // real. The re-delivery waits: the displacing wait's epoch has
+        // not committed.
+        ng::gss_share_hold::test_seam::simulate_restart(&fx.replica).await;
+        let recovery = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("re-seal the actor's recovery share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, recovery, admin, true, None).await;
+        assert!(
+            took.accepted,
+            "the retry displaces once the write answers: {took:?}"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        assert_eq!(
+            installed.secret_epoch, next_secret_epoch,
+            "the actor's key installed"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(actor_secret.as_slice()),
+            "the survivor holds the actor's key"
+        );
+        assert!(
+            ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+            "the retry parked the displaced secret durably"
+        );
+        Ok(())
+    }
+
+    /// #1775 (claude review round 12): the parked record's cleanup
+    /// branches. A stale record, a damaged one (a sender or a secret it
+    /// cannot re-deliver), a demoted, gone or revoked sender: each goes
+    /// without an apply. A refused re-delivery keeps the record for its
+    /// retry, and a successful one consumes it.
+    #[tokio::test]
+    async fn the_parked_records_cleanup_branches() -> Result<()> {
+        use anyhow::Context as _;
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let author_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's later share installs, the frame waits, and the actor's
+        // share displaces and parks: the record waits, because the head
+        // still commits the parent's epoch.
+        let foreign = [0xB5u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "the frame waits under B's unpinned later secret"
+        );
+        let actor_secret = [0x07u8; 32];
+        let recovery = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &author_hex,
+            &actor_secret,
+            next_secret_epoch,
+        )
+        .map_err(|_| anyhow::anyhow!("seal the actor's recovery share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, recovery, admin, true, None).await;
+        assert!(took.accepted, "the actor's share displaces: {took:?}");
+        assert!(
+            ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+            "the displacement parked B's secret"
+        );
+        async fn group_of(fx: &GssLeave, group_id: &str) -> anyhow::Result<x0x::groups::GroupInfo> {
+            use anyhow::Context as _;
+            fx.replica
+                .named_groups
+                .read()
+                .await
+                .get(group_id)
+                .cloned()
+                .context("group")
+        }
+        async fn redeliver(fx: &GssLeave) {
+            super::super::owner_recovery::redeliver_parked_secret(&fx.replica, &fx.stable).await;
+        }
+        fn parked(fx: &GssLeave, epoch: u64, sender: String, secret: Vec<u8>, waits: u64) {
+            ng::gss_share_hold::test_seam::force_parked_secret(
+                &fx.replica,
+                &fx.group_id,
+                ng::gss_share_hold::ParkedSecret {
+                    secret_epoch: epoch,
+                    sender,
+                    secret,
+                    waits_epoch: waits,
+                },
+            );
+        }
+        fn gone(fx: &GssLeave, message: &str) {
+            assert!(
+                !ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+                "{message}"
+            );
+        }
+
+        let info = group_of(&fx, &fx.group_id).await?;
+        let committed = x0x::groups::crypto_exclusion::committed_secret_epoch(&info);
+        assert_eq!(
+            info.secret_epoch, next_secret_epoch,
+            "the actor's key is the installed secret"
+        );
+
+        // Stale: a head already committed the record's epoch.
+        parked(&fx, committed, b_hex.clone(), foreign.to_vec(), committed);
+        redeliver(&fx).await;
+        gone(&fx, "a stale record goes without an apply");
+
+        // Damaged: the sender cannot name an agent, and the secret
+        // cannot be a key.
+        parked(
+            &fx,
+            next_secret_epoch + 1,
+            "not-hex".to_string(),
+            foreign.to_vec(),
+            committed,
+        );
+        redeliver(&fx).await;
+        gone(&fx, "a record with no agent sender goes");
+        parked(
+            &fx,
+            next_secret_epoch + 1,
+            b_hex.clone(),
+            vec![0u8; 16],
+            committed,
+        );
+        redeliver(&fx).await;
+        gone(&fx, "a record with no key value goes");
+
+        // Demoted: the sender sits on the roster below Admin, so its
+        // rotation can commit nothing the key would serve.
+        parked(
+            &fx,
+            next_secret_epoch + 1,
+            b_hex.clone(),
+            foreign.to_vec(),
+            committed,
+        );
+        {
+            let mut groups = fx.replica.named_groups.write().await;
+            let member = groups
+                .get_mut(&fx.group_id)
+                .and_then(|info| info.members_v2.get_mut(&b_hex));
+            let member = member.context("B is seated on the roster")?;
+            member.role = x0x::groups::GroupRole::Member;
+        }
+        redeliver(&fx).await;
+        gone(&fx, "a demoted sender's record goes");
+        {
+            let mut groups = fx.replica.named_groups.write().await;
+            let member = groups
+                .get_mut(&fx.group_id)
+                .and_then(|info| info.members_v2.get_mut(&b_hex));
+            if let Some(member) = member {
+                member.role = x0x::groups::GroupRole::Admin;
+            }
+        }
+
+        // Removed: a held removal of B waits at the parked epoch. The
+        // share apply refuses B's key, so the record goes without a
+        // re-seal (claude review at 5e389451).
+        parked(
+            &fx,
+            next_secret_epoch + 1,
+            b_hex.clone(),
+            foreign.to_vec(),
+            committed,
+        );
+        ng::gss_share_hold::test_seam::force_removal_hold(
+            &fx.replica,
+            &fx.group_id,
+            next_secret_epoch + 1,
+            &b_hex,
+        );
+        let before = group_of(&fx, &fx.group_id).await?;
+        redeliver(&fx).await;
+        gone(&fx, "a record whose sender a held removal targets goes");
+        let after = group_of(&fx, &fx.group_id).await?;
+        assert_eq!(
+            (after.secret_epoch, after.shared_secret),
+            (before.secret_epoch, before.shared_secret),
+            "the dropped record installed nothing"
+        );
+        ng::gss_share_hold::test_seam::clear_exclusion_holds(&fx.replica, &fx.group_id);
+        // The same for a held removal of B below the parked epoch.
+        parked(
+            &fx,
+            next_secret_epoch + 1,
+            b_hex.clone(),
+            foreign.to_vec(),
+            committed,
+        );
+        ng::gss_share_hold::test_seam::force_removal_hold(
+            &fx.replica,
+            &fx.group_id,
+            next_secret_epoch,
+            &b_hex,
+        );
+        let before = group_of(&fx, &fx.group_id).await?;
+        redeliver(&fx).await;
+        gone(
+            &fx,
+            "a record whose sender an earlier held removal targets goes",
+        );
+        let after = group_of(&fx, &fx.group_id).await?;
+        assert_eq!(
+            (after.secret_epoch, after.shared_secret),
+            (before.secret_epoch, before.shared_secret),
+            "the dropped record installed nothing"
+        );
+        ng::gss_share_hold::test_seam::clear_exclusion_holds(&fx.replica, &fx.group_id);
+
+        // Gone: the sender is no member of the roster at all.
+        parked(
+            &fx,
+            next_secret_epoch + 1,
+            "ee".repeat(32),
+            foreign.to_vec(),
+            committed,
+        );
+        redeliver(&fx).await;
+        gone(&fx, "a gone sender's record goes");
+
+        // Refused, then successful: a re-delivery the apply cannot
+        // persist keeps the record for its retry; once it persists, the
+        // record is consumed and the key installs.
+        parked(
+            &fx,
+            next_secret_epoch + 1,
+            b_hex.clone(),
+            foreign.to_vec(),
+            committed,
+        );
+        fx.replica
+            .named_groups_requires_durability_confirmation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let fault = ng::set_save_fault(&fx.replica, ng::SaveFault::ReplacedNotDurableAfterWrite);
+        redeliver(&fx).await;
+        assert!(
+            ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+            "a refused re-delivery keeps the record"
+        );
+        let info = group_of(&fx, &fx.group_id).await?;
+        assert_eq!(
+            info.secret_epoch, next_secret_epoch,
+            "the refused re-delivery installed nothing"
+        );
+        drop(fault);
+        redeliver(&fx).await;
+        gone(&fx, "the successful re-delivery consumed the record");
+        let info = group_of(&fx, &fx.group_id).await?;
+        assert_eq!(
+            info.secret_epoch,
+            next_secret_epoch + 1,
+            "the re-delivered key installed"
+        );
+        assert_eq!(
+            info.shared_secret.as_deref(),
+            Some(foreign.as_slice()),
+            "the survivor holds B's key again"
+        );
+
+        // Revoked: a revoked agent sends no trusted share. The record
+        // sits an epoch above the re-delivered key, still eligible.
+        let record = x0x::revocation::RevocationRecord::sign(
+            x0x::revocation::RevokedSubject::Agent(b),
+            b_kp.public_key(),
+            b_kp.secret_key(),
+            1_000,
+            None,
+        )
+        .map_err(|error| anyhow::anyhow!("B's self-revocation signs: {error:?}"))?;
+        assert!(
+            fx.replica
+                .agent
+                .revocation_set()
+                .write()
+                .await
+                .verify_and_insert(record, None)
+                .map_err(|error| anyhow::anyhow!("B's self-revocation inserts: {error:?}"))?,
+            "B's self-revocation inserts"
+        );
+        parked(
+            &fx,
+            next_secret_epoch + 2,
+            b_hex.clone(),
+            foreign.to_vec(),
+            committed,
+        );
+        redeliver(&fx).await;
+        gone(&fx, "a revoked sender's record goes");
+        assert_eq!(
+            group_of(&fx, &fx.group_id).await?.secret_epoch,
+            next_secret_epoch + 1,
+            "the revoked sender's record installed nothing"
+        );
+        Ok(())
+    }
+
+    /// #1775 item 2 (rounds 2-8): the held chain raises with B's
+    /// rotation and rides the author's rename after it; the record names
+    /// B, the raising author, and the exit fires at the raising cursor.
+    /// This shape proves the walk continues past a non-raising step; it
+    /// cannot alone discriminate a last-step rule, because the exit
+    /// fires at the raising cursor under either. The sibling negative
+    /// test carries the `share_sent_by` guard's negative side, and the
+    /// fully discriminating E+2 shape needs a second phantom seat.
+    #[tokio::test]
+    async fn the_held_exit_belongs_to_the_raising_step_author() -> Result<()> {
+        use anyhow::Context as _;
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's share of the later epoch installs (its own value, sealed by
+        // B), while the AUTHOR's rotation of that epoch waits held on
+        // the frame's result: the record names B, not the held step's
+        // author, so the walk must not take the exit.
+        let foreign = [0xB6u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+        let parent_info = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("the survivor's group")?;
+        let frame_commit = body.commit.to_commit();
+        let f_result = ng::apply_stateful_event_to_group(
+            &parent_info,
+            &frame_commit,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.roster_revision =
+                    ng::adopt_roster_revision(next.roster_revision, body.next_revision);
+                next.secret_epoch = next_secret_epoch;
+                next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+            },
+        )
+        .context("the frame's keyless result")?;
+        // The held chain has two steps: B's rotation raises the epoch
+        // past the frame's, and the author's rename rides on it without
+        // raising further. The record names B — the raising author — so
+        // the exit fires at the raising cursor; the rename proves the
+        // walk continues past a non-raising step.
+
+        let mut b_rotation = f_result.clone();
+        b_rotation.roster_revision = b_rotation.roster_revision.saturating_add(1);
+        b_rotation.remove_member(&survivor_hex, Some(b_hex.clone()));
+        b_rotation.secret_epoch = next_secret_epoch + 1;
+        b_rotation.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let b_commit = b_rotation
+            .seal_commit(&b_kp, 0)
+            .context("seal B's removal")?;
+        let b_rotation_head = b_commit.state_hash.clone();
+        let b_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: fx.group_id.clone(),
+            revision: b_rotation.roster_revision,
+            actor: b_hex.clone(),
+            agent_id: survivor_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(next_secret_epoch + 1),
+            commit: Some(b_commit),
+        };
+        super::super::owner_recovery::seed_held_event_for_test(
+            &fx.replica,
+            &fx.stable,
+            b_removal,
+            b,
+            Some(f_result.state_hash.clone()),
+        )
+        .await;
+        let author_kp = fx.state.agent.identity().agent_keypair();
+        let mut rename = b_rotation.clone();
+        rename.state_hash = b_rotation_head.clone();
+        rename.roster_revision = rename.roster_revision.saturating_add(1);
+        rename.name = "renamed".to_string();
+        let rename_commit = rename
+            .seal_commit(author_kp, 0)
+            .context("seal the author's rename")?;
+        let held_rename = ng::NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: fx.group_id.clone(),
+            revision: rename.roster_revision,
+            actor: admin_hex.clone(),
+            name: Some("renamed".to_string()),
+            description: None,
+            commit: Some(rename_commit),
+        };
+        super::super::owner_recovery::seed_held_event_for_test(
+            &fx.replica,
+            &fx.stable,
+            held_rename,
+            admin,
+            Some(b_rotation_head),
+        )
+        .await;
+        // The record names B, the raising author, so the exit fires at
+        // the raising cursor — the rename after it changes nothing.
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the raising author's recorded key takes the exit past a later non-raising step"
+        );
+        Ok(())
+    }
+
+    /// #1775 item 2 (rounds 2-7, restored): the held exit is the
+    /// raising author's recorded key, not any admin's. B's share of the
+    /// later epoch is installed while the AUTHOR's rotation of that
+    /// epoch waits held: the record names B, not the rotation's author,
+    /// so no exit — the frame keeps waiting. Deleting the
+    /// `share_sent_by` guard would let any admin's key take the exit.
+    #[tokio::test]
+    async fn another_admins_installed_secret_takes_no_held_exit() -> Result<()> {
+        use anyhow::Context as _;
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seated(
+                Some((candidate.agent_id(), x0x::groups::GroupRole::Admin)),
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let (fx, b_kp) = (
+            fx.context("a high-ID admin for the fixture")?,
+            b_kp.unwrap(),
+        );
+        let b = b_kp.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // B's share of the later epoch installs, and the AUTHOR's
+        // rotation of that epoch waits held on the frame's result.
+        let foreign = [0xB6u8; 32];
+        let later_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took =
+            ng::apply_named_group_metadata_event(&fx.replica, later_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+        let parent_info = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("the survivor's group")?;
+        let frame_commit = body.commit.to_commit();
+        let f_result = ng::apply_stateful_event_to_group(
+            &parent_info,
+            &frame_commit,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.roster_revision =
+                    ng::adopt_roster_revision(next.roster_revision, body.next_revision);
+                next.secret_epoch = next_secret_epoch;
+                next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+            },
+        )
+        .context("the frame's keyless result")?;
+        let author_kp = fx.state.agent.identity().agent_keypair();
+        let mut held_next = f_result.clone();
+        held_next.roster_revision = held_next.roster_revision.saturating_add(1);
+        held_next.remove_member(&survivor_hex, Some(admin_hex.clone()));
+        held_next.secret_epoch = next_secret_epoch + 1;
+        held_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let held_commit = held_next
+            .seal_commit(author_kp, 0)
+            .context("seal the author's removal")?;
+        let held_removal = ng::NamedGroupMetadataEvent::MemberRemoved {
+            group_id: fx.group_id.clone(),
+            revision: held_next.roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: survivor_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(next_secret_epoch + 1),
+            commit: Some(held_commit),
+        };
+        super::super::owner_recovery::seed_held_event_for_test(
+            &fx.replica,
+            &fx.stable,
+            held_removal,
+            admin,
+            Some(f_result.state_hash.clone()),
+        )
+        .await;
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::WaitingForShare,
+            "another admin's installed secret takes no held exit: the frame keeps waiting"
+        );
+        Ok(())
+    }
+
+    /// #1775 (claude review at 5e389451, Engineer ruling 4 Nov): a
+    /// superseded install parks only the held raise author's later
+    /// secret, and drops any other later secret as main does. Admin B's
+    /// E+1 share is installed unpinned. The held chain on the frame's
+    /// result is A's promotion of L, then L's E+1 rotation that removes
+    /// B. L's E+1 share waits in the early-share park (L is a Member
+    /// here), so the frame installs as a superseded intermediate head.
+    /// B's foreign secret must not come back before the chain replays:
+    /// L's removal of B waits for L's own share and commits with it.
+    /// Red on 5e389451: B's key was parked, re-delivered first (B is
+    /// still an Admin on the frame's result), and L's removal of B
+    /// committed over B's value.
+    #[tokio::test]
+    async fn a_superseded_install_parks_no_foreign_later_secret() -> Result<()> {
+        use anyhow::Context as _;
+        let l_kp = x0x::identity::AgentKeypair::generate()?;
+        let l = l_kp.agent_id();
+        let l_hex = hex::encode(l.as_bytes());
+        // B's raw ID is above the author's, so the author is the
+        // designated admin (D74) and authors the exclusion at once.
+        let mut fx = None;
+        let mut b_kp = None;
+        for _ in 0..24 {
+            let candidate = x0x::identity::AgentKeypair::generate()?;
+            let built = gss_leave_fixture_seats(
+                &[
+                    (candidate.agent_id(), x0x::groups::GroupRole::Admin),
+                    (l, x0x::groups::GroupRole::Member),
+                ],
+                true,
+                true,
+            )
+            .await?;
+            if candidate.agent_id().as_bytes() > built.state.agent.agent_id().as_bytes() {
+                fx = Some(built);
+                b_kp = Some(candidate);
+                break;
+            }
+        }
+        let fx = fx.context("a high-ID admin for the fixture")?;
+        let b = b_kp.context("the high-ID admin's keypair")?.agent_id();
+        let b_hex = hex::encode(b.as_bytes());
+        let admin = fx.state.agent.agent_id();
+        let admin_hex = hex::encode(admin.as_bytes());
+        let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
+        let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&fx.replica.agent_kem_keypair.public_bytes);
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.state,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+        let mut frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        for _ in 0..40 {
+            if frame.is_some() {
+                break;
+            }
+            run_worker(&fx.state).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            frame = latest_frame_for_test(&fx.state, &fx.stable).await;
+        }
+        let frame = frame.context("the GSS crypto-only exclusion committed")?;
+        let body = ce::decode_frame(&frame)
+            .map_err(|refusal| anyhow::anyhow!("frame: {refusal:?}"))?
+            .body;
+        let ce::CryptoExclusionCryptoV1::Gss { next_secret_epoch } = body.crypto else {
+            anyhow::bail!("the fixture commits the GSS form");
+        };
+        let applied = ng::apply_named_group_metadata_event(
+            &fx.replica,
+            fx.leave.clone(),
+            fx.leaver,
+            true,
+            None,
+        )
+        .await;
+        assert!(applied.accepted, "{applied:?}");
+
+        // (1) B's E+1 share installs while the head stays at the parent.
+        let foreign = [0xB7u8; 32];
+        let b_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &b_hex,
+            &foreign,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal B's later-epoch share"))?;
+        let took = ng::apply_named_group_metadata_event(&fx.replica, b_share, b, true, None).await;
+        assert!(took.accepted, "B's later-epoch share installs: {took:?}");
+
+        // (2) The held chain on the frame's result: A promotes L, then L
+        // rotates to E+1 and removes B.
+        let parent_info = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("the survivor's group")?;
+        let frame_commit = body.commit.to_commit();
+        let f_result = ng::apply_stateful_event_to_group(
+            &parent_info,
+            &frame_commit,
+            x0x::groups::ActionKind::AdminOrHigher,
+            |next| {
+                next.roster_revision =
+                    ng::adopt_roster_revision(next.roster_revision, body.next_revision);
+                next.secret_epoch = next_secret_epoch;
+                next.security_binding = Some(ce::gss_binding(next_secret_epoch));
+            },
+        )
+        .context("the frame's keyless result")?;
+        let author_kp = fx.state.agent.identity().agent_keypair();
+        let mut promoted = f_result.clone();
+        promoted.roster_revision = promoted.roster_revision.saturating_add(1);
+        promoted.set_member_role(&l_hex, x0x::groups::GroupRole::Admin);
+        let promotion_commit = promoted
+            .seal_commit(author_kp, 0)
+            .context("seal A's promotion of L")?;
+        let promotion_head = promotion_commit.state_hash.clone();
+        let f_head = f_result.state_hash.clone();
+        super::super::owner_recovery::seed_held_event_for_test(
+            &fx.replica,
+            &fx.stable,
+            ng::NamedGroupMetadataEvent::MemberRoleUpdated {
+                group_id: fx.group_id.clone(),
+                revision: promoted.roster_revision,
+                actor: admin_hex.clone(),
+                agent_id: l_hex.clone(),
+                role: x0x::groups::GroupRole::Admin,
+                commit: Some(promotion_commit),
+            },
+            admin,
+            Some(f_result.state_hash.clone()),
+        )
+        .await;
+        let mut l_next = promoted.clone();
+        l_next.roster_revision = l_next.roster_revision.saturating_add(1);
+        l_next.remove_member(&b_hex, Some(l_hex.clone()));
+        l_next.secret_epoch = next_secret_epoch + 1;
+        l_next.security_binding = Some(format!("gss:epoch={}", next_secret_epoch + 1));
+        let l_commit = l_next
+            .seal_commit(&l_kp, 0)
+            .context("seal L's removal of B")?;
+        let l_head = l_commit.state_hash.clone();
+        super::super::owner_recovery::seed_held_event_for_test(
+            &fx.replica,
+            &fx.stable,
+            ng::NamedGroupMetadataEvent::MemberRemoved {
+                group_id: fx.group_id.clone(),
+                revision: l_next.roster_revision,
+                actor: l_hex.clone(),
+                agent_id: b_hex.clone(),
+                treekem_commit_b64: None,
+                treekem_epoch: None,
+                secret_epoch: Some(next_secret_epoch + 1),
+                commit: Some(l_commit),
+            },
+            l,
+            Some(promotion_head.clone()),
+        )
+        .await;
+
+        // (3) L's E+1 share is refused while L is a Member here, and
+        // waits in the early-share park.
+        let l_secret = [0x1Cu8; 32];
+        let l_share = ng::build_secure_share_event(
+            &fx.group_id,
+            &survivor_hex,
+            &survivor_kem_b64,
+            &l_hex,
+            &l_secret,
+            next_secret_epoch + 1,
+        )
+        .map_err(|_| anyhow::anyhow!("seal L's later-epoch share"))?;
+        let refused =
+            ng::apply_named_group_metadata_event(&fx.replica, l_share, l, true, None).await;
+        assert!(!refused.accepted, "L is a Member here: {refused:?}");
+
+        // (4) The frame takes the superseded exit through L's parked
+        // share. B's secret is not L's: it parks nowhere.
+        assert_eq!(
+            receive(&fx.replica, admin, &frame).await,
+            ReceiveOutcome::Applied,
+            "the frame installs as a superseded intermediate head"
+        );
+        assert!(
+            !ng::gss_share_hold::test_seam::parked_secret_present(&fx.replica, &fx.group_id),
+            "a superseded install parks no foreign later secret"
+        );
+        let installed = fx
+            .replica
+            .named_groups
+            .read()
+            .await
+            .get(&fx.group_id)
+            .cloned()
+            .context("group")?;
+        let reached = if installed.state_hash == f_head {
+            "the frame's result"
+        } else if installed.state_hash == promotion_head {
+            "A's promotion of L"
+        } else if installed.state_hash == l_head {
+            "L's removal of B"
+        } else {
+            "another head"
+        };
+        let key = match installed.shared_secret.as_deref() {
+            Some(key) if key == foreign.as_slice() => "B's",
+            Some(key) if key == l_secret.as_slice() => "L's",
+            Some(_) => "another",
+            None => "no",
+        };
+        assert_eq!(
+            installed.state_hash, l_head,
+            "the held chain replays to L's removal of B; reached {reached} at \
+             epoch {} with {key} key",
+            installed.secret_epoch
+        );
+        assert_eq!(installed.secret_epoch, next_secret_epoch + 1);
+        assert_eq!(
+            x0x::groups::crypto_exclusion::committed_secret_epoch(&installed),
+            next_secret_epoch + 1,
+            "a head commits the later epoch"
+        );
+        assert_eq!(
+            installed.shared_secret.as_deref(),
+            Some(l_secret.as_slice()),
+            "L's removal of B commits with L's own key, not with B's"
+        );
+        assert!(
+            !installed.has_active_member(&b_hex),
+            "B is out of the roster"
         );
         Ok(())
     }

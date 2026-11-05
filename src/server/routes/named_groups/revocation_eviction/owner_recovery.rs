@@ -2210,6 +2210,112 @@ fn open_parked_share(state: &AppState, share: &ParkedShare) -> Option<(u64, [u8;
     Some((*secret_epoch, secret))
 }
 
+/// Test builds only: park a held event for [`promoted_admin_secret`]'s
+/// walk (#1775 item 2).
+#[cfg(test)]
+pub(super) async fn seed_held_event_for_test(
+    state: &AppState,
+    stable_group_id: &str,
+    event: super::super::NamedGroupMetadataEvent,
+    author: AgentId,
+    prev_state_hash: Option<String>,
+) {
+    let mut inner = state.revocation_evictions.inner.lock().await;
+    inner.orc.held_events.push(HeldEvent {
+        stable_group_id: stable_group_id.to_string(),
+        event,
+        author,
+        prev_state_hash,
+        at: Instant::now(),
+    });
+}
+
+/// The held events and parked early shares of `stable_group_id` that
+/// a walk may use: retained, and from no revoked agent. A revoked agent
+/// signs no step and sends no trusted share, as in the ordinary apply's
+/// revocation gate. A revoked agent is not added either (the
+/// OwnerCertified add check).
+async fn live_held_chain(
+    state: &AppState,
+    stable_group_id: &str,
+) -> (Vec<HeldEvent>, Vec<ParkedShare>) {
+    let now = Instant::now();
+    let (held, parked): (Vec<HeldEvent>, Vec<ParkedShare>) = {
+        let inner = state.revocation_evictions.inner.lock().await;
+        (
+            inner
+                .orc
+                .held_events
+                .iter()
+                .filter(|held| {
+                    held.stable_group_id == stable_group_id
+                        && now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL
+                })
+                .cloned()
+                .collect(),
+            inner
+                .orc
+                .early_shares
+                .iter()
+                .filter(|share| {
+                    share.stable_group_id == stable_group_id
+                        && now.saturating_duration_since(share.at) <= ORC_RETAIN_TTL
+                })
+                .cloned()
+                .collect(),
+        )
+    };
+    let revocation_set = state.agent.revocation_set();
+    let revoked = revocation_set.read().await;
+    (
+        held.into_iter()
+            .filter(|held| {
+                !revoked.is_agent_revoked(&held.author)
+                    && match &held.event {
+                        super::super::NamedGroupMetadataEvent::MemberAdded { agent_id, .. } => {
+                            super::super::parse_agent_id_hex(agent_id)
+                                .is_ok_and(|agent| !revoked.is_agent_revoked(&agent))
+                        }
+                        _ => true,
+                    }
+            })
+            .collect::<Vec<_>>(),
+        parked
+            .into_iter()
+            .filter(|share| !revoked.is_agent_revoked(&share.sender))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// #1775 (Engineer ruling, 4 Nov): the lower-case hex author of the
+/// held step that raises the secret epoch to `secret_epoch` on the
+/// verified walk from `result`, or `None`. Each step is checked as
+/// [`promoted_admin_secret`] checks it ([`next_held_state`]), so the
+/// author is an admin of the roster its step chains on. A superseded or
+/// promoted install parks a later secret only when this author sealed
+/// it: that key is the held chain's own, and its commit needs it.
+pub(in crate::server) async fn held_raise_author(
+    state: &AppState,
+    result: &GroupInfo,
+    secret_epoch: u64,
+) -> Option<String> {
+    let (held, _) = live_held_chain(state, result.stable_group_id()).await;
+    let mut cursor = result.clone();
+    for _ in 0..held.len() {
+        if cursor.secret_epoch >= secret_epoch {
+            return None;
+        }
+        let (step, next) = held
+            .iter()
+            .find_map(|held| next_held_state(&cursor, held).map(|next| (held, next)))?;
+        if next.secret_epoch == secret_epoch {
+            return Some(hex::encode(step.author.as_bytes()));
+        }
+        cursor = next;
+    }
+    None
+}
+
 /// What [`promoted_admin_secret`] found for a waiting GSS transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum LaterAdminKey {
@@ -2255,66 +2361,20 @@ pub(in crate::server) enum LaterAdminKey {
 /// epoch. Catch-up seals the current secret only, so after such a rotation
 /// no holder seals `epoch`'s secret any more. A share of the later epoch
 /// from an admin of that later roster gives [`LaterAdminKey::Superseded`].
+/// #1775 item 2: so does the later rotation's own share that installed
+/// directly while its event waits held — the installed secret's record
+/// must name the held step's author — so an unpinned later secret from
+/// its own author strands no wait.
 pub(in crate::server) async fn promoted_admin_secret(
     state: &AppState,
     result: &GroupInfo,
     epoch: u64,
 ) -> Option<LaterAdminKey> {
     let stable_group_id = result.stable_group_id().to_string();
-    let now = Instant::now();
-    let (held, parked): (Vec<HeldEvent>, Vec<ParkedShare>) = {
-        let inner = state.revocation_evictions.inner.lock().await;
-        (
-            inner
-                .orc
-                .held_events
-                .iter()
-                .filter(|held| {
-                    held.stable_group_id == stable_group_id
-                        && now.saturating_duration_since(held.at) <= ORC_RETAIN_TTL
-                })
-                .cloned()
-                .collect(),
-            inner
-                .orc
-                .early_shares
-                .iter()
-                .filter(|share| {
-                    share.stable_group_id == stable_group_id
-                        && now.saturating_duration_since(share.at) <= ORC_RETAIN_TTL
-                })
-                .cloned()
-                .collect(),
-        )
-    };
-    if parked.is_empty() {
-        return None;
-    }
-    // A revoked agent signs no step and sends no trusted share, as in the
-    // ordinary apply's revocation gate. A revoked agent is not added either
-    // (the OwnerCertified add check).
-    let (held, parked) = {
-        let revocation_set = state.agent.revocation_set();
-        let revoked = revocation_set.read().await;
-        (
-            held.into_iter()
-                .filter(|held| {
-                    !revoked.is_agent_revoked(&held.author)
-                        && match &held.event {
-                            super::super::NamedGroupMetadataEvent::MemberAdded {
-                                agent_id, ..
-                            } => super::super::parse_agent_id_hex(agent_id)
-                                .is_ok_and(|agent| !revoked.is_agent_revoked(&agent)),
-                            _ => true,
-                        }
-                })
-                .collect::<Vec<_>>(),
-            parked
-                .into_iter()
-                .filter(|share| !revoked.is_agent_revoked(&share.sender))
-                .collect::<Vec<_>>(),
-        )
-    };
+    // #1775 item 2: no parked share is needed when the walk's own step
+    // author sealed the installed later secret, so the walk runs with an
+    // empty park too.
+    let (held, parked) = live_held_chain(state, &stable_group_id).await;
     // A share of the roster's own epoch from an admin of that roster.
     let admin_share = |roster: &GroupInfo| {
         parked
@@ -2329,6 +2389,18 @@ pub(in crate::server) async fn promoted_admin_secret(
                 _ => None,
             })
     };
+    // #1775 item 2 (claude review round 1): the later rotation's share can
+    // install directly while its event waits held on this transition's
+    // result, so no parked share exists to find. The installed secret
+    // takes the superseded exit when the walk's own step author sealed
+    // it: the held chain replays and commits the later epoch, so an
+    // unpinned later secret from its own author strands no wait — and a
+    // secret from any other sender still does not end one.
+    let installed = group_by_stable(state, &stable_group_id).await;
+    // #1775 rounds 5 and 7: the author of the step that raised the
+    // epoch to each height owns that height's key — a later step's
+    // author, raising further, owns only its own.
+    let mut raises: Vec<(u64, String)> = Vec::new();
     let mut cursor = result.clone();
     // Each step moves the revision up, so the walk ends; the bound keeps it
     // to the held set.
@@ -2340,8 +2412,35 @@ pub(in crate::server) async fn promoted_admin_secret(
                 LaterAdminKey::Superseded
             });
         }
-        match held.iter().find_map(|held| next_held_state(&cursor, held)) {
-            Some(next) => cursor = next,
+        let raise_author = installed.as_ref().and_then(|(_, installed)| {
+            raises
+                .iter()
+                .rev()
+                .find(|(epoch, _)| *epoch == installed.secret_epoch)
+                .map(|(_, author)| author.clone())
+        });
+        if let (Some(author), Some((key, installed))) = (&raise_author, &installed) {
+            if cursor.secret_epoch > epoch
+                && installed.secret_epoch == cursor.secret_epoch
+                && installed.shared_secret.is_some()
+                && cursor
+                    .caller_role(author)
+                    .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+                && super::super::gss_share_hold::share_sent_by(state, key, installed, author)
+            {
+                return Some(LaterAdminKey::Superseded);
+            }
+        }
+        match held
+            .iter()
+            .find_map(|held| next_held_state(&cursor, held).map(|next| (held, next)))
+        {
+            Some((held, next)) => {
+                if next.secret_epoch > cursor.secret_epoch {
+                    raises.push((next.secret_epoch, hex::encode(held.author.as_bytes())));
+                }
+                cursor = next;
+            }
             None => return None,
         }
     }
@@ -3033,8 +3132,12 @@ async fn replay_early_shares(state: &Arc<AppState>, stable_group_id: &str) {
 
 /// After a GSS recovery or crypto-only exclusion installed here: apply the
 /// held commits that chain on it, then the parked shares. Call it with no
-/// group lock held: both re-enter the ordinary apply.
+/// group lock held: both re-enter the ordinary apply. #1775 (claude
+/// review round 11): the displaced later secret re-delivers first, so a
+/// held rotation of its epoch finds its own sender's key in and commits
+/// with it.
 pub(super) async fn replay_after_gss_install(state: &Arc<AppState>, stable_group_id: &str) {
+    redeliver_parked_secret(state, stable_group_id).await;
     replay_held_events(state, stable_group_id).await;
     replay_early_shares(state, stable_group_id).await;
 }
@@ -3043,8 +3146,135 @@ pub(super) async fn replay_after_gss_install(state: &Arc<AppState>, stable_group
 /// held commits that now chain on it and, if one applied (a later admin's
 /// promotion), the parked shares of that group.
 pub(in crate::server) async fn replay_after_commit(state: &Arc<AppState>, stable_group_id: &str) {
+    redeliver_parked_secret(state, stable_group_id).await;
     if replay_held_events(state, stable_group_id).await {
         replay_early_shares(state, stable_group_id).await;
+    }
+}
+
+/// #1775 (claude review round 11, Engineer ruling 4 Nov): re-deliver the
+/// parked secret a wait's own share displaced — or the held raise
+/// author's later key that a promoted or superseded install dropped —
+/// once the head commits the displacing wait's epoch. The re-delivery is a fresh `SecureShareDelivered` sealed to
+/// this node through the ordinary share path, so every guard, the
+/// install and the sender record run exactly as for a delivery, and the
+/// later rotation's commit lands with its key: an honest reordering
+/// stalls on no share re-delivery, which no retry owes. A record whose
+/// epoch a head already committed, or whose value a secret of its epoch
+/// or a later one replaced, is stale and goes; so is a record whose
+/// sender is revoked, demoted below Admin, or gone (round 12) — the
+/// apply would refuse that re-delivery for ever. Call it with no group
+/// lock held, and before the held events replay. Round 12: the share
+/// apply calls it after an accepted share too, because a keyless commit
+/// can commit the displacing wait's epoch with no later commit that
+/// would carry the re-delivery.
+pub(in crate::server) async fn redeliver_parked_secret(
+    state: &Arc<AppState>,
+    stable_group_id: &str,
+) {
+    // The hold files load lazily, and nothing loads them at boot: after a
+    // restart, the first caller may be this one (a `Duplicate` replay),
+    // so the parked map must be loaded before it is read (claude review
+    // at 818f565e).
+    super::super::gss_share_hold::ensure_loaded(state).await;
+    if super::super::gss_share_hold::parks_no_secret(state) {
+        return;
+    }
+    // #1574 item 5: the drop decisions below read the committed map, not
+    // a candidate that a failed write rolls back (claude review at
+    // 5e389451).
+    let Some((group_key, info)) = ({
+        let _committed = state.named_groups_persistence_lock.lock().await;
+        group_by_stable(state, stable_group_id).await
+    }) else {
+        return;
+    };
+    let Some(parked) = super::super::gss_share_hold::parked_secret(state, &group_key) else {
+        return;
+    };
+    if !super::super::gss_share_hold::parked_secret_reinstalls(&parked, &info) {
+        // Early, not stale: the displacing wait still lives (no head
+        // commits its epoch), so the record stays — re-delivering now
+        // would swap the key back under the wait that displaced it.
+        let committed = x0x::groups::crypto_exclusion::committed_secret_epoch(&info);
+        if parked.secret_epoch <= committed || parked.secret_epoch <= info.secret_epoch {
+            super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+        }
+        return;
+    }
+    let sender = hex::decode(&parked.sender)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(AgentId);
+    let secret = <[u8; 32]>::try_from(parked.secret.as_slice()).ok();
+    let (Some(sender), Some(secret)) = (sender, secret) else {
+        // A record that cannot name its sender or a secret value is
+        // damaged; it can re-deliver nothing.
+        super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+        return;
+    };
+    {
+        // A revoked agent sends no trusted share: the ordinary apply
+        // would refuse the re-delivery for ever, so the record goes.
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(&sender) {
+            drop(revoked);
+            super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+            return;
+        }
+    }
+    if !info.active_members().any(|member| {
+        member.agent_id.eq_ignore_ascii_case(&parked.sender)
+            && member.role.at_least(x0x::groups::GroupRole::Admin)
+    }) {
+        // #1775 review round 12: a sender the current roster holds below
+        // Admin — demoted, or gone — can commit no rotation this key
+        // would serve, and the apply refuses its share for ever, so the
+        // record goes instead of re-sealing on every replay.
+        super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+        return;
+    }
+    if super::super::gss_share_hold::removes_share_actor(
+        state,
+        &group_key,
+        &parked.sender,
+        parked.secret_epoch,
+    ) {
+        // A held removal or ban of the sender waits at or below the
+        // parked epoch: the share apply refuses this key, so the record
+        // goes instead of re-sealing on every replay (claude review at
+        // 5e389451).
+        super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked).await;
+        return;
+    }
+    use base64::Engine as _;
+    let recipient_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let recipient_kem_b64 =
+        base64::engine::general_purpose::STANDARD.encode(&state.agent_kem_keypair.public_bytes);
+    match super::super::build_secure_share_event(
+        &group_key,
+        &recipient_hex,
+        &recipient_kem_b64,
+        &parked.sender,
+        &secret,
+        parked.secret_epoch,
+    ) {
+        Ok(event) => {
+            let took =
+                super::super::apply_named_group_metadata_event(state, event, sender, true, None)
+                    .await;
+            if took.accepted {
+                super::super::gss_share_hold::forget_parked_secret(state, &group_key, &parked)
+                    .await;
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                group_id = %super::super::LogHexId::group(&group_key),
+                "#1775 parked share not re-sealed for re-delivery: {error:?}"
+            );
+        }
     }
 }
 
