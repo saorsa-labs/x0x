@@ -337,7 +337,8 @@ counts. The limits are at most 3 attempts, 120 s to readiness per attempt,
 60 s of stable health and a 660 s total trial, with 10 s between attempts.
 These values are provisional until David rules on them. When the attempts
 or the total budget run out, the cause is Failed, and a later service stop
-does not change it. Exhausted attempts also stay Failed after a reboot. A
+does not change it. Exhausted attempts also stay Failed after a reboot; this
+reading of ADR 0094 is provisional until David rules on it. A
 reboot before the launcher sees the run-out total budget is Interrupted,
 because the launcher cannot tell when the deadline passed. A changed boot, a launcher restart during exec or
 rollback, or a service stop while attempts remain is Interrupted. The

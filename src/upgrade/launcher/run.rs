@@ -137,9 +137,17 @@ pub(super) fn run_trial(
             // Nothing was reserved or spawned for this attempt.
             Err(cause) => return rollback(host, path, trial, cause),
             Ok(Some(child)) => child,
-            // Exec or boot setup failed. The attempt stays charged.
+            // Exec or boot setup failed. The attempt stays charged, unless a
+            // stop arrived: a stop can end the child during boot setup, and
+            // that exit is not a failed attempt.
             Ok(None) => {
                 trial.child = None;
+                if stop() {
+                    record_budget_verdict(trial, now().ok().as_ref());
+                    trial.phase = Phase::Stopped;
+                    trial.save(path)?;
+                    return Ok(Outcome::Stopped);
+                }
                 trial.phase = Phase::Authorized;
                 trial.next_launch_ms = now()?.ms.saturating_add(GAP_MS);
                 trial.save(path)?;
@@ -148,16 +156,8 @@ pub(super) fn run_trial(
         };
         let failure = loop {
             if stop() {
-                // The running attempt is already counted but has not failed,
-                // so only a run-out total budget is a Failed verdict here. A
-                // clock error must not leave the child unreaped.
-                if let Some(cause) = now()
-                    .ok()
-                    .and_then(|clock| trial.expired(&clock))
-                    .filter(|cause| cause.class == journal::CauseClass::Failed)
-                {
-                    trial.verdict.get_or_insert(cause);
-                }
+                // A clock error must not leave the child unreaped.
+                record_budget_verdict(trial, now().ok().as_ref());
                 if let Err(error) = child.reap() {
                     return Err(trial.recovery_failed(path, error));
                 }
@@ -181,6 +181,10 @@ pub(super) fn run_trial(
             })();
             match observation {
                 Ok(true) => return Ok(Outcome::Provisional(child)),
+                // A stop can end the child before the next poll sees it.
+                // Take the stop path then, or the stop-caused exit would be
+                // charged as a failed attempt.
+                Err(_) if stop() => continue,
                 Err(error) => break error,
                 Ok(false) => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
@@ -211,6 +215,18 @@ fn failed_verdict(trial: &Trial, clock: &Clock) -> Option<journal::Cause> {
     trial
         .expired(clock)
         .filter(|cause| cause.class == journal::CauseClass::Failed)
+}
+
+/// On a stop during an attempt, record a Failed verdict only for a run-out
+/// total budget. The attempt is counted at reservation but has not failed,
+/// so the attempt count must not decide the verdict here.
+fn record_budget_verdict(trial: &mut Trial, clock: Option<&Clock>) {
+    if let Some(cause) = clock
+        .and_then(|clock| trial.expired(clock))
+        .filter(|cause| cause.class == journal::CauseClass::Failed)
+    {
+        trial.verdict.get_or_insert(cause);
+    }
 }
 
 fn interrupted(reason: &str) -> journal::Cause {
@@ -331,9 +347,18 @@ mod tests {
 
     /// Replace the candidate daemon with an executable that runs but never
     /// acknowledges its boot barrier, and rebind the host to its hash.
-    fn executable_candidate(root: &Path, mut record: journal::JournalRecord) -> recovery::Host {
+    fn executable_candidate(root: &Path, record: journal::JournalRecord) -> recovery::Host {
+        candidate_script(root, record, "#!/bin/sh\nexec sleep 30\n")
+    }
+
+    /// Replace the candidate daemon with `script` and rebind the host to it.
+    fn candidate_script(
+        root: &Path,
+        mut record: journal::JournalRecord,
+        script: &str,
+    ) -> recovery::Host {
         let target = &record.plan.daemon.target_path;
-        std::fs::write(target, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::write(target, script).unwrap();
         std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).unwrap();
         record.plan.daemon.candidate_sha256 = filesystem::hash(target).unwrap();
         journal::write_record(&root.join(journal::JOURNAL_FILE_NAME), &record).unwrap();
@@ -535,6 +560,30 @@ mod tests {
         );
     }
 
+    /// A stop that arrives as the last attempt's exec or boot setup fails is
+    /// a stop: the next start rolls back as Interrupted, not Failed.
+    #[test]
+    fn a_stop_as_the_last_spawn_fails_stays_interrupted() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = trial_in(&host, &path, Phase::Authorized, MAX_ATTEMPTS - 1);
+        let clock = fast_clock(&trial);
+        let polls = std::cell::Cell::new(0u32);
+        let stop = || {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        };
+        let outcome = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), stop);
+        assert!(matches!(outcome, Ok(Outcome::Stopped)));
+        assert_eq!(trial.attempts, MAX_ATTEMPTS);
+        let mut trial = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert!(trial.verdict.is_none());
+        let clock = fast_clock(&trial);
+        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
+        let cause = journal_record(&root).cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Interrupted, "{cause:?}");
+    }
+
     #[test]
     fn a_stopped_trial_restores_the_previous_pair_on_the_next_start() {
         let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
@@ -634,6 +683,8 @@ mod tests {
         let outcome = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), stop);
         assert!(matches!(outcome, Ok(Outcome::Stopped)));
         assert_eq!(trial.attempts, 1);
+        // The stop came during health checks, not after a failed attempt.
+        assert!(trial.cause.is_none());
         let mut trial = Trial::load(&path, &trial.binding, "alice").unwrap();
         assert_eq!(trial.phase, Phase::Stopped);
         let clock = fast_clock(&trial);
@@ -683,6 +734,49 @@ mod tests {
             cause.reason.contains("service stopped during trial"),
             "{cause:?}"
         );
+    }
+
+    /// A stop that ends the last attempt's child before the next poll sees
+    /// it is still a stop: the exit is not charged, and the next start
+    /// rolls back as Interrupted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_that_ends_the_last_child_stays_interrupted() {
+        let (_dir, root, _host, record) = fixture(journal::Phase::SwappedCli);
+        let marker = root.join("stopping");
+        // The child outlives boot setup, then ends as a stop would end it.
+        let script = format!("#!/bin/sh\nsleep 1\ntouch '{}'\nexit 0\n", marker.display());
+        let host = candidate_script(&root, record, &script);
+        let path = root.join("trial.json");
+        let mut trial = trial_in(&host, &path, Phase::Authorized, MAX_ATTEMPTS - 1);
+        let boot = trial.boot.clone();
+        let early = trial.started_ms + 1_000;
+        let clock = || {
+            Ok(Clock {
+                boot: boot.clone(),
+                ms: early,
+            })
+        };
+        // The service manager's stop ends the child, and the launcher sees
+        // the stop flag one poll later: the first poll after the marker
+        // still reads no stop, so the next observation finds the exit first.
+        let seen = std::cell::Cell::new(false);
+        let stop = || {
+            if !marker.exists() {
+                return false;
+            }
+            seen.replace(true)
+        };
+        let outcome = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), stop);
+        assert!(matches!(outcome, Ok(Outcome::Stopped)));
+        assert_eq!(trial.attempts, MAX_ATTEMPTS);
+        assert!(trial.cause.is_none(), "{:?}", trial.cause);
+        let mut trial = Trial::load(&path, &trial.binding, "alice").unwrap();
+        assert!(trial.verdict.is_none());
+        let clock = fast_clock(&trial);
+        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || false);
+        let cause = journal_record(&root).cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Interrupted, "{cause:?}");
     }
 
     #[cfg(target_os = "linux")]
