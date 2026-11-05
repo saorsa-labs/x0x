@@ -81,15 +81,9 @@ pub(super) fn run_trial(
         _ => return Err(invalid("no durable start authority")),
     }
     loop {
-        if stop() {
-            trial.phase = Phase::Stopped;
-            trial.save(path)?;
-            return Ok(Outcome::Stopped);
-        }
-        let clock = now()?;
-        if let Some(cause) = trial.expired(&clock) {
-            return rollback(host, path, trial, cause);
-        }
+        // Check exhaustion first: once every attempt has failed, the verdict
+        // is Failed, and a later stop or reboot must not reclass it as
+        // Interrupted (which would leave the failed release unheld).
         if trial.attempts >= MAX_ATTEMPTS {
             let reason = format!(
                 "launch attempts exhausted: {}",
@@ -101,6 +95,15 @@ pub(super) fn run_trial(
                 trial,
                 cause(journal::CauseClass::Failed, reason),
             );
+        }
+        if stop() {
+            trial.phase = Phase::Stopped;
+            trial.save(path)?;
+            return Ok(Outcome::Stopped);
+        }
+        let clock = now()?;
+        if let Some(cause) = trial.expired(&clock) {
+            return rollback(host, path, trial, cause);
         }
         if clock.ms < trial.next_launch_ms {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -441,6 +444,24 @@ mod tests {
         let saved = Trial::load(&path, &trial.binding, "alice").unwrap();
         assert_eq!(saved.phase, Phase::RecoveryFailed);
         assert!(saved.child.is_none());
+    }
+
+    /// A stop that arrives after the last attempt failed does not turn the
+    /// Failed verdict into Interrupted.
+    #[test]
+    fn a_stop_after_the_last_failed_attempt_stays_failed() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = trial_in(&host, &path, Phase::Authorized, MAX_ATTEMPTS);
+        let clock = fast_clock(&trial);
+        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || true);
+        assert_previous_pair(&host);
+        let cause = journal_record(&root).cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
+        assert!(
+            cause.reason.contains("launch attempts exhausted"),
+            "{cause:?}"
+        );
     }
 
     #[test]
