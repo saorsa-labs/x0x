@@ -1764,8 +1764,36 @@ every wait. A wait always names its cause; it does not stop silently.
     is `rank` (this node waits for its fallback time, `remaining_ms`) or
     `designated_admin_unsupported` (the designated admin's advert lacks
     `eviction_handoff_v1`).
-  - `unresolved_designated_admin` — the hand-off has not reached the
-    designated admin yet.
+  - `unresolved_designated_admin` — this node's own hand-off dispatch
+    against the designated admin completed without an exchange with it
+    and without a definitive routing or eligibility failure (ADR 0110
+    §2). The outcome is recorded per attempt when the dispatch
+    completes, and the outcome-bearing records (`unresolved`,
+    `unsupported`) survive a restart until W ends or the designation
+    changes, when the daemon drops them. The cause shows while the
+    designated window W runs — L171: it "preserves priority through W,
+    not forever" — so a rank whose fallback time is later (W + Δ and
+    on) keeps the plain `waiting_for_designated_admin` for the rest of
+    its stagger wait. The cause also stops when the designation
+    changes or the row reopens, completes or terminates; the dispatch is not
+    retried, and a later hand-off receipt does not rewrite the outcome.
+    `detail` is `rank` with `remaining_ms`, like the plain wait. A
+    definitive failure is not this cause: it keeps
+    `waiting_for_designated_admin` with the
+    `designated_admin_unsupported` detail once the row has dispatched
+    (a verified advert that lacks `eviction_handoff_v1`, or the
+    transport's refusal for that lack). A definitive policy refusal is
+    not this cause either: it keeps the plain
+    `waiting_for_designated_admin` with `detail: "rank"`. Two refusals
+    count. The first is the designated admin's trust policy that rejects
+    this node. The second is this node's pairing policy that denies the
+    designated admin's machine in the pre-send check of the direct send.
+    A pairing denial on the raw-QUIC or DM-registry path is reported as
+    a peer that is not verified, with no policy reason. That outcome is
+    `unresolved`, and it is stored, like any other failed send.
+    The manual remove/ban/seal 202 keeps its documented
+    `waiting_for_designated_admin` answer (ADR 0110 §2's ADR 0016 §6
+    amendment).
   - `local_committer_ineligible` — this admin may not seal (demoted,
     removed, revoked, left, or its own certificate expired).
   - `waiting_for_durable_intake` — the obligation is not on disk yet; the

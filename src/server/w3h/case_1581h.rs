@@ -14,8 +14,8 @@
 //! one rotation (`result_epoch` e0 + 1, no second rekey).
 //!
 //! The second arm is the row's newer-file variant, read with ADR 0110
-//! line 378 ("Memory-only durability"): a `X0XEVICT3\0` sidecar (v2 is
-//! readable since #1508) runs memory-only, and a new self-leave
+//! line 378 ("Memory-only durability"): a `X0XEVICT4\0` sidecar (v3 is
+//! readable since #1785) runs memory-only, and a new self-leave
 //! trigger — durable on the verified chain — is sealed without the
 //! `waiting_for_durable_intake` wait (GREEN on main). The arm also
 //! guards the other side of line 378: if the wait ever appears for a
@@ -90,9 +90,9 @@ const WATCH: Duration = Duration::from_secs(45);
 /// A `.evs` whose v2 header is valid but whose body cannot decode: the
 /// row's "damage the `.evs` body" form.
 const DAMAGED_BODY: &[u8] = b"X0XEVICT2\0not a postcard body";
-/// The newer `.evs` layout this binary must leave untouched (#1508
-/// reads v2, so v3 is the newer form).
-const NEWER_EVS: &[u8] = b"X0XEVICT3\0future layout";
+/// The newer `.evs` layout this binary must leave untouched (this
+/// binary reads up to v3, so v4 is the newer form).
+const NEWER_EVS: &[u8] = b"X0XEVICT4\0future layout";
 
 const FINAL_CONTROL: &str = "the_rebuilt_store_rederives_the_open_row_and_completes_one_rotation";
 const FINAL_NEWER: &str = "the_memory_only_sidecar_seals_the_chain_durable_trigger";
@@ -805,7 +805,7 @@ async fn newer_file_arm(
     receipt.evidence(
         "the_newer_format_bytes_are_at_the_sidecar_path",
         std::fs::read(&path)? == NEWER_EVS,
-        format!("the {NEWER_EVS:?} form; v2 is readable since #1508"),
+        format!("the {NEWER_EVS:?} form; v3 is readable since #1785"),
         at(sim),
     );
     restart_a(sim, "B").await?;
@@ -825,7 +825,7 @@ async fn newer_file_arm(
     passed &= record_check(
         receipt,
         "the_sidecar_runs_memory_only_newer_format",
-        state == "sidecar_newer_format" && detail.as_deref() == Some("version 3"),
+        state == "sidecar_newer_format" && detail.as_deref() == Some("version 4"),
         CAUSE_NEWER_MISCLASSIFIED,
         Some(format!("state={state} detail={detail:?}")),
         format!("state={state:?} detail={detail:?}; the file must stay untouched"),
@@ -1066,7 +1066,7 @@ fn w3h_1581h_control_sidecar_rebuild_body_damage_rederives() -> Result<()> {
 }
 
 /// ADR 0110 `s4_sidecar_rebuild`, the newer-file variant, read with
-/// line 378 ("Memory-only durability"): with a `X0XEVICT3\0` sidecar
+/// line 378 ("Memory-only durability"): with a `X0XEVICT4\0` sidecar
 /// running memory-only, a new self-leave trigger — durable on the
 /// verified chain — is sealed without the `waiting_for_durable_intake`
 /// wait, the file stays untouched and the exclusion completes with one

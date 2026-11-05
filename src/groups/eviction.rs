@@ -179,7 +179,8 @@ impl WaitingCause {
     }
 }
 
-/// Why a designated admin is waiting, for `waiting_for_designated_admin`.
+/// Why a designated admin is waiting, for `waiting_for_designated_admin`
+/// and `unresolved_designated_admin`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -188,6 +189,71 @@ pub enum DesignatedWaitDetail {
     Rank,
     /// The designated admin lacks `eviction_handoff_v1` (§4).
     DesignatedAdminUnsupported,
+}
+
+/// The outcome of this node's outbound hand-off dispatch attempt against
+/// one designated admin (§2, L170–L173), recorded when the attempt
+/// completes, so an attempt still in flight keeps the plain designated
+/// wait. Only `Unresolved` and `Unsupported` persist (§5 v3): a routine
+/// `ExchangeReached` is memory state of its attempt, so a store without
+/// an outcome-bearing record stays v1/v2 (Engineer ruling, 4 Nov 2026
+/// 08:25 GMT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DesignatedHandoffOutcome {
+    /// The hand-off reached an authenticated direct or routed exchange
+    /// with the designated admin (L170: `send_direct` succeeded).
+    /// Routine, so it never rides the stored file; a completion drops
+    /// the record entirely.
+    ExchangeReached,
+    /// The attempt completed without such an exchange and without a
+    /// definitive current routing or eligibility failure: the designated
+    /// route is unresolved (L171). There is no dispatch retry, and a
+    /// later receipt does not rewrite the record. The pass drops it at
+    /// W and when the designation changes (the record names another
+    /// admin), and the row drops it when it completes, terminates or
+    /// reopens (Engineer ruling, 4 Nov 2026 17:22 GMT).
+    Unresolved,
+    /// The designated admin's current verified advert lacks
+    /// `eviction_handoff_v1` (§4, L173), or its transport refused the
+    /// send for that lack (`RecipientUpgradeRequired`): a definitive
+    /// eligibility failure.
+    Unsupported,
+    /// A definitive policy refusal (L171): the designated admin's own
+    /// acknowledgement that its trust policy refused this sender
+    /// (`RecipientRejected`), or this node's ADR-0043 pairing policy
+    /// refused the designated admin's machine. Not an unresolved route
+    /// and not a §4 capability lack, so the row keeps the plain
+    /// designated wait. Never stored (Engineer ruling, 4 Nov 2026
+    /// 18:15 GMT).
+    PolicyRefused,
+}
+
+impl DesignatedHandoffOutcome {
+    /// Whether the outcome rides the `.evs` v3 extension (§5). Only
+    /// `Unresolved` and `Unsupported` do; a routine `ExchangeReached`
+    /// and a `PolicyRefused` stay in memory (Engineer rulings, 4 Nov
+    /// 2026 08:25 and 18:15 GMT).
+    #[must_use]
+    pub(crate) fn persists(self) -> bool {
+        matches!(self, Self::Unresolved | Self::Unsupported)
+    }
+}
+
+/// This node's recorded outbound hand-off dispatch against one
+/// designated admin. The record names the admin it targeted, so a
+/// designation change voids it; the S4 pass then drops it, and it also
+/// drops it at W. The dispatch itself runs once per
+/// attempt — when the row first dispatches, and again after a reopen —
+/// so a designation change alone sends no new attempt and the new
+/// designated admin holds no record until the row reopens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesignatedHandoffRecord {
+    /// The designated admin the attempt targeted.
+    pub designated: [u8; 32],
+    /// The outcome of the completed attempt.
+    pub outcome: DesignatedHandoffOutcome,
 }
 
 /// The persisted phase of one obligation (§5).
@@ -337,7 +403,8 @@ pub struct WaitingState {
     /// The agent IDs the state names (designated admin, revoked admins,
     /// holding survivors).
     pub named: Vec<[u8; 32]>,
-    /// For `waiting_for_designated_admin`: why.
+    /// For the designated-wait causes (`waiting_for_designated_admin`,
+    /// `unresolved_designated_admin`): why.
     pub designated_detail: Option<DesignatedWaitDetail>,
     /// For timed waits: the remaining budget in milliseconds at the time
     /// the state was computed.
@@ -359,6 +426,8 @@ impl WaitingState {
 
 /// One obligation row. This is the frozen v1 persisted shape (§5): field
 /// order is the postcard layout; append only under a new header version.
+/// A `#[serde(skip)]` field stays out of that layout and persists in a
+/// versioned extension instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObligationRow {
     /// Stable group ID.
@@ -407,6 +476,17 @@ pub struct ObligationRow {
     pub outgoing_event: Option<Vec<u8>>,
     /// Wall-clock time of verified completion (Unix ms).
     pub completed_at_unix_ms: Option<u64>,
+    /// This node's recorded outbound hand-off dispatch outcome against
+    /// the row's designated admin (§2, L170–L173). `#[serde(skip)]`: the
+    /// v1 body above is frozen (§5), so the record persists only in the
+    /// `.evs` v3 extension ([`EVS_HEADER_V3`]) and an old-header row
+    /// loads with the `None` default. Only `unresolved` and
+    /// `unsupported` outcomes ride that extension; a routine
+    /// `exchange_reached` stays in memory. The record is dropped at W,
+    /// on a designation change, and when the row completes, terminates
+    /// or reopens (Engineer rulings, 4 Nov 2026 08:25 and 17:22 GMT).
+    #[serde(skip)]
+    pub designated_handoff: Option<DesignatedHandoffRecord>,
 }
 
 impl ObligationRow {
@@ -434,6 +514,7 @@ impl ObligationRow {
             result_epoch: None,
             outgoing_event: None,
             completed_at_unix_ms: None,
+            designated_handoff: None,
         }
     }
 
@@ -518,8 +599,38 @@ impl ObligationRow {
         self.observed_at_unix_ms = now_unix_ms;
         self.first_dispatch_unix_ms = None;
         self.earliest_handoff_receipt_unix_ms = None;
+        // The record belongs to the superseded attempt; the fresh
+        // attempt starts with none (#1581 review r7).
+        self.designated_handoff = None;
         self.boot_id = boot_id;
         self.elapsed_budget_ms = 0;
+    }
+
+    /// Drop the hand-off record once it no longer applies, so a stored
+    /// `unresolved` or `unsupported` outcome leaves the `.evs` v3
+    /// extension and the file returns to v1/v2 (Engineer ruling, 4 Nov
+    /// 2026 17:22 GMT). The record ends at W (`past_window`): L171 keeps
+    /// an unresolved route's priority "through W, not forever", and the
+    /// §4 unsupported wait also lasts for W. It also ends when the
+    /// current designated admin (`designated`, `None` when no
+    /// designation is known this pass) is not the admin the record
+    /// names: the attempt targeted an admin that is no longer
+    /// designated. Returns whether the stored file changes, that is
+    /// whether the dropped record was an outcome-bearing one.
+    pub(crate) fn retire_designated_handoff(
+        &mut self,
+        designated: Option<[u8; 32]>,
+        past_window: bool,
+    ) -> bool {
+        let Some(record) = self.designated_handoff else {
+            return false;
+        };
+        let redesignated = designated.is_some_and(|current| current != record.designated);
+        if !(past_window || redesignated) {
+            return false;
+        }
+        self.designated_handoff = None;
+        record.outcome.persists()
     }
 }
 
@@ -722,6 +833,10 @@ impl ObligationStore {
         row.waiting = None;
         row.result_head = result_head;
         row.result_epoch = result_epoch;
+        // The work is over, so the attempt's outcome no longer applies
+        // (Engineer ruling, 4 Nov 08:25 GMT); dropping it also lets the
+        // sidecar return to the v1/v2 header.
+        row.designated_handoff = None;
         // ADR 0110 §4: a crypto-only exclusion frame stays as replay
         // evidence, so a survivor that missed it can still catch up after
         // this node restarts. Any other saved event is dropped.
@@ -749,6 +864,9 @@ impl ObligationStore {
         row.termination = Some(cause);
         row.waiting = None;
         row.outgoing_event = None;
+        // A terminated row's work is over too, so its hand-off outcome
+        // goes with it, as on completion.
+        row.designated_handoff = None;
         true
     }
 
@@ -1141,7 +1259,37 @@ pub fn evaluate_row(row: &ObligationRow, ctx: &RowContext<'_>, timing: &S4Timing
             (Some(named_designated(cause)), RowAction::None)
         }
         CommitPermission::Wait { remaining, .. } => {
-            let mut waiting = named_designated(WaitingCause::WaitingForDesignatedAdmin);
+            // §2 (L170–L171): split the designated wait on this node's
+            // recorded outbound hand-off outcome against the designated
+            // admin itself, not on receipts from other admins (David,
+            // 4 Nov 2026; the label applies during W, rank 1 and
+            // two-admin groups included). An
+            // attempt that completed without reaching an
+            // authenticated exchange and without a definitive routing
+            // or eligibility failure is an unresolved designated
+            // route; L171 lets it "preserve priority through W, not
+            // forever", so the label stops at W — a higher rank's
+            // stagger wait past W keeps the plain designated cause
+            // (#1581 review r7). The row must have a dispatched
+            // attempt: a reopened row dropped the superseded
+            // attempt's record with its first-dispatch time, and an
+            // attempt still in flight holds no record, so both keep
+            // the plain wait. The record names its admin, so a
+            // designation change voids it, and it persists in the §5
+            // v3 extension, so a restart keeps the split. The
+            // fallback clock itself is untouched: the rank keeps its
+            // fallback time.
+            let unresolved = row.first_dispatch_unix_ms.is_some()
+                && ctx.elapsed < timing.designated_window
+                && row.designated_handoff.is_some_and(|attempt| {
+                    attempt.designated == designation.designated
+                        && attempt.outcome == DesignatedHandoffOutcome::Unresolved
+                });
+            let mut waiting = named_designated(if unresolved {
+                WaitingCause::UnresolvedDesignatedAdmin
+            } else {
+                WaitingCause::WaitingForDesignatedAdmin
+            });
             waiting.designated_detail = Some(DesignatedWaitDetail::Rank);
             waiting.remaining_ms = Some(duration_ms(*remaining));
             (Some(waiting), RowAction::None)
@@ -1441,12 +1589,24 @@ pub const EVS_HEADER_V1: &[u8; 10] = b"X0XEVICT1\0";
 /// [`EvsQueuedBansV2`]. It is written only while a queued manual ban
 /// exists, so a store without one stays v1 and readable by a v1 binary.
 pub const EVS_HEADER_V2: &[u8; 10] = b"X0XEVICT2\0";
+/// The `.evs` v3 header (10 bytes): the v2 body followed by this node's
+/// recorded designated hand-off outcomes. It is written only while some
+/// open row holds an `unresolved` or `unsupported` hand-off outcome
+/// inside W against its current designated admin — a routine
+/// `exchange_reached` never rides the file, and the record is dropped
+/// at W, on a designation change and when the row closes or reopens
+/// (Engineer rulings, 4 Nov 2026 08:25 and 17:22 GMT) — so a store
+/// without such a record stays v1 or v2 and readable by a v1 or v2
+/// binary. A binary older than v3 reads a v3 file as a newer format
+/// and runs S4 memory-only for that whole run: it never rewrites a
+/// newer file, so only a v3-reading binary returns it to v1/v2.
+pub const EVS_HEADER_V3: &[u8; 10] = b"X0XEVICT3\0";
 /// The `.evjournal` v1 header (8 bytes).
 pub const EVJOURNAL_HEADER_V1: &[u8; 8] = b"X0XEVJ1\0";
 /// The highest `.evjournal` layout version this binary reads.
 pub const SIDECAR_MAX_SUPPORTED_VERSION: u8 = 1;
 /// The highest `.evs` layout version this binary reads.
-pub const EVS_MAX_SUPPORTED_VERSION: u8 = 2;
+pub const EVS_MAX_SUPPORTED_VERSION: u8 = 3;
 
 /// Why an S4 file could not be used (ADR 0108 §5a classification).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1498,6 +1658,28 @@ pub struct QueuedBanV1 {
 pub struct EvsQueuedBansV2 {
     /// Accepted manual bans that are not applied yet.
     pub queued_bans: Vec<QueuedBanV1>,
+}
+
+/// One persisted designated-admin hand-off outcome, keyed by its row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DesignatedHandoffV3 {
+    /// Stable group ID of the row.
+    pub stable_group_id: String,
+    /// Target agent ID of the row.
+    pub target: [u8; 32],
+    /// The recorded outcome and the designated admin it names.
+    pub record: DesignatedHandoffRecord,
+}
+
+/// The `.evs` v3 extension that follows the v2 body (§2, L170–L173):
+/// this node's recorded outbound hand-off outcome against each row's
+/// designated admin, so the `unresolved_designated_admin` split and the
+/// §4 downgrade survive a restart. Only `unresolved` and `unsupported`
+/// outcomes ride it (Engineer ruling, 4 Nov 2026 08:25 GMT).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub(crate) struct EvsDesignatedHandoffsV3 {
+    /// One recorded outcome per row that holds one.
+    pub handoffs: Vec<DesignatedHandoffV3>,
 }
 
 /// The frozen v1 `.evjournal` body: one prepared S4 transition (§5).
@@ -1664,7 +1846,39 @@ pub fn decode_evs(bytes: &[u8]) -> Result<EvsBodyV1, SidecarDecodeError> {
     decode_evs_with_queued_bans(bytes).map(|(body, _)| body)
 }
 
+/// Encode the `.evs` sidecar with its queued manual bans and designated
+/// hand-off outcomes. With no outcome-bearing record the file is v1 (no
+/// queued ban) or v2 (the v1 body, then [`EvsQueuedBansV2`]); with any
+/// `unresolved` or `unsupported` outcome it is v3 (the v2 body, then
+/// [`EvsDesignatedHandoffsV3`]). A routine `exchange_reached` must not
+/// reach `handoffs` (Engineer ruling, 4 Nov 2026 08:25 GMT).
+///
+/// # Errors
+///
+/// Returns the postcard error when encoding fails.
+pub(crate) fn encode_evs_with_extensions(
+    body: &EvsBodyV1,
+    queued_bans: &[QueuedBanV1],
+    handoffs: &[DesignatedHandoffV3],
+) -> Result<Vec<u8>, postcard::Error> {
+    if handoffs.is_empty() {
+        return encode_evs_with_queued_bans(body, queued_bans);
+    }
+    let mut out = EVS_HEADER_V3.to_vec();
+    out.extend(postcard::to_stdvec(body)?);
+    out.extend(postcard::to_stdvec(&EvsQueuedBansV2 {
+        queued_bans: queued_bans.to_vec(),
+    })?);
+    out.extend(postcard::to_stdvec(&EvsDesignatedHandoffsV3 {
+        handoffs: handoffs.to_vec(),
+    })?);
+    Ok(out)
+}
+
 /// Decode the `.evs` sidecar with its queued manual bans (empty for v1).
+/// A v3 file's designated hand-off outcomes are applied onto their rows
+/// (§2): a row without an entry loads with the `None` default, and an
+/// entry whose row is absent is dropped.
 ///
 /// # Errors
 ///
@@ -1678,8 +1892,24 @@ pub fn decode_evs_with_queued_bans(
     }
     let (rows, rest) = postcard::take_from_bytes::<EvsBodyV1>(body)
         .map_err(|_| SidecarDecodeError::Damaged("body_decode"))?;
-    let extension: EvsQueuedBansV2 = decode_exact(rest)?;
-    Ok((rows, extension.queued_bans))
+    let (extension, rest) = postcard::take_from_bytes::<EvsQueuedBansV2>(rest)
+        .map_err(|_| SidecarDecodeError::Damaged("extension_decode"))?;
+    let handoffs = if version >= 3 {
+        decode_exact::<EvsDesignatedHandoffsV3>(rest)?
+    } else if !rest.is_empty() {
+        return Err(SidecarDecodeError::Damaged("trailing_bytes"));
+    } else {
+        EvsDesignatedHandoffsV3::default()
+    };
+    let mut body = rows;
+    for handoff in handoffs.handoffs {
+        if let Some(row) = body.rows.iter_mut().find(|row| {
+            row.stable_group_id == handoff.stable_group_id && row.target == handoff.target
+        }) {
+            row.designated_handoff = Some(handoff.record);
+        }
+    }
+    Ok((body, extension.queued_bans))
 }
 
 /// Encode one `.evjournal`.
@@ -2220,8 +2450,8 @@ mod tests {
             Err(SidecarDecodeError::Damaged("missing_nul"))
         );
         let mut newer = bytes;
-        newer[8] = b'3';
-        assert_eq!(decode_evs(&newer), Err(SidecarDecodeError::NewerFormat(3)));
+        newer[8] = b'4';
+        assert_eq!(decode_evs(&newer), Err(SidecarDecodeError::NewerFormat(4)));
     }
 
     #[test]
@@ -2357,6 +2587,370 @@ mod tests {
             observer.waiting.map(|w| (w.cause, w.named)),
             Some((WaitingCause::WaitingForDesignatedAdmin, vec![id(1)]))
         );
+    }
+
+    #[test]
+    fn evaluate_row_splits_unresolved_designated_admin() {
+        // §2 (L170–L171, ruled 4 Nov 2026): a waiting rank splits the
+        // designated wait on this node's recorded outbound hand-off
+        // outcome against the designated admin itself, not on receipts
+        // from other admins: an attempt that
+        // completed with no exchange and no definitive failure is an
+        // unresolved designated route while the budget is inside W
+        // (rank 1 and two-admin groups included), and the rank keeps
+        // its fallback time. A reached exchange, a definitive failure,
+        // a record naming another admin (a designation change), a
+        // record with no dispatched attempt (a reopened row) and no
+        // record at all each keep the plain designated wait, and the
+        // label stops at W (L171: "through W, not forever").
+        let timing = S4Timing::default();
+        let mut row = sample_row();
+        let admins = [id(1), id(2), id(3)];
+        let none = BTreeSet::new();
+        // Rank 2 (id 3) waits past W; its fallback time is W + Δ. Rank 1
+        // (id 2) waits through W and falls back at it.
+        let during_window = Duration::from_secs(5);
+        let unresolved = |designated: [u8; 32]| DesignatedHandoffRecord {
+            designated,
+            outcome: DesignatedHandoffOutcome::Unresolved,
+        };
+
+        // The s4_fallback_rank_manual shape: rank 1's hand-off receipt
+        // is held (any-admin receipt), the budget is inside W, and this
+        // node's own dispatch against the designated admin completed
+        // without an exchange. The receipt and the budget no longer
+        // decide; the record does.
+        row.first_dispatch_unix_ms = Some(981_000);
+        row.earliest_handoff_receipt_unix_ms = Some(999_000);
+        row.designated_handoff = Some(unresolved(id(1)));
+        let split = evaluate_row(&row, &ctx(3, &admins, &none, during_window), &timing);
+        assert_eq!(split.action, RowAction::None);
+        assert_eq!(
+            split.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::UnresolvedDesignatedAdmin)
+        );
+        assert_eq!(
+            split.waiting.as_ref().map(|waiting| waiting.named.clone()),
+            Some(vec![id(1)])
+        );
+        assert!(split
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.remaining_ms.is_some()));
+        assert_eq!(
+            split
+                .waiting
+                .as_ref()
+                .and_then(|waiting| waiting.designated_detail),
+            Some(DesignatedWaitDetail::Rank)
+        );
+
+        // The split shows from the start of the wait, not only past W:
+        // L171 reads with the 4 Nov 2026 ruling (during W).
+        let at_observation = evaluate_row(&row, &ctx(3, &admins, &none, Duration::ZERO), &timing);
+        assert_eq!(
+            at_observation.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::UnresolvedDesignatedAdmin)
+        );
+
+        // A record without a dispatched attempt never shows the label:
+        // a reopened row dropped the superseded attempt's record with
+        // its first-dispatch time, so the fresh wait stays plain until
+        // the new attempt completes (r7 blocking finding 1).
+        row.designated_handoff = Some(unresolved(id(1)));
+        row.first_dispatch_unix_ms = None;
+        let undispatched = evaluate_row(&row, &ctx(3, &admins, &none, during_window), &timing);
+        assert_eq!(
+            undispatched.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+        row.first_dispatch_unix_ms = Some(981_000);
+
+        // L171: the label "preserves priority through W, not forever".
+        // Rank 2's fallback is W + Δ, so it still waits past W; from W
+        // on its plain designated wait names the stagger, never an
+        // unresolved route (r7 finding 5).
+        let past_window = evaluate_row(
+            &row,
+            &ctx(
+                3,
+                &admins,
+                &none,
+                timing.designated_window + Duration::from_secs(2),
+            ),
+            &timing,
+        );
+        assert_eq!(
+            past_window.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+        // The boundary itself: 1 ms before W still shows the cause, and
+        // the budget at exactly W is past the window (L171).
+        let boundary = |elapsed| {
+            evaluate_row(&row, &ctx(3, &admins, &none, elapsed), &timing)
+                .waiting
+                .map(|waiting| waiting.cause)
+        };
+        assert_eq!(
+            boundary(timing.designated_window - Duration::from_millis(1)),
+            Some(WaitingCause::UnresolvedDesignatedAdmin)
+        );
+        assert_eq!(
+            boundary(timing.designated_window),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+
+        // A reached exchange keeps the plain wait (a designated admin
+        // this node reached is never unresolved).
+        row.designated_handoff = Some(DesignatedHandoffRecord {
+            designated: id(1),
+            outcome: DesignatedHandoffOutcome::ExchangeReached,
+        });
+        let exchanged = evaluate_row(&row, &ctx(3, &admins, &none, during_window), &timing);
+        assert_eq!(
+            exchanged.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+
+        // A definitive policy refusal keeps the plain wait (L171;
+        // Engineer ruling, 4 Nov 2026 18:15 GMT).
+        row.designated_handoff = Some(DesignatedHandoffRecord {
+            designated: id(1),
+            outcome: DesignatedHandoffOutcome::PolicyRefused,
+        });
+        let refused = evaluate_row(&row, &ctx(3, &admins, &none, during_window), &timing);
+        assert_eq!(
+            refused.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+
+        // A definitive failure is §4's, never an unresolved route.
+        row.designated_handoff = Some(DesignatedHandoffRecord {
+            designated: id(1),
+            outcome: DesignatedHandoffOutcome::Unsupported,
+        });
+        let unsupported = evaluate_row(&row, &ctx(3, &admins, &none, during_window), &timing);
+        assert_eq!(
+            unsupported.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+
+        // A record naming another admin is void: a designation change
+        // gets its own attempt.
+        row.designated_handoff = Some(unresolved(id(2)));
+        let redesignated = evaluate_row(&row, &ctx(3, &admins, &none, during_window), &timing);
+        assert_eq!(
+            redesignated.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+
+        // No record keeps the plain wait, whatever the stand-in fields
+        // say: the late-admin shape (first dispatch with the budget
+        // already past W) and an attempt still in flight never show the
+        // unresolved route on their own.
+        row.designated_handoff = None;
+        row.earliest_handoff_receipt_unix_ms = None;
+        let unrecorded = evaluate_row(
+            &row,
+            &ctx(
+                3,
+                &admins,
+                &none,
+                timing.designated_window + Duration::from_secs(2),
+            ),
+            &timing,
+        );
+        assert_eq!(
+            unrecorded.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::WaitingForDesignatedAdmin)
+        );
+
+        // Rank 1 shows the split during W (two-admin groups included:
+        // its only peer is the designated admin) ...
+        row.designated_handoff = Some(unresolved(id(1)));
+        let rank_one_waits = evaluate_row(&row, &ctx(2, &admins, &none, during_window), &timing);
+        assert_eq!(
+            rank_one_waits.waiting.as_ref().map(|waiting| waiting.cause),
+            Some(WaitingCause::UnresolvedDesignatedAdmin)
+        );
+        // ... and rank 1 falls back at W, so it never waits past W.
+        let rank_one_fallback = evaluate_row(
+            &row,
+            &ctx(
+                2,
+                &admins,
+                &none,
+                timing.designated_window + Duration::from_secs(2),
+            ),
+            &timing,
+        );
+        assert_eq!(rank_one_fallback.waiting, None);
+        assert_eq!(
+            rank_one_fallback.action,
+            RowAction::CommitRemoval { rank: 1 }
+        );
+    }
+
+    #[test]
+    fn evs_v3_persists_designated_handoff_outcomes() {
+        // §5 v3: a row's designated hand-off record persists only in the
+        // v3 extension, so an old-header row loads with the default and
+        // a v3 file round-trips the record onto its row.
+        let mut row = sample_row();
+        let record = DesignatedHandoffRecord {
+            designated: id(1),
+            outcome: DesignatedHandoffOutcome::Unresolved,
+        };
+        row.designated_handoff = Some(record);
+        let body = EvsBodyV1 {
+            rebuilt_from: Vec::new(),
+            rows: vec![row],
+        };
+        let handoffs = vec![DesignatedHandoffV3 {
+            stable_group_id: body.rows[0].stable_group_id.clone(),
+            target: body.rows[0].target,
+            record,
+        }];
+
+        // With no outcome the file stays v1; with a queued ban only it
+        // stays v2; with an outcome it is v3.
+        let v1 = encode_evs_with_extensions(&body, &[], &[]).expect("encode v1");
+        assert_eq!(&v1[..10], EVS_HEADER_V1);
+        let ban = QueuedBanV1 {
+            stable_group_id: body.rows[0].stable_group_id.clone(),
+            target: body.rows[0].target,
+            queued_at_unix_ms: 1,
+        };
+        let v2 =
+            encode_evs_with_extensions(&body, std::slice::from_ref(&ban), &[]).expect("encode v2");
+        assert_eq!(&v2[..10], EVS_HEADER_V2);
+        let v3 = encode_evs_with_extensions(&body, &[ban], &handoffs).expect("encode v3");
+        assert_eq!(&v3[..10], EVS_HEADER_V3);
+
+        // The v1 and v2 files carry no record (the v1 body is frozen),
+        // so those rows load with the default.
+        for (name, bytes) in [("v1", v1), ("v2", v2)] {
+            let (loaded, _) = decode_evs_with_queued_bans(&bytes).expect("decode");
+            assert_eq!(
+                loaded.rows[0].designated_handoff, None,
+                "an old-header {name} row loads with the default"
+            );
+        }
+
+        // The v3 file carries the queued ban and the record, applied
+        // onto its row by key.
+        let (loaded, bans) = decode_evs_with_queued_bans(&v3).expect("decode v3");
+        assert_eq!(loaded.rows[0].designated_handoff, Some(record));
+        assert_eq!(bans.len(), 1);
+
+        // An entry whose row is absent is dropped, not an error.
+        let orphan = encode_evs_with_extensions(
+            &EvsBodyV1::default(),
+            &[],
+            &[DesignatedHandoffV3 {
+                stable_group_id: "gone".into(),
+                target: id(9),
+                record,
+            }],
+        )
+        .expect("encode orphan");
+        let (loaded, _) = decode_evs_with_queued_bans(&orphan).expect("decode orphan");
+        assert!(loaded.rows.is_empty());
+
+        // Version 4 is a newer format, and a damaged v3 body is damaged.
+        let mut newer = v3.clone();
+        newer[8] = b'4';
+        assert_eq!(
+            decode_evs_with_queued_bans(&newer),
+            Err(SidecarDecodeError::NewerFormat(4))
+        );
+        let mut trailing = v3.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_evs_with_queued_bans(&trailing),
+            Err(SidecarDecodeError::Damaged("trailing_bytes"))
+        );
+    }
+
+    /// #1581 review r7: the record belongs to one attempt of one row.
+    /// A completed row's work is over, so completion drops the record
+    /// (Engineer ruling, 4 Nov 08:25 GMT), and a reopen starts a fresh
+    /// attempt, so the superseded attempt's record leaves with its
+    /// first-dispatch time — no result of an old attempt can label the
+    /// new one (blocking finding 1).
+    #[test]
+    fn completion_and_reopen_clear_the_designated_handoff_record() {
+        let record = DesignatedHandoffRecord {
+            designated: id(1),
+            outcome: DesignatedHandoffOutcome::Unresolved,
+        };
+        let mut store = ObligationStore::new();
+        let k = key(9);
+        store.intake(&k, revocation(1), Some("seat-a"), 1, [0; 16]);
+        {
+            let row = store.get_mut(&k).expect("row");
+            row.first_dispatch_unix_ms = Some(9_000);
+            row.designated_handoff = Some(record);
+        }
+        // Completion ends the work: the record does not survive it.
+        assert!(store.complete(&k, Some("head".into()), Some(4), 2));
+        assert_eq!(store.get(&k).expect("row").designated_handoff, None);
+
+        // A row persisted by an earlier build may still hold a record
+        // once loaded; a new-incarnation trigger reopens the row, and
+        // the fresh attempt starts with no record and no dispatch time.
+        {
+            let row = store.get_mut(&k).expect("row");
+            row.first_dispatch_unix_ms = Some(19_000);
+            row.designated_handoff = Some(record);
+        }
+        assert_eq!(
+            store.intake(&k, revocation(2), Some("seat-b"), 20, [0; 16]),
+            IntakeOutcome::Reopened
+        );
+        let row = store.get(&k).expect("row");
+        assert_eq!(row.first_dispatch_unix_ms, None);
+        assert_eq!(row.designated_handoff, None);
+
+        // A termination closes the row like a completion does, so it
+        // drops the record as well.
+        store.get_mut(&k).expect("row").designated_handoff = Some(record);
+        assert!(store.terminate(&k, TerminationCause::GroupDeleted));
+        assert_eq!(store.get(&k).expect("row").designated_handoff, None);
+    }
+
+    /// #1581 (Engineer ruling, 4 Nov 2026 17:22 GMT): the record ends
+    /// at W and when the designated admin is no longer the one it
+    /// names; only an outcome-bearing record changes the stored file.
+    #[test]
+    fn the_handoff_record_retires_at_w_and_on_a_designation_change() {
+        let mut store = ObligationStore::new();
+        let k = key(9);
+        store.intake(&k, revocation(1), Some("seat-a"), 1, [0; 16]);
+        let row = store.get_mut(&k).expect("row");
+        let record = |outcome| DesignatedHandoffRecord {
+            designated: id(1),
+            outcome,
+        };
+        // Inside W, same admin, or no designation known: kept.
+        row.designated_handoff = Some(record(DesignatedHandoffOutcome::Unresolved));
+        assert!(!row.retire_designated_handoff(Some(id(1)), false));
+        assert!(!row.retire_designated_handoff(None, false));
+        assert!(row.designated_handoff.is_some());
+        // At W: dropped, and the stored file changes.
+        assert!(row.retire_designated_handoff(Some(id(1)), true));
+        assert_eq!(row.designated_handoff, None);
+        // Another designated admin: dropped.
+        row.designated_handoff = Some(record(DesignatedHandoffOutcome::Unsupported));
+        assert!(row.retire_designated_handoff(Some(id(2)), false));
+        assert_eq!(row.designated_handoff, None);
+        // A memory-only outcome is dropped too, but no file changes.
+        row.designated_handoff = Some(record(DesignatedHandoffOutcome::ExchangeReached));
+        assert!(!row.retire_designated_handoff(Some(id(1)), true));
+        assert_eq!(row.designated_handoff, None);
+        row.designated_handoff = Some(record(DesignatedHandoffOutcome::PolicyRefused));
+        assert!(!row.retire_designated_handoff(Some(id(2)), false));
+        assert_eq!(row.designated_handoff, None);
     }
 
     #[test]

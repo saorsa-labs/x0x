@@ -10,6 +10,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # scripts/ci/nextest-isolated.sh sets line-tables-only debuginfo under
+  # GITHUB_ACTIONS (#1789). Use the same profile for every cargo step in this
+  # workflow. Otherwise a plain `cargo build` or `cargo nextest show-config`
+  # step after the isolated run rebuilds the graph with full debuginfo, and
+  # Integration (groups) goes past its 30-minute limit.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   # ── Guardian: API coverage enforcement (every PR, ~30s) ────────────────
