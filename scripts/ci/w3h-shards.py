@@ -41,6 +41,10 @@ GROUPS = (
     ('s3-1661', 'w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed$'),
     ('s3-rm4', 'w3h_1356_control_s3_rm4_'),
     ('s3', 'w3h_1356_'),
+    # #1623 (refs #1356): about 11 s per rerun on macOS; `rest` already
+    # takes about 104 of its 120 minutes (run 41624339394), so the row
+    # has its own shard.
+    ('1623', 'w3h_1623_'),
 )
 
 # The gate's reruns per case (D196). A group in `PARTS` runs them as that
