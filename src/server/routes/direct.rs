@@ -484,6 +484,12 @@ pub(in crate::server) async fn direct_send(
                 x0x::dm::DmError::RecipientRejected { .. } => {
                     (StatusCode::FORBIDDEN, "recipient_rejected")
                 }
+                // ADR-0043 §9: the local B/P gate denied the resolved
+                // (agent, machine) pairing; nothing was sent. A policy
+                // refusal, not a server fault, so 403 and not 500.
+                x0x::dm::DmError::RecipientPairingDenied { .. } => {
+                    (StatusCode::FORBIDDEN, "recipient_pairing_denied")
+                }
                 x0x::dm::DmError::RecipientKeyUnavailable(_) => {
                     (StatusCode::NOT_FOUND, "recipient_key_unavailable")
                 }
