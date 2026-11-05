@@ -1137,6 +1137,8 @@ async fn issue1139_r1_before_own_result_converges() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let s = build_back_to_back(dir.path()).await?;
     let stub_epoch = j2_epoch(&s).await;
+    let chain_epoch = treekem_membership_event_frontier(&s.add_j1.event).and_then(|f| f.epoch);
+    assert_ne!(stub_epoch, chain_epoch, "the chain names another epoch");
     assert!(
         apply_named_group_metadata_event(&s.j2, s.add_j1.event.clone(), s.authority_id, true, None)
             .await

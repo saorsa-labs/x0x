@@ -11163,26 +11163,24 @@ fn admit_treekem_pending_event(
     Some(peers)
 }
 
-/// #1623 round 4: the TreeKEM epoch a catch-up request names as its
-/// cursor. A node with a local TreeKEM group names its own `secret_epoch`,
-/// as before. A pre-Welcome node keeps its local `secret_epoch` (ADR 0109
-/// §2), so it names the epoch of its committed head instead, from the
-/// signed `treekem:epoch=N` binding. Otherwise the responder, which keeps
-/// events past either cursor field, serves the applied link again and the
-/// paging stalls. No wire change.
-async fn treekem_catchup_cursor_epoch(
-    state: &AppState,
-    aliases: &[String],
-    (secret_epoch, binding): (u64, Option<String>),
+/// #1623 round 4/5: the TreeKEM epoch of this node's catch-up cursor.
+/// It is used wherever a cursor epoch is sent or compared: the asks, the
+/// page stop decision, the served-ahead check and the re-arm baseline. A
+/// node with a local TreeKEM group names its own `secret_epoch`, as
+/// before. A node with no local TreeKEM group (pre-Welcome) keeps its
+/// local `secret_epoch` (ADR 0109 §2), so it names the epoch of its
+/// committed head, from the signed `treekem:epoch=N` binding. Otherwise
+/// the responder, which keeps events past either cursor field, serves the
+/// applied link again and the paging stalls. No wire change.
+fn treekem_catchup_cursor_epoch_of(
+    secret_epoch: u64,
+    binding: Option<&str>,
+    has_local_tree: bool,
 ) -> u64 {
-    {
-        let trees = state.treekem_groups.read().await;
-        if aliases.iter().any(|alias| trees.contains_key(alias)) {
-            return secret_epoch;
-        }
+    if has_local_tree {
+        return secret_epoch;
     }
     binding
-        .as_deref()
         .and_then(|binding| binding.strip_prefix("treekem:epoch="))
         .map(|rest| {
             rest.chars()
@@ -11191,6 +11189,20 @@ async fn treekem_catchup_cursor_epoch(
         })
         .and_then(|digits| digits.parse::<u64>().ok())
         .map_or(secret_epoch, |epoch| epoch.max(secret_epoch))
+}
+
+/// [`treekem_catchup_cursor_epoch_of`], with the local tree looked up
+/// under every name of the group in `aliases`.
+async fn treekem_catchup_cursor_epoch(
+    state: &AppState,
+    aliases: &[String],
+    (secret_epoch, binding): (u64, Option<String>),
+) -> u64 {
+    let has_local_tree = {
+        let trees = state.treekem_groups.read().await;
+        aliases.iter().any(|alias| trees.contains_key(alias))
+    };
+    treekem_catchup_cursor_epoch_of(secret_epoch, binding.as_deref(), has_local_tree)
 }
 
 async fn request_treekem_catchup_for_gap(
@@ -11442,21 +11454,33 @@ async fn treekem_catchup_cursor(
     state: &Arc<AppState>,
     group_id: &str,
 ) -> Option<(u64, u64, String)> {
-    let groups = state.named_groups.read().await;
-    groups
-        .get(group_id)
-        .or_else(|| {
+    let (aliases, revision, head_epoch, hash) = {
+        let groups = state.named_groups.read().await;
+        let (key, info) = groups.get_key_value(group_id).or_else(|| {
             groups
-                .values()
-                .find(|info| info.stable_group_id() == group_id)
-        })
-        .map(|info| {
-            (
-                info.state_revision,
-                info.secret_epoch,
-                info.state_hash.clone(),
-            )
-        })
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
+        })?;
+        (
+            treekem_cursor_aliases(group_id, key, info),
+            info.state_revision,
+            (info.secret_epoch, info.security_binding.clone()),
+            info.state_hash.clone(),
+        )
+    };
+    let epoch = treekem_catchup_cursor_epoch(state, &aliases, head_epoch).await;
+    Some((revision, epoch, hash))
+}
+
+/// The names this node may hold a group's TreeKEM tree under, for
+/// [`treekem_catchup_cursor_epoch`] on the page-stop path.
+fn treekem_cursor_aliases(group_id: &str, key: &str, info: &x0x::groups::GroupInfo) -> [String; 4] {
+    [
+        group_id.to_string(),
+        key.to_string(),
+        info.mls_group_id.clone(),
+        info.stable_group_id().to_string(),
+    ]
 }
 
 /// The final replay reinsertion seam, called while membership is serialized.
@@ -13305,16 +13329,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     let response_info = {
         let groups = state.named_groups.read().await;
         groups
-            .get(&response.group_id)
+            .get_key_value(&response.group_id)
             .or_else(|| {
                 groups
-                    .values()
-                    .find(|info| info.stable_group_id() == response.group_id)
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == response.group_id)
             })
-            .filter(|info| !info.withdrawn && info.has_active_member(&sender_hex))
-            .cloned()
+            .filter(|(_, info)| !info.withdrawn && info.has_active_member(&sender_hex))
+            .map(|(key, info)| (key.clone(), info.clone()))
     };
-    let Some(response_info) = response_info else {
+    let Some((response_key, response_info)) = response_info else {
         tracing::warn!(
             group_id = %LogHexId::group(&response.group_id),
             sender = %LogHexId::agent(&sender_hex),
@@ -13340,7 +13364,15 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     // it, so the loop pages on instead of stopping.
     let cursor_before = (
         response_info.state_revision,
-        response_info.secret_epoch,
+        treekem_catchup_cursor_epoch(
+            state,
+            &treekem_cursor_aliases(&response.group_id, &response_key, &response_info),
+            (
+                response_info.secret_epoch,
+                response_info.security_binding.clone(),
+            ),
+        )
+        .await,
         response_info.state_hash.clone(),
     );
     let reported_head = response.responder_state_hash.clone();
@@ -14299,7 +14331,7 @@ async fn maybe_rearm_stopped_treekem_pages(
     group_id: &str,
     skip_peer: Option<&str>,
 ) {
-    let (aliases, cursor) = {
+    let (aliases, revision, head_epoch, hash) = {
         let groups = state.named_groups.read().await;
         let resolved = groups
             .get_key_value(group_id)
@@ -14323,13 +14355,16 @@ async fn maybe_rearm_stopped_treekem_pages(
         aliases.dedup();
         (
             aliases,
-            (
-                info.state_revision,
-                info.secret_epoch,
-                info.state_hash.clone(),
-            ),
+            info.state_revision,
+            (info.secret_epoch, info.security_binding.clone()),
+            info.state_hash.clone(),
         )
     };
+    let cursor = (
+        revision,
+        treekem_catchup_cursor_epoch(state, &aliases, head_epoch).await,
+        hash,
+    );
     if treekem_page_stopped_peer_rows(&aliases).is_empty() {
         return;
     }
@@ -15236,10 +15271,10 @@ async fn request_member_key_package_catchup(
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let (from_revision, head_epoch, current_state_hash, candidates, fence_ids) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(group_id).or_else(|| {
+        let Some((register_key, info)) = groups.get_key_value(group_id).or_else(|| {
             groups
-                .values()
-                .find(|info| info.stable_group_id() == group_id)
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
         }) else {
             return;
         };
@@ -15270,6 +15305,7 @@ async fn request_member_key_package_catchup(
             candidate_hexes,
             vec![
                 group_id.to_string(),
+                register_key.clone(),
                 info.mls_group_id.clone(),
                 info.stable_group_id().to_string(),
             ],

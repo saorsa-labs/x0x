@@ -633,3 +633,76 @@ async fn pre_welcome_joiner_pages_two_links_from_a_real_responder() -> anyhow::R
     assert_no_tree(&joiner, &key).await;
     Ok(())
 }
+
+/// Round 5: the page stop decision maps the cursor epoch as the ask does.
+/// The joiner's head binding names epoch 1 and its local epoch stays 0.
+/// The real page ask records the mapped cursor; a truncated page then
+/// serves a removal the joiner refuses (no armed sequence). Nothing moved,
+/// so the #1685 NO_PROGRESS stop fires. With the raw epoch on the stop
+/// side the ask row never matches and the page loop asks again for ever.
+#[tokio::test]
+async fn pre_welcome_page_that_applies_nothing_stops_the_page_loop() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let mut base = base_group(&owner, None)?;
+    let commit = seal_link(&mut base, &owner, 1_500, take_treekem_epoch)?;
+    base.secret_epoch = 0;
+    assert_ne!(treekem_epoch_of_binding(&base), Some(base.secret_epoch));
+    let (_, event) = removal_link(&base, &owner, false)?;
+    let key = install_stub(&state, base.clone()).await?;
+    let recorders = &state.named_group_test_recorders;
+    recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(request_treekem_catchup_page(&state, &key, &owner.agent_id()).await);
+    let trace_event = event.clone();
+    let response = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: key.clone(),
+        events: vec![event],
+        truncated: true,
+        responder_state_hash: None,
+    };
+    handle_treekem_catchup_response(
+        &state,
+        &owner.agent_id(),
+        &x0x::identity::MachineId([0x23; 32]),
+        true,
+        response,
+    )
+    .await;
+    let head = head_of(&state, &key).await?;
+    assert_eq!(
+        head.state_hash, commit.state_hash,
+        "the page applied nothing"
+    );
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let stops = recorders.catchup_page_stops.lock().expect("stops").clone();
+    assert!(
+        stops.contains(&(
+            key.clone(),
+            owner_hex,
+            TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS
+        )),
+        "NO_PROGRESS stop recorded: {stops:?}"
+    );
+    // The refusal is rule (b)'s, and the no-commit guard has its own reason.
+    let local = hex::encode(state.agent.agent_id().as_bytes());
+    let mut no_commit = trace_event;
+    if let NamedGroupMetadataEvent::MemberRemoved { commit, .. } = &mut no_commit {
+        *commit = None;
+    }
+    let verdict =
+        admit_pre_welcome_state_only_link(&state, &head, &mut head.clone(), &no_commit, &local)
+            .await;
+    assert_eq!(verdict, Err("pre_welcome_no_commit"));
+    Ok(())
+}
+
+fn treekem_epoch_of_binding(info: &GroupInfo) -> Option<u64> {
+    info.security_binding
+        .as_deref()?
+        .strip_prefix("treekem:epoch=")?
+        .parse()
+        .ok()
+}
