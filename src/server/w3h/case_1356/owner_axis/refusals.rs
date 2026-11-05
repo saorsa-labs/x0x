@@ -11,7 +11,9 @@
 //! refused. J's requests then reach no node (A, O or member M1), so no
 //! answer to them changes `last_refusal` (§8: the newest refusal) between
 //! an injection and its read. The row checks this: no write from J is
-//! delivered from the first injection to the last read.
+//! delivered from the first injection to the last read. Frames that carry
+//! a message ID J first wrote before its join are not counted
+//! (`originated_by_j_after` tells why).
 
 use super::*;
 use crate::groups::recovery::{
@@ -110,35 +112,64 @@ async fn inject(sim: &Sim, group: &str, base: &View, injection: &Injection) -> R
     })
 }
 
+/// J-originated writes delivered after trace position `after`, per
+/// receiver: `fresh` counts the frames this row's premise is about, and
+/// `pre_join` the frames it does not count (see below).
+struct FromJ {
+    fresh: Vec<(&'static str, usize)>,
+    pre_join: Vec<(&'static str, usize)>,
+}
+
 /// Writes delivered after trace position `after` whose origin is J, per
 /// receiver. The origin is the one the prefix hold uses: the first sender
 /// of a pubsub message ID, else the sender. So J's relays of other nodes'
 /// gossip do not count; J's own requests do.
-fn originated_by_j_after(sim: &Sim, after: usize) -> Result<Vec<(&'static str, usize)>> {
+///
+/// A message ID first written before trace position `joined` (J redeems
+/// invite I) goes in `pre_join`, not in `fresh`. The hold's origin map
+/// starts when the hold is installed, before `joined`. It does not see a
+/// first write from before that time, so it names a later writer and
+/// passes the frame. This count reads the full trace and names J. Such IDs
+/// are J's traffic from before it had the group (its announces), and the
+/// control frames whose header ID is one of them: an IHAVE header carries
+/// the first ID of its batch, an IWANT header the first ID it requests, and
+/// every anti-entropy digest has the all-zero ID, so the first digest of
+/// the run names the origin of every later digest. Every request of J's
+/// for the group comes after `joined`, as a direct write or a message ID
+/// that J writes first after `joined`. The hold sees those first writes
+/// and holds them, and `fresh` counts them if one is delivered.
+fn originated_by_j_after(sim: &Sim, joined: usize, after: usize) -> Result<FromJ> {
     use crate::network::sim::{Fate, LaneClass};
     let j = sim.peer("J")?.0;
     let mut origins = std::collections::HashMap::new();
     let mut counts = Vec::new();
     for peer in ["O", "A", "X", "M1"] {
-        counts.push((peer, sim.peer(peer)?.0, 0));
+        counts.push((peer, sim.peer(peer)?.0, 0, 0));
     }
     for (position, write, fate) in sim.fabric().writes_with_positions() {
         let msg = (write.lane.class == LaneClass::PubSub)
             .then(|| pubsub_header(&write.bytes))
             .flatten()
             .map(|(_, id)| id);
-        let origin = match msg {
-            Some(id) => *origins.entry(id).or_insert(write.lane.src),
-            None => write.lane.src,
+        let (origin, first) = match msg {
+            Some(id) => *origins.entry(id).or_insert((write.lane.src, position)),
+            None => (write.lane.src, position),
         };
         let delivered = matches!(fate, Some(Fate::Delivered { .. }));
         if position > after && delivered && origin == j {
             if let Some(count) = counts.iter_mut().find(|c| c.1 == write.lane.dst) {
-                count.2 += 1;
+                if first >= joined {
+                    count.2 += 1;
+                } else {
+                    count.3 += 1;
+                }
             }
         }
     }
-    Ok(counts.into_iter().map(|(peer, _, n)| (peer, n)).collect())
+    Ok(FromJ {
+        fresh: counts.iter().map(|c| (c.0, c.2)).collect(),
+        pre_join: counts.iter().map(|c| (c.0, c.3)).collect(),
+    })
 }
 
 /// Whether `label` holds a re-seat journal or a staging record.
@@ -420,11 +451,15 @@ pub(super) async fn authorisation_refusals(sim: &mut Sim, receipt: &mut Receipt)
     injections.push(expired_one);
     // The module doc's premise: no answer to a request of J's could land
     // between an injection and its read.
-    let from_j = originated_by_j_after(sim, injecting)?;
+    let from_j = originated_by_j_after(sim, p.joined_at, injecting)?;
     receipt.evidence(
         "no_write_from_j_delivered_during_the_injections",
-        from_j.iter().all(|(_, n)| *n == 0),
-        format!("frames that J originated, delivered per node {from_j:?}"),
+        from_j.fresh.iter().all(|(_, n)| *n == 0),
+        format!(
+            "frames that J originated, delivered per node {:?}; not counted, frames whose \
+             message ID J first wrote before its join {:?}",
+            from_j.fresh, from_j.pre_join
+        ),
         at(sim),
     );
 

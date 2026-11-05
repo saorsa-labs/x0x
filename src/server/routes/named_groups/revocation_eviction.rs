@@ -1558,8 +1558,10 @@ pub(in crate::server) async fn revocation_eviction_pass(state: &Arc<AppState>) {
                 inner.ce.holders.insert(key.clone(), holders);
             }
         }
-        // §1a, §4b(2): every admin other than the target is expired; the
-        // row waits for an owner renewal and the admin's self-rebind.
+        // §1a, §4b(2): every admin other than the target is expired, or the
+        // target is the sole admin and its own certificate is expired
+        // (#1581); the row waits for an owner renewal and the admin's
+        // self-rebind.
         if let Some(wait) = rebind::row_override(&inner.rebind, info, &row, target_seated, now_unix)
         {
             evaluation.waiting = Some(wait);

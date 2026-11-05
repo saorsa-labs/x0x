@@ -2066,7 +2066,7 @@ the fields shown:
 |---|---|---|
 | `catching_up` | `attested_by`, `verified`, `cursor`, `segment_terminal` | An admin's attestation (ATA) covers this node's gap. The node applies the attested links. While a verified catch-up makes progress, a soft refusal (for example `rate_limited`) or a silent round does not change the state. A new verified attestation counts as progress for the hold only; it does not defer `renewal_due`. After 10 minutes without progress, the next refusal or silent round replaces it with `awaiting_attestation`; the timeout alone does not change the state. An armed attestation with no progress asks for renewal (`renewal_due`) after 30 minutes. A hard refusal, for example `not_a_member`, replaces it at once. |
 | `awaiting_attestation` | `reason`, `asked`, `next_retry_at_ms` | The node asks capable admins, then members. `reason` is `no_capable_peer`, `no_reply`, `segment_exhausted`, `renewal_due`, `provisional_unverified`, or the last refusal reason. |
-| `readmission_required` | `cause`, `asked`, `exit` | `cause` is `base_beyond_retention` or `local_state_lost`. `exit` is `manual_remove_and_reinvite` until ADR 0114's repair is in effect. |
+| `readmission_required` | `cause`, `asked`, `exit` | `cause` is `base_beyond_retention` or `local_state_lost`. `exit` is `manual_remove_and_reinvite` until ADR 0114's repair is in effect. A readmitted joiner whose own admission commit (`MemberAdded` or `JoinRequestApproved` with a Welcome reference) cannot fetch its staged Welcome (the admitting admin restarted, or the Welcome's 10-minute lifetime passed) comes back to this state and stops asking. Its join attempt ends with `last_join_outcome` `timed_out`, reason `rearm_original_result_unavailable` (ADR 0107), and it applies no later attestation for that attempt. A node that holds its keys never ends this way. A new verified invite starts a new attempt. |
 | `manual_clear_required` | `ref` | The head is on the admin's chain, but the marker names a sibling. Use `POST /groups/:id/quarantine/clear`. |
 | `reseat_required` | `cause`, `ref`, `last_refusal`, `asked` | `cause` is `not_on_chain`, `attestation_conflict`, `not_a_member` or `reseat_failed`. An admin must re-seat this node by hand. When this node refuses a re-seat authorisation, `last_refusal` is `authorisation_refused:<cause>`, where `<cause>` is `signature`, `signer`, `subject`, `basis`, `base_seats_subject` or `expired` (ADR 0109 §3); other failed checks, for example `group_mismatch` or `reseat_invite_unpaired`, show their own name. |
 | `reseat_in_progress` | `authorised_by`, `phase`, `expires_at_ms` | A valid authorisation arrived. The staged join runs. |
@@ -3334,8 +3334,8 @@ Run a command on **another** agent's machine. Disabled by default; every request
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback) |
-| POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart |
+| GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback). Read-only: a check that finds a newer release announces nothing and never leads to an install on this node (#1169, Engineer ruling 3 Nov 2026 17:40 GMT) |
+| POST | `/upgrade/apply` | `x0x upgrade --apply` | Daemon applies the latest verified release manifest with transactional restart; the observed release is announced on `x0x/release` before the apply work (#1169) |
 | GET | `/diagnostics/upgrade` | `x0x diagnostics upgrade` | Local version + update policy + version/policy digest for the M1 census (#1383; no update check runs, nothing is announced) |
 
 **Version/policy digest (#1383).** `GET /diagnostics/upgrade` reports the
