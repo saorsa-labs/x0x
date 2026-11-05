@@ -96,13 +96,24 @@ pub(super) fn run_trial(
                 cause(journal::CauseClass::Failed, reason),
             );
         }
+        // A run-out total budget is Failed and wins over a stop that arrives
+        // in the same pass. A changed boot or a regressed clock stays
+        // Interrupted: the launcher cannot tell whether the deadline passed
+        // before the reboot.
+        let clock = now()?;
+        let expired = trial.expired(&clock);
+        if let Some(cause) = expired
+            .as_ref()
+            .filter(|cause| cause.class == journal::CauseClass::Failed)
+        {
+            return rollback(host, path, trial, cause.clone());
+        }
         if stop() {
             trial.phase = Phase::Stopped;
             trial.save(path)?;
             return Ok(Outcome::Stopped);
         }
-        let clock = now()?;
-        if let Some(cause) = trial.expired(&clock) {
+        if let Some(cause) = expired {
             return rollback(host, path, trial, cause);
         }
         if clock.ms < trial.next_launch_ms {
@@ -460,6 +471,31 @@ mod tests {
         assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
         assert!(
             cause.reason.contains("launch attempts exhausted"),
+            "{cause:?}"
+        );
+    }
+
+    /// A stop that arrives after the total budget ran out does not turn the
+    /// Failed verdict into Interrupted.
+    #[test]
+    fn a_stop_after_the_total_budget_ran_out_stays_failed() {
+        let (_dir, root, host, _record) = fixture(journal::Phase::SwappedCli);
+        let path = root.join("trial.json");
+        let mut trial = trial_in(&host, &path, Phase::Authorized, 1);
+        let boot = trial.boot.clone();
+        let late = trial.deadline_ms;
+        let clock = move || {
+            Ok(Clock {
+                boot: boot.clone(),
+                ms: late,
+            })
+        };
+        let _ = run_trial(&host, &path, &mut trial, clock, |_| Ok(false), || true);
+        assert_previous_pair(&host);
+        let cause = journal_record(&root).cause.unwrap();
+        assert_eq!(cause.class, journal::CauseClass::Failed, "{cause:?}");
+        assert!(
+            cause.reason.contains("total trial deadline reached"),
             "{cause:?}"
         );
     }
