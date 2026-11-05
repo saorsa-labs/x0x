@@ -13104,6 +13104,43 @@ fn catchup_page_within_attested_sequence(
     true
 }
 
+/// ADR 0109 §2 rule (b) (§7 (b), D82): may this node apply the commit of
+/// `event` state-only, with no local TreeKEM group? The caller found no
+/// TreeKEM group for the group. The node must not be Active on its roster
+/// (pre-Welcome). The commit must be the next hash of an armed attested
+/// sequence (owner-armed record or admin-armed ATA), checked on `info`,
+/// the record before this commit. This is the same gate that the
+/// catch-up page path uses, so a link that leaves the sequence, or a link
+/// after the signer lost its Active admin seat, is refused. A link that
+/// changes the policy hash is refused (§2). The TreeKEM commit is then
+/// skipped: no tree and no epoch come from it. The node's keys come only
+/// from its own Welcome at the terminal. `MemberAdded` has its own older
+/// pre-Welcome rule and does not use this check.
+async fn pre_welcome_state_only_link_admitted(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+) -> bool {
+    if info.has_active_member(local_agent_hex) {
+        return false;
+    }
+    let Some(commit) = named_group_metadata_event_commit(event) else {
+        return false;
+    };
+    if commit.policy_hash != x0x::groups::compute_policy_hash(&info.policy) {
+        return false;
+    }
+    let sequence = match armed_anchored_gap_sequence(info) {
+        Some(record) => record.attested_chain_hashes.clone(),
+        None => match group_recovery::armed_admin_sequence(state, info).await {
+            Some(sequence) => sequence,
+            None => return false,
+        },
+    };
+    catchup_page_within_attested_sequence(std::slice::from_ref(event), &info.state_hash, &sequence)
+}
+
 /// Test-only mirror of [`armed_anchored_gap_sequence`]: is the #846
 /// catch-up gate ARMED for this group right now? Lets a test prove the
 /// gate (not a disarm) admitted or refused each page.
@@ -17711,21 +17748,29 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
                 };
-                let Some(group) = group else {
-                    return ApplyMetadataResult::REJECTED;
-                };
-                if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                if let Some(group) = group {
+                    if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                        state,
+                        &resolved_group_key,
+                        &next,
+                        group,
+                        &commit_bytes,
+                        _epoch,
+                        "member_removed_commit",
+                    )
+                    .await
+                    {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM remove commit: {e}");
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                } else if !pre_welcome_state_only_link_admitted(
                     state,
-                    &resolved_group_key,
-                    &next,
-                    group,
-                    &commit_bytes,
-                    _epoch,
-                    "member_removed_commit",
+                    &info,
+                    &event_for_log,
+                    &local_agent_hex,
                 )
                 .await
                 {
-                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM remove commit: {e}");
                     return ApplyMetadataResult::REJECTED;
                 }
             }
@@ -18173,25 +18218,33 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
                 };
-                let Some(group) = group else {
-                    return banned_reject("treekem_group_missing", &resolved_group_key);
-                };
-                if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                if let Some(group) = group {
+                    if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                        state,
+                        &resolved_group_key,
+                        &next,
+                        group,
+                        &commit_bytes,
+                        epoch,
+                        "member_banned_commit",
+                    )
+                    .await
+                    {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM ban commit: {e}");
+                        return banned_reject(
+                            "process_treekem_commit_after_crypto_recheck",
+                            &resolved_group_key,
+                        );
+                    }
+                } else if !pre_welcome_state_only_link_admitted(
                     state,
-                    &resolved_group_key,
-                    &next,
-                    group,
-                    &commit_bytes,
-                    epoch,
-                    "member_banned_commit",
+                    &info,
+                    &event_for_log,
+                    &local_agent_hex,
                 )
                 .await
                 {
-                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM ban commit: {e}");
-                    return banned_reject(
-                        "process_treekem_commit_after_crypto_recheck",
-                        &resolved_group_key,
-                    );
+                    return banned_reject("treekem_group_missing", &resolved_group_key);
                 }
             }
             // ADR 0107 (review r2): inside this apply's critical section, on
@@ -18596,21 +18649,29 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         let map = state.treekem_groups.read().await;
                         map.get(&resolved_group_key).cloned()
                     };
-                    let Some(group) = group else {
-                        return ApplyMetadataResult::REJECTED;
-                    };
-                    if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                    if let Some(group) = group {
+                        if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                            state,
+                            &resolved_group_key,
+                            &next,
+                            group,
+                            &commit_bytes,
+                            _epoch,
+                            "join_request_approved_commit",
+                        )
+                        .await
+                        {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM add commit: {e}");
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    } else if !pre_welcome_state_only_link_admitted(
                         state,
-                        &resolved_group_key,
-                        &next,
-                        group,
-                        &commit_bytes,
-                        _epoch,
-                        "join_request_approved_commit",
+                        &info,
+                        &event_for_log,
+                        &local_agent_hex,
                     )
                     .await
                     {
-                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM add commit: {e}");
                         return ApplyMetadataResult::REJECTED;
                     }
                 }
@@ -51937,6 +51998,7 @@ pub(in crate::server) mod tests {
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
+    mod issue1623_pre_welcome_page_links;
     mod issue1649_reseat_mandate_receive;
     mod issue1657_typed_refusal_catchup;
     mod issue1664_machine_addressed_replies;
