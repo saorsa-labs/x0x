@@ -13108,11 +13108,13 @@ fn catchup_page_within_attested_sequence(
 /// `event` state-only, with no local TreeKEM group? The caller found no
 /// TreeKEM group for the group. The node must not be Active on its roster
 /// (pre-Welcome). The commit must be the next hash of an armed attested
-/// sequence (owner-armed record or admin-armed ATA), checked on `info`,
-/// the record before this commit. This is the same gate that the
-/// catch-up page path uses, so a link that leaves the sequence, or a link
-/// after the signer lost its Active admin seat, is refused. A link that
-/// changes the policy hash is refused (§2). The TreeKEM commit is then
+/// sequence, checked on `info`, the record before this commit. When the
+/// owner-armed record and the admin-armed ATA are both armed, the commit
+/// must be inside both, as on the catch-up page path. So a link that
+/// leaves a sequence, or a link after the ATA signer lost its Active admin
+/// seat, is refused. A link that changes the policy hash is refused (§2);
+/// the ordinary apply also refuses it, because the state hash is
+/// recomputed from the local policy. The TreeKEM commit is then
 /// skipped: no tree and no epoch come from it. The node's keys come only
 /// from its own Welcome at the terminal. `MemberAdded` has its own older
 /// pre-Welcome rule and does not use this check.
@@ -13131,14 +13133,18 @@ async fn pre_welcome_state_only_link_admitted(
     if commit.policy_hash != x0x::groups::compute_policy_hash(&info.policy) {
         return false;
     }
-    let sequence = match armed_anchored_gap_sequence(info) {
-        Some(record) => record.attested_chain_hashes.clone(),
-        None => match group_recovery::armed_admin_sequence(state, info).await {
-            Some(sequence) => sequence,
-            None => return false,
-        },
-    };
-    catchup_page_within_attested_sequence(std::slice::from_ref(event), &info.state_hash, &sequence)
+    let link = std::slice::from_ref(event);
+    let owner_sequence =
+        armed_anchored_gap_sequence(info).map(|record| &record.attested_chain_hashes);
+    let admin_sequence = group_recovery::armed_admin_sequence(state, info).await;
+    if owner_sequence.is_none() && admin_sequence.is_none() {
+        return false;
+    }
+    owner_sequence.is_none_or(|sequence| {
+        catchup_page_within_attested_sequence(link, &info.state_hash, sequence)
+    }) && admin_sequence.is_none_or(|sequence| {
+        catchup_page_within_attested_sequence(link, &info.state_hash, &sequence)
+    })
 }
 
 /// Test-only mirror of [`armed_anchored_gap_sequence`]: is the #846
@@ -18244,7 +18250,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 )
                 .await
                 {
-                    return banned_reject("treekem_group_missing", &resolved_group_key);
+                    // A seated node with no tree is missing its tree; a
+                    // pre-Welcome node failed the rule (b) check.
+                    let reason = if info.has_active_member(&local_agent_hex) {
+                        "treekem_group_missing"
+                    } else {
+                        "pre_welcome_link_not_admitted"
+                    };
+                    return banned_reject(reason, &resolved_group_key);
                 }
             }
             // ADR 0107 (review r2): inside this apply's critical section, on
