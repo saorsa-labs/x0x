@@ -151,7 +151,7 @@ async fn after_responder_interval(sim: &Sim) -> Result<()> {
 }
 
 /// Drops every gossip write to J on `group`'s metadata topic.
-async fn hold_meta_from_j(sim: &Sim, group: &str) -> Result<()> {
+pub(super) async fn hold_meta_from_j(sim: &Sim, group: &str) -> Result<()> {
     use crate::network::sim::{Fault, LaneClass};
     let topic = {
         let state = sim.state("A")?;
@@ -285,6 +285,15 @@ fn segment_boundary(run: &Run) -> bool {
 }
 
 async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+    // This row checks the fixed limit of ADR 0109 §11 (64 links), so its
+    // helpers use `ATA_MAX_LINKS`, not the test-adjustable
+    // `ata_max_links()`. A test override in force would make them wrong.
+    ensure!(
+        crate::groups::recovery::ata_max_links() == ATA_MAX_LINKS,
+        "INFRA: a test override sets the links-per-ATA limit to {}; H-S3-s64 checks the \
+         fixed limit of {ATA_MAX_LINKS}",
+        crate::groups::recovery::ata_max_links()
+    );
     let run64 = gap_run(sim, ATA_MAX_LINKS - 1).await?;
     receipt.setup_done(at(sim));
     // The 64-link run sends no request: its join carry holds all 64 links,
