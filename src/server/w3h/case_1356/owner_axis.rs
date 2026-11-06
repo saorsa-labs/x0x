@@ -470,13 +470,39 @@ async fn fork_prefix(
     // gets no r+1′ frame in some runs (#1689 trace).
     let cut_x = move |origin: Key, dst: Key| (origin == x && dst != j) || (dst == x && origin != j);
     let hold = install_hold(sim);
+    // #1623: a pre-Welcome joiner pages through every link kind of an
+    // armed sequence, so J's catch-up with O or A would apply r+1 and close
+    // the gap before the window. As the ADR orders it, J's catch-up waits:
+    // from the moment J's gap gate is set, every write between J and a
+    // node other than X is held (the next hold keeps this).
+    let gate_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let j_state = sim.state("J")?;
+    let gate_group = group.clone();
+    let j_gated = move || {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !gate_seen.load(SeqCst) {
+            let set = j_state.named_groups.try_read().is_ok_and(|groups| {
+                crate::server::resolve_group_entry_locked(&groups, &gate_group).is_some_and(
+                    |(_, info)| {
+                        info.invite_lineage
+                            .as_ref()
+                            .is_some_and(|l| l.anchored_gap_refusal.is_some())
+                    },
+                )
+            });
+            if set {
+                gate_seen.store(true, SeqCst);
+            }
+        }
+        gate_seen.load(SeqCst)
+    };
     {
         let (held, capture) = (Arc::clone(&held), Arc::clone(&capture));
         let (seal_ids, seal_capture) = (Arc::clone(&seal_ids), Arc::clone(&seal_capture));
         set_hold(
             sim,
             &hold,
-            "X reaches J only; O's r+1 captured",
+            "X reaches J only; O's r+1 captured; J's catch-up held once its gate is set",
             move |origin, dst, msg| {
                 if let (Some(id), true, Ok(mut set)) = (msg, origin == o, held.lock()) {
                     if capture.load(std::sync::atomic::Ordering::SeqCst) {
@@ -488,7 +514,8 @@ async fn fork_prefix(
                         set.insert(id);
                     }
                 }
-                cut_x(origin, dst) || (dst == j && is_held(&held, msg))
+                let j_link = (dst == j && origin != x) || (origin == j && dst != x);
+                cut_x(origin, dst) || (dst == j && is_held(&held, msg)) || (j_link && j_gated())
             },
         );
     }
