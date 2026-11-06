@@ -1,0 +1,387 @@
+//! W3-H red case for #1776: a fresh joiner that starts ~90 s after the
+//! group was created receives its `MemberAdded` over the gossip mesh but
+//! cannot fetch the TreeKEM Welcome, and the join times out.
+//!
+//! # Why it is RED on main (8596bb83d)
+//!
+//! - The staging authority puts a content-addressed `welcome_ref` in the
+//!   `MemberAdded` event and keeps the Welcome bytes locally
+//!   (`stage_treekem_welcome`, named_groups.rs). The joiner's only
+//!   transport for those bytes is a direct-DM `FetchRequest` to
+//!   `welcome_ref.source` — the authority itself.
+//! - A direct DM needs a capability binding (a gossip-inbox KEM advert) or
+//!   a machine it can dial for raw QUIC. In the reported deployment the
+//!   joiner held neither: it joined the mesh ~90 s after the authority's
+//!   last advert and identity-announcement beats (both ride a 600 s
+//!   cadence plus a ~80 s startup burst, and are not replayed onto meshes
+//!   joined later), and nothing from the authority reached it in the other
+//!   direction either — so no store the DM path resolves through ever
+//!   learned the authority. Group membership events seed none of them, so
+//!   the verified `MemberAdded` taught the joiner nothing it could address.
+//! - Every `FetchRequest` therefore failed `AgentNotFound` →
+//!   `RecipientUndiscovered`, each fetch burned its full budget while the
+//!   apply held the group membership lock, and the attempt finalised
+//!   `timed_out` with no local group — while the authority still listed
+//!   the joiner as an active member.
+//!
+//! # Scenario
+//!
+//! Nodes O (node 0, every node's bootstrap peer — the issue's relay R) and
+//! A (the owner). B, the fresh joiner, starts only after the delay. The
+//! fabric carries the deployment's blind window as two fault rules:
+//!
+//! - Nothing but the group's own metadata topic and the targeted
+//!   capability control topics reaches B over pubsub: the identity
+//!   announcements, adverts and shards the mesh would otherwise sync to a
+//!   new subscriber never arrive, exactly the deployment where the relay
+//!   reconciled no state for the late joiner. The `MemberAdded` still
+//!   arrives (the issue's reporter observed that), and a fresh on-demand
+//!   capability exchange still converges.
+//! - No DM-class frame reaches B while B holds no gossip-usable capability
+//!   binding for A: the blind window's other half (in the report, nothing from the
+//!   authority ever reached the joiner). The rule releases the moment B
+//!   can address A — which on main never happens, and with the fix is
+//!   exactly what the targeted refresh brings about.
+//!
+//! 1. A creates a `private_secure` group and invites B.
+//! 2. 90 s of virtual idleness pass — past A's advert startup burst, well
+//!    before its next steady beat (the issue's reproduction delay).
+//! 3. B starts, bootstraps only to O, and redeems the invitation once.
+//! 4. A seats B over the topic mesh. On main, B's local membership never
+//!    turns `active`: its group install waits for a Welcome it cannot
+//!    request — and on an interleaving where the seat event itself never
+//!    reaches B (every mesh envelope to B is opaque to the fault rule and
+//!    every DM is dropped until a binding exists), B never even learns it
+//!    was seated: it re-applies its own `member_joined` while its join
+//!    poll's fetches to the authority die on the instant `AgentNotFound`
+//!    path. With the fix, whichever leg is stuck asks for the authority's
+//!    advert over the targeted control topics — the poll's fetch when it
+//!    cannot address the inviter, and the Welcome fetch before its first
+//!    send and again after any send that still leaves the authority
+//!    unaddressable, whichever `DmError` variant surfaced — so the binding
+//!    lands, the staged result and then the Welcome come back over the
+//!    gossip-inbox leg, and B installs the group; proven further by B
+//!    opening the group store, which needs the group key the Welcome
+//!    carries.
+
+use super::control::{
+    create_group, invite, join, local_membership, members, mesh, open_store, try_open_store,
+};
+use super::receipt::{Receipt, Verdict};
+use super::*;
+use crate::network::sim::{Fault, LaneClass, Write};
+use anyhow::{ensure, Context as _};
+
+const CASE: &str = "w3h_1776_delayed_fresh_joiner_fetches_the_welcome";
+const SEED: u64 = 0x1776_0001;
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+const DM_TOPIC_MARKER: &[u8] = b"x0x/dm/v1/";
+/// The targeted capability refresh carriers (ADR 0030 §3), matched by their
+/// exact wire names: the Critical request and response topics, and the
+/// domain prefix of the warm request copy that rides the steady advert
+/// topic. These are the only wire strings that contain "targeted", so this
+/// is the same set of frames the earlier `b"targeted"` substring passed,
+/// but no unrelated frame can pass Fault 1 by a partial name match.
+const TARGETED_CARRIERS: [&[u8]; 3] = [
+    crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC.as_bytes(),
+    crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.as_bytes(),
+    crate::dm_capability_service::WARM_TARGETED_REQUEST_DOMAIN,
+];
+
+fn is_targeted_capability_carrier(write: &Write) -> bool {
+    TARGETED_CARRIERS
+        .iter()
+        .any(|marker| contains(&write.bytes, marker))
+}
+
+/// Virtual-time budget for B to report active membership after the join.
+const B_ACTIVE_BUDGET: Duration = secs(180);
+
+fn is_dm(write: &Write) -> bool {
+    match write.lane.class {
+        LaneClass::Direct | LaneClass::RelayedDm => true,
+        LaneClass::PubSub => contains(&write.bytes, DM_TOPIC_MARKER),
+        _ => false,
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "W3-H daemon cases run in the Linux isolated namespace only"
+)]
+fn w3h_1776_delayed_fresh_joiner_fetches_the_welcome() -> Result<()> {
+    super::block_on_paused(async move {
+        let receipt = run().await;
+        ensure!(
+            receipt.verdict() == Some(Verdict::Green),
+            "{CASE} verdict {:?}, expected GREEN",
+            receipt.verdict()
+        );
+        Ok(())
+    })
+}
+
+async fn run() -> Receipt {
+    let mut receipt = Receipt::new(CASE, SEED);
+    receipt.note(
+        "The fabric drops every pubsub frame to B except the group's own \
+         metadata topic and the targeted capability control topics, and every \
+         DM to B while B holds no gossip-usable capability binding for A: the deployment's \
+         blind window. Welcome delivery is observed as B's own active \
+         membership plus B opening the group store, which needs the group \
+         key the Welcome carries.",
+    );
+    match Sim::empty(CASE, SEED, &["O", "A", "B"]) {
+        Ok(mut sim) => {
+            if let Err(error) = scenario(&mut sim, &mut receipt).await {
+                receipt.infra(format!("{error:#}"), sim.fabric().now().as_micros());
+            }
+            if let Err(error) = sim.finish().await {
+                receipt.infra(format!("finish: {error:#}"), 0);
+            }
+        }
+        Err(error) => receipt.infra(format!("sim: {error:#}"), 0),
+    }
+    if receipt.verdict().is_none() || receipt.has_infra() {
+        receipt.reclassify(CASE);
+    }
+    receipt.emit();
+    receipt
+}
+
+async fn scenario(sim: &mut Sim, receipt: &mut Receipt) -> Result<()> {
+    let at = |sim: &Sim| sim.fabric().now().as_micros();
+    sim.start_node_with("O", Provision::default()).await?;
+    sim.start_node_with("A", Provision::default()).await?;
+    mesh(sim, &["O", "A"]).await?;
+    let group = create_group(sim, "A").await?;
+    let link = invite(sim, "A", &group).await?;
+    let metadata_topic = {
+        let state = sim.state("A")?;
+        let groups = state.named_groups.read().await;
+        crate::server::resolve_group_entry_locked(&groups, &group)
+            .map(|(_, info)| info.metadata_topic.clone())
+            .context("A has no record of the group")?
+    };
+
+    // The reproduction delay: 90 s after creation, A's advert startup
+    // burst is over and the next steady beat is 600 s away. B joins the
+    // mesh after every advert A has already published.
+    sim.within(
+        "90 s idle after the invite",
+        secs(92),
+        tokio::time::sleep(secs(90)),
+    )
+    .await?;
+
+    let b_machine = sim.ids("B")?.1 .0;
+    let topic_bytes = metadata_topic.clone().into_bytes();
+    // Fault 1: the mesh reconciles no state for the late joiner. Of the
+    // pubsub traffic delivered to B, only the group's own metadata topic
+    // (the `MemberAdded` leg) and the targeted capability request/response
+    // control topics pass; the identity, advert and shard topics that
+    // would teach B about A never arrive.
+    sim.fabric().add_rule(move |write| {
+        if write.lane.dst == b_machine
+            && write.lane.class == LaneClass::PubSub
+            && !is_dm(write)
+            && !contains(&write.bytes, &topic_bytes)
+            && !is_targeted_capability_carrier(write)
+        {
+            Fault::Drop
+        } else {
+            Fault::Pass
+        }
+    });
+
+    sim.start_node_with("B", Provision::default()).await?;
+    mesh(sim, &["O", "B"]).await?;
+    // Fault 2: no DM-class frame reaches B while B holds no gossip-usable
+    // capability binding for A (the same check production uses). Installed after B's daemon exists, before the join:
+    // A has nothing to send B before the join volley. The rule holds only
+    // a Weak handle, so it cannot keep B's daemon state alive past
+    // shutdown.
+    let b_state = Arc::downgrade(&sim.state("B")?);
+    let a_agent = sim.ids("A")?.0;
+    sim.fabric().add_rule(move |write| {
+        if write.lane.dst == b_machine
+            && is_dm(write)
+            && b_state.upgrade().is_some_and(|state| {
+                !state
+                    .agent
+                    .capability_store
+                    .lookup_binding(&a_agent)
+                    .as_ref()
+                    .is_some_and(crate::dm_capability::binding_is_gossip_usable)
+            })
+        {
+            Fault::Drop
+        } else {
+            Fault::Pass
+        }
+    });
+    receipt.setup_done(at(sim));
+
+    join(sim, "B", &link).await?;
+
+    let b = sim.agent_hex("B")?;
+    sim.until("A seats B", secs(180), async |s: &Sim| {
+        members(s, "A", &group)
+            .await
+            .is_ok_and(|listed| listed.contains(&b))
+    })
+    .await?;
+    receipt.evidence("a_seats_b_over_the_topic_mesh", true, b.clone(), at(sim));
+    receipt.request_delivered(
+        "b_join_volley_reaches_a_over_the_topic_mesh",
+        true,
+        "A seated B, so the join volley arrived although B holds no binding for A",
+        at(sim),
+    );
+    sim.fabric().mark("checkpoint: A seated B");
+    // The A->B leg (the Welcome reply rides A's pinned path to B) needs a
+    // binding on A's side. Record what A holds for B when it seats B, so a
+    // receipt shows which source the reply leg used. Observation only.
+    let b_agent = sim.ids("B")?.0;
+    let a_binding = sim
+        .state("A")?
+        .agent
+        .capability_store
+        .lookup_binding(&b_agent);
+    receipt.note(format!(
+        "a_binding_for_b_at_seat: present={} gossip_usable={}",
+        a_binding.is_some(),
+        a_binding
+            .as_ref()
+            .is_some_and(crate::dm_capability::binding_is_gossip_usable),
+    ));
+
+    // The step that never completes on main: B's own seat installs only
+    // with the Welcome, and B's group lookup 404s until then. On an
+    // interleaving where the seat event reached B the fetch's own repair
+    // applies: the fix refreshes the authority's advert before the first
+    // send, so the path activates within seconds. Where the seat event
+    // never arrived, the join poll's 2 s fetches repair addressability the
+    // same way and retrieve the authority's staged result, and the Welcome
+    // fetch (binding now held) follows. The budget covers the grind of a
+    // send that burns its whole absolute budget (~70 s here) before the
+    // reactive refresh lands the binding and the retry delivers.
+    let b_active = sim
+        .until(
+            "B reports active membership",
+            B_ACTIVE_BUDGET,
+            async |s: &Sim| local_membership(s, "B", &group).await.as_deref() == Some("active"),
+        )
+        .await
+        .is_ok();
+    if !b_active {
+        // The defect, observed: record it as the expected cause so the
+        // verdict is RED (bug reproduced), not INFRA (harness failure).
+        // No API read here: the apply that waits for the Welcome holds
+        // the group membership lock, so a GET would block on it. The
+        // daemon's own WARN trail names where the joiner stalled — the
+        // observation is otherwise blind (every API read blocks on the
+        // same lock).
+        // One second past the budget, so the trail starts before the join.
+        let since_join = sim.fabric().now() - (B_ACTIVE_BUDGET + secs(1));
+        let mut trail: Vec<(String, usize, f64, f64)> = Vec::new();
+        for log in sim.logs_containing(&[]) {
+            if log.at < since_join {
+                continue;
+            }
+            // Collapse a retry grind into one line: the first and last
+            // occurrence of a run of identical message bodies.
+            let body = log.text.chars().take(200).collect::<String>();
+            let at_s = log.at.as_secs_f64();
+            match trail.last_mut().filter(|(last, ..)| last == &body) {
+                Some((_, count, _, last_at)) => {
+                    *count += 1;
+                    *last_at = at_s;
+                }
+                None => trail.push((body, 1, at_s, at_s)),
+            }
+        }
+        let mut trail: Vec<String> = trail
+            .into_iter()
+            .map(|(body, count, first_at, last_at)| {
+                if count > 1 {
+                    format!("t={first_at:.1}-{last_at:.1}s (x{count}) {body}")
+                } else {
+                    format!("t={first_at:.1}s {body}")
+                }
+            })
+            .collect();
+        let trail = if trail.len() > 30 {
+            trail.split_off(trail.len() - 30)
+        } else {
+            trail
+        };
+        receipt.cause(
+            "welcome_fetch_never_completes_for_the_fresh_joiner",
+            Some(format!(
+                "B never reported active membership inside the 180 s budget; \
+                 WARN trail: {}",
+                trail.join(" | ")
+            )),
+            true,
+            at(sim),
+        );
+        receipt.finish(CASE, false, at(sim));
+        return Ok(());
+    }
+    receipt.evidence(
+        "b_fetches_the_welcome_and_activates",
+        true,
+        "membership_state=active",
+        at(sim),
+    );
+    receipt.request_delivered(
+        "b_fetches_the_welcome_over_the_gossip_mesh",
+        true,
+        "B's group install completed with the Welcome, so the FetchRequest \
+         reached the staging authority and the chunks returned",
+        at(sim),
+    );
+    sim.fabric()
+        .mark("checkpoint: B fetched and applied the Welcome");
+
+    // The Welcome's keying material, not just its metadata: opening the
+    // group store needs the group key the Welcome carries.
+    let store = open_store(sim, "A", &group).await?;
+    let mut opened = None;
+    let mut last = String::new();
+    sim.until(
+        "B opens the group store",
+        secs(60),
+        async |s: &Sim| match try_open_store(s, "B", &group).await {
+            Ok(id) => {
+                opened = Some(id);
+                true
+            }
+            Err(error) => {
+                last = format!("{error:#}");
+                false
+            }
+        },
+    )
+    .await
+    .with_context(|| format!("B last store-open error: {last}"))?;
+    ensure!(
+        opened.as_deref() == Some(store.as_str()),
+        "B opened a different store id: {opened:?}"
+    );
+    receipt.evidence(
+        "b_opens_the_group_store_with_the_welcome_key",
+        true,
+        store,
+        at(sim),
+    );
+    sim.fabric().mark("checkpoint: B holds the group key");
+    receipt.finish(CASE, true, at(sim));
+    Ok(())
+}

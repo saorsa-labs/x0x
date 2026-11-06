@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Read-only `GET /diagnostics/sidecar-quarantine` (#1597, D148).** It lists
+  each ADR 0108 §5a quarantined sidecar copy (pending or history) with its
+  `txid` and size in bytes, plus `count` and `total_bytes`. It does not change
+  a file. CLI: `x0x diagnostics sidecar-quarantine`.
 - **Per-kind gossip efficiency counters on `GET /diagnostics/gossip` (#1170).**
   `per_kind.current` is the open interval and `per_kind.last_completed` is the
   previous finished interval. Every reader receives the same

@@ -64,6 +64,12 @@ filter = 'test(/(^|::)w3h_1356_red_1661_welcome_lost_after_readmission_ends_type
 slow-timeout = { period = "60s", terminate-after = 15 }
 priority = 60
 
+# The H-S3-rm2 row: see the `w3h-gate` override below.
+[[profile.w3h.overrides]]
+filter = 'test(/(^|::)w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed$/)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+priority = 60
+
 # The H-S3-s64 row: see the `w3h-gate` override below.
 [[profile.w3h.overrides]]
 filter = 'test(/(^|::)w3h_1356_control_s3_s64_segment_boundary$/)'
@@ -109,6 +115,17 @@ priority = 60
 # runner, so this row gets 15 minutes and starts early in each rerun.
 [[profile.w3h-gate.overrides]]
 filter = 'test(/(^|::)w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed$/)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+priority = 60
+
+# ADR 0109 H-S3-rm2 (#1572): the d3-shaped five-node prefix with M1
+# seated, the 30-minute virtual advance and a re-seat like the H-S3-c
+# rows, then seven forgery windows of up to 60 s of virtual time each.
+# One run took about 161 s in the 12-CPU Lima VM, so about 320 s on the
+# 4-vCPU runner (the #1780 ratio). The 300 s kill above would end it with
+# no receipt, so it gets 15 minutes and starts early.
+[[profile.w3h-gate.overrides]]
+filter = 'test(/(^|::)w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed$/)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 priority = 60
 
@@ -184,6 +201,14 @@ priority = 60
 # gets 15 minutes here too, like the H-S3-c rows (run 40864998747).
 [[profile.default.overrides]]
 filter = 'test(/(^|::)w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed$/)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+priority = 60
+
+# ADR 0109 H-S3-rm2 (#1572): the row (see `w3h-gate`) is longer than an
+# H-S3-c row, which the 600 s kill here already ended (run 40864998747),
+# so it gets 15 minutes here too.
+[[profile.default.overrides]]
+filter = 'test(/(^|::)w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed$/)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 priority = 60
 
@@ -319,6 +344,22 @@ slow-timeout = { period = "60s", terminate-after = 25 }
 
 [test-groups.h-s3-home-released]
 max-threads = 2
+
+# ADR 0109 §10 H-S3-rm released-binary rows (#1572). Only rm1 exists
+# now; the filter also selects later rows in the same module. They
+# are `#[ignore]` and run only in the `h-s3-released-rows` CI job. Each
+# row runs a W3-H prefix, then four or five daemons on real loopback
+# sockets, one of them the published v0.46.1. A row took 145-250 s on a
+# 12-CPU VM, and the 4-vCPU runner takes about twice as long, so the
+# 10-minute default limit is too near. The limit is 25 minutes per row.
+# The group runs one row at a time.
+[[profile.default.overrides]]
+filter = 'test(/::owner_axis::released::/)'
+test-group = "h-s3-released-rows"
+slow-timeout = { period = "60s", terminate-after = 25 }
+
+[test-groups.h-s3-released-rows]
+max-threads = 1
 
 # The #1614 pair test (ADR 0083, issue #1593) stands up two loopback
 # daemons, and after its readiness loop saw every show gate true, the

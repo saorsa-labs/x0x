@@ -807,6 +807,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::None,
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/diagnostics/sidecar-quarantine",
+        cli_name: "diagnostics sidecar-quarantine",
+        description: "Read-only list of each quarantined sidecar copy (ADR 0108 §5a) with its size (D148)",
+        category: "network",
+        request: RequestSpec::None,
+    },
+    EndpointDef {
         method: Method::Post,
         path: "/peers/:peer_id/probe",
         cli_name: "peer probe",
