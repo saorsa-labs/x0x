@@ -324,9 +324,54 @@ The private pair engine is implemented and tested, but no live apply path calls
 it yet. Activation requires the S2c host inventory and the S3a acknowledged
 flush, whose daemon-side owner and arm-and-flush control listener now exist
 (see [Acknowledged shutdown flush](#acknowledged-shutdown-flush-supervised-exit)
-below); launcher-coordinated host transactions remain the missing piece.
-The current apply path still uses its existing single-binary replacement flow.
-Do not infer pair rollback or launcher protection from this dormant module.
+below). The launcher-side flush receipt, reap check and pair restore code
+now exists too, but it is switched off (`ENABLED = false`) and no apply path
+calls it; activation of launcher-coordinated host transactions is what
+remains. The current apply path still uses its existing single-binary
+replacement flow. Do not infer pair rollback or launcher protection from this
+dormant module.
+
+The dormant launcher trial (`src/upgrade/launcher/run.rs`) bounds a candidate
+start. It reserves each attempt durably before exec, so a failed exec still
+counts. The limits are at most 3 attempts, 120 s to readiness per attempt,
+60 s of stable health and a 660 s total trial, with 10 s between attempts.
+These values are provisional until David rules on them. When the attempts
+or the total budget run out, the cause is Failed, and a later service stop
+does not change it. Exhausted attempts also stay Failed after a reboot; this
+reading of ADR 0094 is provisional until David rules on it. A
+reboot before the launcher sees the run-out total budget is Interrupted,
+because the launcher cannot tell when the deadline passed. A changed boot, a launcher restart during exec or
+rollback, or a service stop while attempts remain is Interrupted. The
+launcher then restores the previous pair and starts the restored daemon. For
+a service stop, the restore happens on the next launcher start; the candidate
+bytes stay installed until then. A restarted launcher resumes an interrupted
+rollback and starts only a missing restored child, at most 3 times. The
+trial keeps its first rollback cause. Until the host journal reaches
+Restored, a Failed cause there replaces an Interrupted one, so the journal
+cause, which decides the hold, can differ from the trial cause. After
+Restored, the journal cause does not change. A failed reap or a failed restored start stops automatic
+recovery (`RecoveryFailed`) until an operator repairs the host.
+
+The `x0x-launcher` binary builds only with the non-default `m2-launcher`
+cargo feature. Default builds and `cargo install` of the published crate do
+not build it until the activation slice. The launcher gives a candidate its boot
+permit as one JSON line on descriptor 3 (`X0X_M2_BOOT_FD=3`). This contract is
+provisional and dormant; it is frozen before `ENABLED = true`.
+
+While activation is held, the dormant launcher child cannot brick a daemon
+start. `x0xd` reads `X0X_M2_BOOT_FD` before runtime creation; a marker with
+no launcher permit behind it (an unrelated or missing descriptor 3) is
+dropped with one warning line and the daemon starts normally. ADR 0094 §6
+itself governs unknown or corrupt recovery records. The held-boot path
+applies that rule to the boot marker by analogy: fail closed means "start
+the configured binary normally and report degraded", never brick startup.
+The degraded report in the code is one warning line on stderr. The refusal
+covers only a permit present on descriptor 3: one that fails its checks,
+or one the process cannot verify. On a non-Linux Unix host, every well-formed
+permit refuses the boot today, because the process-custody identity check
+needs Linux `/proc`. When activation turns the engine on, the full boot
+barrier applies as specified: permit checks, boot record write, then the
+barrier ack.
 
 The engine checks a verified release plan and durable passing probes under the
 existing daemon and managed-CLI install locks. It checks the installed hashes

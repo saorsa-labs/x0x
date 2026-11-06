@@ -821,6 +821,14 @@ pub(crate) fn millis_since(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// The message prefix of the [`DmError::EnvelopeConstruction`] that
+/// `send_direct` returns when this node's ADR-0043 B/P pairing policy
+/// refuses the recipient's machine. A caller that must tell this
+/// definitive policy refusal from other envelope failures (the ADR 0110
+/// S4 designated hand-off outcome) matches on it, so every producer
+/// builds its message from this constant.
+pub(crate) const RECIPIENT_PAIRING_DENIED: &str = "recipient pairing denied";
+
 /// Errors surfaced by the gossip DM path. See design doc §"Error model".
 #[derive(Debug, thiserror::Error)]
 pub enum DmError {
@@ -911,6 +919,18 @@ pub enum DmError {
     /// rejected the sender.
     #[error("recipient rejected: {reason}")]
     RecipientRejected { reason: String },
+
+    /// The local ADR-0043 §9 B/P gate denied the `(agent, machine)` pairing
+    /// that the send resolved, so nothing was sent. Check B: a tombstone
+    /// retired the binding. Check P: a current placement record pins the
+    /// agent to another machine. This is a local policy refusal, not a
+    /// transient fault: a retry fails the same way until the recipient's
+    /// binding or placement changes.
+    #[error("recipient pairing denied (ADR-0043 B/P): {denial:?}")]
+    RecipientPairingDenied {
+        /// Which check denied the pairing.
+        denial: crate::key_move::PairingDenial,
+    },
 
     /// Local gossip publish failed — typically because the mesh is not
     /// joined yet or the inbox topic has no active peers. Distinct from

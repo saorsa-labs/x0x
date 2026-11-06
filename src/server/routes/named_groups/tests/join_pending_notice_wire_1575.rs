@@ -2601,3 +2601,88 @@ async fn the_seam_recheck_withholds_mid_delivery_changes() -> Result<()> {
     );
     Ok(())
 }
+
+/// #1640 (ADR 0108 §8 Joiner, §6 typed blocks, D64): an attempt that
+/// reaches its poll deadline ends `timed_out` with a reason, never
+/// cause-free. With a held verified notice the reason is that notice's
+/// cause (an unknown cause in its `unrecognized_cause` display form).
+/// With no verified notice the reason is `no_admission_result`. The
+/// reason shows in the 404 join-status body after the stub is removed.
+#[tokio::test]
+async fn a_timed_out_join_names_its_last_cause_or_no_admission_result() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let inviter = AgentKeypair::generate()?;
+    let member_signer = AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let inviter_hex = hex::encode(inviter.agent_id().as_bytes());
+    let now = now_millis_u64();
+    let cases: [(&str, Option<&str>, &str); 3] = [
+        (
+            "1640a",
+            Some("owner_certificate_pending"),
+            "owner_certificate_pending",
+        ),
+        ("1640b", Some("future_slice_cause"), "unrecognized_cause"),
+        ("1640c", None, JOIN_NO_ADMISSION_RESULT_REASON),
+    ];
+    for (seed, held, expected) in cases {
+        let group_key = seed.repeat(12);
+        let attempt_id = format!("at{seed}");
+        let _ =
+            seed_joiner_attempt(&state, &group_key, &attempt_id, &inviter, &member_signer).await;
+        // A fresh join: the non-durable stub is pending (not an ADR 0107
+        // fetch-only re-arm over a durable remnant).
+        state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(group_key.clone());
+        let stable = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .map(|info| info.stable_group_id().to_string())
+            .expect("stub installed");
+        if let Some(cause) = held {
+            let notice = signed_notice(
+                notice_body(
+                    &group_key,
+                    &joiner_hex,
+                    &inviter_hex,
+                    &attempt_id,
+                    cause,
+                    JoinPendingNoticeDetail {
+                        count: (cause == "owner_certificate_pending").then_some(2),
+                        ..JoinPendingNoticeDetail::default()
+                    },
+                    now,
+                ),
+                &inviter,
+            );
+            assert!(
+                verify_and_hold_join_pending_notice(&state, true, &notice).await,
+                "{seed}: the authority-signed notice is held"
+            );
+        }
+        let disposition = finalize_join_attempt(
+            &state,
+            &group_key,
+            &stable,
+            &joiner_hex,
+            &attempt_id,
+            JoinAttemptOutcome::TimedOut,
+            JoinFinalizeGuard::Unlocked,
+        )
+        .await;
+        assert_eq!(disposition, JoinFinalizeDisposition::Finalized, "{seed}");
+        let (code, body) = join_status_body(&state, &group_key).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{seed}: the stub is removed");
+        assert_eq!(body["last_join_outcome"]["outcome"], "timed_out", "{seed}");
+        assert_eq!(
+            body["last_join_outcome"]["reason"], expected,
+            "{seed}: a timed_out join names its cause"
+        );
+    }
+    Ok(())
+}

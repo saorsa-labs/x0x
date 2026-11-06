@@ -3287,7 +3287,7 @@ pub(super) async fn join_carry_attestation(
         .map(|link| link.commit.state_hash.clone())
         .chain(std::iter::once(terminal.state_hash.clone()))
         .collect();
-    sequence.truncate(s3::ATA_MAX_LINKS);
+    sequence.truncate(s3::ata_max_links());
     let segment_terminal_revision = from_revision.saturating_add(sequence.len() as u64);
     let segment_terminal_epoch = if segment_terminal_revision == terminal.revision {
         terminal_epoch

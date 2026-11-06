@@ -983,6 +983,8 @@ enum DiagnosticsSub {
     Connect,
     /// Print WebSocket outbound-queue health (capacity, drops, slow-consumer closes).
     Ws,
+    /// Print each quarantined sidecar copy with its size (read-only, D148).
+    SidecarQuarantine,
     /// Print durable-history writer/reaper counters (ADR-0023).
     History,
 }
@@ -2656,6 +2658,9 @@ async fn run(
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,
             DiagnosticsSub::Connect => commands::network::diagnostics_connect(&client).await,
             DiagnosticsSub::Ws => commands::network::diagnostics_ws(&client).await,
+            DiagnosticsSub::SidecarQuarantine => {
+                commands::network::diagnostics_sidecar_quarantine(&client).await
+            }
             DiagnosticsSub::History => commands::history::diagnostics(&client).await,
         },
         Commands::History { sub } => match sub {

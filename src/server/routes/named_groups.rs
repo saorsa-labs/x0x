@@ -14926,8 +14926,31 @@ async fn request_treekem_catchup_page(
         (from_revision, from_epoch, current_state_hash.clone()),
     );
     #[cfg(test)]
+    detached_send_test_seam::park(&format!("treekem-catchup-page:{group_id}")).await;
+    // #1655 (ADR 0110 §3): re-read the agent revocation immediately
+    // before the write. Every caller decided on its peer before one or
+    // more awaits (the response handler applies and persists a whole
+    // page first), so a revocation can land in between. An agent-revoked
+    // peer gets no new message from this node, and its answer would die
+    // at the page gate ([`treekem_catchup_sender_departed`]) anyway. The
+    // machine and binding holds and the resync hold are not checked
+    // here: they keep the callers' #1685 round 9 behaviour (the ask goes
+    // to the agent, whose clean machine may answer). A refused ask
+    // returns `false`, the "could not send" result every caller handles.
     {
-        detached_send_test_seam::park(&format!("treekem-catchup-page:{group_id}")).await;
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if treekem_catchup_sender_departed(&revoked, peer) {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                peer = %LogHexId::agent(&hex::encode(peer.as_bytes())),
+                "TreeKEM catch-up page request withheld: the peer's agent was revoked before the send"
+            );
+            return false;
+        }
+    }
+    #[cfg(test)]
+    {
         if state
             .named_group_test_recorders
             .catchup_page_force_ok
@@ -15496,6 +15519,9 @@ async fn apply_named_group_metadata_event_with_binding(
     } else {
         None
     };
+    // #1775 (claude review round 12): only the share half moves parked
+    // secrets on; a role update replays removals, not re-deliveries.
+    let secure_share = matches!(event, NamedGroupMetadataEvent::SecureShareDelivered { .. });
     // #946 C3: a member who leaves or is removed/banned loses any
     // certificate-unobtainable refusal window, so a later rejoin starts
     // retryable. Captured before `event` moves.
@@ -15563,6 +15589,17 @@ async fn apply_named_group_metadata_event_with_binding(
         }
     }
     if let Some(gid) = share_group {
+        // #1775 (claude review round 12): an accepted share can complete
+        // the wait a parked secret records with no commit that follows
+        // it — a keyless commit already committed the displacing wait's
+        // epoch — so the re-delivery runs here, with every apply guard
+        // dropped, before the removals replay: the re-delivered key lets
+        // that replay find keys, the order replay_after_gss_install
+        // keeps.
+        if secure_share && applied.accepted {
+            Box::pin(revocation_eviction::owner_recovery::redeliver_parked_secret(state, &gid))
+                .await;
+        }
         replay_parked_gss_removals(state, &gid).await;
     }
     refresh_group_rosters_for_gossip(state).await;
@@ -19083,16 +19120,23 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // MemberBanned commit but have not yet received the actual shared
             // secret material. #1766: a waiting transition's share may
             // replace an uncommitted secret of its epoch from another sender.
-            if secret_epoch < info.secret_epoch
+            // #1775 (3 Nov review thread): a share of an earlier epoch takes
+            // that same replace path over a secret of a later epoch that no
+            // commit pins — the sealed share that raised the local epoch past
+            // the head — so the waiting transition's own share recovers its
+            // frame; the strict guard alone would refuse it for ever.
+            let replaces_unpinned_secret = info.shared_secret.is_some()
+                && gss_share_hold::replaces_uncommitted_secret(
+                    state,
+                    &resolved_group_key,
+                    &info,
+                    &sender_hex,
+                    secret_epoch,
+                );
+            if (secret_epoch < info.secret_epoch && !replaces_unpinned_secret)
                 || (secret_epoch == info.secret_epoch
                     && info.shared_secret.is_some()
-                    && !gss_share_hold::replaces_uncommitted_secret(
-                        state,
-                        &resolved_group_key,
-                        &info,
-                        &sender_hex,
-                        secret_epoch,
-                    ))
+                    && !replaces_unpinned_secret)
             {
                 return ApplyMetadataResult::REJECTED;
             }
@@ -19141,6 +19185,28 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             .await
             {
                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "rejecting SecureShareDelivered after post-crypto terminality recheck: {e}");
+                return ApplyMetadataResult::REJECTED;
+            }
+            // #1775 (claude review round 11): a replacing share of an
+            // earlier epoch displaces a later epoch's installed secret —
+            // an honest rotation's share that arrived before its commit.
+            // The displaced value is parked, durably and before the
+            // replacing secret installs, and re-delivers once the head
+            // commits the displacing wait's epoch, so the later
+            // rotation's commit lands with its key. Round 12: a park
+            // whose durable write fails installs nothing — the displaced
+            // value must not pass to a restart with no record behind it —
+            // and the share retries.
+            if replaces_unpinned_secret
+                && secret_epoch < info.secret_epoch
+                && !gss_share_hold::park_displaced_secret(
+                    state,
+                    &resolved_group_key,
+                    &info,
+                    secret_epoch,
+                )
+                .await
+            {
                 return ApplyMetadataResult::REJECTED;
             }
             let mut next = info.clone();
@@ -19289,9 +19355,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
 
-            // 4. Derived AgentId must match the claimed member_agent_id.
+            // 4. Derived AgentId must match the claimed member_agent_id
+            //    exactly. The roster, ban list and invite ledger are keyed
+            //    by the lowercase `hex::encode` id, so a case-folded id
+            //    would get around `is_banned` (#1149).
             let derived = hex::encode(ant_quic::derive_peer_id_from_public_key(&pubkey).0);
-            if !derived.eq_ignore_ascii_case(&member_agent_id) {
+            if derived != member_agent_id {
                 tracing::debug!(
                     group_id = %resolved_group_key,
                     "MemberJoined: derived agent_id {} != claimed {}",
@@ -19464,6 +19533,32 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     member = %LogHexId::agent(&member_agent_id),
                     "MemberJoined: admission withheld; no eligible admin remains (ADR 0110 §4)"
                 );
+                return ApplyMetadataResult::REJECTED;
+            }
+
+            // 6b. #1149: an invite does not end a ban. An invite minted
+            //     before the ban is still in the ledger, and
+            //     `add_member_with_kem` below sets a banned row back to
+            //     Active, so with no check here the banned agent gets its
+            //     seat and the TreeKEM Welcome again. The
+            //     `JoinRequestCreated` / `JoinRequestApproved` applies and
+            //     the TreeKEM approve route also refuse a banned agent. A
+            //     joiner-signed event cannot end a ban: only an admin
+            //     action can (the unban route, an admin add route, or the
+            //     admin GSS request-approve route, which has no ban check).
+            //     Refuse before the invite is consumed, so other holders
+            //     can still use it. Step 4 makes `member_agent_id` the
+            //     exact derived lowercase id, so this lookup cannot be
+            //     bypassed by letter case.
+            if info.is_banned(&member_agent_id) {
+                tracing::info!(
+                    group_id = %resolved_group_key,
+                    member = %LogHexId::agent(&member_agent_id),
+                    "MemberJoined: rejecting a banned agent (#1149)"
+                );
+                state
+                    .groups_diagnostics
+                    .record_member_joined_rejected_banned(&resolved_group_key);
                 return ApplyMetadataResult::REJECTED;
             }
 
@@ -41810,6 +41905,9 @@ async fn preserve_unsupported_saved_bytes(path: &FsPath) -> Result<()> {
         .await
         .is_ok_and(|held| held == bytes)
     {
+        // #1809: the copy holds the same group secrets as `path`, so an
+        // earlier 0644 copy is tightened when it is reused.
+        tighten_secret_file_mode(&backup).await;
         // Reused: make sure the earlier copy itself is on stable storage.
         let file = tokio::fs::File::open(&backup)
             .await
@@ -41839,9 +41937,25 @@ async fn sync_parent_dir(path: &FsPath) -> Result<()> {
 async fn write_durably(path: &FsPath, bytes: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let tmp = path.with_extension("tmp-1604");
-    let mut file = tokio::fs::File::create(&tmp)
+    // #1809: the bytes are a copy of a group secret file. A new temp file
+    // is created 0600; a stale temp left by a crash keeps its old mode
+    // through a truncating open, so it is set to 0600 on the open handle
+    // before any byte lands.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(SECRET_FILE_MODE);
+    let mut file = options
+        .open(&tmp)
         .await
         .with_context(|| format!("failed to create {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(SECRET_FILE_MODE))
+            .await
+            .with_context(|| format!("failed to restrict {}", tmp.display()))?;
+    }
     file.write_all(bytes)
         .await
         .with_context(|| format!("failed to write {}", tmp.display()))?;
@@ -41864,6 +41978,9 @@ pub(in crate::server) async fn load_named_groups_merged(
     // the shared test fixture), which sit close to the Linux CI
     // test-thread stack ceiling (PR #465 CI abort).
     Box::pin(async move {
+        // #1809: both files hold group shared secrets.
+        tighten_secret_file_mode(named_groups_path).await;
+        tighten_secret_file_mode(sidecar_path).await;
         let named = load_named_groups(named_groups_path).await?;
         let sidecar = load_home_suite_groups(sidecar_path).await?;
         let mut merged = merge_home_suite_groups(named, sidecar);
@@ -44649,6 +44766,43 @@ pub(in crate::server) mod atomic_write_test_seam {
     }
 }
 
+/// #1809: Unix mode for files that hold group shared secrets or key
+/// material (owner read and write only).
+#[cfg(unix)]
+pub(in crate::server) const SECRET_FILE_MODE: u32 = 0o600;
+
+/// #1809: best-effort tighten of an existing secret file to
+/// [`SECRET_FILE_MODE`] when group or other bits are set. A file written by
+/// an older daemon keeps its 0644 mode until the next save; this closes
+/// that gap at load. A missing file or a failed `chmod` is not an error.
+pub(in crate::server) async fn tighten_secret_file_mode(path: &FsPath) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = tokio::fs::metadata(path).await else {
+            return;
+        };
+        if metadata.permissions().mode() & 0o077 == 0 {
+            return;
+        }
+        // `set_permissions` follows a symlink. That is acceptable: the
+        // path is in the daemon's own data dir, and a link there already
+        // decides where the daemon reads and writes these secrets.
+        if let Err(error) =
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(SECRET_FILE_MODE))
+                .await
+        {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "#1809: cannot tighten a group secret file to 0600"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 pub(in crate::server) async fn write_named_groups_json_atomic(
     path: &FsPath,
     json: &str,
@@ -44661,12 +44815,15 @@ pub(in crate::server) async fn write_named_groups_json_atomic(
 
     // Finding 1 (Sam 6664f60) / Watson ruling: stage-aware atomic
     // replacement. The rename is the point of no return.
-    let mut file = match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .await
-    {
+    //
+    // #1809: these files hold group shared secrets. On Unix the temp file
+    // is created 0600 before any byte lands, and the rename replaces the
+    // destination inode, so an older 0644 file is tightened on this save.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(SECRET_FILE_MODE);
+    let mut file = match options.open(&temp_path).await {
         Ok(file) => file,
         Err(error) => {
             tracing::error!(
@@ -46423,6 +46580,11 @@ pub(in crate::server) enum JoinAttemptOutcome {
 /// remove-member + re-invite.
 pub(in crate::server) const JOIN_REARM_TIMEOUT_REASON: &str = "rearm_original_result_unavailable";
 
+/// ADR 0108 §8: the `timed_out` reason when the attempt reached its poll
+/// deadline without a verified `JoinPendingNotice`. With a held notice the
+/// reason is that notice's cause instead.
+pub(in crate::server) const JOIN_NO_ADMISSION_RESULT_REASON: &str = "no_admission_result";
+
 /// #477 C5 — the SEAT finalizer at the `MemberAdded` apply site (the
 /// caller holds the group's membership guard): whatever attempt is pending
 /// for `(event_group_id, member)` is finalized as `Seated` — its polls and
@@ -46598,6 +46760,9 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
     // ADR 0107: whether the finalized attempt was a fetch-only S8 (a) re-arm
     // (a registered attempt with no stored volley).
     let mut fetch_only = false;
+    // ADR 0108 §8: the cause of the verified notice the attempt held, in
+    // its join-status display form. A `TimedOut` names it as its reason.
+    let mut held_cause: Option<&'static str> = None;
     // The legacy TimedOut owner has no registry entry. It still clears its
     // pin after this lock drops. An owned entry clears its pin inside the
     // lock (#1191).
@@ -46619,6 +46784,10 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             // join can record the same key in any gap after this remove.
             clear_expected_join_result_inviter(state, &expected_key);
             fetch_only = entry.stored_resend.is_none();
+            held_cause = entry
+                .held_pending_notice
+                .as_ref()
+                .map(|held| display_join_pending_cause(&held.cause).0);
             (
                 std::mem::take(&mut entry.polls),
                 std::mem::take(&mut entry.tasks),
@@ -46712,9 +46881,15 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
         // that times out names its cause on the existing status surface:
         // the authority's original result or Welcome could not be fetched.
         // The remnant stays for the owner remove-member + re-invite exit.
+        // ADR 0108 §8 / §6 (D64): any other `TimedOut` names its cause —
+        // the last verified notice's cause, or `no_admission_result` when
+        // the attempt held no verified notice.
         let reason = match (outcome, reason) {
             (JoinAttemptOutcome::TimedOut, None) if fetch_only && !stub_is_pending => {
                 Some(JOIN_REARM_TIMEOUT_REASON)
+            }
+            (JoinAttemptOutcome::TimedOut, None) => {
+                Some(held_cause.unwrap_or(JOIN_NO_ADMISSION_RESULT_REASON))
             }
             (_, reason) => reason,
         };
@@ -50380,7 +50555,9 @@ async fn poll_join_result_until_membership_confirmed(
         // hole: the direct message is unusable until the joiner has resolved
         // the authority's DM key material (routinely still pending here, and
         // the reason a DM-only retry cannot repair the very window it
-        // targets), while the metadata publish needs no key material but only
+        // targets — the fetch below therefore also asks for the authority's
+        // advert over the targeted control topics when it cannot address it,
+        // #1776), while the metadata publish needs no key material but only
         // reaches an authority the mesh already covers.
         //
         // Spawned, not awaited, for the same reason every other named-group
@@ -50517,6 +50694,25 @@ async fn poll_join_result_until_membership_confirmed(
             .send_direct_with_config(&inviter, payload, direct_message_send_config())
             .await
         {
+            // #1776: this poll is the joiner's own repair loop, but a DM
+            // cannot repair the very window it targets (above) — a fresh
+            // joiner behind the advert cadence holds no binding for the
+            // authority, so every fetch dies on the instant
+            // `AgentNotFound` path. The mesh's targeted control topics are
+            // the one leg that still reaches the authority: ask for its
+            // advert whenever the poll cannot address it, and the next
+            // fetch rides the gossip-inbox leg instead of grinding. The
+            // flight registry and per-recipient cooldown bound repeat
+            // requests while the window lasts. The request is detached, not
+            // awaited: its convergence wait (up to 3 s) must not stretch the
+            // poll past its own window, and the next fetch needs only the
+            // binding, not this caller's wait.
+            if !state.agent.holds_gossip_usable_dm_binding(&inviter) {
+                let agent = Arc::clone(&state.agent);
+                tokio::spawn(async move {
+                    agent.refresh_dm_capability_binding(inviter).await;
+                });
+            }
             tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
             tracing::debug!(
                 target: "treekem.trace",
@@ -50764,12 +50960,48 @@ async fn send_welcome_fetch_request(
         detached_send_test_seam::park(&detached_send_test_seam::welcome_fetch_key(welcome_id))
             .await;
     }
-    state
+    // #1776, proactive: an unaddressable authority is not a transient gap
+    // the send ladder can climb — a fresh joiner joined the mesh after the
+    // staging authority's last advert beat, and neither the advert cadence
+    // (600 s) nor the identity heartbeat replays onto meshes joined later.
+    // Ask for the advert over the mesh's targeted control topics BEFORE
+    // the send: the request's convergence wait (bounded, and free when a
+    // usable binding already exists) is cheaper than the doomed send it
+    // replaces — a send that cannot address its recipient either fails
+    // fast on `AgentNotFound` or grinds its whole absolute send budget.
+    if !state.agent.holds_gossip_usable_dm_binding(agent_id) {
+        state.agent.refresh_dm_capability_binding(*agent_id).await;
+    }
+    let error = match state
         .agent
         .send_direct_with_config(agent_id, payload, welcome_blob_send_config(request))
         .await
-        .map(|_| ())
-        .map_err(classify_welcome_fetch_send_error)
+    {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
+    // #1776, reactive: the same structural gap can surface as either
+    // variant — `RecipientUndiscovered` from the fast `AgentNotFound`
+    // path, or `Timeout` after the send's absolute budget burned — and
+    // the repair must not depend on which one this interleaving produced,
+    // so it keys on the binding alone. A usable binding means the request
+    // would publish nothing, so it is not sent.
+    // Whenever the failed send leaves the authority still unaddressable,
+    // ask for its advert; the retry schedule above re-sends once the
+    // binding lands. The request is detached, not awaited: the metadata
+    // apply path calls this fetch while it holds the group membership
+    // lock, and the retry needs only the binding, not this caller's wait.
+    // Only the proactive wait above stays on the lock (at most
+    // `CAPABILITY_REFRESH_CONVERGENCE_WAIT` per attempt), because it
+    // replaces a doomed send that would hold the lock far longer.
+    if !state.agent.holds_gossip_usable_dm_binding(agent_id) {
+        let agent = Arc::clone(&state.agent);
+        let recipient = *agent_id;
+        tokio::spawn(async move {
+            agent.refresh_dm_capability_binding(recipient).await;
+        });
+    }
+    Err(classify_welcome_fetch_send_error(error))
 }
 
 async fn notify_welcome_waiters(
@@ -52119,9 +52351,12 @@ pub(in crate::server) mod tests {
     mod issue1622_binding_revoked_catchup;
     mod issue1623_pre_welcome_page_links;
     mod issue1649_reseat_mandate_receive;
+    mod issue1655_catchup_recheck_before_write;
     mod issue1657_typed_refusal_catchup;
     mod issue1664_machine_addressed_replies;
     mod issue1685_catchup_page_no_progress;
+    #[cfg(unix)]
+    mod issue1809_secret_file_mode;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;
@@ -61496,9 +61731,10 @@ pub(in crate::server) mod tests {
         assert!(!held.accepted);
         let path = gss_share_hold::test_seam::hold_path_for(&f.state, &f.group_id);
         let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let version = gss_share_hold::test_seam::hold_file_version();
         assert_eq!(written["version"], 1, "the written file carries version 1");
         let newer = serde_json::to_vec(&serde_json::json!({
-            "version": 2,
+            "version": version + 1,
             "group_key": f.group_id,
             "removals": [],
             "exclusions": [],
@@ -64576,6 +64812,198 @@ pub(in crate::server) mod tests {
             !persisted.contains(&forger_public_key_b64),
             "forged member public key / protected material must not be persisted after rejection"
         );
+        Ok(())
+    }
+
+    /// #1149 fixture: a PublicOpen group whose local agent is the inviter,
+    /// with one unaddressed invite minted BEFORE `banned` was banned.
+    async fn banned_joiner_with_pre_ban_invite_for_test(
+        group_byte: u8,
+    ) -> Result<(
+        Arc<AppState>,
+        tempfile::TempDir,
+        String,
+        String,
+        String,
+        x0x::identity::AgentKeypair,
+    )> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let group_id = format!("{group_byte:02x}").repeat(32);
+        let inviter = state.agent.agent_id();
+        let inviter_hex = hex::encode(inviter.as_bytes());
+        let invite_secret = format!("issue1149-pre-ban-invite-{group_byte:02x}");
+        let banned = x0x::identity::AgentKeypair::generate()?;
+        let banned_hex = hex::encode(banned.agent_id().as_bytes());
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "#1149 banned joiner".to_string(),
+            String::new(),
+            inviter,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        info.record_issued_invite(
+            invite_secret.clone(),
+            now_millis_u64() / 1_000,
+            0,
+            x0x::groups::GroupRole::Member,
+        );
+        info.add_member(
+            banned_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(inviter_hex.clone()),
+            None,
+        );
+        info.ban_member(&banned_hex, Some(inviter_hex.clone()));
+        assert!(info.is_banned(&banned_hex), "fixture bans the joiner");
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        assert!(save_named_groups(&state).await);
+        Ok((state, dir, group_id, inviter_hex, invite_secret, banned))
+    }
+
+    /// #1149: the invite record and every roster row for `banned_hex`
+    /// (any letter case) after a refused `MemberJoined`.
+    async fn assert_banned_joiner_not_readmitted(
+        state: &AppState,
+        group_id: &str,
+        banned_hex: &str,
+        invite_secret: &str,
+    ) {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(group_id).expect("group retained");
+        assert!(
+            live.is_banned(banned_hex),
+            "#1149: the banned row must stay banned"
+        );
+        let rows: Vec<(String, x0x::groups::GroupMemberState)> = live
+            .members_v2
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(banned_hex))
+            .map(|(key, member)| (key.clone(), member.state))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(
+                banned_hex.to_string(),
+                x0x::groups::GroupMemberState::Banned
+            )],
+            "#1149: exactly one row (the canonical lowercase key) and it is banned"
+        );
+        let record = live
+            .issued_invites
+            .get(invite_secret)
+            .expect("pre-ban invite still recorded");
+        assert_eq!(
+            record.consumed_by, None,
+            "#1149: the refused join must not consume the pre-ban invite"
+        );
+    }
+
+    /// #1149 review blocker: an UPPERCASE `member_agent_id` is the same
+    /// agent as the lowercase banned roster key. Before the fix the
+    /// case-insensitive step-4 compare let it through, `is_banned` and
+    /// `has_active_member` missed (exact-case keys), and
+    /// `add_member_with_kem` seated a second, Active row under the
+    /// uppercase key. The authority now refuses any id that is not the
+    /// exact derived lowercase id.
+    #[tokio::test]
+    async fn issue1149_uppercase_member_id_of_banned_agent_is_refused() -> Result<()> {
+        let (state, _dir, group_id, inviter_hex, invite_secret, banned) =
+            banned_joiner_with_pre_ban_invite_for_test(0x49).await?;
+        let banned_id = banned.agent_id();
+        let banned_hex = hex::encode(banned_id.as_bytes());
+        let upper_hex = banned_hex.to_ascii_uppercase();
+        assert_ne!(upper_hex, banned_hex, "the id has hex letters to fold");
+
+        // The joiner signs its own event, so it can choose the case.
+        let public_key_b64 = BASE64.encode(banned.public_key().as_bytes());
+        let ts_ms = now_millis_u64();
+        let canonical = canonical_member_joined_bytes(
+            &group_id,
+            Some(&group_id),
+            &upper_hex,
+            &public_key_b64,
+            x0x::groups::GroupRole::Member,
+            None,
+            &inviter_hex,
+            &invite_secret,
+            ts_ms,
+            None,
+        );
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            banned.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| anyhow::anyhow!("sign uppercase MemberJoined: {e:?}"))?;
+        let event = NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.clone(),
+            stable_group_id: Some(group_id.clone()),
+            member_agent_id: upper_hex.clone(),
+            member_public_key_b64: public_key_b64,
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: inviter_hex,
+            invite_secret: invite_secret.clone(),
+            ts_ms,
+            treekem_key_package_b64: None,
+            kem_public_key_b64: None,
+            kem_signature_b64: None,
+            certificate_b64: None,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: BASE64.encode(signature.as_bytes()),
+        };
+        let result = apply_named_group_metadata_event(&state, event, banned_id, true, None).await;
+        assert!(
+            !result.accepted,
+            "#1149: an uppercase id must not re-admit the banned agent"
+        );
+        assert_eq!(
+            state
+                .groups_diagnostics
+                .member_joined_rejected_banned(&group_id),
+            0,
+            "#1149: step 4 (exact derived id) refuses it, before the ban check"
+        );
+        assert_banned_joiner_not_readmitted(&state, &group_id, &banned_hex, &invite_secret).await;
+        Ok(())
+    }
+
+    /// #1149: the exact (lowercase) id of a banned agent with a pre-ban
+    /// invite is refused by the ban check, which counts the refusal and
+    /// leaves the invite unused.
+    #[tokio::test]
+    async fn issue1149_banned_member_joined_is_refused_and_counted() -> Result<()> {
+        let (state, _dir, group_id, inviter_hex, invite_secret, banned) =
+            banned_joiner_with_pre_ban_invite_for_test(0x4a).await?;
+        assert_eq!(
+            state
+                .groups_diagnostics
+                .member_joined_rejected_banned(&group_id),
+            0
+        );
+        let (banned_id, banned_hex, _, event) = signed_member_joined_event_for_test(
+            &banned,
+            &group_id,
+            &inviter_hex,
+            &invite_secret,
+            x0x::groups::GroupRole::Member,
+        )?;
+        let result = apply_named_group_metadata_event(&state, event, banned_id, true, None).await;
+        assert!(!result.accepted, "#1149: a banned agent must be refused");
+        assert_eq!(
+            state
+                .groups_diagnostics
+                .member_joined_rejected_banned(&group_id),
+            1,
+            "#1149: the ban check refused the join and counted it"
+        );
+        assert_banned_joiner_not_readmitted(&state, &group_id, &banned_hex, &invite_secret).await;
         Ok(())
     }
 
