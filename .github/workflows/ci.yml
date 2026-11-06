@@ -7,6 +7,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # CMake 4 (ubuntu-26.04 runners) rejects the bundled opus in audiopus_sys
+  # 0.2.2 (cmake_minimum_required < 3.5). The env var alone did not reach the
+  # configure call in CI, so the cmake crate also runs a wrapper that adds
+  # -DCMAKE_POLICY_VERSION_MINIMUM=3.5. See scripts/ci/cmake-policy-min.sh
+  # (#1816). Do not pin or downgrade cmake.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CMAKE_x86_64_unknown_linux_gnu: ${{ github.workspace }}/scripts/ci/cmake-policy-min.sh
   RUST_BACKTRACE: 1
 
 # Retire only an older head of the same pull request. Non-PR runs use their
@@ -1156,6 +1163,8 @@ jobs:
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
           --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome
           --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome=GREEN
+          --require w3h_1623_red_pre_welcome_joiner_applies_removal_and_ban_links
+          --expect w3h_1623_red_pre_welcome_joiner_applies_removal_and_ban_links=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable
