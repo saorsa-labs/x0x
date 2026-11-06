@@ -9,6 +9,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # ubuntu-26.04 runner images ship CMake 4, which rejects
+  # cmake_minimum_required(VERSION < 3.5). audiopus_sys 0.2.2 bundles opus
+  # with such a line. This env lets CMake 4 configure it with 3.5 policies.
+  # CMake 3.x ignores the variable. Do not pin or downgrade cmake.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
   RUSTFLAGS: "-D warnings"
   # scripts/ci/nextest-isolated.sh sets line-tables-only debuginfo under
   # GITHUB_ACTIONS (#1789). Use the same profile for every cargo step in this
