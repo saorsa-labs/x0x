@@ -920,6 +920,18 @@ pub enum DmError {
     #[error("recipient rejected: {reason}")]
     RecipientRejected { reason: String },
 
+    /// The local ADR-0043 §9 B/P gate denied the `(agent, machine)` pairing
+    /// that the send resolved, so nothing was sent. Check B: a tombstone
+    /// retired the binding. Check P: a current placement record pins the
+    /// agent to another machine. This is a local policy refusal, not a
+    /// transient fault: a retry fails the same way until the recipient's
+    /// binding or placement changes.
+    #[error("recipient pairing denied (ADR-0043 B/P): {denial:?}")]
+    RecipientPairingDenied {
+        /// Which check denied the pairing.
+        denial: crate::key_move::PairingDenial,
+    },
+
     /// Local gossip publish failed — typically because the mesh is not
     /// joined yet or the inbox topic has no active peers. Distinct from
     /// `Timeout`, which is "remote didn't respond".
