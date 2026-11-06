@@ -15,8 +15,8 @@
 //!   NUL terminator) each quarantine in one transaction — the damaged
 //!   bytes move to a history copy, one empty replacement whose
 //!   `rebuilt_from` lists the transaction id, the store state `rebuilt`,
-//!   no `.pending` left — and a newer-layout `.evs` (`X0XEVICT3\0`; v2 is
-//!   readable since #1508, so the row's "newer" form moves to v3) runs
+//!   no `.pending` left — and a newer-layout `.evs` (`X0XEVICT4\0`; v3 is
+//!   readable since #1785, so the row's "newer" form moves to v4) runs
 //!   memory-only: state `sidecar_newer_format` naming the version, the
 //!   file byte-identical, no history.
 //! - `red_sidecar_lifecycle_journal_and_pending_resume`: a `.evjournal`
@@ -59,9 +59,9 @@ const EVS_FILE: &str = EVS_FILE_NAME;
 /// The planted journal: any stem is equivalent (see the module honesty
 /// note); `treekem/planted.evjournal`.
 const JOURNAL_FILE: &str = "planted.evjournal";
-/// A newer-layout `.evs` body: `X0XEVICT3\0` plus bytes this binary
+/// A newer-layout `.evs` body: `X0XEVICT4\0` plus bytes this binary
 /// never reads.
-const EVS_NEWER: &[u8] = b"X0XEVICT3\0newer-layout";
+const EVS_NEWER: &[u8] = b"X0XEVICT4\0newer-layout";
 /// A newer-layout `.evjournal` body (`X0XEVJ2\0`; v1 is the highest this
 /// binary reads).
 const JOURNAL_NEWER: &[u8] = b"X0XEVJ2\0newer-layout";
@@ -325,9 +325,9 @@ async fn newer_cycle(sim: &mut Sim, receipt: &mut Receipt, group: &str) -> Resul
     let dir = sim.data_dir("A")?;
     let path = dir.join(EVS_FILE);
     std::fs::write(&path, EVS_NEWER)?;
-    sim.fabric().mark("case: .evs holds a v3 (newer) layout");
+    sim.fabric().mark("case: .evs holds a v4 (newer) layout");
     receipt.evidence(
-        "newer: the v3 bytes are at the sidecar path",
+        "newer: the v4 bytes are at the sidecar path",
         std::fs::read(&path)? == EVS_NEWER,
         format!("{} bytes planted", EVS_NEWER.len()),
         at(sim),
@@ -345,7 +345,7 @@ async fn newer_cycle(sim: &mut Sim, receipt: &mut Receipt, group: &str) -> Resul
     let untouched = std::fs::read(&path).unwrap_or_default() == EVS_NEWER;
     let (history, pending) = quarantine_names(&dir, EVS_FILE);
     let ok = state == "sidecar_newer_format"
-        && detail.as_deref() == Some("version 3")
+        && detail.as_deref() == Some("version 4")
         && rebuilt_from.is_empty()
         && untouched
         && pending.is_empty()

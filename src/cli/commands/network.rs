@@ -188,6 +188,14 @@ pub async fn diagnostics_ws(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/ws").await
 }
 
+/// `x0x diagnostics sidecar-quarantine` — GET /diagnostics/sidecar-quarantine
+///
+/// Read-only. Lists each ADR 0108 §5a quarantined sidecar copy with its
+/// state, `txid` and size in bytes (D148, #1597).
+pub async fn diagnostics_sidecar_quarantine(client: &DaemonClient) -> Result<()> {
+    client.run_get("/diagnostics/sidecar-quarantine").await
+}
+
 /// `x0x diagnostics connect` — GET /diagnostics/connect
 ///
 /// Connect-ACL policy summary (enabled flag, loaded-from path, allow-entry

@@ -65,6 +65,7 @@ use routes::public_group_bootstrap_outbox::{
     load_public_group_bootstrap_outbox, public_group_bootstrap_outbox_step,
     PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX,
 };
+use routes::sidecar_quarantine_diagnostics;
 use routes::{
     ack_diagnostics, acl_connect_add, acl_connect_list, acl_connect_remove, acl_exec_add,
     acl_exec_list, acl_exec_remove, acl_reload, add_contact, add_machine, add_mls_member,
@@ -3213,6 +3214,11 @@ pub async fn serve_with_options(
         .route("/diagnostics/exec", get(exec_diagnostics))
         .route("/diagnostics/connect", get(connect_diagnostics_handler))
         .route("/diagnostics/ws", get(ws_diagnostics))
+        // D148: read-only list of ADR 0108 §5a quarantined sidecar copies.
+        .route(
+            "/diagnostics/sidecar-quarantine",
+            get(sidecar_quarantine_diagnostics),
+        )
         .route("/exec/run", post(exec_run))
         .route("/exec/cancel", post(exec_cancel))
         .route("/exec/sessions", get(exec_sessions))

@@ -215,6 +215,11 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/diagnostics/connect", daemon_api_diagnostics_connect),
     covered!(Get, "/diagnostics/ws", daemon_api_diagnostics_ws),
     covered!(
+        Get,
+        "/diagnostics/sidecar-quarantine",
+        sidecar_quarantine_diagnostics_lists_each_copy_with_its_size
+    ),
+    covered!(
         Post,
         "/peers/:peer_id/probe",
         peer_probe_returns_finite_rtt_against_live_peer
@@ -666,6 +671,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/owner.rs",
         include_str!("../src/server/routes/owner.rs"),
+    ),
+    // D148 (#1597): the sidecar-quarantine route's coverage lives in its
+    // route lib tests.
+    (
+        "src/server/routes/sidecar_quarantine.rs",
+        include_str!("../src/server/routes/sidecar_quarantine.rs"),
     ),
     (
         "tests/daemon_api_integration.rs",

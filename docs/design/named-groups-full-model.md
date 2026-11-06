@@ -643,7 +643,7 @@ ADR-0016 defines a flat protocol ruleset:
 ### Explicit rejects
 - non-admin cannot approve requests
 - non-admin cannot remove other members
-- banned peer cannot rejoin through open-join alone
+- banned peer cannot rejoin through open-join alone, or through an invite minted before the ban
 - invite creation must follow policy and role checks
 
 ## Unifying named groups and MLS

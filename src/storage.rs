@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(test))]
 use tokio::fs;
 
+pub(crate) mod outbox;
+
 /// Test-only FS layer for W3-H (#1245): when the entropy/wall-clock shim is
 /// active, read/write/exists/remove/metadata run on the current-thread
 /// runtime instead of `tokio::fs`'s blocking pool, so same-instant task
