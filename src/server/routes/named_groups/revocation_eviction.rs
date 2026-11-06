@@ -3125,9 +3125,10 @@ async fn dispatch_handoffs(state: &Arc<AppState>) {
 ///   `Some(false)` read — so it is `Unsupported`.
 /// - `RecipientRejected` (the designated admin's own acknowledgement that
 ///   its trust policy refused this sender) and the ADR-0043 pairing
-///   denial (`EnvelopeConstruction` with the
-///   `RECIPIENT_PAIRING_DENIED` prefix: this node's policy refused the
-///   designated admin's machine) are definitive policy refusals under
+///   denial (`RecipientPairingDenied`, or the legacy
+///   `EnvelopeConstruction` with the `RECIPIENT_PAIRING_DENIED` prefix:
+///   this node's policy refused the designated admin's machine) are
+///   definitive policy refusals under
 ///   L171: `PolicyRefused`, the plain designated wait, never stored
 ///   (Engineer ruling, 4 Nov 2026 18:15 GMT).
 /// - Every other error leaves the route unresolved: the missing-binding,
@@ -3148,6 +3149,7 @@ fn designated_send_outcome(
     match error {
         DmError::RecipientUpgradeRequired { .. } => Outcome::Unsupported,
         DmError::RecipientRejected { .. } => Outcome::PolicyRefused,
+        DmError::RecipientPairingDenied { .. } => Outcome::PolicyRefused,
         DmError::EnvelopeConstruction(message)
             if message.starts_with(x0x::dm::RECIPIENT_PAIRING_DENIED) =>
         {
@@ -8335,6 +8337,12 @@ pub(super) mod tests {
         assert_eq!(
             designated_send_outcome(&Err(x0x::dm::DmError::RecipientRejected {
                 reason: "trust policy".into()
+            })),
+            s4::DesignatedHandoffOutcome::PolicyRefused
+        );
+        assert_eq!(
+            designated_send_outcome(&Err(x0x::dm::DmError::RecipientPairingDenied {
+                denial: x0x::key_move::PairingDenial::BindingRevoked,
             })),
             s4::DesignatedHandoffOutcome::PolicyRefused
         );

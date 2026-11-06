@@ -10767,10 +10767,7 @@ impl Agent {
                 denial = ?denial,
                 "machine-addressed data reply withheld: the pairing was denied at the send"
             );
-            return Err(dm::DmError::EnvelopeConstruction(format!(
-                "{} (ADR-0043 B/P): {denial:?}",
-                dm::RECIPIENT_PAIRING_DENIED
-            )));
+            return Err(dm::DmError::RecipientPairingDenied { denial });
         }
         // #1664 r4 (Engineer ruling, 31 Oct 2026 09:00 GMT): the answer
         // rides the SAME pinned exchange a join-result chunk uses — the
@@ -11298,10 +11295,7 @@ impl Agent {
         } {
             if let Some(denial) = self.recipient_pairing_denied(to, &machine_id).await {
                 self.direct_messaging.record_outgoing_failed(*to);
-                return Err(dm::DmError::EnvelopeConstruction(format!(
-                    "{} (ADR-0043 B/P): {denial:?}",
-                    dm::RECIPIENT_PAIRING_DENIED
-                )));
+                return Err(dm::DmError::RecipientPairingDenied { denial });
             }
         }
         if *to == self.identity.agent_id() {
@@ -11428,10 +11422,14 @@ impl Agent {
             if let Some(cap_machine) = cap_machine {
                 if let Some(denial) = self.recipient_pairing_denied(to, &cap_machine).await {
                     self.direct_messaging.record_outgoing_failed(*to);
-                    return Err(dm::DmError::EnvelopeConstruction(format!(
-                        "{} (ADR-0043 B/P, capability binding): {denial:?}",
-                        dm::RECIPIENT_PAIRING_DENIED
-                    )));
+                    tracing::debug!(
+                        target: "x0x::direct",
+                        stage = "send",
+                        outcome = "drop_pairing_capability_binding",
+                        denial = ?denial,
+                        "send refused: recipient pairing denied on the capability binding (ADR-0043 B/P)"
+                    );
+                    return Err(dm::DmError::RecipientPairingDenied { denial });
                 }
             }
         }
@@ -12626,9 +12624,7 @@ impl Agent {
                 reason = ?denial,
                 "pinned send refused: recipient pairing denied (ADR-0043 B/P)"
             );
-            return Err(Self::map_raw_quic_dm_error(
-                error::NetworkError::PeerNotVerified { agent_id: to.0 },
-            ));
+            return Err(dm::DmError::RecipientPairingDenied { denial });
         }
         let mut connected = transport.is_connected(&ant_peer_id).await;
         let mut repair_outcome: Option<&'static str> = None;
@@ -12679,9 +12675,7 @@ impl Agent {
                 reason = ?denial,
                 "pinned send refused after repair: recipient pairing denied (ADR-0043 B/P)"
             );
-            return Err(Self::map_raw_quic_dm_error(
-                error::NetworkError::PeerNotVerified { agent_id: to.0 },
-            ));
+            return Err(dm::DmError::RecipientPairingDenied { denial });
         }
         if connected {
             if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
@@ -41798,6 +41792,51 @@ async fn revocation_discovery_eviction_preserves_authenticated_binding() {
         )
         .await,
         Some(machine.machine_id())
+    );
+}
+
+/// #1785 follow-up (David, 5 Nov 2026): a send whose resolved
+/// `(agent, machine)` pairing fails the ADR-0043 B/P gate answers the
+/// typed `DmError::RecipientPairingDenied`, not a stringly
+/// `EnvelopeConstruction`. FAIL-BEFORE: the variant did not exist, and the
+/// gate answered `EnvelopeConstruction("recipient pairing denied ...")`.
+#[tokio::test]
+async fn send_direct_reports_a_denied_pairing_as_recipient_pairing_denied() {
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    // No network config: an offline, inert agent.
+    let sender = Agent::builder()
+        .with_identity_dir(tempdir.path())
+        .build()
+        .await
+        .expect("sender agent");
+    let recipient = identity::AgentKeypair::generate().expect("recipient keygen");
+    let machine = identity::MachineKeypair::generate().expect("machine keygen");
+    let mut discovered = discovered_agent_fixture(0x67, 6_000, &[], None);
+    discovered.agent_id = recipient.agent_id();
+    discovered.machine_id = machine.machine_id();
+    discovered.machine_public_key = machine.public_key().as_bytes().to_vec();
+    sender.insert_discovered_agent_for_testing(discovered).await;
+    // Check B: retire the (recipient, machine) binding.
+    assert!(sender.revocation_set.write().await.union_bundle_retired(&[
+        revocation::AgentMachineBinding {
+            agent: recipient.agent_id(),
+            machine: machine.machine_id(),
+            move_epoch: 1,
+        }
+    ]));
+
+    let err = sender
+        .send_direct(&recipient.agent_id(), b"denied".to_vec())
+        .await
+        .expect_err("a denied pairing must refuse the send");
+    assert!(
+        matches!(
+            err,
+            dm::DmError::RecipientPairingDenied {
+                denial: key_move::PairingDenial::BindingRevoked
+            }
+        ),
+        "expected RecipientPairingDenied {{ BindingRevoked }}, got {err:?}"
     );
 }
 
