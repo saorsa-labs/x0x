@@ -1,11 +1,13 @@
 //! Dormant-mode passthrough for the installed stable launcher.
 //!
-//! ADR 0094 §5 requires the unit `ExecStart` to bind `x0x-launcher` before
-//! M2 activation, once the §5 preconditions hold. With no launcher-owned
-//! trial in flight the launcher has no authority and no child to own, so
-//! it becomes the daemon by `exec`: the manager keeps one process with the
-//! same signals, exit codes and restart semantics as the previous direct
-//! job.
+//! In ADR 0094 §5 the launcher starts and owns the daemon as a child
+//! (manager -> launcher -> child readback). That mode is held until
+//! `ENABLED = true`. This passthrough is a provisional, dormant interim
+//! mode that ADR 0094 does not describe, and it cannot meet that readback.
+//! With no launcher-owned trial in flight the launcher has no authority
+//! and no child to own, so it becomes the daemon by `exec`: the manager
+//! keeps one process with the same signals, exit codes and restart
+//! semantics as the previous direct job.
 use super::*;
 use std::ffi::OsString;
 
