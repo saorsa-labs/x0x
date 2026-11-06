@@ -9,11 +9,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # ubuntu-26.04 runner images ship CMake 4, which rejects
-  # cmake_minimum_required(VERSION < 3.5). audiopus_sys 0.2.2 bundles opus
-  # with such a line. This env lets CMake 4 configure it with 3.5 policies.
-  # CMake 3.x ignores the variable. Do not pin or downgrade cmake.
+  # CMake 4 (ubuntu-26.04 runners) rejects the bundled opus in audiopus_sys
+  # 0.2.2 (cmake_minimum_required < 3.5). The env var alone did not reach the
+  # configure call in CI, so the cmake crate also runs a wrapper that adds
+  # -DCMAKE_POLICY_VERSION_MINIMUM=3.5. See scripts/ci/cmake-policy-min.sh
+  # (#1816). Do not pin or downgrade cmake.
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CMAKE_x86_64_unknown_linux_gnu: ${{ github.workspace }}/scripts/ci/cmake-policy-min.sh
   RUSTFLAGS: "-D warnings"
   # scripts/ci/nextest-isolated.sh sets line-tables-only debuginfo under
   # GITHUB_ACTIONS (#1789). Use the same profile for every cargo step in this
@@ -41,6 +43,13 @@ jobs:
           ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Use the system Opus so audiopus_sys finds it with pkg-config and
+      # does not build its bundled copy with CMake (#1816).
+      - name: Install Opus (libopus-dev, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopus-dev pkg-config
+          pkg-config --modversion opus
       - name: Run guardian tests
         run: |
           cargo test --all-features --test api_coverage --no-run
@@ -463,6 +472,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.144  # exact pin: floating latest can silently change CI behaviour (refs #673)
+      # Use the system Opus so audiopus_sys finds it with pkg-config and
+      # does not build its bundled copy with CMake (#1816).
+      - name: Install Opus (libopus-dev, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopus-dev pkg-config
+          pkg-config --modversion opus
       # Pin the bytes before any runtime: build the suite without
       # executing it, so discovery below reuses binaries that already
       # exist rather than compiling inside the namespace.
