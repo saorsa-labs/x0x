@@ -554,10 +554,11 @@ jobs:
           if-no-files-found: warn
 
   # ADR 0109 §10 H-S3-rm released-binary rows (#1572): rm1 (capability
-  # floor) and rm3 (i) and (ii) (older receiver after the seal). Phase
-  # 1 of each row runs on the paused W3-H sim; phase 2 runs candidate daemons on real loopback sockets, with member
-  # M on the published v0.46.1 daemon. The rows are `#[ignore]` and run
-  # only here, one at a time. A row took 145-250 s on a 12-CPU VM, and
+  # floor) and rm3 (i) and (ii) (older receiver after the seal). The
+  # filter also selects later rows in the same module. Phase 1 of each
+  # row runs on the paused W3-H sim; phase 2 runs candidate daemons on
+  # real loopback sockets, with member M on the published v0.46.1
+  # daemon. The rows are `#[ignore]` and run only here, one at a time. A row took 145-250 s on a 12-CPU VM, and
   # the 4-vCPU runner takes about twice as long. The job is separate
   # because it needs the released binary. It is not a required check.
   # The pinned v0.46.1 is installed before the loopback-only namespace:
@@ -753,8 +754,9 @@ jobs:
     # their own S3 group (`s3-c`, `s3-c2`, `s3-c3`, `s3-d8`, `s3-d3`). H-S3-d3
     # runs as four parallel parts (`s3-d3.1` to `s3-d3.4`, 5 reruns each;
     # `PARTS` in w3h-shards.py). The #1661 welcome-lost row has its own
-    # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), and the
-    # H-S3-rm4 variants share `s3-rm4.1` and `s3-rm4.2`. A group is
+    # group too (`s3-1661.1` and `s3-1661.2`, 10 reruns each), the
+    # H-S3-rm4 variants share `s3-rm4.1` and `s3-rm4.2`, and H-S3-rm2 has
+    # its own group (`s3-rm2.1` and `s3-rm2.2`, 10 reruns each). A group is
     # omitted when the tree has no matching test.
     name: W3-H shard plan
     runs-on: ubuntu-latest
@@ -1013,10 +1015,16 @@ jobs:
           --expect w3h_1427_offline_member_reaches_the_epoch_it_missed=GREEN
           --require w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer
           --expect w3h_1427_catchup_moves_past_three_offline_admins_to_the_signer=GREEN
+          --require w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate
+          --expect w3h_1360_red_s7_h7_1_copied_key_creates_no_duplicate=RED
           --require w3h_1161_card_import_invite
           --expect w3h_1161_card_import_invite=GREEN
           --require w3h_1161_control_share_withheld_is_red
           --expect w3h_1161_control_share_withheld_is_red=RED
+          --require w3h_1149_treekem_banned_agent_not_readmitted_by_pre_ban_invite
+          --expect w3h_1149_treekem_banned_agent_not_readmitted_by_pre_ban_invite=GREEN
+          --require w3h_1149_signed_public_banned_agent_not_readmitted_by_pre_ban_invite
+          --expect w3h_1149_signed_public_banned_agent_not_readmitted_by_pre_ban_invite=GREEN
           --require w3h_969_leave_rekey_restart_seals_under_the_current_epoch
           --expect w3h_969_leave_rekey_restart_seals_under_the_current_epoch=GREEN
           --require w3h_1471_forged_card_import_invite
@@ -1067,8 +1075,12 @@ jobs:
           --expect w3h_1356_control_s3_attestation_touches_only_the_subject=GREEN
           --require w3h_1356_control_s3_d7_request_flood_rate_limited
           --expect w3h_1356_control_s3_d7_request_flood_rate_limited=GREEN
+          --require w3h_1356_control_s3_d6_provisional_ata_bogus_hashes
+          --expect w3h_1356_control_s3_d6_provisional_ata_bogus_hashes=GREEN
           --require w3h_1356_control_s3_s64_segment_boundary
           --expect w3h_1356_control_s3_s64_segment_boundary=GREEN
+          --require w3h_1356_control_s3_s_two_link_segments_across_a_restart
+          --expect w3h_1356_control_s3_s_two_link_segments_across_a_restart=GREEN
           --require w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix
           --expect w3h_1356_control_s3_x_attestation_conflict_stops_at_common_prefix=GREEN
           --require w3h_1356_red_s3_forked_node_shows_reseat_required
@@ -1097,6 +1109,8 @@ jobs:
           --expect w3h_1356_control_s3_d8_removal_basis_reseats_owner_axis_node=GREEN
           --require w3h_1356_control_s3_d3_authorisation_refusals_typed
           --expect w3h_1356_control_s3_d3_authorisation_refusals_typed=GREEN
+          --require w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed
+          --expect w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed=GREEN
           --require w3h_1666_control_certificate_only_admin_seals
           --expect w3h_1666_control_certificate_only_admin_seals=GREEN
           --require w3h_1578_red_gss_survivor_without_a_roster_kem_key_installs_the_frame_keyless
@@ -1137,6 +1151,8 @@ jobs:
           --expect w3h_1581h_control_sidecar_rebuild_newer_file_memory_only=GREEN
           --require w3h_1765_red_newer_file_revocation_waits_for_store_write
           --expect w3h_1765_red_newer_file_revocation_waits_for_store_write=GREEN
+          --require w3h_1776_delayed_fresh_joiner_fetches_the_welcome
+          --expect w3h_1776_delayed_fresh_joiner_fetches_the_welcome=GREEN
 
       # A shard can upload traces and still exit non-zero (runner error
       # after the cases). The gate above already fails a short or unstable

@@ -62,6 +62,7 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
+| GET | `/diagnostics/sidecar-quarantine` | `x0x diagnostics sidecar-quarantine` | Read-only. Lists each ADR 0108 §5a quarantined sidecar copy (`revocation-evictions.evs`, `.evh` and `.rdc`, `treekem/*.evjournal` and `*.orcpend`, `group-recovery/*.grecov`) with `sidecar`, `file`, `path`, `txid`, `state` (`pending` or `history`) and `size` in bytes, plus `count`, `total_bytes` and `scan_errors`. Copies are never deleted automatically (D148) |
 
 ## Presence
 

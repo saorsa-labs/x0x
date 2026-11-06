@@ -326,6 +326,10 @@ pub struct GroupsDiagnostics {
     /// packets are attacker-replayable, so the counter is rate-limited
     /// to one increment per group per second.
     conflict_unauthenticated_last_ms: Mutex<HashMap<String, u64>>,
+    /// #1149: per-group count of `MemberJoined` events refused because
+    /// the joiner is banned. Internal only: it is not a `GroupCounters`
+    /// field, so the `/diagnostics/groups` response shape is unchanged.
+    member_joined_rejected_banned: Mutex<HashMap<String, u64>>,
 }
 
 /// Sum two counter tables field-by-field (saturating). Module-scoped so
@@ -876,6 +880,29 @@ impl GroupsDiagnostics {
                 .member_joined_events_rejected_owner_cert_pending
                 .saturating_add(1);
         });
+    }
+
+    /// Record a `MemberJoined` refused because the joiner is banned
+    /// (#1149). Internal only; see the field doc.
+    pub(crate) fn record_member_joined_rejected_banned(&self, group_id: &str) {
+        let mut guard = match self.member_joined_rejected_banned.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entry = guard.entry(group_id.to_string()).or_default();
+        *entry = entry.saturating_add(1);
+    }
+
+    /// The number of `MemberJoined` events refused for `group_id` because
+    /// the joiner is banned (#1149). Read by tests only.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn member_joined_rejected_banned(&self, group_id: &str) -> u64 {
+        let guard = match self.member_joined_rejected_banned.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.get(group_id).copied().unwrap_or(0)
     }
 
     /// Record a `MemberJoined` rejection because the TreeKEM group was

@@ -22,9 +22,10 @@ impl Clock {
 pub(crate) fn candidate_boot(version: &str) -> io::Result<()> {
     child::candidate_boot(version)
 }
-pub(crate) fn candidate_boot_for_fixture(version: &str) -> io::Result<()> {
-    child::candidate_boot_owned(version)
-}
+mod control;
+mod recovery;
+#[cfg(all(test, unix))]
+mod testkit;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
