@@ -3,15 +3,17 @@ set -eu
 umask 077
 
 usage() {
-  echo "usage: $0 --probe /absolute/probe [--manager user|system] [--artifact-root DIR]" >&2
+  echo "usage: $0 --probe /absolute/probe [--manager user|system] [--artifact-root DIR] [--launcher-tests /absolute/test-binary]" >&2
   exit 64
 }
 
 probe=
+launcher_tests=
 manager=user
 artifact_root=
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --launcher-tests) [ "$#" -ge 2 ] || usage; launcher_tests=$2; shift 2 ;;
     --probe) [ "$#" -ge 2 ] || usage; probe=$2; shift 2 ;;
     --manager) [ "$#" -ge 2 ] || usage; manager=$2; shift 2 ;;
     --artifact-root) [ "$#" -ge 2 ] || usage; artifact_root=$2; shift 2 ;;
@@ -21,6 +23,10 @@ done
 [ -n "$probe" ] || usage
 [ -x "$probe" ] || { echo "probe is not executable: $probe" >&2; exit 65; }
 case "$probe" in /*) ;; *) echo "probe path must be absolute" >&2; exit 65;; esac
+if [ -n "$launcher_tests" ]; then
+  case "$launcher_tests" in /*) ;; *) echo "launcher tests path must be absolute" >&2; exit 65;; esac
+  [ -x "$launcher_tests" ] || { echo "launcher tests are not executable" >&2; exit 65; }
+fi
 case "$manager" in user|system) ;; *) usage;; esac
 command -v timeout >/dev/null 2>&1 || { echo "GNU timeout is required" >&2; exit 69; }
 
@@ -270,6 +276,47 @@ run_case positive verified "" simple always "" no
 run_case on-failure not_guaranteed "Restart=" simple on-failure "" no
 run_case prevent-exit-zero not_guaranteed "RestartPreventExitStatus" simple always 0 no
 run_case remain-after-exit not_guaranteed "RemainAfterExit=yes" simple always "" yes
+
+
+run_launcher_case() {
+  case_name=$1
+  unit="$run_id-launcher-$case_name.service"
+  case_dir="$artifact_root/launcher-$case_name"
+  mkdir -m 700 "$case_dir"
+  if [ "$manager" = system ]; then
+    chown "$fixture_uid:$fixture_gid" "$case_dir"
+    set -- "--property=User=$fixture_uid" "--property=Group=$fixture_gid"
+  else
+    set --
+  fi
+  units="$unit $units"
+  systemd_run_bounded "launcher-$case_name" "$case_dir/systemd-run.out" "$case_dir/systemd-run.err" \
+    --unit="$unit" --collect --property=Type=simple --property=Restart=on-failure \
+    --property=RestartSec=100ms --property=StartLimitBurst=2 --property=StartLimitIntervalSec=60 \
+    --property=KillMode=mixed --property=TimeoutStopSec=15 --property=PrivateNetwork=yes \
+    --property=CapabilityBoundingSet= --property=AmbientCapabilities= --property=NoNewPrivileges=yes \
+    "$@" "--setenv=X0X_FIXTURE_PARENT_NETNS=$parent_netns" \
+    "--setenv=X0X_LAUNCHER_CASE=$case_name" "--setenv=X0X_LAUNCHER_ROOT=$case_dir" \
+    "--setenv=X0X_LAUNCHER_FIXTURE_BIN=$probe" \
+    "$launcher_tests" --ignored --exact launcher::lifecycle::systemd --nocapture
+  if [ "$case_name" = stop ]; then
+    wait_file "$case_dir/child-running" 20
+    systemctl_bounded "launcher-stop-$case_name" "$case_dir/stop.out" "$case_dir/stop.err" stop "$unit"
+  fi
+  wait_file "$case_dir/done.json" 30
+  python3 -B "$script_dir/linux690_launcher_done.py" "$case_dir" "$case_name"
+  journal_bounded "launcher-journal-$case_name" "$unit" "$case_dir/journal.txt" "$case_dir/journal.err" || true
+  systemctl_bounded "launcher-final-stop-$case_name" "$case_dir/final-stop.out" "$case_dir/final-stop.err" stop "$unit" || true
+  systemctl_bounded "launcher-reset-$case_name" "$case_dir/reset.out" "$case_dir/reset.err" reset-failed "$unit" || true
+  wait_unit_absent "$unit" "$case_dir/post-cleanup.log" 10
+  safe=$(printf '%s' "$unit" | tr -c 'A-Za-z0-9._-' '_')
+  : >"$artifact_root/.cleaned-$safe"
+}
+
+if [ -n "$launcher_tests" ]; then
+  sha256sum "$launcher_tests" >"$artifact_root/launcher-tests-sha256.txt"
+  for launcher_case in exec crash hang restart restart-child stop; do run_launcher_case "$launcher_case"; done
+fi
 
 cat >"$artifact_root/oneshot-limit.txt" <<'EOF_LIMIT'
 A loaded Type=oneshot + RemainAfterExit=yes job cannot simultaneously use Restart=always or
