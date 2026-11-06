@@ -15,8 +15,8 @@ too, split as `s3-1661.1` and `s3-1661.2`, 10 reruns each. The H-S3-rm4
 variants run the H-S3-c prefix and share one shard, split as `s3-rm4.1`
 and `s3-rm4.2`, 10 reruns each. H-S3-rm2 runs the H-S3-d3 five-node
 prefix with M1 seated, then the H-S3-c advance and re-seat; it has its
-own shard, split as `s3-rm2.1` and `s3-rm2.2`, 10 reruns each. The
-summary job still counts 20 receipts.
+own shard, split as `s3-rm2.1` and `s3-rm2.2`, 10 reruns each. H-S3-d2
+has its own shard (`s3-d2`). The summary job still counts 20 receipts.
 
 The S3 shard is omitted when the tree has no `w3h_1356_` test, so `main`
 does not spend a runner on an empty filter. Adding those tests makes the
@@ -44,6 +44,7 @@ GROUPS = (
     ('s3-1661', 'w3h_1356_red_1661_welcome_lost_after_readmission_ends_typed$'),
     ('s3-rm4', 'w3h_1356_control_s3_rm4_'),
     ('s3-rm2', 'w3h_1356_control_s3_rm2_reseat_mandate_refusals_typed$'),
+    ('s3-d2', 'w3h_1356_control_s3_d2_fork_exposure_contained$'),
     ('s3', 'w3h_1356_'),
 )
 
