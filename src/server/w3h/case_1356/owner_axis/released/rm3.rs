@@ -387,7 +387,7 @@ fn released_s3_rm3_i_past_grace_refuses_then_candidate_applies() -> Result<()> {
 fn released_s3_rm3_ii_unobserved_warn_accepts() -> Result<()> {
     let case = "released_s3_rm3_ii_unobserved_warn_accepts";
     let note = "ADR 0109 S3 (#1356, #1572) H-S3-rm3 (ii); M runs the released v0.46.1";
-    released_test(case, SEED + 1, FINAL_RM3, note, |r| {
+    released_test(case, SEED, FINAL_RM3, note, |r| {
         row(r, case, Variant::Unobserved)
     })
 }
