@@ -11163,6 +11163,48 @@ fn admit_treekem_pending_event(
     Some(peers)
 }
 
+/// #1623 round 4/5: the TreeKEM epoch of this node's catch-up cursor.
+/// It is used wherever a cursor epoch is sent or compared: the asks, the
+/// page stop decision, the served-ahead check and the re-arm baseline. A
+/// node with a local TreeKEM group names its own `secret_epoch`, as
+/// before. A node with no local TreeKEM group (pre-Welcome) keeps its
+/// local `secret_epoch` (ADR 0109 §2), so it names the epoch of its
+/// committed head, from the signed `treekem:epoch=N` binding. Otherwise
+/// the responder, which keeps events past either cursor field, serves the
+/// applied link again and the paging stalls. No wire change.
+fn treekem_catchup_cursor_epoch_of(
+    secret_epoch: u64,
+    binding: Option<&str>,
+    has_local_tree: bool,
+) -> u64 {
+    if has_local_tree {
+        return secret_epoch;
+    }
+    binding
+        .and_then(|binding| binding.strip_prefix("treekem:epoch="))
+        .map(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .map_or(secret_epoch, |epoch| epoch.max(secret_epoch))
+}
+
+/// [`treekem_catchup_cursor_epoch_of`], with the local tree looked up
+/// under every name of the group in `aliases`.
+async fn treekem_catchup_cursor_epoch(
+    state: &AppState,
+    aliases: &[String],
+    (secret_epoch, binding): (u64, Option<String>),
+) -> u64 {
+    let has_local_tree = {
+        let trees = state.treekem_groups.read().await;
+        aliases.iter().any(|alias| trees.contains_key(alias))
+    };
+    treekem_catchup_cursor_epoch_of(secret_epoch, binding.as_deref(), has_local_tree)
+}
+
 async fn request_treekem_catchup_for_gap(
     state: &Arc<AppState>,
     group_id: &str,
@@ -11179,7 +11221,7 @@ async fn request_treekem_catchup_for_gap(
     // fence aliases under the same read that fills the request; each
     // admitted peer's ask cursor is recorded once its send LEFT (see
     // the note at the send below).
-    let (from_revision, from_epoch, current_state_hash, fence_aliases) = {
+    let (from_revision, head_epoch, current_state_hash, fence_aliases) = {
         let groups = state.named_groups.read().await;
         let resolved = groups
             .get_key_value(group_id)
@@ -11206,11 +11248,12 @@ async fn request_treekem_catchup_for_gap(
         fence_aliases.dedup();
         (
             info.state_revision,
-            info.secret_epoch,
+            (info.secret_epoch, info.security_binding.clone()),
             info.state_hash.clone(),
             fence_aliases,
         )
     };
+    let from_epoch = treekem_catchup_cursor_epoch(state, &fence_aliases, head_epoch).await;
     for peer in peers {
         let peer_hex = hex::encode(peer.as_bytes());
         let throttle_key = format!("{group_id}:{peer_hex}:{from_revision}:{from_epoch}");
@@ -11411,21 +11454,33 @@ async fn treekem_catchup_cursor(
     state: &Arc<AppState>,
     group_id: &str,
 ) -> Option<(u64, u64, String)> {
-    let groups = state.named_groups.read().await;
-    groups
-        .get(group_id)
-        .or_else(|| {
+    let (aliases, revision, head_epoch, hash) = {
+        let groups = state.named_groups.read().await;
+        let (key, info) = groups.get_key_value(group_id).or_else(|| {
             groups
-                .values()
-                .find(|info| info.stable_group_id() == group_id)
-        })
-        .map(|info| {
-            (
-                info.state_revision,
-                info.secret_epoch,
-                info.state_hash.clone(),
-            )
-        })
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
+        })?;
+        (
+            treekem_cursor_aliases(group_id, key, info),
+            info.state_revision,
+            (info.secret_epoch, info.security_binding.clone()),
+            info.state_hash.clone(),
+        )
+    };
+    let epoch = treekem_catchup_cursor_epoch(state, &aliases, head_epoch).await;
+    Some((revision, epoch, hash))
+}
+
+/// The names this node may hold a group's TreeKEM tree under, for
+/// [`treekem_catchup_cursor_epoch`] on the page-stop path.
+fn treekem_cursor_aliases(group_id: &str, key: &str, info: &x0x::groups::GroupInfo) -> [String; 4] {
+    [
+        group_id.to_string(),
+        key.to_string(),
+        info.mls_group_id.clone(),
+        info.stable_group_id().to_string(),
+    ]
 }
 
 /// The final replay reinsertion seam, called while membership is serialized.
@@ -13104,6 +13159,80 @@ fn catchup_page_within_attested_sequence(
     true
 }
 
+/// ADR 0109 §2 rule (b) (§7 (b), D82): may this node apply the commit of
+/// `event` state-only, with no local TreeKEM group? The caller found no
+/// TreeKEM group for the group. The node must not be Active on its roster
+/// (pre-Welcome). The commit must be the next hash of an armed attested
+/// sequence, checked on `info`, the record before this commit. When the
+/// owner-armed record and the admin-armed ATA are both armed, the commit
+/// must be inside both, as on the catch-up page path. So a link that
+/// leaves a sequence, or a link after the ATA signer lost its Active admin
+/// seat, is refused. A link that changes the policy hash is refused (§2);
+/// the ordinary apply also refuses it, because the state hash is
+/// recomputed from the local policy. A link that changes a GSS security
+/// binding (`gss:epoch=N` on the head or on the link) is refused (§2, as
+/// #458 r6 item 4 refuses it): the joiner cannot verify a GSS secret
+/// rotation from the chain. A TreeKEM-to-TreeKEM binding move is not a GSS
+/// change; every link with a TreeKEM commit makes one. The ordinary apply
+/// takes the link's binding, so this guard alone refuses a GSS change.
+/// The TreeKEM commit is then skipped: no tree and no epoch come from
+/// it. On admission `next` keeps
+/// this node's `secret_epoch`, as `apply_link_state_only` does; the signed
+/// `security_binding` stays, because the state hash covers it. The node's
+/// keys come only from its own Welcome at the terminal. `MemberAdded` has
+/// its own older pre-Welcome rule, which this check does not change.
+async fn admit_pre_welcome_state_only_link(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    next: &mut x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    local_agent_hex: &str,
+) -> Result<(), &'static str> {
+    let verdict = 'check: {
+        if info.has_active_member(local_agent_hex) {
+            break 'check Err("pre_welcome_local_seat_active");
+        }
+        let Some(commit) = named_group_metadata_event_commit(event) else {
+            break 'check Err("pre_welcome_no_commit");
+        };
+        if commit.policy_hash != x0x::groups::compute_policy_hash(&info.policy) {
+            break 'check Err("pre_welcome_policy_change");
+        }
+        let is_gss = |binding: Option<&str>| binding.is_some_and(|b| b.starts_with("gss:"));
+        let (head_binding, link_binding) = (
+            info.security_binding.as_deref(),
+            commit.security_binding.as_deref(),
+        );
+        if head_binding != link_binding && (is_gss(head_binding) || is_gss(link_binding)) {
+            break 'check Err("pre_welcome_gss_binding_change");
+        }
+        let link = std::slice::from_ref(event);
+        let owner_sequence =
+            armed_anchored_gap_sequence(info).map(|record| &record.attested_chain_hashes);
+        let admin_sequence = group_recovery::armed_admin_sequence(state, info).await;
+        if owner_sequence.is_none() && admin_sequence.is_none() {
+            break 'check Err("pre_welcome_no_armed_sequence");
+        }
+        if owner_sequence.is_some_and(|sequence| {
+            !catchup_page_within_attested_sequence(link, &info.state_hash, sequence)
+        }) || admin_sequence.is_some_and(|sequence| {
+            !catchup_page_within_attested_sequence(link, &info.state_hash, &sequence)
+        }) {
+            break 'check Err("pre_welcome_outside_armed_sequence");
+        }
+        // ADR 0109 §2: no epoch is taken from the chain.
+        next.secret_epoch = info.secret_epoch;
+        Ok(())
+    };
+    if let Err(reason) = verdict {
+        tracing::debug!(
+            target: "treekem.trace", stage = "pre_welcome_state_only_refused",
+            group_id = %info.mls_group_id, reason,
+        );
+    }
+    verdict
+}
+
 /// Test-only mirror of [`armed_anchored_gap_sequence`]: is the #846
 /// catch-up gate ARMED for this group right now? Lets a test prove the
 /// gate (not a disarm) admitted or refused each page.
@@ -13214,16 +13343,16 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     let response_info = {
         let groups = state.named_groups.read().await;
         groups
-            .get(&response.group_id)
+            .get_key_value(&response.group_id)
             .or_else(|| {
                 groups
-                    .values()
-                    .find(|info| info.stable_group_id() == response.group_id)
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == response.group_id)
             })
-            .filter(|info| !info.withdrawn && info.has_active_member(&sender_hex))
-            .cloned()
+            .filter(|(_, info)| !info.withdrawn && info.has_active_member(&sender_hex))
+            .map(|(key, info)| (key.clone(), info.clone()))
     };
-    let Some(response_info) = response_info else {
+    let Some((response_key, response_info)) = response_info else {
         tracing::warn!(
             group_id = %LogHexId::group(&response.group_id),
             sender = %LogHexId::agent(&sender_hex),
@@ -13249,7 +13378,15 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     // it, so the loop pages on instead of stopping.
     let cursor_before = (
         response_info.state_revision,
-        response_info.secret_epoch,
+        treekem_catchup_cursor_epoch(
+            state,
+            &treekem_cursor_aliases(&response.group_id, &response_key, &response_info),
+            (
+                response_info.secret_epoch,
+                response_info.security_binding.clone(),
+            ),
+        )
+        .await,
         response_info.state_hash.clone(),
     );
     let reported_head = response.responder_state_hash.clone();
@@ -14208,7 +14345,7 @@ async fn maybe_rearm_stopped_treekem_pages(
     group_id: &str,
     skip_peer: Option<&str>,
 ) {
-    let (aliases, cursor) = {
+    let (aliases, revision, head_epoch, hash) = {
         let groups = state.named_groups.read().await;
         let resolved = groups
             .get_key_value(group_id)
@@ -14232,13 +14369,16 @@ async fn maybe_rearm_stopped_treekem_pages(
         aliases.dedup();
         (
             aliases,
-            (
-                info.state_revision,
-                info.secret_epoch,
-                info.state_hash.clone(),
-            ),
+            info.state_revision,
+            (info.secret_epoch, info.security_binding.clone()),
+            info.state_hash.clone(),
         )
     };
+    let cursor = (
+        revision,
+        treekem_catchup_cursor_epoch(state, &aliases, head_epoch).await,
+        hash,
+    );
     if treekem_page_stopped_peer_rows(&aliases).is_empty() {
         return;
     }
@@ -14750,7 +14890,7 @@ async fn request_treekem_catchup_page(
     // peer's page moved it. The alias family is resolved under the
     // same read that fills the request, so every spelling of the
     // group a response can carry finds the row.
-    let (from_revision, from_epoch, current_state_hash, fence_aliases) = {
+    let (from_revision, head_epoch, current_state_hash, fence_aliases) = {
         let groups = state.named_groups.read().await;
         let resolved = groups
             .get_key_value(group_id)
@@ -14774,11 +14914,12 @@ async fn request_treekem_catchup_page(
         fence_aliases.dedup();
         (
             info.state_revision,
-            info.secret_epoch,
+            (info.secret_epoch, info.security_binding.clone()),
             info.state_hash.clone(),
             fence_aliases,
         )
     };
+    let from_epoch = treekem_catchup_cursor_epoch(state, &fence_aliases, head_epoch).await;
     treekem_page_ask_cursor_note(
         &fence_aliases,
         &hex::encode(peer.as_bytes()),
@@ -15165,12 +15306,12 @@ async fn request_member_key_package_catchup(
     member_agent_id: &str,
 ) {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let (from_revision, from_epoch, current_state_hash, candidates, fence_ids) = {
+    let (from_revision, head_epoch, current_state_hash, candidates, fence_ids) = {
         let groups = state.named_groups.read().await;
-        let Some(info) = groups.get(group_id).or_else(|| {
+        let Some((register_key, info)) = groups.get_key_value(group_id).or_else(|| {
             groups
-                .values()
-                .find(|info| info.stable_group_id() == group_id)
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
         }) else {
             return;
         };
@@ -15196,16 +15337,18 @@ async fn request_member_key_package_catchup(
         }
         (
             info.state_revision,
-            info.secret_epoch,
+            (info.secret_epoch, info.security_binding.clone()),
             info.state_hash.clone(),
             candidate_hexes,
             vec![
                 group_id.to_string(),
+                register_key.clone(),
                 info.mls_group_id.clone(),
                 info.stable_group_id().to_string(),
             ],
         )
     };
+    let from_epoch = treekem_catchup_cursor_epoch(state, &fence_ids, head_epoch).await;
     for candidate_hex in candidates {
         if candidate_hex.eq_ignore_ascii_case(&local_agent_hex) {
             continue;
@@ -17748,21 +17891,31 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
                 };
-                let Some(group) = group else {
-                    return ApplyMetadataResult::REJECTED;
-                };
-                if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                if let Some(group) = group {
+                    if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                        state,
+                        &resolved_group_key,
+                        &next,
+                        group,
+                        &commit_bytes,
+                        _epoch,
+                        "member_removed_commit",
+                    )
+                    .await
+                    {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM remove commit: {e}");
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                } else if admit_pre_welcome_state_only_link(
                     state,
-                    &resolved_group_key,
-                    &next,
-                    group,
-                    &commit_bytes,
-                    _epoch,
-                    "member_removed_commit",
+                    &info,
+                    &mut next,
+                    &event_for_log,
+                    &local_agent_hex,
                 )
                 .await
+                .is_err()
                 {
-                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM remove commit: {e}");
                     return ApplyMetadataResult::REJECTED;
                 }
             }
@@ -18210,25 +18363,42 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
                 };
-                let Some(group) = group else {
-                    return banned_reject("treekem_group_missing", &resolved_group_key);
-                };
-                if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                if let Some(group) = group {
+                    if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                        state,
+                        &resolved_group_key,
+                        &next,
+                        group,
+                        &commit_bytes,
+                        epoch,
+                        "member_banned_commit",
+                    )
+                    .await
+                    {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM ban commit: {e}");
+                        return banned_reject(
+                            "process_treekem_commit_after_crypto_recheck",
+                            &resolved_group_key,
+                        );
+                    }
+                } else if admit_pre_welcome_state_only_link(
                     state,
-                    &resolved_group_key,
-                    &next,
-                    group,
-                    &commit_bytes,
-                    epoch,
-                    "member_banned_commit",
+                    &info,
+                    &mut next,
+                    &event_for_log,
+                    &local_agent_hex,
                 )
                 .await
+                .is_err()
                 {
-                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM ban commit: {e}");
-                    return banned_reject(
-                        "process_treekem_commit_after_crypto_recheck",
-                        &resolved_group_key,
-                    );
+                    // A seated node with no tree is missing its tree; a
+                    // pre-Welcome node failed the rule (b) check.
+                    let reason = if info.has_active_member(&local_agent_hex) {
+                        "treekem_group_missing"
+                    } else {
+                        "pre_welcome_link_not_admitted"
+                    };
+                    return banned_reject(reason, &resolved_group_key);
                 }
             }
             // ADR 0107 (review r2): inside this apply's critical section, on
@@ -18514,7 +18684,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             let request_key_package_b64 = req_snapshot.treekem_key_package_b64.clone();
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(
+            let Ok(mut next) = apply_stateful_event_with_evidence(
                 state,
                 &resolved_group_key,
                 &current,
@@ -18633,21 +18803,31 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         let map = state.treekem_groups.read().await;
                         map.get(&resolved_group_key).cloned()
                     };
-                    let Some(group) = group else {
-                        return ApplyMetadataResult::REJECTED;
-                    };
-                    if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                    if let Some(group) = group {
+                        if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                            state,
+                            &resolved_group_key,
+                            &next,
+                            group,
+                            &commit_bytes,
+                            _epoch,
+                            "join_request_approved_commit",
+                        )
+                        .await
+                        {
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM add commit: {e}");
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    } else if admit_pre_welcome_state_only_link(
                         state,
-                        &resolved_group_key,
-                        &next,
-                        group,
-                        &commit_bytes,
-                        _epoch,
-                        "join_request_approved_commit",
+                        &info,
+                        &mut next,
+                        &event_for_log,
+                        &local_agent_hex,
                     )
                     .await
+                    .is_err()
                     {
-                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM add commit: {e}");
                         return ApplyMetadataResult::REJECTED;
                     }
                 }
@@ -52169,6 +52349,7 @@ pub(in crate::server) mod tests {
     mod issue1577_revoked_catchup_request;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
+    mod issue1623_pre_welcome_page_links;
     mod issue1649_reseat_mandate_receive;
     mod issue1655_catchup_recheck_before_write;
     mod issue1657_typed_refusal_catchup;

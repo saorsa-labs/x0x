@@ -345,8 +345,11 @@ rollback, or a service stop while attempts remain is Interrupted. The
 launcher then restores the previous pair and starts the restored daemon. For
 a service stop, the restore happens on the next launcher start; the candidate
 bytes stay installed until then. A restarted launcher resumes an interrupted
-rollback, keeps the first rollback cause, and starts only a missing restored
-child, at most 3 times. A failed reap or a failed restored start stops automatic
+rollback and starts only a missing restored child, at most 3 times. The
+trial keeps its first rollback cause. Until the host journal reaches
+Restored, a Failed cause there replaces an Interrupted one, so the journal
+cause, which decides the hold, can differ from the trial cause. After
+Restored, the journal cause does not change. A failed reap or a failed restored start stops automatic
 recovery (`RecoveryFailed`) until an operator repairs the host.
 
 The `x0x-launcher` binary builds only with the non-default `m2-launcher`
