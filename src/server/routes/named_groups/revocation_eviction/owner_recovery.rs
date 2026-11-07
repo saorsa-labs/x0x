@@ -2461,7 +2461,12 @@ pub(in crate::server) async fn promoted_admin_secret(
 /// admin's removal or ban with or without a rotation, a member's own
 /// leave, and the request-based admission steps (a request, its approval,
 /// rejection or cancellation).
+///
+/// #1606: the role update, rename, policy update, unban, rejection and
+/// cancellation steps call the ordinary apply's own pure steps
+/// ([`super::super::event_steps`]), so the two cannot drift apart.
 fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
+    use super::super::event_steps as steps;
     use super::super::NamedGroupMetadataEvent as Event;
     let commit = super::super::named_group_metadata_event_commit(&held.event)?;
     if commit.prev_state_hash.as_deref() != Some(cursor.state_hash.as_str()) {
@@ -2475,6 +2480,9 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
                 .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
     };
     let next = match &held.event {
+        // #1578 rc11 (audit): the join's key-only marker row is not a
+        // seat — the replay stops on it, exactly as the apply side parks a
+        // role update for a member that has not landed.
         Event::MemberRoleUpdated {
             revision,
             actor,
@@ -2482,31 +2490,9 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             role,
             ..
         } => {
-            // #1578 rc11 (audit): the join's key-only marker row is not
-            // a seat — the replay stops on it, exactly as the apply
-            // side parks a role update for a member that has not
-            // landed.
-            let target = cursor
-                .members_v2
-                .get(agent_id)
-                .filter(|_| !cursor.join_seat_key_marker_only(agent_id))?;
-            if !admin(actor)
-                || target.is_removed()
-                || target.is_banned()
-                || *role == x0x::groups::GroupRole::Owner
-            {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
-                cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision =
-                        super::super::adopt_roster_revision(next.roster_revision, *revision);
-                    next.set_member_role(agent_id, *role);
-                },
-            )
+            let (action, mutate) =
+                steps::role_update(cursor, &author, *revision, actor, agent_id, *role).ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         Event::GroupMetadataUpdated {
             revision,
@@ -2515,25 +2501,17 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             description,
             ..
         } => {
-            if !admin(actor) {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
+            let (action, mutate) = steps::metadata_update(
                 cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision =
-                        super::super::adopt_roster_revision(next.roster_revision, *revision);
-                    if let Some(name) = name.clone() {
-                        next.name = name;
-                    }
-                    if let Some(description) = description.clone() {
-                        next.description = description;
-                    }
-                    next.updated_at = commit.committed_at;
-                },
+                &author,
+                *revision,
+                actor,
+                name,
+                description,
+                commit.committed_at,
             )
+            .ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         // #1508 rc16 (Codex P1): an admin's GSS add between the removal
         // and a promotion. It seats a Member only and keeps the epoch.
@@ -2612,23 +2590,15 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             policy,
             ..
         } => {
-            if !admin(actor)
-                || cursor
-                    .policy
-                    .admission
-                    .owner_certified_user_id()
-                    .is_some_and(|owner| policy.admission.owner_certified_user_id() != Some(owner))
-            {
+            // #1606: the walk also checks the event's actor field. The
+            // ordinary apply checks only the commit signer's authority.
+            // The walk is the stricter side, so it fails safe.
+            if !admin(actor) {
                 return None;
             }
-            super::super::apply_stateful_event_to_group(
-                cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    super::super::set_policy_update(next, *revision, policy, commit.committed_at)
-                },
-            )
+            let (action, mutate) =
+                steps::policy_update(cursor, *revision, policy, commit.committed_at).ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         Event::MemberUnbanned {
             revision,
@@ -2636,19 +2606,19 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
             agent_id,
             ..
         } => {
-            if !admin(actor) || cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+            if cursor.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                 return None;
             }
-            super::super::apply_stateful_event_to_group(
+            let (action, mutate) = steps::unban(
                 cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision =
-                        super::super::adopt_roster_revision(next.roster_revision, *revision);
-                    next.unban_member(agent_id);
-                },
+                &author,
+                *revision,
+                actor,
+                agent_id,
+                commit.committed_at,
             )
+            .ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         // #1533 rc17 (Codex P1): an active member's own GSS leave between
         // the removal and a promotion, checked as the ordinary self-leave
@@ -2885,48 +2855,25 @@ fn next_held_state(cursor: &GroupInfo, held: &HeldEvent) -> Option<GroupInfo> {
         Event::JoinRequestRejected {
             request_id, actor, ..
         } => {
-            if !admin(actor)
-                || !cursor
-                    .join_requests
-                    .get(request_id)
-                    .is_some_and(|request| request.is_pending())
-            {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
+            let (action, mutate) = steps::join_request_rejected(
                 cursor,
-                commit,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    super::super::set_join_request_rejected(
-                        next,
-                        request_id,
-                        actor,
-                        commit.committed_at,
-                    )
-                },
+                &author,
+                request_id,
+                actor,
+                commit.committed_at,
             )
+            .ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         Event::JoinRequestCancelled {
             request_id,
             requester_agent_id,
             ..
         } => {
-            if *requester_agent_id != author
-                || !cursor.join_requests.get(request_id).is_some_and(|request| {
-                    request.is_pending() && request.requester_agent_id == *requester_agent_id
-                })
-            {
-                return None;
-            }
-            super::super::apply_stateful_event_to_group(
-                cursor,
-                commit,
-                x0x::groups::ActionKind::NonMemberRequest,
-                |next| {
-                    super::super::set_join_request_cancelled(next, request_id, requester_agent_id)
-                },
-            )
+            let (action, mutate) =
+                steps::join_request_cancelled(cursor, &author, request_id, requester_agent_id)
+                    .ok()?;
+            super::super::apply_stateful_event_to_group(cursor, commit, action, mutate)
         }
         _ => return None,
     }
@@ -8115,6 +8062,378 @@ mod restart_tests {
         );
         restarted.agent.shutdown().await;
         b.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// `info` as JSON without each member's `joined_at` and `updated_at`:
+    /// the roster setters stamp them from the local clock, so two runs of
+    /// one step can differ there by a millisecond. The state hash does
+    /// not bind them.
+    fn member_clock_free(info: &GroupInfo) -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(info)?;
+        if let Some(members) = value["members_v2"].as_object_mut() {
+            for member in members.values_mut().filter_map(|m| m.as_object_mut()) {
+                member.remove("joined_at");
+                member.remove("updated_at");
+            }
+        }
+        Ok(value)
+    }
+
+    /// #1606: the GSS held-chain walk and the ordinary apply reach the
+    /// same decision and the same state on a mixed chain: a join request,
+    /// its approval, a promotion, a rename, a policy update, a ban, an
+    /// unban, a rejection and a cancellation, plus refused steps (a
+    /// promotion to Owner, a member's rename, a rename in a member's name,
+    /// a promotion of an agent with no seat, a rejection of a request that
+    /// is not pending, a cancellation by another agent or of a request that
+    /// is not pending). Every step chains on the head, so only the event
+    /// rules decide. #1606 review: a policy update in the name of a member,
+    /// or of an admin that did not send it, is the one place where the two
+    /// sides differ today. The walk refuses it and the apply accepts it
+    /// (FOR ENGINEER in #1825); the test pins both decisions.
+    #[tokio::test]
+    async fn the_walk_and_the_ordinary_apply_agree_on_a_mixed_chain() -> Result<()> {
+        use super::super::super as ng;
+        use x0x::groups::GroupRole;
+        let dir = tempfile::tempdir()?;
+        let state = offline_daemon(dir.path(), None).await?;
+        let keys = (0..5)
+            .map(|_| x0x::identity::AgentKeypair::generate())
+            .collect::<Result<Vec<_>, _>>()?;
+        let [admin, joiner, second, third, member] = &keys[..] else {
+            anyhow::bail!("five keys");
+        };
+        let id = |kp: &x0x::identity::AgentKeypair| hex::encode(kp.agent_id().as_bytes());
+        let mut cursor = GroupInfo::with_policy(
+            "parity".to_string(),
+            "desc".to_string(),
+            admin.agent_id(),
+            "ab".repeat(32),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        let local = hex::encode(state.agent.agent_id().as_bytes());
+        cursor.add_member(local, GroupRole::Member, None, None);
+        cursor.add_member(id(member), GroupRole::Member, None, None);
+        cursor.seal_commit(admin, ng::now_millis_u64())?;
+        hold_persisted(&state, &cursor).await?;
+        let gid = cursor.stable_group_id().to_string();
+        let mut policy = cursor.policy.clone();
+        policy.discoverability = x0x::groups::GroupDiscoverability::ListedToContacts;
+        let request = |kp: &x0x::identity::AgentKeypair, rid: &str| x0x::groups::JoinRequest {
+            request_id: rid.to_string(),
+            group_id: gid.clone(),
+            requester_agent_id: id(kp),
+            requester_user_id: None,
+            requested_role: GroupRole::Member,
+            message: None,
+            treekem_key_package_b64: None,
+            created_at: 7,
+            reviewed_at: None,
+            reviewed_by: None,
+            status: x0x::groups::JoinRequestStatus::Pending,
+            predecessor_envelope_digest: None,
+            predecessor_first_seen_ms: None,
+        };
+        let (j, m, a) = (id(joiner), id(member), id(admin));
+        let (listed, open) = (policy.clone(), cursor.policy.clone());
+        let created = |kp| {
+            serde_json::json!({"event": "join_request_created", "ts": 7,
+            "request_id": format!("r{}", id(kp)), "requester_agent_id": id(kp)})
+        };
+        // (label, signer, accepted, event fields; the commit and the
+        // group, revision and actor fields are added below.)
+        let chain = [
+            ("join request", joiner, true, created(joiner)),
+            (
+                "approval",
+                admin,
+                true,
+                serde_json::json!({"event": "join_request_approved",
+                "request_id": format!("r{j}"), "requester_agent_id": j}),
+            ),
+            (
+                "promotion to Owner",
+                admin,
+                false,
+                serde_json::json!({
+                "event": "member_role_updated", "agent_id": j, "role": GroupRole::Owner}),
+            ),
+            (
+                "promotion",
+                admin,
+                true,
+                serde_json::json!({
+                "event": "member_role_updated", "agent_id": j, "role": GroupRole::Admin}),
+            ),
+            (
+                "member rename",
+                member,
+                false,
+                serde_json::json!({
+                "event": "group_metadata_updated", "name": "renamed"}),
+            ),
+            (
+                "rename",
+                joiner,
+                true,
+                serde_json::json!({
+                "event": "group_metadata_updated", "name": "renamed"}),
+            ),
+            (
+                "rename in a member's name",
+                joiner,
+                false,
+                serde_json::json!({
+                "event": "group_metadata_updated", "name": "other", "actor": m}),
+            ),
+            (
+                "policy update",
+                joiner,
+                true,
+                serde_json::json!({
+                "event": "policy_updated", "policy": listed}),
+            ),
+            (
+                "policy update in a member's name",
+                joiner,
+                true,
+                serde_json::json!({"event": "policy_updated", "policy": open, "actor": m}),
+            ),
+            (
+                "policy update in another admin's name",
+                joiner,
+                true,
+                serde_json::json!({"event": "policy_updated", "policy": listed, "actor": a}),
+            ),
+            (
+                "ban",
+                joiner,
+                true,
+                serde_json::json!({"event": "member_banned", "agent_id": m}),
+            ),
+            (
+                "unban",
+                admin,
+                true,
+                serde_json::json!({"event": "member_unbanned", "agent_id": m}),
+            ),
+            (
+                "promotion of an agent with no seat",
+                admin,
+                false,
+                serde_json::json!({"event": "member_role_updated", "agent_id": id(second),
+                "role": GroupRole::Admin}),
+            ),
+            ("second request", second, true, created(second)),
+            ("third request", third, true, created(third)),
+            (
+                "rejection",
+                admin,
+                true,
+                serde_json::json!({"event": "join_request_rejected",
+                "request_id": format!("r{}", id(second)), "requester_agent_id": id(second)}),
+            ),
+            (
+                "rejection of a resolved request",
+                admin,
+                false,
+                serde_json::json!({
+                "event": "join_request_rejected", "request_id": format!("r{}", id(second)),
+                "requester_agent_id": id(second)}),
+            ),
+            (
+                "cancellation by another agent",
+                admin,
+                false,
+                serde_json::json!({"event": "join_request_cancelled",
+                "request_id": format!("r{}", id(third)), "requester_agent_id": id(third)}),
+            ),
+            (
+                "cancellation",
+                third,
+                true,
+                serde_json::json!({"event": "join_request_cancelled",
+                "request_id": format!("r{}", id(third)), "requester_agent_id": id(third)}),
+            ),
+            (
+                "cancellation of a resolved request",
+                third,
+                false,
+                serde_json::json!({"event": "join_request_cancelled",
+                "request_id": format!("r{}", id(third)), "requester_agent_id": id(third)}),
+            ),
+        ];
+        // The steps that the apply accepts and the walk refuses.
+        let walk_refuses = [
+            "policy update in a member's name",
+            "policy update in another admin's name",
+        ];
+        let mut accepted = 0;
+        for (label, signer, accept, mut fields) in chain {
+            // The author's side: the same change, sealed by the signer.
+            let mut next = cursor.clone();
+            let revision = next.roster_revision.saturating_add(1);
+            let at = ng::now_millis_u64();
+            let field = |name: &str| fields[name].as_str().unwrap_or_default().to_string();
+            let (agent, rid, actor) = (field("agent_id"), field("request_id"), id(signer));
+            match fields["event"].as_str() {
+                Some("join_request_created") => {
+                    ng::set_join_request_created(&mut next, request(signer, &rid), None)
+                }
+                Some("join_request_approved") => ng::set_join_request_approved(
+                    &mut next,
+                    &rid,
+                    &actor,
+                    &field("requester_agent_id"),
+                    revision,
+                    at,
+                ),
+                Some("member_role_updated") => {
+                    next.set_member_role(&agent, serde_json::from_value(fields["role"].clone())?)
+                }
+                Some("group_metadata_updated") => next.name = field("name"),
+                Some("policy_updated") => ng::set_policy_update(
+                    &mut next,
+                    revision,
+                    &serde_json::from_value(fields["policy"].clone())?,
+                    at,
+                ),
+                Some("member_banned") => next.ban_member(&agent, Some(actor.clone())),
+                Some("member_unbanned") => next.unban_member(&agent),
+                Some("join_request_rejected") => {
+                    ng::set_join_request_rejected(&mut next, &rid, &actor, at)
+                }
+                _ => ng::set_join_request_cancelled(&mut next, &rid, &field("requester_agent_id")),
+            }
+            next.updated_at = at;
+            next.roster_revision = revision;
+            let commit = next.seal_commit(signer, at)?;
+            fields["group_id"] = gid.clone().into();
+            fields["revision"] = revision.into();
+            if fields.get("actor").is_none() {
+                fields["actor"] = actor.into();
+            }
+            fields["commit"] = serde_json::to_value(&commit)?;
+            let event: ng::NamedGroupMetadataEvent = serde_json::from_value(fields)?;
+            // The walk's side, then the ordinary apply's side.
+            let held = HeldEvent {
+                stable_group_id: gid.clone(),
+                event: event.clone(),
+                author: signer.agent_id(),
+                prev_state_hash: Some(cursor.state_hash.clone()),
+                at: Instant::now(),
+            };
+            let walked = next_held_state(&cursor, &held);
+            let applied =
+                ng::apply_named_group_metadata_event(&state, event, signer.agent_id(), true, None)
+                    .await
+                    .accepted;
+            let (_, stored) = group_by_stable(&state, &gid).await.context("loaded")?;
+            let walk_accepts = accept && !walk_refuses.contains(&label);
+            assert_eq!(
+                walked.is_some(),
+                walk_accepts,
+                "{label}: the walk's decision"
+            );
+            assert_eq!(applied, accept, "{label}: the apply's decision");
+            match (walked, applied) {
+                (Some(walked), _) => {
+                    assert_eq!(
+                        member_clock_free(&walked)?,
+                        member_clock_free(&stored)?,
+                        "{label}: the walk and the apply reach the same state"
+                    );
+                    cursor = walked;
+                    accepted += 1;
+                }
+                (None, true) => {
+                    cursor = stored;
+                    accepted += 1;
+                }
+                (None, false) => {
+                    assert_eq!(stored.state_hash, cursor.state_hash, "{label}: no change")
+                }
+            }
+        }
+        assert_eq!(accepted, 13, "every accepting step ran");
+        // The apply parked the promotion of the agent with no seat (#876);
+        // the walk only refused it.
+        let (key, _) = group_by_stable(&state, &gid).await.context("loaded")?;
+        let parked = state
+            .parked_role_updates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .map_or(0, Vec::len);
+        assert_eq!(
+            parked, 1,
+            "the apply parks the role update for the unseated agent"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// #1606 review: the walk refuses an unban on the TreeKEM plane, though
+    /// the shared step and the commit check accept it. The plane rule is
+    /// the walk's own: the same unban on the GSS plane (the control) is
+    /// walked.
+    #[test]
+    fn the_walk_refuses_a_treekem_unban() -> Result<()> {
+        use super::super::super::event_steps as steps;
+        use x0x::mls::SecureGroupPlane;
+        let (admin, banned) = (
+            x0x::identity::AgentKeypair::generate()?,
+            x0x::identity::AgentKeypair::generate()?,
+        );
+        let (a, b) = (
+            hex::encode(admin.agent_id().as_bytes()),
+            hex::encode(banned.agent_id().as_bytes()),
+        );
+        for (plane, walked) in [
+            (SecureGroupPlane::Gss, true),
+            (SecureGroupPlane::TreeKem, false),
+        ] {
+            let mut cursor =
+                GroupInfo::new("t".into(), "d".into(), admin.agent_id(), "cd".repeat(32));
+            cursor.add_member(b.clone(), x0x::groups::GroupRole::Member, None, None);
+            cursor.ban_member(&b, Some(a.clone()));
+            cursor.secure_plane = plane;
+            cursor.seal_commit(&admin, 1)?;
+            let revision = cursor.roster_revision.saturating_add(1);
+            let step = || steps::unban(&cursor, &a, revision, &a, &b, 2).ok();
+            let (_, mutate) = step().context("the shared step accepts")?;
+            let mut next = cursor.clone();
+            mutate(&mut next);
+            next.roster_revision = revision;
+            let commit = next.seal_commit(&admin, 2)?;
+            let (action, mutate) = step().context("the shared step accepts")?;
+            anyhow::ensure!(
+                super::super::super::apply_stateful_event_to_group(
+                    &cursor, &commit, action, mutate
+                )
+                .is_ok(),
+                "{plane:?}: the commit check accepts the unban"
+            );
+            let held = HeldEvent {
+                stable_group_id: cursor.stable_group_id().to_string(),
+                event: super::super::super::NamedGroupMetadataEvent::MemberUnbanned {
+                    group_id: cursor.stable_group_id().to_string(),
+                    revision,
+                    actor: a.clone(),
+                    agent_id: b.clone(),
+                    commit: Some(commit),
+                },
+                author: admin.agent_id(),
+                prev_state_hash: Some(cursor.state_hash.clone()),
+                at: Instant::now(),
+            };
+            assert_eq!(
+                next_held_state(&cursor, &held).is_some(),
+                walked,
+                "{plane:?}: the walk's decision"
+            );
+        }
         Ok(())
     }
 }
