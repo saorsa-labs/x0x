@@ -44,6 +44,30 @@ The 17 Accepted transient records were folded into their target slots on
 Proposed as open proposals; the [transient index](transient/README.md) lists
 them with their target slots.
 
+## Capability registry
+
+This table is the live allocation table for capability bits. Allocate the next bit here.
+
+**ADR 0093 capability registry** (the canonical allocation table since ADR 0089, accepted 2026-09-30, amended 0093's allocation procedure; ADR 0093 itself is immutable):
+
+| Bit | Name | Meaning | Allocated by |
+| --- | --- | --- | --- |
+| 0 | `share_grant_v1` | Understands and validates the ShareGrant v1 typed DM | ADR 0093 |
+| 1 | `predecessor_offer_v1` | Understands the predecessor/requester offer route and its application handling | ADR 0093 |
+| 2 | `peer_evidence_v1` | Accepts `EvidenceV1` (stream protocol 0x06) evidence Hello/Lookup streams | ADR 0089 (accepted 2026-09-30; advertised since the S5 slice) |
+| 3 | `file_control_ack_v1` | Sends and expects `file-control-ack` for file offer, accept, and reject | Accepted transient [T-file-control-ack](./transient/T-file-control-ack.md), slot A10, 2026-10-12 |
+| 4 | `eviction_handoff_v1` | Understands typed authenticated `EvictionHandoffV1` revocation-eviction hand-off evidence | ADR 0110 §4 (accepted 2026-10-20) |
+| 5 | `crypto_exclusion_v1` | Verifies and applies `CryptoExclusionV1` for an already-Removed target | ADR 0110 §4 (accepted 2026-10-20) |
+| 6 | `certificate_rebind_v1` | Verifies and applies `CertificateRebindV1` seat rebinding commits | ADR 0110 §4a (accepted 2026-10-20) |
+| 7 | `owner_recovery_v1` | Verifies and applies `OwnerRecoveryV1` commits | ADR 0110 §4b (accepted 2026-10-20) |
+| 8 | `group_terminal_attest_v1` | Issues and verifies admin terminal attestations, answers `group_attest_request`, consumes re-seat authorisations | ADR 0109 §5 (accepted 2026-10-20) |
+| 9 | `group_reseat_mandate_v1` | Verifies and applies promoted-admin `ReseatMandateV1` commits | ADR 0109 §3a (accepted 2026-10-20) |
+| 10 | `gui_show_v1` | Understands remote GUI show typed direct messages | ADR 0083 slice 3 (lowest free bit on 2026-10-23) |
+| 11 | `join_pending_notice_v1` | Serves and understands `JoinPendingNotice` on the join-result poll | ADR 0108 §8 (accepted 2026-10-05; wire half ruled by David 2026-10-25, D-ruling 05:14 GMT; next free bit in acceptance order) |
+| 12 | `key_republish_v1` | Verifies and seats signed `MemberKeyRepublishV1` (`X0XKR1`) key republications on an Active seat | #1663 (David's ruling, 28 Oct 2026 02:25 GMT; lowest free bit) |
+| 13 | `treekem_catchup_refusal_v1` | Sends and understands the typed `treekem_catchup_refusal` that answers a machine- or binding-revoked TreeKEM catch-up request ONLY — never sent on another lane: a machine- or binding-revoked control-blob fetch gets no answer at all (blob withheld, no frame; #1664) | #1657 (David's approval, 28 Oct 2026 02:08 GMT; bit ruled by the Engineer 29 Oct 2026 22:14 GMT; lane boundary ruled by the Engineer 31 Oct 2026 03:40 GMT — bit 13 is catch-up only, as on main since #1714, unreleased; a typed control-blob refusal would be a separate wire question; next free bit) |
+| 14–63 | unallocated | Must not be advertised until allocated | — |
+
 ## Checks
 
 - `python3 scripts/check-adr-consolidation.py` — exactly 15 Accepted slots,
