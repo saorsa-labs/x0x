@@ -41,6 +41,10 @@ ws://127.0.0.1:12700/ws?token=<session_token>
 
 ## Quick Start Examples
 
+For a complete, CI-verified walkthrough — two local daemons, a direct
+message over REST, delivery on the WebSocket event stream — see
+[quickstart-two-agents.md](quickstart-two-agents.md).
+
 ### curl
 
 ```bash
@@ -218,7 +222,9 @@ signed bytes, and receivers verify the full owner-cert → sub-agent-key
 
 ## Available Endpoints
 
-x0xd exposes 160 REST endpoints. Key categories:
+x0xd exposes 217 REST endpoints (the registry in `src/api/mod.rs` is
+authoritative). `x0x routes` prints the registry that is compiled into the
+CLI. It does not send a request to a daemon. Key categories:
 
 | Category | Endpoints | What you can do |
 |----------|-----------|-----------------|
@@ -235,7 +241,8 @@ x0xd exposes 160 REST endpoints. Key categories:
 
 Full API reference: [api-reference.md](api-reference.md)
 
-Use `x0x routes` to print all endpoints from a running daemon.
+Use `x0x routes` (or `x0x routes --json`) to print all endpoints. The command
+reads the registry in the CLI binary. It does not need a running daemon.
 
 ## Direct Event Backpressure
 

@@ -192,6 +192,8 @@ curl -N -H "Authorization: Bearer $TOKEN" "http://$API/events"     # SSE; fields
 
 Topics starting `local:` are never gossipped — same-daemon IPC only.
 
+To rehearse all of this offline first (two loopback daemons, one DM, the event stream), follow the CI-verified [10-minute recipe](https://github.com/saorsa-labs/x0x/blob/main/docs/quickstart-two-agents.md).
+
 ---
 
 ## 2. Identity Model (and your OWNER)
@@ -298,7 +300,7 @@ x0x move list                      # GET /agent/moves — move-log view (custodi
 
 ## 6. Voice (1:1)
 
-Voice is a **library** surface (`voice` crate feature), not REST: signaling rides real DMs (typed `x0x-voice-sig-v1\n` prefix, classified Ephemeral — never recorded to history), and audio rides ADR-0022 streams under `StreamProtocol::WebRtcV1` (0x04). One stream per (direction, lane); identity gate + connect-ACL apply exactly as for every other protocol.
+Call **lifecycle** is REST + CLI (ADR-0073 slice 1): `POST /calls` (`x0x call <agent_id>`), `GET /calls(/:id)`, `POST /calls/:id/accept|reject|hangup`, with `call.incoming`/`call.state` events on `/events` and `/ws`. **Media** is a **library** surface (`voice` crate feature), not REST: signaling rides real DMs (typed `x0x-voice-sig-v1\n` prefix, classified Ephemeral — never recorded to history), and audio rides ADR-0022 streams under `StreamProtocol::WebRtcV1` (0x04). One stream per (direction, lane); identity gate + connect-ACL apply exactly as for every other protocol.
 
 - **Datagram lane** (ADR-0042c): audio frames ride unreliable QUIC datagrams (`AudioDatagram` wire framing, one datagram per frame) once both ends exchange the capability advert — with the **reliable stream as fallback**. The jitter buffer is mandatory on receive.
 - **SessionConflict (single acceptor)**: the lane manager accepts one call session per agent — a second concurrent call is refused instead of interleaving. Typed surface: `X0xLinkTransport::start_lane()` fails with `VoiceLaneError::SessionConflict`. Through the `LinkTransport` trait's `start()` the SAME refusal surfaces today as `LinkTransportError::IoError("WebRtcV1 stream acceptor already held by a concurrent call session on this agent")` (the typed variant is flattened to a string there — #460); match on the message or use `start_lane()` when you need the typed error.
@@ -343,7 +345,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see [Operat
 | Placement ledger | `/owner/placement` | `x0x owner placement` | GA (read) |
 | Roaming move ceremony | `/agent/move*` `/agent/moves` | `x0x move ...` | **gated off (501)** |
 | Relay (header v2, digest-bound) | `--relay` + `/diagnostics/relay` | — | GA |
-| Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
+| Voice 1:1 (lifecycle REST; media lib) | `/calls*` | `x0x call ...` (media: `voice` feature, `--example voice_call`) | GA · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
 | Diagnostics (11 areas) | `/diagnostics/*` | `x0x diagnostics <area>` | GA |
 | Durable history | `/history*` | `x0x history scopes/list/message/search/stats/purge` | GA (local-only; Tier-2 Home backfill designed, not shipped — [Stores, files, and history](https://github.com/saorsa-labs/x0x/blob/main/docs/skill/stores.md) §4.10, §5.1) |
 | Self-update | daemon: `/upgrade(+/apply)` · CLI: check or delegate apply | `x0x upgrade --check`; `x0x upgrade --apply` or authenticated `POST /upgrade/apply` to install through the daemon | GA |
