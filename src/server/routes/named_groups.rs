@@ -9273,6 +9273,30 @@ fn treekem_catchup_link_cursor(event: &NamedGroupMetadataEvent) -> Option<(u64, 
     treekem_state_only_link(event).map(|(commit, _)| (commit.revision, 0))
 }
 
+/// #1623: is a logged link ahead of the cursor `(from_revision,
+/// from_epoch)`? The cursor leg of [`treekem_catchup_link_cursor`], or the
+/// link's commit revision past `from_revision`. A membership link's filter
+/// reads its event `revision` (the roster clock), and that clock can lag
+/// the state chain: after a joiner applies served renames, its state
+/// revision passes the roster revision of the next membership link. A link
+/// with no new TreeKEM epoch then failed both legs and was never served.
+/// The commit leg serves it. It adds no link the requester already holds:
+/// on one chain, a commit revision past the requester's state revision is
+/// a link the requester has not applied. So the #1685 stop and the dedupe
+/// key are unchanged.
+fn treekem_catchup_link_is_ahead(
+    event: &NamedGroupMetadataEvent,
+    from_revision: u64,
+    from_epoch: u64,
+) -> bool {
+    let cursor_ahead = treekem_catchup_link_cursor(event)
+        .is_some_and(|(revision, epoch)| revision > from_revision || epoch > from_epoch);
+    let commit_ahead = treekem_catchup_link_cursor(event).is_some()
+        && named_group_metadata_event_commit(event)
+            .is_some_and(|commit| commit.revision > from_revision);
+    cursor_ahead || commit_ahead
+}
+
 /// #1623: the order of the links on a catch-up page — the state chain
 /// order (commit revision), then the TreeKEM epoch. The page carries one
 /// link, so the responder must serve the next chain link first, of
@@ -13167,9 +13191,11 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         events
             .into_iter()
             .filter(|event| {
-                treekem_catchup_link_cursor(event).is_some_and(|(revision, epoch)| {
-                    revision > request.from_revision || epoch > request.from_treekem_epoch
-                })
+                treekem_catchup_link_is_ahead(
+                    event,
+                    request.from_revision,
+                    request.from_treekem_epoch,
+                )
             })
             .collect::<Vec<_>>()
     };
@@ -13531,10 +13557,9 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
     // #1623: a state-only link (rename, role change, unban) that
     // could not apply counts too, or a truncated page that serves only
     // that link would be asked for again for ever.
-    let page_served_ahead = events.iter().any(|event| {
-        treekem_catchup_link_cursor(event)
-            .is_some_and(|(revision, epoch)| revision > cursor_before.0 || epoch > cursor_before.1)
-    });
+    let page_served_ahead = events
+        .iter()
+        .any(|event| treekem_catchup_link_is_ahead(event, cursor_before.0, cursor_before.1));
     let key_package_shaped = !events.is_empty()
         && events
             .iter()

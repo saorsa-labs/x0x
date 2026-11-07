@@ -937,7 +937,7 @@ fn treekem_catchup_cursor_epoch_maps_the_head_binding() {
 }
 
 // #1623 responder slice: the catch-up log keeps and serves the state-only
-// links (rename, policy, role change, unban) that this node signed, next
+// links (rename, role change, unban) that this node signed, next
 // to the membership links. Before it kept only the membership links, so a
 // pre-Welcome joiner was never served a rename or a role change in its gap.
 
@@ -1265,6 +1265,126 @@ async fn state_only_links_keep_their_own_log_cap() -> anyhow::Result<()> {
         log.iter()
             .any(|event| matches!(event, NamedGroupMetadataEvent::MemberRemoved { .. })),
         "the membership link is not evicted"
+    );
+    drop(logs);
+    // The other way: more membership links than the cap evict only
+    // membership links, never a state-only link.
+    for step in 1..=(TREEKEM_EVENT_LOG_PER_GROUP_CAP as u64 + extra) {
+        let mut membership = removal.clone();
+        if let NamedGroupMetadataEvent::MemberRemoved { revision, .. } = &mut membership {
+            *revision += step;
+        }
+        remember_treekem_membership_event(&state, &membership).await;
+    }
+    let logs = state.treekem_event_log.read().await;
+    let log = logs.get(&stable).expect("the log holds the group");
+    let count = |state_only: bool| {
+        log.iter()
+            .filter(|event| treekem_state_only_link(event).is_some() == state_only)
+            .count()
+    };
+    assert_eq!(
+        count(false),
+        TREEKEM_EVENT_LOG_PER_GROUP_CAP,
+        "membership links are capped"
+    );
+    assert_eq!(
+        count(true),
+        TREEKEM_EVENT_LOG_PER_GROUP_CAP,
+        "no state-only link is evicted by membership links"
+    );
+    Ok(())
+}
+
+/// The membership filter reads the event's roster revision, which can lag
+/// the state chain. After the joiner applied a served rename, its state
+/// revision equals the next membership link's roster revision, and that
+/// link has no new TreeKEM epoch (a roster-only leave shape). The responder
+/// still serves it, by its commit revision, and does not serve the rename
+/// again. RED before: the page was empty.
+#[tokio::test]
+async fn membership_link_behind_the_roster_clock_is_still_served() -> anyhow::Result<()> {
+    let (responder, _responder_dir) = secure_endpoint_test_state().await?;
+    let owner = responder.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let joiner = AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(joiner.agent_id().as_bytes());
+    let base = base_group(owner, None)?;
+    let stable = base.stable_group_id().to_string();
+    let mut ahead = base.clone();
+    let rename = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.name = "renamed before the leave".to_string();
+    })?;
+    let leave = seal_link(&mut ahead, owner, 3_000, |next| {
+        next.remove_member(&agent(REMOVED), Some(agent(REMOVED)));
+    })?;
+    let key = install_stub(&responder, ahead).await?;
+    seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
+    let rename_event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+        group_id: stable.clone(),
+        revision: rename.revision,
+        actor: owner_hex,
+        name: Some("renamed before the leave".to_string()),
+        description: None,
+        commit: Some(rename.clone()),
+    };
+    let leave_event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: stable,
+        // The roster clock lags the state chain by one.
+        revision: rename.revision,
+        actor: agent(REMOVED),
+        agent_id: agent(REMOVED),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        secret_epoch: None,
+        commit: Some(leave.clone()),
+    };
+    for event in [&rename_event, &leave_event] {
+        remember_treekem_membership_event(&responder, event).await;
+    }
+    let recorder = &responder.named_group_test_recorders.catchup_responses;
+    recorder.lock().expect("recorder").clear();
+    handle_treekem_catchup_request(
+        &responder,
+        &joiner.agent_id(),
+        &x0x::identity::MachineId([0x27; 32]),
+        true,
+        TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: key.clone(),
+            requester_agent_id: joiner_hex,
+            // The joiner applied the rename.
+            from_revision: rename.revision,
+            from_treekem_epoch: 0,
+            current_state_hash: rename.state_hash.clone(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        },
+    )
+    .await;
+    let payload = recorder
+        .lock()
+        .expect("recorder")
+        .pop()
+        .expect("responder sent a catch-up response");
+    let page: TreeKemCatchupResponse = serde_json::from_slice(&payload)?;
+    let served: Vec<_> = page
+        .events
+        .iter()
+        .map(named_group_metadata_event_kind)
+        .collect();
+    assert_eq!(
+        served,
+        ["member_removed"],
+        "the leave is served, the rename is not"
+    );
+    assert_eq!(
+        page.events
+            .first()
+            .and_then(named_group_metadata_event_commit)
+            .map(|commit| commit.state_hash.clone()),
+        Some(leave.state_hash)
     );
     Ok(())
 }
