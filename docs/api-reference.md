@@ -247,8 +247,9 @@ Open issues for this release are listed in the README's *Known limitations*
 table (#446–#451). This reference documents **217 endpoints — exactly the set
 `x0x routes` prints** (two further served paths sit outside the registry:
 `/.well-known/agent-card.json` and the `/gui/` alias). The registry in
-`src/api/mod.rs` is the authoritative list; `x0x routes` prints it from a
-running daemon.
+`src/api/mod.rs` is the authoritative list. `x0x routes` prints the copy of
+that registry that is compiled into the CLI. It does not send a request to a
+daemon, so it shows the routes of the CLI build, not of a running `x0xd`.
 
 ## System
 
@@ -3410,13 +3411,25 @@ read-only **TOML floor** (`connect-acl.toml`, `exec-acl.toml`) plus an
 entry answers `409`. See [docs/connect-acl.md](connect-acl.md) and
 [docs/exec.md](exec.md) for entry schemas and evaluation order.
 
+Every ACL route, reads included, requires the durable API token. The auth
+middleware refuses session and rider bearers with `403` before the handler
+runs, and each handler checks again. An entry with `principal = "owner"` or
+`principal = "grant"` also needs an owner identity (user key) on the install;
+without one, `add` answers `409`.
+
+`x0x acl connect add` and `x0x acl exec add` take one required positional
+`<ENTRY_JSON>` argument: the entry as JSON, given as a literal, `@path`, or
+`-` for stdin. Example:
+`x0x acl connect add '{"principal":"owner","targets":["127.0.0.1:22"]}'`.
+`rm` is an alias of `remove`.
+
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/acl/connect` | `x0x acl connect list` | List connect ACL entries (TOML floor + API-managed) and reload status |
-| POST | `/acl/connect` | `x0x acl connect add` | Add an API-managed connect ACL entry (TOML entry schema as JSON) |
+| POST | `/acl/connect` | `x0x acl connect add <ENTRY_JSON>` | Add an API-managed connect ACL entry (TOML entry schema as JSON) |
 | DELETE | `/acl/connect/:id` | `x0x acl connect rm <id>` | Remove an API-managed connect ACL entry (floor entries: `409`) |
 | GET | `/acl/exec` | `x0x acl exec list` | List exec ACL entries (TOML floor + API-managed) and reload status |
-| POST | `/acl/exec` | `x0x acl exec add` | Add an API-managed exec ACL entry (TOML entry schema as JSON) |
+| POST | `/acl/exec` | `x0x acl exec add <ENTRY_JSON>` | Add an API-managed exec ACL entry (TOML entry schema as JSON) |
 | DELETE | `/acl/exec/:id` | `x0x acl exec rm <id>` | Remove an API-managed exec ACL entry (floor entries: `409`) |
 | POST | `/acl/reload` | `x0x acl reload` | Re-read the connect/exec ACL floors and overlays; a rejected file keeps the last good ACL |
 
@@ -3425,13 +3438,39 @@ entry answers `409`. See [docs/connect-acl.md](connect-acl.md) and
 Owner-signed capability grants that admit a named peer to a gated surface
 (e.g. an `Exec` grant counts as trust `Accept` for remote exec when the exec
 ACL has a `principal = "grant"` entry — see [docs/exec.md](exec.md)). Every
-route requires the durable owner API token; session and rider bearers receive
+route requires the durable API token; session and rider bearers receive
 a typed `403`.
+
+`POST /grants` body (unknown fields are refused):
+
+```json
+{
+  "grantee_user": "<64-hex user id>",
+  "agents": ["<64-hex agent id>"],
+  "caps": ["dm", {"connect": {"ports": [22]}}],
+  "ttl_secs": 86400
+}
+```
+
+- `grantee_user` or `grantee_agent` (64-hex): set exactly one, else `400`.
+- `agents` (required, non-empty): this owner's agents to share.
+- `caps` (required, non-empty): any of `"dm"`, `"exec"`, `"group_invite"`,
+  `"call"`, `{"connect":{"ports":[...]}}`.
+- `expiry` (Unix seconds) or `ttl_secs` (seconds from `not_before`): set
+  exactly one, else `400`. Grants must expire.
+- `not_before` (optional, Unix seconds): default is now.
+- `deliver_to` (optional, 64-hex agent ids): more agents to deliver the grant
+  to.
+
+An install with no owner identity (user key) answers `409`.
+
+`x0x grant issue` takes one required positional `<GRANT_JSON>` argument: this
+body as a literal, `@path`, a bare path, or `-` for stdin.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/grants` | `x0x grant list` | List share grants this install's owner issued, with status |
-| POST | `/grants` | `x0x grant issue` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
+| POST | `/grants` | `x0x grant issue <GRANT_JSON>` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
 | DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3`) |
 | GET | `/grants/received` | `x0x grant received` | List share grants that name this install as grantee |
 

@@ -223,7 +223,8 @@ signed bytes, and receivers verify the full owner-cert → sub-agent-key
 ## Available Endpoints
 
 x0xd exposes 217 REST endpoints (the registry in `src/api/mod.rs` is
-authoritative; `x0x routes` prints the live set). Key categories:
+authoritative). `x0x routes` prints the registry that is compiled into the
+CLI. It does not send a request to a daemon. Key categories:
 
 | Category | Endpoints | What you can do |
 |----------|-----------|-----------------|
@@ -240,7 +241,8 @@ authoritative; `x0x routes` prints the live set). Key categories:
 
 Full API reference: [api-reference.md](api-reference.md)
 
-Use `x0x routes` to print all endpoints from a running daemon.
+Use `x0x routes` (or `x0x routes --json`) to print all endpoints. The command
+reads the registry in the CLI binary. It does not need a running daemon.
 
 ## Direct Event Backpressure
 

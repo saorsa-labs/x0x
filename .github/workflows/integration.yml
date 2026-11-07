@@ -189,12 +189,14 @@ jobs:
         run: bash scripts/ci/nextest-isolated.sh --all-features --test agent_usability_eval -- --run-ignored ignored-only --no-tests=fail
 
   # Onboarding recipe proof (directive 2026-11-07 ruling 3a/3b, ADR 0095
-  # headline): runs docs/quickstart-two-agents.md verbatim — two
-  # loopback-only daemons, a DM each way over REST, delivery asserted on
-  # the receiver's own /ws/direct WebSocket subscription. The recipe is
-  # only allowed to claim "CI-verified" while this job runs it. Default
-  # features only (the recipe installs release binaries, which also build
-  # without --all-features), inside the loopback-only namespace.
+  # headline): scripts/ci/onboarding-recipe.sh runs the steps of
+  # docs/quickstart-two-agents.md (same config, connect wait and send
+  # retry) — two loopback-only daemons on the private x0x.quickstart plane
+  # with self-update off, a DM each way over REST, delivery and sender
+  # asserted on the receiver's own /ws/direct WebSocket subscription. The
+  # recipe is only allowed to claim "CI-verified" while this job passes.
+  # Default features only (the recipe installs release binaries, which also
+  # build without --all-features), inside the loopback-only namespace.
   onboarding-recipe:
     name: Onboarding recipe (quickstart-two-agents)
     runs-on: ubuntu-latest
