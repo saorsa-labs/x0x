@@ -2086,16 +2086,30 @@ fn prepare_measurement() -> MeasurementPreparation {
 }
 
 fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
-    // crates.io 0.5.90 retains the reviewed outbound meter, per-peer wire
-    // lengths and key-cache accounting. Its pubsub sources are byte-identical
-    // to 0.5.89; 0.5.90 only moves the ant-quic pin to =0.27.61. Compared
-    // with 0.5.88, 0.5.89 changed only payload replay refusal state/handling
-    // and its tests. Refused replays can change attempt counts without
-    // changing the meter.
+    reviewed_pubsub_producer_in_lock(package, include_str!("../Cargo.lock"))
+}
+
+// crates.io 0.5.90 retains the reviewed outbound meter, per-peer wire
+// lengths and key-cache accounting. Its pubsub sources are byte-identical
+// to 0.5.89; 0.5.90 only moves the ant-quic pin to =0.27.61. Compared
+// with 0.5.88, 0.5.89 changed only payload replay refusal state/handling
+// and its tests. Refused replays can change attempt counts without
+// changing the meter. 0.5.88 was the reviewed pin before 0.5.89 and
+// keeps that meter; #1346 holds the family at 0.5.88 while ant-quic is
+// =0.27.62 (0.5.89 pins ant-quic =0.27.60 and 0.5.90 pins =0.27.61),
+// so it stays a reviewed producer until a family release accepts
+// 0.27.62 and supersedes it. The held entry is valid only while the
+// build lock still pins 0.5.88: the first family release past the hold
+// must retire it, and a later move back to 0.5.88 must never pass
+// silently (#1772 review, round 4).
+fn reviewed_pubsub_producer_in_lock(package: &toml::Value, lock: &str) -> bool {
     const REGISTRY_PUBSUB_VERSION: &str = "0.5.90";
     const REGISTRY_PUBSUB_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const REGISTRY_PUBSUB_SHA: &str =
         "ae450e28dd005cd606e006815fde51e515c6c0dc671a94e5fc044e35228320b0";
+    const HELD_PUBSUB_VERSION: &str = "0.5.88";
+    const HELD_PUBSUB_SHA: &str =
+        "accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097";
     const GIT_PUBSUB_VERSION: &str = "0.5.85";
     // SG 997abc75 supplies the reviewed meter accounting. Its descendant
     // 9258cee9 adds local delivery, cold-relay ID offers, the ant-quic
@@ -2109,11 +2123,60 @@ fn reviewed_pubsub_producer(package: &toml::Value) -> bool {
     let registry = version == Some(REGISTRY_PUBSUB_VERSION)
         && source == Some(REGISTRY_PUBSUB_SOURCE)
         && package.get("checksum").and_then(toml::Value::as_str) == Some(REGISTRY_PUBSUB_SHA);
+    let held = version == Some(HELD_PUBSUB_VERSION)
+        && source == Some(REGISTRY_PUBSUB_SOURCE)
+        && package.get("checksum").and_then(toml::Value::as_str) == Some(HELD_PUBSUB_SHA)
+        && lock_pins_pubsub_version(lock, HELD_PUBSUB_VERSION);
     let git = version == Some(GIT_PUBSUB_VERSION)
         && (source == Some(GIT_PUBSUB_SOURCE_ACCOUNTING)
             || source == Some(GIT_PUBSUB_SOURCE_CURRENT))
         && package.get("checksum").is_none();
-    registry || git
+    registry || held || git
+}
+
+// #1772 review, round 4: the held entry keys to the lock, like the #1226
+// guard. Returns false on unparsable lock text, and false when no
+// `saorsa-gossip-pubsub` entry exists: zero matching entries must not
+// keep the hold alive vacuously.
+fn lock_pins_pubsub_version(lock: &str, version: &str) -> bool {
+    let parsed: toml::Value = match toml::from_str(lock) {
+        Ok(parsed) => parsed,
+        Err(_) => return false,
+    };
+    let mut saw_pubsub = false;
+    for package in parsed
+        .get("package")
+        .and_then(|packages| packages.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if package.get("name").and_then(toml::Value::as_str) != Some("saorsa-gossip-pubsub") {
+            continue;
+        }
+        saw_pubsub = true;
+        // A missing version field fails, not passes.
+        if package.get("version").and_then(toml::Value::as_str) != Some(version) {
+            return false;
+        }
+    }
+    saw_pubsub
+}
+
+// A minimal Cargo.lock-shaped TOML pinning the pubsub crate at `version`
+// (#1772 review, round 4 fixtures).
+fn lock_with_pubsub_pin(version: &str) -> String {
+    format!(
+        "[[package]]\nname = \"unrelated-crate\"\nversion = \"1.0.0\"\n\n\
+         [[package]]\nname = \"saorsa-gossip-pubsub\"\nversion = \"{version}\"\n"
+    )
+}
+
+// The held 0.5.88 registry package shape, for the synthetic-lock tests.
+fn held_pubsub_package() -> toml::Value {
+    toml::from_str(
+        "version = '0.5.88'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097'",
+    )
+    .expect("held registry fixture")
 }
 
 #[test]
@@ -2158,11 +2221,17 @@ fn controlled_load_producer_allowlist_is_exact() {
     )
     .expect("prior registry fixture");
     assert!(!reviewed_pubsub_producer(&prior_registry));
+    // 0.5.88 is the #1346 hold: while ant-quic is =0.27.62 the family
+    // cannot move past it, and its reviewed meter makes it a producer.
+    // This assertion is keyed to the real build lock: once Cargo.lock
+    // moves past 0.5.88 it fails, and the held entry plus this fixture
+    // must then be removed together — the failure is the visible record,
+    // like the #1226 stand-down (#1772 review, round 4).
     let previous_registry: toml::Value = toml::from_str(
         "version = '0.5.88'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'accb179096680e311f03bca8639769370aca089e70db7cf5e8450690ffbc4097'",
     )
     .expect("previous registry fixture");
-    assert!(!reviewed_pubsub_producer(&previous_registry));
+    assert!(reviewed_pubsub_producer(&previous_registry));
     // 0.5.89 has the same pubsub sources as 0.5.90 but is superseded.
     let superseded_registry: toml::Value = toml::from_str(
         "version = '0.5.89'\nsource = 'registry+https://github.com/rust-lang/crates.io-index'\nchecksum = 'f3bec1a8233738b93f847040e7618e4f06d1e275e002845e558fef956412edb6'",
@@ -2203,6 +2272,36 @@ fn controlled_load_producer_allowlist_is_exact() {
         .expect("table fixture")
         .remove("source");
     assert!(!reviewed_pubsub_producer(&missing_source));
+}
+
+// The held entry stands only against a lock that still pins 0.5.88.
+#[test]
+fn controlled_load_held_producer_passes_while_lock_pins_0_5_88() {
+    assert!(reviewed_pubsub_producer_in_lock(
+        &held_pubsub_package(),
+        &lock_with_pubsub_pin("0.5.88")
+    ));
+}
+
+// A later move back to 0.5.88 would not pass silently: the held arm
+// retires once the lock pins any other version (#1772 review, round 4).
+#[test]
+fn controlled_load_held_producer_retires_when_lock_moves_past_hold() {
+    assert!(!reviewed_pubsub_producer_in_lock(
+        &held_pubsub_package(),
+        &lock_with_pubsub_pin("0.5.91")
+    ));
+}
+
+// A lock without the pubsub entry keeps the held arm rejected: zero
+// matching entries must not pass vacuously.
+#[test]
+fn controlled_load_held_producer_fails_without_lock_pubsub_entry() {
+    let lock = "[[package]]\nname = \"unrelated-crate\"\nversion = \"1.0.0\"\n";
+    assert!(!reviewed_pubsub_producer_in_lock(
+        &held_pubsub_package(),
+        lock
+    ));
 }
 
 #[test]

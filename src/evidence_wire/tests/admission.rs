@@ -1562,7 +1562,10 @@ async fn issue1207_s1b_default_off_replacement_around_open_does_not_spend_unsent
         {
             let state = f.context.runtime.wire_limits.state.lock().unwrap();
             let budget = &state.machines[&machine];
-            assert!(!budget.attempted, "unsent g1 must not consume an attempt");
+            assert!(
+                budget.hello_attempts.iter().all(|slot| slot.is_none()),
+                "unsent g1 must not consume an attempt"
+            );
             assert!(
                 budget.hello_out.is_none(),
                 "unsent g1 must not start 60 s gate"
@@ -1590,7 +1593,7 @@ async fn issue1207_s1b_delayed_disconnect_cannot_rearm_live_generation() {
     let machine = f.initiator.machine_id();
     let generation = f.s1b_generation();
     let limits = &f.context.runtime.wire_limits;
-    limits.need_certificate(machine, f.initiator.agent_id(), [9; 32]);
+    limits.need_certificate(machine, f.initiator.agent_id(), [9; 32], generation);
     limits.disconnect(machine); // A delayed local event has no generation.
     assert!(limits.state.lock().unwrap().machines[&machine]
         .certificate
@@ -1603,10 +1606,361 @@ async fn issue1207_s1b_delayed_disconnect_cannot_rearm_live_generation() {
     f.shutdown().await;
 }
 
+// #1346: the reply gate must charge the accepted stream's own connection
+// generation, never a sample of the current winner. After a replacement to
+// generation 2 and a follow back to the older generation 1 (ADR-017 keeps
+// the followed connection open and reading), a Hello arriving on the
+// generation-1 stream must still be answered with our full Hello. The old
+// high-water rule sampled the current winner (1), compared it with the
+// stored marker (2) and refused (`hello_reply_attempt_unavailable`), so
+// the peer got a bare ACK and no evidence on a connection that had never
+// attempted.
+#[tokio::test]
+async fn issue1346_reply_after_follow_to_older_generation_carries_hello() {
+    let mut f = Fixture::new_with_transport(true, true, true, true).await;
+    let machine = f.initiator.machine_id();
+    let peer = ant_quic::PeerId(machine.0);
+    let responder = f.responder.network().unwrap().clone();
+    let fabric = f._fabric.as_ref().expect("simulated fixture").clone();
+    let g1 = f.s1b_generation();
+
+    // First Hello over generation 1 with no publishable advert: the reply
+    // is ACK-only, so nothing is attempted, but the machine's budget entry
+    // now exists (the inbound rate gate created it).
+    let hello = f.hello();
+    assert_eq!(
+        f.exchange(StreamProtocol::EvidenceV1, &hello).await,
+        Outcome::HelloVerified
+    );
+    assert_eq!(f.sent(), 0);
+    {
+        let state = f.context.runtime.wire_limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(budget.hello_generation, None);
+        assert!(budget.hello_attempts.iter().all(|slot| slot.is_none()));
+    }
+    // Age the inbound rate gate so the second Hello is not refused.
+    f.context
+        .runtime
+        .wire_limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_in = Some(Instant::now() - HELLO_INTERVAL);
+
+    // The pair replaces to generation 2; the responder's readiness pass
+    // observes the new marker without spending any attempt, then the
+    // winner follows back to the older generation 1.
+    let (old, g2) = fabric
+        .supersede_link_for_test(&responder.peer_id(), &peer, false)
+        .expect("the pair has a link");
+    assert_eq!(old, g1);
+    assert!(g2 > g1);
+    f.context.runtime.wire_limits.hello_connection(machine, g2);
+    assert!(
+        fabric.restore_link_generation_for_test(&responder.peer_id(), &peer, g1),
+        "follow back to the older generation"
+    );
+    assert_eq!(
+        f.s1b_generation(),
+        g1,
+        "the live winner is the older generation again"
+    );
+
+    // The initiator's Hello travels on the generation-1 link, so the
+    // accepted stream is stamped with it. The reply must carry our Hello.
+    f.publish_ready();
+    assert_eq!(
+        f.exchange(StreamProtocol::EvidenceV1, &hello).await,
+        Outcome::HelloVerified
+    );
+    assert_eq!(
+        f.sent(),
+        1,
+        "the reply on the followed lower-generation connection must carry our Hello"
+    );
+    // The followed connection's single try is spent. The reply charges the
+    // stream's generation without moving the marker (#1772 review): the
+    // readiness pass owns the marker, so it still shows g2 until a pass
+    // observes the followed winner.
+    {
+        let state = f.context.runtime.wire_limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(budget.hello_generation, Some(g2));
+        assert!(budget.hello_attempted(g1));
+        assert!(!budget.hello_attempted(g2), "marker 2 consumed nothing");
+    }
+    f.shutdown().await;
+}
+
+// #1772 review, round 3: an A→B→A winner flip across open_bi hands the
+// exchange a stream stamped with B while every sample of the winner around
+// the open still reads A. The one-ended winner models the flip: the
+// responder's tracked winner moves to the new generation while the
+// transport still resolves streams on the older link. The stream's own
+// stamp owns the attempt, so the mismatch is refused and neither
+// generation is charged. Round 4: the refusal is a local race, never peer
+// behaviour — no reset is charged, the same generation backs off for one
+// lease deadline, and both stamp directions are refused
+// (stamp_matches_sample).
+#[tokio::test]
+async fn issue1346_winner_flip_across_open_charges_no_generation() {
+    let f = Fixture::new_with_transport(true, true, true, true).await;
+    f.publish_ready();
+    let machine = f.initiator.machine_id();
+    let peer = ant_quic::PeerId(machine.0);
+    let responder = f.responder.network().unwrap().clone();
+    let fabric = f._fabric.as_ref().expect("simulated fixture").clone();
+    let stamp = f.s1b_generation();
+    let (_, winner) = fabric
+        .supersede_one_sided_for_test(&responder.peer_id(), &peer)
+        .expect("the pair has a link");
+    assert!(
+        winner > stamp,
+        "the one-ended winner moves past the link the streams resolve on"
+    );
+    let mut job = tokio::spawn(Arc::clone(&f.context).connect(machine, None, None));
+    // The unfixed code writes the Hello on the older link and charges the
+    // sampled generation; drain and refuse it so its exchange settles
+    // inside the lease deadline. The fixed code opens, refuses the stamp
+    // mismatch and drops the stream; the drain disposes of that reset
+    // open, so neither path waits out the drain's 2 s bound.
+    let drain = async {
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            let (_peer, mut send, mut recv) =
+                f.initiator.network().unwrap().accept_bi().await.ok()?;
+            assert_eq!(
+                recv.read_u8().await.ok()?,
+                StreamProtocol::EvidenceV1.as_u8()
+            );
+            let (kind, _body) = read_message(&mut recv, &Limits::default()).await.ok()?;
+            assert_eq!(kind, HELLO);
+            write_message(
+                &mut send,
+                &Limits::default(),
+                f.responder.machine_id(),
+                NOT_FOUND,
+                &[],
+            )
+            .await
+            .ok()?;
+            Some(())
+        })
+        .await;
+    };
+    tokio::pin!(drain);
+    let settled = tokio::time::timeout(DEADLINE, async {
+        tokio::select! {
+            settled = &mut job => {
+                // The refused open still queued a stream on the peer. Let
+                // the drain dispose of it (bounded by its own inner 2 s)
+                // instead of leaving it for the control's accept.
+                let _ = (&mut drain).await;
+                settled
+            }
+            // The drained refusal only unblocks the job; keep waiting for it.
+            _ = &mut drain => tokio::time::timeout(DEADLINE, &mut job)
+                .await
+                .expect("connect job settles after the drained refusal"),
+        }
+    })
+    .await
+    .expect("connect job settles within its lease deadlines");
+    settled.expect("connect job settles without panicking");
+    assert_eq!(
+        f.sent(),
+        0,
+        "a stream stamped with a generation the samples never named must not carry the Hello"
+    );
+    {
+        let state = f.context.runtime.wire_limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert!(
+            budget.hello_attempts.iter().all(|slot| slot.is_none()),
+            "the mismatched open charges no generation"
+        );
+        assert!(
+            budget.hello_out.is_none(),
+            "the mismatched open starts no 60 s gate"
+        );
+        assert_eq!(
+            budget.bytes.total, 0,
+            "a local stamp mismatch is not the peer's reset"
+        );
+    }
+    // The unstamped inbound gate refuses the sentinel before any charge.
+    assert!(
+        f.context
+            .begin_hello_current(machine, true, u64::MAX)
+            .is_none(),
+        "an unstamped inbound stream cannot spend a reply attempt"
+    );
+    // The mismatch backs off the sampled generation only: the generation
+    // the stream was actually stamped with stays a candidate.
+    assert!(!f
+        .context
+        .runtime
+        .wire_limits
+        .hello_candidate(machine, winner));
+    assert!(
+        f.context
+            .runtime
+            .wire_limits
+            .hello_candidate(machine, stamp),
+        "a different generation ends the back-off"
+    );
+    // Control: with the tracked winner and the link agreed again, the same
+    // connect path sends exactly one Hello and charges that generation.
+    fabric
+        .supersede_link_for_test(&responder.peer_id(), &peer, false)
+        .expect("the pair has a link");
+    let agreed = f.s1b_generation();
+    let ((), ()) = tokio::join!(
+        Arc::clone(&f.context).connect(machine, None, None),
+        f.s1b_read_hello(S1bReply::Refuse),
+    );
+    assert_eq!(f.sent(), 1, "the agreed generation still owns its try");
+    assert!(
+        f.context.runtime.wire_limits.state.lock().unwrap().machines[&machine]
+            .hello_attempted(agreed)
+    );
+    f.shutdown().await;
+}
+
+// #1772 review, round 5: the two local races after the open — the winner
+// replaced under the parked open, and the reply gate spending the
+// generation's try while the open is in flight — are this node's own
+// timing, so the outgoing job must charge the peer no reset for either.
+#[tokio::test]
+async fn issue1772_post_open_local_races_charge_no_reset() {
+    // Race 1: the connection is replaced while the open is parked. The
+    // stream's stamp still matches the sample, so only the post-open
+    // connection check can refuse it.
+    let mut f = Fixture::new_with_transport(true, true, true, true).await;
+    f.publish_ready();
+    let machine = f.initiator.machine_id();
+    let old = f.s1b_generation();
+    let pause = Arc::new(HelloOpenPause {
+        after_open: true,
+        ..Default::default()
+    });
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_open_pause
+        .lock()
+        .unwrap() = Some(Arc::clone(&pause));
+    let job = tokio::spawn(Arc::clone(&f.context).connect(machine, None, None));
+    tokio::time::timeout(DEADLINE, pause.reached.notified())
+        .await
+        .expect("the job must reach the open boundary");
+    f.s1b_restart_remote().await;
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_open_pause
+        .lock()
+        .unwrap() = None;
+    pause.resume.notify_one();
+    tokio::time::timeout(DEADLINE, job).await.unwrap().unwrap();
+    assert_eq!(f.sent(), 0, "a replaced connection carries no Hello");
+    assert_ne!(f.s1b_generation(), old);
+    {
+        let state = f.context.runtime.wire_limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        // The stamp matched, so the mismatch back-off cannot explain the
+        // refusal: this is the post-open connection check.
+        assert!(budget.hello_mismatch.is_none());
+        assert!(
+            budget.hello_attempts.iter().all(|slot| slot.is_none()),
+            "the refused open spends no attempt"
+        );
+        assert!(
+            budget.hello_out.is_none(),
+            "the refused open starts no 60 s gate"
+        );
+        assert_eq!(
+            budget.bytes.total, 0,
+            "a replacement under the open is not the peer's reset"
+        );
+    }
+    // Control: the replacement generation still owns its one try.
+    let ((), ()) = tokio::join!(
+        Arc::clone(&f.context).connect(machine, None, None),
+        f.s1b_read_hello(S1bReply::Ack),
+    );
+    assert_eq!(f.sent(), 1);
+    f.shutdown().await;
+
+    // Race 2: the reply gate spends the generation's try while the same
+    // open is parked. The begin check must refuse without charging.
+    let f = Fixture::new_with_transport(true, true, true, true).await;
+    f.publish_ready();
+    let machine = f.initiator.machine_id();
+    let generation = f.s1b_generation();
+    let pause = Arc::new(HelloOpenPause {
+        after_open: true,
+        ..Default::default()
+    });
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_open_pause
+        .lock()
+        .unwrap() = Some(Arc::clone(&pause));
+    let job = tokio::spawn(Arc::clone(&f.context).connect(machine, None, None));
+    tokio::time::timeout(DEADLINE, pause.reached.notified())
+        .await
+        .expect("the job must reach the open boundary");
+    assert_eq!(
+        f.context
+            .begin_hello_current(machine, true, generation)
+            .expect("the reply gate spends the try first"),
+        generation
+    );
+    *f.context
+        .runtime
+        .wire_limits
+        .hello_open_pause
+        .lock()
+        .unwrap() = None;
+    pause.resume.notify_one();
+    tokio::time::timeout(DEADLINE, job).await.unwrap().unwrap();
+    assert_eq!(f.sent(), 0, "the spent try carries no Hello");
+    {
+        let state = f.context.runtime.wire_limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert!(budget.hello_attempted(generation), "the reply owns the try");
+        assert!(budget.hello_out.is_some(), "the reply owns the rate window");
+        assert_eq!(
+            budget.bytes.total, 0,
+            "this node spending its own try is not the peer's reset"
+        );
+    }
+    // The refused open still queues a reset stream on the peer (it wrote
+    // nothing); drain and drop that carcass before proving no retry
+    // follows, as the winner-flip test does.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        f.initiator.network().unwrap().accept_bi(),
+    )
+    .await;
+    f.s1b_no_more_hellos().await;
+    f.shutdown().await;
+}
+
+// #1346: attempts are per connection generation, not a high-water mark. A
+// follow can make an older generation the Live winner again; that
+// connection still owns its single Hello try, and a generation that
+// attempted stays consumed however the winner moves.
 #[test]
-fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget() {
+fn issue1346_followed_older_generation_owns_one_try_after_a_newer_attempt() {
     let limits = Limits::default();
     let machine = MachineId([19; 32]);
+    // Generation 2 is attempted: its single try is spent.
     assert!(limits.begin_hello_on_connection(machine, true, Some(2)));
     let aged = Instant::now() - HELLO_INTERVAL;
     limits
@@ -1617,17 +1971,558 @@ fn issue1207_s1b_older_promoted_generation_fails_closed_without_spending_budget(
         .get_mut(&machine)
         .unwrap()
         .hello_out = Some(aged);
+    // 2→1 follow: the live winner is generation 1 again while the machine
+    // has attempted on 2. The old high-water rule refused this (fail
+    // closed); the followed connection never attempted, so it owns one try.
     limits.hello_connection(machine, 1);
-    assert!(!limits.hello_candidate(machine, 1));
-    assert!(!limits.begin_hello_on_connection(machine, true, Some(1)));
+    assert!(limits.hello_candidate(machine, 1));
+    assert!(limits.begin_hello_on_connection(machine, true, Some(1)));
     {
         let state = limits.state.lock().unwrap();
         let budget = &state.machines[&machine];
-        assert_eq!(budget.hello_generation, Some(2));
-        assert!(budget.attempted);
-        assert_eq!(budget.hello_out, Some(aged));
+        assert_eq!(budget.hello_generation, Some(1));
+        assert!(budget.hello_attempted(1));
+        assert!(budget.hello_attempted(2));
     }
+    // One try per connection: after the shared 60 s machine gate clears,
+    // both attempted generations stay consumed.
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(aged);
+    assert!(
+        !limits.begin_hello_on_connection(machine, true, Some(1)),
+        "the followed generation's try is spent"
+    );
+    assert!(
+        !limits.begin_hello_on_connection(machine, true, Some(2)),
+        "the replaced generation's try stays spent"
+    );
+}
+
+// The u64::MAX unstamped sentinel never owns or blocks an attempt.
+#[test]
+fn issue1346_unstamped_stream_never_spends_or_blocks_an_attempt() {
+    let limits = Limits::default();
+    let machine = MachineId([21; 32]);
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(u64::MAX)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert!(budget.hello_attempts.iter().all(|slot| slot.is_none()));
+        assert!(budget.hello_out.is_none());
+    }
+    assert!(
+        limits.begin_hello_on_connection(machine, true, Some(1)),
+        "a later stamped stream must not inherit the sentinel's refusal"
+    );
+}
+
+// The stamp check refuses both directions: a stamp older than the sample
+// (a follow across the open, covered end to end by the winner-flip test
+// above) and a stamp newer than the sample (an A→B→A winner flip across
+// the open). The unstamped sentinel never matches (#1772 review, round 4).
+#[test]
+fn issue1346_stamp_owns_the_attempt_in_both_directions() {
+    assert!(stamp_matches_sample(7, 7));
+    assert!(
+        !stamp_matches_sample(6, 7),
+        "an older stamp cannot carry the sample's Hello"
+    );
+    assert!(
+        !stamp_matches_sample(8, 7),
+        "a newer stamp cannot carry the sample's Hello"
+    );
+    assert!(
+        !stamp_matches_sample(u64::MAX, 7),
+        "the unstamped sentinel never matches"
+    );
+    assert!(!stamp_matches_sample(u64::MAX, u64::MAX));
+}
+
+// #1772 review, round 4 (finding 3): on first contact the peer's Hello can
+// arrive before any readiness pass observes the machine. The accept path
+// solicits the certificate first, then the reply path raises the ceiling
+// from None on the same stream generation. The fence used to drop the
+// solicitation it had just made, so the peer's CERTIFICATE was refused as
+// unsolicited and the stream reset. A solicitation premised on the
+// generation now being observed must survive either raise.
+#[test]
+fn issue1346_first_contact_certificate_survives_the_raise() {
+    let limits = Limits::default();
+    let agent = AgentId([37; 32]);
+    // The begin path's own raise (the reply carries our Hello).
+    let replied = MachineId([36; 32]);
+    limits.need_certificate(replied, agent, [7; 32], 4);
+    assert!(limits.begin_hello_on_connection(replied, true, Some(4)));
+    assert!(
+        limits.take_certificate(replied, agent, [7; 32]),
+        "the begin-path raise keeps the same-generation solicitation"
+    );
+    // The readiness pass observing the new connection first.
+    let observed = MachineId([38; 32]);
+    limits.need_certificate(observed, agent, [7; 32], 4);
+    limits.hello_connection(observed, 4);
+    assert!(
+        limits.take_certificate(observed, agent, [7; 32]),
+        "the readiness raise keeps the same-generation solicitation"
+    );
+}
+
+// #1772 review, round 4 (finding 8): nothing checked that the scheduler
+// filter re-arms after a follow back to a generation that never tried.
+#[test]
+fn issue1346_follow_back_to_untried_generation_rearms_hello_pending() {
+    let limits = Limits::default();
+    let machine = MachineId([39; 32]);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    limits.hello_connection(machine, 3);
+    assert!(
+        !limits.hello_pending(machine),
+        "the shared 60 s machine gate still holds"
+    );
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    assert!(
+        limits.hello_pending(machine),
+        "an untried followed generation re-arms the filter"
+    );
+    assert!(limits.hello_candidate(machine, 3));
+}
+
+// #1772 review, round 4 (finding 6): a refused stamp mismatch is a local
+// race. No reset is charged (the winner-flip test proves that end to end);
+// the next unsolicited try on the same generation backs off for one lease
+// deadline, and observing a different generation ends the back-off.
+#[test]
+fn issue1346_stamp_mismatch_backs_off_one_deadline() {
+    let limits = Limits::default();
+    let machine = MachineId([41; 32]);
+    // The inbound rate gate creates the machine entry, as on a real accept.
+    assert!(limits.request(machine, true));
+    limits.note_hello_mismatch(machine, 4);
+    limits.hello_connection(machine, 4);
+    assert!(
+        !limits.hello_pending(machine),
+        "the same generation backs off"
+    );
+    assert!(!limits.hello_candidate(machine, 4));
+    assert!(limits.hello_candidate(machine, 5));
+    limits.hello_connection(machine, 5);
+    assert!(
+        limits.hello_pending(machine),
+        "a different generation ends the back-off"
+    );
+}
+
+// Bounded memory: once every slot holds a distinct attempted generation,
+// the smallest is forgotten by raising the floor, and everything at or
+// below the floor stays consumed (fail closed, never re-armed).
+#[test]
+fn issue1346_attempt_record_is_bounded_and_forgotten_generations_fail_closed() {
+    let limits = Limits::default();
+    let machine = MachineId([23; 32]);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(1)));
+    for generation in 2..=HELLO_ATTEMPT_SLOTS as u64 {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&machine)
+            .unwrap()
+            .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+        assert!(limits.begin_hello_on_connection(machine, true, Some(generation)));
+    }
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert!(budget.hello_attempted(1));
+        assert_eq!(budget.hello_floor, 0);
+        assert_eq!(
+            budget
+                .hello_attempts
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count(),
+            HELLO_ATTEMPT_SLOTS
+        );
+    }
+    // Slot pressure: generation 5 evicts the smallest (1) and raises the
+    // floor above it.
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(budget.hello_floor, 1);
+        assert!(budget.hello_attempted(1), "forgotten but still consumed");
+        assert!(!budget.hello_attempted(6));
+    }
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(6)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(budget.hello_floor, 2);
+        assert!(!budget.hello_attempted(7));
+    }
+}
+
+// #1772 review: a Hello on a stale-generation stream must not be able to
+// drop a pending certificate. The reply used to move the marker backward
+// to the stream's generation, so the next readiness pass for the still-live
+// generation looked like a replacement and cleared the certificate the peer
+// was about to redeem.
+#[test]
+fn issue1346_stale_generation_reply_keeps_pending_certificate() {
+    let limits = Limits::default();
+    let machine = MachineId([25; 32]);
+    let agent = AgentId([26; 32]);
+    let age_gate = |limits: &Limits| {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&machine)
+            .unwrap()
+            .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    };
+    // Generation 5 is the live winner; the Hello try on it is spent.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    // The peer's Hello on a stale generation-3 stream solicits its
+    // certificate; the reply charges generation 3, and the solicitation's
+    // premise is that stale stream's generation.
+    limits.need_certificate(machine, agent, [7; 32], 3);
+    age_gate(&limits);
     assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+    // The readiness pass still sees generation 5 as the live winner.
+    limits.hello_connection(machine, 5);
+    assert!(
+        limits.take_certificate(machine, agent, [7; 32]),
+        "a stale-generation Hello cannot make the live generation look like a replacement"
+    );
+}
+
+// #1772 review: a winner that flips 5→3→5 moves the marker backward and
+// forward without any new connection. The certificate fence keys on the
+// highest generation ever observed, so only a genuinely new generation
+// (the control below) drops the pending certificate.
+#[test]
+fn issue1346_winner_flip_keeps_certificate_until_a_new_generation() {
+    let limits = Limits::default();
+    let machine = MachineId([27; 32]);
+    let agent = AgentId([28; 32]);
+    // Generation 5 is the live winner before the certificate is solicited.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    limits.need_certificate(machine, agent, [7; 32], 5);
+    limits.hello_connection(machine, 3);
+    limits.hello_connection(machine, 5);
+    assert!(
+        limits.take_certificate(machine, agent, [7; 32]),
+        "a 5->3->5 winner flip must not drop the pending certificate"
+    );
+    limits.need_certificate(machine, agent, [7; 32], 5);
+    limits.hello_connection(machine, 6);
+    assert!(
+        !limits.take_certificate(machine, agent, [7; 32]),
+        "a connection newer than every observed generation still drops the fence"
+    );
+}
+
+// #1772 review, round 3: the reply path raises the ceiling before the rate
+// gate, so a readiness pass that follows only finds the ceiling already at
+// the new generation and never fires. The certificate fence must therefore
+// fire on the begin path's own raise: a Hello reply on a genuinely new
+// generation is a replacement, and the pending certificate's premise is
+// gone.
+#[test]
+fn issue1346_replacement_reply_drops_pending_certificate() {
+    let limits = Limits::default();
+    let machine = MachineId([33; 32]);
+    let agent = AgentId([34; 32]);
+    // Generation 5 is attempted and observed; the peer's certificate is
+    // pending on that connection.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    limits.need_certificate(machine, agent, [7; 32], 5);
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    // The peer's Hello soliciting our reply arrives on generation 6, newer
+    // than every observed generation.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(6)));
+    assert!(
+        !limits.take_certificate(machine, agent, [7; 32]),
+        "a reply on a genuinely new generation must drop the pending certificate"
+    );
+    // Control: the later readiness pass for the same generation finds the
+    // fence already fired; nothing restores the certificate.
+    limits.hello_connection(machine, 6);
+    assert!(!limits.take_certificate(machine, agent, [7; 32]));
+}
+
+// #1772 review: a begin that the machine rate gate refuses must move no
+// marker. The old code moved the marker before the gate, so a refused
+// begin spoke for a generation that never attempted.
+#[test]
+fn issue1346_rate_refused_begin_moves_no_marker() {
+    let limits = Limits::default();
+    let machine = MachineId([29; 32]);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(6)));
+    assert!(!limits.begin_hello_on_connection(machine, true, Some(7)));
+    let state = limits.state.lock().unwrap();
+    let budget = &state.machines[&machine];
+    assert_eq!(budget.hello_generation, Some(6));
+    assert!(!budget.hello_attempted(7));
+}
+
+// #1772 review: out-of-order eviction must not block a generation that
+// never tried. With the slots {5,6,7,8} full, an attempt on generation 3
+// used to raise the floor to 5, blocking never-tried generation 4.
+#[test]
+fn issue1346_out_of_order_eviction_does_not_block_untried_generation() {
+    let limits = Limits::default();
+    let machine = MachineId([30; 32]);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    for generation in [6, 7, 8] {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&machine)
+            .unwrap()
+            .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+        assert!(limits.begin_hello_on_connection(machine, true, Some(generation)));
+    }
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(
+            budget.hello_floor, 0,
+            "an arrival below every stored slot raises no floor"
+        );
+        assert!(!budget.hello_attempted(4), "generation 4 never tried");
+        // The forgotten generation 5 is the trade: under five-generation
+        // churn it can re-arm, still bounded by the machine rate gate.
+        assert!(!budget.hello_attempted(5));
+    }
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&machine)
+        .unwrap()
+        .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    assert!(
+        limits.begin_hello_on_connection(machine, true, Some(4)),
+        "the never-tried generation still owns its try"
+    );
+}
+
+// #1772 review, round 3: an out-of-order arrival immediately below the
+// smallest stored slot leaves no untried generation between the two, so
+// the floor may cover the forgotten smallest and close its re-arm window.
+// A gapped arrival (the test above) still raises nothing.
+#[test]
+fn issue1346_out_of_order_adjacent_eviction_raises_floor() {
+    let limits = Limits::default();
+    let machine = MachineId([35; 32]);
+    let age_gate = |limits: &Limits| {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&machine)
+            .unwrap()
+            .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    };
+    assert!(limits.begin_hello_on_connection(machine, true, Some(2)));
+    for generation in [3, 4, 5] {
+        age_gate(&limits);
+        assert!(limits.begin_hello_on_connection(machine, true, Some(generation)));
+    }
+    // Slots {2,3,4,5}; the arrival 1 sits immediately below the smallest.
+    age_gate(&limits);
+    assert!(limits.begin_hello_on_connection(machine, true, Some(1)));
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(
+            budget.hello_floor, 2,
+            "the adjacent arrival covers the forgotten smallest"
+        );
+        assert!(budget.hello_attempted(1), "the arrival itself is recorded");
+        assert!(
+            budget.hello_attempted(2),
+            "the forgotten smallest stays consumed"
+        );
+    }
+    age_gate(&limits);
+    assert!(
+        limits.begin_hello_on_connection(machine, true, Some(6)),
+        "a later generation still owns its try"
+    );
+    assert!(limits.state.lock().unwrap().machines[&machine].hello_attempted(6));
+}
+
+// #1772 review, round 4 (finding 4): an in-order arrival over a gapped
+// history must not raise the floor over generations that never tried. With
+// the slots {5,6,7,8} full and floor 0, an attempt on generation 9 used to
+// set the floor to 5, so a follow that restored generation 3 found its try
+// consumed. The floor rises only when no untried generation sits between
+// it and the smallest slot.
+#[test]
+fn issue1346_gapped_in_order_eviction_does_not_block_older_follow() {
+    let limits = Limits::default();
+    let machine = MachineId([40; 32]);
+    let age_gate = |limits: &Limits| {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&machine)
+            .unwrap()
+            .hello_out = Some(Instant::now() - HELLO_INTERVAL);
+    };
+    // The first attempt creates the budget the age gate writes to.
+    assert!(limits.begin_hello_on_connection(machine, true, Some(5)));
+    for generation in [6, 7, 8, 9] {
+        age_gate(&limits);
+        assert!(limits.begin_hello_on_connection(machine, true, Some(generation)));
+    }
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&machine];
+        assert_eq!(
+            budget.hello_floor, 0,
+            "generations 1..4 never tried; the in-order arrival raises no floor"
+        );
+        assert!(!budget.hello_attempted(4));
+    }
+    // A follow restores generation 3: never attempted, so it owns a try
+    // and the scheduler filter re-arms once the machine gate clears.
+    limits.hello_connection(machine, 3);
+    assert!(
+        !limits.hello_pending(machine),
+        "the shared 60 s machine gate still holds"
+    );
+    age_gate(&limits);
+    assert!(
+        limits.hello_pending(machine),
+        "an untried followed generation re-arms the filter"
+    );
+    assert!(limits.begin_hello_on_connection(machine, true, Some(3)));
+}
+
+// #1772 review: the unattributed Some(0) slot is never an eviction
+// candidate, in-order or out-of-order.
+#[test]
+fn issue1346_unattributed_slot_survives_eviction() {
+    let limits = Limits::default();
+    let aged = Instant::now() - HELLO_INTERVAL;
+    // In-order pressure: {0,5,6,7} then 8 evicts the smallest positive slot.
+    let orderly = MachineId([31; 32]);
+    assert!(limits.begin_hello_on_connection(orderly, true, None));
+    for generation in [5, 6, 7, 8] {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&orderly)
+            .unwrap()
+            .hello_out = Some(aged);
+        assert!(limits.begin_hello_on_connection(orderly, true, Some(generation)));
+    }
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&orderly];
+        // Round 4: generations 1..4 never tried, so the gapped history
+        // raises no floor; only the smallest slot is forgotten.
+        assert_eq!(budget.hello_floor, 0);
+        assert!(
+            budget.hello_attempted(0),
+            "the unattributed slot keeps its try"
+        );
+        assert!(budget.hello_attempts.contains(&Some(0)));
+    }
+    // Out-of-order pressure: {0,6,7,8} then 4 arrives below every stored
+    // positive slot; generation 5 never tried and must stay free.
+    let unordered = MachineId([32; 32]);
+    assert!(limits.begin_hello_on_connection(unordered, true, None));
+    for generation in [6, 7, 8, 4] {
+        limits
+            .state
+            .lock()
+            .unwrap()
+            .machines
+            .get_mut(&unordered)
+            .unwrap()
+            .hello_out = Some(aged);
+        assert!(limits.begin_hello_on_connection(unordered, true, Some(generation)));
+    }
+    {
+        let state = limits.state.lock().unwrap();
+        let budget = &state.machines[&unordered];
+        assert_eq!(budget.hello_floor, 0);
+        assert!(budget.hello_attempts.contains(&Some(0)));
+        assert!(!budget.hello_attempted(5), "generation 5 never tried");
+    }
+    limits
+        .state
+        .lock()
+        .unwrap()
+        .machines
+        .get_mut(&unordered)
+        .unwrap()
+        .hello_out = Some(aged);
+    assert!(
+        limits.begin_hello_on_connection(unordered, true, Some(5)),
+        "the never-tried generation still owns its try"
+    );
 }
 
 #[test]
@@ -1673,7 +2568,7 @@ fn issue1207_s1b_stale_attempts_allow_new_machine_without_evicting_active_budget
         assert_eq!(state.machines.len(), 8);
         for id in 0..7 {
             let budget = &state.machines[&machine(id)];
-            assert!(budget.attempted);
+            assert!(budget.hello_attempted(100));
             assert_eq!(budget.hello_generation, Some(100));
         }
         assert!(!state.machines.contains_key(&machine(7)));
