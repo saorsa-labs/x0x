@@ -541,9 +541,23 @@ pub(in crate::server) fn populate_invite_base_state_v4(
     // #1023: the digest-only projection — the invite link is DM-budgeted
     // and is not a certificate carrier; the bytes travel with the
     // retained-commit chain instead.
-    invite.base_roster = Some(x0x::groups::state_commit::roster_projection_digest_only(
-        &info.members_v2,
-    ));
+    // #646 (D13): a projection past the inline cap no longer rides the
+    // link at all — the invite becomes v5 and carries the projection's
+    // CONTENT ADDRESS (its roster root); the joiner fetches the
+    // projection from the inviter and admits it only when it re-derives
+    // this signed root. At or under the cap the invite stays v4,
+    // byte-identical to pre-#646 links.
+    let projection = x0x::groups::state_commit::roster_projection_digest_only(&info.members_v2);
+    if projection.len() > x0x::groups::invite::MAX_INVITE_ROSTER_ENTRIES {
+        invite.version = x0x::groups::invite::INVITE_VERSION_V5;
+        invite.base_roster = None;
+        invite.base_roster_root = Some(x0x::groups::state_commit::roster_root_of_projection(
+            &projection,
+        ));
+    } else {
+        invite.base_roster = Some(projection);
+        invite.base_roster_root = None;
+    }
     invite.base_members_v2 = None;
     // #469 D1: exact public-meta snapshot — the precise input of
     // `compute_public_meta_hash`, so the joiner recomputes the base state

@@ -1300,6 +1300,7 @@ pub async fn serve_with_options(
         profile_path,
         mls_groups_path,
         pending_join_results: RwLock::new(HashMap::new()),
+        base_roster_fetch_slots: StdMutex::new(HashMap::new()),
         expected_join_result_inviters: StdMutex::new(HashMap::new()),
         pending_welcomes: RwLock::new(HashMap::new()),
         pending_welcome_receives: RwLock::new(HashMap::new()),
