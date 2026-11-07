@@ -742,7 +742,30 @@ fn decode_hold_file(bytes: &[u8]) -> Result<HoldFile, String> {
             file.version
         ));
     }
+    // #1597 item 5: a held removal whose sender is not a 32-byte hex agent
+    // id cannot replay. Before, `absorb` skipped it and the next `persist`
+    // wrote the file again without it, so the hold was lost. Now the file
+    // fails closed like a damaged one: it stays on disk, unchanged, and its
+    // group stays held until the file is repaired or removed.
+    if let Some(held) = file
+        .removals
+        .iter()
+        .find(|held| decode_sender(&held.sender).is_none())
+    {
+        return Err(format!(
+            "held removal sender {:?} is not a 32-byte hex agent id",
+            held.sender
+        ));
+    }
     Ok(file)
+}
+
+/// A held removal's sender: a 32-byte agent id, hex-encoded.
+fn decode_sender(sender: &str) -> Option<AgentId> {
+    hex::decode(sender)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(AgentId)
 }
 
 fn absorb(state: &AppState, file: HoldFile) {
@@ -777,10 +800,9 @@ fn absorb(state: &AppState, file: HoldFile) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let list = lot.entry(file.group_key.clone()).or_default();
         for held in file.removals {
-            let Some(sender) = hex::decode(&held.sender)
-                .ok()
-                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            else {
+            // `decode_hold_file` refuses a file with a sender that does
+            // not decode, so this skip is never taken for a loaded file.
+            let Some(sender) = decode_sender(&held.sender) else {
                 continue;
             };
             let hash = named_group_metadata_event_commit(&held.event)
@@ -794,7 +816,7 @@ fn absorb(state: &AppState, file: HoldFile) {
             }
             list.push(ParkedRoleUpdate {
                 event: held.event,
-                sender: AgentId(sender),
+                sender,
                 parked_at: Instant::now(),
             });
         }
@@ -2876,6 +2898,44 @@ mod tests {
             (kept.secret_epoch, kept.sender.as_str()),
             (6, c.as_str()),
             "a dead record yields the slot to the newer displacement"
+        );
+    }
+
+    /// #1597 item 5: a hold file with a held removal whose sender does not
+    /// decode fails closed. Before, the load skipped that removal and the
+    /// next write saved the file again without it, so the hold was lost.
+    /// Now the group stays held, no write replaces the file, and the file
+    /// stays byte-identical.
+    #[tokio::test]
+    async fn a_held_removal_with_an_undecodable_sender_is_kept() {
+        let (state, _dir) = test_state().await;
+        let group_key = "g".to_string();
+        let event =
+            serde_json::to_value(parked_removal([0x0A; 32], 2).event).expect("the removal encodes");
+        let body = serde_json::json!({
+            "version": HOLD_FILE_VERSION_V1,
+            "group_key": group_key,
+            "removals": [{ "event": event, "sender": "not-hex" }],
+        })
+        .to_string();
+        let path = super::test_seam::hold_path_for(&state, &group_key);
+        std::fs::create_dir_all(path.parent().expect("the hold dir has a parent"))
+            .expect("make the hold dir");
+        std::fs::write(&path, &body).expect("write the hold file");
+        ensure_loaded(&state).await;
+        let info = gss_info_at_head(1, None);
+        assert!(
+            withholds(&state, &group_key, &info),
+            "a file with a removal that cannot replay holds its group"
+        );
+        assert!(
+            persist(&state, &group_key).await.is_err(),
+            "the file is kept, not replaced by a write without the removal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file stays"),
+            body,
+            "the file is byte-identical after the refused write"
         );
     }
 

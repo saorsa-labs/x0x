@@ -120,6 +120,7 @@ fn truncated_page(group_id: &str, event: NamedGroupMetadataEvent) -> TreeKemCatc
         events: vec![event],
         truncated: true,
         responder_state_hash: Some("fork-head".to_string()),
+        responder_state_revision: None,
     }
 }
 
@@ -132,6 +133,7 @@ fn terminal_page(group_id: &str, events: Vec<NamedGroupMetadataEvent>) -> TreeKe
         events,
         truncated: false,
         responder_state_hash: Some("terminal-head".to_string()),
+        responder_state_revision: None,
     }
 }
 
@@ -2864,6 +2866,7 @@ async fn a_key_package_reply_no_longer_skips_the_armed_sender_in_the_rearm_pass(
         }],
         truncated: false,
         responder_state_hash: Some("kp-reply-head".to_string()),
+        responder_state_revision: None,
     };
     handle_treekem_catchup_response(
         &state,

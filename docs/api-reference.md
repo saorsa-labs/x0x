@@ -1801,7 +1801,16 @@ every wait. A wait always names its cause; it does not stop silently.
     daemon retries. When the obligation file runs memory-only, a
     revocation waits here until the revocation store holds it on disk.
   - `waiting_for_head_sync` — a catch-up round must finish first (for
-    example after a restart).
+    example after a restart). A holder can be far behind: this node cannot
+    link its reported head through the retained commit log, and its
+    reported `responder_state_revision` is below the log's retained floor.
+    Such a holder adds no conflicting-head evidence and clears its earlier
+    evidence. It does not confirm the round. A head at or above the floor
+    that this node cannot link still counts as conflicting (#1597 item 5b).
+    `responder_state_revision` is an optional field of the peer-to-peer
+    TreeKEM catch-up answer, not a REST field. It gives the revision of
+    the saved head in `responder_state_hash`. An old peer omits it and
+    keeps the old rule.
   - `waiting_for_member_key_package` — the TreeKEM removal needs the
     member's KeyPackage; the daemon asks for it.
   - `waiting_for_fork_resolution` — a competing branch exists. A saved
@@ -1881,7 +1890,8 @@ re-sealed share of a rotated secret, so the member installs a verified
 exclusion frame without the new secret. A `signed_public` group holds no
 secret and no seat KEM key by design — its members are not keyless
 survivors. While the state lasts: the node withholds new group ciphertext
-with the 409 above; its catch-up answers omit `responder_state_hash` (a
+with the 409 above; its catch-up answers omit `responder_state_hash` and
+`responder_state_revision` (a
 node that holds no secret of an epoch cannot vouch for a head of that
 epoch; every other responder — a `signed_public` member, an
 `mls_encrypted` joiner still waiting for its welcome share, and a

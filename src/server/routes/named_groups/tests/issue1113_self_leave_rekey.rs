@@ -877,6 +877,7 @@ fn empty_catchup(group_id: &str, truncated: bool) -> TreeKemCatchupResponse {
         events: Vec::new(),
         truncated,
         responder_state_hash: None,
+        responder_state_revision: None,
     }
 }
 
@@ -899,6 +900,7 @@ async fn truncated_catchup_page_does_not_seal() -> Result<()> {
         events: vec![leave],
         truncated: true,
         responder_state_hash: None,
+        responder_state_revision: None,
     };
     // The transport sender is an active peer, not the leaver. The commit
     // signature is the author.
@@ -2030,6 +2032,7 @@ async fn deliver_catchup(
             events: vec![event],
             truncated: false,
             responder_state_hash: None,
+            responder_state_revision: None,
         },
     )
     .await;
@@ -2252,6 +2255,7 @@ fn catchup_page(
         events: Vec::new(),
         truncated,
         responder_state_hash,
+        responder_state_revision: None,
     }
 }
 
@@ -2296,6 +2300,7 @@ fn key_package_reply(
         }],
         truncated: false,
         responder_state_hash,
+        responder_state_revision: None,
     }
 }
 

@@ -5407,6 +5407,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             survivor_head.as_deref(),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -6091,6 +6092,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             parent.as_deref(),
+            None,
         )
         .await;
         if let Ok(mut scheduled) = fx
@@ -6158,6 +6160,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             Some(result_head.as_str()),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -6239,6 +6242,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             parent.as_deref(),
+            None,
         )
         .await;
         if let Ok(mut scheduled) = fx
@@ -6434,6 +6438,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         // The parent head — the answer David's ruled-out alternative
@@ -6446,6 +6451,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             parent.as_deref(),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -6526,6 +6532,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             reported.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -6658,6 +6665,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         {
@@ -6687,6 +6695,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             Some(&parent_head),
+            None,
         )
         .await;
         {
@@ -7015,6 +7024,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_ne!(
@@ -7195,6 +7205,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -7341,6 +7352,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_ne!(
@@ -7430,6 +7442,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -7884,6 +7897,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_ne!(
@@ -8136,6 +8150,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_ne!(
@@ -8224,6 +8239,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -8866,7 +8882,12 @@ mod daemon_tests {
     #[tokio::test]
     async fn a_keyless_commit_keeps_the_first_foreign_share_replaceable() -> Result<()> {
         use anyhow::Context as _;
-        let other_admin = AgentId([0xfe; 32]);
+        // The highest raw ID, so the fixture's admin stays designated
+        // (D74: the lowest eligible admin is designated). With
+        // `[0xfe; 32]`, a random fixture admin ID that starts `0xff`
+        // (about 1 run in 256) ranked 1 and could not author the frame
+        // before the 18 s designated window.
+        let other_admin = AgentId([0xff; 32]);
         let other_admin_hex = hex::encode(other_admin.as_bytes());
         let fx = gss_leave_fixture_seated(
             Some((other_admin, x0x::groups::GroupRole::Admin)),
@@ -8879,6 +8900,10 @@ mod daemon_tests {
             .key_republish_suppressed
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let admin = fx.state.agent.agent_id();
+        anyhow::ensure!(
+            admin.as_bytes() < other_admin.as_bytes(),
+            "the fixture's admin must be the designated admin"
+        );
         let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
         let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
             .encode(&fx.replica.agent_kem_keypair.public_bytes);
@@ -11487,6 +11512,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
 
@@ -11627,6 +11653,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             reported.as_deref(),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -11688,6 +11715,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             reported.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -12069,6 +12097,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -12209,6 +12238,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &member_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -12332,6 +12362,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &member_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -13314,6 +13345,7 @@ mod daemon_tests {
                 std::slice::from_ref(&self.group_id),
                 &self.survivor_hex,
                 reported,
+                None,
             )
             .await;
         }
@@ -13994,7 +14026,8 @@ mod daemon_tests {
                 let sender = control.survivor_hex.clone();
                 let head = control.result_head.clone();
                 tokio::spawn(async move {
-                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head)).await;
+                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head), None)
+                        .await;
                 })
             };
             // The report runs to the verdict's revocation-set read and
@@ -14020,7 +14053,8 @@ mod daemon_tests {
                 let sender = fx.survivor_hex.clone();
                 let head = fx.result_head.clone();
                 tokio::spawn(async move {
-                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head)).await;
+                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head), None)
+                        .await;
                 })
             };
             tokio::task::yield_now().await;

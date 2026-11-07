@@ -6804,8 +6804,14 @@ mod restart_tests {
     async fn report_head(author: &AppState, survivor: &AppState, stable: &str) -> Result<()> {
         let head = head_of(survivor, stable).await.context("survivor head")?;
         let survivor_hex = hex::encode(survivor.agent.agent_id().as_bytes());
-        super::super::note_catchup_head(author, &[stable.to_string()], &survivor_hex, Some(&head))
-            .await;
+        super::super::note_catchup_head(
+            author,
+            &[stable.to_string()],
+            &survivor_hex,
+            Some(&head),
+            None,
+        )
+        .await;
         Ok(())
     }
 

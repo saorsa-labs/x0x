@@ -14784,6 +14784,7 @@ mod tests {
                 events,
                 truncated: false,
                 responder_state_hash: None,
+                responder_state_revision: None,
             },
         )
         .await;
@@ -14937,6 +14938,7 @@ mod tests {
                 events,
                 truncated: false,
                 responder_state_hash: None,
+                responder_state_revision: None,
             },
         )
         .await;

@@ -4984,6 +4984,36 @@ fn push_unique<T: Copy + PartialEq>(items: &mut Vec<T>, item: T) {
     }
 }
 
+/// The certificate fields of an agent's OWN discovery record, written
+/// directly after it publishes `announcement`: the pair the announcement
+/// carries and the digest its V3 form commits to
+/// ([`announce_v3::cert_digest`], as in `build_from_v2`).
+///
+/// The self-write moves the entry to the announcement's `announced_at`, so
+/// it must commit to the same digest, including the anonymous digest. The
+/// digest is always `Some` on purpose. A digest-less self-write at that
+/// second keeps a stale certificate, and the #1643 equal-second rule then
+/// stops the listener's ingest of the same beat from withdrawing it.
+fn own_announcement_cert_fields(
+    announcement: &IdentityAnnouncement,
+) -> (
+    Option<u64>,
+    Option<identity::AgentCertificate>,
+    Option<[u8; 32]>,
+) {
+    (
+        announcement
+            .agent_certificate
+            .as_ref()
+            .and_then(identity::AgentCertificate::not_after),
+        announcement.agent_certificate.clone(),
+        Some(announce_v3::cert_digest(
+            &announcement.user_id,
+            &announcement.agent_certificate,
+        )),
+    )
+}
+
 fn prioritize_discovery_addresses(addresses: &mut [std::net::SocketAddr]) {
     addresses.sort_by_key(|addr| is_publicly_advertisable(*addr));
 }
@@ -6595,6 +6625,8 @@ impl HeartbeatContext {
             ),
         )
         .await;
+        let (cert_not_after, agent_certificate, cert_digest) =
+            own_announcement_cert_fields(&announcement);
         let discovered_agent = DiscoveredAgent {
             self_name: announcement.self_name.clone(),
             agent_id: announcement.agent_id,
@@ -6610,10 +6642,10 @@ impl HeartbeatContext {
             is_coordinator: announcement.is_coordinator,
             reachable_via: announcement.reachable_via.clone(),
             relay_candidates: announcement.relay_candidates.clone(),
-            cert_not_after: None,
-            agent_certificate: None,
+            cert_not_after,
+            agent_certificate,
             agent_public_key: announcement.agent_public_key.clone(),
-            cert_digest: None,
+            cert_digest,
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         upsert_discovered_agent(&self.cache, &self.verified_cert_tx, discovered_agent).await;
@@ -14451,6 +14483,8 @@ impl Agent {
             ),
         )
         .await;
+        let (cert_not_after, agent_certificate, cert_digest) =
+            own_announcement_cert_fields(&announcement);
         let discovered_agent = DiscoveredAgent {
             self_name: announcement.self_name.clone(),
             agent_id: announcement.agent_id,
@@ -14466,10 +14500,10 @@ impl Agent {
             is_coordinator: announcement.is_coordinator,
             reachable_via: announcement.reachable_via.clone(),
             relay_candidates: announcement.relay_candidates.clone(),
-            cert_not_after: None,
-            agent_certificate: None,
+            cert_not_after,
+            agent_certificate,
             agent_public_key: announcement.agent_public_key.clone(),
-            cert_digest: None,
+            cert_digest,
         };
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
             .await;
@@ -42884,6 +42918,95 @@ async fn same_second_anonymous_announce_keeps_a_pending_fetch_digest() {
         "the entry keeps the digest the in-flight fetch will resolve"
     );
     assert!(entry.agent_certificate.is_none());
+}
+
+/// WHY (#1643 follow-up; r19_cert_carry CI flake on main 3883ddf6): an
+/// agent writes its OWN discovery record directly after it publishes an
+/// announcement. That write ran at the announcement's `announced_at` but
+/// committed to no digest. When the write landed before the listener
+/// ingested the same announcement (listener lag under CI load), the
+/// listener's anonymous V3 beat met an entry already at its second, and
+/// the #1643 equal-second exception kept the stale certificate. No later
+/// beat in the same second could withdraw it. The barrier holds the
+/// listener's ingest until `announce_identity` returns, so the bad order
+/// happens every run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_anonymous_announce_withdraws_a_stale_cert_when_the_self_write_lands_first() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let agent = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_network_config(network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            ..network::NetworkConfig::default()
+        })
+        .build()
+        .await
+        .expect("agent");
+    let id = agent.agent_id();
+    let owner = identity::UserKeypair::generate().expect("owner kp");
+    let cert =
+        identity::AgentCertificate::issue(&owner, agent.identity().agent_keypair()).expect("cert");
+    // The stale certificate: a record older than any real announcement.
+    let mut stale = discovered_agent_fixture(9, 0, &[], Some(owner.user_id()));
+    stale.agent_id = id;
+    stale.machine_id = agent.machine_id();
+    stale.last_seen = Agent::unix_timestamp_secs();
+    stale.cert_not_after = cert.not_after();
+    stale.agent_certificate = Some(cert);
+    agent
+        .identity_discovery_cache
+        .write()
+        .await
+        .insert(id, stale);
+
+    let gate = announced_record_barrier::arm(id, announced_record_barrier::INGEST_BETWEEN_WRITES);
+    agent
+        .announce_identity(false, false)
+        .await
+        .expect("announce");
+    // The self-write has landed. Only now may the listener ingest. One
+    // permit releases one parked ingest; 64 covers every beat this
+    // announce publishes (V2, V3, V3.1) with room to spare.
+    gate.release.add_permits(64);
+    let anonymous = announce_v3::anonymous_cert_digest();
+    let withdrawn = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let reached = gate.reached.available_permits() > 0;
+            let entry = agent
+                .identity_discovery_cache
+                .read()
+                .await
+                .get(&id)
+                .cloned();
+            if reached
+                && entry.is_some_and(|e| {
+                    e.agent_certificate.is_none() && e.cert_digest == Some(anonymous)
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    announced_record_barrier::disarm(&id, announced_record_barrier::INGEST_BETWEEN_WRITES);
+    let entry = agent
+        .identity_discovery_cache
+        .read()
+        .await
+        .get(&id)
+        .cloned();
+    agent.shutdown().await;
+    assert!(
+        withdrawn.is_ok(),
+        "the agent's own anonymous announce must withdraw the stale certificate; entry: {:?}",
+        entry.map(|e| (e.announced_at, e.cert_digest, e.agent_certificate.is_some()))
+    );
 }
 
 #[test]
