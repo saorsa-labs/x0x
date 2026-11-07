@@ -29,6 +29,8 @@ fn names_router_inner(state: Arc<AppState>, with_auth: bool) -> axum::Router {
         .route("/names/owners/:label", delete(names_owner_unbind))
         .route("/names/machines", post(names_machine_label))
         .route("/names/pins/:name", delete(names_unpin))
+        .route("/names/accept", post(names_accept))
+        .route("/names/suggestions/:label", delete(names_dismiss))
         .route("/forwards", post(super::super::connect::forward_add))
         .route(
             "/forwards/:local_addr",
@@ -202,6 +204,107 @@ async fn names_routes_wired() -> anyhow::Result<()> {
     let (status, body) = send(&app, "DELETE", "/names/owners/bob", serde_json::Value::Null).await?;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, _) = send(&app, "DELETE", "/names/owners/bob", serde_json::Value::Null).await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// WHY: ADR 0079 §2 — the grant-names suggestion surface is wired: a
+/// stranger's defaults show up as a suggestion in `GET /names`, `POST
+/// /names/accept` applies them (owner petname + machine pin, source
+/// `grant`) and removes the suggestion, a second accept is 404, and
+/// `DELETE /names/suggestions/:label` drops a pending one. Conflicts are
+/// reported in `GET /names`.
+#[tokio::test]
+async fn grant_names_routes_wired() -> anyhow::Result<()> {
+    let (state, _dir) =
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+    let app = names_router(Arc::clone(&state));
+    let bob = UserId([0xbb; 32]);
+    let machine = MachineId([0xdd; 32]);
+    let defaults = x0x::names::GrantNameDefaults {
+        owner: bob,
+        owner_name: Some("Bob Smith".to_string()),
+        machines: vec![(machine, "Studio Mac".to_string())],
+    };
+
+    // A stranger's grant yields a suggestion, never a binding.
+    let applied = state.names.apply_grant_names(&defaults, false, 1).await?;
+    assert!(applied.suggested, "{applied:?}");
+    assert!(!applied.owner_bound, "{applied:?}");
+    let (status, body) = send(&app, "GET", "/names", serde_json::Value::Null).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["owners"], serde_json::json!([]));
+    assert_eq!(body["suggestions"][0]["label"], "bob-smith", "{body}");
+    assert_eq!(
+        body["suggestions"][0]["machines"][0]["machine_name"],
+        "Studio Mac"
+    );
+
+    // Accept applies the defaults and removes the suggestion.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/names/accept",
+        serde_json::json!({ "label": "bob-smith" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["owner_bound"], true, "{body}");
+    assert_eq!(body["machine_pins"][0], "machine:studio-mac.bob-smith");
+    let (status, body) = send(&app, "GET", "/names", serde_json::Value::Null).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["owners"][0]["label"], "bob-smith");
+    assert_eq!(body["owners"][0]["source"], "grant");
+    assert_eq!(body["suggestions"], serde_json::json!([]), "{body}");
+    assert_eq!(body["pins"][0]["name"], "machine:studio-mac.bob-smith");
+    assert_eq!(body["pins"][0]["source"], "grant");
+
+    // A second accept of the same label is gone.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/names/accept",
+        serde_json::json!({ "label": "bob-smith" }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // A conflicting later default is reported, not applied.
+    let other = x0x::names::GrantNameDefaults {
+        owner: UserId([0xcc; 32]),
+        owner_name: Some("Bob Smith".to_string()),
+        machines: Vec::new(),
+    };
+    let applied = state.names.apply_grant_names(&other, true, 2).await?;
+    assert_eq!(applied.conflicts, 1, "{applied:?}");
+    let (status, body) = send(&app, "GET", "/names", serde_json::Value::Null).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["conflicts"][0]["case"], "label_taken", "{body}");
+    assert_eq!(body["conflicts"][0]["label"], "bob-smith");
+
+    // Dismiss drops a pending suggestion; a missing one is 404.
+    let carol = x0x::names::GrantNameDefaults {
+        owner: UserId([0xee; 32]),
+        owner_name: Some("Carol".to_string()),
+        machines: Vec::new(),
+    };
+    state.names.apply_grant_names(&carol, false, 3).await?;
+    let (status, body) = send(
+        &app,
+        "DELETE",
+        "/names/suggestions/carol",
+        serde_json::Value::Null,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["removed"], true);
+    let (status, _) = send(
+        &app,
+        "DELETE",
+        "/names/suggestions/carol",
+        serde_json::Value::Null,
+    )
+    .await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
     Ok(())
 }
@@ -626,6 +729,16 @@ async fn names_and_forwards_refuse_session_and_rider_tokens() -> anyhow::Result<
         (
             "DELETE",
             "/names/pins/agent:studio.bob".to_string(),
+            String::new(),
+        ),
+        (
+            "POST",
+            "/names/accept".to_string(),
+            serde_json::json!({ "label": "bob" }).to_string(),
+        ),
+        (
+            "DELETE",
+            "/names/suggestions/bob".to_string(),
             String::new(),
         ),
         ("POST", "/forwards".to_string(), forward_body),

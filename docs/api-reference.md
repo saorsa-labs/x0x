@@ -4252,8 +4252,9 @@ An unreadable `forwards.json` restores nothing, is never overwritten, and is rep
 
 These are local names for agents and machines: `[agent:|machine:]<label>.<owner>`. Labels are lowercase DNS labels (`[a-z0-9-]`, 1–63 characters, no leading or trailing `-`). `me`, `agent` and `machine` are reserved. A 64-character hex agent id stays valid wherever a name is accepted.
 
-- **Owner label.** `me` is this install's owner. Any other owner label is a local petname for a `UserId`, never a network claim. A petname is bound in one of two ways:
+- **Owner label.** `me` is this install's owner. Any other owner label is a local petname for a `UserId`, never a network claim. A petname is bound in one of three ways:
   - importing a signed agent card that carries `user_id` and `owner_name`. The `owner_name` becomes a DNS label, so "Bob Smith" becomes `bob-smith`, and the import response reports `owner_label`. A signed card binds that label only when the contact is Known or Trusted and that user has no petname yet. Unknown and Blocked stay unbound: `owner_label` is null and the name store is unchanged. `POST /names/owners` still binds a label explicitly.
+  - receiving a v2 (names-carrying) `ShareGrant` (ADR 0079; see **Grant-carried name defaults** below).
   - `POST /names/owners`.
 
   A petname is frozen at first bind. Binding it to another key returns `409` `pin_mismatch` until the label is removed.
@@ -4272,6 +4273,43 @@ Resolution is local and makes no network query. It adds no trust: every identity
 | DELETE | `/names/owners/:label` | `x0x names owner rm <LABEL>` | Remove a petname and every pin under it |
 | POST | `/names/machines` | `x0x names machine label <NAME> <MACHINE_ID>` | Label a shared machine (`machine:<label>.<owner>`) |
 | DELETE | `/names/pins/:name` | `x0x names unpin <NAME>` | Drop a pin (e.g. `agent:studio.bob`) |
+| POST | `/names/accept` | `x0x names accept <LABEL>` | Apply a pending grant-names suggestion (ADR 0079) |
+| DELETE | `/names/suggestions/:label` | `x0x names dismiss <LABEL>` | Drop a pending grant-names suggestion |
+
+### Grant-carried name defaults (ADR 0079)
+
+A grant owner's daemon can wrap a `ShareGrant` in a v2 envelope
+(`x0x-sharegrant-v2\0`): the unchanged v1 grant, a names section
+(`owner_name` and the `machine_name` of each machine that hosts a granted
+agent), and a second signature by the owner **user** key over the names and
+the SHA-256 of the grant's signed bytes. The names cannot be moved to
+another grant or attributed to another user. Names are never broadcast:
+they travel only inside the end-to-end encrypted grant DM. The daemon
+advertises ADR 0093 application bit 14, `share_grant_names_v1`, for this
+route; a sender uses the v2 envelope only toward a grantee whose current
+verified advert sets bit 14, and sends the unchanged v1 payload otherwise.
+
+The receiver verifies the grant by the v1 rules and the names signature
+under the grant's owner key; a failure of either refuses the whole envelope
+(nothing stored, ACK withheld). The grant itself is stored exactly as a v1
+delivery, so v1 and v2 copies of one grant are an idempotent duplicate.
+The names become ADR-0074 §1 defaults in the local name store:
+
+- When the grant's owner is a **Known or Trusted** contact, an unbound
+  owner gets the petname derived from `owner_name` (source `grant`), and
+  each listed machine with no label under that owner gets a machine pin.
+  Defaults never rebind: a label already bound to another key, or a later
+  grant carrying a different name, is reported as a `default_conflict`
+  (`conflicts` in `GET /names`: `kind`, `case` `label_taken` or
+  `name_changed`, `label`, `held`, `offered`, `offered_name`) and not
+  applied. Only the local owner rebinds, by removing the label first.
+- A **stranger's** grant yields only a pending suggestion (`suggestions` in
+  `GET /names`). `POST /names/accept {"label": …}` applies it (and removes
+  it); `DELETE /names/suggestions/:label` drops it.
+
+A machine label recorded from a grant resolves only while the ADR-0074
+shared-machine rule holds: the machine must currently host a certified
+agent of an active, unrevoked grant from that owner.
 
 `POST /names/resolve` takes `{"name": "studio.me"}` and returns:
 

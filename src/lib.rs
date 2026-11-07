@@ -28980,6 +28980,7 @@ mod tests {
         for prefix in [
             crate::history::classify::KV_STORE_DELTA_DM_PREFIX,
             crate::share_grant::SHARE_GRANT_DM_PREFIX,
+            crate::share_grant::names::SHARE_GRANT_V2_DM_PREFIX,
             crate::history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
             crate::exec::EXEC_DM_PREFIX,
             b"X0X-GROUP-PREDECESSOR-RELAY-V1\n".as_slice(),

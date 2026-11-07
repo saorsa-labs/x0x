@@ -1637,3 +1637,232 @@ async fn evidence_backed_peer_resolves_name_without_authenticated_cache() {
     assert_eq!(machine.agent_id, Some(real_id));
     local.shutdown().await;
 }
+
+// ─── ADR 0079 §2: grant-carried name defaults ───────────────────────────────
+
+fn defaults(owner: UserId, owner_name: &str, machines: &[(u8, &str)]) -> GrantNameDefaults {
+    GrantNameDefaults {
+        owner,
+        owner_name: Some(owner_name.to_string()),
+        machines: machines
+            .iter()
+            .map(|(b, n)| (MachineId([*b; 32]), (*n).to_string()))
+            .collect(),
+    }
+}
+
+/// WHY (ADR 0079 §2): "a default applies once and is never rebound" — a
+/// later trusted grant carrying a different name is reported as
+/// `name_changed` and the first label stands; the same conflict is not
+/// recorded twice.
+#[tokio::test]
+async fn later_grant_with_a_different_name_is_reported_not_applied() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bob Smith", &[]), true, NOW)
+        .await
+        .unwrap();
+    assert!(applied.owner_bound);
+    assert_eq!(applied.owner_label.as_deref(), Some("bob-smith"));
+
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Robert Smith", &[]), true, NOW + 1)
+        .await
+        .unwrap();
+    assert!(!applied.owner_bound);
+    assert_eq!(applied.conflicts, 1, "{applied:?}");
+    assert_eq!(
+        store.owner("bob-smith").await.unwrap().map(|b| b.user_id),
+        Some(bob),
+        "the first bind stands"
+    );
+    assert!(store.owner("robert-smith").await.unwrap().is_none());
+    let (_, conflicts) = store.pending().await.unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].case, ConflictCase::NameChanged);
+    assert_eq!(conflicts[0].offered, "robert-smith");
+
+    // The identical conflict is deduplicated.
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Robert Smith", &[]), true, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(applied.conflicts, 0, "{applied:?}");
+    let (_, conflicts) = store.pending().await.unwrap();
+    assert_eq!(conflicts.len(), 1);
+}
+
+/// WHY (ADR 0079 §2): a label already bound to another key is `label_taken`
+/// for owners and machines alike; nothing rebinds.
+#[tokio::test]
+async fn taken_labels_are_reported_not_rebound() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    let carol = UserId([0xcc; 32]);
+    store
+        .bind_owner("bob-smith", carol, BindSource::Manual, NOW)
+        .await
+        .unwrap();
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bob Smith", &[]), true, NOW + 1)
+        .await
+        .unwrap();
+    assert!(!applied.owner_bound);
+    assert_eq!(applied.conflicts, 1);
+    assert_eq!(
+        store.owner("bob-smith").await.unwrap().map(|b| b.user_id),
+        Some(carol)
+    );
+
+    // Machine label taken under the same owner.
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bobby", &[(0x01, "Studio")]), true, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(applied.machine_pins, ["machine:studio.bobby"]);
+    let applied = store
+        .apply_grant_names(&defaults(bob, "Bobby", &[(0x02, "Studio")]), true, NOW + 3)
+        .await
+        .unwrap();
+    assert!(applied.machine_pins.is_empty(), "{applied:?}");
+    assert_eq!(applied.conflicts, 1);
+    assert_eq!(
+        store
+            .get_pin("machine:studio.bobby")
+            .await
+            .unwrap()
+            .map(|p| p.id),
+        Some([0x01; 32]),
+        "the first machine pin stands"
+    );
+}
+
+/// WHY (ADR 0079 §2): a machine already labelled under that owner gets no
+/// second label from a grant default.
+#[tokio::test]
+async fn an_already_labelled_machine_gets_no_second_default() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    store
+        .apply_grant_names(&defaults(bob, "Bob", &[(0x01, "Studio")]), true, NOW)
+        .await
+        .unwrap();
+    let applied = store
+        .apply_grant_names(
+            &defaults(bob, "Bob", &[(0x01, "Renamed Studio")]),
+            true,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+    assert!(applied.machine_pins.is_empty(), "{applied:?}");
+    assert_eq!(applied.conflicts, 0, "a skip is not a conflict");
+    assert!(store
+        .get_pin("machine:renamed-studio.bob")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// WHY (ADR 0079 §2): suggestions and conflicts persist across restart,
+/// and a pre-ADR-0079 names.json (no new fields) still loads.
+#[tokio::test]
+async fn suggestions_and_conflicts_persist_and_old_files_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = NameStore::path_in(dir.path());
+    let bob = UserId([0xbb; 32]);
+    {
+        let store = NameStore::load(path.clone()).await;
+        let applied = store
+            .apply_grant_names(&defaults(bob, "Bob Smith", &[(0x01, "Studio")]), false, NOW)
+            .await
+            .unwrap();
+        assert!(applied.suggested);
+        // A different user offering the same label is a conflict.
+        let applied = store
+            .apply_grant_names(
+                &defaults(UserId([0xcc; 32]), "Bob Smith", &[]),
+                false,
+                NOW + 1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied.conflicts, 1);
+    }
+    let store = NameStore::load(path.clone()).await;
+    assert!(store.load_error().is_none(), "{:?}", store.load_error());
+    let (suggestions, conflicts) = store.pending().await.unwrap();
+    assert_eq!(suggestions.get("bob-smith").map(|s| s.user_id), Some(bob));
+    assert_eq!(
+        suggestions
+            .get("bob-smith")
+            .map(|s| s.machines.clone())
+            .unwrap_or_default(),
+        vec![(MachineId([0x01; 32]), "Studio".to_string())]
+    );
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].case, ConflictCase::LabelTaken);
+
+    // Accept applies and the result persists.
+    let applied = store.accept_suggestion("bob-smith", NOW + 2).await.unwrap();
+    assert!(applied.owner_bound);
+    let reloaded = NameStore::load(path.clone()).await;
+    assert_eq!(
+        reloaded.owner("bob-smith").await.unwrap().map(|b| b.source),
+        Some(BindSource::Grant)
+    );
+    let (suggestions, _) = reloaded.pending().await.unwrap();
+    assert!(suggestions.is_empty(), "accepted suggestion removed");
+
+    // A file without the ADR 0079 fields (pre-upgrade daemon) loads.
+    let old = serde_json::json!({
+        "version": 1,
+        "owners": {
+            "carol": {
+                "user_id": "cc".repeat(32),
+                "bound_at": 1,
+                "source": "manual",
+            },
+        },
+        "pins": {},
+    });
+    tokio::fs::write(&path, serde_json::to_vec_pretty(&old).unwrap())
+        .await
+        .unwrap();
+    let old_store = NameStore::load(path).await;
+    assert!(
+        old_store.load_error().is_none(),
+        "{:?}",
+        old_store.load_error()
+    );
+    assert!(old_store.owner("carol").await.unwrap().is_some());
+    let (suggestions, conflicts) = old_store.pending().await.unwrap();
+    assert!(suggestions.is_empty() && conflicts.is_empty());
+}
+
+/// WHY (ADR 0079 §2): a stranger's suggestion never touches bindings, a
+/// re-send refreshes it idempotently, and dismiss drops it.
+#[tokio::test]
+async fn suggestions_are_inert_until_accepted_and_can_be_dismissed() {
+    let store = NameStore::in_memory();
+    let bob = UserId([0xbb; 32]);
+    let first = defaults(bob, "Bob", &[(0x01, "Studio")]);
+    store.apply_grant_names(&first, false, NOW).await.unwrap();
+    // Identical re-send: still one suggestion.
+    store
+        .apply_grant_names(&first, false, NOW + 1)
+        .await
+        .unwrap();
+    let (owners, pins) = store.snapshot().await.unwrap();
+    assert!(
+        owners.is_empty() && pins.is_empty(),
+        "suggestions are inert"
+    );
+    let (suggestions, _) = store.pending().await.unwrap();
+    assert_eq!(suggestions.len(), 1);
+    assert!(store.dismiss_suggestion("bob").await.unwrap());
+    assert!(!store.dismiss_suggestion("bob").await.unwrap());
+    let (suggestions, _) = store.pending().await.unwrap();
+    assert!(suggestions.is_empty());
+}

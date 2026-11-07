@@ -112,7 +112,60 @@ fn source_str(source: BindSource) -> &'static str {
         BindSource::Card => "card",
         BindSource::Manual => "manual",
         BindSource::FirstUse => "first_use",
+        BindSource::Grant => "grant",
     }
+}
+
+/// ADR 0079 §2 contact gate: whether `owner` is a Known or Trusted contact
+/// of this install — some Known/Trusted contact agent whose cached, valid,
+/// unexpired, unrevoked `AgentCertificate` chains to that user.
+pub(in crate::server) async fn owner_is_known_or_trusted_contact(
+    state: &AppState,
+    owner: x0x::identity::UserId,
+) -> bool {
+    let now = unix_now_secs();
+    let candidates: Vec<x0x::identity::AgentId> = {
+        let contacts = state.agent.contacts().read().await;
+        contacts
+            .list()
+            .into_iter()
+            .filter(|c| {
+                matches!(
+                    c.trust_level,
+                    x0x::contacts::TrustLevel::Known | x0x::contacts::TrustLevel::Trusted
+                )
+            })
+            .map(|c| c.agent_id)
+            .collect()
+    };
+    if candidates.is_empty() {
+        return false;
+    }
+    let cache_arc = state.agent.identity_discovery_cache();
+    let revocation_arc = state.agent.revocation_set();
+    let cache = cache_arc.read().await;
+    let revocations = revocation_arc.read().await;
+    candidates.into_iter().any(|agent_id| {
+        let Some(cert) = cache
+            .get(&agent_id)
+            .and_then(|entry| entry.agent_certificate.as_ref())
+        else {
+            return false;
+        };
+        let revoked = revocations.is_agent_revoked(&agent_id);
+        x0x::owner_trust::certificate_chains_to_owner(&owner, &agent_id, cert, revoked, now)
+    })
+}
+
+/// A grant-names outcome as REST JSON.
+fn applied_json(applied: &x0x::names::GrantNamesApplied) -> serde_json::Value {
+    serde_json::json!({
+        "owner_label": applied.owner_label,
+        "owner_bound": applied.owner_bound,
+        "machine_pins": applied.machine_pins,
+        "suggested": applied.suggested,
+        "conflicts": applied.conflicts,
+    })
 }
 
 /// GET /names — owner petnames and pins.
@@ -125,6 +178,10 @@ pub(in crate::server) async fn names_list(
     }
     let (owners, pins) = match state.names.snapshot().await {
         Ok(snapshot) => snapshot,
+        Err(e) => return name_error(&e),
+    };
+    let (suggestions, conflicts) = match state.names.pending().await {
+        Ok(pending) => pending,
         Err(e) => return name_error(&e),
     };
     let owners: Vec<serde_json::Value> = owners
@@ -150,11 +207,104 @@ pub(in crate::server) async fn names_list(
             })
         })
         .collect();
+    let suggestions: Vec<serde_json::Value> = suggestions
+        .iter()
+        .map(|(label, s)| {
+            serde_json::json!({
+                "label": label,
+                "user_id": hex::encode(s.user_id.as_bytes()),
+                "owner_name": s.owner_name,
+                "machines": s
+                    .machines
+                    .iter()
+                    .map(|(id, name)| serde_json::json!({
+                        "machine_id": hex::encode(id.as_bytes()),
+                        "machine_name": name,
+                    }))
+                    .collect::<Vec<_>>(),
+                "suggested_at": s.suggested_at,
+            })
+        })
+        .collect();
+    let conflicts: Vec<serde_json::Value> = conflicts
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "kind": c.kind.as_str(),
+                "case": c.case.as_str(),
+                "label": c.label,
+                "held": c.held,
+                "offered": c.offered,
+                "offered_name": c.offered_name,
+                "reported_at": c.reported_at,
+            })
+        })
+        .collect();
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "owners": owners, "pins": pins })),
+        Json(serde_json::json!({
+            "ok": true,
+            "owners": owners,
+            "pins": pins,
+            "suggestions": suggestions,
+            "conflicts": conflicts,
+        })),
     )
         .into_response()
+}
+
+/// `POST /names/accept` body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::server) struct NameAcceptRequest {
+    /// The suggested owner label to apply (ADR 0079 §2).
+    label: String,
+}
+
+/// POST /names/accept — apply a pending grant-names suggestion.
+pub(in crate::server) async fn names_accept(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<ActorContext>,
+    Json(req): Json<NameAcceptRequest>,
+) -> Response {
+    if !actor.is_durable_owner() {
+        return forbidden();
+    }
+    match state
+        .names
+        .accept_suggestion(&req.label, unix_now_secs())
+        .await
+    {
+        Ok(applied) => {
+            let mut body = applied_json(&applied);
+            body["ok"] = serde_json::json!(true);
+            body["label"] = serde_json::json!(req.label);
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => name_error(&e),
+    }
+}
+
+/// DELETE /names/suggestions/:label — drop a pending suggestion.
+pub(in crate::server) async fn names_dismiss(
+    State(state): State<Arc<AppState>>,
+    Extension(actor): Extension<ActorContext>,
+    Path(label): Path<String>,
+) -> Response {
+    if !actor.is_durable_owner() {
+        return forbidden();
+    }
+    match state.names.dismiss_suggestion(&label).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "removed": true })),
+        )
+            .into_response(),
+        Ok(false) => name_error(&NameError::UnknownName(format!(
+            "no pending suggestion under {label:?}"
+        ))),
+        Err(e) => name_error(&e),
+    }
 }
 
 /// `POST /names/resolve` body.

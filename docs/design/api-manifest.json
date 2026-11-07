@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 217,
+  "endpoint_count": 219,
   "endpoints": [
     {
       "category": "status",
@@ -3671,6 +3671,34 @@
       "description": "Drop a TOFU pin so the name re-pins at next use",
       "method": "DELETE",
       "path": "/names/pins/:name",
+      "request": {
+        "kind": "none"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names accept",
+      "description": "Apply a pending grant-names suggestion (ADR 0079)",
+      "method": "POST",
+      "path": "/names/accept",
+      "request": {
+        "fields": [
+          {
+            "cli": "LABEL",
+            "in": "body",
+            "name": "label",
+            "required": true
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "names",
+      "cli_name": "names dismiss",
+      "description": "Drop a pending grant-names suggestion",
+      "method": "DELETE",
+      "path": "/names/suggestions/:label",
       "request": {
         "kind": "none"
       }
