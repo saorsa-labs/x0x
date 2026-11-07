@@ -165,7 +165,7 @@ That mints an invite addressed to that one agent and prints the join command; it
 
 Sync is owner-to-owner only (Tier 1: profile, names, Home roster pointer, sub-agent issuance facts); DMs and other groups' history never replicate. As implemented today the synced Home pointer is **applied**: a device holding a Home that lost the election reports `state: "adoption_pending"` and names the winner, and a device with no Home reports `state: "elsewhere"`. Applying the pointer is not adoption — moving a device into the canonical Home is an explicit act by you (`x0x home seat <agent-id>` on the device holding it, then `x0x group join <invite> --home --owner <owner-user-id>` on the new one), and rosters are not merged. Synced sub-agent journal lines record the issuance fact (digest + time) without mode, label, or certificate bytes. The joining device needs one explicit `x0x announce` carrying its owner identity so its certificate is visible; a join that arrives first waits in a `pending` state rather than failing. Seating is not complete until that join is accepted and survives a restart on the new device — see [Known limitations](#known-limitations-v041-pre-release).
 
-**8. Voice.** Ratified in [ADR-0042](docs/adr/0042-voice-media-over-tailnet-streams.md). What is implemented today is **point-to-point (two-party) calls**: signaling over DMs (`x0x-voice-sig-v1`), audio over `WebRtcV1` streams with an opt-in unreliable-datagram lane (audio only, mutually negotiated) and reliable-stream fallback. It is a library surface behind the `voice` cargo feature (`x0x::voice`) — there is **no CLI or GUI call button yet**, and multi-party mesh (design-bounded at four participants), SFU, and browser access are recorded ADR follow-ups.
+**8. Voice.** Ratified in [ADR-0042](docs/adr/0042-voice-media-over-tailnet-streams.md). What is implemented today is **point-to-point (two-party) calls**. Call **lifecycle** is REST + CLI (ADR-0073 slice 1): `x0x call <agent_id>` / `POST /calls`, then `x0x call accept|reject|hangup`, with `call.incoming` / `call.state` events on `/events` and `/ws`. **Media** — signaling over DMs (`x0x-voice-sig-v1`), audio over `WebRtcV1` streams with an opt-in unreliable-datagram lane (audio only, mutually negotiated) and reliable-stream fallback — is a library surface behind the `voice` cargo feature (`x0x::voice`). There is **no GUI call button yet**, and multi-party mesh (design-bounded at four participants), SFU, and browser access are recorded ADR follow-ups.
 
 **9. Stay current.** The serving daemon is the only update writer. The CLI can check for a release or ask that daemon to install it:
 
@@ -310,7 +310,8 @@ curl -H "Authorization: Bearer $TOKEN" "http://$API/contacts"
 ```
 
 - **[SKILL.md](./SKILL.md)** — core agent skill (first direct message, group join, scratch KV write). Longer contracts are the topic pages in `docs/skill/`.
-- **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 174 endpoints, auth classes, request/response shapes, WS/SSE event tables).
+- **[docs/quickstart-two-agents.md](./docs/quickstart-two-agents.md)** — the 10-minute recipe: two local daemons, a direct message exchanged over REST, received on the event stream. CI runs it end-to-end on every PR.
+- **[docs/api-reference.md](./docs/api-reference.md)** — the complete REST + WebSocket + SSE reference (all 217 endpoints, auth classes, request/response shapes, WS/SSE event tables).
 - **[docs/local-apps.md](./docs/local-apps.md)** — integrating non-Rust applications with the daemon.
 - **[docs/adr/README.md](./docs/adr/README.md)** — the ADR index: every design decision, 0001–0058, with errata.
 - `x0x routes` — print every endpoint served by your running daemon.

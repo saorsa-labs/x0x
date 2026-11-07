@@ -41,6 +41,10 @@ ws://127.0.0.1:12700/ws?token=<session_token>
 
 ## Quick Start Examples
 
+For a complete, CI-verified walkthrough — two local daemons, a direct
+message over REST, delivery on the WebSocket event stream — see
+[quickstart-two-agents.md](quickstart-two-agents.md).
+
 ### curl
 
 ```bash
@@ -218,7 +222,8 @@ signed bytes, and receivers verify the full owner-cert → sub-agent-key
 
 ## Available Endpoints
 
-x0xd exposes 160 REST endpoints. Key categories:
+x0xd exposes 217 REST endpoints (the registry in `src/api/mod.rs` is
+authoritative; `x0x routes` prints the live set). Key categories:
 
 | Category | Endpoints | What you can do |
 |----------|-----------|-----------------|

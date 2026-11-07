@@ -8,7 +8,9 @@ the `x0x` CLI consume it so routes and CLI commands stay in lockstep
 (`x0x routes` prints them at runtime). For request/response examples and
 the WebSocket protocol details, see [api-reference.md](api-reference.md).
 
-The daemon currently exposes **153 endpoints**. Authentication is by bearer
+The daemon currently exposes **217 endpoints**; the tables below are an
+at-a-glance subset ([api-reference.md](api-reference.md) covers the full
+set). Authentication is by bearer
 token (`Authorization: Bearer …`). The token is auto-discovered from
 `~/.local/share/x0x/api-token` (Linux) or
 `~/Library/Application Support/x0x/api-token` (macOS).

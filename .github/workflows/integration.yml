@@ -188,6 +188,40 @@ jobs:
       - name: Run agent-usability eval (onboard output + core skill only)
         run: bash scripts/ci/nextest-isolated.sh --all-features --test agent_usability_eval -- --run-ignored ignored-only --no-tests=fail
 
+  # Onboarding recipe proof (directive 2026-11-07 ruling 3a/3b, ADR 0095
+  # headline): runs docs/quickstart-two-agents.md verbatim — two
+  # loopback-only daemons, a DM each way over REST, delivery asserted on
+  # the receiver's own /ws/direct WebSocket subscription. The recipe is
+  # only allowed to claim "CI-verified" while this job runs it. Default
+  # features only (the recipe installs release binaries, which also build
+  # without --all-features), inside the loopback-only namespace.
+  onboarding-recipe:
+    name: Onboarding recipe (quickstart-two-agents)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      X0X_RUNTIME_TIMEOUT_SECONDS: 600
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Symlink dependencies
+        run: |
+          mkdir -p .deps
+          git clone --depth 1 https://github.com/saorsa-labs/ant-quic .deps/ant-quic || true
+          git clone --depth 1 https://github.com/saorsa-labs/saorsa-gossip .deps/saorsa-gossip || true
+          ln -sf "$(pwd)/.deps/ant-quic" ../ant-quic
+          ln -sf "$(pwd)/.deps/saorsa-gossip" ../saorsa-gossip
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'  # global WebSocket for the recipe's event-stream step
+      - name: Build x0xd (default features, as the recipe's source build does)
+        run: cargo build --locked --bin x0xd
+      - name: Run the recipe end-to-end in the loopback-only namespace
+        run: python3 scripts/ci/isolated-runtime.py bash scripts/ci/onboarding-recipe.sh
+
   # Tailnet (ADR-0074 slice 0): the ignored loopback stream/forward suites
   # (7 in tailnet_streams_integration + 1 in forward_v2_attestation_e2e
   # + 2 in forward_half_close_e2e, the #961 FIN/denial proofs,

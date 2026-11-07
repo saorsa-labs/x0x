@@ -244,9 +244,11 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
   `GET /diagnostics/ws`.
 
 Open issues for this release are listed in the README's *Known limitations*
-table (#446–#451). This reference documents **175 endpoints — exactly the set
+table (#446–#451). This reference documents **217 endpoints — exactly the set
 `x0x routes` prints** (two further served paths sit outside the registry:
-`/.well-known/agent-card.json` and the `/gui/` alias).
+`/.well-known/agent-card.json` and the `/gui/` alias). The registry in
+`src/api/mod.rs` is the authoritative list; `x0x routes` prints it from a
+running daemon.
 
 ## System
 
@@ -1555,6 +1557,9 @@ token. A session token is refused before the body is read.
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 20) and 429 `invite_cap_reached` (64 live unconsumed records/group). **Invites are single-use**: the link carries a one-time secret that the issuing daemon consumes on the first validated `MemberJoined` (before it publishes the authority-signed `MemberAdded`). A replay's fate depends on where it lands: after the authority validated the original join, a replayed secret is rejected `invite_secret_consumed` and never seated; if the authority has NOT validated yet (event still in flight, or it restarted first) the secret is unburned; a replay by an already-active member is refused earlier as an idempotent no-op (and a same-node duplicate join is an idempotent local success, #188); an addressed invite replayed by the wrong joiner is refused without consuming the secret. None of these paths proves YOUR seat — mint a fresh invite instead. `expiry_secs` only bounds how long an *unconsumed* invite stays valid |
 | POST | `/groups/:id/stores` | `x0x group store create <GROUP_ID> <NAME>` | Open or idempotently re-open a creator-anchored group store: signed plaintext for `SignedPublic`, encrypted for `MlsEncrypted` GSS; current group policy gates writes |
+| GET | `/groups/:id/stores/:app/legacy-imports` | `x0x group store legacy imports <GROUP_ID> <APP>` | List local legacy Wiki/Web snapshots with durable import and local sync-publication status (see [docs/legacy-compat.md](legacy-compat.md)) |
+| POST | `/groups/:id/stores/:app/legacy-imports/:source_id` | `x0x group store legacy import <GROUP_ID> <APP> <SOURCE_ID>` | Import a reviewed local legacy Wiki/Web snapshot and offer its retained history for shared-space sync. Body: `source_digest` (required), `idempotency_key` (required) |
+| GET | `/groups/:id/stores/:app/legacy-imports/:source_id` | `x0x group store legacy download <GROUP_ID> <APP> <SOURCE_ID>` | Download the exact reviewed legacy snapshot without changing it; `idempotency_key` query optional |
 | POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `reseat_invite_outside_staging` (an ADR 0109 §3a re-seat invite: owner-axis policy, no inline owner key; it is valid only in the §3 staging join), `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
 | GET | `/groups/:id/join-status` | `x0x group join-status <id>` / `x0x group join <invite> --wait <secs>` | Pending-join status (#477): `{join_state, last_join_outcome?}` where `last_join_outcome ∈ {refused(reason), timed_out(reason)}`. After a terminal finalize removed the local stub the route returns **404 with the outcome in the body**. Typed refusal reasons: `invite_secret_unknown`, `invite_secret_consumed`, `invite_role_exceeds_cap`, `invite_event_before_creation`, `invite_expired`, `invite_not_addressed`. ADR 0108 §8 (#1575): the **200** body always carries the `pending_cause` key (null unless `join_state` is `pending_authority_commit` and the joiner holds a verified `JoinPendingNotice`), holding `pending_cause {cause, raw_cause?, detail {count?, revision?, digests?}, issued_at_ms, signer_agent_id}`; the 404 body after a terminal finalize carries no `pending_cause` key; a well-formed cause this build does not know shows as `unrecognized_cause` with the raw name in `raw_cause`, never a decode failure. A later Result or Refused replaces it. Timed-out reasons (ADR 0108 §8, #1640): a `timed_out` outcome always carries a `reason`. An ADR 0107 fetch-only re-arm gives `rearm_original_result_unavailable`, and this rule wins over the two rules after it. Else the reason is the cause of the verified `JoinPendingNotice` that the attempt held, in its `pending_cause.cause` form (`unrecognized_cause` for a cause this build does not know; the raw name is not kept in `reason`). Else the reason is `no_admission_result`: the attempt reached its poll deadline with no verified notice. An attempt that ADR 0109 S3 holds reports reason `adr0109_recovery_held`, not a bare `timed_out`. A different invite while a join is pending returns 409 `join_already_pending` from `POST /groups/join` |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set the local agent's own display name. Body `{"name":"<display name>"}`. Requires an active seat in the group, any role, on any token class. The label is local, so there is no Home durable fence. The name is not part of the signed roster |
@@ -3397,6 +3402,39 @@ Run a command on **another** agent's machine. Disabled by default; every request
 
 `agent_id` is optional; when omitted the local pending-session table resolves the target.
 
+## ACL administration
+
+Manage the connect and exec ACL overlays at runtime. Each plane has a
+read-only **TOML floor** (`connect-acl.toml`, `exec-acl.toml`) plus an
+**API-managed overlay**; these routes edit the overlay only — removing a floor
+entry answers `409`. See [docs/connect-acl.md](connect-acl.md) and
+[docs/exec.md](exec.md) for entry schemas and evaluation order.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/acl/connect` | `x0x acl connect list` | List connect ACL entries (TOML floor + API-managed) and reload status |
+| POST | `/acl/connect` | `x0x acl connect add` | Add an API-managed connect ACL entry (TOML entry schema as JSON) |
+| DELETE | `/acl/connect/:id` | `x0x acl connect rm <id>` | Remove an API-managed connect ACL entry (floor entries: `409`) |
+| GET | `/acl/exec` | `x0x acl exec list` | List exec ACL entries (TOML floor + API-managed) and reload status |
+| POST | `/acl/exec` | `x0x acl exec add` | Add an API-managed exec ACL entry (TOML entry schema as JSON) |
+| DELETE | `/acl/exec/:id` | `x0x acl exec rm <id>` | Remove an API-managed exec ACL entry (floor entries: `409`) |
+| POST | `/acl/reload` | `x0x acl reload` | Re-read the connect/exec ACL floors and overlays; a rejected file keeps the last good ACL |
+
+## Share grants (ADR-0070 §2)
+
+Owner-signed capability grants that admit a named peer to a gated surface
+(e.g. an `Exec` grant counts as trust `Accept` for remote exec when the exec
+ACL has a `principal = "grant"` entry — see [docs/exec.md](exec.md)). Every
+route requires the durable owner API token; session and rider bearers receive
+a typed `403`.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/grants` | `x0x grant list` | List share grants this install's owner issued, with status |
+| POST | `/grants` | `x0x grant issue` | Sign a share grant with the owner key, store it, and deliver it by durable DM |
+| DELETE | `/grants/:id` | `x0x grant revoke <id>` | Revoke a share grant (owner key; revocation gossiped on `x0x.revocation.v3`) |
+| GET | `/grants/received` | `x0x grant received` | List share grants that name this install as grantee |
+
 ## Upgrade
 
 | Method | Endpoint | CLI | Purpose |
@@ -3683,11 +3721,23 @@ structured push.
 | `GET /direct/events` | `direct_message` | flat DM row (`sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?`); `?backfill=N` attempts to replay `history_direct_message` rows then emits `live` `{}` even when history is unavailable or its query fails; 15 s keepalive is a `ping` comment |
 | `GET /peers/events` | `peer-lifecycle` | `{"peer_id","event","at_ms"}` — `event` is the Debug text of the transition (`Established`, `Replaced`, `Closing`, `Closed`, `ReaderExited`); treat as open string |
 
-## Voice (ADR-0042)
+## Voice and calls (ADR-0042, ADR-0073)
 
-Voice has **no REST endpoints** — it is not part of the endpoint registry and
-does not appear in `x0x routes`. What ships today is **point-to-point
-(two-party) calls**, feature-gated behind the `voice` cargo feature:
+Call **lifecycle** is a REST surface (ADR-0073 slice 1): ring, accept, reject,
+hang up, and inspect calls, with `call.incoming` / `call.state` events on
+`/events` and `/ws`. **Media** is not — audio ships as a library surface,
+feature-gated behind the `voice` cargo feature.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| POST | `/calls` | `x0x call <agent_id> [--video]` | Ring an agent (audio, optionally video); the callee must pass trust and connect-ACL gates. Body: `{"agent_id":"<64-hex>","video":false}` |
+| GET | `/calls` | `x0x call list` | List calls with gate and lifecycle counters |
+| GET | `/calls/:id` | `x0x call show <call_id>` | Show one call's lifecycle state |
+| POST | `/calls/:id/accept` | `x0x call accept <call_id>` | Answer a ringing incoming call |
+| POST | `/calls/:id/reject` | `x0x call reject <call_id>` | Decline a ringing incoming call |
+| POST | `/calls/:id/hangup` | `x0x call hangup <call_id>` | End or cancel a call |
+
+The media plane (what the accepted call carries):
 
 - **Signaling** rides direct messages: payloads prefixed `x0x-voice-sig-v1\n`
   followed by the serialized `SignalingMessage`
@@ -3702,8 +3752,9 @@ does not appear in `x0x routes`. What ships today is **point-to-point
   trust, and ACL gates.
 - **Multi-party mesh** (ADR-0042 design-bounds it at four participants), SFU,
   and browser access are recorded **ADR follow-ups**, not shipped.
-- **Surface today:** the `x0x::voice` library module (adapters:
-  `X0xSignaling`, `X0xLinkTransport`). There is no CLI command and no GUI
+- **Media surface today:** the `x0x::voice` library module (adapters:
+  `X0xSignaling`, `X0xLinkTransport`), behind the `voice` cargo feature.
+  The REST/CLI surface above manages call lifecycle only; there is no GUI
   call button yet.
 
 ### GUI
