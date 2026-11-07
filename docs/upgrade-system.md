@@ -257,10 +257,17 @@ guarantees. The inert flag works on both binaries on Windows as well.
 At startup, `x0xd` checks recovery records before it calls
 `sweep_stale_upgrade_artifacts(dir, min_age)`. Unknown, unreadable, corrupt or
 pending M2 records suppress the sweep. A valid legacy-only handoff permits
-the sweep unless its target or backup path matches a cleanup pattern.
-The sweep removes `.x0x-upgrade-*` directories and `*.x0xold-*` sidelined
-binaries only after the same age gate (`min_age`, normally one hour).
-It must not remove retained recovery material to make startup succeed.
+the sweep unless its target or backup path matches a cleanup pattern. The
+sweep removes `.x0x-upgrade-*` directories and `*.x0xold-*` sidelined
+binaries only after the same age gate (`min_age`, normally one hour). It
+also removes this instance's own aged per-swap backups
+(`<target>.backup-<version>-<pid>-<nanos>`) and interrupted canonical-copy
+staging (`<target>.backup-partial-<pid>`) — only those its data-dir creation
+ledger (`<data_dir>/upgrade-backup-ledger.json`) proves this instance
+created, never one named by a recovery record, and never one whose age
+cannot be established (#1106: a sibling instance sharing the install
+directory must not lose its rollback bytes). It must not remove retained
+recovery material to make startup succeed.
 
 ### Recovery-record diagnosis (M2 S2a)
 
@@ -518,8 +525,13 @@ The scenario: a migrated/supervised job took the supervised exit, the
 replacement failed to start, and the daemon is now down. Keep the flush records
 above with these two recovery artifacts:
 
-- `<target>.backup` — the exact bytes that were serving before the swap,
-  written beside the installed binary (`<target>`).
+- The **rollback token** is the per-swap backup
+  `<target>.backup-<version>-<pid>-<nanos>` named by the handoff record's
+  `backup_path` — the bytes that transaction preserved when it swapped
+  (#1106). `<target>.backup` beside it is a convenience copy of the most
+  recent swap's preserved bytes; when two instances share one executable,
+  that copy can hold another instance's bytes, so recover from the record's
+  `backup_path` first.
 - `<data_dir>/upgrade-handoff.json` — the intent record: from/to versions,
   `target_path`, `backup_path`, argv, cwd, old pid, API address. On the
   supervised path it also carries `launchd_verified` — the launchd label and
@@ -645,10 +657,17 @@ switch also needs David's approval because it changes production hosts.
 #### 2. Restore the known-good binary
 
 Only needed when the replacement will not start. On Unix a rename over the
-installed path is safe even if a copy is still running:
+installed path is safe even if a copy is still running. Restore from the
+handoff record's `backup_path` — the per-swap file that transaction created
+(#1106); it names exactly the bytes that transaction preserved. The shared
+`<target>.backup` is the fallback when the record names nothing else, but
+with two instances on one executable it can hold a later transaction's
+bytes:
 
 ```bash
-# <target> is the intent file's target_path (the job's program/ExecStart)
+# backup_path comes from <data_dir>/upgrade-handoff.json
+mv "<backup_path from the record>" <target>
+# fallback only, single-instance installs:
 mv <target>.backup <target>
 ```
 

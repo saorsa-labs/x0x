@@ -3109,7 +3109,11 @@ pub struct UpgradeHandoff {
     pub to_version: String,
     /// Path the new bytes were swapped into (the daemon's install path).
     pub target_path: PathBuf,
-    /// Path holding the previous binary (`x0xd.backup`).
+    /// Path holding the previous binary. The per-swap backup this
+    /// transaction's swap created (`x0xd.backup-<ver>-<pid>-<nanos>`, issue
+    /// #1106) when one exists; otherwise the canonical `x0xd.backup` (an
+    /// equal-bytes-skip restart swapped nothing and has no backup of its
+    /// own).
     pub backup_path: PathBuf,
     /// Full argv of the old process, including `argv[0]`. `argv[0]` is recorded
     /// for diagnosis only — the respawn always uses `target_path`.
@@ -3158,6 +3162,21 @@ impl UpgradeHandoff {
     /// changed, so argv/cwd/roots are *carried* here rather than re-sampled
     /// from a process whose binary has since been replaced.
     pub fn from_plan(plan: &RestartPlan, to_version: &str) -> Self {
+        Self::from_plan_with_backup(plan, to_version, None)
+    }
+
+    /// [`Self::from_plan`] carrying the per-swap backup this transaction's
+    /// swap actually created (issue #1106). The helper is a separate process
+    /// that restores after the host lock was released and the old process
+    /// exited; a fixed shared name let a concurrent swapper on the same
+    /// executable overwrite or consume those bytes, so the record must name
+    /// this transaction's own file. `None` (no fresh swap, e.g. the
+    /// equal-bytes skip) falls back to the canonical derived name.
+    pub(crate) fn from_plan_with_backup(
+        plan: &RestartPlan,
+        to_version: &str,
+        fresh_backup: Option<&Path>,
+    ) -> Self {
         let env = ENV_WHITELIST
             .iter()
             .filter_map(|key| {
@@ -3170,7 +3189,9 @@ impl UpgradeHandoff {
             from_version: crate::VERSION.to_string(),
             to_version: to_version.to_string(),
             target_path: plan.executable.clone(),
-            backup_path: Self::backup_path_for(&plan.executable),
+            backup_path: fresh_backup
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| Self::backup_path_for(&plan.executable)),
             argv: plan.argv.clone(),
             cwd: plan.cwd.to_string_lossy().into_owned(),
             env,
@@ -3206,7 +3227,10 @@ impl UpgradeHandoff {
             .map_err(|_| std::io::Error::other("invalid upgrade handoff record"))
     }
 
-    /// Backup path the swap created for this target (`x0xd.backup`).
+    /// Canonical backup name for `target` (`x0xd.backup`) — the fallback when
+    /// no fresh per-swap backup exists. The swap itself writes
+    /// `<target>.backup-<ver>-<pid>-<nanos>` and refreshes this name to a
+    /// separate copy of those bytes.
     pub fn backup_path_for(target_path: &Path) -> PathBuf {
         target_path.with_extension("backup")
     }
@@ -5372,12 +5396,43 @@ mod tests {
 
     #[test]
     fn backup_path_for_matches_swap_backup_name() {
-        // The handoff must point at the same x0xd.backup the swap created
-        // (target.with_extension("backup")), or rollback restores nothing.
+        // The canonical fallback the no-swap handoff derives: the swap itself
+        // records its own per-swap backup (`x0xd.backup-<ver>-<pid>-<nanos>`,
+        // #1106) and refreshes this name to point at those bytes, so a
+        // fallback restore still finds preserved bytes.
         let target = Path::new("/opt/x0x/bin/x0xd");
         assert_eq!(
             UpgradeHandoff::backup_path_for(target),
             Path::new("/opt/x0x/bin/x0xd.backup")
+        );
+    }
+
+    #[test]
+    fn from_plan_with_backup_carries_the_fresh_backup_or_falls_back() {
+        let plan = RestartPlan {
+            mode: RestartMode::TransactionalHandoff,
+            supervised_exit_code: None,
+            supervision_signal: None,
+            executable: PathBuf::from("/opt/x0x/bin/x0xd"),
+            argv: vec!["x0xd".into()],
+            cwd: PathBuf::from("/opt/x0x"),
+            data_root: PathBuf::from("/var/lib/x0x"),
+            api_addr: "127.0.0.1:12700".parse().unwrap(),
+            launchd_verified: None,
+            systemd_verified: None,
+        };
+        // A real swap (#1106): the record must name this transaction's own
+        // per-swap file so a concurrent swapper on the same executable can
+        // never orphan the helper's rollback bytes.
+        let fresh = Path::new("/opt/x0x/bin/x0xd.backup-1.2.3-4212-99887766554433221100");
+        let handoff = UpgradeHandoff::from_plan_with_backup(&plan, "1.3.0", Some(fresh));
+        assert_eq!(handoff.backup_path, fresh);
+        assert_eq!(handoff.target_path, plan.executable);
+
+        // No swap this transaction (equal-bytes skip): canonical fallback.
+        assert_eq!(
+            UpgradeHandoff::from_plan_with_backup(&plan, "1.3.0", None).backup_path,
+            UpgradeHandoff::backup_path_for(&plan.executable)
         );
     }
 

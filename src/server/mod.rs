@@ -2129,7 +2129,14 @@ pub async fn serve_with_options(
             let dir = exe.parent()?.to_path_buf();
             Some(crate::upgrade::journal::sweep_if_no_pending_records(
                 &upgrade_record_root,
-                || x0x::upgrade::sweep_stale_upgrade_artifacts(&dir, Duration::from_secs(3600)),
+                |exempt, proven| {
+                    x0x::upgrade::sweep_stale_upgrade_artifacts_proven(
+                        &dir,
+                        Duration::from_secs(3600),
+                        exempt,
+                        proven,
+                    )
+                },
             ))
         })
         .await

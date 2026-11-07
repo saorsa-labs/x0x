@@ -3,6 +3,8 @@
 //! #1447 host-wide backup guard: two units on one shared target must leave
 //! `<target>.backup` holding the original bytes. Uses a libtest self-exec
 //! pattern so the race runs in independent processes (not threads).
+//! #1106 extends it: transactions applying different releases must each keep
+//! their own rollback copy instead of sharing one fixed backup name.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -235,6 +237,76 @@ fn spawn_apply_worker(
         .expect("spawn apply worker")
 }
 
+/// Child (#1106): like the apply worker, but the from/to versions come from
+/// the environment so one fixture can apply different releases.
+const DIFFERENT_RELEASE_WORKER_ENV: &str = "X0X_1106_DIFFERENT_RELEASE_WORKER";
+/// Fixture filter name — real test names in this file must not contain it.
+const DIFFERENT_RELEASE_WORKER: &str = "fixture_role_host_backup_different_release_worker";
+
+#[test]
+fn fixture_role_host_backup_different_release_worker() {
+    let Ok(dir) = std::env::var(DIFFERENT_RELEASE_WORKER_ENV) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let target = dir.join("target");
+    let incoming = dir.join(std::env::var("X0X_1106_INCOMING").unwrap());
+    let ready = dir.join(std::env::var("X0X_1106_READY").unwrap());
+    let go = dir.join("barrier_go");
+    let result = dir.join(std::env::var("X0X_1106_RESULT").unwrap());
+    let from = std::env::var("X0X_1106_FROM").unwrap();
+    let to = std::env::var("X0X_1106_TO").unwrap();
+
+    fs::write(&ready, b"ready").unwrap();
+    let deadline = Instant::now() + WAIT_DEADLINE;
+    while !go.exists() {
+        if Instant::now() >= deadline {
+            panic!("different-release worker timed out waiting for barrier_go");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let upgrader = Upgrader::new(target, Version::parse(&from).unwrap());
+    let outcome = upgrader
+        .perform_upgrade(&incoming, &Version::parse(&to).unwrap())
+        .expect("perform_upgrade");
+    assert!(
+        matches!(outcome, UpgradeResult::Success { .. }),
+        "different-release apply must be Success: {outcome:?}"
+    );
+    // Same reporting vocabulary as the apply worker: skip leaves the incoming
+    // path in place, replace renames it onto the target.
+    let kind = if incoming.exists() {
+        "skipped"
+    } else {
+        "replaced"
+    };
+    fs::write(&result, kind).unwrap();
+}
+
+fn spawn_different_release_worker(
+    dir: &Path,
+    incoming_name: &str,
+    ready_name: &str,
+    result_name: &str,
+    from: &str,
+    to: &str,
+) -> Child {
+    Command::new(test_exe())
+        .arg(DIFFERENT_RELEASE_WORKER)
+        .env(DIFFERENT_RELEASE_WORKER_ENV, dir)
+        .env("X0X_1106_INCOMING", incoming_name)
+        .env("X0X_1106_READY", ready_name)
+        .env("X0X_1106_RESULT", result_name)
+        .env("X0X_1106_FROM", from)
+        .env("X0X_1106_TO", to)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn different-release worker")
+}
+
 fn assert_backup_and_target(target: &Path) {
     // Unconditional postcondition (Codex nit on #1451): backup keeps original
     // bytes and target holds the candidate. A skip never stands in for this.
@@ -385,6 +457,171 @@ fn two_old_processes_one_shared_target_both_succeed() {
         "both old processes must finish with Success-side outcomes: a={a} b={b}"
     );
     assert_backup_and_target(&target);
+}
+
+/// #1106 acceptance: two daemon processes on one shared executable applying
+/// different releases must each leave a valid previous-version backup. On the
+/// single fixed `<target>.backup` name the second swap copied the already-new
+/// bytes over the first transaction's rollback copy, so the v1 rollback
+/// bytes were lost.
+#[test]
+fn two_processes_different_releases_keep_both_rollback_copies() {
+    if std::env::var_os(DIFFERENT_RELEASE_WORKER_ENV).is_some() {
+        return;
+    }
+    const V3: &[u8] = b"candidate-binary-bytes-v3";
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let target = root.join("target");
+    write_bytes(&target, ORIGINAL);
+    write_bytes(&root.join("incoming_v2"), CANDIDATE);
+    write_bytes(&root.join("incoming_v3"), V3);
+
+    // First instance (running v1) applies v2.
+    let mut reaper_v2 = ChildReaper::new();
+    let idx_v2 = reaper_v2.push(spawn_different_release_worker(
+        root,
+        "incoming_v2",
+        "ready_v2",
+        "result_v2",
+        FROM,
+        TO,
+    ));
+    wait_until_exists(
+        &root.join("ready_v2"),
+        &mut reaper_v2,
+        "different_releases ready_v2",
+    );
+    fs::write(root.join("barrier_go"), b"go").unwrap();
+    wait_for_result(
+        &root.join("result_v2"),
+        &mut reaper_v2,
+        "different_releases result_v2",
+    );
+    reap_success(&mut reaper_v2, idx_v2, "different_releases v2");
+    let _ = fs::remove_file(root.join("barrier_go"));
+
+    // Second instance, still running v1 from the same shared executable,
+    // applies a different release; disk now holds v2.
+    let mut reaper_v3 = ChildReaper::new();
+    let idx_v3 = reaper_v3.push(spawn_different_release_worker(
+        root,
+        "incoming_v3",
+        "ready_v3",
+        "result_v3",
+        FROM,
+        "3.0.0",
+    ));
+    wait_until_exists(
+        &root.join("ready_v3"),
+        &mut reaper_v3,
+        "different_releases ready_v3",
+    );
+    fs::write(root.join("barrier_go"), b"go").unwrap();
+    wait_for_result(
+        &root.join("result_v3"),
+        &mut reaper_v3,
+        "different_releases result_v3",
+    );
+    reap_success(&mut reaper_v3, idx_v3, "different_releases v3");
+
+    assert_eq!(fs::read(&target).unwrap(), V3);
+    let preserved: Vec<Vec<u8>> = fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .map(|entry| fs::read(entry.path()).unwrap_or_default())
+        .collect();
+    assert!(
+        preserved.iter().any(|bytes| bytes == ORIGINAL),
+        "the first transaction's v1 rollback copy must survive the second release's swap"
+    );
+    assert!(
+        preserved.iter().any(|bytes| bytes == CANDIDATE),
+        "the second transaction's v2 rollback copy must exist"
+    );
+}
+
+/// #1106, concurrent form of the test above: both workers are alive at the
+/// barrier, so the host lock serialises the two critical sections in either
+/// order. Whichever transaction wins, the first transaction's v1 rollback
+/// copy must survive the other release's swap — on the single fixed
+/// `<target>.backup` name the loser's copy destroyed it.
+#[test]
+fn concurrent_processes_different_releases_keep_a_v1_rollback_copy() {
+    if std::env::var_os(DIFFERENT_RELEASE_WORKER_ENV).is_some() {
+        return;
+    }
+    const V3: &[u8] = b"candidate-binary-bytes-v3";
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let target = root.join("target");
+    write_bytes(&target, ORIGINAL);
+    write_bytes(&root.join("incoming_v2"), CANDIDATE);
+    write_bytes(&root.join("incoming_v3"), V3);
+
+    let mut reaper_v2 = ChildReaper::new();
+    let idx_v2 = reaper_v2.push(spawn_different_release_worker(
+        root,
+        "incoming_v2",
+        "ready_v2",
+        "result_v2",
+        FROM,
+        TO,
+    ));
+    let mut reaper_v3 = ChildReaper::new();
+    let idx_v3 = reaper_v3.push(spawn_different_release_worker(
+        root,
+        "incoming_v3",
+        "ready_v3",
+        "result_v3",
+        FROM,
+        "3.0.0",
+    ));
+    wait_until_exists(
+        &root.join("ready_v2"),
+        &mut reaper_v2,
+        "concurrent ready_v2",
+    );
+    wait_until_exists(
+        &root.join("ready_v3"),
+        &mut reaper_v3,
+        "concurrent ready_v3",
+    );
+    fs::write(root.join("barrier_go"), b"go").unwrap();
+    let kind_v2 = wait_for_result(
+        &root.join("result_v2"),
+        &mut reaper_v2,
+        "concurrent result_v2",
+    );
+    let kind_v3 = wait_for_result(
+        &root.join("result_v3"),
+        &mut reaper_v3,
+        "concurrent result_v3",
+    );
+    reap_success(&mut reaper_v2, idx_v2, "concurrent v2");
+    reap_success(&mut reaper_v3, idx_v3, "concurrent v3");
+
+    // Neither worker can hit the equal-bytes skip: whichever wins the host
+    // lock first, the other sees the winner's bytes on disk, not its own.
+    assert_eq!(kind_v2, "replaced");
+    assert_eq!(kind_v3, "replaced");
+
+    let final_bytes = fs::read(&target).unwrap();
+    assert!(
+        final_bytes == CANDIDATE || final_bytes == V3,
+        "target must hold whichever release won the lock, got {final_bytes:?}"
+    );
+    let preserved: Vec<Vec<u8>> = fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .map(|entry| fs::read(entry.path()).unwrap_or_default())
+        .collect();
+    assert!(
+        preserved.iter().any(|bytes| bytes == ORIGINAL),
+        "the first transaction's v1 rollback copy must survive the concurrent second release's swap"
+    );
 }
 
 /// Parent holds the real host lock: a ready worker must not replace until unlock.

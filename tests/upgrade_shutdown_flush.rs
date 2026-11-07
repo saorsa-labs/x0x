@@ -174,6 +174,58 @@ macro_rules! shutdown_flush_regression_tests {
                 assert!(exited);
             }
 
+            /// #1106: the supervised-exit path writes the handoff record
+            /// through `from_plan_with_backup`, so the record the operator
+            /// (and a later rollback) reads back must name this
+            /// transaction's own per-swap backup, never the shared
+            /// canonical name a concurrent swapper can replace.
+            #[test]
+            fn supervised_exit_record_names_this_transactions_per_swap_backup() {
+                let (_dir, plan) = fixture();
+                let fresh = plan
+                    .executable
+                    .with_file_name("x0xd.backup-1.2.3-4212-99887766554433221100");
+                std::fs::write(&fresh, b"previous daemon").unwrap();
+                let owner =
+                    flush::register(plan.data_root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
+                let mut exited = false;
+                AutoApplyUpgrader::new("x0xd")
+                    .with_swapped_artifacts(vec![(plan.executable.clone(), fresh.clone())])
+                    .trigger_restart_with_exit(&plan, "2.0.0", |code| {
+                        assert_eq!(code, 7);
+                        let handoff = restart::UpgradeHandoff::read(&plan.handoff_path()).unwrap();
+                        assert_eq!(
+                            handoff.backup_path, fresh,
+                            "the written record must carry the per-swap backup"
+                        );
+                        exited = true;
+                    })
+                    .unwrap();
+                owner.join_workers();
+                assert!(exited);
+
+                // Without a swap manifest (equal-bytes skip) the record
+                // falls back to the canonical derived name.
+                let (_dir, plan) = fixture();
+                let owner =
+                    flush::register(plan.data_root.clone(), Arc::new(|_, _| Ok(()))).unwrap();
+                let mut exited = false;
+                AutoApplyUpgrader::new("x0xd")
+                    .trigger_restart_with_exit(&plan, "2.0.0", |code| {
+                        assert_eq!(code, 7);
+                        let handoff = restart::UpgradeHandoff::read(&plan.handoff_path()).unwrap();
+                        assert_eq!(
+                            handoff.backup_path,
+                            restart::UpgradeHandoff::backup_path_for(&plan.executable),
+                            "a transaction that swapped nothing falls back to the canonical name"
+                        );
+                        exited = true;
+                    })
+                    .unwrap();
+                owner.join_workers();
+                assert!(exited);
+            }
+
             #[test]
             fn supervised_exit_refusal_before_the_stop_keeps_the_daemon_running() {
                 let (_dir, plan) = fixture();

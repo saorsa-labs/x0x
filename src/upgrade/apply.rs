@@ -745,8 +745,9 @@ async fn apply_replacements_with_permit(
                 ),
                 Err(error) => error!(
                     %error,
-                    "cannot restore the companion binaries this transaction \
-                     swapped; manual recovery applies"
+                    "companion restore failed, or the renames succeeded and only the \
+                     post-restore directory flush failed; verify the install directory \
+                     before manual recovery"
                 ),
             }
         };
@@ -1409,7 +1410,11 @@ impl AutoApplyUpgrader {
             None
         };
 
-        let upgrader = Upgrader::new(target_path.clone(), current_version.clone());
+        // #1106: creations recorded in this instance's ledger so its own
+        // startup sweep can later prove it created them (engineer ruling,
+        // 3 Nov 12:48 GMT).
+        let upgrader = Upgrader::new(target_path.clone(), current_version.clone())
+            .with_backup_ledger_at(&restart_plan.data_root);
         let temp_dir = upgrader.create_temp_dir()?;
         // Guarantees temp-dir removal on every early-return error path below.
         let _temp_guard = TempDirGuard {
@@ -1505,7 +1510,8 @@ impl AutoApplyUpgrader {
                 #[cfg(unix)]
                 {
                     companion = Some((
-                        Upgrader::new(x0x_path, current_version.clone()),
+                        Upgrader::new(x0x_path, current_version.clone())
+                            .with_backup_ledger_at(&restart_plan.data_root),
                         probe_cli.clone(),
                     ));
                 }
@@ -1518,7 +1524,8 @@ impl AutoApplyUpgrader {
                         warn!("Failed to extract companion x0x binary: {e}");
                     } else {
                         companion = Some((
-                            Upgrader::new(x0x_path, current_version.clone()),
+                            Upgrader::new(x0x_path, current_version.clone())
+                                .with_backup_ledger_at(&restart_plan.data_root),
                             extracted_x0x,
                         ));
                     }
@@ -1695,7 +1702,15 @@ impl AutoApplyUpgrader {
         target_version: &str,
         mut exit: impl FnMut(i32),
     ) -> Result<(), UpgradeError> {
-        let handoff = restart::UpgradeHandoff::from_plan(plan, target_version);
+        // Issue #1106: name this transaction's per-swap backup in the handoff
+        // so the helper restores only bytes this transaction preserved. The
+        // canonical fallback covers transactions that swapped nothing.
+        let fresh_backup = fresh_backup_for(
+            self.swapped_artifacts.as_deref().unwrap_or(&[]),
+            &plan.executable,
+        );
+        let handoff =
+            restart::UpgradeHandoff::from_plan_with_backup(plan, target_version, fresh_backup);
         let handoff_path = plan.handoff_path();
 
         match plan.mode {
@@ -1761,8 +1776,10 @@ impl AutoApplyUpgrader {
                                             .iter()
                                             .map(|(target, _)| target.display().to_string())
                                             .collect::<Vec<_>>(),
-                                        "cannot restore the swapped binaries; \
-                                         manual recovery applies"
+                                        "restore failed, or the renames succeeded and \
+                                         only the post-restore directory flush failed; \
+                                         verify the install directory before manual \
+                                         recovery"
                                     );
                                     false
                                 }
@@ -1812,8 +1829,10 @@ impl AutoApplyUpgrader {
                                             .iter()
                                             .map(|(target, _)| target.display().to_string())
                                             .collect::<Vec<_>>(),
-                                        "cannot restore the swapped binaries; the daemon \
-                                         keeps serving but the install needs manual recovery"
+                                        "restore failed, or the renames succeeded and \
+                                         only the post-restore directory flush failed; the \
+                                         daemon keeps serving but the install needs manual \
+                                         verification"
                                     );
                                     false
                                 }
@@ -1861,6 +1880,19 @@ impl AutoApplyUpgrader {
             ),
         }
     }
+}
+
+/// The fresh per-swap backup this transaction's own swap created for
+/// `executable`, if any (#1106). The handoff record must restore only bytes
+/// this transaction preserved: a derived shared name can hold a later
+/// swapper's bytes, and consuming it by rename would take another live
+/// transaction's rollback copy. `None` (an equal-bytes skip swapped nothing)
+/// falls back to the canonical derived name.
+fn fresh_backup_for<'a>(swapped: &'a [(PathBuf, PathBuf)], executable: &Path) -> Option<&'a Path> {
+    swapped
+        .iter()
+        .find(|(target, _)| target == executable)
+        .map(|(_, backup)| backup.as_path())
 }
 
 /// The flush already succeeded, so the daemon is stopped behind the hook.
@@ -2386,6 +2418,29 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// #1106: the handoff names this transaction's own per-swap backup for
+    /// the daemon target, never the companion CLI's, and a transaction that
+    /// swapped nothing falls back to the canonical derived name.
+    #[test]
+    fn fresh_backup_for_selects_the_plan_executable_or_none() {
+        let daemon = PathBuf::from("/opt/x0x/bin/x0xd");
+        let cli = PathBuf::from("/opt/x0x/bin/x0x");
+        let daemon_backup = PathBuf::from("/opt/x0x/bin/x0xd.backup-1.0.0-7-998877");
+        let cli_backup = PathBuf::from("/opt/x0x/bin/x0x.backup-1.0.0-7-998877");
+        let swapped = vec![(daemon.clone(), daemon_backup.clone()), (cli, cli_backup)];
+
+        assert_eq!(
+            fresh_backup_for(&swapped, &daemon),
+            Some(daemon_backup.as_path()),
+            "the handoff must carry the daemon target's own backup"
+        );
+        assert_eq!(
+            fresh_backup_for(&[], &daemon),
+            None,
+            "no swap this transaction: from_plan_with_backup falls back to the canonical name"
+        );
+    }
 
     #[cfg(unix)]
     async fn check_supervised_unused_reservation_after_replacement(rollback: bool) {
