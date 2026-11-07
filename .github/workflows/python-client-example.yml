@@ -13,6 +13,10 @@ on:
       - 'src/api/**'
       - 'src/server/**'
       - 'docs/api-reference.md'
+      - 'src/lib.rs'
+      - 'src/dm*.rs'
+      - 'Cargo.lock'
+      - 'scripts/ci/isolated-runtime.py'
   pull_request:
     paths:
       - 'examples/python-client/**'
@@ -20,6 +24,17 @@ on:
       - 'src/api/**'
       - 'src/server/**'
       - 'docs/api-reference.md'
+      - 'src/lib.rs'
+      - 'src/dm*.rs'
+      - 'Cargo.lock'
+      - 'scripts/ci/isolated-runtime.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,8 +42,9 @@ env:
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
   CMAKE_x86_64_unknown_linux_gnu: ${{ github.workspace }}/scripts/ci/cmake-policy-min.sh
   RUSTFLAGS: "-D warnings"
-  # Match the isolated-runtime debuginfo profile (#1789) so this workflow
-  # shares the cargo cache graph with the integration workflow.
+  # Match the isolated-runtime debuginfo profile (#1789). The rust-cache
+  # entry is this workflow's own: there is no shared-key, and the feature
+  # set differs from the integration workflow.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
@@ -36,6 +52,7 @@ jobs:
   typecheck-lint:
     name: Python Example Typecheck & Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -52,6 +69,8 @@ jobs:
     name: Python Example Demo (two-daemon DM)
     runs-on: ubuntu-latest
     needs: typecheck-lint
+    # One debug build of x0xd plus a demo of about 3 minutes.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
         with:
@@ -79,6 +98,10 @@ jobs:
         # loopback-only namespace. The demo's own config is already hermetic
         # (--no-hard-coded-bootstrap, loopback bind, mDNS off); the namespace
         # makes that fail-closed.
+        env:
+          # Deadline for the isolated demo only (the build is a separate
+          # step); isolated-runtime.py stops the child when it expires.
+          X0X_RUNTIME_TIMEOUT_SECONDS: 900
         run: |
           python3 scripts/ci/isolated-runtime.py \
             python3 examples/python-client/demo.py --x0xd target/debug/x0xd

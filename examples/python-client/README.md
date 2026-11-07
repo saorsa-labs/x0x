@@ -38,13 +38,20 @@ Options: `--x0xd <path>` (default `target/debug/x0xd`), `--api-port-a` /
 
 ### Network isolation
 
-The demo daemons never join the real x0x network: both run with
-`--no-hard-coded-bootstrap`, a loopback-only `bind_address`, mDNS off, and
-daemon B's only bootstrap peer is daemon A's loopback address — the same
-hermetic pattern as `tests/e2e_local_mesh.sh`. In CI the demo also runs
-inside the loopback-only network namespace of
-`scripts/ci/isolated-runtime.py`, as `tests/AGENTS.md` requires for
-anything that starts a daemon.
+You can run `demo.py` directly. It is hermetic by configuration only:
+
+- Both daemons bind to loopback only (`127.0.0.1`).
+- Both run with `--no-hard-coded-bootstrap`. Daemon A has an empty peer
+  list. Daemon B's only peer is daemon A's loopback address.
+- mDNS and port mapping (UPnP) are off.
+- No public peers are contacted. This is **not** a join of the
+  production network: the daemons use throwaway identities on the
+  `x0x.testnet` network ID and talk only to each other.
+
+This is the same pattern as `tests/e2e_local_mesh.sh`. CI adds a second
+layer: it runs the demo inside the loopback-only network namespace of
+`scripts/ci/isolated-runtime.py`, as `tests/AGENTS.md` requires for test
+runs.
 
 ## Use the client against your own daemon
 
@@ -70,10 +77,20 @@ with client.ws_direct() as sub:
 Error handling: HTTP failures raise `ApiError` (`status`, `error`,
 `reason`, `detail`). `send_dm` raises typed subclasses for the documented
 codes — `RecipientUnknown`, `RecipientKeyNotConverged`,
-`RecipientNeedsUpgrade`, `PairingDenied`, `IdempotencyConflict`,
-`PayloadTooLarge`, `SendTimeout`. The two 409s prescribe opposite repairs:
+`RecipientUndiscovered`, `RecipientNeedsUpgrade`,
+`RecipientUpgradeRequired`, `PairingDenied`, `IdempotencyConflict`,
+`PayloadTooLarge`, `SendTimeout`. The 409s prescribe opposite repairs:
 `RecipientNeedsUpgrade` means retry later or deliberately resend with
 `durable=False`; `IdempotencyConflict` means a retry can never succeed.
+`RecipientUndiscovered` (503) is a discovery gap: retry.
+
+Timeouts: quick calls use a 10 s HTTP timeout. `send_dm` and `connect`
+default to 90 s, above the server's own budgets (about 70 s for a
+durable send, 60 s for a connect). A client timeout raises `X0xTimeout`
+(also a `TimeoutError`); a durable resend with the same `logical_id` is
+safe. A WebSocket `recv` timeout also raises `X0xTimeout` and leaves the
+session usable. The client ignores `http_proxy` environment variables,
+so the token never goes to a proxy.
 
 Delivery semantics worth knowing before you build on this (details in the
 API reference):

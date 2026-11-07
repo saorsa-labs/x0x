@@ -22,6 +22,7 @@ import json
 import secrets
 import socket
 import struct
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ __all__ = [
     "AgentIdentity",
     "ApiError",
     "Connected",
+    "DEFAULT_TIMEOUT_SECS",
     "DaemonStatus",
     "DirectMessage",
     "DirectSendError",
@@ -45,13 +47,17 @@ __all__ = [
     "PayloadTooLarge",
     "RecipientKeyNotConverged",
     "RecipientNeedsUpgrade",
+    "RecipientUndiscovered",
     "RecipientUnknown",
+    "RecipientUpgradeRequired",
+    "SLOW_TIMEOUT_SECS",
     "SendReceipt",
     "SendTimeout",
     "WsDirectSession",
     "WsEvent",
     "X0xClient",
     "X0xError",
+    "X0xTimeout",
     "read_api_token",
 ]
 
@@ -61,6 +67,18 @@ __all__ = [
 
 class X0xError(Exception):
     """Base class for every error this client raises deliberately."""
+
+
+class X0xTimeout(X0xError, TimeoutError):
+    """No HTTP response or WebSocket frame arrived within the timeout.
+
+    It is also a :class:`TimeoutError`. After a WebSocket ``recv`` timeout
+    the session stays usable: call ``recv`` again.
+
+    The daemon may still finish the request. For ``POST /direct/send`` a
+    durable resend with the same ``logical_id`` is the same request, not a
+    duplicate, so a retry is safe.
+    """
 
 
 class ApiError(X0xError):
@@ -102,6 +120,20 @@ class RecipientKeyNotConverged(DirectSendError):
     """409 ``recipient_key_invalid`` — key view not converged yet. Retry."""
 
 
+class RecipientUndiscovered(DirectSendError):
+    """503 ``recipient_undiscovered`` — the sender has not discovered the
+    recipient yet (a discovery gap, not missing key material). Retry: the
+    gap usually closes in seconds when the peer re-announces.
+    """
+
+
+class RecipientUpgradeRequired(DirectSendError):
+    """409 ``recipient_upgrade_required`` — the recipient's advertised
+    version cannot accept this send. Retry later or tell the user to upgrade
+    the peer. Do not conflate with :class:`IdempotencyConflict`.
+    """
+
+
 class RecipientNeedsUpgrade(DirectSendError):
     """409 ``recipient_ack_semantics_unavailable`` — the durable (v2) ACK the
     send required is not advertised by the recipient. Retry later, tell the
@@ -138,6 +170,8 @@ class SendTimeout(DirectSendError):
 _DIRECT_SEND_ERRORS: dict[str, type[DirectSendError]] = {
     "recipient_key_unavailable": RecipientUnknown,
     "recipient_key_invalid": RecipientKeyNotConverged,
+    "recipient_undiscovered": RecipientUndiscovered,
+    "recipient_upgrade_required": RecipientUpgradeRequired,
     "recipient_ack_semantics_unavailable": RecipientNeedsUpgrade,
     "recipient_pairing_denied": PairingDenied,
     "idempotency_conflict": IdempotencyConflict,
@@ -316,6 +350,21 @@ def _parse_ws_event(obj: dict[str, Any]) -> WsEvent:
 
 _WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+# The daemon is local: never route the bearer token through a proxy from
+# ``http_proxy`` / ``HTTPS_PROXY`` environment variables.
+_WS_TIMEOUT_MESSAGE = "no WebSocket message within the timeout"
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+DEFAULT_TIMEOUT_SECS = 10.0
+"""HTTP read timeout for quick endpoints."""
+
+SLOW_TIMEOUT_SECS = 90.0
+"""HTTP read timeout for ``POST /direct/send`` and ``POST /agents/connect``.
+A durable send has a server budget of about 70 s and a connect waits up to
+60 s, so this stays above both; the server's own 504 then reaches the
+caller as :class:`SendTimeout`."""
+
 
 class WsDirectSession:
     """A ``/ws/direct`` session: auto-receives DMs, no subscribe needed.
@@ -333,6 +382,9 @@ class WsDirectSession:
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._buffer = b""
+        # Partial fragmented message, kept across recv() timeouts.
+        self._message_opcode: int | None = None
+        self._message = b""
 
     def __enter__(self) -> "WsDirectSession":
         return self
@@ -346,15 +398,15 @@ class WsDirectSession:
         self.close()
 
     def recv(self, timeout: float | None = None) -> WsEvent:
-        """Return the next event. Raises ``socket.timeout`` on no frame in
-        ``timeout`` seconds, :class:`X0xError` on a closed session. Protocol
-        pings are answered internally and never surface.
+        """Return the next event. Raises :class:`X0xTimeout` (also a
+        ``TimeoutError``) on no complete message in ``timeout`` seconds, and
+        :class:`X0xError` on a closed session. A timeout loses no bytes:
+        partial frames stay buffered, so calling ``recv`` again is safe.
+        Protocol pings are answered internally and never surface.
         """
-        self._sock.settimeout(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            opcode, payload = self._read_frame()
-            if opcode == 0x1:  # text
-                return _parse_ws_event(_as_obj(json.loads(payload.decode("utf-8"))))
+            fin, opcode, payload = self._next_frame(deadline)
             if opcode == 0x9:  # ping → pong, carry the payload back
                 self._send_frame(0xA, payload)
                 continue
@@ -362,8 +414,26 @@ class WsDirectSession:
                 code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else 1005
                 self.close()
                 raise X0xError(f"WebSocket closed by daemon (code {code})")
-            # Binary and unsolicited pong frames are not part of the protocol;
-            # skip rather than fail so a future server addition stays harmless.
+            if opcode == 0xA:  # unsolicited pong
+                continue
+            # Data frame. Control frames above may arrive between fragments
+            # (RFC 6455 §5.4) and leave the partial message untouched.
+            if opcode == 0x0:
+                if self._message_opcode is None:
+                    raise X0xError("WebSocket continuation frame without a start")
+                self._message += payload
+            else:
+                if self._message_opcode is not None:
+                    raise X0xError("WebSocket data frame inside a fragmented message")
+                self._message_opcode, self._message = opcode, payload
+            if not fin:
+                continue
+            message_opcode, message = self._message_opcode, self._message
+            self._message_opcode, self._message = None, b""
+            if message_opcode == 0x1:  # text
+                return _parse_ws_event(_as_obj(json.loads(message.decode("utf-8"))))
+            # Binary messages are not part of the protocol; skip rather than
+            # fail so a future server addition stays harmless.
 
     def send_json(self, obj: dict[str, Any]) -> None:
         """Send one client command, e.g. ``{"type": "ping"}``. Note that
@@ -384,42 +454,63 @@ class WsDirectSession:
 
     # frame plumbing ──────────────────────────────────────────────────────
 
-    def _read_exact(self, n: int) -> bytes:
-        while len(self._buffer) < n:
-            chunk = self._sock.recv(65536)
+    def _next_frame(self, deadline: float | None) -> tuple[bool, int, bytes]:
+        """Return one complete frame as ``(fin, opcode, payload)``.
+
+        Bytes are consumed from the buffer only once a whole frame is there,
+        so a timeout in the middle of a frame never corrupts the stream.
+        """
+        while True:
+            frame = self._take_frame()
+            if frame is not None:
+                return frame
+            if deadline is None:
+                self._sock.settimeout(None)
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise X0xTimeout(_WS_TIMEOUT_MESSAGE)
+                self._sock.settimeout(remaining)
+            try:
+                chunk = self._sock.recv(65536)
+            except TimeoutError:
+                raise X0xTimeout(_WS_TIMEOUT_MESSAGE) from None
             if not chunk:
                 raise X0xError("WebSocket connection ended unexpectedly")
             self._buffer += chunk
-        out, self._buffer = self._buffer[:n], self._buffer[n:]
-        return out
 
-    def _read_frame(self) -> tuple[int, bytes]:
-        """Read one message, reassembling continuation frames."""
-        opcode: int | None = None
-        payload = b""
-        while True:
-            head = self._read_exact(2)
-            fin = bool(head[0] & 0x80)
-            frame_opcode = head[0] & 0x0F
-            masked = bool(head[1] & 0x80)
-            length = head[1] & 0x7F
-            if length == 126:
-                length = struct.unpack("!H", self._read_exact(2))[0]
-            elif length == 127:
-                length = struct.unpack("!Q", self._read_exact(8))[0]
-            mask = self._read_exact(4) if masked else b""
-            data = self._read_exact(length)
-            if masked:
-                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
-            if frame_opcode in (0x8, 0x9, 0xA):  # control frames never fragment
-                return frame_opcode, data
-            if frame_opcode != 0x0:
-                opcode = frame_opcode
-            payload += data
-            if fin:
-                if opcode is None:
-                    raise X0xError("WebSocket continuation frame without a start")
-                return opcode, payload
+    def _take_frame(self) -> tuple[bool, int, bytes] | None:
+        buf = self._buffer
+        if len(buf) < 2:
+            return None
+        fin = bool(buf[0] & 0x80)
+        opcode = buf[0] & 0x0F
+        masked = bool(buf[1] & 0x80)
+        length = buf[1] & 0x7F
+        offset = 2
+        if length == 126:
+            if len(buf) < offset + 2:
+                return None
+            length = struct.unpack_from("!H", buf, offset)[0]
+            offset += 2
+        elif length == 127:
+            if len(buf) < offset + 8:
+                return None
+            length = struct.unpack_from("!Q", buf, offset)[0]
+            offset += 8
+        mask = b""
+        if masked:
+            if len(buf) < offset + 4:
+                return None
+            mask = buf[offset : offset + 4]
+            offset += 4
+        if len(buf) < offset + length:
+            return None
+        data = buf[offset : offset + length]
+        self._buffer = buf[offset + length :]
+        if masked:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        return fin, opcode, data
 
     def _send_frame(self, opcode: int, payload: bytes) -> None:
         mask = secrets.token_bytes(4)
@@ -445,7 +536,9 @@ class X0xClient:
     'healthy'
     """
 
-    def __init__(self, base_url: str, token: str | None = None, timeout: float = 10.0) -> None:
+    def __init__(
+        self, base_url: str, token: str | None = None, timeout: float = DEFAULT_TIMEOUT_SECS
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
@@ -531,9 +624,17 @@ class X0xClient:
             request["trust_level"] = trust_level
         return self._request("POST", "/agent/card/import", body=request)
 
-    def connect(self, agent_id: str) -> dict[str, Any]:
-        """``POST /agents/connect`` — establish a direct connection."""
-        return self._request("POST", "/agents/connect", body={"agent_id": agent_id})
+    def connect(self, agent_id: str, *, timeout: float = SLOW_TIMEOUT_SECS) -> dict[str, Any]:
+        """``POST /agents/connect`` — establish a direct connection.
+
+        A 200 reply is not a success by itself: check ``outcome``
+        (``Direct``, ``Coordinated``, ``AlreadyConnected``, ``Unreachable``
+        or ``NotFound``). The daemon waits up to 60 s, hence the long
+        default ``timeout``.
+        """
+        return self._request(
+            "POST", "/agents/connect", body={"agent_id": agent_id}, timeout=timeout
+        )
 
     def send_dm(
         self,
@@ -542,6 +643,7 @@ class X0xClient:
         *,
         durable: bool = True,
         logical_id: str | None = None,
+        timeout: float = SLOW_TIMEOUT_SECS,
     ) -> SendReceipt:
         """``POST /direct/send`` — send a direct message.
 
@@ -549,6 +651,11 @@ class X0xClient:
         the recipient durably committed the message. ``logical_id`` (durable
         only; ``[a-z0-9._:-]``, 1–128 chars) makes a resend after a timeout or
         restart the *same* request instead of a duplicate.
+
+        ``timeout`` defaults above the server's own send budget (about 70 s),
+        so the server's 504 arrives as :class:`SendTimeout`. If the client
+        timeout still fires, :class:`X0xTimeout` is raised; a durable resend
+        with the same ``logical_id`` is safe.
 
         Raises a :class:`DirectSendError` subclass on the documented codes —
         see each class's docstring for the repair it prescribes. The two 409s
@@ -565,7 +672,7 @@ class X0xClient:
         if logical_id is not None:
             request["logical_id"] = logical_id
         try:
-            body = self._request("POST", "/direct/send", body=request)
+            body = self._request("POST", "/direct/send", body=request, timeout=timeout)
         except ApiError as exc:
             mapped = _DIRECT_SEND_ERRORS.get(exc.reason or exc.error)
             if mapped is not None:
@@ -644,6 +751,7 @@ class X0xClient:
         path: str,
         body: dict[str, Any] | None = None,
         auth: bool = True,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         headers = {"Accept": "application/json"}
         if auth:
@@ -658,7 +766,7 @@ class X0xClient:
             self.base_url + path, data=data, method=method, headers=headers
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with _OPENER.open(request, timeout=self.timeout if timeout is None else timeout) as response:
                 return _as_obj(json.load(response))
         except urllib.error.HTTPError as exc:
             raw = exc.read()
@@ -673,5 +781,8 @@ class X0xClient:
                 detail=_opt_str(parsed, "detail"),
                 body=parsed,
             ) from None
-        except urllib.error.URLError as exc:
-            raise X0xError(f"{method} {self.base_url}{path} failed: {exc.reason}") from None
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            if isinstance(reason, TimeoutError):
+                raise X0xTimeout(f"{method} {path}: no response within the timeout") from None
+            raise X0xError(f"{method} {self.base_url}{path} failed: {reason}") from None

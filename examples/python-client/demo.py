@@ -15,9 +15,10 @@ Run it from the repository root::
     cargo build --bin x0xd
     python3 examples/python-client/demo.py
 
-The daemons never join the real network: both are started with
-``--no-hard-coded-bootstrap`` and a loopback-only config. In CI the demo
-additionally runs inside the loopback-only network namespace of
+The daemons never join the real network. Isolation comes from their
+config: loopback-only binds, ``--no-hard-coded-bootstrap``, an empty or
+loopback-only peer list, mDNS and port mapping off. In CI the demo also
+runs inside the loopback-only network namespace of
 ``scripts/ci/isolated-runtime.py``, per ``tests/AGENTS.md``.
 
 Exit code 0 means the DM arrived on B's subscription with the exact bytes
@@ -43,15 +44,29 @@ from x0x_client import (
     DirectMessage,
     RecipientKeyNotConverged,
     RecipientNeedsUpgrade,
+    RecipientUndiscovered,
     RecipientUnknown,
+    RecipientUpgradeRequired,
     X0xClient,
     X0xError,
+    X0xTimeout,
     read_api_token,
 )
 
 HEALTH_DEADLINE_SECS = 60.0
 SEND_DEADLINE_SECS = 90.0
 RECEIVE_DEADLINE_SECS = 30.0
+
+# Transient /direct/send outcomes worth retrying (see send_with_retry).
+TRANSIENT_SEND_ERRORS = (
+    RecipientUnknown,
+    RecipientUndiscovered,
+    RecipientKeyNotConverged,
+    RecipientNeedsUpgrade,
+    RecipientUpgradeRequired,
+    X0xTimeout,
+)
+CONNECTED_OUTCOMES = frozenset({"Direct", "Coordinated", "AlreadyConnected"})
 
 
 @dataclass
@@ -77,6 +92,7 @@ def write_config(
         f'api_address = "127.0.0.1:{api_port}"\n'
         f'bind_address = "127.0.0.1:{quic_port}"\n'
         "mdns_enabled = false\n"
+        "port_mapping_enabled = false\n"
         f"bootstrap_peers = [{peers}]\n"
         'log_level = "info"\n',
         encoding="utf-8",
@@ -137,8 +153,10 @@ def send_with_retry(client: X0xClient, recipient: str, payload: bytes) -> str:
     """Send a durable DM, retrying the documented transient conditions.
 
     Right after a card import the sender's view of the recipient's KEM key
-    and capability advert may not have converged; those answer 404/409 codes
-    that the API reference marks transient. Everything else propagates.
+    and capability advert may not have converged, and discovery may still
+    have a gap; those answer 404/409/503 codes that are transient. A client
+    timeout is also retried: the same ``logical_id`` makes the resend the
+    same request, not a duplicate. Everything else propagates.
     """
     deadline = time.monotonic() + SEND_DEADLINE_SECS
     attempt = 0
@@ -147,10 +165,10 @@ def send_with_retry(client: X0xClient, recipient: str, payload: bytes) -> str:
         try:
             receipt = client.send_dm(recipient, payload, logical_id="python-client-demo:1")
             return receipt.path
-        except (RecipientUnknown, RecipientKeyNotConverged, RecipientNeedsUpgrade) as exc:
+        except TRANSIENT_SEND_ERRORS as exc:
             if time.monotonic() >= deadline:
                 raise X0xError(f"send did not converge within {SEND_DEADLINE_SECS}s: {exc}") from exc
-            print(f"  send attempt {attempt}: {exc.error} — retrying")
+            print(f"  send attempt {attempt}: {exc} — retrying")
             time.sleep(2.0)
 
 
@@ -217,12 +235,18 @@ def main() -> int:
         client_b.import_agent_card(card_a)
         print("agent cards exchanged")
 
+        # The gossip path still delivers without a live direct connection,
+        # so a failed connect is reported, not fatal.
         try:
-            client_a.connect(identity_b.agent_id)
-            print("A → B direct connection requested")
+            outcome = str(client_a.connect(identity_b.agent_id).get("outcome", ""))
         except ApiError as exc:
-            # The gossip path still delivers without a live direct connection.
-            print(f"A → B connect not established ({exc.error}) — gossip path will carry the DM")
+            outcome = f"error: {exc.error}"
+        except X0xTimeout:
+            outcome = "client timeout"
+        if outcome in CONNECTED_OUTCOMES:
+            print(f"A → B direct connection: {outcome}")
+        else:
+            print(f"A → B connect not established ({outcome}) — gossip path will carry the DM")
 
         payload = b"hello from agent A via the typed Python client"
         with client_b.ws_direct() as subscription:
@@ -234,7 +258,10 @@ def main() -> int:
 
             deadline = time.monotonic() + RECEIVE_DEADLINE_SECS
             while time.monotonic() < deadline:
-                event = subscription.recv(timeout=max(1.0, deadline - time.monotonic()))
+                try:
+                    event = subscription.recv(timeout=max(0.1, deadline - time.monotonic()))
+                except X0xTimeout:
+                    break
                 if isinstance(event, DirectMessage):
                     if event.payload != payload:
                         print(f"FAIL: payload mismatch: {event.payload!r}", file=sys.stderr)
@@ -249,7 +276,10 @@ def main() -> int:
                     print("PASS")
                     rc = 0
                     return rc
-            print("FAIL: no DM arrived on B's subscription in time", file=sys.stderr)
+            print(
+                f"FAIL: no DM arrived on B's subscription within {RECEIVE_DEADLINE_SECS}s",
+                file=sys.stderr,
+            )
             return rc
     except (X0xError, OSError, TimeoutError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
