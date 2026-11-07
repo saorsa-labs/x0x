@@ -2346,13 +2346,26 @@ pub(in crate::server) async fn create_group_kv_store(
         }
     };
     // S4 group-access core: the rider grant on the binding's stable id,
-    // at the inline check's exact position (owners pass on class; the
-    // middleware's deny-by-default allowlist keeps riders off this
-    // route, so the 403 is defence in depth).
+    // at the inline check's exact position (owners pass on class; since
+    // #1094 the middleware admits a `scratch:read_write` rider here, so
+    // this grant arm is the group-level half of that admission and stays
+    // defence in depth for scopeless riders).
     if let Err((code, body)) =
         crate::server::group_access::admit_group_store_route(&actor, &binding.stable_group_id)
     {
         return (code, body);
+    }
+    // Issue #1094 / ADR 0075 decision 5: a rider may open ONLY the
+    // `scratch` store, and only with the `scratch:read_write` scope (the
+    // auth middleware admits the route on that scope; this is the
+    // name-level half of the check, on the resolved binding).
+    if let crate::server::rider_auth::ActorContext::Rider { scopes, .. } = &actor {
+        if binding.name != crate::server::rider_auth::SCRATCH_STORE_NAME {
+            return forbidden("riders may open only the scratch store");
+        }
+        if !crate::server::rider_auth::scopes_allow_scratch(scopes, true) {
+            return forbidden("rider token is missing scope scratch:read_write");
+        }
     }
     let snapshot_lease = claim_bound_store_open(&state, &binding).await;
     let reservation = crdt_subscriptions::handle_reservation(
@@ -7206,6 +7219,92 @@ mod tests {
         );
         let _ = GssKvSecureContext::from_group; // keep backend import referenced
         let _ = GroupPolicy::default();
+    }
+
+    /// Issue #1094 / ADR 0075 decision 5: through `POST /groups/:id/stores`
+    /// a rider can open ONLY the `scratch` store, only with the
+    /// `scratch:read_write` scope, and only on a granted group — each
+    /// failing arm is a 403 before any store state changes.
+    #[tokio::test]
+    async fn create_group_kv_store_rider_opens_only_scratch() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let treekem_key = "34".repeat(16);
+        seed_treekem_group(&state, &treekem_key).await;
+
+        // Resolve the STABLE group id the rider grant must name.
+        let stable = {
+            let groups = state.named_groups.read().await;
+            resolve_treekem_group_store(&groups, &treekem_key, "scratch", &state.agent.agent_id())
+                .expect("binding")
+                .stable_group_id
+        };
+        let rider = |groups: Vec<String>, scopes: Vec<String>| {
+            crate::server::rider_auth::ActorContext::Rider {
+                sub_agent_id: "aa".repeat(32),
+                token_id: 1,
+                token_hash: "hash".to_string(),
+                groups,
+                scopes,
+            }
+        };
+        let rw = vec!["scratch:read_write".to_string()];
+
+        // Ungranted group -> the S4 grant 403.
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(treekem_key.clone()),
+            Extension(rider(vec![], rw.clone())),
+            Json(CreateGroupStoreRequest {
+                name: "scratch".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{resp:?}");
+
+        // Granted group, non-scratch name -> 403.
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(treekem_key.clone()),
+            Extension(rider(vec![stable.clone()], rw.clone())),
+            Json(CreateGroupStoreRequest {
+                name: "notes".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{resp:?}");
+
+        // Granted group, scratch name, read-only scope -> 403.
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(treekem_key.clone()),
+            Extension(rider(
+                vec![stable.clone()],
+                vec!["scratch:read".to_string()],
+            )),
+            Json(CreateGroupStoreRequest {
+                name: "scratch".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{resp:?}");
+
+        // Granted group + scratch + read_write -> the store opens sealed.
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(treekem_key.clone()),
+            Extension(rider(vec![stable.clone()], rw)),
+            Json(CreateGroupStoreRequest {
+                name: "scratch".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{resp:?}");
+        assert_eq!(resp.0["policy"], "encrypted");
+        assert_eq!(
+            resp.0["topic"].as_str(),
+            Some(format!("x0x/group/{stable}/kv/scratch").as_str()),
+            "the scratch topic is deterministic from the stable id"
+        );
     }
 
     /// Codex P2 (#1508 r6), same class as the task-list write: ADR 0110

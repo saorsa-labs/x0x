@@ -42,8 +42,19 @@ pub(super) const RIDER_MAX_TTL_SECS: u64 = 90 * 24 * 60 * 60;
 /// (owners keep the store-wide 500 cap).
 pub(super) const RIDER_HISTORY_MAX_LIMIT: usize = 100;
 
-/// The only defined rider-token scope (ADR 0083 slice 2).
+/// The first defined rider-token scope (ADR 0083 slice 2).
 pub(super) const GUI_SHOW_SCOPE: &str = "gui:show";
+
+/// Scratch read scope (issue #1094, ADR 0075 decision 5): the token may
+/// read the `scratch` store of its granted groups.
+pub(super) const SCRATCH_READ_SCOPE: &str = "scratch:read";
+
+/// Scratch read-write scope (issue #1094, ADR 0075 decision 5): the token
+/// may read, write and open the `scratch` store of its granted groups.
+pub(super) const SCRATCH_READ_WRITE_SCOPE: &str = "scratch:read_write";
+
+/// The one rider-reachable group store name (ADR 0075 decision 4).
+pub(in crate::server) const SCRATCH_STORE_NAME: &str = "scratch";
 
 /// File name of the persisted rider-token store, in the daemon data dir.
 pub(super) const RIDER_TOKENS_FILE: &str = "rider-tokens.json";
@@ -126,6 +137,10 @@ impl ActorContext {
 ///   in the handler, limit clamped to [`RIDER_HISTORY_MAX_LIMIT`]).
 /// - `POST /gui/show` — only when `scopes` contains [`GUI_SHOW_SCOPE`].
 ///   The send, encrypt, and history rows ignore `scopes`.
+///
+/// The scratch rows (#1094, ADR 0075 decision 5) live in
+/// [`rider_scratch_route_allowed`], which the middleware consults as a
+/// second predicate; both deny by default.
 pub(super) fn rider_route_allowed(
     method: &axum::http::Method,
     path: &str,
@@ -147,21 +162,31 @@ pub(super) fn scopes_allow_gui_show(scopes: &[String]) -> bool {
     scopes.iter().any(|scope| scope == GUI_SHOW_SCOPE)
 }
 
-/// Accept only exact `gui:show`. An empty list is the default token.
-/// Duplicates of that one scope collapse to a single entry.
+/// Accept only the defined scopes (`gui:show`, `scratch:read`,
+/// `scratch:read_write`). An empty list is the default token.
+/// Duplicates collapse to a single entry.
 /// `Err` is the rejected scope text, with no added words.
 pub(super) fn parse_rider_scopes(scopes: &[String]) -> Result<Vec<String>, String> {
+    const KNOWN: [&str; 3] = [GUI_SHOW_SCOPE, SCRATCH_READ_SCOPE, SCRATCH_READ_WRITE_SCOPE];
     let mut parsed = Vec::new();
     for scope in scopes {
-        if scope == GUI_SHOW_SCOPE {
-            if !parsed.iter().any(|known| known == GUI_SHOW_SCOPE) {
-                parsed.push(GUI_SHOW_SCOPE.to_string());
-            }
-            continue;
+        let Some(known) = KNOWN.iter().find(|known| *known == scope) else {
+            return Err(scope.clone());
+        };
+        if !parsed.iter().any(|have| have == known) {
+            parsed.push((*known).to_string());
         }
-        return Err(scope.clone());
     }
     Ok(parsed)
+}
+
+/// Whether the token's scratch scope admits a read (`scratch:read` or
+/// `scratch:read_write`) or, with `write`, a write (`scratch:read_write`
+/// only). No scratch scope is `scratch: none` — the ADR 0075 default.
+pub(super) fn scopes_allow_scratch(scopes: &[String], write: bool) -> bool {
+    scopes
+        .iter()
+        .any(|scope| scope == SCRATCH_READ_WRITE_SCOPE || (!write && scope == SCRATCH_READ_SCOPE))
 }
 
 /// JSON body for a rider that reached `POST /gui/show` without the scope.
@@ -226,6 +251,98 @@ fn is_two_segment_action(path: &str, action: &str) -> bool {
                 && segs.next() == Some(action)
                 && segs.next().is_none()
         }
+        None => false,
+    }
+}
+
+/// Strict percent-decode of one path segment. `None` on a malformed or
+/// non-UTF-8 encoding — the caller denies.
+pub(super) fn percent_decode_segment(segment: &str) -> Option<String> {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = hex_val(*bytes.get(i + 1)?)?;
+            let lo = hex_val(*bytes.get(i + 2)?)?;
+            out.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The stable group id when `store_id` is a group SCRATCH store topic
+/// (`x0x/group/<gid>/kv/scratch` — ADR 0075 decision 4), else `None`.
+pub(super) fn scratch_topic_group(store_id: &str) -> Option<&str> {
+    let (gid, name) = store_id.strip_prefix("x0x/group/")?.split_once("/kv/")?;
+    (name == SCRATCH_STORE_NAME && !gid.is_empty() && !gid.contains('/')).then_some(gid)
+}
+
+/// Issue #1094 / ADR 0075 decision 5 — the scratch rows of the rider
+/// matrix. Deny-by-default stands; this admits EXACTLY:
+///
+/// - `POST /groups/:id/stores` with `scratch:read_write` — the handler
+///   additionally requires `name == "scratch"` and the group grant
+///   (`admit_group_store_route`), so a rider can open only the scratch
+///   store of a granted group;
+/// - `GET /stores/:id/keys` and `GET /stores/:id/:key` with
+///   `scratch:read` or `scratch:read_write`;
+/// - `PUT /stores/:id/:key` and `DELETE /stores/:id/:key` with
+///   `scratch:read_write`;
+///
+/// where `:id` strictly percent-decodes to the scratch topic
+/// `x0x/group/<gid>/kv/scratch` of a group on the token's grant list.
+/// The auth middleware ADDITIONALLY requires the open store at that
+/// topic to be group-bound (sealed or group-signed) before admitting a
+/// rider, so a personal store planted at a scratch-shaped topic stays
+/// out of reach. A rider never reaches any other store, and a token
+/// without a scratch scope (`scratch: none`, the default) changes
+/// nothing.
+pub(super) fn rider_scratch_route_allowed(
+    method: &axum::http::Method,
+    path: &str,
+    scopes: &[String],
+    groups: &[String],
+) -> bool {
+    use axum::http::Method;
+    if *method == Method::POST {
+        return is_two_segment_action(path, "stores") && scopes_allow_scratch(scopes, true);
+    }
+    let write = match *method {
+        Method::GET => false,
+        Method::PUT | Method::DELETE => true,
+        _ => return false,
+    };
+    if !scopes_allow_scratch(scopes, write) {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix("/stores/") else {
+        return false;
+    };
+    let mut segs = rest.split('/');
+    let (Some(id_enc), Some(tail), None) = (segs.next(), segs.next(), segs.next()) else {
+        return false;
+    };
+    if id_enc.is_empty() || tail.is_empty() {
+        return false;
+    }
+    let Some(store_id) = percent_decode_segment(id_enc) else {
+        return false;
+    };
+    match scratch_topic_group(&store_id) {
+        Some(gid) => groups.iter().any(|g| g == gid),
         None => false,
     }
 }
@@ -691,6 +808,182 @@ mod tests {
         }
         assert!(!rider_route_allowed(&Method::GET, "/history/", &[]));
         assert!(!rider_route_allowed(&Method::PUT, "/history", &[]));
+    }
+
+    // ── Scratch rows (#1094, ADR 0075 decision 5) ───────────────────────
+
+    fn scratch_store_path(gid: &str) -> String {
+        format!("/stores/x0x%2Fgroup%2F{gid}%2Fkv%2Fscratch")
+    }
+
+    #[test]
+    fn scratch_scopes_parse_and_dedupe() {
+        // WHY: ADR 0075 Q5 — the scope set widens by exactly these two
+        // names; anything else still fails closed at issuance.
+        let parsed = parse_rider_scopes(&[
+            SCRATCH_READ_SCOPE.to_string(),
+            SCRATCH_READ_SCOPE.to_string(),
+            GUI_SHOW_SCOPE.to_string(),
+            SCRATCH_READ_WRITE_SCOPE.to_string(),
+        ])
+        .expect("known scopes parse");
+        assert_eq!(
+            parsed,
+            vec![
+                SCRATCH_READ_SCOPE.to_string(),
+                GUI_SHOW_SCOPE.to_string(),
+                SCRATCH_READ_WRITE_SCOPE.to_string(),
+            ]
+        );
+        assert_eq!(
+            parse_rider_scopes(&["scratch:write".to_string()]),
+            Err("scratch:write".to_string()),
+            "undefined scratch scope spellings stay refused"
+        );
+        assert_eq!(
+            parse_rider_scopes(&["scratch".to_string()]),
+            Err("scratch".to_string())
+        );
+    }
+
+    #[test]
+    fn scratch_matrix_scope_gates_read_and_write() {
+        // WHY: issue #1094 acceptance — a rider with scope `none`
+        // (no scratch scope) or `read` cannot write; `read_write` can.
+        let gid = "stable-g";
+        let groups = vec![gid.to_string()];
+        let read = vec![SCRATCH_READ_SCOPE.to_string()];
+        let rw = vec![SCRATCH_READ_WRITE_SCOPE.to_string()];
+        let keys = format!("{}/keys", scratch_store_path(gid));
+        let key = format!("{}/note", scratch_store_path(gid));
+
+        // scope none (default): nothing is admitted.
+        for method in [Method::GET, Method::PUT, Method::DELETE] {
+            assert!(
+                !rider_scratch_route_allowed(&method, &key, &[], &groups),
+                "{method} must be denied without a scratch scope"
+            );
+        }
+        assert!(!rider_scratch_route_allowed(
+            &Method::POST,
+            "/groups/g/stores",
+            &[],
+            &groups
+        ));
+
+        // read: GET only.
+        assert!(rider_scratch_route_allowed(
+            &Method::GET,
+            &keys,
+            &read,
+            &groups
+        ));
+        assert!(rider_scratch_route_allowed(
+            &Method::GET,
+            &key,
+            &read,
+            &groups
+        ));
+        assert!(!rider_scratch_route_allowed(
+            &Method::PUT,
+            &key,
+            &read,
+            &groups
+        ));
+        assert!(!rider_scratch_route_allowed(
+            &Method::DELETE,
+            &key,
+            &read,
+            &groups
+        ));
+        assert!(
+            !rider_scratch_route_allowed(&Method::POST, "/groups/g/stores", &read, &groups),
+            "opening the store is a write"
+        );
+
+        // read_write: all four, plus the open route.
+        assert!(rider_scratch_route_allowed(
+            &Method::GET,
+            &keys,
+            &rw,
+            &groups
+        ));
+        assert!(rider_scratch_route_allowed(
+            &Method::PUT,
+            &key,
+            &rw,
+            &groups
+        ));
+        assert!(rider_scratch_route_allowed(
+            &Method::DELETE,
+            &key,
+            &rw,
+            &groups
+        ));
+        assert!(rider_scratch_route_allowed(
+            &Method::POST,
+            "/groups/g/stores",
+            &rw,
+            &groups
+        ));
+    }
+
+    #[test]
+    fn scratch_matrix_is_store_and_group_exact() {
+        // WHY: ADR 0075 §5 — a rider never reaches notes, wiki, personal
+        // stores, task lists or an ungranted group's scratch; a
+        // store-name or group check bug would expose them.
+        let groups = vec!["granted".to_string()];
+        let rw = vec![SCRATCH_READ_WRITE_SCOPE.to_string()];
+        let denied = [
+            // another group's scratch store
+            format!("{}/k", scratch_store_path("other")),
+            // prefix near-miss on the grant
+            format!("{}/k", scratch_store_path("grante")),
+            // a non-scratch store of the granted group
+            "/stores/x0x%2Fgroup%2Fgranted%2Fkv%2Fnotes/k".to_string(),
+            // a personal store named scratch
+            "/stores/scratch/k".to_string(),
+            // nested-key shapes beyond the route's two segments
+            format!("{}/a/b", scratch_store_path("granted")),
+            // store listing stays owner-only
+            "/stores".to_string(),
+            // malformed percent-encoding fails closed
+            "/stores/x0x%2%2Fgroup/k".to_string(),
+            // an encoded extra path segment inside the group id
+            "/stores/x0x%2Fgroup%2Fgranted%2Fextra%2Fkv%2Fscratch/k".to_string(),
+        ];
+        for path in &denied {
+            assert!(
+                !rider_scratch_route_allowed(&Method::GET, path, &rw, &groups),
+                "GET {path} must be denied"
+            );
+        }
+        // "/join" IS a valid key segment name for GET/PUT of a key named
+        // join on the scratch store — but POST join is not admitted.
+        assert!(!rider_scratch_route_allowed(
+            &Method::POST,
+            &format!("{}/join", scratch_store_path("granted")),
+            &rw,
+            &groups
+        ));
+        // The granted scratch store itself is admitted.
+        assert!(rider_scratch_route_allowed(
+            &Method::GET,
+            &format!("{}/k", scratch_store_path("granted")),
+            &rw,
+            &groups
+        ));
+    }
+
+    #[test]
+    fn scratch_topic_group_parses_exactly() {
+        assert_eq!(scratch_topic_group("x0x/group/g1/kv/scratch"), Some("g1"));
+        assert_eq!(scratch_topic_group("x0x/group/g1/kv/notes"), None);
+        assert_eq!(scratch_topic_group("x0x/group//kv/scratch"), None);
+        assert_eq!(scratch_topic_group("x0x/group/a/b/kv/scratch"), None);
+        assert_eq!(scratch_topic_group("scratch"), None);
+        assert_eq!(scratch_topic_group("x0x/group/g1/kv/"), None);
     }
 
     #[test]

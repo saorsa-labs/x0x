@@ -42,6 +42,19 @@
       "wire": {
         "bincode": "04000000"
       }
+    },
+    {
+      "input": {
+        "data": {
+          "access": "rw",
+          "group": "6767",
+          "store": "scratch"
+        }
+      },
+      "variant": "Data",
+      "wire": {
+        "bincode": "0500000004000000000000003637363707000000000000007363726174636801000000"
+      }
     }
   ],
   "type": "ShareCap"

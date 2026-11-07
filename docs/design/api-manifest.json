@@ -624,7 +624,7 @@
     {
       "category": "identity",
       "cli_name": "owner riders issue",
-      "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty, only gui:show is defined; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
+      "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; scopes is a string list, default empty; defined scopes: gui:show, scratch:read, scratch:read_write; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
       "method": "POST",
       "path": "/owner/riders",
       "request": {
