@@ -560,14 +560,15 @@ jobs:
             target/h-s3-home/*/*/std*-*.log
           if-no-files-found: warn
 
-  # ADR 0109 §10 H-S3-rm released-binary rows (#1572). Only rm1
-  # (capability floor) exists now; the filter also selects later rows in
-  # the same module. Phase 1 of each row runs on the paused W3-H sim;
-  # phase 2 runs candidate daemons on real loopback sockets, with member
-  # M on the published v0.46.1 daemon. The rows are `#[ignore]` and run
-  # only here, one at a time. A row took 145-250 s on a 12-CPU VM, and
-  # the 4-vCPU runner takes about twice as long. The job is separate
-  # because it needs the released binary. It is not a required check.
+  # ADR 0109 §10 H-S3-rm released-binary rows (#1572): rm1 (capability
+  # floor) and rm3 (i) and (ii) (older receiver after the seal). The
+  # filter also selects later rows in the same module. Phase 1 of each
+  # row runs on the paused W3-H sim; phase 2 runs candidate daemons on
+  # real loopback sockets, with member M on the published v0.46.1
+  # daemon. The rows are `#[ignore]` and run only here, one at a time.
+  # A row took 145-250 s on a 12-CPU VM, and the 4-vCPU runner takes
+  # about twice as long. The job is separate because it needs the
+  # released binary. It is not a required check.
   # The pinned v0.46.1 is installed before the loopback-only namespace:
   # nextest-isolated.sh fetches it only for the `h_s3_home_released`
   # binary, and these rows are in the lib test binary. `tokio_unstable`
