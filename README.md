@@ -25,17 +25,16 @@ David stated this product vision on 13 Oct 2026. The marks below are against com
 | A2A and ACP as full session protocols | Target | Checked at `86a1d395`. Shipped pieces: an ACP-attached key (`CertMode::Acp` in `src/profile.rs`; the harness owns it) and an A2A discovery card (`get_a2a_agent_card` in `src/server/routes/identity.rs`, `GET /.well-known/agent-card.json`). [A04](docs/adr/consolidated/A04-r01-agent-attachment-and-inbound-events.md) says x0xd does not run the Agent Client Protocol, and A2A streaming and push stay off. |
 | Peers keep held data inside a partition | Shipped | Checked at `86a1d395`. Held data is the local snapshot a peer already stored. It is not data that state-sync has delivered (#1105). KV snapshots load through `load_snapshot` in `src/kv/sync.rs`. Task-list snapshots load through `TaskListStorage::load_task_list` in `src/crdt/persistence.rs`. [ADR 0006](docs/adr/0006-no-global-dht-for-user-and-group-data.md) is the rule. [A08](docs/adr/consolidated/A08-r01-groups-home-membership-and-repair.md) keeps liveness and repair incomplete. Availability stays with the peers who hold the data. |
 | CRDT data | Shipped | Checked at `86a1d395`. Replicated task lists (`TaskList` in `src/crdt/task_list.rs`) and key-value stores (`src/kv/mod.rs`). A last-writer value is not a text editor ([A10](docs/adr/consolidated/A10-r01-shared-data-files-and-synchronization.md)). |
-| BLE, serial and radio | Target | ant-quic 0.27.60 (tag `v0.27.60`, commit `ea64efc5`; same files on master `4c5fde07`) already has the scaffolding. Those paths are in the ant-quic crate. x0x has no `src/transport` directory. ant-quic `src/transport/addr.rs` defines `TransportAddr` for `Ble`, `LoRa` and `Serial`. ant-quic `src/transport/capabilities.rs` defines `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in ant-quic `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`. ant-quic stays the transport boundary ([T-alternate-bearers](docs/adr/transient/T-alternate-bearers.md), slot A05). |
+| BLE, serial and radio | Target | ant-quic 0.27.60 (tag `v0.27.60`, commit `ea64efc5`; same files on master `4c5fde07`) already has the scaffolding. Those paths are in the ant-quic crate. x0x has no `src/transport` directory. ant-quic `src/transport/addr.rs` defines `TransportAddr` for `Ble`, `LoRa` and `Serial`. ant-quic `src/transport/capabilities.rs` defines `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in ant-quic `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`. ant-quic stays the transport boundary ([A05](docs/adr/consolidated/A05-r01-connectivity-discovery-and-names.md), Alternate bearers). |
 | Public and private groups | Shipped | Checked at `86a1d395`. Presets `private_secure`, `public_request_secure`, `public_open` and `public_announce` (`GroupPolicyPreset` in `src/groups/policy.rs`). `SignedPublic` is a confidentiality mode. Home stays private ([A08](docs/adr/consolidated/A08-r01-groups-home-membership-and-repair.md)). |
 | Those groups challenge Slack and Discord | Target | The group kinds above are the collaboration places. Feature parity with Slack or Discord is not claimed. |
 
 ## Architecture review
 
-Read the [5 October architecture review](docs/reviews/2026-10-05-architecture/README.md)
-and the [15 ADR review set](docs/adr/consolidated/README.md). They capture the
-agreed direction, the agent delivery gap, and the controlled transfer from the
-existing decisions. The replacement ADRs remain Proposed until that transfer
-is complete.
+Read the [accepted 15 ADR set](docs/adr/consolidated/README.md) and the
+[5 October architecture review](docs/reviews/2026-10-05-architecture/README.md).
+David accepted the 15 slots on 7 November 2026; they are the live decision
+authority, and the numbered records stay archived as the historical record.
 
 ---
 

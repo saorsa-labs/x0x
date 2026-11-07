@@ -1,14 +1,14 @@
 # A06 Gossip Relay Roles and Resource Limits
 
-- **Status:** Proposed
+- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
 - **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the transfer and acceptance checks in A15.
-- **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
+- **Replacement activation:** Active since 7 November 2026. The 15 accepted slots are the live decision authority.
+- **Supersedes:** The archived numbered records mapped to this slot in [TRANSFER.md](TRANSFER.md). The archive stays the historical record. Existing implementation gates remain in force.
 
-These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). They are the live decision authority. The numbered records stay in [docs/adr-archive](../../adr-archive/ARCHIVE.md) as the historical record. [docs/adr-archive/move.json](../../adr-archive/move.json) records the archive transfer David accepted on 10 October 2026. Use the [index](README.md) for the current rules.
 
 x0x must bound the work and resources used by each daemon. A user's device must not become general network infrastructure without a clear role and policy.
 
@@ -52,6 +52,8 @@ Live displays and best-effort events can use documented loss policies. Report th
 Revocation, membership and delivery-control traffic need protected capacity. Priority does not remove signature checks, resource limits or fairness between peers.
 
 A peer that sends excessive or invalid work must not consume all verification capacity. Apply per-peer and per-owner limits before costly work where possible.
+
+Relay ingress refuses unsigned inner V1 messages (accepted by David, relayed 17 Oct 2026; archived as [T-relay-refuse-unsigned-inner-v1](../../adr-archive/transient/T-relay-refuse-unsigned-inner-v1.md)). The composite topic validator returns `Drop` when the inner payload decodes as unsigned V1, before content validators and relay fan-out budgets and after the outer signature checks, on normal ingress and on frames replayed after outer-key recovery. A refused message must not reach local delivery, eager forwarding, IHAVE advertisement, IWANT retrieval or anti-entropy serving; the gossip cache may retain its identifier for duplicate suppression, marked as refused. Signed V2/V3 prefixes and unsupported versions never fall back to V1. `relay_fanout.unsigned_inner_v1_dropped` on `GET /diagnostics/gossip` counts these validator refusals.
 
 Gossip fan-out must reflect usable transport connections. Stale discovery entries must not create unbounded send targets.
 

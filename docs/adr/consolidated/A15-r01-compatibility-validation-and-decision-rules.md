@@ -1,14 +1,14 @@
 # A15 Compatibility Validation and Decision Rules
 
-- **Status:** Proposed
+- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
 - **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the [transfer review](TRANSFER.md) and the Acceptance checks below.
-- **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
+- **Replacement activation:** Active since 7 November 2026. The 15 accepted slots are the live decision authority.
+- **Supersedes:** The archived numbered records mapped to this slot in [TRANSFER.md](TRANSFER.md). The archive stays the historical record. Existing implementation gates remain in force.
 
-These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). They are the live decision authority. The numbered records stay in [docs/adr-archive](../../adr-archive/ARCHIVE.md) as the historical record. [docs/adr-archive/move.json](../../adr-archive/move.json) records the archive transfer David accepted on 10 October 2026. Use the [index](README.md) for the current rules.
 
 x0x will have no more than 15 current ADR slots. The new set must preserve important decisions and evidence while making the current architecture easier to read.
 
@@ -30,12 +30,11 @@ his approval in the PR body or comment. An approved additive API needs no
 new ADR. Preserve Accepted bytes and frozen evidence. See the
 [current authoring rule](../transient/README.md).
 
-After transfer and revision-aware gate support, the proposed model selects
-one accepted revision per active slot. That historical future model does not
-authorize a new revision file under the current no-new-ADR ruling. David
-directs any later change; earlier Accepted text remains unchanged.
-The present gate supports one Proposed draft per slot. An agent cannot accept
-it or create A16.
+David accepted all 15 slots at revision r01 on 7 November 2026
+(course-correction directive, ruling 2). The accepted slots are the live
+decision authority. The gate supports one accepted revision file per slot;
+an agent cannot change a slot's acceptance or create A16. David directs any
+later change; earlier Accepted text remains unchanged.
 
 Target 500–1,000 words per ADR. Review records above 1,500 words. Keep the key guarantees, alternatives and consequences in the decision record.
 
@@ -67,6 +66,10 @@ Consume each body exactly; trailing bytes are an error. Allow a fallback
 only when at most one candidate layout can consume the body exactly.
 
 Gate incompatible behavior on verified capability evidence. Unknown capability is not proof of support.
+
+Two accepted records set the TreeKEM removal compatibility rule (David, 16 Oct 2026, PR #1337; archived as [T-self-leave-relay-commit-binding](../../adr-archive/transient/T-self-leave-relay-commit-binding.md) and [T-self-leave-mixed-version-break](../../adr-archive/transient/T-self-leave-mixed-version-break.md)). A third-party catch-up relay may apply TreeKEM removal bytes only when the signed binding equals `treekem:epoch=<n>:commit=<digest>` for those exact bytes; the roster signature must not authorize bytes it does not cover. The legacy form `treekem:epoch=<n>` stays valid only when the authenticated author delivers the event, and the admin remove route keeps sealing that legacy form. A roster-only self-leave has no TreeKEM payload and may still be relayed by a third party.
+
+A self-leave rekey binds `treekem:epoch=<n>:commit=<blake3>`, and David accepted the documented mixed-version break this creates: a v0.48 receiver cannot rebuild the digest string, hits `StateHashMismatch`, and leaves a group that contains an upgraded member until it upgrades and catch-up serves the same event. The leaf removal does not wait for a capability bit. `StateHashMismatch` is not fork evidence, although a later `PrevHashMismatch` can enter fork-evidence evaluation. [A09](A09-r01-group-encryption-and-key-changes.md) carries the committer and catch-up author rules.
 
 Document upgrade and downgrade limits. Test state produced by a real supported older release. Preserve retained data when a downgrade cannot read it.
 
@@ -112,13 +115,13 @@ Compressing all detail into 15 large records would change the file count without
 
 ## Acceptance
 
-Verify all 102 record mappings and complete the clause-level transfer. Check archived hashes, frozen evidence, links, revision chains and the 15-slot limit.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). The accepted slots are the live decision authority. The archived numbered records and rulings digest remain the historical record and the primary sources; where a slot is silent on a detail an archived accepted record settles, that archived record still answers it.
 
-Publish one short current capability guide. Update the repository instructions and documentation mirror when the migration is applied.
+The clause-level transfer review in [TRANSFER.md](TRANSFER.md) remains open as documentation work. It verifies coverage; it no longer gates slot acceptance. Archived hashes, frozen evidence and the 15-slot limit stay checked by CI.
 
 ## Matters to settle
 
-The 15-slot direction was confirmed by David (D198) on 5 October 2026. He accepted the archive transfer on 10 October 2026. Archived decisions still govern implementation. Complete the clause-level transfer review and acceptance controls before activating replacements.
+Complete the clause-level transfer review as documentation follow-up. Publish one short current capability guide. Keep the repository instructions and documentation mirror aligned with the accepted set.
 
 ## Existing decision records
 

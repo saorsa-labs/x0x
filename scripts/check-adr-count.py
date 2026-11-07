@@ -15,6 +15,8 @@ cannot be resolved. The set does not come from the working-tree
 ``TRANSFER.md``. A path is excluded only when that history approves it,
 ``move.json`` records it, and the table has exactly one valid slot row for
 it. A transfer row or ``move.json`` entry outside that set is rejected.
+A ``move.json`` entry may also archive a ``docs/adr/transient/T-<slug>.md``
+record that existed at the trusted pre-change commit (the 7 Nov 2026 fold).
 Files under ``docs/adr/transient/`` do not count (D242). A nested file that
 reuses a mapped number counts. A legal run prints the pass line only.
 
@@ -40,6 +42,7 @@ SLOT_LINK = re.compile(
     r"\]\((A(?:0[1-9]|1[0-5])-r\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\.md)\)"
 )
 NUMBERED_REPO_PATH = re.compile(r"^docs/adr/\d{4}-[a-z0-9][a-z0-9-]*\.md$")
+TRANSIENT_REPO_PATH = re.compile(r"^docs/adr/transient/T-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
 # David placed these two after the original 100-row source set.
 EXPLICIT_HISTORICAL_ADDITIONS = {
     "docs/adr/0115-identity-discovery-authority.md",
@@ -229,14 +232,24 @@ def _history_base(repo: Path) -> str:
 
 
 def approved_historical_sources(root: Path | None = None) -> set[str]:
-    """Numbered ADR paths before this change, including 0115 and 0116.
+    """Numbered and transient ADR paths before this change.
 
-    The working-tree transfer table cannot add a path to this set. The
-    candidate HEAD cannot add a path either.
+    The numbered set includes 0115 and 0116. The transient set covers the
+    `docs/adr/transient/T-<slug>.md` records that existed at the trusted
+    pre-change commit, so a recorded fold move (7 Nov 2026 reconciliation)
+    is not an invented archive record. The working-tree transfer table
+    cannot add a path to this set. The candidate HEAD cannot add a path
+    either.
     """
     repo = _git_repo(root)
-    listing = _git(["ls-tree", "--name-only", _history_base(repo), "docs/adr/"], repo)
-    found = {line for line in listing.splitlines() if NUMBERED_REPO_PATH.match(line)}
+    listing = _git(
+        ["ls-tree", "-r", "--name-only", _history_base(repo), "docs/adr/"], repo
+    )
+    found = {
+        line
+        for line in listing.splitlines()
+        if NUMBERED_REPO_PATH.match(line) or TRANSIENT_REPO_PATH.match(line)
+    }
     missing = EXPLICIT_HISTORICAL_ADDITIONS - found
     if missing:
         raise ValueError(

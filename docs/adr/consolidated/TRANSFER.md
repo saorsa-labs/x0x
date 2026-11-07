@@ -3,8 +3,14 @@
 Source commit: `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. The source set contains 100 numbered ADRs.
 David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026. Those two rows are after the source set.
 
+David accepted the 15 slots at their current revisions on 7 November 2026
+(course-correction directive, ruling 2). The accepted slots are the live
+decision authority; this map and the archived records are the historical
+record. The clause-review columns below remain open as documentation work;
+they verify coverage and no longer gate slot acceptance.
+
 Every row has one primary home. Related ADRs can cite other slots.
-**All clause reviews remain pending.** A mapping is not formal supersession.
+A mapping alone is not clause-level supersession.
 
 | Source ADR | Status at source | Primary home | Clause review |
 |---|---|---|---|
@@ -119,10 +125,10 @@ to their destination slots. D196–D200 were checked against the charter and the
 on 5 October 2026. The digest holds the ruling text; the topic column below is
 only a locator. Ruling ranges include every D-row in that range.
 
-**Pending means the clause transfer remains open, not that David has not
-ruled.** An accepted source ADR or a ruled value does not accept a replacement
-slot. A01–A15 in a row means every slot. Retain the named source gates until
-David accepts the transfer. See A08 for the exact D196 gate and D63 order.
+**Pending means the clause transfer review remains open, not that David has
+not ruled.** A01–A15 in a row means every slot. David accepted the slots on
+7 November 2026; the named source gates stay in force until a clause review
+retires them. See A08 for the exact D196 gate and D63 order.
 
 | Ruling | Topic to retain | Destination slots | Transfer status |
 |---|---|---|---|
@@ -232,4 +238,5 @@ Preserve frozen grounding files with their accepted records. Recheck the map
 against main before activation; source records can change while teams work.
 
 An old Proposed, Rejected or Superseded record does not become Accepted
-because this map links to it. Read the existing status overlay as well.
+because this map links to it. The retired status overlay is archived at
+[legacy-index-and-status-overlay.md](../../adr-archive/legacy-index-and-status-overlay.md).

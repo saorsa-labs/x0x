@@ -3,17 +3,19 @@
 - **Status:** maintained digest, not an ADR. It records the design rulings
   David Irvine made from 2026-09-28 to 2026-10-05 (decisions D01–D200 and the
   efficiency decisions E-D1–E-D17).
-- **Updated:** 2026-10-19 (authoring-rule overlay).
-- **Relationship to ADRs:** ADRs remain the decision records. Acceptance needs
-  David, with the [19 Oct 2026 transient consensus exception](../adr/transient/README.md).
-  Where a ruling here changes what an Accepted ADR
-  means in practice, the status overlay at the top of the
-  [ADR README](../adr/README.md) says so. New work follows the ruling until the named successor ADR is
-  decided.
-- **ADR numbers marked (prov.)** are provisional. The real number is
-  allocated when the ADR PR is opened on `main`.
-- **Keep in sync:** a PR that changes a ruling updates this file and the ADR
-  README overlay together.
+- **Updated:** 2026-11-07 (ADR reconciliation: the accepted 15 slots are the
+  live authority).
+- **Relationship to ADRs:** the [accepted 15 ADR set](../adr/consolidated/README.md)
+  is the live decision authority (David, 7 Nov 2026, course-correction
+  directive, ruling 2). Acceptance of a change needs David, with the
+  [19 Oct 2026 transient consensus exception](../adr/transient/README.md).
+  The archived numbered records and the
+  [retired status overlay](../adr-archive/legacy-index-and-status-overlay.md)
+  are the historical record of how these rulings reached the slots.
+- **ADR numbers marked (prov.)** are provisional and historical. Under the
+  19 Oct 2026 rule no new ADR file is opened for them.
+- **Keep in sync:** a PR that changes a ruling updates this file and the
+  affected slot together, on David's instruction.
 
 ## Current authoring rule (19 Oct 2026)
 
@@ -337,7 +339,7 @@ and D29 (an ADR 0089 slice pulled into v0.46).
 | D195 | ADR 0094: SKILL.md installs only after the verified candidate's health holds; the prior guide is kept and restored in recovery. | Ruled (2026-10-05) |
 | D196 | W3-H is verdict-stable: all 20 CI reruns give the same verdict with complete structured receipts (setup, evidence, delivered request, exact cause for RED; every precondition for GREEN). Byte-identical canonical traces are reported but non-blocking; ordering and entropy work continues. This satisfies D181 and supersedes the old identical-trace criterion. | Ruled (2026-10-05) |
 | D197 | EvidenceV1 admission for relationship peers (same group roster, same owner, grant counterparty) needs not-Blocked trust; Unknown is allowed, Blocked is refused, and the evidence must verify. This matches ADR 0089 decision 2. | Ruled (2026-10-05) |
-| D198 | The 100 numbered ADRs consolidate into 15 replacement slots A01–A15. The direction and approximately 80% ASD-STE100 target for ADRs, docs and PR text are confirmed by David; drafts stay Proposed until he accepts the transfer. Keep technical terms; no claim of formal compliance. | Ruled (2026-10-05); transfer Pending |
+| D198 | The 100 numbered ADRs consolidate into 15 replacement slots A01–A15. The direction and approximately 80% ASD-STE100 target for ADRs, docs and PR text are confirmed by David; drafts stay Proposed until he accepts the transfer. Keep technical terms; no claim of formal compliance. | Ruled (2026-10-05); slots accepted 7 Nov 2026 |
 | D199 | During transfer, new or changed decisions use the numbered ADR series only (ADR 0087). Slot revisions are drafts. Reserved numbers stand: 0090/0091 (D18), 0097 (D20), 0098 (D35), 0084–0105 (D63). Slices 0109–0114 continue to numbered acceptance. | Ruled (2026-10-05); the new-decision route is superseded by D242 (2026-10-10): new or changed decisions are transient records in `docs/adr/transient/`. The reserved numbers and the 0109–0114 lanes stand. |
 | D200 | Accepted ADR 0040 stands: task-list CRDT `owner_agent`, with transfers signed by the current owner. A12 states that decision and reports implementation separately; the decision is not deferred. | Ruled (2026-10-05) |
 | D283 | #1659: once this receiver can attribute a machine revocation to an agent, the DM inbox requires that sender's origin attestation and refuses an unattested DM or ACK, including from an older pre-#213 peer. The wire format is unchanged. | Ruled (David, 28 Oct 2026, 02:08 GMT). Next free number after D282. |

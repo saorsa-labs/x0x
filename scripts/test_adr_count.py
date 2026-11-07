@@ -154,6 +154,47 @@ class AdrCountTests(unittest.TestCase):
             errors,
         )
 
+    def test_folded_transient_move_entries_are_approved(self):
+        manifest = json.loads(
+            (self.root / "docs/adr-archive/move.json").read_text(encoding="utf-8")
+        )
+        transient_moves = [
+            entry["from"]
+            for entry in manifest["moves"]
+            if entry["from"].startswith("docs/adr/transient/")
+        ]
+        self.assertEqual(len(transient_moves), 17)
+        self.assertEqual(CHECK.validate(self.root), [])
+        approved = CHECK.approved_historical_sources()
+        for src in transient_moves:
+            self.assertIn(src, approved)
+
+    def test_invented_transient_archive_is_rejected(self):
+        name = "T-invented-record.md"
+        payload = b"# Invented\n"
+        archive = self.root / "docs/adr-archive/transient"
+        archive.mkdir(exist_ok=True)
+        (archive / name).write_bytes(payload)
+        source = self.root / "docs/adr/transient" / name
+        source.symlink_to(f"../../adr-archive/transient/{name}")
+        manifest_path = self.root / "docs/adr-archive/move.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["moves"].append(
+            {
+                "from": f"docs/adr/transient/{name}",
+                "to": f"docs/adr-archive/transient/{name}",
+                "link": f"../../adr-archive/transient/{name}",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        )
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        errors = CHECK.validate(self.root)
+        self.assertIn(
+            f"docs/adr/transient/{name}: newly invented archive record is not in "
+            "the approved historical source set.",
+            errors,
+        )
+
     def test_transfer_row_cannot_approve_an_invented_archive(self):
         name = "0117-review-invented.md"
         payload = b"# Invented\n"

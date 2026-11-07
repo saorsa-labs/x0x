@@ -1,14 +1,14 @@
 # A01 Purpose and Product Limits
 
-- **Status:** Proposed
+- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
 - **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the transfer and acceptance checks in A15.
-- **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
+- **Replacement activation:** Active since 7 November 2026. The 15 accepted slots are the live decision authority.
+- **Supersedes:** The archived numbered records mapped to this slot in [TRANSFER.md](TRANSFER.md). The archive stays the historical record. Existing implementation gates remain in force.
 
-These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). They are the live decision authority. The numbered records stay in [docs/adr-archive](../../adr-archive/ARCHIVE.md) as the historical record. [docs/adr-archive/move.json](../../adr-archive/move.json) records the archive transfer David accepted on 10 October 2026. Use the [index](README.md) for the current rules.
 
 x0x connects people, their agents and their machines so they can collaborate. It supplies identity, permissions, communication, shared data and work coordination. This decision sets the boundary for the other 14 ADRs.
 
@@ -34,8 +34,8 @@ Core capabilities in this tree are:
 
 Target capabilities are:
 
-- Projects. A project is one group, the shared data that group may use, and the agents shared into that work. David accepted the record (D275, 14 Oct 2026) and did not fold it: [T-projects-and-agent-rental](../transient/T-projects-and-agent-rental.md). No project type is shipped.
-- Agent rental. Rental is time-bounded use of a shared agent through ShareGrant expiry and revocation. David accepted this amendment (D275, 14 Oct 2026). The billing exclusion no longer rules rental out. Rental adds no price, invoice or marketplace. It is not shipped.
+- Projects. A project is one group, the shared data that group may use, and the agents shared into that work. The group supplies membership and authority. A project adds no second identity and no second permission system. David accepted the record (D275, 14 Oct 2026); it is folded here (archived as [T-projects-and-agent-rental](../../adr-archive/transient/T-projects-and-agent-rental.md)). No project type is shipped, and no project identifier, API or store exists.
+- Agent rental. Rental is time-bounded use of a shared agent through ShareGrant expiry and revocation. The grant names the recipient, the agent, the actions and the expiry. Revocation ends the rental, and re-sharing stays denied unless a later accepted decision permits it. David accepted this amendment (D275, 14 Oct 2026). The billing exclusion no longer rules rental out. Rental adds no price, invoice or marketplace. It is not shipped.
 - Scoped scratchpads.
 - The complete resource envelope for network traffic, CPU, memory, disk and idle cost. [A06](A06-r01-gossip-relay-roles-and-resource-limits.md) keeps that envelope incomplete.
 
@@ -83,9 +83,15 @@ ADR 0095 is Accepted and archived. This draft does not edit its text.
 
 David ruled D246 on 11 Oct 2026. He closed ADR 0095 open question 4 (Goal E under rule 5).
 
-Goal E counts in place of an R under rule 5 when the change keeps the wire format, API, stored format and dependencies unchanged, and the rule-21 delivery matrix shows no loss. The decision states a target gain when Proposed. It is Folded only after a measured before-and-after result that meets E-D15 rule 15. Any wire, protocol, API or dependency change needs a transient ADR (D242) that names an R.
+Goal E counts in place of an R under rule 5 when the change keeps the wire format, API, stored format and dependencies unchanged, and the rule-21 delivery matrix shows no loss. The decision states a target gain when Proposed. It is Folded only after a measured before-and-after result that meets E-D15 rule 15. Any wire, protocol, API or dependency change still names an R and uses its existing approval gate.
 
-The full record is the transient decision [T-goal-e-rule-5](../transient/T-goal-e-rule-5.md) (D247). David accepted it (D255, 2026-10-12).
+Apply the rule in this order (D247, accepted D255, 2026-10-12; archived as [T-goal-e-rule-5](../../adr-archive/transient/T-goal-e-rule-5.md)):
+
+1. Scope test. Check four surfaces: the wire format, the API, the stored format and the dependencies. If one changes, goal E alone is not enough; name an R.
+2. Delivery. Attach the rule-21 delivered and published matrix. Own-origin, inbox, targeted and revocation classes stay at 100%, and no pair falls below the baseline.
+3. Target. The Proposed decision states the target gain and how it will be measured.
+4. Measurement. The result meets E-D15 rule 15: gates use histograms, not means; gating rates need at least 5 deploys per arm; p90 needs at least 30 samples and p95 at least 60; public-mesh rows never gate; evidence is collected at the shipped default log level, first on a sealed, all-upgraded mesh (rule 14).
+5. Lifecycle. David accepts the decision. It is complete only after the measured result is attached. The other E-D15 rules still apply to every PR.
 
 ## Existing decision records
 
@@ -98,6 +104,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
-Shipped claims in the 13 October 2026 vision text were checked on 14 October 2026 at commit `86a1d395` on `origin/main`. Grant caps are `ShareCap` in `src/share_grant.rs` (`Dm`, `Exec`, `Connect`, `GroupInvite`, `Call`). Presets are `GroupPolicyPreset` in `src/groups/policy.rs` (`private_secure`, `public_request_secure`, `public_open`, `public_announce`). The agent card route is `get_a2a_agent_card` in `src/server/routes/identity.rs`. Voice is `X0xSignaling` and `X0xLinkTransport` in `src/voice/mod.rs`, behind feature `voice`. Call routes in `src/server/routes/calls.rs` cover lifecycle only. Those routes are experimental and carry no media. Release builds lack `voice`. Projects, rental and scratchpads stay targets. David accepted these amendments (D275, 14 Oct 2026). This slot stays Proposed. This note does not fold them into a new revision.
+Shipped claims in the 13 October 2026 vision text were checked on 14 October 2026 at commit `86a1d395` on `origin/main`. Grant caps are `ShareCap` in `src/share_grant.rs` (`Dm`, `Exec`, `Connect`, `GroupInvite`, `Call`). Presets are `GroupPolicyPreset` in `src/groups/policy.rs` (`private_secure`, `public_request_secure`, `public_open`, `public_announce`). The agent card route is `get_a2a_agent_card` in `src/server/routes/identity.rs`. Voice is `X0xSignaling` and `X0xLinkTransport` in `src/voice/mod.rs`, behind feature `voice`. Call routes in `src/server/routes/calls.rs` cover lifecycle only. Those routes are experimental and carry no media. Release builds lack `voice`. Projects, rental and scratchpads stay targets. David accepted these amendments (D275, 14 Oct 2026). They are folded into this slot as of 7 November 2026.
 
 [All 15 ADRs](README.md)
