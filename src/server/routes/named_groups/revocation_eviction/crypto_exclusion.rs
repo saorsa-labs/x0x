@@ -8882,7 +8882,12 @@ mod daemon_tests {
     #[tokio::test]
     async fn a_keyless_commit_keeps_the_first_foreign_share_replaceable() -> Result<()> {
         use anyhow::Context as _;
-        let other_admin = AgentId([0xfe; 32]);
+        // The highest raw ID, so the fixture's admin stays designated
+        // (D74: the lowest eligible admin is designated). With
+        // `[0xfe; 32]`, a random fixture admin ID that starts `0xff`
+        // (about 1 run in 256) ranked 1 and could not author the frame
+        // before the 18 s designated window.
+        let other_admin = AgentId([0xff; 32]);
         let other_admin_hex = hex::encode(other_admin.as_bytes());
         let fx = gss_leave_fixture_seated(
             Some((other_admin, x0x::groups::GroupRole::Admin)),
@@ -8895,6 +8900,10 @@ mod daemon_tests {
             .key_republish_suppressed
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let admin = fx.state.agent.agent_id();
+        anyhow::ensure!(
+            admin.as_bytes() < other_admin.as_bytes(),
+            "the fixture's admin must be the designated admin"
+        );
         let survivor_hex = hex::encode(fx.replica.agent.agent_id().as_bytes());
         let survivor_kem_b64 = base64::engine::general_purpose::STANDARD
             .encode(&fx.replica.agent_kem_keypair.public_bytes);
