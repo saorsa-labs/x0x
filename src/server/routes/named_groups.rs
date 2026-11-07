@@ -1332,6 +1332,17 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     /// equals the local head after the page is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     responder_state_hash: Option<String>,
+    /// #1597 item 5b (additive; David's approval, 7 Nov 2026 03:46 GMT):
+    /// the revision of the saved head in `responder_state_hash`. It is
+    /// present exactly when that head is a known group's saved head, and
+    /// absent on every answer that omits the head, on the unknown-group
+    /// answer, and on an old peer (serde default `None`, so old answers
+    /// still decode; old peers ignore the field). The asker uses it only
+    /// for ADR 0110 §2 head sync: a head it cannot link at a revision
+    /// below its retained commit log window is a far-behind holder, not
+    /// conflicting-head evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    responder_state_revision: Option<u64>,
 }
 
 /// Authenticated direct-channel bootstrap for a newly-added member of a
@@ -12516,6 +12527,7 @@ async fn member_keyed_treekem_catchup_response(
         events: event.into_iter().collect(),
         truncated: false,
         responder_state_hash: None,
+        responder_state_revision: None,
     })
 }
 
@@ -12912,6 +12924,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
                 info.state_hash.clone(),
                 info.shared_secret.is_some(),
                 revocation_eviction::crypto_exclusion::own_seat_cannot_take_a_share(state, info),
+                info.state_revision,
             );
             (info.has_active_member(&sender_hex), keys, Some(claim))
         } else {
@@ -12952,17 +12965,21 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
     // member of any other plane, and a group this responder does not
     // know included — keeps main's answer: the saved head, present and
     // empty for the unknown group.
-    let saved_head = match &held_group {
-        Some((gss_plane, encrypted, saved_head, has_secret, own_seat_keyless)) => {
-            gss_share_hold::reported_head(
+    // #1597 item 5b: the revision travels only with a known group's
+    // saved head. The unknown-group answer's empty head claims none.
+    let (saved_head, saved_revision) = match &held_group {
+        Some((gss_plane, encrypted, saved_head, has_secret, own_seat_keyless, revision)) => {
+            let head = gss_share_hold::reported_head(
                 *gss_plane,
                 *encrypted,
                 saved_head,
                 *has_secret,
                 *own_seat_keyless,
-            )
+            );
+            let revision = head.is_some().then_some(*revision);
+            (head, revision)
         }
-        None => Some(String::new()),
+        None => (Some(String::new()), None),
     };
     // ADR 0110 §4: crypto-only exclusions in the requested range go to a
     // capable requester on their own gated carrier, never in this page.
@@ -13051,6 +13068,7 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         events,
         truncated,
         responder_state_hash: saved_head,
+        responder_state_revision: saved_revision,
     };
     let payload = match serde_json::to_vec(&response) {
         Ok(payload) => payload,
@@ -13390,6 +13408,10 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         response_info.state_hash.clone(),
     );
     let reported_head = response.responder_state_hash.clone();
+    // #1597 item 5b: the revision counts only with the head it came with.
+    let response_revision = reported_head
+        .as_ref()
+        .and(response.responder_state_revision);
     let mut events = response.events;
     events.sort_by_key(treekem_membership_event_sort_key);
     let page_served_ahead = events.iter().any(|event| {
@@ -13751,6 +13773,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
             &fence_ids,
             &sender_hex,
             reported_head.as_deref(),
+            response_revision,
         )
         .await;
         self_leave_startup_note_verified_head(
@@ -52347,6 +52370,7 @@ pub(in crate::server) mod tests {
     mod issue1570_held_back_tombstone;
     mod issue1574_persist_preflight_refusal;
     mod issue1577_revoked_catchup_request;
+    mod issue1597_responder_state_revision;
     mod issue1616_machine_revoked_catchup;
     mod issue1622_binding_revoked_catchup;
     mod issue1623_pre_welcome_page_links;
@@ -68480,6 +68504,7 @@ pub(in crate::server) mod tests {
             events: Vec::new(),
             truncated: false,
             responder_state_hash: None,
+            responder_state_revision: None,
         };
         let encoded = serde_json::to_value(&response).expect("catch-up response serializes");
         assert_eq!(encoded["message_type"], "treekem_catchup_response");
@@ -71561,6 +71586,7 @@ pub(in crate::server) mod tests {
             events: vec![fixture.event.clone()],
             truncated: false,
             responder_state_hash: None,
+            responder_state_revision: None,
         };
 
         // Negative control: the roster commits other bytes for the seat.
@@ -71635,6 +71661,7 @@ pub(in crate::server) mod tests {
             events: vec![fixture.event.clone()],
             truncated: false,
             responder_state_hash: None,
+            responder_state_revision: None,
         };
         let unauthorized = x0x::identity::AgentKeypair::generate()?;
         handle_treekem_catchup_response(

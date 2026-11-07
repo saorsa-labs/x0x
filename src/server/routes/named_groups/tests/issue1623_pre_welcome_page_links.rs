@@ -175,6 +175,7 @@ async fn deliver_page(
             events,
             truncated: false,
             responder_state_hash: None,
+            responder_state_revision: None,
         },
     )
     .await;
@@ -823,6 +824,7 @@ async fn pre_welcome_page_that_applies_nothing_stops_the_page_loop() -> anyhow::
         events: vec![event],
         truncated: true,
         responder_state_hash: None,
+        responder_state_revision: None,
     };
     handle_treekem_catchup_response(
         &state,

@@ -317,10 +317,12 @@ const HEAD_ROUND_REASK: Duration = Duration::from_secs(2);
 /// A retry or a new round never erases unresolved evidence (§2: "no known
 /// higher/conflicting head ... may remain unresolved"). The evidence of a
 /// holder clears only when that holder itself reports a head on the local
-/// chain, or when it is no longer a holder. A new local head does not
-/// clear it either: the round keeps only the holder, not the head it
-/// reported, so the new round asks that holder again and classifies its
-/// new answer against the new local chain.
+/// chain or a revision below the retained window
+/// ([`HeadReport::BelowRetainedWindow`], #1597 item 5b), or when it is no
+/// longer a holder. A new local head does not clear it either: the round
+/// keeps only the holder, not the head it reported, so the new round asks
+/// that holder again and classifies its new answer against the new local
+/// chain.
 #[derive(Debug, Clone)]
 struct HeadRound {
     /// The local head this round confirms.
@@ -474,16 +476,55 @@ enum HeadReport {
     /// not yet received this node's own exclusion). The holder holds
     /// nothing this node lacks.
     OnLocalChain,
+    /// #1597 item 5b (David's ruling, 7 Nov 2026 03:46 GMT, an approved
+    /// change to ADR 0110 §2): a head this node cannot link, at a
+    /// revision the holder reports (`responder_state_revision`) below the
+    /// retained window ([`retained_window_floor`]). The holder is far
+    /// behind. Its head is not conflicting-head evidence: the report adds
+    /// none and clears the holder's earlier evidence. The revision is
+    /// only the holder's claim, so the report does not confirm the round
+    /// and is no §3 survivor convergence evidence. A sibling fork that
+    /// split below the window is not detected this way; the ruling
+    /// accepts that.
+    BelowRetainedWindow,
     /// A head this node does not have: a later head, or a sibling. This
-    /// is unresolved higher-head evidence (§2).
+    /// is unresolved higher-head evidence (§2). A head this node cannot
+    /// link with no reported revision (an old peer) stays here too.
     Unknown,
+}
+
+/// The lowest revision for which the local verified chain knows the head
+/// hash: the parent of the oldest retained commit, or the current head
+/// when the commit log is empty (capped at
+/// [`x0x::groups::COMMIT_LOG_CAP`], or cleared). A report at this
+/// revision or above, with a hash this node cannot link, is a later
+/// head, a sibling or a revision in a gap of the log, and stays
+/// [`HeadReport::Unknown`].
+fn retained_window_floor(info: &GroupInfo) -> u64 {
+    info.commit_log
+        .iter()
+        .map(|retained| {
+            if retained.commit.prev_state_hash.is_some() {
+                retained.commit.revision.saturating_sub(1)
+            } else {
+                retained.commit.revision
+            }
+        })
+        .fold(info.state_revision, u64::min)
 }
 
 /// Classify `reported` against the local verified chain: the current head
 /// and every head the retained commit log links (each commit's own hash
 /// and its parent). A head older than the retained log cannot be proved
-/// an ancestor and stays [`HeadReport::Unknown`].
-fn classify_head_report(info: &GroupInfo, reported: &str) -> HeadReport {
+/// an ancestor. It is [`HeadReport::BelowRetainedWindow`] when the holder
+/// reports a revision below [`retained_window_floor`], and otherwise
+/// stays [`HeadReport::Unknown`] (ADR 0110 §2 as changed by David's
+/// ruling of 7 Nov 2026).
+fn classify_head_report(
+    info: &GroupInfo,
+    reported: &str,
+    reported_revision: Option<u64>,
+) -> HeadReport {
     let on_chain = reported == info.state_hash
         || info.commit_log.iter().any(|retained| {
             retained.commit.state_hash == reported
@@ -491,6 +532,8 @@ fn classify_head_report(info: &GroupInfo, reported: &str) -> HeadReport {
         });
     if on_chain {
         HeadReport::OnLocalChain
+    } else if reported_revision.is_some_and(|revision| revision < retained_window_floor(info)) {
+        HeadReport::BelowRetainedWindow
     } else {
         HeadReport::Unknown
     }
@@ -521,7 +564,9 @@ fn installed_heads(info: &GroupInfo, reported: &str) -> BTreeSet<String> {
 /// round: it answered and holds no later head. A holder at a head this
 /// node does not have blocks the seal (the stale-replica protection).
 /// Only a report about a later or sibling head is evidence; a survivor
-/// that is behind must not block the delivery that brings it forward. A
+/// that is behind must not block the delivery that brings it forward,
+/// also when it is behind the retained commit log
+/// ([`HeadReport::BelowRetainedWindow`], #1597 item 5b). A
 /// report for a new local head starts the new round first, and keeps the
 /// unresolved evidence ([`HeadRound::restart`]).
 fn note_head_report(
@@ -545,6 +590,14 @@ fn note_head_report(
     match report {
         HeadReport::OnLocalChain => {
             round.confirmed = true;
+            round.conflicting.remove(&sender);
+        }
+        // #1597 item 5b: the holder's last report is far behind, so it no
+        // longer holds a head this node lacks and its evidence clears. A
+        // revision the holder only claims proves no head of the local
+        // chain, so it does not confirm the round: with no proven holder
+        // the bounded wait ends discovery (D73).
+        HeadReport::BelowRetainedWindow => {
             round.conflicting.remove(&sender);
         }
         HeadReport::Unknown => {
@@ -1001,11 +1054,16 @@ pub(in crate::server) async fn s4_gate_probe_for_test(
 /// prove the head the sender reported reached the local chain
 /// (ADR 0110 §2). Every other sender's hash-less answer is exactly
 /// main's reply — ignored, so the ask cadence still counts the sender.
+///
+/// `reported_revision` is the responder's `responder_state_revision`
+/// (#1597 item 5b), served with its head. `None` from an old peer keeps
+/// main's classification.
 pub(in crate::server) async fn note_catchup_head(
     state: &AppState,
     group_ids: &[String],
     sender_hex: &str,
     reported: Option<&str>,
+    reported_revision: Option<u64>,
 ) {
     let Ok(sender) = super::parse_agent_id_hex(sender_hex) else {
         return;
@@ -1029,7 +1087,7 @@ pub(in crate::server) async fn note_catchup_head(
                     info.state_hash.clone(),
                     reported.map(|reported| {
                         (
-                            classify_head_report(info, reported),
+                            classify_head_report(info, reported, reported_revision),
                             installed_heads(info, reported),
                         )
                     }),
@@ -5190,6 +5248,9 @@ fn now_unix_ms() -> u64 {
 }
 
 #[cfg(test)]
+mod head_window_tests;
+
+#[cfg(test)]
 pub(super) mod tests {
     use super::*;
 
@@ -5691,17 +5752,20 @@ pub(super) mod tests {
         let mut later = info.clone();
         later.seal_commit(&kp, 4)?;
 
-        assert_eq!(classify_head_report(&info, &head), HeadReport::OnLocalChain);
         assert_eq!(
-            classify_head_report(&info, &parent),
+            classify_head_report(&info, &head, None),
             HeadReport::OnLocalChain
         );
         assert_eq!(
-            classify_head_report(&info, &later.state_hash),
+            classify_head_report(&info, &parent, None),
+            HeadReport::OnLocalChain
+        );
+        assert_eq!(
+            classify_head_report(&info, &later.state_hash, None),
             HeadReport::Unknown
         );
         assert_eq!(
-            classify_head_report(&info, &sibling.state_hash),
+            classify_head_report(&info, &sibling.state_hash, None),
             HeadReport::Unknown
         );
 
@@ -5712,7 +5776,7 @@ pub(super) mod tests {
             let mut rounds = HashMap::new();
             let mut asks = HeadRoundAsks::new();
             refresh_head_round(&mut rounds, &mut asks, "g", &head, &[holder], now, wait);
-            let report = classify_head_report(&info, reported);
+            let report = classify_head_report(&info, reported, None);
             note_head_report(&mut rounds, &mut asks, "g", &head, holder, report, now);
             rounds
                 .get("g")
@@ -9653,7 +9717,14 @@ pub(super) mod tests {
                 },
             );
         // The served answer of a keyless survivor: the field is absent.
-        note_catchup_head(&state, std::slice::from_ref(&group_id), &survivor_hex, None).await;
+        note_catchup_head(
+            &state,
+            std::slice::from_ref(&group_id),
+            &survivor_hex,
+            None,
+            None,
+        )
+        .await;
         {
             let inner = state.revocation_evictions.inner.lock().await;
             assert!(
@@ -9680,6 +9751,7 @@ pub(super) mod tests {
             std::slice::from_ref(&group_id),
             &confirmer_hex,
             Some(&info.state_hash),
+            None,
         )
         .await;
         tokio::time::pause();
@@ -9696,6 +9768,7 @@ pub(super) mod tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             Some(&info.state_hash),
+            None,
         )
         .await;
         assert!(
@@ -9762,6 +9835,7 @@ pub(super) mod tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             Some(&info.state_hash),
+            None,
         )
         .await;
         let inner = state.revocation_evictions.inner.lock().await;
@@ -9849,6 +9923,7 @@ pub(super) mod tests {
                 &state,
                 std::slice::from_ref(&group_id),
                 &hex::encode(sender),
+                None,
                 None,
             )
             .await;
@@ -10258,6 +10333,7 @@ pub(super) mod tests {
             std::slice::from_ref(&group_id),
             &hex::encode(keyless),
             None,
+            None,
         )
         .await;
         let inner = state.revocation_evictions.inner.lock().await;
@@ -10327,6 +10403,7 @@ pub(super) mod tests {
             &state,
             std::slice::from_ref(&group_id),
             &hex::encode(keyless),
+            None,
             None,
         )
         .await;
