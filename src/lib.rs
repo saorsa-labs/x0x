@@ -13896,10 +13896,14 @@ impl Agent {
     ///
     /// # Security Note
     ///
-    /// This method does **not** apply trust filtering from `ContactStore`.
-    /// Messages from blocked agents will still be delivered. Use
-    /// [`recv_direct_annotated()`](Self::recv_direct_annotated) if you need
-    /// trust-based filtering.
+    /// The receive path drops a message before delivery when its trust
+    /// decision is [`TrustDecision::RejectBlocked`](trust::TrustDecision::RejectBlocked)
+    /// or [`TrustDecision::RejectMachineMismatch`](trust::TrustDecision::RejectMachineMismatch).
+    /// This method applies no other trust filter. Every other message,
+    /// including one from an unknown sender, is delivered. This method and
+    /// [`recv_direct_annotated()`](Self::recv_direct_annotated) return the
+    /// same messages. Inspect `msg.trust_decision` and `msg.verified` to
+    /// decide how to handle each message.
     ///
     /// # Returns
     ///
@@ -13998,13 +14002,19 @@ impl Agent {
             .cloned()
     }
 
-    /// Receive the next direct message, filtering by trust level.
+    /// Receive the next direct message with its trust annotations.
     ///
-    /// All messages now carry pre-computed `verified` and `trust_decision`
-    /// fields from the identity discovery cache and contact store. This
-    /// method passes through all messages — applications should inspect
-    /// `msg.trust_decision` and `msg.verified` to decide how to handle
-    /// each message.
+    /// Each message carries `verified` and `trust_decision` fields. The
+    /// receive path sets them from the identity discovery cache and the
+    /// contact store.
+    ///
+    /// Before delivery, the receive path drops a message whose trust
+    /// decision is [`TrustDecision::RejectBlocked`](trust::TrustDecision::RejectBlocked)
+    /// or [`TrustDecision::RejectMachineMismatch`](trust::TrustDecision::RejectMachineMismatch).
+    /// This method does not filter further. It reads the same queue as
+    /// [`recv_direct()`](Self::recv_direct) and returns the same messages.
+    /// Inspect `msg.trust_decision` and `msg.verified` to decide how to
+    /// handle each message.
     ///
     /// # Returns
     ///
@@ -14016,7 +14026,6 @@ impl Agent {
     /// loop {
     ///     if let Some(msg) = agent.recv_direct_annotated().await {
     ///         match msg.trust_decision {
-    ///             Some(TrustDecision::RejectBlocked) => continue, // skip
     ///             Some(TrustDecision::Accept) if msg.verified => { /* trusted */ }
     ///             _ => { /* handle accordingly */ }
     ///         }
