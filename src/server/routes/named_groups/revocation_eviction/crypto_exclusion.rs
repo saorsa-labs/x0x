@@ -5407,6 +5407,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             survivor_head.as_deref(),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -6091,6 +6092,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             parent.as_deref(),
+            None,
         )
         .await;
         if let Ok(mut scheduled) = fx
@@ -6158,6 +6160,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             Some(result_head.as_str()),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -6239,6 +6242,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             parent.as_deref(),
+            None,
         )
         .await;
         if let Ok(mut scheduled) = fx
@@ -6434,6 +6438,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         // The parent head — the answer David's ruled-out alternative
@@ -6446,6 +6451,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             parent.as_deref(),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -6526,6 +6532,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             reported.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -6658,6 +6665,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         {
@@ -6687,6 +6695,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             Some(&parent_head),
+            None,
         )
         .await;
         {
@@ -7015,6 +7024,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_ne!(
@@ -7195,6 +7205,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -7341,6 +7352,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_ne!(
@@ -7430,6 +7442,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -7884,6 +7897,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_ne!(
@@ -8136,6 +8150,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_ne!(
@@ -8224,6 +8239,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -11487,6 +11503,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
 
@@ -11627,6 +11644,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             reported.as_deref(),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -11688,6 +11706,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             reported.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -12069,6 +12088,7 @@ mod daemon_tests {
             std::slice::from_ref(&fx.group_id),
             &survivor_hex,
             served.as_deref(),
+            None,
         )
         .await;
         tokio::time::sleep(CE_RESEND_INTERVAL + Duration::from_millis(100)).await;
@@ -12209,6 +12229,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &member_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -12332,6 +12353,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &member_hex,
             served.as_deref(),
+            None,
         )
         .await;
         assert_eq!(
@@ -13314,6 +13336,7 @@ mod daemon_tests {
                 std::slice::from_ref(&self.group_id),
                 &self.survivor_hex,
                 reported,
+                None,
             )
             .await;
         }
@@ -13994,7 +14017,8 @@ mod daemon_tests {
                 let sender = control.survivor_hex.clone();
                 let head = control.result_head.clone();
                 tokio::spawn(async move {
-                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head)).await;
+                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head), None)
+                        .await;
                 })
             };
             // The report runs to the verdict's revocation-set read and
@@ -14020,7 +14044,8 @@ mod daemon_tests {
                 let sender = fx.survivor_hex.clone();
                 let head = fx.result_head.clone();
                 tokio::spawn(async move {
-                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head)).await;
+                    super::super::note_catchup_head(&state, &[group], &sender, Some(&head), None)
+                        .await;
                 })
             };
             tokio::task::yield_now().await;

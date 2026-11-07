@@ -52,6 +52,18 @@ values are the W3-H p99.9 measured numbers (D69/D73). The implementing PR
 body records them before any timing-dependent code merges. The fixed 2 s /
 5 s values stay rejected (D69). This draft does not choose new bounds.
 
+On 7 Nov 2026 03:46 GMT David approved a change to ADR 0110 §2 head
+sync (#1597 item 5b): "Yes, stop counting those older revisions as
+conflicting-head evidence and allow responder_state_revision with a
+compatibility default." The TreeKEM catch-up answer gets the optional
+field `responder_state_revision`; old peers omit it and keep the old
+rule. A holder is far behind when this node cannot link its head through
+the retained commit log and its revision is below the retained floor.
+Such a holder adds no conflicting-head evidence. It does not confirm the
+round. A sibling fork that split below the window is not detected. ADR
+0110 stays Accepted and its text is unchanged. The code and this slot
+carry the change.
+
 [A08](A08-r01-groups-home-membership-and-repair.md) defines valid group-state and fork recovery. A09 must not bypass that authority to obtain keys faster.
 
 ## Security claims

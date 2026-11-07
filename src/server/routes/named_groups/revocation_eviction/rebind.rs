@@ -3130,6 +3130,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             None,
+            None,
         )
         .await;
         assert!(
@@ -3167,6 +3168,7 @@ mod daemon_tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             Some(&info.state_hash),
+            None,
         )
         .await;
         let mut converged = false;
@@ -4505,6 +4507,7 @@ pub(super) mod restart_tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             Some(&unknown),
+            None,
         )
         .await;
         worker_step(&state).await;
@@ -4523,6 +4526,7 @@ pub(super) mod restart_tests {
             std::slice::from_ref(&group_id),
             &survivor_hex,
             Some(&info.state_hash),
+            None,
         )
         .await;
         worker_step(&state).await;
@@ -5444,6 +5448,7 @@ pub(super) mod restart_tests {
             std::slice::from_ref(&stable),
             &survivor_hex,
             Some(&unknown),
+            None,
         )
         .await;
         assert!(
@@ -5475,6 +5480,7 @@ pub(super) mod restart_tests {
             std::slice::from_ref(&stable),
             &survivor_hex,
             Some(&info.state_hash),
+            None,
         )
         .await;
         worker_step(&state).await;

@@ -69,6 +69,7 @@ fn truncated_catchup(group_id: &str) -> TreeKemCatchupResponse {
         events: Vec::new(),
         truncated: true,
         responder_state_hash: None,
+        responder_state_revision: None,
     }
 }
 

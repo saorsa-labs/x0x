@@ -162,6 +162,7 @@ async fn a_next_page_ask_to_a_sender_revoked_mid_handler_is_not_sent() -> Result
                 events: vec![event],
                 truncated: true,
                 responder_state_hash: Some("next-head".to_string()),
+                responder_state_revision: None,
             },
         )
         .await;
