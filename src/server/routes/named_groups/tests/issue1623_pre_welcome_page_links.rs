@@ -976,8 +976,12 @@ async fn page_from_responder(
             request,
         )
         .await;
-        let payload = recorder.lock().expect("recorder").pop();
-        let page: TreeKemCatchupResponse = serde_json::from_slice(&payload.unwrap_or_default())?;
+        let payload = recorder
+            .lock()
+            .expect("recorder")
+            .pop()
+            .expect("responder sent a catch-up response");
+        let page: TreeKemCatchupResponse = serde_json::from_slice(&payload)?;
         if page.events.is_empty() {
             break;
         }
@@ -1085,6 +1089,20 @@ async fn responder_serves_its_role_change_and_rename_to_a_pre_welcome_joiner() -
 /// removal first, which does not link to the joiner's base.
 #[tokio::test]
 async fn membership_catch_up_pages_through_logged_state_only_links() -> anyhow::Result<()> {
+    page_role_removal_rename(&[0, 1, 2]).await
+}
+
+/// The same chain, logged removal first (a membership link can reach the
+/// log before the state-only link it follows). The responder serves in
+/// chain order, not log order.
+#[tokio::test]
+async fn catch_up_serves_chain_order_when_the_removal_is_logged_first() -> anyhow::Result<()> {
+    page_role_removal_rename(&[1, 0, 2]).await
+}
+
+/// Role change, removal, rename on a real responder that logs them in
+/// `log_order` (indexes into the chain); the joiner pages to the head.
+async fn page_role_removal_rename(log_order: &[usize]) -> anyhow::Result<()> {
     let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
     let (responder, _responder_dir) = secure_endpoint_test_state().await?;
     let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
@@ -1131,9 +1149,9 @@ async fn membership_catch_up_pages_through_logged_state_only_links() -> anyhow::
     let key = install_stub(&joiner, stub).await?;
     install_stub(&responder, ahead).await?;
     seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
-    // The production log path, in signing order.
-    for event in &events {
-        remember_treekem_membership_event(&responder, event).await;
+    // The production log path, in `log_order`.
+    for index in log_order {
+        remember_treekem_membership_event(&responder, &events[*index]).await;
     }
 
     let served = page_from_responder(&joiner, &responder, &key).await?;
@@ -1201,12 +1219,25 @@ async fn state_only_links_keep_their_own_log_cap() -> anyhow::Result<()> {
         remember_treekem_membership_event(&state, &event).await;
         remember_treekem_membership_event(&state, &event).await;
     }
+    // A link this node did not sign: another actor, another commit
+    // signer, or both. Each half of the signer check refuses one case.
     let other = AgentKeypair::generate()?;
-    let foreign = rename(&mut ahead.clone(), &other, 999)?;
-    remember_treekem_membership_event(&state, &foreign).await;
+    let other_hex = hex::encode(other.agent_id().as_bytes());
+    let mut foreign_actor = rename(&mut ahead.clone(), owner, 997)?;
+    if let NamedGroupMetadataEvent::GroupMetadataUpdated { actor, .. } = &mut foreign_actor {
+        *actor = other_hex;
+    }
+    let mut foreign_signer = rename(&mut ahead.clone(), &other, 998)?;
+    if let NamedGroupMetadataEvent::GroupMetadataUpdated { actor, .. } = &mut foreign_signer {
+        *actor = owner_hex.clone();
+    }
+    let foreign_both = rename(&mut ahead.clone(), &other, 999)?;
+    for foreign in [&foreign_actor, &foreign_signer, &foreign_both] {
+        remember_treekem_membership_event(&state, foreign).await;
+    }
 
     let logs = state.treekem_event_log.read().await;
-    let log = logs.get(&stable).cloned().unwrap_or_default();
+    let log = logs.get(&stable).expect("the log holds the group");
     let renames: Vec<_> = log
         .iter()
         .filter_map(|event| match event {
@@ -1224,10 +1255,12 @@ async fn state_only_links_keep_their_own_log_cap() -> anyhow::Result<()> {
         Some(format!("rename {extra}").as_str()),
         "the oldest state-only links go first"
     );
-    assert!(
-        !renames.iter().any(|name| name == "rename 999"),
-        "a link this node did not sign is not kept"
-    );
+    for foreign in ["rename 997", "rename 998", "rename 999"] {
+        assert!(
+            !renames.iter().any(|name| name == foreign),
+            "a link this node did not sign is not kept: {foreign}"
+        );
+    }
     assert!(
         log.iter()
             .any(|event| matches!(event, NamedGroupMetadataEvent::MemberRemoved { .. })),
@@ -1289,5 +1322,110 @@ async fn refused_state_only_page_stops_the_page_loop() -> anyhow::Result<()> {
         stops.contains(&(key, owner_hex, TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS)),
         "NO_PROGRESS stop recorded: {stops:?}"
     );
+    Ok(())
+}
+
+/// A responder's REST unban is logged and served; the pre-Welcome joiner
+/// applies it (on a TreeKEM group the unbanned seat becomes Removed).
+#[tokio::test]
+async fn responder_serves_its_unban_to_a_pre_welcome_joiner() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (responder, _responder_dir) = secure_endpoint_test_state().await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let owner = responder.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut base = base_group(owner, None)?;
+    seal_link(&mut base, owner, 1_500, |next| {
+        next.ban_member(&agent(BANNED), Some(owner_hex.clone()));
+    })?;
+    let key = install_stub(&joiner, base.clone()).await?;
+    install_stub(&responder, base).await?;
+    let response = unban_group_member(
+        State(Arc::clone(&responder)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path((key.clone(), agent(BANNED))),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the owner unbans");
+    let terminal = head_of(&responder, &key).await?;
+    seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
+
+    let served = page_from_responder(&joiner, &responder, &key).await?;
+
+    assert_eq!(served, ["member_unbanned"], "the unban is served");
+    let head = head_of(&joiner, &key).await?;
+    assert_eq!(
+        head.state_hash, terminal.state_hash,
+        "the joiner is at the head"
+    );
+    assert!(!head.is_banned(&agent(BANNED)), "the unban applied");
+    assert!(!head.has_active_member(&joiner_hex), "still pre-Welcome");
+    assert_no_tree(&joiner, &key).await;
+    Ok(())
+}
+
+/// ADR 0109 §2 rule (b): a pre-Welcome node refuses a link that changes
+/// the policy hash, and the `PolicyUpdated` apply has no pre-Welcome
+/// check. So the responder neither logs nor serves a policy link, from
+/// the REST path or from `remember_treekem_membership_event`.
+#[tokio::test]
+async fn policy_links_are_not_logged_or_served() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (responder, _responder_dir) = secure_endpoint_test_state().await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let owner = responder.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = base_group(owner, None)?;
+    let key = install_stub(&joiner, base.clone()).await?;
+    install_stub(&responder, base.clone()).await?;
+    let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
+        "discoverability": "public_directory"
+    }))?;
+    let response = update_group_policy(
+        State(Arc::clone(&responder)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(key.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the owner updates the policy"
+    );
+    let mut ahead = base.clone();
+    let commit = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.policy.discoverability = x0x::groups::GroupDiscoverability::PublicDirectory;
+    })?;
+    let policy = ahead.policy.clone();
+    remember_treekem_membership_event(
+        &responder,
+        &NamedGroupMetadataEvent::PolicyUpdated {
+            group_id: base.stable_group_id().to_string(),
+            revision: commit.revision,
+            actor: owner_hex,
+            policy,
+            commit: Some(commit),
+        },
+    )
+    .await;
+    let logged = responder
+        .treekem_event_log
+        .read()
+        .await
+        .values()
+        .any(|log| {
+            log.iter()
+                .any(|event| matches!(event, NamedGroupMetadataEvent::PolicyUpdated { .. }))
+        });
+    assert!(!logged, "no policy link is logged");
+    seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
+
+    let served = page_from_responder(&joiner, &responder, &key).await?;
+
+    assert!(served.is_empty(), "no policy link is served: {served:?}");
+    assert_eq!(head_of(&joiner, &key).await?.policy, base.policy);
     Ok(())
 }
