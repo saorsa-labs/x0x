@@ -96,7 +96,8 @@ pub(in crate::server) fn metadata_update<'a>(
 
 /// `PolicyUpdated`. The ordinary apply does not check the event's actor
 /// field; only the commit signer's [`ActionKind::AdminOrHigher`] is
-/// checked.
+/// checked. The GSS held-chain walk adds its own actor check: the actor
+/// must be the sender and an admin.
 pub(in crate::server) fn policy_update<'a>(
     cursor: &GroupInfo,
     revision: u64,
@@ -211,6 +212,32 @@ mod tests {
         }
         let same = cursor.policy.clone();
         assert!(policy_update(&cursor, 1, &same, 0).is_ok());
+    }
+
+    /// #1606 review: a rejection of a request that is not pending, and a
+    /// cancellation by an agent that is not the requester, are `Refused`.
+    #[test]
+    fn resolved_or_foreign_requests_are_refused() {
+        let admin = x0x::identity::AgentId([2; 32]);
+        let admin_hex = hex::encode(admin.as_bytes());
+        let requester = "ee".repeat(32);
+        let mut cursor = GroupInfo::new("g".into(), "d".into(), admin, "g".into());
+        let mut request = x0x::groups::JoinRequest::new("g".into(), requester.clone(), None, 0);
+        request.request_id = "r".into();
+        cursor.join_requests.insert("r".into(), request.clone());
+        // A pending request: only its requester may cancel it.
+        assert_eq!(
+            join_request_cancelled(&cursor, &admin_hex, "r", &requester).err(),
+            Some(StepRefusal::Refused)
+        );
+        assert!(join_request_rejected(&cursor, &admin_hex, "r", &admin_hex, 0).is_ok());
+        // A resolved request: no admin may reject it.
+        request.status = x0x::groups::JoinRequestStatus::Rejected;
+        cursor.join_requests.insert("r".into(), request);
+        assert_eq!(
+            join_request_rejected(&cursor, &admin_hex, "r", &admin_hex, 0).err(),
+            Some(StepRefusal::Refused)
+        );
     }
 
     /// #1606 review: a role update for an agent with no seat is

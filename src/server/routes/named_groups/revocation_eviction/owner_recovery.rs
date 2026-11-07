@@ -8376,10 +8376,12 @@ mod restart_tests {
 
     /// #1606 review: the walk refuses an unban on the TreeKEM plane, though
     /// the shared step and the commit check accept it. The plane rule is
-    /// the walk's own.
+    /// the walk's own: the same unban on the GSS plane (the control) is
+    /// walked.
     #[test]
     fn the_walk_refuses_a_treekem_unban() -> Result<()> {
         use super::super::super::event_steps as steps;
+        use x0x::mls::SecureGroupPlane;
         let (admin, banned) = (
             x0x::identity::AgentKeypair::generate()?,
             x0x::identity::AgentKeypair::generate()?,
@@ -8388,41 +8390,50 @@ mod restart_tests {
             hex::encode(admin.agent_id().as_bytes()),
             hex::encode(banned.agent_id().as_bytes()),
         );
-        let mut cursor = GroupInfo::new("t".into(), "d".into(), admin.agent_id(), "cd".repeat(32));
-        cursor.add_member(b.clone(), x0x::groups::GroupRole::Member, None, None);
-        cursor.ban_member(&b, Some(a.clone()));
-        cursor.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
-        cursor.seal_commit(&admin, 1)?;
-        let revision = cursor.roster_revision.saturating_add(1);
-        let step = || steps::unban(&cursor, &a, revision, &a, &b, 2).ok();
-        let (_, mutate) = step().context("the shared step accepts")?;
-        let mut next = cursor.clone();
-        mutate(&mut next);
-        next.roster_revision = revision;
-        let commit = next.seal_commit(&admin, 2)?;
-        let (action, mutate) = step().context("the shared step accepts")?;
-        anyhow::ensure!(
-            super::super::super::apply_stateful_event_to_group(&cursor, &commit, action, mutate)
+        for (plane, walked) in [
+            (SecureGroupPlane::Gss, true),
+            (SecureGroupPlane::TreeKem, false),
+        ] {
+            let mut cursor =
+                GroupInfo::new("t".into(), "d".into(), admin.agent_id(), "cd".repeat(32));
+            cursor.add_member(b.clone(), x0x::groups::GroupRole::Member, None, None);
+            cursor.ban_member(&b, Some(a.clone()));
+            cursor.secure_plane = plane;
+            cursor.seal_commit(&admin, 1)?;
+            let revision = cursor.roster_revision.saturating_add(1);
+            let step = || steps::unban(&cursor, &a, revision, &a, &b, 2).ok();
+            let (_, mutate) = step().context("the shared step accepts")?;
+            let mut next = cursor.clone();
+            mutate(&mut next);
+            next.roster_revision = revision;
+            let commit = next.seal_commit(&admin, 2)?;
+            let (action, mutate) = step().context("the shared step accepts")?;
+            anyhow::ensure!(
+                super::super::super::apply_stateful_event_to_group(
+                    &cursor, &commit, action, mutate
+                )
                 .is_ok(),
-            "the commit check accepts the unban"
-        );
-        let held = HeldEvent {
-            stable_group_id: cursor.stable_group_id().to_string(),
-            event: super::super::super::NamedGroupMetadataEvent::MemberUnbanned {
-                group_id: cursor.stable_group_id().to_string(),
-                revision,
-                actor: a,
-                agent_id: b,
-                commit: Some(commit),
-            },
-            author: admin.agent_id(),
-            prev_state_hash: Some(cursor.state_hash.clone()),
-            at: Instant::now(),
-        };
-        assert!(
-            next_held_state(&cursor, &held).is_none(),
-            "the walk refuses it"
-        );
+                "{plane:?}: the commit check accepts the unban"
+            );
+            let held = HeldEvent {
+                stable_group_id: cursor.stable_group_id().to_string(),
+                event: super::super::super::NamedGroupMetadataEvent::MemberUnbanned {
+                    group_id: cursor.stable_group_id().to_string(),
+                    revision,
+                    actor: a.clone(),
+                    agent_id: b.clone(),
+                    commit: Some(commit),
+                },
+                author: admin.agent_id(),
+                prev_state_hash: Some(cursor.state_hash.clone()),
+                at: Instant::now(),
+            };
+            assert_eq!(
+                next_held_state(&cursor, &held).is_some(),
+                walked,
+                "{plane:?}: the walk's decision"
+            );
+        }
         Ok(())
     }
 }
