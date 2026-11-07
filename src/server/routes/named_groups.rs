@@ -8,6 +8,7 @@
 
 mod control_blob;
 mod direct_metadata_lanes;
+mod event_steps;
 mod fair_admission;
 mod group_recovery;
 mod gss_share_hold;
@@ -18122,15 +18123,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // that changes or removes an existing OwnerCertified owner
             // axis, even inside an admin-signed commit — immutability is
             // enforced at apply time, not just at the authoring API.
-            if let Some(current_owner) = info.policy.admission.owner_certified_user_id() {
-                if policy.admission.owner_certified_user_id() != Some(current_owner) {
-                    tracing::warn!(
-                        group_id = %resolved_group_key,
-                        "PolicyUpdated: rejecting change/removal of the OwnerCertified axis"
-                    );
-                    return ApplyMetadataResult::REJECTED;
-                }
-            }
+            let (action, mutate) =
+                match event_steps::policy_update(&info, revision, &policy, commit.committed_at) {
+                    Ok(step) => step,
+                    Err(refusal) => {
+                        if refusal == event_steps::StepRefusal::OwnerAxisChanged {
+                            tracing::warn!(
+                                group_id = %resolved_group_key,
+                                "PolicyUpdated: rejecting change/removal of the OwnerCertified axis"
+                            );
+                        }
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -18140,8 +18145,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None,
                 roster_lock_already_held,
                 held_gss_guard,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| set_policy_update(next, revision, &policy, commit.committed_at),
+                action,
+                mutate,
             )
             .await
             else {
@@ -18168,51 +18173,43 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
-            let actor_role = info.caller_role(&actor);
-            let actor_authorized = actor == sender_hex
-                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized {
-                return ApplyMetadataResult::REJECTED;
-            }
-            let Some(target) = info
-                .members_v2
-                .get(&agent_id)
-                // #1578 rc11 (Claude blocking 1): the join's key-only
-                // marker row is not a seat. Treating it as one applied
-                // the role update against the joiner's pre-admission
-                // stub instead of parking it, so the joiner's own view
-                // lost its new role with no error.
-                .filter(|_| !join_seat_key_marker_only(&info, &agent_id))
-                .cloned()
-            else {
-                // #876 (issue item 3): the member's own MemberAdded has
-                // not reached this roster yet (its join blob can lag
-                // behind the control-blob staging budget) — or the only
-                // row is the join's key-only marker (#1578 rc11). Never
-                // drop the signed role update silently — park it and
-                // replay once the member lands. The apply result stays
-                // REJECTED so ordering semantics are unchanged.
-                park_role_update_for_late_member(
-                    state,
-                    &resolved_group_key,
-                    event_for_log.clone(),
-                    sender,
-                    &agent_id,
-                    allow_queue,
-                );
-                return ApplyMetadataResult::REJECTED;
+            // #1578 rc11 (Claude blocking 1): the join's key-only marker
+            // row is not a seat, so the step reads it as `NotSeated`.
+            // ADR-0016 reserved-role rationale: the REST authoring API
+            // rejects Owner/Moderator/Guest assignments. Signed gossip
+            // apply rejects only Owner because it is admin-equivalent;
+            // Moderator/Guest rank below Admin, grant no control
+            // authority, and remain replayable for validly signed
+            // legacy/cross-version convergence.
+            let (action, mutate) = match event_steps::role_update(
+                &info,
+                &sender_hex,
+                revision,
+                &actor,
+                &agent_id,
+                role,
+            ) {
+                Ok(step) => step,
+                Err(event_steps::StepRefusal::NotSeated) => {
+                    // #876 (issue item 3): the member's own MemberAdded has
+                    // not reached this roster yet (its join blob can lag
+                    // behind the control-blob staging budget) — or the only
+                    // row is the join's key-only marker (#1578 rc11). Never
+                    // drop the signed role update silently — park it and
+                    // replay once the member lands. The apply result stays
+                    // REJECTED so ordering semantics are unchanged.
+                    park_role_update_for_late_member(
+                        state,
+                        &resolved_group_key,
+                        event_for_log.clone(),
+                        sender,
+                        &agent_id,
+                        allow_queue,
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+                Err(_) => return ApplyMetadataResult::REJECTED,
             };
-            if target.is_removed() || target.is_banned() {
-                return ApplyMetadataResult::REJECTED;
-            }
-            // ADR-0016 reserved-role rationale: the REST authoring API rejects
-            // Owner/Moderator/Guest assignments. Signed gossip apply rejects only
-            // Owner because it is admin-equivalent; Moderator/Guest rank below
-            // Admin, grant no control authority, and remain replayable for
-            // validly signed legacy/cross-version convergence.
-            if role == x0x::groups::GroupRole::Owner {
-                return ApplyMetadataResult::REJECTED;
-            }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -18222,11 +18219,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None,
                 roster_lock_already_held,
                 held_gss_guard,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
-                    next.set_member_role(&agent_id, role);
-                },
+                action,
+                mutate,
             )
             .await
             else {
@@ -18474,12 +18468,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
-            let actor_role = info.caller_role(&actor);
-            let actor_authorized = actor == sender_hex
-                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized {
+            let Ok((action, mutate)) = event_steps::unban(
+                &info,
+                &sender_hex,
+                revision,
+                &actor,
+                &agent_id,
+                commit.committed_at,
+            ) else {
                 return ApplyMetadataResult::REJECTED;
-            }
+            };
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -18489,23 +18487,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None,
                 roster_lock_already_held,
                 held_gss_guard,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
-                    if next.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
-                        // #1578 rc11 (audit): the join's key-only marker
-                        // row is not a seat — main holds no row to flip.
-                        if !next.join_seat_key_marker_only(&agent_id) {
-                            if let Some(member) = next.members_v2.get_mut(&agent_id) {
-                                member.state = x0x::groups::GroupMemberState::Removed;
-                                member.updated_at = commit.committed_at;
-                                member.removed_by = None;
-                            }
-                        }
-                    } else {
-                        next.unban_member(&agent_id);
-                    }
-                },
+                action,
+                mutate,
             )
             .await
             else {
@@ -18913,18 +18896,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
-            let actor_role = info.caller_role(&actor);
-            let actor_authorized = actor == sender_hex
-                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized {
-                return ApplyMetadataResult::REJECTED;
-            }
-            let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
+            let Ok((action, mutate)) = event_steps::join_request_rejected(
+                &info,
+                &sender_hex,
+                &request_id,
+                &actor,
+                commit.committed_at,
+            ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if !req_snapshot.is_pending() {
-                return ApplyMetadataResult::REJECTED;
-            }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -18934,8 +18914,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None,
                 roster_lock_already_held,
                 held_gss_guard,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| set_join_request_rejected(next, &request_id, &actor, commit.committed_at),
+                action,
+                mutate,
             )
             .await
             else {
@@ -18959,15 +18939,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if sender_hex != requester_agent_id {
-                return ApplyMetadataResult::REJECTED;
-            }
-            let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
+            let Ok((action, mutate)) = event_steps::join_request_cancelled(
+                &info,
+                &sender_hex,
+                &request_id,
+                &requester_agent_id,
+            ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if req_snapshot.requester_agent_id != requester_agent_id || !req_snapshot.is_pending() {
-                return ApplyMetadataResult::REJECTED;
-            }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -18977,8 +18956,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None,
                 roster_lock_already_held,
                 held_gss_guard,
-                x0x::groups::ActionKind::NonMemberRequest,
-                |next| set_join_request_cancelled(next, &request_id, &requester_agent_id),
+                action,
+                mutate,
             )
             .await
             else {
@@ -19040,12 +19019,17 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
-            let actor_role = info.caller_role(&actor);
-            let actor_authorized = actor == sender_hex
-                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized {
+            let Ok((action, mutate)) = event_steps::metadata_update(
+                &info,
+                &sender_hex,
+                revision,
+                &actor,
+                &name,
+                &description,
+                commit.committed_at,
+            ) else {
                 return ApplyMetadataResult::REJECTED;
-            }
+            };
             let current = info.clone();
             let Ok(next) = apply_stateful_event_with_evidence(
                 state,
@@ -19055,17 +19039,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None,
                 roster_lock_already_held,
                 held_gss_guard,
-                x0x::groups::ActionKind::AdminOrHigher,
-                |next| {
-                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
-                    if let Some(n) = name.clone() {
-                        next.name = n;
-                    }
-                    if let Some(d) = description.clone() {
-                        next.description = d;
-                    }
-                    next.updated_at = commit.committed_at;
-                },
+                action,
+                mutate,
             )
             .await
             else {

@@ -1,0 +1,186 @@
+//! #1606: the pure step of an ordinary metadata event. The ordinary apply
+//! ([`super::apply_named_group_metadata_event`]) and the GSS later-admin
+//! held-chain walk (`owner_recovery::next_held_state`) both call it.
+//!
+//! A step holds three things: the event's own authority checks, the
+//! [`ActionKind`] that the commit signer must hold, and the [`GroupInfo`]
+//! change. It has no side effects. The apply adds its side effects
+//! (persist, card cache, parking). The walk adds its own GSS-only rules.
+//! So the walk and the apply accept the same commits from one rule, with
+//! no hand copy.
+//!
+//! The steps cover the role update, the rename, the policy update, the
+//! unban, and the rejection and cancellation of a join request. The
+//! removal, ban, GSS add, join request and approval arms are not here yet
+//! (#1606).
+
+use crate as x0x;
+use x0x::groups::{ActionKind, GroupInfo, GroupPolicy, GroupRole};
+
+/// Why a step refuses its event. The ordinary apply rejects the event in
+/// every case; it parks it, or logs it, as the variant says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum StepRefusal {
+    /// The event fails its authority or state checks.
+    Refused,
+    /// The target has no seat yet (or only the join's key-only marker
+    /// row). The ordinary apply parks a role update for it.
+    NotSeated,
+    /// A policy update changes or removes the OwnerCertified owner axis.
+    OwnerAxisChanged,
+}
+
+/// The action the commit signer must hold, and the change to apply.
+pub(in crate::server) type Step<F> = Result<(ActionKind, F), StepRefusal>;
+
+/// `actor` is the sender and an admin of `cursor`.
+fn admin_signed(cursor: &GroupInfo, actor: &str, sender_hex: &str) -> bool {
+    actor == sender_hex
+        && cursor
+            .caller_role(actor)
+            .is_some_and(|role| role.at_least(GroupRole::Admin))
+}
+
+/// `MemberRoleUpdated`.
+pub(in crate::server) fn role_update<'a>(
+    cursor: &GroupInfo,
+    sender_hex: &str,
+    revision: u64,
+    actor: &str,
+    agent_id: &'a str,
+    role: GroupRole,
+) -> Step<impl FnOnce(&mut GroupInfo) + 'a> {
+    if !admin_signed(cursor, actor, sender_hex) {
+        return Err(StepRefusal::Refused);
+    }
+    // #1578 rc11: the join's key-only marker row is not a seat.
+    let target = cursor
+        .members_v2
+        .get(agent_id)
+        .filter(|_| !cursor.join_seat_key_marker_only(agent_id))
+        .ok_or(StepRefusal::NotSeated)?;
+    // ADR-0016: signed gossip apply rejects only Owner (admin-equivalent).
+    if target.is_removed() || target.is_banned() || role == GroupRole::Owner {
+        return Err(StepRefusal::Refused);
+    }
+    Ok((ActionKind::AdminOrHigher, move |next: &mut GroupInfo| {
+        next.roster_revision = super::adopt_roster_revision(next.roster_revision, revision);
+        next.set_member_role(agent_id, role);
+    }))
+}
+
+/// `GroupMetadataUpdated` (a rename or a new description).
+pub(in crate::server) fn metadata_update<'a>(
+    cursor: &GroupInfo,
+    sender_hex: &str,
+    revision: u64,
+    actor: &str,
+    name: &'a Option<String>,
+    description: &'a Option<String>,
+    committed_at: u64,
+) -> Step<impl FnOnce(&mut GroupInfo) + 'a> {
+    if !admin_signed(cursor, actor, sender_hex) {
+        return Err(StepRefusal::Refused);
+    }
+    Ok((ActionKind::AdminOrHigher, move |next: &mut GroupInfo| {
+        next.roster_revision = super::adopt_roster_revision(next.roster_revision, revision);
+        if let Some(name) = name.clone() {
+            next.name = name;
+        }
+        if let Some(description) = description.clone() {
+            next.description = description;
+        }
+        next.updated_at = committed_at;
+    }))
+}
+
+/// `PolicyUpdated`. The ordinary apply does not check the event's actor
+/// field; only the commit signer's [`ActionKind::AdminOrHigher`] is
+/// checked.
+pub(in crate::server) fn policy_update<'a>(
+    cursor: &GroupInfo,
+    revision: u64,
+    policy: &'a GroupPolicy,
+    committed_at: u64,
+) -> Step<impl FnOnce(&mut GroupInfo) + 'a> {
+    // ADR-0038 review B2: an existing OwnerCertified owner axis never
+    // changes or goes, even inside an admin-signed commit.
+    if let Some(owner) = cursor.policy.admission.owner_certified_user_id() {
+        if policy.admission.owner_certified_user_id() != Some(owner) {
+            return Err(StepRefusal::OwnerAxisChanged);
+        }
+    }
+    Ok((ActionKind::AdminOrHigher, move |next: &mut GroupInfo| {
+        super::set_policy_update(next, revision, policy, committed_at)
+    }))
+}
+
+/// `MemberUnbanned`.
+pub(in crate::server) fn unban<'a>(
+    cursor: &GroupInfo,
+    sender_hex: &str,
+    revision: u64,
+    actor: &str,
+    agent_id: &'a str,
+    committed_at: u64,
+) -> Step<impl FnOnce(&mut GroupInfo) + 'a> {
+    if !admin_signed(cursor, actor, sender_hex) {
+        return Err(StepRefusal::Refused);
+    }
+    Ok((ActionKind::AdminOrHigher, move |next: &mut GroupInfo| {
+        next.roster_revision = super::adopt_roster_revision(next.roster_revision, revision);
+        if next.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+            // #1578 rc11 (audit): the join's key-only marker row is not
+            // a seat — main holds no row to flip.
+            if !next.join_seat_key_marker_only(agent_id) {
+                if let Some(member) = next.members_v2.get_mut(agent_id) {
+                    member.state = x0x::groups::GroupMemberState::Removed;
+                    member.updated_at = committed_at;
+                    member.removed_by = None;
+                }
+            }
+        } else {
+            next.unban_member(agent_id);
+        }
+    }))
+}
+
+/// `JoinRequestRejected`: an admin rejects a pending request.
+pub(in crate::server) fn join_request_rejected<'a>(
+    cursor: &GroupInfo,
+    sender_hex: &str,
+    request_id: &'a str,
+    actor: &'a str,
+    committed_at: u64,
+) -> Step<impl FnOnce(&mut GroupInfo) + 'a> {
+    if !admin_signed(cursor, actor, sender_hex)
+        || !cursor
+            .join_requests
+            .get(request_id)
+            .is_some_and(|request| request.is_pending())
+    {
+        return Err(StepRefusal::Refused);
+    }
+    Ok((ActionKind::AdminOrHigher, move |next: &mut GroupInfo| {
+        super::set_join_request_rejected(next, request_id, actor, committed_at)
+    }))
+}
+
+/// `JoinRequestCancelled`: the requester cancels its own pending request.
+pub(in crate::server) fn join_request_cancelled<'a>(
+    cursor: &GroupInfo,
+    sender_hex: &str,
+    request_id: &'a str,
+    requester_agent_id: &'a str,
+) -> Step<impl FnOnce(&mut GroupInfo) + 'a> {
+    if sender_hex != requester_agent_id
+        || !cursor.join_requests.get(request_id).is_some_and(|request| {
+            request.requester_agent_id == requester_agent_id && request.is_pending()
+        })
+    {
+        return Err(StepRefusal::Refused);
+    }
+    Ok((ActionKind::NonMemberRequest, move |next: &mut GroupInfo| {
+        super::set_join_request_cancelled(next, request_id, requester_agent_id)
+    }))
+}
