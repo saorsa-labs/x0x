@@ -66,7 +66,8 @@ This table is the live allocation table for capability bits. Allocate the next b
 | 11 | `join_pending_notice_v1` | Serves and understands `JoinPendingNotice` on the join-result poll | ADR 0108 §8 (accepted 2026-10-05; wire half ruled by David 2026-10-25, D-ruling 05:14 GMT; next free bit in acceptance order) |
 | 12 | `key_republish_v1` | Verifies and seats signed `MemberKeyRepublishV1` (`X0XKR1`) key republications on an Active seat | #1663 (David's ruling, 28 Oct 2026 02:25 GMT; lowest free bit) |
 | 13 | `treekem_catchup_refusal_v1` | Sends and understands the typed `treekem_catchup_refusal` that answers a machine- or binding-revoked TreeKEM catch-up request ONLY — never sent on another lane: a machine- or binding-revoked control-blob fetch gets no answer at all (blob withheld, no frame; #1664) | #1657 (David's approval, 28 Oct 2026 02:08 GMT; bit ruled by the Engineer 29 Oct 2026 22:14 GMT; lane boundary ruled by the Engineer 31 Oct 2026 03:40 GMT — bit 13 is catch-up only, as on main since #1714, unreleased; a typed control-blob refusal would be a separate wire question; next free bit) |
-| 14–63 | unallocated | Must not be advertised until allocated | — |
+| 14 | `grant_revocation_push_v1` | Accepts the single-record grant revocation push (`x0x-grant-revocation-push-v1`) and ingests it through the shared v3 revocation path; the sender needs POSITIVE evidence (push only to a current verified advert that has the bit) | #1003 (course-correction directive ruling 3e, 7 Nov 2026; design: archived ADR 0080 under slot A03; next free bit) |
+| 15–63 | unallocated | Must not be advertised until allocated | — |
 
 ## Checks
 

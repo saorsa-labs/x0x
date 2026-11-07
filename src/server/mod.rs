@@ -956,6 +956,10 @@ pub async fn serve_with_options(
     // ADR 0083 slice 3: one channel, three prefixes. No validator — a
     // validator would parse the body before owner trust.
     let (gui_show_dm_tx, mut gui_show_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
+    // #1003 (ADR 0080 archived, slot A03): plain typed route — the sender
+    // waits for no ACK; the record carries its own authority.
+    let (revocation_push_dm_tx, mut revocation_push_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(256);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
     // Tasks started before AppState exists still need owned cancellation on a
     // later startup rejection. They are folded into the supervisor's normal
@@ -2065,6 +2069,7 @@ pub async fn serve_with_options(
     let dm_inbox_predecessor_relay_route_tx = predecessor_relay_dm_tx.clone();
     let dm_inbox_share_grant_route_tx = share_grant_dm_tx.clone();
     let dm_inbox_gui_show_route_tx = gui_show_dm_tx.clone();
+    let dm_inbox_revocation_push_route_tx = revocation_push_dm_tx.clone();
     bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
@@ -2075,6 +2080,7 @@ pub async fn serve_with_options(
         dm_inbox_predecessor_relay_route_tx,
         dm_inbox_share_grant_route_tx,
         dm_inbox_gui_show_route_tx,
+        dm_inbox_revocation_push_route_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -2862,6 +2868,21 @@ pub async fn serve_with_options(
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = share_grant_dm_rx.recv().await {
                 let _ = grant_agent.handle_share_grant_delivery(typed).await;
+            }
+        }));
+    }
+
+    // #1003: grant-revocation pushes. The handler drops before any verify
+    // (decode/subject/stale/duplicate/rate limit), then ingests through
+    // the same v3 revocation path as gossip. Best-effort: no ACK is owed.
+    {
+        let push_agent = Arc::clone(&agent);
+        bg_tasks.push(tokio::spawn(async move {
+            let limiter = tokio::sync::Mutex::new(x0x::revocation_push::PushRateLimiter::new());
+            while let Some(typed) = revocation_push_dm_rx.recv().await {
+                let _ = push_agent
+                    .handle_grant_revocation_push_delivery(&limiter, typed)
+                    .await;
             }
         }));
     }
@@ -3877,6 +3898,7 @@ async fn start_dm_inbox_when_gossip_ready(
     predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     share_grant_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     gui_show_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    revocation_push_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -3938,6 +3960,13 @@ async fn start_dm_inbox_when_gossip_ready(
             .with_durable_typed_payload_route(
                 x0x::gui::remote::ACTIVITY_PREFIX,
                 gui_show_route_tx.clone(),
+            )
+            // #1003: plain (non-durable) — the push sender waits for no
+            // ACK, and the route owning the prefix keeps the payload out
+            // of DM history and generic subscribers on every path.
+            .with_typed_payload_route(
+                x0x::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
+                revocation_push_route_tx.clone(),
             );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)

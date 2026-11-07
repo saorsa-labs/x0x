@@ -227,7 +227,10 @@ pub(in crate::server) async fn grants_issue(
 /// DELETE /grants/:id — revoke a grant with the owner key. Effective locally
 /// at once; gossiped on `x0x.revocation.v3`. Answers success only once the
 /// revocation and the removal of the grant's queued redeliveries (#926) are
-/// durable; otherwise `503` (retry is idempotent).
+/// durable; otherwise `503` (retry is idempotent, and only a successful
+/// DELETE schedules pushes). `push` reports the best-effort direct
+/// revocation pushes scheduled to capable recipients (#1003); the DELETE
+/// does not wait for them, and gossip remains the backstop.
 pub(in crate::server) async fn grants_revoke(
     State(state): State<Arc<AppState>>,
     Extension(actor): Extension<ActorContext>,
@@ -251,14 +254,15 @@ pub(in crate::server) async fn grants_revoke(
         .agent
         .share_grant_store()
         .is_some_and(|store| store.issued(&grant_id).is_some());
-    match state.agent.revoke_share_grant(grant_id, None).await {
-        Ok(_record) => (
+    match x0x::share_grant::revoke_share_grant_pushing(&state.agent, grant_id, None).await {
+        Ok((_record, push)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": true,
                 "grant_id": hex::encode(grant_id),
                 "revoked": true,
                 "known": known,
+                "push": push,
             })),
         )
             .into_response(),

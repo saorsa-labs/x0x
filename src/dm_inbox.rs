@@ -46,7 +46,7 @@ pub const GROUP_PREDECESSOR_RELAY_DM_PREFIX: &[u8] = b"X0X-GROUP-PREDECESSOR-REL
 ///
 /// `PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX` is defined in the server layer; its
 /// literal is repeated here and pinned equal by a server-side test.
-pub(crate) const PRODUCTION_TYPED_DM_PREFIXES: [&[u8]; 9] = [
+pub(crate) const PRODUCTION_TYPED_DM_PREFIXES: [&[u8]; 10] = [
     crate::exec::EXEC_DM_PREFIX,
     GROUP_PREDECESSOR_RELAY_DM_PREFIX,
     crate::share_grant::SHARE_GRANT_DM_PREFIX,
@@ -56,6 +56,7 @@ pub(crate) const PRODUCTION_TYPED_DM_PREFIXES: [&[u8]; 9] = [
     crate::gui::remote::SHOW_REQUEST_PREFIX,
     crate::gui::remote::SHOW_RESULT_PREFIX,
     crate::gui::remote::ACTIVITY_PREFIX,
+    crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
 ];
 
 /// Whether these bytes claim one of the production typed-DM protocols

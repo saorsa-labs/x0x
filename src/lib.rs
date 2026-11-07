@@ -80,6 +80,11 @@ pub(crate) mod file_lock;
 /// gossip-fed set consulted at every trust gate.
 pub mod revocation;
 
+/// #1003 (ADR 0080, archived; slot A03): the direct, capability-gated
+/// single-record push of a share-grant revocation. Gossip stays the
+/// backstop.
+pub mod revocation_push;
+
 /// ADR-0043 agent key-move protocol: the per-agent signed move log, the
 /// total fold (custodian / retired bindings / placement / phase), the
 /// participant CAS and mesh verification rules, the ML-KEM export
@@ -7180,6 +7185,29 @@ async fn ingest_share_grant_revocations_for_s4(
     let Ok(records) = revocation::decode_revocation_batch(payload) else {
         return false;
     };
+    let inserted = ingest_share_grant_revocation_records(
+        owner_trust,
+        revocation_set,
+        identity_dir.as_deref(),
+        records,
+    )
+    .await;
+    persist_completed_revocation_rebuild_for_s4(revocation_set, s4_intake, identity_dir.as_deref())
+        .await;
+    inserted
+}
+
+/// The shared ShareGrant-revocation ingest (#1003): every remote carrier —
+/// the `x0x.revocation.v3` gossip batch and the direct push
+/// ([`revocation_push`]) — inserts through here, so a pushed record and a
+/// gossiped record have one verify path, one revocation barrier and one
+/// store. Records of any other subject are ignored.
+pub(crate) async fn ingest_share_grant_revocation_records(
+    owner_trust: &owner_trust::OwnerTrust,
+    revocation_set: &tokio::sync::RwLock<revocation::RevocationSet>,
+    identity_dir: Option<&std::path::Path>,
+    records: Vec<revocation::RevocationRecord>,
+) -> bool {
     let mut inserted = false;
     {
         // #926: ordered against in-flight grant redeliveries.
@@ -7203,10 +7231,8 @@ async fn ingest_share_grant_revocations_for_s4(
         }
     }
     if inserted {
-        persist_share_grant_revocations(revocation_set, identity_dir.as_deref()).await;
+        persist_share_grant_revocations(revocation_set, identity_dir).await;
     }
-    persist_completed_revocation_rebuild_for_s4(revocation_set, s4_intake, identity_dir.as_deref())
-        .await;
     inserted
 }
 
@@ -28975,6 +29001,7 @@ mod tests {
             crate::gui::remote::SHOW_REQUEST_PREFIX,
             crate::gui::remote::SHOW_RESULT_PREFIX,
             crate::gui::remote::ACTIVITY_PREFIX,
+            crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX,
         ] {
             let mut payload = prefix.to_vec();
             payload.extend_from_slice(b"unverified-startup-window-frame");

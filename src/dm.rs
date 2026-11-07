@@ -128,6 +128,14 @@ impl CapabilityRegistry {
     /// main's silent drop, so an older peer never records the refusal
     /// as a durable DM-history row.
     pub const TREEKEM_CATCHUP_REFUSAL_V1: u64 = 1 << 13;
+    /// #1003 (ADR 0080, archived; slot A03): accepts the single-record
+    /// grant revocation push (`x0x-grant-revocation-push-v1\0`) and
+    /// ingests it through the shared v3 revocation path. Bit 14, the next
+    /// free bit in acceptance order. The push sender needs POSITIVE
+    /// evidence: it pushes only to a peer whose current verified advert
+    /// HAS this bit (unknown or expired state means "no push"), because an
+    /// old receiver would show the payload as an ordinary DM.
+    pub const GRANT_REVOCATION_PUSH_V1: u64 = 1 << 14;
 
     /// The routes supported by this release's ready receiver.
     pub const fn current() -> Self {
@@ -146,7 +154,8 @@ impl CapabilityRegistry {
                 | Self::GUI_SHOW_V1
                 | Self::JOIN_PENDING_NOTICE_V1
                 | Self::KEY_REPUBLISH_V1
-                | Self::TREEKEM_CATCHUP_REFUSAL_V1,
+                | Self::TREEKEM_CATCHUP_REFUSAL_V1
+                | Self::GRANT_REVOCATION_PUSH_V1,
         }
     }
 
@@ -182,6 +191,8 @@ impl CapabilityRegistry {
             Some((Self::GUI_SHOW_V1, "gui_show_v1"))
         } else if payload.starts_with(crate::groups::key_republish::KEY_REPUBLISH_PREFIX) {
             Some((Self::KEY_REPUBLISH_V1, "key_republish_v1"))
+        } else if payload.starts_with(crate::revocation_push::GRANT_REVOCATION_PUSH_PREFIX) {
+            Some((Self::GRANT_REVOCATION_PUSH_V1, "grant_revocation_push_v1"))
         } else {
             None
         }
