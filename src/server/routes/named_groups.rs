@@ -97,6 +97,9 @@ const NAMED_GROUP_METADATA_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 const TREEKEM_PENDING_EVENTS_PER_GROUP_CAP: usize = 64;
 
+/// The most membership links the TreeKEM catch-up log keeps per group.
+/// #1623: the state-only links (see [`treekem_state_only_link`]) have their
+/// own count under the same cap, so they never evict a membership link.
 const TREEKEM_EVENT_LOG_PER_GROUP_CAP: usize = 128;
 /// #1139: the most intervening membership events a join result carries.
 /// A larger gap falls back to TreeKEM catch-up (today's path).
@@ -9184,7 +9187,28 @@ fn treekem_membership_event_frontier(
 }
 
 fn treekem_membership_event_key(event: &NamedGroupMetadataEvent) -> Option<String> {
-    let frontier = treekem_membership_event_frontier(event)?;
+    let Some(frontier) = treekem_membership_event_frontier(event) else {
+        // #1623: a state-only link. Its key names the signed state hash,
+        // so two different links at one revision are both kept.
+        let (commit, actor) = treekem_state_only_link(event)?;
+        let (kind, target) = match event {
+            NamedGroupMetadataEvent::GroupMetadataUpdated { .. } => ("rename", ""),
+            NamedGroupMetadataEvent::PolicyUpdated { .. } => ("policy", ""),
+            NamedGroupMetadataEvent::MemberRoleUpdated { agent_id, .. } => {
+                ("role", agent_id.as_str())
+            }
+            NamedGroupMetadataEvent::MemberUnbanned { agent_id, .. } => {
+                ("unban", agent_id.as_str())
+            }
+            _ => return None,
+        };
+        return Some(format!(
+            "{}:{kind}:{}:{actor}:{target}:{}",
+            named_group_metadata_event_group_id(event),
+            commit.revision,
+            commit.state_hash
+        ));
+    };
     let kind = match event {
         NamedGroupMetadataEvent::MemberAdded { .. } => "add",
         NamedGroupMetadataEvent::MemberRemoved { .. } => "remove",
@@ -9200,6 +9224,65 @@ fn treekem_membership_event_key(event: &NamedGroupMetadataEvent) -> Option<Strin
         frontier.actor,
         frontier.target
     ))
+}
+
+/// #1623 (ADR 0109 §7 (b)): a commit-bearing link with no TreeKEM commit
+/// that the TreeKEM catch-up log keeps and serves next to the membership
+/// links: a rename, a policy update, a role change or an unban. Returns
+/// the signed commit and the event's actor. Every one of them is a link
+/// of the same state chain, so a joiner whose gap holds one cannot link
+/// the membership links after it until it is served.
+fn treekem_state_only_link(
+    event: &NamedGroupMetadataEvent,
+) -> Option<(&x0x::groups::GroupStateCommit, &str)> {
+    match event {
+        NamedGroupMetadataEvent::GroupMetadataUpdated {
+            actor,
+            commit: Some(commit),
+            ..
+        }
+        | NamedGroupMetadataEvent::PolicyUpdated {
+            actor,
+            commit: Some(commit),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberRoleUpdated {
+            actor,
+            commit: Some(commit),
+            ..
+        }
+        | NamedGroupMetadataEvent::MemberUnbanned {
+            actor,
+            commit: Some(commit),
+            ..
+        } => Some((commit, actor.as_str())),
+        _ => None,
+    }
+}
+
+/// #1623: the catch-up cursor of a logged link, `(revision, TreeKEM
+/// epoch)`, compared with the requester's `(from_revision,
+/// from_treekem_epoch)`. A membership link keeps its frontier values. A
+/// state-only link has no epoch; its revision is its commit revision, the
+/// same state chain count as the requester's `from_revision`.
+fn treekem_catchup_link_cursor(event: &NamedGroupMetadataEvent) -> Option<(u64, u64)> {
+    if let Some(frontier) = treekem_membership_event_frontier(event) {
+        return Some((frontier.revision, frontier.epoch.unwrap_or_default()));
+    }
+    treekem_state_only_link(event).map(|(commit, _)| (commit.revision, 0))
+}
+
+/// #1623: the order of the links on a catch-up page — the state chain
+/// order (commit revision), then the TreeKEM epoch. The page carries one
+/// link, so the responder must serve the next chain link first, of
+/// whichever kind.
+fn treekem_catchup_link_sort_key(event: &NamedGroupMetadataEvent) -> (u64, u64) {
+    let epoch = treekem_membership_event_frontier(event)
+        .and_then(|frontier| frontier.epoch)
+        .unwrap_or_default();
+    named_group_metadata_event_commit(event)
+        .map(|commit| (commit.revision, epoch))
+        .unwrap_or_default()
 }
 
 fn treekem_membership_event_sort_key(event: &NamedGroupMetadataEvent) -> (u64, u64) {
@@ -9427,18 +9510,40 @@ async fn should_queue_treekem_membership_event(
     treekem_state_frontier_gap_reason(info, event, local_agent_hex, local_epoch)
 }
 
+/// Keep `event` in the in-memory TreeKEM catch-up log
+/// (`AppState::treekem_event_log`), which `handle_treekem_catchup_request`
+/// serves. It keeps the membership links and (#1623, ADR 0109 §7 (b)) the
+/// state-only links of [`treekem_state_only_link`]. A state-only link is
+/// kept only when this node signed it: the receiver applies a rename, a
+/// role change or an unban only from its signer (`actor == sender`), so a
+/// relayed copy would be refused, and a released receiver with no #1685
+/// stop would ask for the same page again. Each class has its own
+/// [`TREEKEM_EVENT_LOG_PER_GROUP_CAP`], oldest out first, so state-only
+/// links never evict a membership link that key catch-up needs.
 async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupMetadataEvent) {
-    let Some(frontier) = treekem_membership_event_frontier(event) else {
-        return;
+    let state_only = match (
+        treekem_membership_event_frontier(event),
+        treekem_state_only_link(event),
+    ) {
+        (Some(_), _) => false,
+        (None, Some((commit, actor))) => {
+            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+            if actor != local_hex || commit.committed_by != local_hex {
+                return;
+            }
+            true
+        }
+        (None, None) => return,
     };
+    let group_id = named_group_metadata_event_group_id(event);
     {
         let groups = state.named_groups.read().await;
-        if has_withdrawn_group_record(&groups, frontier.group_id) {
+        if has_withdrawn_group_record(&groups, group_id) {
             return;
         }
     }
     let mut logs = state.treekem_event_log.write().await;
-    let log = logs.entry(frontier.group_id.to_string()).or_default();
+    let log = logs.entry(group_id.to_string()).or_default();
     if let Some(key) = treekem_membership_event_key(event) {
         if log
             .iter()
@@ -9449,8 +9554,14 @@ async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupM
         }
     }
     log.push_back(event.clone());
-    while log.len() > TREEKEM_EVENT_LOG_PER_GROUP_CAP {
-        log.pop_front();
+    // The two classes are disjoint event kinds.
+    let same_class =
+        |logged: &NamedGroupMetadataEvent| treekem_state_only_link(logged).is_some() == state_only;
+    while log.iter().filter(|logged| same_class(logged)).count() > TREEKEM_EVENT_LOG_PER_GROUP_CAP {
+        let Some(oldest) = log.iter().position(&same_class) else {
+            break;
+        };
+        log.remove(oldest);
     }
 }
 
@@ -13052,14 +13163,13 @@ pub(in crate::server) async fn handle_treekem_catchup_request(
         events
             .into_iter()
             .filter(|event| {
-                treekem_membership_event_frontier(event).is_some_and(|frontier| {
-                    frontier.revision > request.from_revision
-                        || frontier.epoch.unwrap_or_default() > request.from_treekem_epoch
+                treekem_catchup_link_cursor(event).is_some_and(|(revision, epoch)| {
+                    revision > request.from_revision || epoch > request.from_treekem_epoch
                 })
             })
             .collect::<Vec<_>>()
     };
-    events.sort_by_key(treekem_membership_event_sort_key);
+    events.sort_by_key(treekem_catchup_link_sort_key);
     let truncated = events.len() > request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP);
     events.truncate(request.limit.min(TREEKEM_CATCHUP_RESPONSE_EVENT_CAP));
     let response = TreeKemCatchupResponse {
@@ -13413,12 +13523,13 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         .as_ref()
         .and(response.responder_state_revision);
     let mut events = response.events;
-    events.sort_by_key(treekem_membership_event_sort_key);
+    events.sort_by_key(treekem_catchup_link_sort_key);
+    // #1623: a state-only link (rename, policy, role change, unban) that
+    // could not apply counts too, or a truncated page that serves only
+    // that link would be asked for again for ever.
     let page_served_ahead = events.iter().any(|event| {
-        treekem_membership_event_frontier(event).is_some_and(|frontier| {
-            frontier.revision > cursor_before.0
-                || frontier.epoch.unwrap_or_default() > cursor_before.1
-        })
+        treekem_catchup_link_cursor(event)
+            .is_some_and(|(revision, epoch)| revision > cursor_before.0 || epoch > cursor_before.1)
     });
     let key_package_shaped = !events.is_empty()
         && events
@@ -33834,6 +33945,8 @@ pub(in crate::server) async fn update_named_group(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // #1623: the catch-up log serves this signed link to a joiner whose gap holds it.
+    remember_treekem_membership_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -33976,6 +34089,8 @@ pub(in crate::server) async fn update_group_policy(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // #1623: the catch-up log serves this signed link to a joiner whose gap holds it.
+    remember_treekem_membership_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -34096,6 +34211,8 @@ pub(in crate::server) async fn update_member_role(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // #1623: the catch-up log serves this signed link to a joiner whose gap holds it.
+    remember_treekem_membership_event(&state, &event).await;
     spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
     // The membership guard is already dropped. A demotion can make this
@@ -34658,6 +34775,8 @@ pub(in crate::server) async fn unban_group_member(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // #1623: the catch-up log serves this signed link to a joiner whose gap holds it.
+    remember_treekem_membership_event(&state, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (

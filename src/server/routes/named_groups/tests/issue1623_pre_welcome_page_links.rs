@@ -935,3 +935,359 @@ fn treekem_catchup_cursor_epoch_maps_the_head_binding() {
         );
     }
 }
+
+// #1623 responder slice: the catch-up log keeps and serves the state-only
+// links (rename, policy, role change, unban) that this node signed, next
+// to the membership links. Before it kept only the membership links, so a
+// pre-Welcome joiner was never served a rename or a role change in its gap.
+
+/// Pages `joiner` from the real `responder` until a page is empty, as
+/// `pre_welcome_joiner_pages_two_links_from_a_real_responder` does, with
+/// the responder as the page sender. Returns the kinds served, in order.
+async fn page_from_responder(
+    joiner: &Arc<AppState>,
+    responder: &Arc<AppState>,
+    key: &str,
+) -> anyhow::Result<Vec<&'static str>> {
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let mut served = Vec::new();
+    for _ in 0..8 {
+        let head = head_of(joiner, key).await?;
+        let cursor = (head.secret_epoch, head.security_binding.clone());
+        let request = TreeKemCatchupRequest {
+            message_type: "treekem_catchup_request".to_string(),
+            group_id: key.to_string(),
+            requester_agent_id: joiner_hex.clone(),
+            from_revision: head.state_revision,
+            from_treekem_epoch: treekem_catchup_cursor_epoch(joiner, &[key.to_string()], cursor)
+                .await,
+            current_state_hash: head.state_hash.clone(),
+            missing_prev_state_hash: None,
+            target_member_id: None,
+            limit: TREEKEM_CATCHUP_RESPONSE_EVENT_CAP,
+        };
+        let recorder = &responder.named_group_test_recorders.catchup_responses;
+        recorder.lock().expect("recorder").clear();
+        handle_treekem_catchup_request(
+            responder,
+            &joiner.agent.agent_id(),
+            &x0x::identity::MachineId([0x25; 32]),
+            true,
+            request,
+        )
+        .await;
+        let payload = recorder.lock().expect("recorder").pop();
+        let page: TreeKemCatchupResponse = serde_json::from_slice(&payload.unwrap_or_default())?;
+        if page.events.is_empty() {
+            break;
+        }
+        served.extend(page.events.iter().map(named_group_metadata_event_kind));
+        handle_treekem_catchup_response(
+            joiner,
+            &responder.agent.agent_id(),
+            &x0x::identity::MachineId([0x26; 32]),
+            true,
+            TreeKemCatchupResponse {
+                truncated: false,
+                ..page
+            },
+        )
+        .await;
+    }
+    Ok(served)
+}
+
+/// The responder seats the joiner (the terminal add, not on any page), so
+/// it authorizes the joiner's ask. Not sealed: the served links stay as
+/// they were signed.
+async fn seat_joiner_on_responder(responder: &AppState, key: &str, joiner_hex: &str) {
+    if let Some(info) = responder.named_groups.write().await.get_mut(key) {
+        info.add_member(
+            joiner_hex.to_string(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+    }
+}
+
+/// RED on main: the responder's REST rename and role change were never
+/// logged, so the page was empty and the joiner stayed at its base.
+#[tokio::test]
+async fn responder_serves_its_role_change_and_rename_to_a_pre_welcome_joiner() -> anyhow::Result<()>
+{
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (responder, _responder_dir) = secure_endpoint_test_state().await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let owner = responder.agent.identity().agent_keypair();
+    let base = base_group(owner, None)?;
+    let key = install_stub(&joiner, base.clone()).await?;
+    install_stub(&responder, base.clone()).await?;
+    let owner_ctx = || {
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true })
+    };
+    let response = update_member_role(
+        State(Arc::clone(&responder)),
+        owner_ctx(),
+        Path((key.clone(), agent(PROMOTED))),
+        Json(UpdateMemberRoleRequest {
+            role: "admin".to_string(),
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the owner promotes");
+    let response = update_named_group(
+        State(Arc::clone(&responder)),
+        owner_ctx(),
+        Path(key.clone()),
+        Json(UpdateGroupRequest {
+            name: Some("renamed in the gap".to_string()),
+            description: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "the owner renames");
+    let terminal = head_of(&responder, &key).await?;
+    seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
+
+    let served = page_from_responder(&joiner, &responder, &key).await?;
+
+    assert_eq!(
+        served,
+        ["member_role_updated", "group_metadata_updated"],
+        "both state-only links are served, in chain order"
+    );
+    let head = head_of(&joiner, &key).await?;
+    assert_eq!(
+        head.state_hash, terminal.state_hash,
+        "the joiner is at the head"
+    );
+    assert_eq!(head.name, "renamed in the gap", "the rename applied");
+    assert_eq!(
+        head.caller_role(&agent(PROMOTED)),
+        Some(x0x::groups::GroupRole::Admin),
+        "the role change applied"
+    );
+    assert!(!head.has_active_member(&joiner_hex), "still pre-Welcome");
+    assert_eq!(
+        head.secret_epoch, base.secret_epoch,
+        "no epoch from the chain"
+    );
+    assert_no_tree(&joiner, &key).await;
+    Ok(())
+}
+
+/// Membership catch-up still pages when the log also holds state-only
+/// links: role change, removal (a TreeKEM commit, applied state-only inside
+/// the armed sequence), then rename. RED on main: the responder served the
+/// removal first, which does not link to the joiner's base.
+#[tokio::test]
+async fn membership_catch_up_pages_through_logged_state_only_links() -> anyhow::Result<()> {
+    let (joiner, _joiner_dir) = secure_endpoint_test_state().await?;
+    let (responder, _responder_dir) = secure_endpoint_test_state().await?;
+    let joiner_hex = hex::encode(joiner.agent.agent_id().as_bytes());
+    let owner = responder.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = base_group(owner, None)?;
+    let stable = base.stable_group_id().to_string();
+    let mut ahead = base.clone();
+    let role = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.set_member_role(&agent(PROMOTED), x0x::groups::GroupRole::Admin);
+    })?;
+    let removal = seal_link(&mut ahead, owner, 3_000, |next| {
+        next.remove_member(&agent(REMOVED), Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let rename = seal_link(&mut ahead, owner, 4_000, |next| {
+        next.name = "renamed after the removal".to_string();
+    })?;
+    let events = [
+        NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: stable.clone(),
+            revision: role.revision,
+            actor: owner_hex.clone(),
+            agent_id: agent(PROMOTED),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(role.clone()),
+        },
+        removal_event(&base, &owner_hex, &removal),
+        NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: stable,
+            revision: rename.revision,
+            actor: owner_hex.clone(),
+            name: Some("renamed after the removal".to_string()),
+            description: None,
+            commit: Some(rename.clone()),
+        },
+    ];
+    let mut stub = base.clone();
+    let sequence = [&role, &removal, &rename]
+        .iter()
+        .map(|link| link.state_hash.clone())
+        .collect();
+    arm(&mut stub, sequence, owner);
+    let key = install_stub(&joiner, stub).await?;
+    install_stub(&responder, ahead).await?;
+    seat_joiner_on_responder(&responder, &key, &joiner_hex).await;
+    // The production log path, in signing order.
+    for event in &events {
+        remember_treekem_membership_event(&responder, event).await;
+    }
+
+    let served = page_from_responder(&joiner, &responder, &key).await?;
+
+    assert_eq!(
+        served,
+        [
+            "member_role_updated",
+            "member_removed",
+            "group_metadata_updated"
+        ]
+    );
+    let head = head_of(&joiner, &key).await?;
+    assert_eq!(
+        head.state_hash, rename.state_hash,
+        "the joiner is at the head"
+    );
+    assert!(
+        !head.has_active_member(&agent(REMOVED)),
+        "the removal applied"
+    );
+    assert_eq!(head.name, "renamed after the removal");
+    assert_eq!(
+        head.caller_role(&agent(PROMOTED)),
+        Some(x0x::groups::GroupRole::Admin)
+    );
+    assert_epoch_kept(&head, &base);
+    assert_no_tree(&joiner, &key).await;
+    Ok(())
+}
+
+/// The log keeps state-only links under their own cap, so they never evict
+/// a membership link. It keeps only the state-only links this node signed
+/// (the receiver applies a rename, a role change or an unban only from its
+/// signer), and a repeat of one link once.
+#[tokio::test]
+async fn state_only_links_keep_their_own_log_cap() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = state.agent.identity().agent_keypair();
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let mut ahead = base_group(owner, None)?;
+    let stable = ahead.stable_group_id().to_string();
+    let base = ahead.clone();
+    let removal = seal_link(&mut ahead, owner, 2_000, |next| {
+        next.remove_member(&agent(REMOVED), Some(owner_hex.clone()));
+        take_treekem_epoch(next);
+    })?;
+    let removal = removal_event(&base, &owner_hex, &removal);
+    remember_treekem_membership_event(&state, &removal).await;
+    let rename = |info: &mut GroupInfo, signer: &AgentKeypair, n: u64| {
+        let name = format!("rename {n}");
+        let commit = seal_link(info, signer, 3_000 + n, |next| next.name = name.clone())?;
+        anyhow::Ok(NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: stable.clone(),
+            revision: commit.revision,
+            actor: hex::encode(signer.agent_id().as_bytes()),
+            name: Some(name),
+            description: None,
+            commit: Some(commit),
+        })
+    };
+    let extra = 5;
+    for n in 0..(TREEKEM_EVENT_LOG_PER_GROUP_CAP as u64 + extra) {
+        let event = rename(&mut ahead, owner, n)?;
+        remember_treekem_membership_event(&state, &event).await;
+        remember_treekem_membership_event(&state, &event).await;
+    }
+    let other = AgentKeypair::generate()?;
+    let foreign = rename(&mut ahead.clone(), &other, 999)?;
+    remember_treekem_membership_event(&state, &foreign).await;
+
+    let logs = state.treekem_event_log.read().await;
+    let log = logs.get(&stable).cloned().unwrap_or_default();
+    let renames: Vec<_> = log
+        .iter()
+        .filter_map(|event| match event {
+            NamedGroupMetadataEvent::GroupMetadataUpdated { name, .. } => name.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        renames.len(),
+        TREEKEM_EVENT_LOG_PER_GROUP_CAP,
+        "state-only links are capped, each kept once"
+    );
+    assert_eq!(
+        renames.first().map(String::as_str),
+        Some(format!("rename {extra}").as_str()),
+        "the oldest state-only links go first"
+    );
+    assert!(
+        !renames.iter().any(|name| name == "rename 999"),
+        "a link this node did not sign is not kept"
+    );
+    assert!(
+        log.iter()
+            .any(|event| matches!(event, NamedGroupMetadataEvent::MemberRemoved { .. })),
+        "the membership link is not evicted"
+    );
+    Ok(())
+}
+
+/// A current receiver counts a state-only link in the #1685 no-progress
+/// stop. A truncated page with one refused rename (its actor is not the
+/// page sender) stops the page loop. RED on main: the stop counted only
+/// membership links, so the joiner asked for the same page again.
+#[tokio::test]
+async fn refused_state_only_page_stops_the_page_loop() -> anyhow::Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner = AgentKeypair::generate()?;
+    let owner_hex = hex::encode(owner.agent_id().as_bytes());
+    let base = base_group(&owner, None)?;
+    let mut ahead = base.clone();
+    let rename = seal_link(&mut ahead, &owner, 2_000, |next| {
+        next.name = "refused".to_string();
+    })?;
+    let key = install_stub(&state, base.clone()).await?;
+    let recorders = &state.named_group_test_recorders;
+    recorders
+        .catchup_page_force_ok
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(request_treekem_catchup_page(&state, &key, &owner.agent_id()).await);
+    let response = TreeKemCatchupResponse {
+        message_type: "treekem_catchup_response".to_string(),
+        group_id: key.clone(),
+        events: vec![NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: base.stable_group_id().to_string(),
+            revision: rename.revision,
+            actor: agent(ADMIN),
+            name: Some("refused".to_string()),
+            description: None,
+            commit: Some(rename),
+        }],
+        truncated: true,
+        responder_state_hash: None,
+        responder_state_revision: None,
+    };
+    handle_treekem_catchup_response(
+        &state,
+        &owner.agent_id(),
+        &x0x::identity::MachineId([0x23; 32]),
+        true,
+        response,
+    )
+    .await;
+    assert_eq!(
+        head_of(&state, &key).await?.state_hash,
+        base.state_hash,
+        "the page applied nothing"
+    );
+    let stops = recorders.catchup_page_stops.lock().expect("stops").clone();
+    assert!(
+        stops.contains(&(key, owner_hex, TREEKEM_CATCHUP_PAGE_STOP_NO_PROGRESS)),
+        "NO_PROGRESS stop recorded: {stops:?}"
+    );
+    Ok(())
+}
