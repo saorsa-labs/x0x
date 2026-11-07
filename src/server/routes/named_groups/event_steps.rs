@@ -184,3 +184,54 @@ pub(in crate::server) fn join_request_cancelled<'a>(
         super::set_join_request_cancelled(next, request_id, requester_agent_id)
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1606 review: a policy update keeps an existing OwnerCertified
+    /// owner axis; it may not change or remove it.
+    #[test]
+    fn a_policy_update_keeps_the_owner_axis() {
+        let owner = x0x::identity::UserId([1; 32]);
+        let mut cursor = GroupInfo::new(
+            "g".into(),
+            "d".into(),
+            x0x::identity::AgentId([2; 32]),
+            "g".into(),
+        );
+        cursor.policy = GroupPolicy::home(&owner);
+        let other = GroupPolicy::home(&x0x::identity::UserId([3; 32]));
+        let open = x0x::groups::GroupPolicyPreset::PublicOpen.to_policy();
+        for policy in [&other, &open] {
+            assert_eq!(
+                policy_update(&cursor, 1, policy, 0).err(),
+                Some(StepRefusal::OwnerAxisChanged)
+            );
+        }
+        let same = cursor.policy.clone();
+        assert!(policy_update(&cursor, 1, &same, 0).is_ok());
+    }
+
+    /// #1606 review: a role update for an agent with no seat is
+    /// `NotSeated`, so the apply parks it.
+    #[test]
+    fn a_role_update_without_a_seat_is_not_seated() {
+        let admin = x0x::identity::AgentId([2; 32]);
+        let cursor = GroupInfo::new("g".into(), "d".into(), admin, "g".into());
+        let admin_hex = hex::encode(admin.as_bytes());
+        let absent = "ee".repeat(32);
+        assert_eq!(
+            role_update(
+                &cursor,
+                &admin_hex,
+                1,
+                &admin_hex,
+                &absent,
+                GroupRole::Admin
+            )
+            .err(),
+            Some(StepRefusal::NotSeated)
+        );
+    }
+}
