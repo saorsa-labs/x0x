@@ -1,14 +1,14 @@
 # A09 Group Encryption and Key Changes
 
-- **Status:** Proposed
+- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
 - **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the transfer and acceptance checks in A15.
-- **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
+- **Replacement activation:** Active since 7 November 2026. The 15 accepted slots are the live decision authority.
+- **Supersedes:** The archived numbered records mapped to this slot in [TRANSFER.md](TRANSFER.md). The archive stays the historical record. Existing implementation gates remain in force.
 
-These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). They are the live decision authority. The numbered records stay in [docs/adr-archive](../../adr-archive/ARCHIVE.md) as the historical record. [docs/adr-archive/move.json](../../adr-archive/move.json) records the archive transfer David accepted on 10 October 2026. Use the [index](README.md) for the current rules.
 
 Group encryption must follow committed membership. A roster change alone does not prove that a departed member can no longer decrypt later traffic.
 
@@ -41,6 +41,14 @@ The remaining authorized participants perform the key transition. A leaver canno
 ## Ordering and recovery
 
 Coordinate membership state, key state and their durable records. On restart, complete or safely refuse an unfinished transition. Do not publish content from an uncommitted or stale state.
+
+### TreeKEM self-leave
+
+Two accepted records govern the rekey after a TreeKEM self-leave (D274, 14 Oct 2026, and 16 Oct 2026, PR #1337; archived as [T-self-leave-rekey-committer](../../adr-archive/transient/T-self-leave-rekey-committer.md) and [T-self-leave-catchup-author](../../adr-archive/transient/T-self-leave-catchup-author.md)).
+
+The committer election stays ADR 0016 decision 6: the lowest active admin by raw agent id commits the responsive rekey, every active admin stays eligible, and other admins hold off until a capability bit that rides an existing signed advertisement is accepted. A mixed group waits until the lowest admin runs this code or is removed. One JSON file per group at `data_dir/treekem-self-leave-outbox/<blake3 of the group key>.json` records the roster-only self-leave, unpublished rekeys and published rekeys, so a restart can serve them on catch-up; it is not the TreeKEM journal. The rekey is saved with its commit bytes before the epoch is durable, a published rekey is kept for catch-up and not sent again, and a retry that finds a pending record for the current head restores that record's saved post-commit tree rather than minting a second commit. D274's acceptance includes the consequence that a node that seals while it does not know it is behind can quarantine the group; no seal timeout and no second committer are added.
+
+On the catch-up recovery path only, a `MemberRemoved` applies as its verified signer when the transport sender is an active member, `verify_structure` succeeds and the event actor equals `committed_by`; the roster checks then run against that signer. A self-leave still requires the signer to be the removed member, and an admin removal still requires the signer to be an active admin. The direct path does not change: a transport sender who is not the signer cannot apply a `MemberRemoved` by writing the actor field. A truncated membership page opens a catch-up fence for that peer only; a later page from another peer or a member-keyed KeyPackage reply does not close it, and the fence closes when that peer returns a non-truncated membership page. [A15](A15-r01-compatibility-validation-and-decision-rules.md) carries the relay commit-binding rule and the accepted v0.48 mixed-version break for the digest-bound rekey seal.
 
 Future-epoch content may be held under defined size and time limits while the required state arrives. Report expiry and recovery failure. Do not silently present such content as applied.
 

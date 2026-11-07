@@ -1,14 +1,14 @@
 # A05 Connectivity Discovery and Names
 
-- **Status:** Proposed
+- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)
 - **Revision:** 1
 - **Date:** 2026-10-05
 - **Decision owner:** David Irvine
 - **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the transfer and acceptance checks in A15.
-- **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
+- **Replacement activation:** Active since 7 November 2026. The 15 accepted slots are the live decision authority.
+- **Supersedes:** The archived numbered records mapped to this slot in [TRANSFER.md](TRANSFER.md). The archive stays the historical record. Existing implementation gates remain in force.
 
-These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). They are the live decision authority. The numbered records stay in [docs/adr-archive](../../adr-archive/ARCHIVE.md) as the historical record. [docs/adr-archive/move.json](../../adr-archive/move.json) records the archive transfer David accepted on 10 October 2026. Use the [index](README.md) for the current rules.
 
 x0x connects verified peers and gives applications controlled byte streams and machine-service access. A working network path does not itself grant access to a service.
 
@@ -26,6 +26,20 @@ Discovery uses authenticated information where authority is required. Unverified
 
 mDNS and local discovery belong in the transport layer. Avoid a second independent discovery system with conflicting peer state.
 
+Receive-side transport hardening in ant-quic 0.27.61 is accepted (David, 2026-10-17; archived as [T-ant-quic-0-27-61-transport-hardening](../../adr-archive/transient/T-ant-quic-0-27-61-transport-hardening.md)): stream reassembly merges overlapping or adjacent chunks without re-copying buffered bytes, `read_to_end` enforces its size and entry-count bounds, the DATAGRAM receive limit applies to the whole encoded frame per RFC 9221 §3 and is capped at the advertised `u16` value, an advertised limit of 0 rejects every DATAGRAM frame, and the sender treats a peer limit of 0 or 1 as datagrams unsupported. The x0x API is unchanged.
+
+### Alternate bearers
+
+BLE, serial and radio are alternate bearers under ant-quic; their scaffolding is in the ant-quic crate and x0x does not call it (D275, 14 Oct 2026; archived as [T-alternate-bearers](../../adr-archive/transient/T-alternate-bearers.md)). When a bearer is in use:
+
+1. The path must prove the expected peer identity. A radio neighbour gains no authority from the link.
+2. Members who can reach each other keep the group state they already hold.
+3. The bearer must carry membership actions, messages and small shared-data deltas. Files, media and full state images are bulk, and the group must be able to defer or refuse bulk. No byte budget is set.
+4. Public-group discovery may stop. Members who already hold the group do not need the directory.
+5. x0x must not add a BLE, serial or radio stack beside ant-quic.
+
+Wiring these bearers into x0x stays a target until a test exchanges a group message and a small delta on one named bearer while the wide network is down, and defers or refuses bulk.
+
 ## Paths and status
 
 Prefer a usable direct path. Use an allowed relay path when required and supported. Report which path is active, why a connection is waiting, and whether the wait can be retried.
@@ -33,6 +47,8 @@ Prefer a usable direct path. Use an allowed relay path when required and support
 UDP on port 443 remains UDP. It is not an HTTPS fallback and does not guarantee access through a network that blocks UDP.
 
 A connection failure must have a bounded attempt and a queryable reason. Retry policy must avoid endless work on revoked or permanently denied peers.
+
+A JOIN seed that answers a dial and then closes before admission waits a loss cooldown (D252, accepted D256, 2026-10-12; archived as [T-join-loss-pacing](../../adr-archive/transient/T-join-loss-pacing.md)). x0x reports the loss to saorsa-gossip, which starts a cooldown for that seed address: 100 ms, doubled after each loss, at most 30 s, plus the JOIN jitter. The cooldown belongs to the address for the whole join and does not reset. The next attempt starts at the later of the dial backoff and the loss cooldown, uses no attempt while it waits, and a ready admitted address goes first. The dial backoff, the at-once retry after a plain send failure, the suppressed-peer rule and the ten-attempt budget per address stay unchanged.
 
 The connectivity target is reliable operation across the owner's devices. Claims of better reach or lower cost than another network require measured evidence.
 
@@ -66,7 +82,7 @@ A full IP overlay can support more applications, but it expands routing, operati
 
 QUIC transport, discovery, streams and loopback forwarding exist. Friendly names, persistent forwards and SOCKS are a separate Phase 2 design. They must not be described as a complete shipped tailnet.
 
-ant-quic 0.27.60 already has bearer scaffolding. The paths in this note are in the ant-quic crate. x0x has no `src/transport` directory. `TransportAddr` in ant-quic `src/transport/addr.rs` names `Ble`, `LoRa` and `Serial`. `TransportCapabilities` in ant-quic `src/transport/capabilities.rs` names `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in ant-quic `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`. David accepted that record (D275, 14 Oct 2026) in [T-alternate-bearers](../transient/T-alternate-bearers.md). This note does not fold it into A05. Wiring those bearers into x0x stays a target.
+The bearer scaffolding named under Alternate bearers above is in the ant-quic crate. x0x has no `src/transport` directory. `TransportAddr` in ant-quic `src/transport/addr.rs` names `Ble`, `LoRa` and `Serial`. `TransportCapabilities` in ant-quic `src/transport/capabilities.rs` names `ble`, `lora_long_range`, `lora_fast` and `serial_115200`. Feature `ble` builds `BleTransport` in ant-quic `src/transport/ble.rs`. x0x does not enable `ble` and does not call `BleTransport`.
 
 [A06](A06-r01-gossip-relay-roles-and-resource-limits.md) owns relay duties and resource limits. [A03](A03-r01-trust-permissions-sharing-and-revocation.md) owns service authority.
 
@@ -91,6 +107,6 @@ These records are the primary sources for this draft. This mapping does not comp
 
 Decision source snapshot: 5 October 2026, commit `eacf68591dffcb6f949e2a12bc6f05cfb6e8d481`. Implementation checked on 12 October 2026 at commit `8cb6488331e6c1226913104ddb99ca4ec18bec37`.
 
-David accepted the bearer amendment above (D275, 14 Oct 2026). This slot stays Proposed. This note does not fold [T-alternate-bearers](../transient/T-alternate-bearers.md) into a new revision.
+The bearer, JOIN-pacing and transport-hardening amendments above are folded into this slot as of 7 November 2026.
 
 [All 15 ADRs](README.md)

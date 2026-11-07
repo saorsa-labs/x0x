@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Check the 15-slot set while legacy ADRs still govern implementation.
+"""Check the accepted 15-slot set.
 
-This check does not replace adr-governance.py. Formal acceptance requires a
-follow-up that adds revision-aware frozen history and completes the transfer.
-It reads local files only. It never starts x0xd or contacts the network.
+David accepted A01-A15 at revision r01 on 7 Nov 2026 (course-correction
+directive, ruling 2). The accepted slots are the live decision authority.
+This check keeps the set at exactly 15 Accepted records and rejects a new
+revision file, an unindexed record, or a status change away from Accepted.
+It does not replace adr-governance.py. It reads local files only. It never
+starts x0xd or contacts the network.
 """
 from __future__ import annotations
 
@@ -32,8 +35,8 @@ def validate(root: Path) -> list[str]:
         return [f"Cannot read the consolidated index: {exc}"]
     if not isinstance(index, dict):
         return ["The consolidated index must be an object."]
-    if index.get("schema_version") != 1 or index.get("phase") != "transfer_review":
-        errors.append("Only schema 1 transfer_review is supported. Add acceptance controls before activation.")
+    if index.get("schema_version") != 1 or index.get("phase") != "accepted":
+        errors.append("Only schema 1 accepted is supported. David accepted the 15 slots on 7 Nov 2026; the phase does not change without his ruling.")
     if index.get("maximum_current_adrs") != 15:
         errors.append("The maximum current ADR count must remain 15.")
     slots = index.get("slots")
@@ -75,8 +78,8 @@ def validate(root: Path) -> list[str]:
         if not isinstance(title, str) or not text.startswith(f"# {identity} {title}\n"):
             errors.append(f"{name}: title must match the selected slot.")
         statuses = re.findall(r"^- \*\*Status:\*\* (.+)$", text, re.MULTILINE)
-        if [status_token(status) for status in statuses] != ["Proposed"]:
-            errors.append(f"{name}: replacement status must remain Proposed until transfer and acceptance controls are complete.")
+        if [status_token(status) for status in statuses] != ["Accepted"]:
+            errors.append(f"{name}: slot status must remain Accepted (David, 7 Nov 2026). A status change needs David's ruling.")
         for section in sorted(REQUIRED_SECTIONS):
             if not re.search(rf"^## {section}$", text, re.MULTILINE):
                 errors.append(f"{name}: missing ## {section}.")
@@ -98,7 +101,7 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print("PASS: 15 distinct Proposed replacement ADRs; legacy governance remains required.")
+    print("PASS: 15 distinct Accepted ADRs; archive governance remains required.")
     return 0
 
 

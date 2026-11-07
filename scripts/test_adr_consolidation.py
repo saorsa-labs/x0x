@@ -56,30 +56,33 @@ class ConsolidationTests(unittest.TestCase):
         (self.directory / self.index["slots"][0]["path"]).unlink()
         self.assert_rejected("cannot read record")
 
-    def test_accepted_status_cannot_skip_the_transfer_and_freeze_controls(self):
+    STATUS_LINE = "- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)"
+
+    def test_status_cannot_be_reverted_without_davids_ruling(self):
         path = self.directory / self.index["slots"][0]["path"]
-        path.write_text(path.read_text().replace("**Status:** Proposed", "**Status:** Accepted"))
-        self.assert_rejected("replacement status must remain Proposed")
+        self.assertIn(self.STATUS_LINE, path.read_text())
+        path.write_text(path.read_text().replace(self.STATUS_LINE, "- **Status:** Proposed"))
+        self.assert_rejected("slot status must remain Accepted")
 
     def test_status_annotations_use_the_leading_lifecycle_token(self):
         path = self.directory / self.index["slots"][0]["path"]
         original = path.read_text()
-        for status in ("Proposed (transfer pending)", "**Proposed** review pending", "Proposed; review pending"):
+        for status in ("Accepted (record)", "**Accepted** review recorded", "Accepted; folded 7 Nov 2026"):
             with self.subTest(status=status):
-                path.write_text(original.replace("**Status:** Proposed", f"**Status:** {status}"))
+                path.write_text(original.replace(self.STATUS_LINE, f"- **Status:** {status}"))
                 self.assertEqual(CHECK.validate(self.root), [])
-        for status in ("Accepted (record)", "Accepted (Proposed replacement)", "ProposedElsewhere"):
+        for status in ("Proposed", "Proposed (Accepted draft)", "AcceptedElsewhere"):
             with self.subTest(status=status):
-                path.write_text(original.replace("**Status:** Proposed", f"**Status:** {status}"))
-                self.assert_rejected("replacement status must remain Proposed")
+                path.write_text(original.replace(self.STATUS_LINE, f"- **Status:** {status}"))
+                self.assert_rejected("slot status must remain Accepted")
 
     def test_missing_or_duplicate_status_cannot_bypass_the_lock(self):
         path = self.directory / self.index["slots"][0]["path"]
         original = path.read_text()
-        for replacement in ("", "- **Status:** Proposed\n- **Status:** Accepted"):
+        for replacement in ("", f"{self.STATUS_LINE}\n- **Status:** Accepted"):
             with self.subTest(replacement=replacement):
-                path.write_text(original.replace("- **Status:** Proposed", replacement))
-                self.assert_rejected("replacement status must remain Proposed")
+                path.write_text(original.replace(self.STATUS_LINE, replacement))
+                self.assert_rejected("slot status must remain Accepted")
 
     def test_title_must_match_the_index(self):
         self.index["slots"][0]["title"] = "Different title"
@@ -111,10 +114,12 @@ class ConsolidationTests(unittest.TestCase):
         self.save_index()
         self.assert_rejected("use its own Axx-rNN-title.md file and matching revision")
 
-    def test_phase_flag_alone_cannot_activate_the_new_set(self):
-        self.index["phase"] = "active"
-        self.save_index()
-        self.assert_rejected("Add acceptance controls before activation")
+    def test_phase_cannot_change_without_davids_ruling(self):
+        for phase in ("active", "transfer_review"):
+            with self.subTest(phase=phase):
+                self.index["phase"] = phase
+                self.save_index()
+                self.assert_rejected("Only schema 1 accepted is supported")
 
     def test_record_path_cannot_escape_the_governed_directory(self):
         self.index["slots"][0]["path"] = "../0001-bootstrap-peers-are-seed-hints-only.md"

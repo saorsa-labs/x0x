@@ -1,14 +1,14 @@
 # A14 Health Updates and Recovery
 
-- **Status:** Proposed
+- **Status:** Accepted (David, course-correction directive, 7 Nov 2026, ruling 2)
 - **Revision:** 1
 - **Date:** 2026-10-21
 - **Decision owner:** David Irvine
 - **Direction:** Confirmed by David (D198) on 2026-10-05 for this team review.
-- **Replacement activation:** Pending the transfer and acceptance checks in A15.
-- **Supersedes:** None yet. Existing decisions and implementation gates remain in force.
+- **Replacement activation:** Active since 7 November 2026. The 15 accepted slots are the live decision authority.
+- **Supersedes:** The archived numbered records mapped to this slot in [TRANSFER.md](TRANSFER.md). The archive stays the historical record. Existing implementation gates remain in force.
 
-These slots remain Proposed (D198, D199). David accepted the archive transfer on 10 October 2026. [docs/adr/README.md](../README.md) and [docs/adr-archive/move.json](../../adr-archive/move.json) record that acceptance. Replacement acceptance and clause-level transfer checks are still open. Use the [index and transition rules](README.md) to interpret their status.
+David accepted the 15 slots at their current revisions on 7 November 2026 (course-correction directive, ruling 2). They are the live decision authority. The numbered records stay in [docs/adr-archive](../../adr-archive/ARCHIVE.md) as the historical record. [docs/adr-archive/move.json](../../adr-archive/move.json) records the archive transfer David accepted on 10 October 2026. Use the [index](README.md) for the current rules.
 
 x0x must remain recoverable when an update fails. Agents can help maintain a node, but update safety must also work when no agent is available.
 
@@ -36,6 +36,8 @@ Health reports must state which services and invariants were checked. Distinguis
 
 Use typed degraded and blocked states. Do not report healthy merely because one HTTP handler responds.
 
+`x0x doctor --json` prints one JSON object with four named checks — `connectivity`, `key_health`, `store_integrity` and `upgrade` — each with `status` (`ok`, `warn` or `fail`), `detail` and optional `evidence`, plus a top-level `ok` that is false when any check is `fail` (accepted by David, 2026-10-17; archived as [T-doctor-json-summary](../../adr-archive/transient/T-doctor-json-summary.md)). The process exits non-zero only when a check is `fail`, after the JSON is written; warnings alone exit zero. Degraded connectivity is `warn`. A failed release lookup is `warn`, so local health can still exit zero; a failed upgrade attempt is `fail`. When `--name <instance>` has no `api.port`, doctor prints the object with all four checks `fail` and does not target the default daemon. The first `/health` probe uses a two-second timeout. Text mode uses the same checks and the same exit rule. This is a CLI contract; it changes no wire format, daemon REST schema or upgrade apply path.
+
 Diagnostic data for the owner should identify the failed condition and the permitted recovery action. Reports to maintainers are opt-in and must remove secrets and unrelated private data.
 
 ## Safe apply
@@ -43,6 +45,8 @@ Diagnostic data for the owner should identify the failed condition and the permi
 Resolve who owns process restart before changing installed files. The old daemon records the intended executables, paths, arguments, data roots and supervisor behavior.
 
 Use a host-level lock and durable transaction state. Prevent two daemons that share an executable from applying conflicting updates.
+
+One host keeps one previous binary (accepted by Claude+Codex consensus under David's 19 Oct 2026 rule, 2026-10-19, PR #1462; archived as [T-self-update-host-backup-guard](../../adr-archive/transient/T-self-update-host-backup-guard.md)). Before backup or replace, the applier takes an OS exclusive lock on `<file-name>.upgrade.lock` beside the target; the OS releases it when the holder dies, and reclaim must not unlink a held lock file. If the on-disk bytes already match the incoming binary, backup and replace are skipped while `perform_upgrade` still returns `Success`, so admission can still own restart for an old-running process. If they differ, the applier copies to `<target>.backup` and then replaces. After every host lock is held and the async caller is still alive, replacement is admitted and the blocking worker owns restart; cancel after admission must not leave installed bytes without that owner, and a fallible hand-off of the deferred restart owner must either refuse before mutation or keep exactly one continuation or fallback owner. HTTP apply opts into one crate-internal deferred restart that survives HTTP-task cancel; CLI `--check-updates` never restarts. There are no versioned backup names (#1373 keeps that scope), and managed Windows apply stays refused under archived ADR 0094.
 
 Verify and probe the candidate before replacement. Keep the exact old bytes needed for recovery. Record each file replacement and restoration; replacing a daemon and CLI is not one atomic filesystem operation.
 
@@ -70,7 +74,7 @@ Treating a signed manifest as the only release gate protects authenticity but do
 
 ## Current implementation
 
-Signed updates, diagnostics and an unsupervised restart helper exist. Supervised updates request a restart but do not arm automatic rollback. The apply lock is local to one daemon process, not host-wide. M2 safe apply and the complete owner-governed maintenance system remain incomplete.
+Signed updates, diagnostics and an unsupervised restart helper exist. Supervised updates request a restart but do not arm automatic rollback. The host-wide exclusive apply lock above entered the tree with PR #1462. M2 safe apply and the complete owner-governed maintenance system remain incomplete.
 
 ## Validation
 

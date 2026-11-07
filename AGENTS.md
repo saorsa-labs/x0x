@@ -71,30 +71,31 @@ The documentation and communication style is in `docs/documentation-style.md`.
 
 ## Architecture decisions (ADRs)
 Before changing architecture, protocols, storage formats, crypto, network
-behaviour, public APIs or operational invariants, check `docs/adr/` and its
-status overlay. Keep the current ADR pack at 15. Under David's 19 Oct 2026
-ruling, do not add ADR files, including transient `T-*.md` records or folded
-overlays. Put the rationale in the PR body and existing documentation or code
-doc comments. Use about 80% ASD-STE100 style; follow
-`docs/documentation-style.md`.
+behaviour, public APIs or operational invariants, read the accepted 15 ADR
+set in `docs/adr/consolidated/`. David accepted A01 through A15 on
+7 Nov 2026 (course-correction directive, ruling 2); they are the live
+decision authority. Keep the current ADR pack at 15. Under David's 19 Oct
+2026 ruling, do not add ADR files, including numbered records, transient
+`T-*.md` records or folded overlays. Put the rationale in the PR body and
+existing documentation or code doc comments. Use about 80% ASD-STE100
+style; follow `docs/documentation-style.md`.
 
 If a change touches the wire format or public API, write a `FOR ENGINEER:`
 line describing the change for David's decision. Record any approval in the
 PR body or comment. An approved additive API does not need a new ADR.
 Preserve Accepted records and frozen evidence. Do not create a superseding
-ADR or change an acceptance status as a workaround. Read
-`docs/adr/transient/README.md` for the retained records' historical rules.
+ADR or change an acceptance status as a workaround. A change to an accepted
+slot needs David's ruling.
 
-The 15-slot direction, A01 through A15, is confirmed by David (D198).
-David accepted the transfer on 10 Oct 2026. Slot files stay Proposed.
-Mapped numbered records are the historical archive. Their `docs/adr/` paths
-stay as links, and the bytes live in `docs/adr-archive/`. Read
-`docs/adr/consolidated/README.md` for the transfer rules. Do not create A16
-or a second consolidated series. Reserved numbered ADRs remain reserved:
-0090/0091 (D18), 0097 (D20), 0098 (D35), and 0084–0105 (D63).
-Slices 0109–0114 continue to acceptance as numbered ADRs. The accepted
-records, overlay, frozen evidence and team gates remain in force.
-David placed ADR 0115 in A02 and ADR 0116 in A07 on 10 Oct 2026.
-Run `python3 scripts/check-adr-consolidation.py` for the transition checks.
+The numbered records (0001–0116) are the historical archive: their
+`docs/adr/` paths stay as links, and the bytes live in `docs/adr-archive/`.
+Where a slot is silent on a detail an archived accepted record settles, the
+archived record still answers it. The old index and status overlay are
+retired and archived at `docs/adr-archive/legacy-index-and-status-overlay.md`.
+The 17 Accepted transient records are folded into their slots and archived
+under `docs/adr-archive/transient/`; 6 Proposed transients stay open in
+`docs/adr/transient/` (see its README). Do not create A16 or a second
+consolidated series.
+Run `python3 scripts/check-adr-consolidation.py` for the 15-slot checks.
 Run `python3 scripts/check-adr-count.py` for the current-count limit of 15.
-The plan is `docs/adr/consolidated/README.md`.
+The rules are in `docs/adr/consolidated/README.md`.
